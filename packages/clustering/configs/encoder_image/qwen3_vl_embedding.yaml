@@ -1,0 +1,21 @@
+# @package encoder_image
+# Qwen3-VL-Embedding — purpose-built multimodal embedding model (base:
+# Qwen3-VL-8B-Instruct), used here as a page-image encoder.
+# Select with:  encoder_image=qwen3_vl_embedding
+name: qwen3_vl_embedding
+model_id: Qwen/Qwen3-VL-Embedding-8B
+# Matryoshka (MRL): the native 4096-d embedding is truncated to this width and
+# re-normalized. Any value in [64, 4096] is valid; smaller ⇒ cheaper downstream.
+embedding_dim: 1024
+# Single-vector only (one pooled embedding per input); late_interaction is
+# rejected — use colpali for multi-vector.
+multi_vector: false
+extra:
+  # 8B custom-code checkpoint: trust_remote_code is required, and a GPU is
+  # strongly recommended. Native dtype is used unless torch_dtype overrides it.
+  trust_remote_code: true
+  # torch_dtype: bfloat16
+  batch_size: 8
+  # Optional instruction to steer the embedding (defaults to the model's own
+  # "Represent the user's input."):
+  # prompt: "Represent this document page for type-based clustering."

@@ -1,0 +1,316 @@
+{
+  "label": "Raul Terrill \u2014 synthetic mutual NDA (legal contract)",
+  "source": {
+    "docset_id": "gcan45a1lytb",
+    "file_id": "n3g18tho34ft",
+    "filename": "Raul Terrill.pdf",
+    "text_mode": "digital",
+    "page_count": 3
+  },
+  "layout": {
+    "signatures": {
+      "kind": "free_form"
+    },
+    "parties": {
+      "kind": "free_form"
+    }
+  },
+  "phase1": {
+    "agreement_type": {
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ],
+      "text": "Mutual Non-Disclosure Agreement"
+    },
+    "exceptions": [
+      {
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ],
+        "text": "were, at the date of disclosure, or have subsequently become, generally known or available to the public through no act or failure to act by the receiving party"
+      },
+      {
+        "text": "were rightfully known by the receiving party prior to receiving such information or materials from the disclosing party",
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ]
+      },
+      {
+        "text": "are rightfully acquired by the receiving party from a third party who has the right to disclose such information or materials without breach of any confidentiality obligation to the disclosing party",
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ]
+      },
+      {
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ],
+        "text": "are independently developed by the receiving party without access to any Confidential Information of the disclosing party"
+      }
+    ],
+    "effective_date": {
+      "text": "5/6/2018",
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ]
+    },
+    "compelled_disclosure_clause": {
+      "text": "Nothing in this Agreement will be deemed to restrict a party from disclosing the other party\u2019s Confidential Information to the extent required by any order, subpoena, law, statute or regulation; provided, that the party required to make such a disclosure uses reasonable efforts to give the other party reasonable advance notice of such required disclosure in order to enable the other party to prevent or limit such disclosure.",
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ]
+    },
+    "entire_agreement_clause": {
+      "text": "This Agreement is the complete and exclusive understanding and agreement between the parties regarding the subject matter of this Agreement and supersedes all prior agreements, understandings and communications, oral or written, between the parties regarding the subject matter of this Agreement.",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "signatures": [
+      {
+        "signatory_title": {
+          "text": "CEO",
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ]
+        },
+        "signatory_name": {
+          "text": "Jean Paoli",
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ]
+        },
+        "party_name": {
+          "text": "CLASSIFY & PROCESS INC.",
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ]
+        }
+      },
+      {
+        "party_name": {
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ],
+          "text": "Raul Terrill"
+        }
+      }
+    ],
+    "no_warranty_clause": {
+      "text": "ALL CONFIDENTIAL INFORMATION IS PROVIDED BY THE DISCLOSING PARTY \u201cAS IS\u201d.",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "return_of_confidential_information_clause": {
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ],
+      "text": "Upon the completion or abandonment of the Purpose, and in any event upon the disclosing party\u2019s request, the receiving party will promptly return to the disclosing party all tangible items and embodiments containing or consisting of the disclosing party\u2019s Confidential Information and all copies thereof (including electronic copies), and any notes, analyses, compilations, studies, interpretations, memoranda or other documents (regardless of the form thereof) prepared by or on behalf of the receiving party that contain or are based upon the disclosing party\u2019s Confidential Information."
+    },
+    "parties": [
+      {
+        "name": {
+          "locations": [
+            {
+              "page_number": 1
+            }
+          ],
+          "text": "Classify & Process Inc."
+        },
+        "jurisdiction_of_formation": {
+          "text": "Delaware",
+          "locations": [
+            {
+              "page_number": 1
+            }
+          ]
+        },
+        "address": {
+          "locations": [
+            {
+              "page_number": 1
+            }
+          ],
+          "text": "150 Lake Street South, Suite 221, Kirkland, Washington 98033"
+        },
+        "entity_type": {
+          "text": "corporation",
+          "locations": [
+            {
+              "page_number": 1
+            }
+          ]
+        }
+      },
+      {
+        "entity_type": {
+          "locations": [
+            {
+              "page_number": 1
+            }
+          ],
+          "text": "individual"
+        },
+        "address": {
+          "text": "591 Memorial Dr, Chicopee MA 1020",
+          "locations": [
+            {
+              "page_number": 1
+            }
+          ]
+        },
+        "name": {
+          "locations": [
+            {
+              "page_number": 1
+            }
+          ],
+          "text": "Raul Terrill"
+        }
+      }
+    ],
+    "obligations_and_restrictions": {
+      "text": "Each party agrees: (i) to maintain the other party's Confidential Information in strict confidence; (ii) not to disclose such Confidential Information to any third party; and (iii) not to use such Confidential Information for any purpose except for the Purpose. Each party may disclose the other party\u2019s Confidential Information to its employees and consultants who have a bona fide need to know such Confidential Information for the Purpose, but solely to the extent necessary to pursue the Purpose and for no other purpose; provided, that each such employee and consultant first executes a written agreement (or is otherwise already bound by a written agreement) that contains use and nondisclosure restrictions at least as protective of the other party\u2019s Confidential Information as those set forth in this Agreement.",
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ]
+    },
+    "equitable_relief_clause": {
+      "text": "Each party acknowledges that the unauthorized use or disclosure of the disclosing party\u2019s Confidential Information may cause the disclosing party to incur irreparable harm and significant damages, the degree of which may be difficult to ascertain. Accordingly, each party agrees that the disclosing party will have the right to seek immediate equitable relief to enjoin any unauthorized use or disclosure of its Confidential Information, in addition to any other rights and remedies that it may have at law or otherwise.",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "no_license_clause": {
+      "text": "All Confidential Information remains the sole and exclusive property of the disclosing party. Each party acknowledges and agrees that nothing in this Agreement will be construed as granting any rights to the receiving party, by license or otherwise, in or to any Confidential Information of the disclosing party, or any patent, copyright or other intellectual property or proprietary rights of the disclosing party, except as specified in this Agreement.",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "assignment_clause": {
+      "text": "Neither party may assign this Agreement, in whole or in part, by operation of law or otherwise, without the other party\u2019s prior written consent, and any attempted assignment without such consent will be void.",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "no_obligations_clause": {
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ],
+      "text": "Each party retains the right, in its sole discretion, to determine whether to disclose any Confidential Information to the other party. Neither party will be required to negotiate nor enter into any other agreements or arrangements with the other party, whether or not related to the Purpose."
+    },
+    "confidential_information_definition": {
+      "text": "means any information or materials disclosed by one party to the other party that: (i) if disclosed in writing or in the form of tangible materials, is marked \u201cconfidential\u201d or \u201cproprietary\u201d at the time of such disclosure; (ii) if disclosed orally or by visual presentation, is identified as \u201cconfidential\u201d or \u201cproprietary\u201d at the time of such disclosure, and is summarized in a writing sent by the disclosing party to the receiving party within thirty (30) days after any such disclosure; or (iii) due to its nature or the circumstances of its disclosure, a person exercising reasonable business judgment would understand to be confidential or proprietary.",
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ]
+    },
+    "counterparts_clause": {
+      "text": "This Agreement may be executed in counterparts, each of which will be deemed an original, but all of which together will constitute one and the same instrument.",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "agreement_title": {
+      "text": "MUTUAL NON-DISCLOSURE AGREEMENT",
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ]
+    },
+    "severability_clause": {
+      "text": "If any provision of this Agreement is held invalid or unenforceable by a court of competent jurisdiction, that provision of this Agreement will be enforced to the maximum extent permissible and the other provisions of this Agreement will remain in full force and effect.",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "governing_law": {
+      "text": "laws of the State of Washington",
+      "locations": [
+        {
+          "page_number": 2
+        }
+      ]
+    },
+    "purpose": {
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ],
+      "text": "engage in discussions regarding a potential agreement or other transaction between the parties"
+    },
+    "term": {
+      "full_text": {
+        "text": "This Agreement will remain in effect for a period of five (5) years from the date of last disclosure of Confidential Information by either party, at which time it will terminate.",
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ]
+      },
+      "duration": {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "five (5) years"
+      },
+      "trigger": {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "from the date of last disclosure of Confidential Information by either party"
+      }
+    }
+  }
+}

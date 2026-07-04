@@ -1,0 +1,41 @@
+[project]
+name = "dgml-clustering"
+version = "0.1.1"
+description = "Cluster DGML files into DocSets via multimodal embeddings."
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Docugami" }]
+readme = "../../README.md"
+dependencies = [
+    "omegaconf>=2.3",
+    "pillow>=10",
+    "pydantic>=2.6",
+    "torch>=2.6,<2.7",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pyarrow>=15",
+    "scipy>=1.12",
+    "scikit-learn>=1.4",
+    "networkx>=3.2",
+    "geoopt>=0.5",
+    # transformers 5.x is required to correctly load the Qwen3-VL-Embedding
+    # checkpoints (the 4.x AutoModel resolves the bare Qwen3VLModel backbone
+    # and silently random-inits the `model.`-prefixed weights).
+    "transformers>=5,<6",
+    "sentence-transformers>=5.6",
+    "accelerate>=0.30",
+    "timm>=1.0",
+]
+
+[project.optional-dependencies]
+logging = [
+    "clearml>=1.16",
+    "wandb>=0.17",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clustering"]

@@ -1,0 +1,221 @@
+# Prompts for the DGML generation pipeline.
+# Edit prompt wording here (not inline in the Python modules).
+# Loaded by dgml.generation.prompts.get(<name>).
+"transcribe_system": |
+  You transcribe document pages into a FLAT JSON list of typed blocks. You do
+  not build a tree, you do not invent names, you do not summarise — you copy
+  every visible character of body text, in reading order, into blocks.
+
+  Block types (the only ones):
+  - {"structure": "heading", "level": 1-6, "lim": "<printed number, if any>",
+     "text": "<heading text>"}            — any section/clause/rule heading
+  - {"structure": "p", "text": "..."}     — a paragraph of prose
+  - {"structure": "item", "lim": "<printed marker>", "text": "..."}
+                                          — one list/enumeration item
+  - {"structure": "row", "cells": ["...", "..."]}
+                                          — one table row, one string per cell
+  - {"structure": "field", "lim": "<printed item no.>", "label": "...",
+     "value": "..."}                      — one label/value form line
+
+  Rules:
+  1. Copy text verbatim. Never paraphrase, never skip, never re-order.
+  2. `lim` holds the PRINTED enumerator exactly as shown ("2.13", "(a)",
+     "ITEM 3", "•"). Empty when nothing is printed.
+  3. Heading levels reflect the document's own hierarchy (a clause heading
+     under a part heading gets a higher level number).
+  4. Exclude only repeated page decorations (page numbers, running headers).
+  5. Output JSON only: {"continues": "...", "blocks": [...]}.
+     `continues` holds text that finishes the PREVIOUS window's final block
+     when your first page starts mid-sentence; otherwise "".
+"transcribe_window_header": |-
+  Transcribe pages {first}-{last} of {total} into blocks.
+"transcribe_window_tail": |-
+  The previous window's transcription ended with:
+  <TAIL>{tail}</TAIL>
+  If your first page begins mid-sentence, put the completing text in "continues" and do NOT repeat anything inside <TAIL>.
+"transcribe_window_json": |-
+  Return JSON only: {"continues": "...", "blocks": [...]}.
+"label_system": |
+  You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
+  belong to one document set; your single most important job is to use the
+  SAME concept for the same role across every block and every document.
+
+  REUSE BEFORE YOU COIN. A roster of concepts already in use is provided. For
+  EVERY block and entity, FIRST scan the roster for a concept whose role
+  matches what you are labeling — if one fits, use that name VERBATIM. Coin a
+  NEW concept ONLY when no roster entry fits the role. The roster should supply
+  most of your labels; coining a fresh concept for a role the roster already
+  covers is the most common and most damaging mistake you can make.
+
+  Concepts are PascalCase role names ("PaymentTerms", "CommencementDate",
+  "EquipmentName"). Name the ROLE, never the value: a concept must stay
+  correct if a different document filled it with different content.
+
+  Concept naming rules:
+  - NEVER include structural or discourse words ("Section", "Clause", "Item",
+    "Heading", "Paragraph", "List", "Title", "Text", "Block"): the block's
+    structure is recorded separately. "PaymentTerms", not "PaymentTermsClause".
+  - Be as SPECIFIC as the content supports: name what the content is about,
+    not its broad family. Prefer the precise role over an umbrella term.
+  - One concept names ONE role. If a heading covers several distinct topics,
+    pick the dominant role — never concatenate topics into one name.
+
+  Density rules:
+  - EVERY heading block gets a concept naming its section's role
+    ("RepairsAndMaintenance", "InsuranceObligations", "Definitions").
+    Never skip a heading.
+  - If a heading's TEXT is itself a value rather than a topic title, add an
+    entity quoting the whole heading text, with a concept naming that value-kind.
+  - Paragraphs get a concept when they carry an identifiable role
+    (a definition, an obligation, a notice clause); ordinary connective
+    prose stays unlabeled — that is the only category you may skip.
+  - Do NOT give a section heading, a heading nested inside it, and that
+    section's body all the SAME concept. Each names its own role — broader at
+    the top, narrower below; a body that only restates the section's topic
+    stays unlabeled rather than repeating the section's concept.
+  - Never use generic catch-alls ("section", "content", "paragraph", "misc").
+
+  Tables (row blocks) — for each row, also return:
+    "table": a name for the whole table (the kind of thing it holds, NO
+      "Table" in the name), the SAME for every row of that table; and
+    "cells": one concept per cell, in column order, each naming the kind of
+      value that column holds (what its header would be called).
+    When rows are records of the same kind (e.g. a column always holds a
+    name, the next always a price), every row gets the SAME "table",
+    the SAME row "concept", and the SAME per-column "cells" concepts —
+    consistency across rows is required. When the table instead pairs a
+    field with its value and each row is DIFFERENT information, the cell
+    concepts are specific to that row's value (they will differ between
+    rows) — name them by what each value is.
+    A single cell may pack MORE THAN ONE value into one column (for example an
+    identifier next to the name it labels). For such a cell, add an "entities"
+    list with one entry per value (each a verbatim quote + its own concept) —
+    the values are tagged inline inside the cell. Use "cells" for single-value
+    columns and "entities" for cells that carry several distinct values; a cell
+    may use either.
+
+  Lists (item blocks):
+    - Short, uniform items (a list of like things) all share ONE concept.
+    - Items that are full clauses/paragraphs each get their own specific
+      concept.
+
+  For blocks whose text contains atomic extractable values (dates, amounts,
+  durations, parties, identifiers), also add entities. Each entity is the
+  value QUOTED VERBATIM from the block's text: copy the complete value exactly
+  as printed — never a fragment of it, never surrounding words or punctuation
+  that are not part of the value, and never one value split across several
+  entities. If the same value string occurs more than once in the block, add
+  "occurrence": N (1-based) for the one you mean; otherwise omit it.
+
+  Entity concepts name the KIND OF VALUE — what a column header for that field
+  would be called — never the topic it belongs to:
+  - A block about a supplier contains values of different kinds: the supplier's
+    name is "SupplierName", its address "SupplierAddress", its registration
+    number "SupplierRegistrationNumber" — never all of them "Supplier".
+  - An entity concept must NEVER equal its block's concept — EXCEPT when the
+    entity's quote is the block's ENTIRE text (the block is itself only that one
+    value): then tag the block with that single concept and add no separate
+    entity. Otherwise the block concept names what the content is ABOUT and each
+    entity concept names the KIND of value it is. When a value would otherwise
+    take the block's own name, make the value's concept MORE SPECIFIC — name the
+    kind of value (an amount, a date, a rate, an identifier, …) — so the block
+    keeps its role and the value stays distinctly tagged.
+  - If a block is only a short label followed by its value (a "label: value"
+    line), the value carries the concept and the block stays unlabeled — tag the
+    value, not the whole line.
+  - Distinct value kinds in one block always get distinct concepts (a date is
+    never the same concept as an amount, a name never the same as an address).
+
+  Output JSON only:
+  {"labels": {"<block_id>": {"concept": "...",
+    "entities": [{"quote": "<exact substring>", "concept": "..."}]}}}
+  Every key must be a block id from the input. Label densely per the rules
+  above; omit only connective prose.
+"plan_system": |
+  You design the CONCEPT ROSTER for a set of related documents. You are shown
+  the structural skeleton (headings, form fields, table rows, first list
+  items) of EVERY document side by side. Your job: propose one concept per
+  semantic role that RECURS across the documents — derived from what they
+  share, so every document can be labeled with the same names.
+
+  Concepts are PascalCase role names ("DefinitionOfTerm"). Name the ROLE,
+  never the value; a concept must fit every document's instance of that role.
+  Never include structural or discourse words ("Section", "Clause", "Item",
+  "Heading", "Paragraph", "List", "Title") — structure is recorded separately.
+  Be as specific as the shared content supports, and never concatenate two
+  distinct topics into one concept.
+
+  Plan TWO levels of concepts:
+  - TOPIC concepts for recurring sections and recurring items/rows/fields.
+  - VALUE-KIND concepts for the atomic values those blocks contain — named
+    for what a column header for that field would be called ("SupplierName",
+    "SupplierAddress", "InvoiceDate", "TotalAmount"), one concept per kind of
+    value. A topic concept is never reused for a value: a block's name,
+    address, date, and amount are four different value-kind concepts.
+  Cover:
+  - every recurring section role (one concept per distinct heading role)
+  - every recurring form-field / table-column / list-item role
+  - the atomic value roles those blocks contain (dates, amounts, parties,
+    durations, identifiers)
+  Do not invent concepts for content that appears in only one document, and
+  never propose generic catch-alls.
+
+  Output JSON only:
+  {"concepts": {"<concept>": "<one-line role description>", ...}}
+"roster_complete": |-
+  Review your roster against the document skeletons above. A first-pass roster
+  routinely MISSES recurring roles. ADD every recurring section, field, column,
+  list-item, and atomic-value role that is visible in the skeletons but absent
+  from your roster — a value that appears across documents must have a concept.
+  Keep every concept you already have, with the same names (do not rename, do
+  not remove). Return the COMPLETE roster (your originals plus the additions),
+  same JSON only:
+  {"concepts": {"<concept>": "<one-line role description>", ...}}
+"roster_intro": |-
+  CONCEPTS ALREADY IN USE in this document set — reuse these names verbatim where the role matches:
+"section_retry": |-
+  These section headings were left unlabeled. Give each a concept naming its section's role:
+"describe_concepts": |
+  You write one-line ROLE descriptions for document field concepts. Each concept
+  is a PascalCase name shown with one or more example values observed in the
+  documents. For EACH concept, return a concise description of what the field IS
+  — its role or meaning in the document — describing the KIND of value it holds.
+  Never restate or include the example value; describe the field, not the
+  instance. One short sentence or phrase per concept.
+  Output JSON only: {"descriptions": {"<Concept>": "<one-line role>", ...}}.
+
+"link_system": |
+  You find SEMANTIC LINKS in a DGML document: a relationship one element
+  (the subject) has to another (the object) that the tree's nesting does not
+  capture. Prefer NON-LOCAL links — subject and object far apart, or in different
+  sections; skip trivial label-next-to-value pairs recoverable from layout alone.
+
+  You are given one element per line as `eNNNN <TagName>: text`. Return JSON only:
+  {"links": [{"subject": "eNNNN", "object": "eMMMM", "predicate": "...", "value": "..."}]}
+  - subject = the element that HAS the relationship / whose value is derived.
+  - object  = the element it points to. For a value derived from SEVERAL elements
+    (e.g. "the lesser of (i) … or (ii) …"), object may be a LIST of element ids.
+  - predicate = a short lowerCamelCase name for the relationship. Use the natural
+    name; examples by family:
+      references:  references, incorporates, amends, supersedes, signatoryOf,
+                   describes, attestsTo, governedBy, guarantorOf
+      relative date: relativeTo (an offset/anniversary) or effectiveOn (the date
+                   simply EQUALS an event, e.g. the signature date)
+      derived value: lesserOf / greaterOf (object = the operand list), escalates
+                   (the base value it adjusts), valueFrom (value stated elsewhere),
+                   accruesFrom (a period bounded by a date)
+  - value = an ISO-8601 duration for a date offset ("P1Y" annual, "P30D" for 30
+    days), or a numeric multiplier/amount the predicate carries; else "".
+  Only return real relationships. If there are none, return {"links": []}.
+
+"link_verify": |
+  You are a skeptical reviewer of proposed semantic links. Each line is a
+  candidate `LNNN: <SubjectTag> "text" --predicate--> <ObjectTag> "text"`. Decide,
+  for each, whether to KEEP it — keep ONLY links that are a real, correctly-typed
+  relationship where the object is the RIGHT target and the predicate names it
+  accurately. DROP a link if it is: trivial/recoverable from layout alone, a
+  guess, the wrong object, a mislabeled predicate, or a mere co-location. Default
+  to keep=false when uncertain — precision matters more than recall.
+
+  Return JSON only: {"verdicts": [{"i": 0, "keep": true, "reason": "..."}]}
+  Include one verdict per candidate index.

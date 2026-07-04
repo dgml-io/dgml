@@ -1,0 +1,69 @@
+<?xml version='1.0' encoding='utf-8'?>
+<dg:chunk xmlns:dg="http://dgml.io/ns/dg#" xmlns:docset="http://dgml.io/acme-corp/master-services-agreements#" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  
+  <docset:VendorName xml:id="vendor-co">MagicSoft, Inc.</docset:VendorName>
+
+  
+  <docset:IndemnificationClause>
+    <dg:chunk>
+      <dg:chunk>3.1</dg:chunk>
+      Indemnification
+    </dg:chunk>
+    <docset:LiabilityCap xsi:type="decimal" dg:value="500000">$500,000</docset:LiabilityCap>
+    <docset:EffectiveDate xsi:type="date" dg:value="2024-01-01">January 1, 2024</docset:EffectiveDate>
+    
+    <docset:ConfidentialityObligation>
+      Each party shall hold the other's confidential information in strict confidence.
+    </docset:ConfidentialityObligation>
+    
+    <docset:SignatoryName xml:id="sig-1" dg:itemprop="signatoryOf" dg:href="#vendor-co">Jane Smith</docset:SignatoryName>
+    
+    <docset:InvoiceCycle>Net 30</docset:InvoiceCycle>
+    
+    <docset:WarrantyDisclaimer>
+      THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+    </docset:WarrantyDisclaimer>
+  </docset:IndemnificationClause>
+
+  
+  <docset:BilledCharges>
+    <docset:BilledCharge>
+      <docset:ProductName>Widget</docset:ProductName>
+      <docset:UnitPrice xsi:type="decimal" dg:value="9.95">$9.95</docset:UnitPrice>
+      <docset:OrderedQuantity xsi:type="integer" dg:value="3">3</docset:OrderedQuantity>
+    </docset:BilledCharge>
+  </docset:BilledCharges>
+
+  
+  <dg:chunk>
+    <docset:Premises>
+      <dg:chunk>ITEM 1 — Premises</dg:chunk>
+      <docset:PremisesDescription>Portion of the land at 1234 Main St.</docset:PremisesDescription>
+    </docset:Premises>
+    <dg:chunk>
+      <dg:chunk>ITEM 2 — Rent</dg:chunk>
+      <docset:MonthlyRent xsi:type="decimal" dg:value="4500">$4,500</docset:MonthlyRent>
+    </dg:chunk>
+  </dg:chunk>
+
+  
+  <docset:Annexures>
+    <docset:Annexure><dg:chunk>A.</dg:chunk>Plan of the Premises</docset:Annexure>
+    <docset:Annexure><dg:chunk>B.</dg:chunk>Rules and Regulations</docset:Annexure>
+  </docset:Annexures>
+
+  
+  <dg:chunk>
+    <docset:RepairObligation>
+      <dg:chunk>5.1</dg:chunk>The Lessee must keep the Premises in good repair.</docset:RepairObligation>
+    <docset:InsuranceObligation>
+      <dg:chunk>5.2</dg:chunk>The Lessee must insure the Premises for full replacement value.</docset:InsuranceObligation>
+  </dg:chunk>
+
+  
+  <dg:chunk>
+    <docset:PaymentTerms>Net 30 days from invoice date.</docset:PaymentTerms>
+  </dg:chunk>
+
+</dg:chunk>

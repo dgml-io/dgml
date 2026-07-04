@@ -1,0 +1,163 @@
+{
+  "@context": {
+    "docset": "http://dgml.io/acme-corp/master-services-agreements#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "Tag": "docset:Tag",
+    "TagGroup": "docset:TagGroup",
+    "siblingsShare": {
+      "@id": "docset:siblingsShare",
+      "@type": "xsd:boolean"
+    },
+    "members": {
+      "@id": "docset:members",
+      "@type": "@id",
+      "@container": "@set"
+    },
+    "description": "docset:description",
+    "example": "docset:example"
+  },
+  "@graph": [
+    {
+      "@id": "docset:ContractLevelTag",
+      "@type": "docset:TagGroup",
+      "members": [
+        "docset:IndemnificationClause",
+        "docset:PaymentTerms",
+        "docset:BilledCharges"
+      ]
+    },
+    {
+      "@id": "docset:ClauseItemTag",
+      "@type": "docset:TagGroup",
+      "members": [
+        "docset:LiabilityCap",
+        "docset:EffectiveDate",
+        "docset:VendorName",
+        "docset:IndemnifyingParty",
+        "docset:IndemnifiedParty",
+        "docset:InvoiceCycle",
+        "docset:LatePaymentPenalty"
+      ]
+    },
+    {
+      "@id": "docset:TableRowTag",
+      "@type": "docset:TagGroup",
+      "members": [
+        "docset:BilledCharge"
+      ]
+    },
+    {
+      "@id": "docset:TableCellTag",
+      "@type": "docset:TagGroup",
+      "members": [
+        "docset:ProductName",
+        "docset:UnitPrice",
+        "docset:OrderedQuantity"
+      ]
+    },
+    {
+      "@id": "docset:InlineTag",
+      "@type": "docset:TagGroup",
+      "members": [
+        "docset:SignatoryName"
+      ]
+    },
+    {
+      "@id": "docset:AnyTag",
+      "@type": "docset:TagGroup",
+      "members": [
+        "docset:ContractLevelTag",
+        "docset:ClauseItemTag",
+        "docset:TableRowTag",
+        "docset:TableCellTag",
+        "docset:InlineTag"
+      ]
+    },
+    {
+      "@id": "docset:IndemnificationClause",
+      "@type": "docset:NonSharedTag",
+      "description": "Indemnification clause section"
+    },
+    {
+      "@id": "docset:PaymentTerms",
+      "@type": "docset:NonSharedTag",
+      "description": "Payment terms section"
+    },
+    {
+      "@id": "docset:BilledCharges",
+      "@type": "docset:NonSharedTag",
+      "description": "Table of billed charges"
+    },
+    {
+      "@id": "docset:LiabilityCap",
+      "@type": "docset:SharedTag",
+      "description": "Agreed maximum liability exposure under the contract",
+      "example": "$500,000"
+    },
+    {
+      "@id": "docset:EffectiveDate",
+      "@type": "docset:SharedTag",
+      "description": "Effective date of the contract",
+      "example": "January 1, 2024"
+    },
+    {
+      "@id": "docset:VendorName",
+      "@type": "docset:NonSharedTag",
+      "description": "Legal name of the vendor party",
+      "example": "MagicSoft, Inc."
+    },
+    {
+      "@id": "docset:IndemnifyingParty",
+      "@type": "docset:NonSharedTag",
+      "description": "Party responsible for providing indemnification",
+      "example": "Vendor"
+    },
+    {
+      "@id": "docset:IndemnifiedParty",
+      "@type": "docset:NonSharedTag",
+      "description": "Party receiving indemnification protection",
+      "example": "Client"
+    },
+    {
+      "@id": "docset:InvoiceCycle",
+      "@type": "docset:SharedTag",
+      "description": "Payment cycle for invoices",
+      "example": "Net 30"
+    },
+    {
+      "@id": "docset:LatePaymentPenalty",
+      "@type": "docset:SharedTag",
+      "description": "Penalty rate applied to late payments",
+      "example": "1.5% per month"
+    },
+    {
+      "@id": "docset:BilledCharge",
+      "@type": "docset:NonSharedTag",
+      "description": "A single billed charge line item"
+    },
+    {
+      "@id": "docset:ProductName",
+      "@type": "docset:NonSharedTag",
+      "description": "Name of a billed product or service",
+      "example": "Widget"
+    },
+    {
+      "@id": "docset:UnitPrice",
+      "@type": "docset:SharedTag",
+      "description": "Unit price of a billed item",
+      "example": "$9.95"
+    },
+    {
+      "@id": "docset:OrderedQuantity",
+      "@type": "docset:SharedTag",
+      "description": "Quantity of units ordered",
+      "example": "3"
+    },
+    {
+      "@id": "docset:SignatoryName",
+      "@type": "docset:NonSharedTag",
+      "description": "Name of a signatory",
+      "example": "Jane Smith"
+    }
+  ]
+}

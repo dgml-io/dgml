@@ -1,0 +1,56 @@
+<?xml version='1.0' encoding='utf-8'?>
+<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"
+          xmlns:docset="http://dgml.io/acme-corp/master-services-agreements#"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <docset:VendorName xml:id="vendor"
+      dg:origin="1 220 150 680 200">MagicSoft, Inc.</docset:VendorName>
+
+  <docset:IndemnificationClause dg:origin="2 460 300 1800 800">
+    <dg:chunk dg:structure="header" dg:style="font-size: 1.5em; text-transform: uppercase"
+              dg:origin="2 460 300 1800 345">
+      <dg:chunk dg:structure="lim">3.1</dg:chunk>
+      Indemnification
+    </dg:chunk>
+    <docset:IndemnifyingParty dg:origin="2 460 310 1800 355">Vendor</docset:IndemnifyingParty>
+    <docset:IndemnifiedParty dg:origin="2 460 360 1800 405">Client</docset:IndemnifiedParty>
+    <docset:LiabilityCap xsi:type="decimal" dg:value="500000"
+        dg:origin="2 460 410 1800 455">$500,000</docset:LiabilityCap>
+    <docset:EffectiveDate xsi:type="date" dg:value="2024-01-01"
+        dg:origin="2 998 710 1466 755">January 1, 2024</docset:EffectiveDate>
+  </docset:IndemnificationClause>
+
+  <docset:PaymentTerms dg:structure="section" dg:origin="4 460 100 1800 400">
+    <dg:chunk dg:structure="header" dg:origin="4 460 100 1800 145">
+      <dg:chunk dg:structure="lim">4.2</dg:chunk>
+      Payment Terms
+    </dg:chunk>
+    <docset:InvoiceCycle dg:origin="4 460 150 1800 195">Net 30</docset:InvoiceCycle>
+    <docset:LatePaymentPenalty xsi:type="decimal" dg:value="0.015"
+        dg:origin="4 460 200 1800 245">1.5% per month</docset:LatePaymentPenalty>
+  </docset:PaymentTerms>
+
+  <docset:BilledCharges dg:structure="table" dg:origin="6 460 100 1800 400">
+    <docset:BilledCharge dg:structure="tr">
+      <docset:ProductName dg:structure="td" dg:origin="6 460 150 900 195">Widget</docset:ProductName>
+      <docset:UnitPrice dg:structure="td" xsi:type="decimal" dg:value="9.95"
+          dg:origin="6 900 150 1200 195">$9.95</docset:UnitPrice>
+      <docset:OrderedQuantity dg:structure="td" xsi:type="integer" dg:value="3"
+          dg:origin="6 1200 150 1800 195">3</docset:OrderedQuantity>
+    </docset:BilledCharge>
+    <docset:BilledCharge dg:structure="tr">
+      <docset:ProductName dg:structure="td" dg:origin="6 460 200 900 245">Gadget</docset:ProductName>
+      <docset:UnitPrice dg:structure="td" xsi:type="decimal" dg:value="24.50"
+          dg:origin="6 900 200 1200 245">$24.50</docset:UnitPrice>
+      <docset:OrderedQuantity dg:structure="td" xsi:type="integer" dg:value="2"
+          dg:origin="6 1200 200 1800 245">2</docset:OrderedQuantity>
+    </docset:BilledCharge>
+  </docset:BilledCharges>
+
+  <docset:SignatoryName
+      xml:id="sig-1"
+      dg:itemprop="signatoryOf"
+      dg:href="#vendor"
+      dg:origin="11 460 2430 1200 2475">Jane Smith</docset:SignatoryName>
+
+</dg:chunk>

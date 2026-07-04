@@ -1,0 +1,43 @@
+[project]
+name = "dgml"
+version = "0.1.1"
+description = "DGML CLI: command-line interface for the DGML document toolkit."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Docugami" }]
+readme = "../../README.md"
+dependencies = [
+    # The CLI is a thin front end over the library; all runtime deps live in
+    # dgml-core and arrive transitively. Floor-pinned because the CLI imports
+    # dgml-core's internal modules (not just a stable public API).
+    "dgml-core>=0.1.0",
+]
+
+[tool.uv.sources]
+dgml-core = { workspace = true }
+
+[project.optional-dependencies]
+# Pass-through extras: `pip install dgml[aws]` forwards to dgml-core[aws], so
+# the CLI install UX is unchanged from when the library lived in this package.
+# Install with `pip install dgml[aws]` to enable OCR via AWS Textract.
+aws = ["dgml-core[aws]"]
+# Install with `pip install dgml[azure]` to enable OCR via Azure Document Intelligence.
+azure = ["dgml-core[azure]"]
+# Install with `pip install dgml[macos]` to enable on-device OCR via Apple
+# Vision (macOS only; the default provider when no OCR config is set).
+macos = ["dgml-core[macos]"]
+# Install with `pip install dgml[clustering]` to enable `dgml cluster`.
+clustering = ["dgml-core[clustering]"]
+# Install with `pip install dgml[chain]` to enable on-chain attestation
+# (`dgml stake|prove|registry|chain|wallet`).
+chain = ["dgml-core[chain]"]
+
+[project.scripts]
+dgml = "dgml.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dgml"]

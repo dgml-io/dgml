@@ -1,0 +1,88 @@
+<?xml version='1.0' encoding='utf-8'?>
+<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"
+          xmlns:docset="http://dgml.io/acme-corp/master-services-agreements#"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <!-- vendor name with xml:id for cross-referencing -->
+  <docset:VendorName xml:id="vendor-co"
+      dg:structure="p" dg:style="font-weight: bold"
+      dg:origin="1 220 150 680 200">MagicSoft, Inc.</docset:VendorName>
+
+  <!-- section with header and typed values -->
+  <docset:IndemnificationClause dg:structure="section"
+      dg:origin="3 180 400 2360 1200">
+    <dg:chunk dg:structure="header" dg:style="font-size: 1.5em; text-transform: uppercase"
+              dg:origin="3 180 400 2360 450">
+      <dg:chunk dg:structure="lim">3.1</dg:chunk>
+      Indemnification
+    </dg:chunk>
+    <docset:LiabilityCap xsi:type="decimal" dg:value="500000"
+        dg:structure="p" dg:style="font-weight: bold"
+        dg:origin="3 180 500 2360 540">$500,000</docset:LiabilityCap>
+    <docset:EffectiveDate xsi:type="date" dg:value="2024-01-01"
+        dg:structure="p"
+        dg:origin="3 180 550 2360 590">January 1, 2024</docset:EffectiveDate>
+    <!-- multi-line origin spanning two lines -->
+    <docset:ConfidentialityObligation
+        dg:structure="p"
+        dg:origin="3 209 710 2341 755; 3 209 760 2341 805">
+      Each party shall hold the other's confidential information in strict confidence.
+    </docset:ConfidentialityObligation>
+    <!-- itemprop/href link -->
+    <docset:SignatoryName
+        xml:id="sig-1"
+        dg:itemprop="signatoryOf"
+        dg:href="#vendor-co"
+        dg:structure="p"
+        dg:origin="11 460 2430 1200 2475">Jane Smith</docset:SignatoryName>
+    <!-- semantic element with no dg:structure, short text → span -->
+    <docset:InvoiceCycle dg:origin="4 460 139 1800 184">Net 30</docset:InvoiceCycle>
+    <!-- semantic element with no dg:structure, long text → div -->
+    <docset:WarrantyDisclaimer dg:origin="4 209 2800 2341 3300; 5 209 50 2341 300">
+      THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+    </docset:WarrantyDisclaimer>
+  </docset:IndemnificationClause>
+
+  <!-- record table -->
+  <docset:BilledCharges dg:structure="table">
+    <docset:BilledCharge dg:structure="tr">
+      <docset:ProductName dg:structure="td">Widget</docset:ProductName>
+      <docset:UnitPrice dg:structure="td" xsi:type="decimal" dg:value="9.95"
+          dg:style="text-align: right">$9.95</docset:UnitPrice>
+      <docset:OrderedQuantity dg:structure="td" xsi:type="integer" dg:value="3">3</docset:OrderedQuantity>
+    </docset:BilledCharge>
+  </docset:BilledCharges>
+
+  <!-- key-value table -->
+  <dg:chunk dg:structure="table">
+    <docset:Premises dg:structure="tr">
+      <dg:chunk dg:structure="td">ITEM 1 — Premises</dg:chunk>
+      <docset:PremisesDescription dg:structure="td">Portion of the land at 1234 Main St.</docset:PremisesDescription>
+    </docset:Premises>
+    <dg:chunk dg:structure="tr">
+      <dg:chunk dg:structure="td">ITEM 2 — Rent</dg:chunk>
+      <docset:MonthlyRent dg:structure="td" xsi:type="decimal" dg:value="4500"
+          dg:style="font-weight: bold; text-align: right">$4,500</docset:MonthlyRent>
+    </dg:chunk>
+  </dg:chunk>
+
+  <!-- ordered list -->
+  <docset:Annexures dg:structure="ol">
+    <docset:Annexure dg:structure="li"><dg:chunk dg:structure="lim">A.</dg:chunk>Plan of the Premises</docset:Annexure>
+    <docset:Annexure dg:structure="li"><dg:chunk dg:structure="lim">B.</dg:chunk>Rules and Regulations</docset:Annexure>
+  </docset:Annexures>
+
+  <!-- prose list with per-item concepts -->
+  <dg:chunk dg:structure="ol">
+    <docset:RepairObligation dg:structure="li">
+      <dg:chunk dg:structure="lim">5.1</dg:chunk>The Lessee must keep the Premises in good repair.</docset:RepairObligation>
+    <docset:InsuranceObligation dg:structure="li">
+      <dg:chunk dg:structure="lim">5.2</dg:chunk>The Lessee must insure the Premises for full replacement value.</docset:InsuranceObligation>
+  </dg:chunk>
+
+  <!-- inner dg:chunk with no dg:structure -->
+  <dg:chunk>
+    <docset:PaymentTerms dg:structure="p">Net 30 days from invoice date.</docset:PaymentTerms>
+  </dg:chunk>
+
+</dg:chunk>

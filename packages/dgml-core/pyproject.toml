@@ -1,0 +1,55 @@
+[project]
+name = "dgml-core"
+version = "0.1.0"
+description = "DGML core library: PDF→DGML pipeline, OCR, page rendering, generation, grounding, and workspace storage."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Docugami" }]
+readme = "../../README.md"
+dependencies = [
+    # PDF text/page parsing (page slicing + rendering go through ghostscript)
+    "pdfminer.six>=20240706",
+    # XML emission + canonicalization (generation pipeline)
+    "lxml>=5.0.0",
+    # Prompt templates
+    "PyYAML>=6.0",
+    # Date normalization in the semantic-transform pass
+    "dateparser>=1.2",
+    # LLM client used by classification, grounded extraction, and generation
+    "litellm>=1.51.0",
+]
+
+[tool.uv.sources]
+dgml-clustering = { workspace = true }
+dgml-chain = { workspace = true }
+
+[project.optional-dependencies]
+# Install with `pip install dgml-core[aws]` to enable OCR via AWS Textract.
+aws = ["boto3>=1.34"]
+# Install with `pip install dgml-core[azure]` to enable OCR via Azure Document Intelligence.
+azure = [
+    "azure-ai-documentintelligence>=1.0",
+    "azure-identity>=1.15",
+]
+# Install with `pip install dgml-core[macos]` to enable on-device OCR via Apple
+# Vision (macOS only; the default provider when no OCR config is set).
+# PyObjC is MIT-licensed.
+macos = [
+    "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
+# Install with `pip install dgml-core[clustering]` to enable the clustering
+# pipelines (S1/S2 scenario pipelines, embedding models, networkx, scipy,
+# sklearn, colpali_engine — a heavyweight ML stack that not all users need).
+clustering = ["dgml-clustering"]
+# Install with `pip install dgml-core[chain]` to enable on-chain attestation.
+# Pulls eth-account + eth-abi for EVM transaction signing and calldata
+# encoding; transport is stdlib JSON-RPC.
+chain = ["dgml-chain"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dgml_core"]
