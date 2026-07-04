@@ -1,0 +1,30 @@
+{
+  "classification": {
+    // Classification uses a vision-capable model. A small, low-latency model is sufficient.
+    "model": "gemini/gemini-3.1-flash-lite"
+  },
+  "generation": {
+    // `docset generate` transcription model. Haiku gives the best results here.
+    "model": "anthropic/claude-haiku-4-5",
+    // One batch-wide semantic-labeling call per generate. Sonnet gives the best
+    // results here; it's one small-output call per batch, so it's cheap.
+    "label_model": "anthropic/claude-sonnet-4-6"
+  },
+  "grounded": {
+    // Schema induction benefits from a frontier-class model.
+    "schema_model": "anthropic/claude-opus-4-8",
+    // Value extraction is higher-volume; a strong mid-tier model balances quality and cost.
+    "values_model": "gemini/gemini-2.5-pro"
+  },
+  // OCR is required only for scanned or image-based PDFs. On macOS, remove this
+  // section to use the on-device Apple Vision engine. For cloud OCR, set provider
+  // to "azure" (requires endpoint) or "aws" (requires region) and provide the
+  // corresponding credentials via environment variables.
+  "ocr": {
+    "provider": "azure",
+    "endpoint": "https://<your-di-resource>.cognitiveservices.azure.com/"
+  }
+}
+// API keys are read from environment variables by default (ANTHROPIC_API_KEY for
+// anthropic/... models, GEMINI_API_KEY for gemini/... models). Set
+// "<section>.api_key_env" only if the key is stored in a differently named variable.

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev --locked
+      - run: uv run mypy packages
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ghostscript
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ghostscript
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev --locked
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+      - run: uv run pytest
+
+  license-audit:
+    name: License audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev --locked
+      - name: Fail on copyleft dependencies
+        # `--partial-match` is required for the deny tokens (GPL, AGPL, …)
+        # to match real license strings like "GNU General Public License
+        # v3 (GPLv3)" — without it pip-licenses does exact-string match
+        # and silently passes everything. MPL is intentionally not in
+        # the list: it's weak (file-level) copyleft, and tooling we rely
+        # on (certifi, tqdm, pathspec) ships it transitively. See
+        # CLAUDE.md "License compatibility" for the policy.
+        run: |
+          uv run pip-licenses \
+            --from=mixed \
+            --partial-match \
+            --fail-on="GPL;LGPL;AGPL;SSPL;EUPL;CC-BY-SA"

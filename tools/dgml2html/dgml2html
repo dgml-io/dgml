@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""dgml2html — render a DGML XML file as HTML.
+
+dg:structure maps to an HTML element; dg:style is copied verbatim into the
+style attribute. Semantic elements without dg:structure are rendered as
+<div> or <span> based on context (parent structure, child structure, text length).
+
+Usage:
+    dgml2html input.dgml.xml                  # writes to stdout
+    dgml2html input.dgml.xml -o output.html   # writes to file
+    cat input.dgml.xml | dgml2html -          # reads from stdin
+"""
+
+from __future__ import annotations
+
+import argparse
+import html as html_mod
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+_DG_NS = "http://dgml.io/ns/dg#"
+
+_STRUCTURE = f"{{{_DG_NS}}}structure"
+_STYLE = f"{{{_DG_NS}}}style"
+
+# dg:structure values that map to HTML block containers
+_BLOCK_STRUCTURES = {"section", "ol", "ul", "table", "tr"}
+# dg:structure values whose children are inline content
+_INLINE_STRUCTURES = {"p", "li", "td", "header", "span", "lim"}
+
+_STRUCTURE_TO_TAG = {
+    "section": "section",
+    "header": "header",
+    "p": "p",
+    "ol": "ol",
+    "ul": "ul",
+    "li": "li",
+    "table": "table",
+    "tr": "tr",
+    "td": "td",
+    "span": "span",
+    # lim → handled separately (emit text only)
+}
+
+_TEXT_THRESHOLD = 80
+
+_BLOCK_TAGS = {"section", "header", "p", "ol", "ul", "li", "table", "tr", "td", "div"}
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _all_text(element: ET.Element) -> str:
+    return "".join(element.itertext())
+
+
+def _has_block_child(element: ET.Element) -> bool:
+    for child in element:
+        if child.attrib.get(_STRUCTURE) in _BLOCK_STRUCTURES:
+            return True
+    return False
+
+
+def _fallback_tag(element: ET.Element, parent_structure: str | None) -> str:
+    """Choose div or span for a semantic element with no dg:structure."""
+    if parent_structure in _INLINE_STRUCTURES:
+        return "span"
+    if parent_structure in _BLOCK_STRUCTURES:
+        return "div"
+    if _has_block_child(element):
+        return "div"
+    if len(_all_text(element)) > _TEXT_THRESHOLD:
+        return "div"
+    return "span"
+
+
+def _render_element(
+    element: ET.Element,
+    out: list[str],
+    parent_structure: str | None = None,
+    depth: int = 0,
+) -> None:
+    structure = element.attrib.get(_STRUCTURE)
+    style = element.attrib.get(_STYLE)
+    style_attr = f' style="{html_mod.escape(style)}"' if style else ""
+
+    if structure == "lim":
+        text = _normalize(_all_text(element))
+        if text:
+            out.append(html_mod.escape(text) + " ")
+        return
+
+    if structure in _STRUCTURE_TO_TAG:
+        tag = _STRUCTURE_TO_TAG[structure]
+    else:
+        tag = _fallback_tag(element, parent_structure)
+
+    indent = "  " * depth
+    child_indent = "  " * (depth + 1)
+    is_block = tag in _BLOCK_TAGS
+    child_depth = depth + 1 if is_block else depth
+
+    if is_block:
+        out.append(f"\n{indent}<{tag}{style_attr}>")
+    else:
+        out.append(f"<{tag}{style_attr}>")
+
+    if element.text:
+        text = _normalize(element.text)
+        if text:
+            if is_block:
+                out.append(f"\n{child_indent}{html_mod.escape(text)}")
+            else:
+                out.append(html_mod.escape(text))
+
+    for child in element:
+        child_structure = child.attrib.get(_STRUCTURE)
+        _render_element(child, out, parent_structure=structure, depth=child_depth)
+        if child.tail:
+            tail = _normalize(child.tail)
+            if tail:
+                # After a lim, keep tail inline — it's part of the same text flow.
+                if is_block and child_structure != "lim":
+                    out.append(f"\n{child_indent}{html_mod.escape(tail)}")
+                else:
+                    out.append(html_mod.escape(tail))
+
+    if is_block:
+        out.append(f"\n{indent}</{tag}>")
+    else:
+        out.append(f"</{tag}>")
+
+
+def _to_html(source: str) -> str:
+    for prefix, uri in re.findall(r'xmlns:(\w+)="([^"]+)"', source):
+        ET.register_namespace(prefix, uri)
+
+    root = ET.fromstring(source)
+
+    parts: list[str] = []
+    parts.append(
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "<head>\n"
+        "<meta charset='utf-8'>\n"
+        "<style>\n"
+        "  html { background: #f0f0f0; }\n"
+        "  body { font-family: 'Palatino Linotype', Palatino, Georgia, serif;"
+        " font-size: 15px; line-height: 1.75;"
+        " max-width: 900px; margin: 40px auto; padding: 50px 70px;"
+        " color: #1a1a1a; background: #ffffff;"
+        " box-shadow: 0 4px 32px rgba(0,0,0,0.12); }\n"
+        "  section { margin: 2em 0; padding-left: 16px;"
+        " border-left: 4px solid #3dba6f; }\n"
+        "  header { font-weight: bold; color: #1f7a45;"
+        " margin-bottom: 0.5em; letter-spacing: 0.04em;"
+        " text-transform: uppercase; font-size: 0.9em; }\n"
+        "  table { border-collapse: collapse; width: 100%; margin: 1.2em 0; }\n"
+        "  td, th { border: 1px solid #d0e8d8; padding: 7px 14px; vertical-align: top; }\n"
+        "  tr:first-child td { background: #1f7a45; color: #fff; font-weight: bold; }\n"
+        "  tr:nth-child(even) td { background: #f4fbf7; }\n"
+        "  ol, ul { margin: 0.5em 0; padding-left: 2em; }\n"
+        "  li { margin: 0.3em 0; }\n"
+        "  p { margin: 0.5em 0; }\n"
+        "  div { margin: 0.4em 0; }\n"
+        "</style>\n"
+        "</head>\n"
+        "<body>\n"
+    )
+    _render_element(root, parts)
+    parts.append("\n</body>\n</html>\n")
+    return "".join(parts)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Render a DGML XML file as HTML.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "input",
+        metavar="INPUT",
+        help="DGML XML file to render, or '-' to read from stdin.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="Write output to FILE instead of stdout.",
+    )
+    args = parser.parse_args()
+
+    if args.input == "-":
+        source = sys.stdin.read()
+    else:
+        path = Path(args.input)
+        if not path.exists():
+            print(f"dgml2html: file not found: {args.input}", file=sys.stderr)
+            sys.exit(1)
+        source = path.read_text(encoding="utf-8")
+
+    try:
+        result = _to_html(source)
+    except ET.ParseError as exc:
+        print(f"dgml2html: XML parse error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        Path(args.output).write_text(result, encoding="utf-8")
+    else:
+        sys.stdout.write(result)
+
+
+if __name__ == "__main__":
+    main()

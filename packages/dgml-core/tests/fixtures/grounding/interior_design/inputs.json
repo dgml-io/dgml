@@ -1,0 +1,1459 @@
+{
+  "label": "Interior Design, BAA \u2014 Bellevue College program of study (public)",
+  "source": {
+    "docset_id": "p9pjusnwg50l",
+    "file_id": "kxlv1o15powg",
+    "filename": "Program of Study_ Interior Design, BAA - Bellevue College - Acalog ACMS.pdf",
+    "text_mode": "ocr",
+    "page_count": 5
+  },
+  "layout": null,
+  "phase1": {
+    "learning_outcomes": [
+      {
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ],
+        "text": "Apply fundamental and essential interior design principles and practices."
+      },
+      {
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ],
+        "text": "Recognize the implications of globalization on design practices and understand how social, political and physical influences shape the design of built environments."
+      },
+      {
+        "text": "Utilize the principles of lighting, acoustics, thermal comfort and indoor air quality to enhance building performance and improve social and environmental well-being.",
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ]
+      },
+      {
+        "text": "Select and specify furniture, fixtures, equipment and finish materials on the basis of their properties and performance criteria, including environmental attributes, maintenance, installation, and life cycle cost.",
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ]
+      },
+      {
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ],
+        "text": "Apply ethical and accepted standards of practice for project management, project communication, and project delivery."
+      },
+      {
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ],
+        "text": "Engage in multi-disciplinary teams representing a variety of collaborative and consensus building activities and professional perspectives."
+      },
+      {
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ],
+        "text": "Understand the laws, codes, standards, and guidelines that impact the design of interior spaces and protect human and environmental wellbeing."
+      },
+      {
+        "text": "Appraise the job market, create a search strategy and professional portfolio; leverage internship experience for career success; earn experience necessary to qualify for NCIDQ certification.",
+        "locations": [
+          {
+            "page_number": 1
+          }
+        ]
+      }
+    ],
+    "catalog_year": {
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ],
+      "text": "2022-23 Catalog"
+    },
+    "general_degree_requirements": [
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "Complete a total of at least 191 applicable college-level quarter credits (including the lower-division general education and core course requirements)"
+      },
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "Earn a C (2.0) or better in all required upper-division core courses"
+      },
+      {
+        "text": "Earn a cumulative GPA of 2.0 for all coursework applied to the degree, including credits transferred from other colleges",
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ]
+      },
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "Complete at least 45 quarter credits for the degree in residence at BC, of which 30 credits must be upper-division"
+      }
+    ],
+    "curriculum_structure": [
+      {
+        "group_name": {
+          "text": "GENERAL EDUCATION - AA REQUIREMENTS",
+          "locations": [
+            {
+              "page_number": 2
+            }
+          ]
+        },
+        "credits_required": {
+          "locations": [
+            {
+              "page_number": 2
+            }
+          ],
+          "text": "25 CREDITS"
+        },
+        "courses": [
+          {
+            "course_code": {
+              "text": "ENGL& 101",
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ]
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "English Composition I"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "text": "Survey of Environmental Science",
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ]
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "ENVS& 100"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "ENVS 105"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "The Science of Sustainable Living"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "Modern Architecture and Design"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "5 CR"
+            },
+            "course_code": {
+              "text": "ART 101",
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ]
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "INDES 255"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "Seminar in Built Environments: Global Context"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 3
+                }
+              ],
+              "text": "5 CR"
+            }
+          }
+        ],
+        "instructions": {
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ],
+          "text": "Students pursuing the BAA in Interior Design must complete all AA general education requirements, or approved transfer sub stitutions. In some cases, AA course requirements are prerequisites for BAA course requirements. Students can choose general education courses in some categories, while others are restricted to the courses listed."
+        }
+      },
+      {
+        "credits_required": {
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ],
+          "text": "25-26 CREDITS"
+        },
+        "group_name": {
+          "text": "GENERAL EDUCATION - BAA REQUIREMENTS",
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ]
+        },
+        "instructions": {
+          "text": "Students pursuing the BAA in Interior Design must complete all AA general education requirements, or approved transfer sub stitutions. In some cases, AA course requirements are prerequisites for BAA course requirements. Students can choose general education courses in some categories, while others are restricted to the courses listed.",
+          "locations": [
+            {
+              "page_number": 3
+            }
+          ]
+        },
+        "courses": [
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "ENGL 201"
+            },
+            "course_title": {
+              "text": "The Research Paper",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "ENGL& 235"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Technical Writing"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_title": {
+              "text": "Field & Laboratory Environmental Science",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5-6 CR"
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "ENVS 207"
+            }
+          },
+          {
+            "course_title": {
+              "text": "Light and Color",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5-6 CR"
+            },
+            "course_code": {
+              "text": "PHYS 105",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "CMST 350"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Professional Communication for the Designer"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "text": "Designing a Just and Sustainable Future",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            },
+            "course_code": {
+              "text": "INDES 201",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "group_name": {
+          "text": "LOWER-DIVISION CORE COURSEWORK",
+          "locations": [
+            {
+              "page_number": 4
+            }
+          ]
+        },
+        "credits_required": {
+          "locations": [
+            {
+              "page_number": 4
+            }
+          ],
+          "text": "75 CREDITS"
+        },
+        "courses": [
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Two-Dimensional Design"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "ART 110*"
+            }
+          },
+          {
+            "course_title": {
+              "text": "Design Color",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            },
+            "course_code": {
+              "text": "ART 111*",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Three-Dimensional Design"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            },
+            "course_code": {
+              "text": "ART 112*",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_code": {
+              "text": "ART 120*",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_title": {
+              "text": "Drawing I",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_code": {
+              "text": "INDES 140",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Introduction to Interior Design"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "SketchUp"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 169"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 171"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Interior Design Studio I"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 172"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Interior Design Studio II"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 220"
+            },
+            "course_title": {
+              "text": "Design Drawing",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "text": "Interior Materials & Sources",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            },
+            "course_code": {
+              "text": "INDES 242",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 267"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Design Presentation"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_code": {
+              "text": "INDES 273",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_title": {
+              "text": "Interior Design Studio III",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_title": {
+              "text": "Introduction to Revit",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 262"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 265"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Design Illustration"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Contract Documents"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_code": {
+              "text": "INDES 280",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          }
+        ],
+        "instructions": {
+          "locations": [
+            {
+              "page_number": 4
+            }
+          ],
+          "text": "Core courses develop discipline-specific knowledge, skills, and abilities. Students must achieve a minimum grade as listed be low in order to satisfy degree or prerequisite requirements. Many of these courses have prerequisites or follow a restricted sequence. NOTE: Students must complete the lower-division core courses listed below, or foundational transfer courses in Interior Design, Architecture, Design, or Art, and earn a C- or better in each course."
+        }
+      },
+      {
+        "courses": [
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "ART 108"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Introduction to Hand and Power Tools"
+            },
+            "credits": {
+              "text": "2 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "Interior Design Theory"
+            },
+            "credits": {
+              "text": "3 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 340"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "INDES 350"
+            },
+            "course_title": {
+              "text": "History of Interiors & Furniture",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_code": {
+              "text": "INDES 351",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "course_title": {
+              "text": "Modern Interiors & Furniture",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 4
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "Design & Fabrication"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "3 CR"
+            },
+            "course_code": {
+              "text": "INDES 352",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "Interior Building Systems"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "INDES 390"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "INDES 391"
+            },
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "Lighting for Interiors"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "Professional Practices & Principles"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "course_code": {
+              "text": "INDES 480",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            }
+          }
+        ],
+        "credits_required": {
+          "text": "65 CREDITS",
+          "locations": [
+            {
+              "page_number": 4
+            }
+          ]
+        },
+        "group_name": {
+          "text": "UPPER-DIVISION CORE COURSEWORK",
+          "locations": [
+            {
+              "page_number": 4
+            }
+          ]
+        }
+      },
+      {
+        "group_name": {
+          "locations": [
+            {
+              "page_number": 5
+            }
+          ],
+          "text": "Selective Admission Studio Sequence"
+        },
+        "courses": [
+          {
+            "course_code": {
+              "text": "INDES 380",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "course_title": {
+              "text": "Interior Design Studio 4",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "Interior Design Studio 5"
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "INDES 381"
+            }
+          },
+          {
+            "course_code": {
+              "text": "INDES 382",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "course_title": {
+              "text": "Interior Design Studio 6",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "5 CR"
+            }
+          },
+          {
+            "course_title": {
+              "text": "Design Research",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "credits": {
+              "text": "5 CR",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "INDES 440"
+            }
+          },
+          {
+            "course_title": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "Capstone Design Studio 1"
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "5 CR"
+            },
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "INDES 471"
+            }
+          },
+          {
+            "course_code": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "INDES 472"
+            },
+            "course_title": {
+              "text": "Capstone Design Studio 2",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "5 CR"
+            }
+          }
+        ],
+        "instructions": {
+          "locations": [
+            {
+              "page_number": 5
+            }
+          ],
+          "text": "Selective admission to upper-division studio sequence is by application and portfolio review. Students must successfully complete all lower-division core coursework, or foundational transfer courses in Interior Design, Architecture, Design, or Art, before beginning this upper-division studio sequence. NOTE: INDES 370, 371, or 372 are acceptable substitutions for INDES 380, 381 or 382."
+        }
+      },
+      {
+        "instructions": {
+          "text": "Students must complete a 100-hour supervised, interior design-related internship or other practice-based learning experience.",
+          "locations": [
+            {
+              "page_number": 5
+            }
+          ]
+        },
+        "courses": [
+          {
+            "course_code": {
+              "text": "EXPRL 191",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "course_title": {
+              "text": "Academic Internship Experience",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "credits": {
+              "text": "2 Credits",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            }
+          },
+          {
+            "course_title": {
+              "text": "Academic Internship Experience",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            },
+            "credits": {
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ],
+              "text": "2 Credits"
+            },
+            "course_code": {
+              "text": "INDES 485",
+              "locations": [
+                {
+                  "page_number": 5
+                }
+              ]
+            }
+          }
+        ],
+        "credits_required": {
+          "text": "2 Credits",
+          "locations": [
+            {
+              "page_number": 5
+            }
+          ]
+        },
+        "group_name": {
+          "text": "Practicum Requirement",
+          "locations": [
+            {
+              "page_number": 5
+            }
+          ]
+        }
+      }
+    ],
+    "overview": {
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ],
+      "text": "The Bachelor of Applied Arts in Interior Design (BAA) offers a broadly-based and professionally-relevant curriculum that embraces the responsibility of preparing and inspiring the designers of the future. The BAA program provides a learning environment based on a foundation of holistic, creative problem-solving, and is accredited as a professional level degree by the Council for Interior Design Accreditation (CIDA). The BAA curriculum is a four-year course of study offering a combination of core courses and liberal arts education that help students achieve their particular career goals."
+    },
+    "additional_links": [
+      {
+        "text": "bellevuecollege.edu/interiordesign/apply/baa/",
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ]
+      },
+      {
+        "text": "bellevuecollege.edu/interiordesign/",
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ]
+      }
+    ],
+    "program_type": {
+      "text": "Bachelor of Applied Arts",
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ]
+    },
+    "program_name": {
+      "locations": [
+        {
+          "page_number": 1
+        }
+      ],
+      "text": "Interior Design, BAA"
+    },
+    "total_credits": {
+      "locations": [
+        {
+          "page_number": 5
+        }
+      ],
+      "text": "Grand Total: 190-191 CR"
+    },
+    "application_process": [
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "Complete Bellevue College general admission application form"
+      },
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "Pay admissions and placement fee"
+      },
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "Complete Bachelor of Applied Arts in Interior Design application form"
+      },
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "Check program\u2019s website for more information"
+      },
+      {
+        "locations": [
+          {
+            "page_number": 2
+          }
+        ],
+        "text": "For students planning to transfer credits to Bellevue College, submit official transcripts from regionally accredited college(s) and transfer credit request form to the BC Evaluations Office"
+      }
+    ]
+  }
+}

@@ -1,0 +1,127 @@
+namespace docset = "http://dgml.io/acme-corp/master-services-agreements#"
+
+ContractLevelTag = IndemnificationClause | PaymentTerms | BilledCharges
+ClauseItemTag    = LiabilityCap | EffectiveDate | VendorName
+                 | IndemnifyingParty | IndemnifiedParty
+                 | InvoiceCycle | LatePaymentPenalty
+TableRowTag      = BilledCharge
+TableCellTag     = ProductName | UnitPrice | OrderedQuantity
+InlineTag        = SignatoryName
+
+AnyTag = ContractLevelTag | ClauseItemTag | TableRowTag | TableCellTag | InlineTag
+
+## Indemnification clause section
+IndemnificationClause =
+  element docset:IndemnificationClause {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Payment terms section
+PaymentTerms =
+  element docset:PaymentTerms {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Table of billed charges
+BilledCharges =
+  element docset:BilledCharges {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Agreed maximum liability exposure under the contract
+## Example: $500,000
+LiabilityCap =
+  element docset:LiabilityCap {
+    attribute siblingsShare { "true" },
+    (text | AnyTag)*
+  }
+
+## Effective date of the contract
+## Example: January 1, 2024
+EffectiveDate =
+  element docset:EffectiveDate {
+    attribute siblingsShare { "true" },
+    (text | AnyTag)*
+  }
+
+## Legal name of the vendor party
+## Example: MagicSoft, Inc.
+VendorName =
+  element docset:VendorName {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Party responsible for providing indemnification
+## Example: Vendor
+IndemnifyingParty =
+  element docset:IndemnifyingParty {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Party receiving indemnification protection
+## Example: Client
+IndemnifiedParty =
+  element docset:IndemnifiedParty {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Payment cycle for invoices
+## Example: Net 30
+InvoiceCycle =
+  element docset:InvoiceCycle {
+    attribute siblingsShare { "true" },
+    (text | AnyTag)*
+  }
+
+## Penalty rate applied to late payments
+## Example: 1.5% per month
+LatePaymentPenalty =
+  element docset:LatePaymentPenalty {
+    attribute siblingsShare { "true" },
+    (text | AnyTag)*
+  }
+
+## A single billed charge line item
+BilledCharge =
+  element docset:BilledCharge {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Name of a billed product or service
+## Example: Widget
+ProductName =
+  element docset:ProductName {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }
+
+## Unit price of a billed item
+## Example: $9.95
+UnitPrice =
+  element docset:UnitPrice {
+    attribute siblingsShare { "true" },
+    (text | AnyTag)*
+  }
+
+## Quantity of units ordered
+## Example: 3
+OrderedQuantity =
+  element docset:OrderedQuantity {
+    attribute siblingsShare { "true" },
+    (text | AnyTag)*
+  }
+
+## Name of a signatory
+## Example: Jane Smith
+SignatoryName =
+  element docset:SignatoryName {
+    attribute siblingsShare { "false" },
+    (text | AnyTag)*
+  }

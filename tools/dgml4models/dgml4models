@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""dgml4models — strip spatial and layout attributes from a DGML XML file.
+
+Removes dg:origin, dg:structure, and dg:style attributes before sending
+DGML to a language model. Strips 20-40% of token volume on typical documents
+while preserving all semantic content: element tags, dg:value, xsi:type,
+dg:itemprop, dg:href, xml:id, and text.
+
+Usage:
+    dgml4models input.dgml.xml                  # writes to stdout
+    dgml4models input.dgml.xml -o output.xml    # writes to file
+    cat input.dgml.xml | dgml4models -          # reads from stdin
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+_STRIP_ATTRS = {
+    "dg:origin",
+    "dg:structure",
+    "dg:style",
+}
+
+# Resolve prefixed attribute names to Clark notation once we know the namespace map.
+_DG_NS = "http://dgml.io/ns/dg#"
+
+_STRIP_CLARK = {
+    f"{{{_DG_NS}}}origin",
+    f"{{{_DG_NS}}}structure",
+    f"{{{_DG_NS}}}style",
+}
+
+
+def _strip(element: ET.Element) -> None:
+    """Recursively remove stripped attributes in-place."""
+    for clark in list(element.attrib):
+        if clark in _STRIP_CLARK:
+            del element.attrib[clark]
+    for child in element:
+        _strip(child)
+
+
+def _process(source: str) -> str:
+    """Parse *source* XML string, strip attributes, return serialised XML."""
+    # Register namespaces so round-trip preserves prefixes.
+    # ElementTree drops unknown namespace declarations; parse once to collect them.
+    ET.register_namespace("dg", _DG_NS)
+
+    # Collect all namespace declarations from the raw text before parsing,
+    # so we can re-register them and avoid xmlns:ns0 mangling.
+    import re
+
+    for prefix, uri in re.findall(r'xmlns:(\w+)="([^"]+)"', source):
+        ET.register_namespace(prefix, uri)
+
+    root = ET.fromstring(source)
+    _strip(root)
+
+    # ET.tostring doesn't emit the XML declaration; add it back.
+    body = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    return "<?xml version='1.0' encoding='utf-8'?>\n" + body + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Strip dg:origin, dg:structure, and dg:style from a DGML XML file.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "input",
+        metavar="INPUT",
+        help="DGML XML file to process, or '-' to read from stdin.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="Write output to FILE instead of stdout.",
+    )
+    args = parser.parse_args()
+
+    if args.input == "-":
+        source = sys.stdin.read()
+    else:
+        path = Path(args.input)
+        if not path.exists():
+            print(f"dgml4models: file not found: {args.input}", file=sys.stderr)
+            sys.exit(1)
+        source = path.read_text(encoding="utf-8")
+
+    try:
+        result = _process(source)
+    except ET.ParseError as exc:
+        print(f"dgml4models: XML parse error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        Path(args.output).write_text(result, encoding="utf-8")
+    else:
+        sys.stdout.write(result)
+
+
+if __name__ == "__main__":
+    main()
