@@ -94,11 +94,15 @@ def _convert_element(
     if raw_id is not None:
         node["@id"] = _normalize_id(str(raw_id))
 
-    # dg:itemprop/dg:href on this element → named link property on this node
+    # dg:itemprop/dg:href on this element → named link property on this node.
+    # dg:href may hold more than one id (space-separated) when the property
+    # aggregates several targets; JSON-LD requires a single IRI per "@id", so
+    # multiple targets become a list of link objects instead of one.
     itemprop = elem.attrib.get(_ITEMPROP)
     href = elem.attrib.get(_HREF)
     if itemprop is not None and href is not None:
-        node[itemprop] = {"@id": href}
+        ids = href.split()
+        node[itemprop] = {"@id": ids[0]} if len(ids) == 1 else [{"@id": i} for i in ids]
 
     # attributes — all except id, xml:id, dg:itemprop, dg:href
     skip = {"id", _XML_ID, _ITEMPROP, _HREF}

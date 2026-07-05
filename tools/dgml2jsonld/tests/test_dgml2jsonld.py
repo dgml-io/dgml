@@ -185,6 +185,23 @@ def test_itemprop_href_on_element() -> None:
     assert signatory["children"] == [{"nodeType": "xast:text", "value": "Jane Smith"}]
 
 
+def test_itemprop_href_multi_valued() -> None:
+    result = parse("""\
+        <dg:chunk xmlns:dg="http://dgml.io/ns/dg#"
+                  xmlns:docset="http://dgml.io/x/y#">
+          <docset:QuarterlyRevenue
+              dg:itemprop="aggregates"
+              dg:href="#monthly-1 #monthly-2 #monthly-3">$300,000</docset:QuarterlyRevenue>
+        </dg:chunk>
+    """)
+    quarterly = result["@graph"][0]["children"][0]
+    assert quarterly["aggregates"] == [
+        {"@id": "#monthly-1"},
+        {"@id": "#monthly-2"},
+        {"@id": "#monthly-3"},
+    ]
+
+
 def test_itemprop_href_empty_element() -> None:
     result = parse("""\
         <dg:chunk xmlns:dg="http://dgml.io/ns/dg#"

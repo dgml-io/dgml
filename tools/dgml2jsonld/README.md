@@ -63,6 +63,9 @@ Every XML element becomes a JSON object:
 
 If an element carries both `dg:itemprop` and `dg:href`, those become a named link
 property on the element: `{ "<itemprop_value>": {"@id": "<href_value>"} }`.
+If `dg:href` holds more than one space-separated id (an aggregating property
+with multiple targets), the property becomes a list of link objects instead:
+`{ "<itemprop_value>": [{"@id": "<id_1>"}, {"@id": "<id_2>"}, ...] }`.
 
 The `@context` always includes the `xast:` namespace terms inline — no external fetch required.
 All `xmlns:` declarations on the root element are mapped to `@context` prefix entries.
