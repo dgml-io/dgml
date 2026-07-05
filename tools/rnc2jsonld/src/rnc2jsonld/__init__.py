@@ -86,31 +86,46 @@ def _group_refs(define_node: Any) -> list[str]:
     return refs
 
 
+def _collect_namespaces(root: Any) -> tuple[dict[str, str], str]:
+    """Collect all declared namespace prefix→URI pairs from the schema.
+
+    Returns (prefix_to_uri, default_prefix). `default_prefix` is the RNC
+    `default namespace` declaration (the docset's own vocabulary — used for
+    meta-schema terms like Tag/TagGroup and for unprefixed element names),
+    falling back to the first plain `namespace` declaration if the schema
+    declares no default.
+    """
+    ns_map: dict[str, str] = {}
+    default_prefix: str | None = None
+    for node in _find(root, "NS", "DEFAULT_NS"):
+        if isinstance(node.value, list) and node.value:
+            ns_map[str(node.name)] = str(node.value[0])
+            if node.type == "DEFAULT_NS" and default_prefix is None:
+                default_prefix = str(node.name)
+    if default_prefix is None and ns_map:
+        default_prefix = next(iter(ns_map))
+    return ns_map, default_prefix or "docset"
+
+
 def rnc_to_jsonld(source: str | Path) -> dict[str, Any]:
     """Parse a DGML schema.rnc and return its JSON-LD representation."""
     text = Path(source).read_text(encoding="utf-8")
     root = rnc2rng.loads(text)
 
-    # Collect namespace prefix and URI from the RNC namespace declaration
-    prefix: str = "docset"
-    ns_uri: str = ""
-    for ns in _find(root, "NS"):
-        if isinstance(ns.value, list) and ns.value:
-            prefix = str(ns.name)
-            ns_uri = str(ns.value[0])
-            break
+    ns_map, p = _collect_namespaces(root)
 
-    p = prefix
-    context: dict[str, Any] = {
-        p: ns_uri,
-        "xsd": "http://www.w3.org/2001/XMLSchema#",
-        "Tag": f"{p}:Tag",
-        "TagGroup": f"{p}:TagGroup",
-        "siblingsShare": {"@id": f"{p}:siblingsShare", "@type": "xsd:boolean"},
-        "members": {"@id": f"{p}:members", "@type": "@id", "@container": "@set"},
-        "description": f"{p}:description",
-        "example": f"{p}:example",
-    }
+    context: dict[str, Any] = dict(ns_map)
+    context.update(
+        {
+            "xsd": "http://www.w3.org/2001/XMLSchema#",
+            "Tag": f"{p}:Tag",
+            "TagGroup": f"{p}:TagGroup",
+            "siblingsShare": {"@id": f"{p}:siblingsShare", "@type": "xsd:boolean"},
+            "members": {"@id": f"{p}:members", "@type": "@id", "@container": "@set"},
+            "description": f"{p}:description",
+            "example": f"{p}:example",
+        }
+    )
 
     graph: list[dict[str, Any]] = []
 
@@ -129,9 +144,12 @@ def rnc_to_jsonld(source: str | Path) -> dict[str, Any]:
                 if share is False
                 else f"{p}:Tag"
             )
-            local = elem_tag.split(":")[-1] if ":" in elem_tag else elem_tag
+            # elem_tag already carries its own namespace prefix (e.g. "dg:chunk"
+            # vs "docset:RentRoll") except when written unprefixed in the RNC,
+            # which means it belongs to the default namespace.
+            elem_id = elem_tag if ":" in elem_tag else f"{p}:{elem_tag}"
             node: dict[str, Any] = {
-                "@id": f"{p}:{local}",
+                "@id": elem_id,
                 "@type": tag_type,
             }
             description, example = _parse_docs(doc_nodes)
