@@ -59,3 +59,4 @@ DGML is an open initiative, and it's still early — the format and the implemen
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+<!-- trigger CLA check for branch protection setup -->
