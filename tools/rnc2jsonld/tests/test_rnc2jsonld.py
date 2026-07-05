@@ -137,7 +137,7 @@ def test_namespace_trailing_hash_normalised() -> None:
 
 
 def test_full_sample_schema() -> None:
-    sample = Path(__file__).parent.parent / "sample.schema.rnc"
+    sample = Path(__file__).parent.parent / "samples" / "sample.schema.rnc"
     result = rnc_to_jsonld(sample)
     tags = [
         n for n in result["@graph"] if n.get("@type") in ("docset:SharedTag", "docset:NonSharedTag")

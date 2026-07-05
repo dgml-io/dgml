@@ -127,12 +127,33 @@ def rnc_to_jsonld(source: str | Path) -> dict[str, Any]:
         }
     )
 
+    defines = _find(root, "DEFINE")
+
+    # A group's REF names point at other DEFINE pattern names (e.g. "dg.chunk"),
+    # which may differ from the element tag those patterns actually resolve to
+    # (e.g. "dg:chunk"). Resolve every DEFINE name to its final @id up front so
+    # group members reference the same @id used for the Tag/TagGroup node.
+    name_to_id: dict[str, str] = {}
+    elem_tags: dict[str, str | None] = {}
+    for define in defines:
+        name = str(define.name)
+        elem_tag = _elem_name(define)
+        elem_tags[name] = elem_tag
+        # elem_tag already carries its own namespace prefix (e.g. "dg:chunk"
+        # vs "docset:RentRoll") except when written unprefixed in the RNC,
+        # which means it belongs to the default namespace.
+        name_to_id[name] = (
+            (elem_tag if ":" in elem_tag else f"{p}:{elem_tag}")
+            if elem_tag is not None
+            else f"{p}:{name}"
+        )
+
     graph: list[dict[str, Any]] = []
 
-    for define in _find(root, "DEFINE"):
+    for define in defines:
         name = str(define.name)
         doc_nodes = _find(define, "DOCUMENTATION")
-        elem_tag = _elem_name(define)
+        elem_tag = elem_tags[name]
 
         if elem_tag is not None:
             # Element definition → Tag node
@@ -144,12 +165,8 @@ def rnc_to_jsonld(source: str | Path) -> dict[str, Any]:
                 if share is False
                 else f"{p}:Tag"
             )
-            # elem_tag already carries its own namespace prefix (e.g. "dg:chunk"
-            # vs "docset:RentRoll") except when written unprefixed in the RNC,
-            # which means it belongs to the default namespace.
-            elem_id = elem_tag if ":" in elem_tag else f"{p}:{elem_tag}"
             node: dict[str, Any] = {
-                "@id": elem_id,
+                "@id": name_to_id[name],
                 "@type": tag_type,
             }
             description, example = _parse_docs(doc_nodes)
@@ -164,9 +181,9 @@ def rnc_to_jsonld(source: str | Path) -> dict[str, Any]:
             if refs:
                 graph.append(
                     {
-                        "@id": f"{p}:{name}",
+                        "@id": name_to_id[name],
                         "@type": f"{p}:TagGroup",
-                        "members": [f"{p}:{r}" for r in refs],
+                        "members": [name_to_id.get(r, f"{p}:{r}") for r in refs],
                     }
                 )
 
