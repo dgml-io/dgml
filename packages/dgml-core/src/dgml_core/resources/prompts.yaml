@@ -2,23 +2,23 @@
 # without touching Python code; fetched by name via dgml_core.prompts.get
 # (the generation pipeline has its own resources/prompts.yaml + loader).
 
-# ── Hybrid text extraction: LLM-driven per-cluster merge ──────────────────────
-# System prompt for reconciling a digital + OCR token cluster. Each paragraph
+# ── Hybrid text extraction: LLM-driven per-region merge ──────────────────────
+# System prompt for reconciling a digital + OCR token region. Each paragraph
 # is one line; blank lines separate paragraphs. Loaded by dgml.hybrid and
 # rstrip()'d, so the trailing newline YAML adds is harmless.
 merge_system_prompt: |
   You reconcile two text extractions of the same scanned page region: DIGITAL (characters read straight from the PDF's embedded fonts) and OCR (characters recognized from the page image). Each is a list of word tokens; every token has a unique id and is meant to be exactly one word.
 
-  For each cluster you are given, return the best final list of word tokens. Rules, in priority order:
+  For each region you are given, return the best final list of word tokens. Rules, in priority order:
 
   1. Match the intended word boundaries. Each token should be one word as written on the page -- follow the spacing the author used, not dictionary morphology. If one side ran two space-separated words together into a single token (e.g. `outof` -> `out` `of`), prefer the side that splits them. But do NOT split a token that is legitimately a single word even though it fuses parts: brand and product names, and CamelCase or run-together identifiers (e.g. `PayPal`, `SharePoint`, `eBay`, `AccessControl`), stay as one token.
   2. Ligatures. If one side encodes a ligature as a single glyph (fi, fl, ff, ffi, ffl, ... shown as one character) inside a word and the other spells it with separate letters, output the separated-letter form.
   3. Keep whole words, not fragments. If one side has shattered a word into pieces that are not themselves words -- one token per letter, or arbitrary splits like `INFOR` `MATION` -- while the other side keeps it as a single real word, favor the side whose tokens are real words (e.g. digital `F` `L` `I` `G` `H` `T` vs OCR `FLIGHT` -> keep `FLIGHT`). A token that is a lone letter or a non-word fragment is the signal of over-splitting.
   4. Otherwise prefer DIGITAL characters when both sides spell the same word -- digital comes from the font and is more reliable than OCR.
 
-  Every cluster has both a DIGITAL and an OCR side (clusters where one side is missing are resolved without you).
+  Every region has both a DIGITAL and an OCR side (regions where one side is missing are resolved without you).
 
-  Output: each final token must set `ref` to an input token id (it inherits that token's position on the page). Set `t` only when the correct text differs from that referenced token's own text (e.g. de-ligaturing, or recombining split pieces); omit `t` to use the referenced token's text unchanged. Emit tokens in natural reading order. Return only a JSON object mapping each cluster id to its list of output tokens, e.g. {"c0": [{"ref": "d0", "t": "file"}], "c1": [{"ref": "o3"}, {"ref": "o4"}]}.
+  Output: each final token must set `ref` to an input token id (it inherits that token's position on the page). Set `t` only when the correct text differs from that referenced token's own text (e.g. de-ligaturing, or recombining split pieces); omit `t` to use the referenced token's text unchanged. Emit tokens in natural reading order. Return only a JSON object mapping each region id to its list of output tokens, e.g. {"r0": [{"ref": "d0", "t": "file"}], "r1": [{"ref": "o3"}, {"ref": "o4"}]}.
 
 # ── Grounded extraction: schema generation ────────────────────────────────────
 # System + user prompts for proposing a grounded_field JSON Schema from sample
