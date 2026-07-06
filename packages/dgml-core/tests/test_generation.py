@@ -281,7 +281,7 @@ def test_render_dgml_value_heading_names_header_not_section() -> None:
     from dgml_core.generation.to_semantic import render_dgml
 
     seq = [_b("heading", "b1", text="Acme Pty Ltd", level=1, value_concept="SupplierName")]
-    out = render_dgml(seq, header="<dg:chunk>", shared_concepts=frozenset({"SupplierName"}))
+    out = render_dgml(seq, header="<dg:chunk>")
     assert '<dg:chunk dg:structure="section">' in out
     assert '<docset:SupplierName dg:structure="header">Acme Pty Ltd</docset:SupplierName>' in out
 
@@ -449,9 +449,12 @@ def test_cache_write_gates_on_debug_flag(tmp_path: Path) -> None:
     assert (tmp_path / "functional.json").exists()
 
 
-def test_convert_batch_prior_docs_drive_shared_namespacing(
+def test_convert_batch_concepts_always_docset_namespaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Every concept is docset:-namespaced regardless of how many docs use it,
+    and adding a doc never flips a prior doc's namespaces — so nothing semantic
+    lands in dg: and unchanged priors aren't re-rendered."""
     from dgml_core.generation import pipeline as pl
     from dgml_core.generation.to_semantic import render_dgml
 
@@ -471,10 +474,11 @@ def test_convert_batch_prior_docs_drive_shared_namespacing(
         Block(id="p1", structure="p", text="y", concept="Shared"),
         Block(id="p2", structure="p", text="z", concept="OnlyOld"),
     ]
-    # Old render was made when "Shared" lived in one doc only → dg:Shared.
-    prior_outputs = {
-        "old.pdf": render_dgml(prior, header="<dg:chunk>", shared_concepts=frozenset())
-    }
+    # A concept seen in a single document is still docset:, never dg:.
+    prior_outputs = {"old.pdf": render_dgml(prior, header="<dg:chunk>")}
+    assert "docset:Shared" in prior_outputs["old.pdf"]
+    assert "docset:OnlyOld" in prior_outputs["old.pdf"]
+    assert "dg:OnlyOld" not in prior_outputs["old.pdf"]  # nothing semantic in dg:
 
     seen: dict[str, str] = {}
     pl.convert_batch(
@@ -484,11 +488,10 @@ def test_convert_batch_prior_docs_drive_shared_namespacing(
         prior_docs={"old.pdf": prior},
         prior_outputs=prior_outputs,
     )
-    # "Shared" now appears in 2 docs → promoted to docset:; both docs reflect it.
+    # New doc's concept is docset:; the prior doc is NOT re-rendered because
+    # a second occurrence of "Shared" no longer flips any prefix.
     assert "docset:Shared" in seen["new.pdf"]
-    assert "old.pdf" in seen  # prior re-rendered because its namespacing flipped
-    assert "docset:Shared" in seen["old.pdf"]
-    assert "dg:OnlyOld" in seen["old.pdf"]  # single-doc concept stays dg:
+    assert "old.pdf" not in seen
 
 
 def test_plan_concept_roster_caps_to_largest_docs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -792,21 +795,6 @@ def test_skeleton_listing_includes_first_paragraph_after_heading() -> None:
 # ── final dgml conversion (render_dgml) ──────────────────────────────────────
 
 
-def test_collect_shared_concepts_two_doc_threshold() -> None:
-    from dgml_core.generation.to_semantic import collect_shared_concepts
-
-    docs = {
-        "a": [
-            _b("p", "b1", concept="PaymentTerms", text="x"),
-            _b("p", "b2", concept="OnlyA", text="y"),
-        ],
-        "b": [_b("p", "b1", concept="PaymentTerms", text="z")],
-    }
-    shared = collect_shared_concepts(docs)
-    assert "PaymentTerms" in shared  # in 2 docs → docset
-    assert "OnlyA" not in shared  # in 1 doc → dg
-
-
 def test_render_dgml_namespacing_no_hx_and_typing() -> None:
     from dgml_core.generation.to_semantic import render_dgml
 
@@ -821,7 +809,7 @@ def test_render_dgml_namespacing_no_hx_and_typing() -> None:
         _b("p", "b3", text="connective prose, unlabeled"),
         _b("item", "b4", text="first rule", lim="(a)"),
     ]
-    out = render_dgml(seq, header="<dg:chunk>", shared_concepts=frozenset({"ChargesTerms"}))
+    out = render_dgml(seq, header="<dg:chunk>")
     # well-formed once the placeholder header declares the prefixes
     etree.fromstring(
         out.encode().replace(
@@ -830,15 +818,17 @@ def test_render_dgml_namespacing_no_hx_and_typing() -> None:
     )
     # no depth-based hx anywhere
     assert 'dg:structure="h1"' not in out and 'dg:structure="h2"' not in out
-    # shared concept → docset:, real structural type in `dg:structure`
+    # concept → docset:, real structural type in `dg:structure`
     assert '<docset:ChargesTerms dg:structure="section">' in out
     # unlabeled scaffolding → dg:chunk with its real type
     assert '<dg:chunk dg:structure="header">' in out
     assert '<dg:chunk dg:structure="p">connective prose' in out
     assert '<dg:chunk dg:structure="ol">' in out and '<dg:chunk dg:structure="li">' in out
     assert '<dg:chunk dg:structure="lim">(a)</dg:chunk>' in out
-    # single-doc concept → dg:, with value typing on the date entity
-    assert '<dg:DueDate xsi:type="date" dg:value="2025-07-01">1 July 2025</dg:DueDate>' in out
+    # every concept → docset:, even a single-doc one, with value typing on the date
+    assert (
+        '<docset:DueDate xsi:type="date" dg:value="2025-07-01">1 July 2025</docset:DueDate>' in out
+    )
     # envelope
     assert out.startswith("<?xml version='1.0' encoding='utf-8'?>\n<dg:chunk")
     assert out.rstrip().endswith("</dg:chunk>")
@@ -998,8 +988,7 @@ def test_render_dgml_record_table_names_table_and_columns() -> None:
             cell_concepts=["ItemName", "ItemPrice"],
         ),
     ]
-    shared = frozenset({"EquipmentSchedule", "Equipment", "ItemName", "ItemPrice"})
-    out = render_dgml(rows, header="<dg:chunk>", shared_concepts=shared)
+    out = render_dgml(rows, header="<dg:chunk>")
     assert '<docset:EquipmentSchedule dg:structure="table">' in out
     assert '<docset:Equipment dg:structure="tr">' in out
     # concept-tagged cells still carry the td layout role (HTML-render contract)
@@ -1167,8 +1156,7 @@ def test_render_dgml_entity_container_wraps_leaves() -> None:
         Block(id="b3", structure="p", text="unrelated body text", concept=""),
     ]
     pm = {"PartyOrganizationName": "PartyInformation", "PartyAddress": "PartyInformation"}
-    shared = frozenset({"PartyOrganizationName", "PartyAddress"})
-    out = render_dgml(blocks, header="<dg:chunk>", shared_concepts=shared, parent_map=pm)
+    out = render_dgml(blocks, header="<dg:chunk>", parent_map=pm)
     assert '<docset:PartyInformation dg:structure="section">' in out
     inner = out[out.index("<docset:PartyInformation") : out.index("</docset:PartyInformation>")]
     assert "<docset:PartyOrganizationName" in inner
@@ -1205,8 +1193,7 @@ def test_entity_quote_matching_lim_tags_the_lim() -> None:
     assert b.entities == []  # no inline span — the value lives in the lim
     assert not any("not found verbatim" in w for w in warnings)
 
-    shared = frozenset({"TravelDay", "TravelDayDate"})
-    out = render_dgml([b], header="<dg:chunk>", shared_concepts=shared)
+    out = render_dgml([b], header="<dg:chunk>")
     assert '<docset:TravelDayDate dg:structure="lim">JAN 05</docset:TravelDayDate>' in out
 
 
@@ -1256,8 +1243,7 @@ def test_column_propagation_never_buries_cell_entity_evidence() -> None:
     propagate_table_consistency(rows)
     assert rows[0].cell_concepts[0] == "Amount"
     assert rows[2].cell_concepts[0] == ""  # entity evidence preserved the slot
-    shared = frozenset({"Amount", "RegionCode"})
-    out = render_dgml(rows, header="<dg:chunk>", shared_concepts=shared)
+    out = render_dgml(rows, header="<dg:chunk>")
     assert '<docset:RegionCode dg:structure="td">ZZ</docset:RegionCode>' in out
 
 
@@ -1281,8 +1267,7 @@ def test_count_matched_row_keeps_positional_and_partial_entities() -> None:
     assert [s.concept for s in b.cell_entities[0]] == ["SeatCount"]
     assert b.cell_entities[1] == []  # whole-cell span: positional wins
 
-    shared = frozenset({"ProductName", "LinePrice", "SeatCount", "OriginalPrice"})
-    out = render_dgml([b], header="<dg:chunk>", shared_concepts=shared)
+    out = render_dgml([b], header="<dg:chunk>")
     # positional tag kept on the split cell, sub-value wrapped inside it
     assert '<docset:ProductName dg:structure="td">' in out
     assert "<docset:SeatCount>25 seats</docset:SeatCount>" in out
@@ -1314,8 +1299,7 @@ def test_field_secondary_entities_render_inside_value() -> None:
     assert [s.concept for s in b.entities] == ["OrganizationName"]
     assert b.concept == "LicenseNumber"
 
-    shared = frozenset({"LicenseNumber", "OrganizationName"})
-    out = render_dgml([b], header="<dg:chunk>", shared_concepts=shared)
+    out = render_dgml([b], header="<dg:chunk>")
     assert "<docset:LicenseNumber>No. 0000 - " in out.replace("\n", "")
     assert "<docset:OrganizationName>Sample Org LLC</docset:OrganizationName>" in out
 
@@ -1339,8 +1323,7 @@ def test_field_label_entities_render_inside_label() -> None:
     assert [s.concept for s in b.label_entities] == ["LicenseCode", "OrganizationName"]
     assert b.entities == []  # value empty — nothing resolved there
 
-    shared = frozenset({"LicenseCode", "OrganizationName"})
-    out = render_dgml([b], header="<dg:chunk>", shared_concepts=shared)
+    out = render_dgml([b], header="<dg:chunk>")
     assert "<docset:LicenseCode" in out and ">0000</docset:LicenseCode>" in out
     assert "<docset:OrganizationName>Sample Org LLC</docset:OrganizationName>" in out
 

@@ -351,10 +351,12 @@ deterministic. There is no separate transform pass.
 resume below), so adding a document and re-running generates only the new one.
 To keep its tags consistent with the existing docset, the new document is
 labeled seeded with the docset's existing `cache/concept_roster.json` (default;
-disable with `--no-roster`). The `docset:`/`dg:` namespacing is recomputed over
-the whole docset, so any already-generated file whose namespacing changes (a
-concept it shares was promoted to `docset:`) is deterministically re-rendered —
-no re-transcription or re-labeling. These show up in the top-level `rerendered` list.
+disable with `--no-roster`). Every concept is emitted in the per-docset
+`docset:` vocabulary namespace (`dg:` is framework-only), so growing the docset
+never flips a tag's prefix. An already-generated file is still re-rendered
+deterministically when its output changes as the docset's schema/roster grows
+(e.g. entity-container grouping) — no re-transcription or re-labeling. These
+show up in the top-level `rerendered` list.
 
 Output always goes to the docset directory in the workspace
 (`<workspace>/docsets/<docset-id>/`) — there is no output-directory flag,

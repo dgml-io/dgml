@@ -75,11 +75,10 @@ def _scan_dgml(xml_paths: Sequence[Path]) -> _Observed:
             ns = el.tag.rsplit("}", 1)[0].lstrip("{") if "}" in el.tag else ""
             if "dgml.io" in ns and ns != DG_NS:
                 obs.docset_ns = obs.docset_ns or ns
-            # Concept elements live in the docset: namespace when shared by >=2
-            # docs, and in dg: when private to one (dg:chunk is scaffolding).
-            is_concept = (ns == obs.docset_ns and bool(obs.docset_ns)) or (
-                ns == DG_NS and _local(el.tag) != "chunk"
-            )
+            # Every concept lives in the docset: namespace. dg: is framework-only
+            # (the dg:chunk scaffolding element + dg:* attributes), so a concept
+            # is simply any element in the docset namespace.
+            is_concept = ns == obs.docset_ns and bool(obs.docset_ns)
             if not is_concept:
                 continue
             name = _local(el.tag)
@@ -154,13 +153,14 @@ def build_rnc(
     w("# --- generic structural chunk (unlabeled scaffolding) ----------------")
     w("dg.chunk = element dg:chunk { common.atts, mixed { any.docset* } }")
     w("")
-    w("# a concept private to ONE document renders in the dg: namespace instead")
-    w("# of docset: (the shared-tag rule) — same shape, unshared vocabulary")
-    w("dg.private = element dg:* { common.atts, mixed { any.docset* } }")
+    w("# a docset concept with no individual definition below — a rare/one-off")
+    w("# tag, or one coined during labeling that isn't in schema.json yet. It")
+    w("# stays in the docset vocabulary; nothing semantic is ever emitted in dg:.")
+    w("docset.other = element docset:* { common.atts, mixed { any.docset* } }")
     w("")
     w("# any docset element may appear where structure allows it")
     w("any.docset = dg.chunk")
-    w("  | dg.private")
+    w("  | docset.other")
     for n in names:
         w(f"  | {n}")
     w("")

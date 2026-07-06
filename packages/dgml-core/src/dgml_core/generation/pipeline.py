@@ -32,7 +32,6 @@ from dgml_core.generation.label import (
 )
 from dgml_core.generation.render import render_xml
 from dgml_core.generation.to_semantic import (
-    collect_shared_concepts,
     render_dgml,
     render_semantic_xml,
 )
@@ -160,9 +159,10 @@ def convert_batch(
     failed document, serially, after the (possibly concurrent) transcription
     pass — so the callback need not be thread-safe.
 
-    *prior_docs* (already-generated docs from cache) join the shared-concept
-    count so namespacing spans the whole docset; any whose render changes is
-    re-emitted via *on_output* (skipped if unchanged per *prior_outputs*).
+    *prior_docs* (already-generated docs from cache) are re-rendered so the
+    whole docset stays consistent as its schema/roster grows; any whose render
+    changes is re-emitted via *on_output* (skipped if unchanged per
+    *prior_outputs*).
     """
     opts = options
     log = opts.progress or (lambda _m: None)
@@ -229,10 +229,6 @@ def convert_batch(
             roster_seed=opts.roster_seed,
         )
 
-    shared = (
-        collect_shared_concepts({**(prior_docs or {}), **docs}) if opts.dgml_header else frozenset()
-    )
-
     outputs: dict[str, str] = {}
     for name, blocks in docs.items():
         # With dgml_header set, the product output is the final dg:chunk dgml
@@ -241,9 +237,7 @@ def convert_batch(
         # (library/test shape). The compact concept render and the
         # structure-attribute XML are kept as debug artifacts in the cache.
         if opts.dgml_header:
-            xml = render_dgml(
-                blocks, header=opts.dgml_header, shared_concepts=shared, parent_map=opts.parent_map
-            )
+            xml = render_dgml(blocks, header=opts.dgml_header, parent_map=opts.parent_map)
         else:
             xml = render_semantic_xml(blocks)
         # Stream to the sink (freed immediately) or accumulate for the return.
@@ -263,14 +257,16 @@ def convert_batch(
                 render_semantic_xml(blocks), encoding="utf-8"
             )
 
-    # Re-render prior docs whose namespacing flipped; emit only the changed.
+    # Re-render prior docs whose rendered XML changed and emit only those. All
+    # concepts are docset:-namespaced, so sharing no longer shifts prefixes; a
+    # prior render still changes when entity-container grouping moves as the
+    # docset's schema/roster grows (or, once, migrating legacy dg:-namespaced
+    # concepts to docset:).
     if prior_docs and opts.dgml_header and on_output is not None:
         for name, blocks in prior_docs.items():
-            xml = render_dgml(
-                blocks, header=opts.dgml_header, shared_concepts=shared, parent_map=opts.parent_map
-            )
+            xml = render_dgml(blocks, header=opts.dgml_header, parent_map=opts.parent_map)
             if prior_outputs is not None and prior_outputs.get(name) == xml:
                 continue
-            log(f"re-rendering {name} (docset namespacing changed)")
+            log(f"re-rendering {name} (docset render changed)")
             on_output(name, xml)
     return outputs
