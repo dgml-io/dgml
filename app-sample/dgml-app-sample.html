@@ -1,0 +1,2542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>dgml-app-sample</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #app { height: 100%; }
+    body { font-family: 'Inter', sans-serif; font-size: 14px; color: #111827; background: #fff; -webkit-font-smoothing: antialiased; }
+    button { cursor: pointer; background: none; border: none; font: inherit; }
+    input, select, textarea { font: inherit; }
+    pre { font-family: 'Courier New', Courier, monospace; }
+
+    :root {
+      --dg-50:#f0fdf4; --dg-100:#dcfce7; --dg-200:#bbf7d0; --dg-300:#86efac;
+      --dg-400:#4ade80; --dg-600:#1e7444; --dg-700:#15803d; --dg-800:#166534;
+    }
+
+    /* ── App shell ───────────────────────────────────────────── */
+    #app { display: flex; flex-direction: column; overflow: hidden; }
+    #app-body { display: flex; min-height: 0; flex: 1; overflow: hidden; }
+    #main-content { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+
+    /* ── Header ──────────────────────────────────────────────── */
+    #app-header {
+      height: 48px; flex-shrink: 0; display: flex; align-items: center;
+      justify-content: space-between; padding: 0 16px; gap: 12px;
+      background: var(--dg-600); border-bottom: 1px solid var(--dg-700);
+      box-shadow: 0 1px 3px rgba(0,0,0,.15);
+    }
+    .hdr-logo { display: flex; align-items: center; gap: 8px; }
+    .hdr-logo span { font-size: 14px; font-weight: 700; color: #fff; letter-spacing: -.025em; }
+    .hdr-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .hdr-btn { display: flex; align-items: center; gap: 6px; padding: 4px; border-radius: 4px; font-size: 12px; font-weight: 500; color: #d6f7e3; transition: background .12s, color .12s; white-space: nowrap; }
+    .hdr-btn:hover { background: #28a05e; color: #fff; }
+    .hdr-btn-wide { padding: 4px 8px; }
+    .ws-chip { font-family: monospace; font-size: 12px; color: #d6f7e3; padding: 2px 4px; border-radius: 4px; cursor: pointer; max-width: 560px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: background .12s, color .12s; }
+    .ws-chip:hover { background: #28a05e; color: #fff; }
+    #sample-picker { background: transparent; border: 1px solid rgba(255,255,255,.28); color: #d6f7e3; font-size: 12px; border-radius: 4px; padding: 3px 4px; max-width: 200px; cursor: pointer; }
+    #sample-picker:hover { background: #28a05e; color: #fff; }
+    .dot-amber { width: 6px; height: 6px; border-radius: 50%; background: #fbbf24; flex-shrink: 0; }
+
+    /* ── Sidebar ─────────────────────────────────────────────── */
+    #sidebar { flex-shrink: 0; width: 240px; display: flex; flex-direction: column; border-right: 1px solid #e5e7eb; background: #fff; overflow: hidden; }
+    #sidebar-inner { flex: 1; overflow-y: auto; }
+    #resize-handle { width: 4px; flex-shrink: 0; cursor: col-resize; transition: background .12s; }
+    #resize-handle:hover, #resize-handle.drag { background: var(--dg-300); }
+    .sb-section-lbl { padding: 20px 12px 4px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: #9ca3af; }
+    .sb-ds-group { }
+    .sb-ds-hdr { display: flex; align-items: center; padding-right: 8px; }
+    .sb-ds-toggle { width: 24px; height: 24px; display: grid; place-items: center; flex-shrink: 0; color: #9ca3af; font-size: 14px; line-height: 1; cursor: pointer; transition: color .12s; user-select: none; }
+    .sb-ds-toggle:hover { color: #374151; }
+    .sb-ds-toggle.open { transform: rotate(90deg); }
+    .sb-ds-name { flex: 1; min-width: 0; border-radius: 4px; padding: 4px 4px; font-size: 13px; font-weight: 600; color: #374151; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: color .1s; }
+    .sb-ds-name:hover { color: var(--dg-600); }
+    .sb-ds-name.active { color: var(--dg-600); }
+    .sb-file { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-left: 2px solid transparent; font-size: 13px; color: #4b5563; cursor: pointer; transition: background .1s, color .1s, border-color .1s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sb-file:hover { background: #f9fafb; color: #111827; }
+    .sb-file.active { border-left-color: var(--dg-500, #28a05e); background: #edfbf3; color: #166534; font-weight: 500; }
+    .sb-file svg { flex-shrink: 0; opacity: .5; }
+    .sb-file .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+    /* ── Generic page scaffold ───────────────────────────────── */
+    .page { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    .page-hdr { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid #e5e7eb; flex-shrink: 0; }
+    .page-title { font-size: 16px; font-weight: 600; }
+    .page-body { flex: 1; overflow: auto; padding: 20px; }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    .btn { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; border: none; transition: background .12s; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-primary { background: var(--dg-600); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--dg-700); }
+    .btn-secondary { background: #f3f4f6; color: #374151; border: 1px solid #e5e7eb; }
+    .btn-secondary:hover { background: #e5e7eb; }
+    .btn-sm { padding: 5px 12px; font-size: 13px; }
+
+    /* ── Welcome ─────────────────────────────────────────────── */
+    .welcome-wrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: auto; }
+    .welcome-card { max-width: 480px; text-align: center; padding: 40px; }
+    .welcome-icon { margin: 0 auto 24px; display: flex; align-items: center; justify-content: center; }
+    .welcome-title { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+    .welcome-sub { font-size: 14px; color: #6b7280; margin-bottom: 28px; line-height: 1.6; }
+    .welcome-actions { display: flex; flex-direction: column; gap: 12px; align-items: center; }
+
+    /* ── Card grid ───────────────────────────────────────────── */
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap: 16px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; cursor: pointer; transition: all .15s; }
+    .card:hover { border-color: var(--dg-300); box-shadow: 0 2px 8px rgba(30,116,68,.1); }
+    .card-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; word-break: break-all; }
+    .card-sub { font-size: 12px; color: #6b7280; }
+
+    /* ── File viewer ─────────────────────────────────────────── */
+    .fv-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* toolbar */
+    .fv-toolbar {
+      flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+      padding: 6px 14px; border-bottom: 1px solid #e5e7eb; background: #fff; gap: 8px;
+    }
+    .fv-filename { font-size: 13px; font-weight: 600; color: var(--dg-800); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 300px; }
+    .fv-nav { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+    .nav-btn { padding: 3px 8px; border-radius: 4px; font-size: 12px; color: #6b7280; transition: background .1s; }
+    .nav-btn:hover:not(:disabled) { background: var(--dg-50); color: var(--dg-600); }
+    .nav-btn:disabled { color: #d1d5db; cursor: default; }
+    .nav-sep { width: 1px; height: 16px; background: #e5e7eb; margin: 0 4px; }
+    .nav-count { font-size: 12px; color: #374151; min-width: 56px; text-align: center; tabular-nums: all; }
+    .zoom-label { font-size: 11px; color: #6b7280; min-width: 38px; text-align: center; cursor: pointer; border-radius: 4px; padding: 3px 4px; }
+    .zoom-label:hover { background: var(--dg-50); color: var(--dg-600); }
+
+    /* three-pane body */
+    .fv-body { flex: 1; display: flex; min-height: 0; overflow: hidden; }
+
+    /* page column */
+    .fv-page-col { flex: 1; min-width: 0; overflow: auto; background: #e5e7eb; display: flex; flex-direction: column; align-items: center; padding: 16px; }
+    .page-stage-wrap { background: #fff; border-radius: 4px; box-shadow: 0 2px 12px rgba(0,0,0,.25); position: relative; }
+    .page-stage-wrap img { display: block; width: 100%; }
+    .page-stage-wrap svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+    /* right column */
+    .fv-right-col { flex-shrink: 0; width: 300px; display: flex; flex-direction: column; border-left: 1px solid #e5e7eb; background: #fff; overflow: hidden; }
+    .right-resize-handle { height: 4px; flex-shrink: 0; cursor: row-resize; transition: background .1s; }
+    .right-resize-handle:hover { background: var(--dg-200); }
+
+    /* ── Tag Discovery Panel ─────────────────────────────────── */
+    .tdp { display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; border-bottom: 1px solid #e5e7eb; background: #fff; }
+    .tdp-filters { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 8px 4px; }
+    .tdp-btn {
+      padding: 1px 8px; border-radius: 4px; font-size: 12px; font-weight: 500;
+      border: 1px solid #d1d5db; color: #4b5563; background: #fff; cursor: pointer;
+      transition: background .1s, border-color .1s, color .1s;
+    }
+    .tdp-btn:hover:not(.active) { background: var(--dg-50); color: var(--dg-700); border-color: var(--dg-300); }
+    .tdp-btn.active { background: var(--dg-600); color: #fff; border-color: var(--dg-600); }
+    .tdp-btn.sem.no-key { border: 1px dashed #d1d5db; }
+    .tdp-btn.sem.loading { border: 1px dashed var(--dg-400); animation: border-dash 1s linear infinite; }
+    .tdp-search-wrap { position: relative; padding: 0 8px 4px; }
+    .tdp-search { width: 100%; padding: 2px 22px 2px 8px; border: 1px solid #e5e7eb; border-radius: 4px; font-size: 12px; color: #374151; outline: none; }
+    .tdp-search::placeholder { color: #9ca3af; }
+    .tdp-search:focus { border-color: var(--dg-400); }
+    .tdp-search-ico { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); font-size: 11px; color: var(--dg-600); pointer-events: none; }
+    .tdp-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 8px; max-height: 128px; overflow-y: auto; }
+    .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 4px; font-size: 12px; border: 1px solid #e5e7eb; color: #4b5563; background: #fff; cursor: pointer; transition: background .08s, border-color .08s, color .08s; }
+    .chip:hover { background: var(--dg-50); border-color: var(--dg-300); }
+    .chip.hov { background: var(--dg-50); color: var(--dg-800); border-color: var(--dg-300); }
+    .chip.sel { background: var(--dg-600); color: #fff; border-color: var(--dg-600); }
+    .chip-cnt { font-size: 10px; color: #9ca3af; }
+    .chip.sel .chip-cnt { color: #bbf7d0; }
+    .tdp-empty { font-size: 12px; color: #9ca3af; font-style: italic; padding: 8px; }
+
+    /* ── DGML Tree Panel ─────────────────────────────────────── */
+    .tree-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; background: #fff; }
+    .tree-hdr { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: var(--dg-700); padding: 8px 12px; border-bottom: 1px solid #e5e7eb; background: var(--dg-50); flex-shrink: 0; }
+    .tree-scroll { flex: 1; overflow: auto; padding: 8px 0; font-size: 14px; }
+    .tree-node-wrap { }
+    .tree-node-row { display: flex; align-items: flex-start; }
+    .tree-toggle { width: 20px; flex-shrink: 0; padding: 4px 0; text-align: center; font-size: 10px; color: #9ca3af; user-select: none; cursor: pointer; }
+    .tree-toggle:hover { color: #374151; }
+    .tree-toggle.invisible { visibility: hidden; cursor: default; }
+    .tree-node-btn { display: block; flex: 1; min-width: 0; border-radius: 4px; padding: 4px 6px; text-align: left; cursor: pointer; transition: background .1s; }
+    .tree-node-btn:hover { background: #f3f4f6; }
+    .tree-node-btn.tag-sel { background: #bbf7d0; outline: 1px solid #6dd89a; }
+    .tree-node-btn.tag-hov { background: #edfbf3; outline: 1px solid #a8edbe; }
+    .tree-node-btn.no-boxes { cursor: default; }
+    .tree-tag { font-family: monospace; font-size: 12px; color: var(--dg-600); font-weight: 500; }
+    .tree-preview { margin-left: 8px; font-size: 12px; color: #6b7280; }
+    .tree-placeholder { font-size: 12px; color: #9ca3af; padding: 12px; font-style: italic; }
+
+    /* ── Anchor strip ────────────────────────────────────────── */
+    .anchor-strip { flex-shrink: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 12px; border-top: 1px solid #e5e7eb; background: #fff; min-height: 36px; }
+    .anchor-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #9ca3af; white-space: nowrap; }
+    .anchor-basket { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; align-items: center; min-width: 0; }
+    .basket-empty { font-size: 11px; color: #d1d5db; font-style: italic; }
+    .basket-tag { display: inline-flex; align-items: center; gap: 3px; padding: 2px 6px; border: 1px solid #e5e7eb; border-radius: 4px; font-size: 11px; color: #374151; background: #fff; cursor: pointer; transition: all .1s; }
+    .basket-tag:hover { background: var(--dg-50); border-color: var(--dg-300); }
+    .basket-tag.sel { background: var(--dg-600); color: #fff; border-color: var(--dg-600); }
+    .basket-tag.hov { background: var(--dg-50); color: var(--dg-800); border-color: var(--dg-300); }
+    .basket-rm { color: #9ca3af; font-size: 13px; line-height: 1; }
+    .basket-rm:hover { color: #ef4444; }
+    .anchor-add-btn { padding: 2px 8px; border: 1px solid var(--dg-300); border-radius: 4px; font-size: 11px; font-weight: 500; color: var(--dg-700); transition: background .1s; }
+    .anchor-add-btn:hover { background: var(--dg-50); }
+    .anchor-now-btn { padding: 3px 12px; background: var(--dg-600); color: #fff; border-radius: 4px; font-size: 11px; font-weight: 600; transition: background .1s; }
+    .anchor-now-btn:hover { background: var(--dg-700); }
+    .anchor-history { border-top: 1px solid #f3f4f6; background: #fafafa; padding: 5px 12px; }
+    .anchor-history-hdr { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #9ca3af; margin-bottom: 3px; }
+    .anchor-rec { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #4b5563; margin-bottom: 2px; }
+    .anc-ts { color: #9ca3af; font-size: 10px; white-space: nowrap; flex-shrink: 0; }
+    .anc-chain { background: #e5e7eb; border-radius: 3px; padding: 1px 5px; font-size: 10px; font-weight: 500; color: #374151; flex-shrink: 0; }
+    .anc-tags { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .anc-tx { font-family: monospace; font-size: 10px; color: #9ca3af; flex-shrink: 0; }
+    .anc-verify { border: 1px solid var(--dg-300); border-radius: 3px; padding: 1px 5px; font-size: 10px; font-weight: 500; color: var(--dg-700); white-space: nowrap; flex-shrink: 0; }
+    .anc-verify:hover { background: var(--dg-50); }
+
+    /* ── Setup / Pipeline ────────────────────────────────────── */
+    .setup-tabs { display: flex; border-bottom: 1px solid #e5e7eb; flex-shrink: 0; }
+    .setup-tab { padding: 10px 20px; font-size: 14px; cursor: pointer; border-bottom: 2px solid transparent; color: #6b7280; font-weight: 500; transition: all .15s; }
+    .setup-tab.active { color: var(--dg-600); border-bottom-color: var(--dg-600); }
+    .setup-tab:hover:not(.active) { color: #374151; }
+    .setup-panel { padding: 24px 20px; display: flex; flex-direction: column; gap: 16px; max-width: 640px; overflow-y: auto; flex: 1; }
+    .form-row { display: flex; flex-direction: column; gap: 5px; }
+    .form-label { font-size: 13px; font-weight: 500; color: #374151; }
+    .form-hint { font-size: 12px; color: #9ca3af; }
+    .form-input { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; outline: none; }
+    .form-input:focus { border-color: var(--dg-600); box-shadow: 0 0 0 3px rgba(30,116,68,.1); }
+    .stub-notice { background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px; padding: 12px 14px; color: #92400e; font-size: 12px; line-height: 1.6; }
+    .step-list { display: flex; flex-direction: column; gap: 8px; }
+    .step-item { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+    .step-ico { width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 10px; }
+    .step-ico.pending { background: #f3f4f6; color: #9ca3af; border: 1px solid #e5e7eb; }
+    .step-ico.running { background: var(--dg-100); color: var(--dg-600); border: 1px solid var(--dg-300); animation: spin .8s linear infinite; }
+    .step-ico.done { background: var(--dg-600); color: #fff; }
+    .step-ico.error { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; }
+    .log-box { background: #0f1117; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 11px; line-height: 1.6; color: #d1fae5; max-height: 180px; overflow-y: auto; }
+    .flex-row { display: flex; gap: 8px; }
+
+    /* ── Dialogs ─────────────────────────────────────────────── */
+    .dlg-back { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 100; display: flex; align-items: center; justify-content: center; }
+    .dlg { background: #fff; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,.25); width: 440px; max-width: 95vw; max-height: 90vh; overflow-y: auto; }
+    .dlg-wide { width: 560px; }
+    .dlg-hdr { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid #e5e7eb; }
+    .dlg-title { font-size: 14px; font-weight: 600; color: #111827; }
+    .dlg-close { color: #9ca3af; padding: 4px; border-radius: 4px; }
+    .dlg-close:hover { background: #f3f4f6; color: #374151; }
+    .dlg-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+    .dlg-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid #e5e7eb; }
+    .key-row { display: flex; gap: 6px; }
+    .key-row input { flex: 1; }
+    .key-toggle { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 6px; color: #6b7280; cursor: pointer; background: #f9fafb; display: flex; align-items: center; justify-content: center; }
+    .key-toggle:hover { background: #f3f4f6; }
+    .sel-input { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; outline: none; width: 100%; }
+    .sel-input:focus { border-color: var(--dg-600); }
+    .section-lbl { font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: .06em; color: #9ca3af; margin-bottom: 5px; }
+    .code-green { background: #0f1117; border-radius: 6px; padding: 12px 14px; font-size: 11px; color: #4ade80; font-family: monospace; white-space: pre; overflow-x: auto; }
+    .code-amber { background: #0f1117; border-radius: 6px; padding: 12px 14px; font-size: 11px; color: #fcd34d; font-family: monospace; white-space: pre; overflow-x: auto; }
+    .tag-pill { display: inline-flex; padding: 2px 8px; border: 1px solid var(--dg-300); background: var(--dg-50); border-radius: 4px; font-size: 11px; font-weight: 500; color: var(--dg-800); margin: 2px; }
+    .cli-notice { background: #fef3c7; border: 1px solid #fde68a; border-radius: 6px; padding: 10px 12px; font-size: 12px; color: #92400e; }
+    .cli-confirmed { background: #f0fdf4; border: 1px solid var(--dg-200); border-radius: 6px; padding: 10px 12px; font-size: 12px; color: var(--dg-700); }
+
+    /* ── Toast ───────────────────────────────────────────────── */
+    #toast-box { position: fixed; bottom: 20px; right: 20px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
+    .toast { background: #111827; color: #fff; padding: 9px 14px; border-radius: 8px; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.3); animation: slidein .2s ease; }
+    .toast.err { background: #dc2626; }
+
+    /* ── Misc ────────────────────────────────────────────────── */
+    .spinner { width: 14px; height: 14px; border: 2px solid rgba(0,0,0,.1); border-top-color: var(--dg-600); border-radius: 50%; animation: spin .6s linear infinite; display: inline-block; }
+    .empty { color: #9ca3af; text-align: center; padding: 60px 20px; font-size: 13px; }
+    .hidden { display: none !important; }
+    code { font-family: monospace; font-size: .9em; background: #f3f4f6; padding: 1px 4px; border-radius: 3px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes slidein { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+<div id="app">
+  <header id="app-header">
+    <div class="hdr-logo">
+      <svg width="22" height="26" viewBox="0 0 160 180" fill="none" aria-hidden="true">
+        <rect x="18" y="18" width="124" height="154" rx="8" fill="#a7f3c4"/>
+        <rect x="14" y="12" width="124" height="154" rx="8" fill="white" stroke="#a7f3c4" stroke-width="1.5"/>
+        <path d="M110 12 L138 40 L110 40 Z" fill="#dcfce7"/>
+        <path d="M110 12 L138 40" stroke="#a7f3c4" stroke-width="1.5"/>
+        <rect x="26" y="24" width="86" height="14" rx="3" fill="#dcfce7" stroke="#86efac" stroke-width="1"/>
+        <rect x="26" y="66" width="106" height="14" rx="3" fill="#dcfce7" stroke="#86efac" stroke-width="1"/>
+        <rect x="26" y="99" width="77" height="14" rx="3" fill="#bbf7d0" stroke="#4ade80" stroke-width="1"/>
+        <rect x="26" y="150" width="102" height="14" rx="3" fill="#bbf7d0" stroke="#4ade80" stroke-width="1"/>
+        <rect x="26" y="44" width="90" height="5" rx="2" fill="#e5e7eb"/>
+        <rect x="26" y="53" width="72" height="5" rx="2" fill="#e5e7eb"/>
+        <rect x="26" y="86" width="60" height="5" rx="2" fill="#e5e7eb"/>
+        <rect x="34" y="119" width="84" height="5" rx="2" fill="#e5e7eb"/>
+        <rect x="34" y="128" width="76" height="5" rx="2" fill="#e5e7eb"/>
+      </svg>
+      <span>dgml-app-sample</span>
+    </div>
+    <div class="hdr-right">
+      <select class="hidden" id="sample-picker" title="Switch bundled sample workspace"></select>
+      <button class="ws-chip hidden" id="ws-chip" title="Click to open a different workspace"></button>
+      <button class="hdr-btn" id="btn-setup" title="Set up a new workspace">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18M3 6h18M3 18h12"/></svg>
+      </button>
+      <button class="hdr-btn hidden" id="btn-refresh" title="Refresh workspace">
+        <svg id="refresh-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3.6-7.2"/><path d="M21 3v6h-6"/></svg>
+      </button>
+      <button class="hdr-btn hdr-btn-wide" id="btn-llm" title="LLM settings">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M2 12h2M20 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+        <span id="llm-model-lbl">claude-sonnet-4-6</span>
+        <span class="dot-amber hidden" id="no-key-dot"></span>
+      </button>
+    </div>
+  </header>
+  <div id="app-body">
+    <nav id="sidebar"><div id="sidebar-inner"></div></nav>
+    <div id="resize-handle"></div>
+    <div id="main-content"></div>
+  </div>
+</div>
+
+<div id="toast-box"></div>
+
+<!-- LLM settings dialog -->
+<div id="dlg-llm" class="dlg-back hidden">
+  <div class="dlg">
+    <div class="dlg-hdr"><div class="dlg-title">LLM Settings</div><button class="dlg-close" id="llm-x">✕</button></div>
+    <div class="dlg-body">
+      <div class="form-row">
+        <label class="form-label">Model</label>
+        <select class="sel-input" id="llm-model-sel">
+          <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+          <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+          <option value="claude-opus-4-8">Claude Opus 4.8</option>
+          <option value="openai/gpt-4o">GPT-4o</option>
+          <option value="openai/gpt-4o-mini">GPT-4o mini</option>
+          <option value="openai/o3">o3</option>
+          <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro</option>
+          <option value="gemini/gemini-2.5-flash">Gemini 2.5 Flash</option>
+          <option value="__custom__">Custom model ID…</option>
+        </select>
+      </div>
+      <div class="form-row hidden" id="llm-custom-row">
+        <label class="form-label">Custom model ID</label>
+        <input type="text" class="form-input" id="llm-custom-inp" placeholder="e.g. anthropic/my-model" />
+      </div>
+      <div class="form-row">
+        <label class="form-label">API Key</label>
+        <div class="key-row">
+          <input type="password" class="form-input" id="llm-key-inp" placeholder="sk-…" />
+          <button class="key-toggle" id="llm-key-eye" title="Show/hide key">
+            <svg id="eye-on" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            <svg id="eye-off" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+          </button>
+        </div>
+        <span class="form-hint">Stored in localStorage only. Never sent to our servers.</span>
+      </div>
+    </div>
+    <div class="dlg-footer">
+      <button class="btn btn-secondary btn-sm" id="llm-cancel">Cancel</button>
+      <button class="btn btn-primary btn-sm" id="llm-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Anchor now dialog -->
+<div id="dlg-anchor" class="dlg-back hidden">
+  <div class="dlg dlg-wide">
+    <div class="dlg-hdr"><div class="dlg-title">Anchor on Chain ⚓</div><button class="dlg-close" id="anchor-x">✕</button></div>
+    <div class="dlg-body" id="anchor-body"></div>
+    <div class="dlg-footer">
+      <button class="btn btn-secondary btn-sm" id="anchor-cancel">Cancel</button>
+      <button class="btn btn-primary btn-sm" id="anchor-confirm">Anchor on Chain now ⚓</button>
+    </div>
+  </div>
+</div>
+
+<!-- Verify dialog -->
+<div id="dlg-verify" class="dlg-back hidden">
+  <div class="dlg dlg-wide">
+    <div class="dlg-hdr"><div class="dlg-title">Verify on chain ⚓</div><button class="dlg-close" id="verify-x">✕</button></div>
+    <div class="dlg-body" id="verify-body"></div>
+    <div class="dlg-footer"><button class="btn btn-secondary btn-sm" id="verify-close">Close</button></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════
+// True only once a real dgml-app-sample-server.py backend has answered at
+// boot (see detectWorkspaceAndBoot) — not just "not file:". A plain static
+// host (GitHub Pages, `python -m http.server`, ...) has no backend either,
+// so this must default false and be confirmed live, not inferred from the
+// protocol.
+let IS_SERVER = false;
+// Set once a bundled sample workspace (samples/<slug>/dgml-workspace,
+// discovered via samples/file-list.json) is the active workspace — lets
+// buildIndex()/findXml()/getPageBlobUrl() read real workspace files over
+// fetch() instead of a FileSystemDirectoryHandle, with no backend
+// involved. The fetch may be local-relative or point at the
+// REMOTE_SAMPLES_BASE fallback (see staticUrl()) — independent of
+// IS_SERVER either way: this is about how bytes for the *currently open*
+// workspace are read, not whether a backend exists.
+let WORKSPACE_READ_BASE = null;
+// Bundled sample workspaces discovered in samples/file-list.json, for the
+// "sample workspaces" picker: [{ id, name, base }].
+let STATIC_SAMPLES = [];
+const DG_NS = 'http://www.docugami.com/2021/dgml';
+// One box per visual line, "; "-separated within a single dg:origin attribute.
+const ORIGIN_RE = /^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/;
+const LLM_KEY = 'dgml-app-llm-settings';
+const delay = ms => new Promise(r => setTimeout(r, ms));
+const SEMANTIC_FILTERS = ['Who / What?', 'When?', 'Amounts', 'Defined as?', 'Rules & Conditions'];
+const ALGO_FILTERS = ['Sections', 'Values', 'Density', 'Patterns'];
+const PIPELINE_STEPS = ['Initialize workspace', 'Add files (recursive)', 'Cluster documents', 'Generate DGML', 'Ground markup'];
+const FAKE_OUTPUT = [
+  ['Initializing workspace…', 'Workspace ready.'],
+  ['Scanning PDF folder…', 'Found 3 files.', 'Adding file 1/3…', 'Adding file 2/3…', 'Adding file 3/3…'],
+  ['Clustering documents…', 'Identified 1 cluster.', 'Docset created: my-docset'],
+  ['Generating DGML XML…', 'Processing page 1…', 'Processing page 2…', 'Generation complete.'],
+  ['Grounding markup…', 'Matching structure…', 'Grounding complete.'],
+];
+
+// ═══════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════
+const S = {
+  // workspace
+  wsHandle: null, wsName: '', wsPath: '', wsIndex: null,
+  // routing
+  route: '/', routeParams: {},
+  // llm
+  llm: loadLlm(),
+  // file viewer — reset on file switch
+  fileId: null, docsetId: null, pageCount: 0,
+  currentPage: 1, zoomPct: 100,
+  // XML / overlays
+  xmlStr: null,
+  // overlaysByPage: Map<pageNum, [{tag,x,y,w,h}]>  (percent coords, raw from XML)
+  overlaysByPage: new Map(),
+  // selection — four independent axes (mirrors React uiSlice)
+  selTag: null, selNodeId: null,
+  hovTag: null, hovNodeId: null,
+  // basket / anchor history
+  basket: [], anchorHistory: [],
+  // tag panel
+  tagFilter: 'All', tagSearch: '', semanticMap: {}, semanticLoading: false, semanticError: null,
+  describeResults: null, describeLoading: false,
+  // blobs
+  blobCache: {},
+  // pipeline
+  pipelineRunning: false, lastWorkspaceDir: '',
+};
+
+// per-render panel heights
+let tagPanelH = 220;
+const TAG_PANEL_MIN = 140;
+
+// tag metrics cache for current file
+let _metrics = [];
+let _descDebounce = null;
+
+function resetFileState() {
+  S.fileId = null; S.docsetId = null; S.pageCount = 0;
+  S.currentPage = 1; S.zoomPct = 100;
+  S.xmlStr = null; S.overlaysByPage = new Map();
+  S.selTag = null; S.selNodeId = null; S.hovTag = null; S.hovNodeId = null; S.basket = [];
+  S.tagFilter = 'All'; S.tagSearch = ''; S.semanticMap = {};
+  S.semanticLoading = false; S.semanticError = null; S.describeResults = null; S.describeLoading = false;
+  _metrics = [];
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LLM SETTINGS PERSISTENCE
+// ═══════════════════════════════════════════════════════════════════
+function loadLlm() {
+  try { const s = localStorage.getItem(LLM_KEY); if (s) return JSON.parse(s); } catch {}
+  return { model: 'claude-sonnet-4-6', apiKey: '' };
+}
+function saveLlm() { localStorage.setItem(LLM_KEY, JSON.stringify(S.llm)); }
+
+// ═══════════════════════════════════════════════════════════════════
+// ROUTING
+// ═══════════════════════════════════════════════════════════════════
+let prevRoute = '/'; let prevRouteParams = {};
+function nav(route, params = {}) { if (S.route !== route) { prevRoute = S.route; prevRouteParams = S.routeParams; } S.route = route; S.routeParams = params; render(); }
+
+// ═══════════════════════════════════════════════════════════════════
+// FILE SYSTEM ACCESS API
+// ═══════════════════════════════════════════════════════════════════
+async function getDirHandle(root, ...parts) {
+  let h = root;
+  for (const p of parts) { try { h = await h.getDirectoryHandle(p); } catch { return null; } }
+  return h;
+}
+async function listDirNames(dh) {
+  const r = [];
+  try { for await (const [n, e] of dh.entries()) if (e.kind === 'directory' && !n.startsWith('.')) r.push(n); } catch {}
+  return r.sort();
+}
+async function listFileNames(dh) {
+  const r = [];
+  try { for await (const [n, e] of dh.entries()) if (e.kind === 'file') r.push(n); } catch {}
+  return r.sort();
+}
+async function readFileText(dh, name) {
+  try { return await (await (await dh.getFileHandle(name)).getFile()).text(); } catch { return null; }
+}
+async function getBlobUrl(fileHandle) {
+  return URL.createObjectURL(await fileHandle.getFile());
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STATIC SAMPLE BUNDLE — reads real workspace files over fetch(), no
+// backend, no precomputed content. samples/file-list.json is the ONLY
+// precomputed artifact (see scripts/gen_samples_file_list.py in the
+// dgml-spec repo, which publishes samples/): a flat list of real paths,
+// standing in for the directory listing a static host can't serve. It is
+// committed alongside samples/ in dgml-spec. Docset names, file names/page counts, and
+// each file's real *.dgml.xml name are all read from the same real
+// docset.json / file.json / *.dgml.xml files a FileSystemDirectoryHandle
+// would have read — just fetched instead of walked.
+//
+// Tries a local samples/ folder first, then falls back to the same data
+// served live from dgml-spec's main branch on GitHub, so this exact file
+// works standalone with zero copying too.
+//
+// "Local" is checked at two possible relative locations, since this same
+// file can be deployed two different ways: samples/ sitting in the *same*
+// folder as this file (e.g. dgml.io/examples/{dgml-app-sample.html,samples/})
+// vs. samples/ one level *up*, a sibling of the folder this file lives in.
+// Both are tried before the remote fallback. In this repo no local samples/
+// is bundled (they live in dgml-spec), so the remote fallback is used.
+// ═══════════════════════════════════════════════════════════════════
+const REMOTE_SAMPLES_BASE = 'https://raw.githubusercontent.com/dgml-io/dgml-spec/main/';
+const LOCAL_SAMPLES_BASE_CANDIDATES = ['', '../'];
+
+let _staticFileListCache = null;
+let _staticSourceBase = ''; // wherever samples/file-list.json was actually found
+
+// Every fetch the static-bundle code makes goes through here, so switching
+// between a local copy (either relative shape) and the remote fallback is
+// one variable, not a second code path.
+function staticUrl(path) { return _staticSourceBase + path; }
+
+async function loadStaticFileList() {
+  if (_staticFileListCache) return _staticFileListCache;
+  for (const source of [...LOCAL_SAMPLES_BASE_CANDIDATES, REMOTE_SAMPLES_BASE]) {
+    try {
+      const r = await fetch(`${source}samples/file-list.json`);
+      if (r.ok) {
+        _staticSourceBase = source;
+        _staticFileListCache = await r.json();
+        return _staticFileListCache;
+      }
+    } catch {}
+  }
+  throw new Error(`no samples/file-list.json found locally or at ${REMOTE_SAMPLES_BASE}`);
+}
+
+// Every distinct `samples/<slug>/dgml-workspace` root present in the list.
+function discoverStaticSamples(fileList) {
+  const roots = new Map(); // base path -> slug
+  const re = /^(samples\/([^/]+)\/dgml-workspace)\//;
+  for (const p of fileList) {
+    const m = re.exec(p);
+    if (m) roots.set(m[1], m[2]);
+  }
+  return [...roots.entries()].map(([base, slug]) => ({
+    id: slug,
+    name: slug.replace(/^\d+-/, '').replace(/-/g, ' '),
+    base,
+  }));
+}
+
+// Docset ids, each docset's file ids, and each file's real *.dgml.xml
+// filename (the one genuinely unpredictable name) — all parsed from path
+// strings under one workspace root.
+function staticWorkspaceLayout(fileList, base) {
+  const prefix = `${base}/`;
+  const docsets = new Map(); // dsId -> { fileIds: Set, xmlNameByFile: Map }
+  const topFileIds = new Set();
+  for (const p of fileList) {
+    if (!p.startsWith(prefix)) continue;
+    const rel = p.slice(prefix.length);
+    let m = /^docsets\/([^/]+)\/files\/([^/]+)\/(.+\.dgml\.xml)$/.exec(rel);
+    if (m) {
+      const [, dsId, fileId, xmlName] = m;
+      if (!docsets.has(dsId)) docsets.set(dsId, { fileIds: new Set(), xmlNameByFile: new Map() });
+      docsets.get(dsId).fileIds.add(fileId);
+      docsets.get(dsId).xmlNameByFile.set(fileId, xmlName);
+      continue;
+    }
+    m = /^files\/([^/]+)\//.exec(rel);
+    if (m) topFileIds.add(m[1]);
+  }
+  return { docsets, topFileIds };
+}
+
+async function buildStaticIndex(base) {
+  const fileList = await loadStaticFileList();
+  const { docsets, topFileIds } = staticWorkspaceLayout(fileList, base);
+
+  const docsetEntries = await Promise.all([...docsets.entries()].map(async ([id, d]) => {
+    let name = id;
+    try {
+      const meta = await fetch(staticUrl(`${base}/docsets/${id}/docset.json`)).then(r => r.json());
+      name = meta.name || id;
+    } catch {}
+    return { id, name, fileIds: [...d.fileIds] };
+  }));
+
+  const fileEntries = await Promise.all([...topFileIds].map(async id => {
+    try {
+      const meta = await fetch(staticUrl(`${base}/files/${id}/file.json`)).then(r => r.json());
+      return { id, filename: meta.original_filename || id, pageCount: meta.page_count || 0 };
+    } catch { return { id, filename: id, pageCount: 0 }; }
+  }));
+
+  return { docsets: docsetEntries, files: fileEntries };
+}
+
+async function findStaticXml(base, docsetId, fileId) {
+  const fileList = await loadStaticFileList();
+  const { docsets } = staticWorkspaceLayout(fileList, base);
+  const xmlName = docsets.get(docsetId)?.xmlNameByFile.get(fileId);
+  if (!xmlName) return null;
+  try {
+    const url = staticUrl(`${base}/docsets/${docsetId}/files/${fileId}/${encodeURIComponent(xmlName)}`);
+    const r = await fetch(url);
+    return r.ok ? r.text() : null;
+  } catch { return null; }
+}
+
+async function buildIndex(root) {
+  if (IS_SERVER) {
+    const data = await fetch('/workspace/_index').then(r => r.json());
+    // server returns {root, docsets:[{id,name,fileIds}], files:[{id,filename,pageCount}]}
+    return { docsets: data.docsets || [], files: data.files || [] };
+  }
+  if (WORKSPACE_READ_BASE) return buildStaticIndex(WORKSPACE_READ_BASE);
+  const docsetsDir = await getDirHandle(root, 'docsets');
+  const filesDir = await getDirHandle(root, 'files');
+  const docsetIds = docsetsDir ? await listDirNames(docsetsDir) : [];
+  const fileIds = filesDir ? await listDirNames(filesDir) : [];
+  const docsets = await Promise.all(docsetIds.map(async id => {
+    const dd = await getDirHandle(docsetsDir, id);
+    const fd = await getDirHandle(docsetsDir, id, 'files');
+    let name = id;
+    if (dd) { try { const t = await readFileText(dd, 'docset.json'); if (t) { const m = JSON.parse(t); name = m.name || id; } } catch {} }
+    return { id, name, fileIds: fd ? await listDirNames(fd) : [] };
+  }));
+  const files = await Promise.all(fileIds.map(async id => {
+    try {
+      const d = await getDirHandle(filesDir, id);
+      if (d) { const t = await readFileText(d, 'file.json'); if (t) { const m = JSON.parse(t); return { id, filename: m.original_filename || id, pageCount: m.page_count || 0 }; } }
+    } catch {}
+    return { id, filename: id, pageCount: 0 };
+  }));
+  return { docsets, files };
+}
+
+async function findXml(root, docsetId, fileId) {
+  if (IS_SERVER) {
+    try {
+      const data = await fetch(`/workspace/docsets/${encodeURIComponent(docsetId)}/files/${encodeURIComponent(fileId)}/_dgml`).then(r => r.ok ? r.json() : null);
+      return data?.xml ?? null;
+    } catch { return null; }
+  }
+  if (WORKSPACE_READ_BASE) return findStaticXml(WORKSPACE_READ_BASE, docsetId, fileId);
+  const dir = await getDirHandle(root, 'docsets', docsetId, 'files', fileId);
+  if (!dir) return null;
+  const names = await listFileNames(dir);
+  // <stem>.dgml.xml is grounded in place (dg:origin) — no separate grounded artifact.
+  const chosen = names.find(n => n.endsWith('.dgml.xml'));
+  if (!chosen) return null;
+  return (await (await dir.getFileHandle(chosen)).getFile()).text();
+}
+
+async function getPageBlobUrl(root, fileId, page) {
+  if (IS_SERVER) {
+    // Pages are named page_1.png, page_2.png, … (PAGE_FILENAME_TEMPLATE = "page_%d.png")
+    return `/workspace/files/${encodeURIComponent(fileId)}/page_images/page_${page}.png`;
+  }
+  if (WORKSPACE_READ_BASE) {
+    return staticUrl(`${WORKSPACE_READ_BASE}/files/${encodeURIComponent(fileId)}/page_images/page_${page}.png`);
+  }
+  const key = `${fileId}/${page}`;
+  if (S.blobCache[key]) return S.blobCache[key];
+  const dir = await getDirHandle(root, 'files', fileId, 'page_images');
+  if (!dir) return null;
+  const p4 = String(page).padStart(4, '0'), p3 = String(page).padStart(3, '0');
+  for (const name of [`page_${p4}.png`, `page_${p3}.png`, `page_${page}.png`, `${page}.png`]) {
+    try { const url = await getBlobUrl(await dir.getFileHandle(name)); S.blobCache[key] = url; return url; } catch {}
+  }
+  const imgs = (await listFileNames(dir)).filter(n => /\.(png|jpe?g)$/i.test(n));
+  if (imgs[page - 1]) {
+    try { const url = await getBlobUrl(await dir.getFileHandle(imgs[page - 1])); S.blobCache[key] = url; return url; } catch {}
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DGML BOX PARSING
+// ═══════════════════════════════════════════════════════════════════
+
+// Parse dg:origin: "; "-separated list of boxes, each "<page> <x1> <y1> <x2> <y2>"
+// (pixel coords). An element gets one box per visual line, and since a line
+// can only be on one page but a multi-line element can span several, the
+// boxes in a single attribute are not all guaranteed to share the same page.
+function parseOriginAttr(val) {
+  const out = [];
+  for (const part of (val || '').split(';')) {
+    const m = ORIGIN_RE.exec(part.trim());
+    if (!m) continue;
+    const [, page, x1, y1, x2, y2] = m.map(Number);
+    out.push({ page, x: x1, y: y1, w: x2 - x1, h: y2 - y1 });
+  }
+  return out;
+}
+
+// Returns Map<pageNum, [{tag,nodeId,x,y,w,h}]> shallow-first, one entry per
+// box — a node with several boxes on the same page contributes one rect per
+// box, all sharing its nodeId.
+function buildOverlaysByPage(xmlStr) {
+  const doc = new DOMParser().parseFromString(xmlStr, 'application/xml');
+  if (doc.querySelector('parsererror')) return new Map();
+  const entries = [];
+  function walk(el, depth, nodeId) {
+    const origin = el.getAttributeNS(DG_NS, 'origin') ?? el.getAttribute('dg:origin');
+    // Pure containers (sections, lists, tables, rows, the root) now carry a
+    // dg:origin too — one union box per page over their whole grounded
+    // subtree. Skip those for the overlay: only elements with a direct
+    // text-node child (leaves and mixed-content parents) are real content,
+    // and drawing the container's box on top just paints one big rect over
+    // everything underneath it.
+    const hasDirectText = [...el.childNodes].some(n => n.nodeType === 3 && (n.textContent || '').trim());
+    if (origin && hasDirectText) {
+      for (const box of parseOriginAttr(origin))
+        entries.push({ depth, tag: el.tagName, nodeId, ...box });
+    }
+    for (let i = 0; i < el.children.length; i++) walk(el.children[i], depth + 1, `${nodeId}/${i}`);
+  }
+  walk(doc.documentElement, 0, 'r');
+  // Sort shallow-first so parent rects paint before child rects in SVG
+  entries.sort((a, b) => a.depth - b.depth);
+  const byPage = new Map();
+  for (const e of entries) {
+    if (!byPage.has(e.page)) byPage.set(e.page, []);
+    byPage.get(e.page).push({ tag: e.tag, nodeId: e.nodeId, x: e.x, y: e.y, w: e.w, h: e.h });
+  }
+  return byPage;
+}
+
+function firstPageForTag(tag) {
+  for (const [page, rects] of S.overlaysByPage) {
+    if (rects.some(r => stripNs(r.tag) === tag)) return page;
+  }
+  return null;
+}
+
+// A node's boxes can span several pages (one box per visual line). When
+// navigating to a node that isn't selected yet and has nothing on the
+// current page, jump to whichever of its pages is closest to the one
+// being viewed rather than always the first one in document order.
+function nearestPageForNodeId(nodeId) {
+  let best = null, bestDist = Infinity;
+  for (const [page, rects] of S.overlaysByPage) {
+    if (!rects.some(r => r.nodeId === nodeId)) continue;
+    const dist = Math.abs(page - S.currentPage);
+    if (dist < bestDist) { best = page; bestDist = dist; }
+  }
+  return best;
+}
+
+function jumpToPage(page) {
+  if (page && page !== S.currentPage) { S.currentPage = page; showPage(); }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SVG OVERLAY
+// viewBox="0 0 100 100" + rects at percent coords + CSS inset:0 fill parent.
+// Zero dependency on image pixel dimensions — always correct regardless of timing.
+// ═══════════════════════════════════════════════════════════════════
+function renderOverlay() {
+  const svg = document.getElementById('pg-svg');
+  if (!svg) return;
+
+  const { selTag, selNodeId, hovTag, hovNodeId, basket } = S;
+  const rects = S.overlaysByPage.get(S.currentPage) || [];
+  if (!rects.length) { svg.innerHTML = ''; return; }
+
+  // SVG viewBox is always 0 0 100 100 (percent-of-page).
+  // dg:origin rects are in pixels → convert using image natural dims.
+  // Re-render is triggered from img.onload if dimensions aren't available yet.
+  const pgImg = document.getElementById('pg-img');
+  const imgW = pgImg?.naturalWidth || 0;
+  const imgH = pgImg?.naturalHeight || 0;
+
+  svg.innerHTML = rects.map(r => {
+    if (!imgW || !imgH) return ''; // image not decoded yet; onload will re-render
+    const x = r.x * 100 / imgW, y = r.y * 100 / imgH;
+    const w = r.w * 100 / imgW, h = r.h * 100 / imgH;
+    const tag = stripNs(r.tag);
+    // Exact React OR logic: selected = nodeId match OR tag match
+    const isSel = (!!selNodeId && r.nodeId === selNodeId) || (!!selTag && tag === selTag);
+    const isHov = !isSel && ((!!hovNodeId && r.nodeId === hovNodeId) || (!!hovTag && tag === hovTag));
+    const isBasket = !isSel && !isHov && basket.includes(tag);
+
+    let fill, stroke, sw;
+    if      (isSel)    { fill = 'rgba(40,160,94,0.25)';  stroke = 'rgb(30,116,68)';        sw = 0.28; }
+    else if (isHov)    { fill = 'rgba(40,160,94,0.15)';  stroke = 'rgb(40,160,94)';        sw = 0.22; }
+    else if (isBasket) { fill = 'rgba(59,130,246,0.08)'; stroke = 'rgba(59,130,246,0.55)'; sw = 0.14; }
+    else               { fill = 'transparent';            stroke = 'rgba(40,160,94,0.5)';   sw = 0.10; }
+
+    // pointer-events is explicit rather than relying on fill="transparent" being
+    // hit-testable -- some rendering paths don't treat a fully-transparent fill
+    // as "painted" for real pointer input, even though it's not fill="none".
+    return `<rect data-tag="${esc(tag)}" data-nid="${esc(r.nodeId)}" x="${x}" y="${y}" width="${w}" height="${h}" fill="${fill}" stroke="${stroke}" stroke-width="${sw}" style="cursor:pointer;pointer-events:all"><title>${esc(r.tag)}</title></rect>`;
+  }).join('');
+
+  svg.querySelectorAll('rect[data-tag]').forEach(rect => {
+    const tag = rect.dataset.tag;
+    const nid = rect.dataset.nid;
+    // Hover must NOT rebuild the SVG (renderOverlay() replaces every <rect>,
+    // including the one the pointer is currently over) — a real click is a
+    // pointerenter → mousedown → mouseup → click sequence, and browsers drop
+    // the click if its target was removed from the DOM in between. Restyle
+    // the existing elements in place instead.
+    rect.addEventListener('pointerenter', () => { S.hovNodeId = nid; S.hovTag = tag; refreshTagChips(); renderTreePanel(); renderAnchorStrip(); updateOverlayStyles(); });
+    rect.addEventListener('pointerleave', () => { S.hovNodeId = null; S.hovTag = null; refreshTagChips(); renderTreePanel(); renderAnchorStrip(); updateOverlayStyles(); });
+    rect.addEventListener('click', () => {
+      // toggle selNodeId; always set selTag (matches React: toggleSelectedDgmlNodeId + setSelectedTagName)
+      S.selNodeId = S.selNodeId === nid ? null : nid;
+      S.selTag = tag;
+      if (S.selNodeId) expandAncestorsOf(S.selNodeId);
+      refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+      const treeBtn = document.querySelector(`[data-tree-id="${CSS.escape(nid)}"]`);
+      treeBtn?.scrollIntoView({ block: 'nearest' });
+    });
+  });
+}
+
+function updateOverlayStyles() {
+  const svg = document.getElementById('pg-svg');
+  if (!svg) return;
+  const { selTag, selNodeId, hovTag, hovNodeId, basket } = S;
+  svg.querySelectorAll('rect[data-tag]').forEach(rect => {
+    const tag = rect.dataset.tag;
+    const nid = rect.dataset.nid;
+    const isSel = (!!selNodeId && nid === selNodeId) || (!!selTag && tag === selTag);
+    const isHov = !isSel && ((!!hovNodeId && nid === hovNodeId) || (!!hovTag && tag === hovTag));
+    const isBasket = !isSel && !isHov && basket.includes(tag);
+    let fill, stroke, sw;
+    if      (isSel)    { fill = 'rgba(40,160,94,0.25)';  stroke = 'rgb(30,116,68)';        sw = 0.28; }
+    else if (isHov)    { fill = 'rgba(40,160,94,0.15)';  stroke = 'rgb(40,160,94)';        sw = 0.22; }
+    else if (isBasket) { fill = 'rgba(59,130,246,0.08)'; stroke = 'rgba(59,130,246,0.55)'; sw = 0.14; }
+    else               { fill = 'transparent';            stroke = 'rgba(40,160,94,0.5)';   sw = 0.10; }
+    rect.setAttribute('fill', fill);
+    rect.setAttribute('stroke', stroke);
+    rect.setAttribute('stroke-width', sw);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TAG METRICS  (full port of tagMetrics.ts)
+// ═══════════════════════════════════════════════════════════════════
+function stripNs(tag) { const c = tag.indexOf(':'); return c >= 0 ? tag.slice(c + 1) : tag; }
+function countWords(t) { const s = (t || '').trim(); return s ? s.split(/\s+/).length : 0; }
+function shannonH(freq) {
+  const tot = [...freq.values()].reduce((a, b) => a + b, 0);
+  if (!tot) return 0;
+  let h = 0; for (const c of freq.values()) { const p = c / tot; if (p > 0) h -= p * Math.log2(p); } return h;
+}
+
+function computeTagMetrics(xmlStr) {
+  const doc = new DOMParser().parseFromString(xmlStr, 'application/xml');
+  if (doc.querySelector('parsererror')) return [];
+  const allEls = [...doc.getElementsByTagName('*')];
+  const N = allEls.length; if (!N) return [];
+  const rootTag = doc.documentElement.tagName;
+
+  // BFS depths
+  const elDepth = new Map(); elDepth.set(doc.documentElement, 0);
+  const q = [doc.documentElement];
+  while (q.length) { const el = q.shift(); const d = elDepth.get(el); for (let i = 0; i < el.children.length; i++) { const c = el.children[i]; elDepth.set(c, d + 1); q.push(c); } }
+
+  // Post-order subtree sizes
+  const dfs = []; const stk = [doc.documentElement];
+  while (stk.length) { const el = stk.pop(); dfs.push(el); for (let i = el.children.length - 1; i >= 0; i--) stk.push(el.children[i]); }
+  const sz = new Map(), descTags = new Map();
+  for (let i = dfs.length - 1; i >= 0; i--) {
+    const el = dfs[i]; let s = 1; const dt = new Set();
+    for (let j = 0; j < el.children.length; j++) { const c = el.children[j]; s += sz.get(c) || 1; dt.add(c.tagName); const cdt = descTags.get(c); if (cdt) for (const t of cdt) dt.add(t); }
+    sz.set(el, s); descTags.set(el, dt);
+  }
+
+  // Per-element data
+  const elData = new Map(), tagTot = new Map(), tagNoChild = new Map(), allTagNames = new Set();
+  for (const el of allEls) {
+    allTagNames.add(el.tagName);
+    tagTot.set(el.tagName, (tagTot.get(el.tagName) || 0) + 1);
+    if (!el.children.length) tagNoChild.set(el.tagName, (tagNoChild.get(el.tagName) || 0) + 1);
+    let directText = false;
+    for (let i = 0; i < el.childNodes.length; i++) { if (el.childNodes[i].nodeType === 3 && (el.childNodes[i].textContent || '').trim()) { directText = true; break; } }
+    const ctf = new Map();
+    for (let i = 0; i < el.children.length; i++) { const t = el.children[i].tagName; ctf.set(t, (ctf.get(t) || 0) + 1); }
+    elData.set(el, { depth: elDepth.get(el) || 0, sz: sz.get(el) || 1, tokens: countWords(el.textContent || ''), directText, ctf, dt: descTags.get(el) || new Set() });
+  }
+
+  const leafTypes = new Set();
+  for (const [tag, tot] of tagTot) if ((tagNoChild.get(tag) || 0) / tot > 0.7) leafTypes.add(tag);
+  const totalTypes = allTagNames.size;
+
+  const groups = new Map();
+  for (const el of allEls) {
+    if (el.tagName === rootTag) continue;
+    if (!groups.has(el.tagName)) groups.set(el.tagName, []);
+    groups.get(el.tagName).push(el);
+  }
+
+  const results = [];
+  for (const [fullName, instances] of groups) {
+    const count = instances.length;
+    let sD = 0, sSt = 0, sBr = 0, sDT = 0, sHC = 0, sBetw = 0, sEnt = 0;
+    const allDT = new Set();
+    for (const el of instances) {
+      const d = elData.get(el);
+      sD += d.depth; sSt += d.tokens; sBr += d.ctf.size;
+      if (d.directText) sDT++; if (el.children.length) sHC++;
+      const denom = N * (N - 1) / 2;
+      sBetw += denom > 0 ? (d.sz * (N - d.sz)) / denom : 0;
+      sEnt += shannonH(d.ctf);
+      for (const t of d.dt) allDT.add(t);
+    }
+    const depthMean = sD / count, stMean = sSt / count, branchMean = sBr / count;
+    const textRatio = sDT / count, childRatio = sHC / count;
+    const density = stMean / Math.max(1, depthMean);
+    const betweenness = sBetw / count, entropy = sEnt / count;
+    let leafCnt = 0; for (const t of allDT) if (leafTypes.has(t)) leafCnt++;
+    const ancCov = allDT.size / Math.max(1, totalTypes - 1);
+    let role;
+    if (textRatio >= 0.7 && childRatio < 0.3) role = 'leaf-value';
+    else if (childRatio >= 0.7 && textRatio < 0.3) role = 'container';
+    else if (textRatio >= 0.3 || childRatio >= 0.3) role = 'hybrid';
+    else role = 'mixed';
+    results.push({ name: stripNs(fullName), fullName, count, depthMean, stMean, branchMean, textRatio, childRatio, density, leafCnt, ancCov, betweenness, entropy, role });
+  }
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ALGO FILTERS
+// ═══════════════════════════════════════════════════════════════════
+function applyAlgoFilter(metrics, filter) {
+  const n = metrics.length; if (!n) return metrics;
+  const half = Math.ceil(n / 2);
+  if (filter === 'Values') return metrics.filter(m => m.role === 'leaf-value' || (m.textRatio >= 0.5 && m.childRatio < 0.3));
+  if (filter === 'Sections') {
+    const nonLeaf = metrics.filter(m => m.role !== 'leaf-value');
+    const byBetw = new Set([...nonLeaf].sort((a, b) => b.betweenness - a.betweenness).slice(0, half));
+    const byAncCov = new Set([...nonLeaf].sort((a, b) => b.ancCov - a.ancCov).slice(0, half));
+    return nonLeaf.filter(m => byBetw.has(m) || byAncCov.has(m));
+  }
+  if (filter === 'Density') {
+    const byD = new Set([...metrics].sort((a, b) => b.density - a.density).slice(0, half));
+    const byB = new Set([...metrics].sort((a, b) => b.branchMean - a.branchMean).slice(0, half));
+    const byL = new Set([...metrics].sort((a, b) => b.leafCnt - a.leafCnt).slice(0, half));
+    return metrics.filter(m => byD.has(m) || byB.has(m) || byL.has(m));
+  }
+  if (filter === 'Patterns') return [...metrics].sort((a, b) => b.entropy - a.entropy).slice(0, half);
+  return metrics;
+}
+
+function getFilteredMetrics() {
+  let r = _metrics;
+  if (S.tagSearch.trim()) {
+    if (S.describeResults !== null) { const s = new Set(S.describeResults); r = r.filter(m => s.has(m.name)); }
+    else { const q = S.tagSearch.toLowerCase(); r = r.filter(m => m.name.toLowerCase().includes(q)); }
+  }
+  if (S.tagFilter === 'All') return r;
+  if (SEMANTIC_FILTERS.includes(S.tagFilter)) return r.filter(m => S.semanticMap[m.name] === S.tagFilter);
+  if (ALGO_FILTERS.includes(S.tagFilter)) return applyAlgoFilter(r, S.tagFilter);
+  return r;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LLM API
+// ═══════════════════════════════════════════════════════════════════
+function isGemini(m) { return m.toLowerCase().startsWith('gemini/') || m.toLowerCase().startsWith('google/'); }
+function isOpenAI(m) { return m.toLowerCase().startsWith('openai/'); }
+
+async function llmFetch(userPrompt, systemPrompt) {
+  const { model, apiKey } = S.llm;
+  if (!apiKey) throw new Error('No API key — configure one in LLM settings.');
+  if (isGemini(model)) {
+    const modelId = model.split('/').pop();
+    const body = { contents: [{ role: 'user', parts: [{ text: userPrompt }] }] };
+    if (systemPrompt) body.systemInstruction = { parts: [{ text: systemPrompt }] };
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(apiKey)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(`Gemini ${r.status}`);
+    return r.json();
+  } else if (isOpenAI(model)) {
+    const modelId = model.split('/').pop();
+    const msgs = systemPrompt ? [{ role: 'system', content: systemPrompt }] : [];
+    msgs.push({ role: 'user', content: userPrompt });
+    const r = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` }, body: JSON.stringify({ model: modelId, messages: msgs, max_tokens: 1024 }) });
+    if (!r.ok) throw new Error(`OpenAI ${r.status}`);
+    return r.json();
+  } else {
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' }, body: JSON.stringify({ model, max_tokens: 1024, system: systemPrompt || undefined, messages: [{ role: 'user', content: userPrompt }] }) });
+    if (!r.ok) throw new Error(`Anthropic ${r.status}`);
+    return r.json();
+  }
+}
+
+function extractText(d) {
+  return d?.content?.[0]?.text || d?.choices?.[0]?.message?.content || d?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+async function runSemanticClassification() {
+  if (!_metrics.length) return;
+  S.semanticError = null;
+  if (!S.llm.apiKey) return;
+  S.semanticLoading = true; refreshFilterBtns();
+  const names = _metrics.map(m => m.name).join(', ');
+  try {
+    const data = await llmFetch(`You are analyzing XML tag names from a semantic document (could be any domain: legal, medical, financial, technical, etc.).\n\nClassify each tag name below into exactly one of these categories, or null if none fits:\nWho / What? | When? | Amounts | Defined as? | Rules & Conditions\n\nTag names: ${names}\n\nRespond with ONLY a valid JSON object mapping each tag name to its category string or null.`);
+    const text = extractText(data).replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+    try { S.semanticMap = JSON.parse(text); } catch { S.semanticError = 'Could not parse the classification response.'; }
+  } catch (e) { S.semanticError = e.message || 'Classification request failed.'; }
+  S.semanticLoading = false; refreshFilterBtns(); refreshTagChips();
+}
+
+async function runDescribeSearch(q) {
+  if (!S.llm.apiKey || !q.trim() || !_metrics.length) { S.describeResults = null; S.describeLoading = false; refreshTagChips(); return; }
+  try {
+    const data = await llmFetch(`From this list of XML tag names, return the ones that best match the description: "${q}"\n\nTag names: ${_metrics.map(m => m.name).join(', ')}\n\nRespond with ONLY a valid JSON array of matching tag names. Return [] if nothing matches.`);
+    const text = extractText(data).replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+    try { const arr = JSON.parse(text); S.describeResults = Array.isArray(arr) ? arr : null; } catch { S.describeResults = null; }
+  } catch { S.describeResults = null; }
+  S.describeLoading = false; refreshTagChips();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CHAIN BACKEND — real (served over http, shells out to `dgml`) vs fake
+// (file://, canned happy-path data). Same interface either way: every
+// method resolves to {ok:true, data} or {ok:false, error} so dialog code
+// never branches on which backend it's talking to.
+// ═══════════════════════════════════════════════════════════════════
+function fakeTx() { return '0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join(''); }
+
+async function _post(path, body) {
+  try {
+    const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    return await res.json(); // server always answers {ok, data|error}
+  } catch (e) {
+    return { ok: false, error: 'Cannot reach server: ' + e.message };
+  }
+}
+
+const realChainBackend = {
+  listChains: () => _post('/chain/list', {}),
+  connectChain: p => _post('/chain/connect', p),
+  listRegistries: p => _post('/registry/list', p),
+  createRegistry: p => _post('/registry/create', p),
+  walletStatus: p => _post('/wallet/status', p),
+  setWalletKey: p => _post('/wallet/set-key', p),
+  removeWalletKey: () => _post('/wallet/remove-key', {}),
+  resolveNode: p => _post('/node/resolve', p),
+  stakeNode: p => _post('/stake/node', p),
+  stakeFile: p => _post('/stake/file', p),
+  proveNode: p => _post('/prove/node', p),
+  proveFile: p => _post('/prove/file', p),
+};
+
+// Fake backend: happy-path only. It doesn't need to reproduce the real CLI's
+// error taxonomy (insufficient gas, RPC timeout, ...) — only its shape.
+const FAKE_CHAINS = [
+  { name: 'nvnm-testnet', rpc_url: 'https://evm.testnet.nvnmchain.io', chain_id: 787111, anchor_address: '0x0000000000000000000000000000000000000A00', explorer: 'https://explorer.evm.testnet.nvnmchain.io', native_token: 'wmantraUSD', builtin: true },
+  { name: 'nvnm-mainnet', rpc_url: 'https://evm.nvnmchain.io', chain_id: 1611, anchor_address: '0x0000000000000000000000000000000000000A00', explorer: 'https://evm.explorer.nvnmchain.io', native_token: 'wmmUSD', builtin: true },
+];
+let _fakeCustomChains = [];
+let _fakeRegistries = ['demo-registry'];
+let _fakeWalletKeySet = false;
+
+const fakeChainBackend = {
+  async listChains() {
+    await delay(150);
+    return { ok: true, data: { chains: [...FAKE_CHAINS, ..._fakeCustomChains] } };
+  },
+  async connectChain(p) {
+    await delay(400);
+    const chain = { name: p.name, rpc_url: p.rpcUrl, chain_id: p.chainId, anchor_address: p.anchorAddress || FAKE_CHAINS[0].anchor_address, explorer: p.explorer || null, native_token: p.nativeToken || null, builtin: false };
+    _fakeCustomChains.push(chain);
+    return { ok: true, data: chain };
+  },
+  async listRegistries() {
+    await delay(150);
+    return { ok: true, data: { registries: _fakeRegistries.map((n, i) => ({ id: i + 1, name: n, description: 'Simulated registry', creator: '0xSIMULATED', created_at: new Date().toISOString() })) } };
+  },
+  async createRegistry(p) {
+    await delay(p.dryRun ? 150 : 400);
+    if (!p.dryRun) _fakeRegistries.push(p.name);
+    return { ok: true, data: { registry: p.name, broadcast: !p.dryRun, tx_hash: fakeTx() } };
+  },
+  async walletStatus() {
+    await delay(150);
+    if (!_fakeWalletKeySet) return { ok: false, error: 'no signing key configured' };
+    return { ok: true, data: { address: '0xSIMULATED00000000000000000000000000000', balance_eth: '12.3', native_token: 'wmantraUSD', funded: true } };
+  },
+  async setWalletKey() { await delay(300); _fakeWalletKeySet = true; return { ok: true, data: { stored: true } }; },
+  async removeWalletKey() { await delay(150); _fakeWalletKeySet = false; return { ok: true, data: { removed: true } }; },
+  async resolveNode() {
+    await delay(150);
+    return { ok: true, data: { xpath: '/dg:chunk/…(simulated)', leaf_index: 0 } };
+  },
+  async stakeNode(p) {
+    await delay(p.dryRun ? 200 : 600);
+    return { ok: true, data: { chain: p.chain, registry: p.registry, tx_hash: fakeTx(), checksum: fakeTx(), broadcast: !p.dryRun, explorer_url: null, xpath: p.xpath } };
+  },
+  async stakeFile(p) {
+    await delay(p.dryRun ? 200 : 600);
+    return { ok: true, data: { chain: p.chain, registry: p.registry, tx_hash: fakeTx(), checksum: fakeTx(), broadcast: !p.dryRun, explorer_url: null } };
+  },
+  async proveNode() { await delay(300); return { ok: true, data: { valid: true } }; },
+  async proveFile() { await delay(300); return { ok: true, data: { valid: true } }; },
+};
+
+const chainBackend = IS_SERVER ? realChainBackend : fakeChainBackend;
+
+// ═══════════════════════════════════════════════════════════════════
+// ANCHOR / CHAIN
+// ═══════════════════════════════════════════════════════════════════
+
+let anchorChain = null, anchorRegistry = null, anchorDgmlShown = false;
+let anchorChains = [], anchorRegistries = [], anchorWallet = null;
+// Distinguish "still loading" from "loaded and it's actually empty" — each
+// `dgml` call the dialog makes is a fresh `uv run` subprocess (~3s cold
+// start), so without this a first-open dialog looks broken, not busy.
+let anchorChainsLoaded = false, anchorRegistriesLoaded = false;
+let anchorConnectOpen = false, anchorCreateRegOpen = false, anchorKeyOpen = false;
+// Draft values for the two inline forms, tracked outside the DOM so a
+// re-render triggered by something else (e.g. the initial chain/registry/
+// wallet load finishing in the background while the user is mid-typing)
+// doesn't wipe out what they've typed — renderAnchorDialog() rebuilds the
+// whole dialog body's innerHTML on every call, which would otherwise
+// recreate blank <input> elements.
+let anchorConnectDraft = { name: '', rpcUrl: '', chainId: '', anchorAddress: '' };
+let anchorRegDraft = { name: '', description: '' };
+let anchorRegDryRun = null; // {name, description} once previewed, awaiting confirm
+let anchorPreviews = []; // [{tag, nodeId, xpath, leafIndex, error, staked, tx, explorerUrl}]
+let anchorBusy = false, anchorLoadError = null;
+
+function serializeXmlEl(el, indent) {
+  const pad = '  '.repeat(indent);
+  const tag = stripNs(el.tagName);
+  if (el.children.length === 0) {
+    const text = (el.textContent || '').trim();
+    if (!text) return `${pad}<${tag}/>`;
+    return `${pad}<${tag}>${text.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</${tag}>`;
+  }
+  let out = `${pad}<${tag}>\n`;
+  for (let i = 0; i < el.children.length; i++) out += serializeXmlEl(el.children[i], indent + 1) + '\n';
+  return out + `${pad}</${tag}>`;
+}
+
+// App-internal nodeId is "r/i0/i1/..." (buildOverlaysByPage's root marker
+// 'r' plus child indices) — the CLI's --child-path wants bare slash-separated
+// indices only, so strip the 'r'. An id of exactly "r" (the root itself)
+// becomes "" (--child-path's own convention for "the document root").
+function nodeIdToChildPath(nodeId) {
+  return nodeId.split('/').slice(1).join('/');
+}
+
+function elByNodeId(doc, nodeId) {
+  const parts = nodeId.split('/');
+  let el = doc.documentElement;
+  for (let i = 1; i < parts.length; i++) {
+    const idx = parseInt(parts[i], 10);
+    if (!el || idx >= el.children.length) return null;
+    el = el.children[idx];
+  }
+  return el;
+}
+
+function buildDgmlFragments() {
+  if (!S.xmlStr) return '';
+  const doc = new DOMParser().parseFromString(S.xmlStr, 'application/xml');
+  // "Show DGML" previews whatever is currently selected -- it should track
+  // your live selection, not stay frozen on the basket's contents.
+  if (S.selNodeId) {
+    const el = elByNodeId(doc, S.selNodeId);
+    if (el) return serializeXmlEl(el, 0);
+  }
+  // Nothing currently selected: fall back to the basket, one fragment per
+  // tag, preferring the exact instance captured when it was added.
+  const parts = [];
+  for (const entry of S.basket) {
+    const el = (entry.nodeId && elByNodeId(doc, entry.nodeId))
+      || [...doc.getElementsByTagName('*')].find(e => stripNs(e.tagName) === entry.tag);
+    if (el) parts.push(serializeXmlEl(el, 0));
+  }
+  return parts.join('\n\n');
+}
+
+async function openAnchorDialog() {
+  if (!S.basket.length) return;
+  anchorDgmlShown = false; anchorConnectOpen = false; anchorCreateRegOpen = false; anchorKeyOpen = false;
+  anchorRegDryRun = null; anchorLoadError = null;
+  anchorChainsLoaded = false; anchorRegistriesLoaded = false; anchorWallet = null;
+  anchorPreviews = S.basket.map(b => ({ tag: b.tag, nodeId: b.nodeId, xpath: null, leafIndex: null, error: null, staked: false, tx: null, explorerUrl: null }));
+  document.getElementById('dlg-anchor').classList.remove('hidden');
+  anchorBusy = true;
+  renderAnchorDialog();
+  await loadAnchorChains();
+  anchorBusy = false;
+  renderAnchorDialog();
+}
+
+async function loadAnchorChains() {
+  const res = await chainBackend.listChains();
+  anchorChainsLoaded = true;
+  if (!res.ok) { anchorLoadError = res.error; anchorChains = []; return; }
+  anchorChains = res.data.chains || [];
+  if (!anchorChain || !anchorChains.some(c => c.name === anchorChain)) {
+    // Default to testnet when available — this is a testing/sample app, and
+    // defaulting to mainnet risks a real transaction against a real registry
+    // on a genuinely live chain the first time the dialog opens.
+    const testnet = anchorChains.find(c => c.name === 'nvnm-testnet');
+    anchorChain = testnet ? testnet.name : (anchorChains.length ? anchorChains[0].name : null);
+  }
+  await loadAnchorRegistriesWalletAndPreviews();
+}
+
+async function loadAnchorRegistriesWalletAndPreviews() {
+  if (!anchorChain) { anchorRegistries = []; anchorWallet = null; anchorRegistriesLoaded = true; return; }
+  const [regRes, walletRes] = await Promise.all([
+    chainBackend.listRegistries({ chain: anchorChain }),
+    chainBackend.walletStatus({ chain: anchorChain }),
+  ]);
+  anchorRegistriesLoaded = true;
+  anchorRegistries = regRes.ok ? (regRes.data.registries || []) : [];
+  if (!anchorRegistry || !anchorRegistries.some(r => r.name === anchorRegistry)) {
+    anchorRegistry = anchorRegistries.length ? anchorRegistries[0].name : null;
+  }
+  anchorWallet = walletRes;
+  await resolveAnchorPreviews();
+}
+
+async function resolveAnchorPreviews() {
+  for (const p of anchorPreviews) {
+    if (p.xpath || p.error) continue; // node identity doesn't depend on chain/registry — resolve once
+    const res = await chainBackend.resolveNode({ fileId: S.fileId, docsetId: S.docsetId, childPath: nodeIdToChildPath(p.nodeId) });
+    if (res.ok) { p.xpath = res.data.xpath; p.leafIndex = res.data.leaf_index; }
+    else { p.error = res.error; }
+  }
+}
+
+async function onAnchorChainChange(name) {
+  anchorChain = name; anchorRegistry = null;
+  anchorRegistriesLoaded = false; anchorWallet = null;
+  anchorBusy = true; renderAnchorDialog();
+  await loadAnchorRegistriesWalletAndPreviews();
+  anchorBusy = false; renderAnchorDialog();
+}
+
+async function submitConnectChain(fields) {
+  anchorBusy = true; anchorLoadError = null; renderAnchorDialog();
+  const res = await chainBackend.connectChain(fields);
+  if (!res.ok) { anchorLoadError = res.error; anchorBusy = false; renderAnchorDialog(); return; }
+  anchorConnectOpen = false;
+  anchorChain = fields.name;
+  await loadAnchorChains();
+  anchorBusy = false;
+  renderAnchorDialog();
+}
+
+async function submitCreateRegistry(fields) {
+  anchorBusy = true; anchorLoadError = null; renderAnchorDialog();
+  const dryRun = !anchorRegDryRun;
+  const res = await chainBackend.createRegistry({ chain: anchorChain, name: fields.name, description: fields.description, dryRun });
+  if (!res.ok) {
+    anchorLoadError = res.error;
+    // Keep the error visible — but if it failed because the name's already
+    // taken, that registry does exist; look it up by name (bypasses
+    // pagination) and add it to the dropdown so cancelling out of this form
+    // leaves it there to pick manually, instead of a dead end.
+    if (/already exists/i.test(res.error)) {
+      const check = await chainBackend.listRegistries({ chain: anchorChain, name: fields.name });
+      const found = check.ok ? (check.data.registries || []).find(r => r.name === fields.name) : null;
+      if (found && !anchorRegistries.some(r => r.name === found.name)) {
+        anchorRegistries = [found, ...anchorRegistries];
+      }
+    }
+    anchorRegDryRun = null; anchorBusy = false; renderAnchorDialog(); return;
+  }
+  if (dryRun) {
+    // First click just previews the unsigned tx; second click (below) broadcasts it —
+    // registry creation is itself a signed, gas-costing transaction, same as staking.
+    anchorRegDryRun = { name: fields.name, description: fields.description };
+    anchorBusy = false; renderAnchorDialog(); return;
+  }
+  // Don't just trust the broadcast response — confirm the registry is
+  // actually queryable by name before treating it as ready. A plain
+  // unfiltered list wouldn't be conclusive either way (this testnet alone
+  // has 1000+ registries and the list call only returns a default page),
+  // so look it up by its exact name, which the chain resolves directly.
+  const check = await chainBackend.listRegistries({ chain: anchorChain, name: fields.name });
+  const confirmed = check.ok && (check.data.registries || []).some(r => r.name === fields.name);
+  if (!confirmed) {
+    anchorLoadError = `Registry "${fields.name}" was broadcast but a lookup by name doesn't find it yet — it may just need a moment to index. Try again shortly.`;
+    anchorRegDryRun = null;
+    anchorBusy = false;
+    renderAnchorDialog();
+    return;
+  }
+  anchorCreateRegOpen = false; anchorRegDryRun = null;
+  anchorRegistry = fields.name;
+  await loadAnchorRegistriesWalletAndPreviews();
+  anchorBusy = false;
+  renderAnchorDialog();
+}
+
+async function submitSetWalletKey(privateKey) {
+  anchorBusy = true; anchorLoadError = null; renderAnchorDialog();
+  const res = await chainBackend.setWalletKey({ privateKey });
+  if (!res.ok) { anchorLoadError = res.error; anchorBusy = false; renderAnchorDialog(); return; }
+  anchorKeyOpen = false;
+  anchorWallet = await chainBackend.walletStatus({ chain: anchorChain });
+  anchorBusy = false;
+  renderAnchorDialog();
+}
+
+async function submitRemoveWalletKey() {
+  anchorBusy = true; renderAnchorDialog();
+  await chainBackend.removeWalletKey();
+  anchorWallet = await chainBackend.walletStatus({ chain: anchorChain });
+  anchorBusy = false;
+  renderAnchorDialog();
+}
+
+async function confirmAnchor() {
+  if (anchorBusy) return;
+  const pending = anchorPreviews.filter(p => p.xpath && !p.staked);
+  if (!pending.length) return;
+  anchorBusy = true; renderAnchorDialog();
+  for (const p of pending) {
+    const res = await chainBackend.stakeNode({
+      fileId: S.fileId, docsetId: S.docsetId, xpath: p.xpath,
+      chain: anchorChain, registry: anchorRegistry, dryRun: false,
+    });
+    if (res.ok) {
+      p.staked = true; p.tx = res.data.tx_hash; p.explorerUrl = res.data.explorer_url || null;
+      S.anchorHistory.unshift({
+        ts: new Date().toISOString(), fileId: S.fileId || '', tags: [p.tag],
+        chain: anchorChain, tx: res.data.tx_hash, checksum: res.data.checksum, registry: anchorRegistry,
+        xpath: p.xpath, explorerUrl: res.data.explorer_url || null,
+      });
+    } else {
+      p.error = res.error;
+    }
+  }
+  anchorBusy = false;
+  renderAnchorDialog(); renderAnchorStrip();
+}
+
+function renderAnchorDialog() {
+  // "+ Connect/Create" sentinels lead the list — with dozens of other
+  // testers' registries on a shared public chain, an action tacked on at
+  // the end of a long dropdown is effectively invisible.
+  const chainOptions = `<option value="__connect__">+ Connect a chain…</option>`
+    + anchorChains.map(c => `<option value="${esc(c.name)}"${c.name === anchorChain ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
+  // registry_list only returns a default-size page from the chain (this
+  // testnet alone has 1000+ registries), so a just-created or otherwise
+  // known registry can easily fall outside it — inject it as a real
+  // <option> so the <select> doesn't silently fall back to showing
+  // whatever else happens to render first.
+  const knownRegNames = new Set(anchorRegistries.map(r => r.name));
+  const currentRegOption = (anchorRegistry && !knownRegNames.has(anchorRegistry))
+    ? `<option value="${esc(anchorRegistry)}" selected>${esc(anchorRegistry)}</option>` : '';
+  const regOptions = `<option value="__create__">+ Create a registry…</option>`
+    + currentRegOption
+    + anchorRegistries.map(r => `<option value="${esc(r.name)}"${r.name === anchorRegistry ? ' selected' : ''}>${esc(r.name)}</option>`).join('');
+
+  let walletHtml;
+  if (anchorKeyOpen) {
+    walletHtml = `<div class="form-row"><label class="form-label" style="font-size:12px">Wallet private key</label>
+      <input class="form-input" type="password" id="anchor-key-input" placeholder="0x…" />
+      <div style="margin-top:6px"><button class="btn btn-primary btn-sm" id="anchor-key-save">Save key</button>
+      <button class="btn btn-secondary btn-sm" id="anchor-key-cancel">Cancel</button></div></div>`;
+  } else if (anchorWallet === null) {
+    walletHtml = `<div class="form-row" style="font-size:12px;color:#9ca3af">Checking wallet…</div>`;
+  } else if (anchorWallet.ok) {
+    const d = anchorWallet.data;
+    const short = d.address.slice(0, 6) + '…' + d.address.slice(-4);
+    walletHtml = `<div class="form-row" style="font-size:12px">Wallet ${esc(short)} · ${esc(d.balance_eth)} ${esc(d.native_token || '')}
+      <button class="btn btn-secondary btn-sm" id="anchor-key-remove" style="margin-left:8px">Remove key</button></div>`;
+  } else {
+    walletHtml = `<div class="form-row" style="font-size:12px">No signing key configured.
+      <button class="btn btn-secondary btn-sm" id="anchor-key-set">Set key</button></div>`;
+  }
+
+  let connectHtml = '';
+  if (anchorConnectOpen) {
+    connectHtml = `<div class="form-row">
+      <input class="form-input" id="conn-name" placeholder="Chain name" style="margin-bottom:4px" value="${esc(anchorConnectDraft.name)}" />
+      <input class="form-input" id="conn-rpc" placeholder="RPC URL" style="margin-bottom:4px" value="${esc(anchorConnectDraft.rpcUrl)}" />
+      <input class="form-input" id="conn-chainid" placeholder="Chain ID" style="margin-bottom:4px" value="${esc(anchorConnectDraft.chainId)}" />
+      <input class="form-input" id="conn-anchor" placeholder="Anchor address (optional)" style="margin-bottom:4px" value="${esc(anchorConnectDraft.anchorAddress)}" />
+      <button class="btn btn-primary btn-sm" id="conn-submit">Connect</button>
+      <button class="btn btn-secondary btn-sm" id="conn-cancel">Cancel</button>
+    </div>`;
+  }
+
+  let regCreateHtml = '';
+  if (anchorCreateRegOpen) {
+    regCreateHtml = `<div class="form-row">
+      <input class="form-input" id="reg-name" placeholder="Registry name" style="margin-bottom:4px" value="${esc(anchorRegDraft.name)}" />
+      <input class="form-input" id="reg-desc" placeholder="Description" style="margin-bottom:4px" value="${esc(anchorRegDraft.description)}" />
+      ${anchorRegDryRun ? '<div class="cli-notice">Unsigned transaction ready — confirm to broadcast.</div>' : ''}
+      <button class="btn btn-primary btn-sm" id="reg-submit">${anchorRegDryRun ? 'Confirm & create' : 'Create'}</button>
+      <button class="btn btn-secondary btn-sm" id="reg-cancel">Cancel</button>
+    </div>`;
+  }
+
+  const previewRows = anchorPreviews.map(p => {
+    let status;
+    if (p.staked) status = `<span style="color:#16a34a">staked ✓ ${esc(p.tx.slice(0, 10))}…</span>`;
+    else if (p.error) status = `<span style="color:#dc2626">${esc(p.error)}</span>`;
+    else if (p.xpath) status = `<span style="color:#9ca3af">${esc(p.xpath)}</span>`;
+    else status = '<span style="color:#9ca3af">resolving…</span>';
+    return `<div class="form-row" style="font-size:11px;display:flex;gap:8px;align-items:baseline"><span class="tag-pill">${esc(p.tag)}</span>${status}</div>`;
+  }).join('');
+
+  const errorHtml = anchorLoadError ? `<div class="form-row" style="color:#dc2626;font-size:12px">${esc(anchorLoadError)}</div>` : '';
+  const multiTxNotice = anchorPreviews.filter(p => !p.staked).length > 1
+    ? `<div class="form-row" style="font-size:11px;color:#9ca3af">This submits ${anchorPreviews.filter(p => !p.staked).length} separate on-chain transactions, one per node.</div>` : '';
+
+  document.getElementById('anchor-body').innerHTML = `
+    <div class="form-row"><div class="section-lbl">Tags to anchor</div><div>${S.basket.map(b => `<span class="tag-pill">${esc(b.tag)}</span>`).join('')}</div></div>
+    <div class="form-row">
+      <label class="form-label" style="font-size:12px">Chain</label>
+      ${!anchorChainsLoaded ? '<span style="font-size:12px;color:#9ca3af">Loading chains…</span>'
+        : anchorConnectOpen ? '' : `<select class="sel-input" id="anchor-chain-sel" style="width:auto">${chainOptions}</select>`}
+      ${connectHtml}
+    </div>
+    ${walletHtml}
+    <div class="form-row">
+      <label class="form-label" style="font-size:12px">Registry</label>
+      ${!anchorRegistriesLoaded ? '<span style="font-size:12px;color:#9ca3af">Loading registries…</span>'
+        : anchorCreateRegOpen ? '' : `<select class="sel-input" id="anchor-registry-sel" style="width:auto">${regOptions}</select>`}
+      ${regCreateHtml}
+    </div>
+    ${errorHtml}
+    <div class="form-row"><div class="section-lbl">Nodes</div>${previewRows}</div>
+    ${multiTxNotice}
+    <div class="form-row" style="margin-top:4px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <button id="btn-dgml-toggle" class="btn btn-secondary btn-sm" style="font-size:11px;padding:3px 10px">${anchorDgmlShown ? 'Hide DGML ▴' : 'Show DGML ▸'}</button>
+        <span style="font-size:11px;color:#9ca3af">XML fragments for selected tags</span>
+      </div>
+      <div id="dgml-fragment-wrap" style="display:${anchorDgmlShown ? 'block' : 'none'};margin-top:8px">
+        <div class="code-green" style="max-height:280px;overflow-y:auto;white-space:pre">${anchorDgmlShown ? esc(buildDgmlFragments()) : ''}</div>
+      </div>
+    </div>`;
+
+  const chainSel = document.getElementById('anchor-chain-sel');
+  if (chainSel) chainSel.addEventListener('change', function () {
+    if (this.value === '__connect__') {
+      anchorConnectDraft = { name: '', rpcUrl: '', chainId: '', anchorAddress: '' };
+      anchorConnectOpen = true; renderAnchorDialog(); return;
+    }
+    onAnchorChainChange(this.value);
+  });
+  const regSel = document.getElementById('anchor-registry-sel');
+  if (regSel) regSel.addEventListener('change', function () {
+    if (this.value === '__create__') {
+      anchorRegDraft = { name: '', description: '' };
+      anchorCreateRegOpen = true; renderAnchorDialog(); return;
+    }
+    anchorRegistry = this.value; renderAnchorDialog();
+  });
+  // Keep the draft in sync as the user types, so a re-render triggered by
+  // something unrelated (background loads finishing) doesn't lose it.
+  const connName = document.getElementById('conn-name');
+  if (connName) connName.oninput = () => { anchorConnectDraft.name = connName.value; };
+  const connRpc = document.getElementById('conn-rpc');
+  if (connRpc) connRpc.oninput = () => { anchorConnectDraft.rpcUrl = connRpc.value; };
+  const connChainId = document.getElementById('conn-chainid');
+  if (connChainId) connChainId.oninput = () => { anchorConnectDraft.chainId = connChainId.value; };
+  const connAnchor = document.getElementById('conn-anchor');
+  if (connAnchor) connAnchor.oninput = () => { anchorConnectDraft.anchorAddress = connAnchor.value; };
+  const connSubmit = document.getElementById('conn-submit');
+  if (connSubmit) connSubmit.onclick = () => submitConnectChain({
+    name: anchorConnectDraft.name.trim(),
+    rpcUrl: anchorConnectDraft.rpcUrl.trim(),
+    chainId: parseInt(anchorConnectDraft.chainId.trim(), 10),
+    anchorAddress: anchorConnectDraft.anchorAddress.trim() || undefined,
+  });
+  const connCancel = document.getElementById('conn-cancel');
+  if (connCancel) connCancel.onclick = () => { anchorConnectOpen = false; renderAnchorDialog(); };
+  const regName = document.getElementById('reg-name');
+  if (regName) regName.oninput = () => { anchorRegDraft.name = regName.value; };
+  const regDesc = document.getElementById('reg-desc');
+  if (regDesc) regDesc.oninput = () => { anchorRegDraft.description = regDesc.value; };
+  const regSubmit = document.getElementById('reg-submit');
+  if (regSubmit) regSubmit.onclick = () => submitCreateRegistry({
+    name: anchorRegDraft.name.trim(),
+    description: anchorRegDraft.description.trim(),
+  });
+  const regCancel = document.getElementById('reg-cancel');
+  if (regCancel) regCancel.onclick = () => { anchorCreateRegOpen = false; anchorRegDryRun = null; renderAnchorDialog(); };
+  const keySet = document.getElementById('anchor-key-set');
+  if (keySet) keySet.onclick = () => { anchorKeyOpen = true; renderAnchorDialog(); };
+  const keyRemove = document.getElementById('anchor-key-remove');
+  if (keyRemove) keyRemove.onclick = submitRemoveWalletKey;
+  const keySave = document.getElementById('anchor-key-save');
+  if (keySave) keySave.onclick = () => submitSetWalletKey(document.getElementById('anchor-key-input').value);
+  const keyCancel = document.getElementById('anchor-key-cancel');
+  if (keyCancel) keyCancel.onclick = () => { anchorKeyOpen = false; renderAnchorDialog(); };
+  document.getElementById('btn-dgml-toggle').addEventListener('click', () => {
+    anchorDgmlShown = !anchorDgmlShown;
+    const wrap = document.getElementById('dgml-fragment-wrap');
+    const btn = document.getElementById('btn-dgml-toggle');
+    if (anchorDgmlShown) {
+      wrap.querySelector('.code-green').textContent = buildDgmlFragments();
+      wrap.style.display = 'block';
+      btn.textContent = 'Hide DGML ▴';
+    } else {
+      wrap.style.display = 'none';
+      btn.textContent = 'Show DGML ▸';
+    }
+  });
+
+  const pendingCount = anchorPreviews.filter(p => !p.staked).length;
+  const allDone = anchorPreviews.length > 0 && pendingCount === 0;
+  const ready = !anchorBusy && !allDone && anchorChain && anchorRegistry
+    && anchorWallet && anchorWallet.ok && anchorWallet.data.funded
+    && anchorPreviews.some(p => p.xpath && !p.staked);
+  const confirmBtn = document.getElementById('anchor-confirm');
+  confirmBtn.textContent = allDone ? 'Done ✓' : (pendingCount > 1 ? `Anchor ${pendingCount} nodes on Chain now ⚓` : 'Anchor on Chain now ⚓');
+  confirmBtn.disabled = !ready;
+}
+
+async function openVerifyDialog(record) {
+  document.getElementById('verify-body').innerHTML = `
+    <div class="form-row"><div>${record.tags.map(t => `<span class="tag-pill">${esc(t)}</span>`).join('')} <span class="anc-chain">${esc(record.chain)}</span></div></div>
+    <div class="form-row" style="font-size:11px;color:#9ca3af">${esc(record.tx)}</div>
+    <div class="cli-notice">Verifying…</div>`;
+  document.getElementById('dlg-verify').classList.remove('hidden');
+  // checksum (the content hash, distinct from the tx hash) is what the chain
+  // indexes records by — that's what `prove` needs to look one up.
+  const res = record.xpath
+    ? await chainBackend.proveNode({ chain: record.chain, registry: record.registry, checksum: record.checksum })
+    : await chainBackend.proveFile({ chain: record.chain, registry: record.registry, checksum: record.checksum });
+  const verdict = res.ok
+    ? (res.data.valid ? '<div class="cli-confirmed">Verified ✓ — this anchor still holds.</div>' : '<div style="color:#dc2626">Verification failed — this record no longer matches on-chain state.</div>')
+    : `<div style="color:#dc2626">${esc(res.error)}</div>`;
+  document.getElementById('verify-body').innerHTML = `
+    <div class="form-row"><div>${record.tags.map(t => `<span class="tag-pill">${esc(t)}</span>`).join('')} <span class="anc-chain">${esc(record.chain)}</span></div></div>
+    <div class="form-row" style="font-size:11px;color:#9ca3af">${esc(record.tx)}</div>
+    ${verdict}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TOAST
+// ═══════════════════════════════════════════════════════════════════
+function toast(msg, type = '') {
+  const el = document.createElement('div');
+  el.className = 'toast' + (type === 'error' ? ' err' : '');
+  el.textContent = msg;
+  document.getElementById('toast-box').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RENDER — top level
+// ═══════════════════════════════════════════════════════════════════
+function render() {
+  renderHeader();
+  renderSidebar();
+  const main = document.getElementById('main-content');
+  if (S.route === '/setup') { renderSetup(main); return; }
+  if (!S.wsHandle) { renderWelcome(main); return; }
+  if (S.route.startsWith('/docsets/') || S.route.startsWith('/files/')) { renderFileViewer(main); return; }
+  renderHome(main);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HEADER
+// ═══════════════════════════════════════════════════════════════════
+function renderHeader() {
+  const chip = document.getElementById('ws-chip');
+  const btnRefresh = document.getElementById('btn-refresh');
+  if (S.wsHandle) {
+    chip.textContent = S.wsPath || S.wsName;
+    chip.title = S.wsPath ? `${S.wsPath}\n(click to open a different workspace)` : 'Click to open a different workspace';
+    chip.classList.remove('hidden'); btnRefresh.classList.remove('hidden');
+  }
+  else { chip.classList.add('hidden'); btnRefresh.classList.add('hidden'); }
+  document.getElementById('llm-model-lbl').textContent = S.llm.model.split('/').pop();
+  document.getElementById('no-key-dot').classList.toggle('hidden', !!S.llm.apiKey);
+
+  const picker = document.getElementById('sample-picker');
+  if (STATIC_SAMPLES.length) {
+    picker.classList.remove('hidden');
+    picker.innerHTML = STATIC_SAMPLES.map(s =>
+      `<option value="${esc(s.id)}"${s.base === WORKSPACE_READ_BASE ? ' selected' : ''}>${esc(s.name)}</option>`
+    ).join('');
+  } else {
+    picker.classList.add('hidden');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SIDEBAR
+// ═══════════════════════════════════════════════════════════════════
+const SB_FILE_ICON = '<svg width="12" height="12" viewBox="0 0 12 14" fill="currentColor" style="opacity:.5;flex-shrink:0"><path d="M2 0a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.5L7.5 0H2zm5 1v3.5H10L7 1z"/></svg>';
+const sidebarCollapsed = new Set();
+
+function renderSidebar() {
+  const navEl = document.getElementById('sidebar');
+  const rh = document.getElementById('resize-handle');
+  navEl.classList.toggle('hidden', !S.wsHandle);
+  rh.classList.toggle('hidden', !S.wsHandle);
+  const el = document.getElementById('sidebar-inner');
+  if (!S.wsHandle || !S.wsIndex) { el.innerHTML = ''; return; }
+  const { docsets, files } = S.wsIndex;
+  const fileById = new Map(files.map(f => [f.id, f]));
+  const inDocset = new Set(docsets.flatMap(ds => ds.fileIds));
+
+  let h = `<div class="sb-section-lbl">Docsets (${docsets.length})</div>`;
+  if (!docsets.length) h += '<div style="padding:4px 12px;font-size:12px;color:#9ca3af;font-style:italic">No docsets</div>';
+  for (const ds of docsets) {
+    const open = !sidebarCollapsed.has(ds.id);
+    h += `<div class="sb-ds-group">
+      <div class="sb-ds-hdr">
+        <span class="sb-ds-toggle${open ? ' open' : ''}" data-toggle-ds="${esc(ds.id)}">›</span>
+        <span class="sb-ds-name" data-nav-ds="${esc(ds.id)}" title="${esc(ds.name ?? ds.id)}">${esc(ds.name ?? ds.id)}</span>
+      </div>`;
+    if (open) {
+      h += '<ul style="list-style:none;margin:0;padding:0">';
+      for (const fid of ds.fileIds) {
+        const f = fileById.get(fid) || { id: fid, filename: fid, pageCount: 0 };
+        const active = S.routeParams.fileId === fid && S.routeParams.docsetId === ds.id;
+        h += `<li><div class="sb-file${active ? ' active' : ''}" style="padding-left:2.25rem" data-nav-file="${esc(fid)}" data-nav-ds-for-file="${esc(ds.id)}" title="${esc(f.filename)}">
+          ${SB_FILE_ICON}<span class="name">${esc(f.filename)}</span></div></li>`;
+      }
+      h += '</ul>';
+    }
+    h += '</div>';
+  }
+
+  const looseFiles = files.filter(f => !inDocset.has(f.id));
+  if (looseFiles.length) {
+    h += `<div class="sb-section-lbl">Unassigned (${looseFiles.length})</div><ul style="list-style:none;margin:0;padding:0 0 8px">`;
+    for (const f of looseFiles) {
+      const active = S.routeParams.fileId === f.id && !S.routeParams.docsetId;
+      h += `<li><div class="sb-file${active ? ' active' : ''}" style="padding-left:1.5rem" data-nav-file="${esc(f.id)}" title="${esc(f.filename)}">
+        ${SB_FILE_ICON}<span class="name">${esc(f.filename)}</span></div></li>`;
+    }
+    h += '</ul>';
+  }
+
+  el.innerHTML = h;
+  el.querySelectorAll('[data-toggle-ds]').forEach(e => e.addEventListener('click', ev => {
+    ev.stopPropagation();
+    const id = e.dataset.toggleDs;
+    if (sidebarCollapsed.has(id)) sidebarCollapsed.delete(id); else sidebarCollapsed.add(id);
+    renderSidebar();
+  }));
+  el.querySelectorAll('[data-nav-ds]').forEach(e => e.addEventListener('click', () => {
+    const ds = S.wsIndex.docsets.find(d => d.id === e.dataset.navDs);
+    if (ds?.fileIds.length) nav(`/docsets/${ds.id}/files/${ds.fileIds[0]}`, { docsetId: ds.id, fileId: ds.fileIds[0] });
+  }));
+  el.querySelectorAll('[data-nav-file]').forEach(e => e.addEventListener('click', () => {
+    const dsId = e.dataset.navDsForFile;
+    if (dsId) nav(`/docsets/${dsId}/files/${e.dataset.navFile}`, { docsetId: dsId, fileId: e.dataset.navFile });
+    else nav(`/files/${e.dataset.navFile}`, { fileId: e.dataset.navFile });
+  }));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WELCOME
+// ═══════════════════════════════════════════════════════════════════
+function renderWelcome(main) {
+  main.innerHTML = `
+    <div class="welcome-wrap">
+      <div class="welcome-card">
+        <div class="welcome-icon">
+          <svg width="72" height="84" viewBox="0 0 160 180" fill="none"><rect x="18" y="18" width="124" height="154" rx="8" fill="#a7f3c4"/><rect x="14" y="12" width="124" height="154" rx="8" fill="white" stroke="#a7f3c4" stroke-width="1.5"/><path d="M110 12 L138 40 L110 40 Z" fill="#dcfce7"/><path d="M110 12 L138 40" stroke="#a7f3c4" stroke-width="1.5"/><rect x="26" y="24" width="86" height="14" rx="3" fill="#dcfce7" stroke="#86efac" stroke-width="1"/><rect x="26" y="66" width="106" height="14" rx="3" fill="#dcfce7" stroke="#86efac" stroke-width="1"/><rect x="26" y="99" width="77" height="14" rx="3" fill="#bbf7d0" stroke="#4ade80" stroke-width="1"/><rect x="26" y="150" width="102" height="14" rx="3" fill="#bbf7d0" stroke="#4ade80" stroke-width="1"/><rect x="26" y="44" width="90" height="5" rx="2" fill="#e5e7eb"/><rect x="26" y="53" width="72" height="5" rx="2" fill="#e5e7eb"/><rect x="26" y="86" width="60" height="5" rx="2" fill="#e5e7eb"/><rect x="34" y="119" width="84" height="5" rx="2" fill="#e5e7eb"/><rect x="34" y="128" width="76" height="5" rx="2" fill="#e5e7eb"/></svg>
+        </div>
+        <div class="welcome-title">DGML App Sample</div>
+        <div class="welcome-sub">Open a DGML workspace folder to browse docsets, view page images, explore XML structure, and anchor tags on-chain.</div>
+        <div class="welcome-actions">
+          <button class="btn btn-primary" id="btn-open-ws">
+            <svg width="16" height="16" viewBox="0 0 20 20" fill="currentColor"><path d="M2 6a2 2 0 012-2h4l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/></svg>
+            Open workspace folder
+          </button>
+          <button class="btn btn-secondary" id="btn-go-setup">
+            <svg width="16" height="16" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd"/></svg>
+            New docset (pipeline)
+          </button>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('btn-open-ws').onclick = openWorkspace;
+  document.getElementById('btn-go-setup').onclick = () => nav('/setup');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HOME
+// ═══════════════════════════════════════════════════════════════════
+function renderHome(main) {
+  const { docsets } = S.wsIndex || { docsets: [] };
+  main.innerHTML = `
+    <div class="page">
+      <div class="page-hdr"><div class="page-title">Docsets</div><button class="btn btn-primary btn-sm" id="btn-new-ds">+ New docset</button></div>
+      <div class="page-body">
+        ${!docsets.length ? '<div class="empty">No docsets yet. Use <code>dgml-app-sample-server.py</code> or the CLI to run the pipeline and create one.</div>' :
+          `<div class="card-grid">${docsets.map(ds => `<div class="card" data-ds="${ds.id}"><div class="card-title">${esc(ds.name ?? ds.id)}</div><div class="card-sub">${ds.fileIds.length} file${ds.fileIds.length !== 1 ? 's' : ''}</div></div>`).join('')}</div>`}
+      </div>
+    </div>`;
+  document.getElementById('btn-new-ds').onclick = () => nav('/setup');
+  main.querySelectorAll('[data-ds]').forEach(el => el.addEventListener('click', () => {
+    const ds = docsets.find(d => d.id === el.dataset.ds);
+    if (ds?.fileIds.length) nav(`/docsets/${ds.id}/files/${ds.fileIds[0]}`, { docsetId: ds.id, fileId: ds.fileIds[0] });
+  }));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FILE VIEWER
+// ═══════════════════════════════════════════════════════════════════
+const treeExpanded = new Set();
+
+function renderFileViewer(main) {
+  const { docsetId, fileId } = S.routeParams;
+  if (!fileId) { renderHome(main); return; }
+
+  // Reset state when switching to a different file
+  if (S.fileId !== fileId) {
+    resetFileState();
+    S.fileId = fileId;
+    S.docsetId = docsetId || null;
+    treeExpanded.clear();
+  }
+
+  const fileInfo = S.wsIndex?.files?.find(f => f.id === fileId) || { id: fileId, filename: fileId, pageCount: 0 };
+
+  main.innerHTML = `
+    <div class="fv-wrap">
+      <div class="fv-toolbar">
+        <div class="fv-filename" title="${esc(fileInfo.filename)}">${esc(fileInfo.filename)}</div>
+        <div class="fv-nav">
+          <button class="nav-btn" id="nav-prev" title="Previous page (←)">←</button>
+          <span class="nav-count" id="nav-count">1 / ?</span>
+          <button class="nav-btn" id="nav-next" title="Next page (→)">→</button>
+          <div class="nav-sep"></div>
+          <button class="nav-btn" id="nav-zoom-out" title="Zoom out (−)">−</button>
+          <span class="zoom-label" id="zoom-lbl" title="Click to reset zoom (0)" id="zoom-lbl">${S.zoomPct}%</span>
+          <button class="nav-btn" id="nav-zoom-in" title="Zoom in (+)">+</button>
+        </div>
+      </div>
+      <div class="fv-body">
+        <div class="fv-page-col" id="fv-page-col">
+          <div style="color:#9ca3af;padding:40px;font-size:13px;text-align:center"><span class="spinner"></span></div>
+        </div>
+        <div class="fv-right-col" id="fv-right">
+          <div id="tdp-wrap" style="height:${tagPanelH}px;min-height:${TAG_PANEL_MIN}px;flex-shrink:0;display:flex;flex-direction:column;overflow:hidden;border-bottom:1px solid #e5e7eb">
+            <div class="tdp-filters" id="tdp-filters"></div>
+            <div class="tdp-search-wrap">
+              <input class="tdp-search" id="tdp-search" placeholder="Filter tags / Describe tags…" />
+              <span class="tdp-search-ico" id="tdp-search-ico"></span>
+            </div>
+            <div class="tdp-chips" id="tdp-chips"></div>
+          </div>
+          <div class="right-resize-handle" id="right-rh"></div>
+          <div class="tree-panel">
+            <div class="tree-hdr">DGML</div>
+            <div class="tree-scroll" id="tree-scroll"><div class="tree-placeholder">Loading…</div></div>
+          </div>
+        </div>
+      </div>
+      <div id="anchor-area"></div>
+    </div>`;
+
+  // Nav button wiring
+  document.getElementById('nav-prev').onclick = () => { if (S.currentPage > 1) { S.currentPage--; showPage(); } };
+  document.getElementById('nav-next').onclick = () => { if (S.currentPage < S.pageCount) { S.currentPage++; showPage(); } };
+  document.getElementById('nav-zoom-out').onclick = () => { S.zoomPct = Math.max(25, S.zoomPct - 10); updateZoom(); };
+  document.getElementById('nav-zoom-in').onclick = () => { S.zoomPct = Math.min(300, S.zoomPct + 10); updateZoom(); };
+  document.getElementById('zoom-lbl').onclick = () => { S.zoomPct = 100; updateZoom(); };
+
+  // Right panel resize
+  initRightResize();
+
+  // Wire tag search
+  const searchInp = document.getElementById('tdp-search');
+  searchInp.value = S.tagSearch;
+  searchInp.addEventListener('input', e => {
+    S.tagSearch = e.target.value; S.describeResults = null;
+    S.describeLoading = !!S.tagSearch.trim() && !!S.llm.apiKey;
+    refreshTagChips();
+    clearTimeout(_descDebounce);
+    if (S.tagSearch.trim().length > 2 && S.llm.apiKey) {
+      _descDebounce = setTimeout(() => runDescribeSearch(S.tagSearch), 500);
+    } else { S.describeLoading = false; }
+  });
+
+  // Load content (async — don't await here)
+  loadFileContent(fileId, docsetId, fileInfo.pageCount);
+}
+
+async function loadFileContent(fileId, docsetId, pageCount) {
+  try {
+    // Load XML
+    let xmlStr = null;
+    if (docsetId && S.wsHandle) {
+      try { xmlStr = await findXml(S.wsHandle, docsetId, fileId); } catch {}
+    }
+    S.xmlStr = xmlStr;
+    S.overlaysByPage = xmlStr ? buildOverlaysByPage(xmlStr) : new Map();
+    _metrics = xmlStr ? computeTagMetrics(xmlStr) : [];
+
+    refreshFilterBtns();
+    refreshTagChips();
+    renderTreePanel();
+    renderAnchorStrip();
+    renderOverlay();
+
+    if (xmlStr && _metrics.length) runSemanticClassification(); // background, no await
+  } catch (e) {
+    console.error('loadFileContent error:', e);
+    S.xmlStr = null; S.overlaysByPage = new Map(); _metrics = [];
+    refreshFilterBtns(); refreshTagChips(); renderTreePanel(); renderAnchorStrip();
+  }
+
+  // Load page images
+  try { await loadPageImages(fileId, pageCount); } catch (e) { console.error('loadPageImages error:', e); }
+}
+
+async function loadPageImages(fileId, pageCount) {
+  const col = document.getElementById('fv-page-col');
+  if (!col) return;
+
+  let count = pageCount;
+  if (!count && S.wsHandle) {
+    const dir = await getDirHandle(S.wsHandle, 'files', fileId, 'page_images');
+    if (dir) count = (await listFileNames(dir)).filter(n => /\.(png|jpe?g)$/i.test(n)).length;
+  }
+  if (!count) { col.innerHTML = '<div style="color:#9ca3af;padding:40px;font-size:13px;text-align:center">No page images found for this file.</div>'; return; }
+
+  S.pageCount = count;
+  if (S.currentPage > count) S.currentPage = 1;
+
+  // Build stage: wrap > img + svg (SVG absolutely positioned over img)
+  col.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'page-stage-wrap';
+  wrap.id = 'pg-wrap';
+
+  const img = document.createElement('img');
+  img.id = 'pg-img';
+  img.alt = 'Page';
+  img.addEventListener('error', () => { img.style.display = 'none'; });
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.id = 'pg-svg';
+  // viewBox 0 0 100 100 — rect coords are percent-of-page (pixel rects converted at render time)
+  svg.setAttribute('viewBox', '0 0 100 100');
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  wrap.appendChild(img);
+  wrap.appendChild(svg);
+  col.appendChild(wrap);
+
+  updateNavBar();
+  updateZoom();        // sets wrap width so img.offsetWidth is valid when onload fires
+  loadCurrentPageImage();
+}
+
+function loadCurrentPageImage() {
+  const img = document.getElementById('pg-img');
+  const svg = document.getElementById('pg-svg');
+  if (!img) return;
+  svg && (svg.innerHTML = ''); // clear stale overlay; redraw for new page immediately
+  renderOverlay();
+  if (S.wsHandle && S.fileId) {
+    getPageBlobUrl(S.wsHandle, S.fileId, S.currentPage).then(url => {
+      const img2 = document.getElementById('pg-img');
+      if (!img2) return;
+      if (url) { img2.style.display = ''; img2.src = url; img2.onload = renderOverlay; }
+      else { img2.style.display = 'none'; }
+    });
+  }
+}
+
+function showPage() {
+  updateNavBar();
+  updateZoom();
+  loadCurrentPageImage();
+}
+
+function updateNavBar() {
+  const el = document.getElementById('nav-count');
+  if (el) el.textContent = `${S.currentPage} / ${S.pageCount || '?'}`;
+  const prev = document.getElementById('nav-prev');
+  const next = document.getElementById('nav-next');
+  if (prev) prev.disabled = S.currentPage <= 1;
+  if (next) next.disabled = S.currentPage >= S.pageCount;
+}
+
+function updateZoom() {
+  const lbl = document.getElementById('zoom-lbl');
+  if (lbl) lbl.textContent = S.zoomPct + '%';
+  const wrap = document.getElementById('pg-wrap');
+  if (wrap) {
+    // Base width 860px × zoom factor
+    wrap.style.width = Math.round(860 * S.zoomPct / 100) + 'px';
+  }
+  // With viewBox 0 0 100 100 the SVG scales via CSS — no re-render needed on zoom.
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TAG PANEL
+// ═══════════════════════════════════════════════════════════════════
+function refreshFilterBtns() {
+  const el = document.getElementById('tdp-filters');
+  if (!el) return;
+  const mkBtn = (label, isSem) => {
+    const active = S.tagFilter === label;
+    let cls = 'tdp-btn' + (active ? ' active' : '');
+    if (!active && isSem) cls += S.semanticLoading ? ' sem loading' : !S.llm.apiKey ? ' sem no-key' : ' sem';
+    return `<button class="${cls}" data-f="${esc(label)}">${esc(label)}</button>`;
+  };
+  el.innerHTML = mkBtn('All', false) + SEMANTIC_FILTERS.map(f => mkBtn(f, true)).join('') + ALGO_FILTERS.map(f => mkBtn(f, false)).join('');
+  el.querySelectorAll('[data-f]').forEach(btn => btn.addEventListener('click', () => {
+    const label = btn.dataset.f;
+    if (SEMANTIC_FILTERS.includes(label)) {
+      if (!S.llm.apiKey) { toast('This filter needs an LLM API key — set one in LLM Settings.', 'error'); return; }
+      if (S.semanticLoading) { toast('Still classifying tags — try again in a moment.', 'error'); return; }
+      if (S.semanticError) { toast('Tag classification failed: ' + S.semanticError, 'error'); return; }
+    }
+    S.tagFilter = label; refreshFilterBtns(); refreshTagChips();
+  }));
+}
+
+function refreshTagChips() {
+  const chipsEl = document.getElementById('tdp-chips');
+  const icoEl = document.getElementById('tdp-search-ico');
+  if (!chipsEl) return;
+  if (icoEl) icoEl.textContent = S.describeLoading ? '⟳' : S.describeResults !== null ? '✦' : '';
+
+  const filtered = getFilteredMetrics();
+  if (!filtered.length) {
+    chipsEl.innerHTML = `<span class="tdp-empty">${_metrics.length ? 'No tags match.' : 'No DGML loaded.'}</span>`;
+    return;
+  }
+  chipsEl.innerHTML = filtered.map(m => {
+    const sel = S.selTag === m.name, hov = S.hovTag === m.name;
+    return `<span class="chip${sel ? ' sel' : ''}${hov ? ' hov' : ''}" data-tag="${esc(m.name)}">${esc(m.name)}<span class="chip-cnt">${m.count}</span></span>`;
+  }).join('');
+  chipsEl.querySelectorAll('[data-tag]').forEach(chip => {
+    const tag = chip.dataset.tag;
+    // Hover must NOT rebuild the chip list (refreshTagChips() replaces every
+    // chip, including the one under the pointer) — same click-drop hazard as
+    // the SVG overlay. Toggle classes on the existing elements instead.
+    chip.addEventListener('mouseenter', () => { S.hovTag = tag; updateChipStyles(); renderAnchorStrip(); updateOverlayStyles(); });
+    chip.addEventListener('mouseleave', () => { S.hovTag = null; updateChipStyles(); renderAnchorStrip(); updateOverlayStyles(); });
+    chip.addEventListener('click', () => {
+      S.selTag = S.selTag === tag ? null : tag;  // toggle selTag only, never touch selNodeId
+      refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+    });
+  });
+}
+
+function updateChipStyles() {
+  document.querySelectorAll('#tdp-chips [data-tag]').forEach(chip => {
+    const tag = chip.dataset.tag;
+    chip.classList.toggle('sel', S.selTag === tag);
+    chip.classList.toggle('hov', S.hovTag === tag);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TREE PANEL
+// ═══════════════════════════════════════════════════════════════════
+const PREVIEW_MAX = 80;
+
+function buildTreeNodes(el, id) {
+  const children = [];
+  for (let i = 0; i < el.children.length; i++) children.push(buildTreeNodes(el.children[i], `${id}/${i}`));
+  const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+  const preview = text.length > PREVIEW_MAX ? text.slice(0, PREVIEW_MAX - 1) + '…' : text;
+  const originAttr = (el.getAttributeNS(DG_NS, 'origin') ?? el.getAttribute('dg:origin') ?? '').trim();
+  const hasBoxes = !!originAttr;
+  return { id, tag: el.tagName, preview, hasBoxes, children };
+}
+
+function defaultTreeExpanded(node, depth) {
+  if (depth < 2) {
+    treeExpanded.add(node.id);
+    for (const c of node.children) defaultTreeExpanded(c, depth + 1);
+  }
+}
+
+// Node ids are '/'-joined paths (e.g. "r/0/2/0"), so ancestors are just its
+// prefixes. Selecting a node from outside the tree (a page-image click, a
+// tag chip) must expand its whole ancestor chain — otherwise a node past
+// the default depth-2 expansion is selected in state but invisible, and a
+// click looks like it did nothing even though it worked.
+function expandAncestorsOf(nodeId) {
+  if (!nodeId) return;
+  const parts = nodeId.split('/');
+  let path = parts[0];
+  treeExpanded.add(path);
+  for (let i = 1; i < parts.length; i++) {
+    path += '/' + parts[i];
+    treeExpanded.add(path);
+  }
+}
+
+function renderTreePanel() {
+  const scroll = document.getElementById('tree-scroll');
+  if (!scroll) return;
+  if (!S.xmlStr) { scroll.innerHTML = '<div class="tree-placeholder">No DGML file found for this document.</div>'; return; }
+  const doc = new DOMParser().parseFromString(S.xmlStr, 'application/xml');
+  if (doc.querySelector('parsererror')) { scroll.innerHTML = '<div class="tree-placeholder">XML parse error.</div>'; return; }
+  const root = buildTreeNodes(doc.documentElement, 'r');
+  // On first render of this file set default expansion (depth 0 + 1)
+  if (treeExpanded.size === 0) defaultTreeExpanded(root, 0);
+  scroll.innerHTML = renderTreeNode(root, 0);
+  scroll.querySelectorAll('[data-toggle]').forEach(btn => btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const id = btn.dataset.toggle;
+    if (treeExpanded.has(id)) treeExpanded.delete(id); else treeExpanded.add(id);
+    renderTreePanel();
+  }));
+  scroll.querySelectorAll('[data-tree-tag]').forEach(btn => {
+    const tag = btn.dataset.treeTag;
+    const nid = btn.dataset.treeId || null;
+    const hasBoxes = !!btn.dataset.hasBoxes;
+    btn.addEventListener('pointerenter', () => {
+      S.hovNodeId = nid; S.hovTag = tag;
+      refreshTagChips(); renderAnchorStrip(); renderOverlay();
+    });
+    btn.addEventListener('pointerleave', () => {
+      S.hovNodeId = null; S.hovTag = null;
+      refreshTagChips(); renderAnchorStrip(); renderOverlay();
+    });
+    btn.addEventListener('click', () => {
+      // Always set selTag (React: always dispatch setSelectedTagName)
+      S.selTag = tag;
+      // Toggle selNodeId regardless of hasBoxes — a tree click always
+      // identifies one concrete node (buildTreeNodes gives every node an
+      // id), whether or not it has a page bounding box to scroll to. Boxes
+      // only gate the scroll/jump side effect below, not the selection
+      // itself — anchoring a node doesn't require it to be visible on a
+      // page image.
+      S.selNodeId = S.selNodeId === nid ? null : nid;
+      if (hasBoxes) {
+        const onCurrentPage = (S.overlaysByPage.get(S.currentPage) || []).some(r => r.nodeId === nid);
+        if (onCurrentPage) {
+          // scroll the rect into view (React: requestScrollToDgmlNode)
+          const svgRect = document.querySelector(`[data-nid="${CSS.escape(nid)}"]`);
+          svgRect?.scrollIntoView({ block: 'nearest' });
+        } else {
+          jumpToPage(nearestPageForNodeId(nid));
+        }
+      }
+      refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+    });
+  });
+}
+
+function renderTreeNode(node, depth) {
+  const tag = stripNs(node.tag);
+  const hasKids = node.children.length > 0;
+  const expanded = treeExpanded.has(node.id);
+  const isSel = (!!S.selNodeId && node.id === S.selNodeId) || (!!S.selTag && tag === S.selTag);
+  const isHov = !isSel && ((!!S.hovNodeId && node.id === S.hovNodeId) || (!!S.hovTag && tag === S.hovTag));
+  const indent = depth * 12;
+  let btnCls = 'tree-node-btn';
+  if (isSel) btnCls += ' tag-sel';
+  else if (isHov) btnCls += ' tag-hov';
+  if (!node.hasBoxes) btnCls += ' no-boxes';
+  let h = `<div class="tree-node-wrap"><div class="tree-node-row" style="padding-left:${indent}px">`;
+  h += hasKids
+    ? `<span class="tree-toggle" data-toggle="${esc(node.id)}">${expanded ? '▾' : '▸'}</span>`
+    : `<span class="tree-toggle invisible">▸</span>`;
+  h += `<button class="${btnCls}" data-tree-tag="${esc(tag)}" data-tree-id="${esc(node.id)}" data-has-boxes="${node.hasBoxes ? '1' : ''}">`;
+  h += `<span class="tree-tag">${esc(tag)}</span>`;
+  if (node.preview) h += `<span class="tree-preview">${esc(node.preview)}</span>`;
+  h += `</button></div>`;
+  if (hasKids && expanded) {
+    for (const child of node.children) h += renderTreeNode(child, depth + 1);
+  }
+  return h + '</div>';
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ANCHOR STRIP
+// ═══════════════════════════════════════════════════════════════════
+function renderAnchorStrip() {
+  const area = document.getElementById('anchor-area');
+  if (!area) return;
+  const fileId = S.fileId;
+  const canAdd = !!S.selTag && !S.basket.some(b => b.tag === S.selTag);
+  const hasInstance = !!S.selNodeId;
+  const history = fileId ? S.anchorHistory.filter(r => r.fileId === fileId) : [];
+
+  let h = `<div class="anchor-strip">
+    <span class="anchor-label">Anchor on Chain</span>
+    <div class="anchor-basket">`;
+  if (!S.basket.length) {
+    h += '<span class="basket-empty">empty</span>';
+  } else {
+    for (const entry of S.basket) {
+      const sel = S.selTag === entry.tag, hov = !sel && S.hovTag === entry.tag;
+      h += `<span class="basket-tag${sel ? ' sel' : ''}${hov ? ' hov' : ''}" data-bt="${esc(entry.tag)}" data-bt-nid="${esc(entry.nodeId || '')}">${esc(entry.tag)}<button class="basket-rm" data-rm="${esc(entry.tag)}" title="Remove">×</button></span>`;
+    }
+  }
+  h += '</div>';
+  if (canAdd) h += `<button class="anchor-add-btn" id="btn-basket-add"${hasInstance ? '' : ' disabled title="Click an occurrence in the tree first"'}>+ ${esc(S.selTag)}</button>`;
+  if (S.basket.length) h += `<button class="anchor-now-btn" id="btn-anchor-now">Anchor on Chain now ⚓</button>`;
+  h += '</div>';
+
+  if (history.length) {
+    h += `<div class="anchor-history"><div class="anchor-history-hdr">Anchored records</div>`;
+    for (let i = 0; i < history.length; i++) {
+      const r = history[i];
+      const shortTx = r.tx.slice(0, 10) + '…' + r.tx.slice(-6);
+      h += `<div class="anchor-rec"><span class="anc-ts">${new Date(r.ts).toLocaleString()}</span><span class="anc-chain">${esc(r.chain)}</span><span class="anc-tags">${esc(r.tags.join(', '))}</span><span class="anc-tx">${esc(shortTx)}</span><button class="anc-verify" data-vi="${i}">Verify ↗</button></div>`;
+    }
+    h += '</div>';
+  }
+
+  area.innerHTML = h;
+
+  area.querySelectorAll('[data-bt]').forEach(el => el.addEventListener('click', e => {
+    if (e.target.dataset.rm) return;
+    if (S.selTag === el.dataset.bt) {
+      S.selTag = null; // toggle off
+    } else {
+      // Re-select exactly the instance this basket entry was added from.
+      S.selTag = el.dataset.bt;
+      S.selNodeId = el.dataset.btNid || null;
+    }
+    refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+  }));
+  area.querySelectorAll('[data-rm]').forEach(btn => btn.addEventListener('click', e => {
+    e.stopPropagation(); S.basket = S.basket.filter(b => b.tag !== btn.dataset.rm); renderAnchorStrip();
+  }));
+  const addBtn = area.querySelector('#btn-basket-add');
+  if (addBtn) addBtn.onclick = () => {
+    if (S.selTag && S.selNodeId && !S.basket.some(b => b.tag === S.selTag)) {
+      // Only reachable with a concrete selNodeId (the button is disabled
+      // otherwise) — every basket entry names one exact instance, never an
+      // arbitrary first-in-document match of the tag name.
+      S.basket = [...S.basket, { tag: S.selTag, nodeId: S.selNodeId }];
+      renderAnchorStrip();
+    }
+  };
+  const nowBtn = area.querySelector('#btn-anchor-now');
+  if (nowBtn) nowBtn.onclick = openAnchorDialog;
+  area.querySelectorAll('[data-vi]').forEach(btn => btn.addEventListener('click', () => openVerifyDialog(history[+btn.dataset.vi])));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SETUP / PIPELINE
+// ═══════════════════════════════════════════════════════════════════
+function renderSetup(main) {
+  let tab = 'new';
+  function draw() {
+    main.innerHTML = `
+      <div class="page">
+        <div class="page-hdr"><div class="page-title">Pipeline Setup</div></div>
+        <div class="setup-tabs">
+          <div class="setup-tab${tab === 'new' ? ' active' : ''}" id="tab-new">New docset</div>
+          <div class="setup-tab${tab === 'resume' ? ' active' : ''}" id="tab-resume">Resume</div>
+        </div>
+        <div id="setup-body" style="flex:1;display:flex;flex-direction:column;overflow:hidden"></div>
+      </div>`;
+    document.getElementById('tab-new').onclick = () => { tab = 'new'; draw(); };
+    document.getElementById('tab-resume').onclick = () => { tab = 'resume'; draw(); };
+    tab === 'new' ? drawNew() : drawResume();
+  }
+  draw();
+}
+
+function drawNew() {
+  const pickBtn = IS_SERVER ? `<button class="btn btn-secondary btn-sm" id="btn-pick-pdf">Browse…</button>` : '';
+  const pickBtnWs = IS_SERVER ? `<button class="btn btn-secondary btn-sm" id="btn-pick-ws">Browse…</button>` : '';
+  document.getElementById('setup-body').innerHTML = `
+    <div class="setup-panel">
+      ${!IS_SERVER ? '<div class="stub-notice"><strong>Note:</strong> In the standalone browser app, the pipeline cannot run the <code>dgml</code> CLI. Steps below are simulated. Use <code>dgml-app-sample-server.py</code> or the CLI directly for real processing.</div>' : ''}
+      <div class="form-row"><label class="form-label">PDF folder path</label><div style="display:flex;gap:6px"><input class="form-input" id="pdf-path" placeholder="/path/to/pdfs" style="flex:1" />${pickBtn}</div></div>
+      <div class="form-row"><label class="form-label">Workspace path</label><div style="display:flex;gap:6px"><input class="form-input" id="ws-path" placeholder="/path/to/dgml-workspace" style="flex:1" />${pickBtnWs}</div></div>
+      <div id="pipe-area"></div>
+      <div class="flex-row">
+        <button class="btn btn-primary" id="btn-run">${IS_SERVER ? 'Run pipeline' : 'Run pipeline (simulated)'}</button>
+        <button class="btn btn-secondary" id="btn-open-after">Open workspace when done</button>
+      </div>
+    </div>`;
+  if (IS_SERVER) {
+    document.getElementById('btn-pick-pdf').onclick = async () => {
+      const { path } = await fetch('/api/pick-dir', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({}) }).then(r => r.json());
+      if (path) document.getElementById('pdf-path').value = path;
+    };
+    document.getElementById('btn-pick-ws').onclick = async () => {
+      const { path } = await fetch('/api/pick-dir', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({}) }).then(r => r.json());
+      if (path) document.getElementById('ws-path').value = path;
+    };
+    document.getElementById('btn-run').onclick = () => {
+      const sourceDir = document.getElementById('pdf-path').value.trim();
+      const workspaceDir = document.getElementById('ws-path').value.trim();
+      if (!sourceDir || !workspaceDir) { toast('Enter both PDF folder and workspace paths.', 'error'); return; }
+      runServerPipeline('pipe-area', '/pipeline/start', { sourceDir, workspaceDir, model: S.llm.model, apiKey: S.llm.apiKey }, 'btn-run', 'Run pipeline', 'add');
+    };
+  } else {
+    document.getElementById('btn-run').onclick = () => runFakePipeline('pipe-area');
+  }
+  document.getElementById('btn-open-after').onclick = openWorkspace;
+}
+
+function drawResume() {
+  const pickBtnWs = IS_SERVER ? `<button class="btn btn-secondary btn-sm" id="btn-pick-ws-r">Browse…</button>` : '';
+  document.getElementById('setup-body').innerHTML = `
+    <div class="setup-panel">
+      ${!IS_SERVER ? '<div class="stub-notice"><strong>Note:</strong> Resume also runs as a simulation in the browser.</div>' : ''}
+      <div class="form-row"><label class="form-label">Workspace path</label><div style="display:flex;gap:6px"><input class="form-input" id="ws-path-r" placeholder="/path/to/dgml-workspace" value="${esc(S.lastWorkspaceDir)}" style="flex:1" />${pickBtnWs}</div></div>
+      <div id="pipe-area-r"></div>
+      <div class="flex-row">
+        <button class="btn btn-primary" id="btn-resume">${IS_SERVER ? 'Resume pipeline' : 'Resume (simulated)'}</button>
+        <button class="btn btn-secondary" id="btn-open-r">Open workspace</button>
+      </div>
+    </div>`;
+  if (IS_SERVER) {
+    document.getElementById('btn-pick-ws-r').onclick = async () => {
+      const { path } = await fetch('/api/pick-dir', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({}) }).then(r => r.json());
+      if (path) document.getElementById('ws-path-r').value = path;
+    };
+    document.getElementById('btn-resume').onclick = () => {
+      const workspaceDir = document.getElementById('ws-path-r').value.trim();
+      if (!workspaceDir) { toast('Enter the workspace path.', 'error'); return; }
+      runServerPipeline('pipe-area-r', '/pipeline/resume', { workspaceDir, model: S.llm.model, apiKey: S.llm.apiKey }, 'btn-resume', 'Resume pipeline');
+    };
+  } else {
+    document.getElementById('btn-resume').onclick = () => runFakePipeline('pipe-area-r');
+  }
+  document.getElementById('btn-open-r').onclick = openWorkspace;
+}
+
+async function runServerPipeline(areaId, endpoint, body, btnId, idleLabel, gateStep) {
+  if (S.pipelineRunning) return;
+  S.pipelineRunning = true;
+  if (body.workspaceDir) S.lastWorkspaceDir = body.workspaceDir;
+  const area = document.getElementById(areaId);
+  if (!area) { S.pipelineRunning = false; return; }
+
+  const btn = document.getElementById(btnId);
+  const startOnclick = btn ? btn.onclick : null;
+  function toSuspend() {
+    if (!btn) return;
+    btn.textContent = 'Suspend';
+    // Cancelling mid-`add` leaves un-added source files that only "Run
+    // pipeline" (not "Resume") will pick up, so don't offer Suspend until
+    // `add` (when present) has finished.
+    btn.disabled = !!gateStep;
+    btn.onclick = async () => {
+      try { await fetch('/pipeline/cancel', { method: 'POST' }); }
+      catch (e) { toast('Failed to suspend: ' + e.message, 'error'); }
+    };
+  }
+  function toIdle() {
+    if (!btn) return;
+    btn.textContent = idleLabel;
+    btn.disabled = false;
+    btn.onclick = startOnclick;
+  }
+  function toResume() {
+    if (!btn) return;
+    // Suspend is only reachable once `add` (when present) is already done,
+    // so resuming never needs to re-run it — go straight to cluster+generate
+    // on the same workspace, same as the Resume tab.
+    btn.textContent = 'Resume';
+    btn.disabled = false;
+    btn.onclick = () => runServerPipeline(
+      areaId, '/pipeline/resume',
+      { workspaceDir: body.workspaceDir, model: S.llm.model, apiKey: S.llm.apiKey },
+      btnId, idleLabel, null
+    );
+  }
+  toSuspend();
+
+  const stepState = {};
+  const logs = [];
+  function draw() {
+    const stepsHtml = Object.entries(stepState).map(([name, status]) => {
+      const ico = status === 'running' ? '<div class="step-ico running">↻</div>' : status === 'done' ? '<div class="step-ico done">✓</div>' : '<div class="step-ico error">✗</div>';
+      return `<div class="step-item">${ico}<span>${esc(name)}</span></div>`;
+    }).join('');
+    area.innerHTML = `<div class="step-list" style="margin-bottom:12px">${stepsHtml}</div><div class="log-box">${logs.map(l => `<div>${esc(l)}</div>`).join('')}</div>`;
+    const lb = area.querySelector('.log-box'); if (lb) lb.scrollTop = lb.scrollHeight;
+  }
+  draw();
+
+  try {
+    const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (!res.ok) { const e = await res.json(); toast(e.error || 'Pipeline failed to start', 'error'); S.pipelineRunning = false; toIdle(); return; }
+  } catch (e) { toast('Cannot reach server: ' + e.message, 'error'); S.pipelineRunning = false; toIdle(); return; }
+
+  const es = new EventSource('/pipeline/events');
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'step') {
+      stepState[ev.name] = ev.status; draw();
+      if (btn && gateStep && ev.name === gateStep && (ev.status === 'done' || ev.status === 'error')) {
+        btn.disabled = false;
+      }
+    }
+    else if (ev.type === 'log') { logs.push(ev.text); draw(); }
+    else if (ev.type === 'done') {
+      logs.push('Pipeline complete!'); draw();
+      es.close(); S.pipelineRunning = false; toIdle();
+      // Switch workspace to the completed one and navigate home
+      const wsDir = ev.workspaceDir;
+      if (wsDir) {
+        S.wsHandle = 'server'; S.wsName = wsDir.split(/[\\/]/).pop() || wsDir; S.wsPath = wsDir;
+        refreshWorkspace(true);
+      }
+    } else if (ev.type === 'error') {
+      logs.push('Error: ' + ev.message); draw();
+      es.close(); S.pipelineRunning = false; toIdle();
+    } else if (ev.type === 'cancelled') {
+      logs.push('Suspended. Click Resume to continue.'); draw();
+      es.close(); S.pipelineRunning = false; toResume();
+    }
+  };
+  es.onerror = () => { logs.push('Connection to server lost.'); draw(); es.close(); S.pipelineRunning = false; toIdle(); };
+}
+
+async function runFakePipeline(areaId) {
+  if (S.pipelineRunning) return;
+  S.pipelineRunning = true;
+  const area = document.getElementById(areaId);
+  if (!area) { S.pipelineRunning = false; return; }
+  const steps = PIPELINE_STEPS.map(() => 'pending');
+  const logs = [];
+  function draw() {
+    area.innerHTML = `<div class="step-list" style="margin-bottom:12px">${steps.map((s, i) => {
+      const ico = s === 'running' ? '<div class="step-ico running">↻</div>' : s === 'done' ? '<div class="step-ico done">✓</div>' : '<div class="step-ico pending">○</div>';
+      return `<div class="step-item">${ico}<span>${PIPELINE_STEPS[i]}</span></div>`;
+    }).join('')}</div><div class="log-box">${logs.map(l => `<div>${esc(l)}</div>`).join('')}</div>`;
+    const lb = area.querySelector('.log-box'); if (lb) lb.scrollTop = lb.scrollHeight;
+  }
+  draw();
+  for (let i = 0; i < PIPELINE_STEPS.length; i++) {
+    steps[i] = 'running'; draw();
+    for (const line of FAKE_OUTPUT[i]) { logs.push(line); draw(); await delay(280 + Math.random() * 350); }
+    steps[i] = 'done'; draw(); await delay(180);
+  }
+  logs.push('Pipeline complete! Open your workspace folder to explore the results.'); draw();
+  S.pipelineRunning = false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WORKSPACE
+// ═══════════════════════════════════════════════════════════════════
+async function openWorkspace() {
+  if (IS_SERVER) {
+    try {
+      const { path } = await fetch('/api/pick-dir', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ startPath: S.wsPath || null }) }).then(r => r.json());
+      if (!path) return; // user cancelled
+      await fetch('/workspace/switch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ root: path }) });
+      S.wsHandle = 'server'; S.wsName = path.split(/[\\/]/).pop() || path; S.wsPath = path;
+      await refreshWorkspace(true);
+    } catch (e) { toast('Failed to open workspace: ' + e.message, 'error'); }
+    return;
+  }
+  if (!window.showDirectoryPicker) { toast('File System Access API not supported. Use Chrome or Edge.', 'error'); return; }
+  try {
+    const handle = await window.showDirectoryPicker({ mode: 'read' });
+    WORKSPACE_READ_BASE = null; // leaving a bundled sample (if any) for a real local folder
+    S.wsHandle = handle; S.wsName = handle.name; S.wsPath = '';
+    await refreshWorkspace(true);
+  } catch (e) { if (e.name !== 'AbortError') toast('Failed to open workspace: ' + e.message, 'error'); }
+}
+
+// Switch to one of the bundled sample workspaces discovered in
+// samples/file-list.json (see the "STATIC SAMPLE BUNDLE" section above).
+async function selectStaticSample(sample) {
+  WORKSPACE_READ_BASE = sample.base;
+  S.wsHandle = 'static'; S.wsName = sample.name; S.wsPath = sample.base;
+  await refreshWorkspace(true);
+}
+
+async function refreshWorkspace(initial = false) {
+  if (!S.wsHandle) return;
+  const ico = document.getElementById('refresh-ico');
+  if (ico) ico.style.animation = 'spin .6s linear infinite';
+  try {
+    S.wsIndex = await buildIndex(S.wsHandle);
+    if (initial) {
+      const { docsets, files } = S.wsIndex;
+      if (!files.length && !docsets.length) nav('/setup');
+      else if (docsets.length && docsets[0].fileIds.length) nav(`/docsets/${docsets[0].id}/files/${docsets[0].fileIds[0]}`, { docsetId: docsets[0].id, fileId: docsets[0].fileIds[0] });
+      else nav('/');
+    } else render();
+  } catch (e) { toast('Error reading workspace: ' + e.message, 'error'); }
+  finally { if (ico) ico.style.animation = ''; }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RESIZE HANDLES
+// ═══════════════════════════════════════════════════════════════════
+function initSidebarResize() {
+  const handle = document.getElementById('resize-handle');
+  const sb = document.getElementById('sidebar');
+  let drag = false, sx = 0, sw = 0;
+  handle.addEventListener('mousedown', e => { drag = true; sx = e.clientX; sw = sb.offsetWidth; handle.classList.add('drag'); e.preventDefault(); });
+  document.addEventListener('mousemove', e => { if (!drag) return; sb.style.width = Math.max(160, Math.min(480, sw + e.clientX - sx)) + 'px'; });
+  document.addEventListener('mouseup', () => { drag = false; handle.classList.remove('drag'); });
+}
+
+function initRightResize() {
+  const handle = document.getElementById('right-rh');
+  if (!handle) return;
+  let drag = false, sy = 0, sh = 0;
+  handle.addEventListener('mousedown', e => { drag = true; sy = e.clientY; sh = tagPanelH; e.preventDefault(); });
+  document.addEventListener('mousemove', e => {
+    if (!drag) return;
+    const wrap = document.getElementById('tdp-wrap');
+    if (!wrap) return;
+    tagPanelH = Math.max(TAG_PANEL_MIN, sh + e.clientY - sy);
+    wrap.style.height = tagPanelH + 'px';
+  });
+  document.addEventListener('mouseup', () => { drag = false; });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UTILS
+// ═══════════════════════════════════════════════════════════════════
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+// ═══════════════════════════════════════════════════════════════════
+// BOOT
+// ═══════════════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', () => {
+  initSidebarResize();
+
+  // Keyboard shortcuts for file viewer
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+    if (e.key === 'ArrowLeft') { if (S.currentPage > 1) { S.currentPage--; showPage(); } }
+    else if (e.key === 'ArrowRight') { if (S.currentPage < S.pageCount) { S.currentPage++; showPage(); } }
+    else if (e.key === '+' || e.key === '=') { S.zoomPct = Math.min(300, S.zoomPct + 10); updateZoom(); }
+    else if (e.key === '-') { S.zoomPct = Math.max(25, S.zoomPct - 10); updateZoom(); }
+    else if (e.key === '0') { S.zoomPct = 100; updateZoom(); }
+  });
+
+  // Header
+  document.getElementById('ws-chip').onclick = openWorkspace;
+  document.getElementById('btn-refresh').onclick = () => refreshWorkspace();
+  document.getElementById('sample-picker').onchange = e => {
+    const sample = STATIC_SAMPLES.find(s => s.id === e.target.value);
+    if (sample) selectStaticSample(sample);
+  };
+  document.getElementById('btn-setup').onclick = () => {
+    if (S.route === '/setup') nav(prevRoute, prevRouteParams);
+    else nav('/setup');
+  };
+  document.getElementById('btn-llm').onclick = () => {
+    const sel = document.getElementById('llm-model-sel');
+    const knownVals = [...sel.options].map(o => o.value).filter(v => v !== '__custom__');
+    if (knownVals.includes(S.llm.model)) { sel.value = S.llm.model; document.getElementById('llm-custom-row').classList.add('hidden'); }
+    else { sel.value = '__custom__'; document.getElementById('llm-custom-row').classList.remove('hidden'); document.getElementById('llm-custom-inp').value = S.llm.model; }
+    const keyInp = document.getElementById('llm-key-inp');
+    keyInp.value = S.llm.apiKey; keyInp.type = 'password';
+    document.getElementById('eye-on').style.display = ''; document.getElementById('eye-off').style.display = 'none';
+    document.getElementById('dlg-llm').classList.remove('hidden');
+  };
+
+  // LLM dialog
+  document.getElementById('llm-model-sel').onchange = function () {
+    document.getElementById('llm-custom-row').classList.toggle('hidden', this.value !== '__custom__');
+  };
+  const llmClose = () => document.getElementById('dlg-llm').classList.add('hidden');
+  document.getElementById('llm-x').onclick = llmClose;
+  document.getElementById('llm-cancel').onclick = llmClose;
+  document.getElementById('dlg-llm').onclick = e => { if (e.target === e.currentTarget) llmClose(); };
+  document.getElementById('llm-save').onclick = () => {
+    const sel = document.getElementById('llm-model-sel');
+    S.llm.model = sel.value === '__custom__' ? (document.getElementById('llm-custom-inp').value.trim() || 'claude-sonnet-4-6') : sel.value;
+    S.llm.apiKey = document.getElementById('llm-key-inp').value.trim();
+    saveLlm(); renderHeader();
+    llmClose(); toast('LLM settings saved.');
+  };
+  document.getElementById('llm-key-eye').onclick = () => {
+    const inp = document.getElementById('llm-key-inp');
+    const show = inp.type === 'text'; inp.type = show ? 'password' : 'text';
+    document.getElementById('eye-on').style.display = show ? '' : 'none';
+    document.getElementById('eye-off').style.display = show ? 'none' : '';
+  };
+
+  // Anchor dialog
+  const anchorClose = () => document.getElementById('dlg-anchor').classList.add('hidden');
+  document.getElementById('anchor-x').onclick = anchorClose;
+  document.getElementById('anchor-cancel').onclick = anchorClose;
+  document.getElementById('dlg-anchor').onclick = e => { if (e.target === e.currentTarget) anchorClose(); };
+  document.getElementById('anchor-confirm').onclick = confirmAnchor;
+
+  // Verify dialog
+  const verifyClose = () => document.getElementById('dlg-verify').classList.add('hidden');
+  document.getElementById('verify-x').onclick = verifyClose;
+  document.getElementById('verify-close').onclick = verifyClose;
+  document.getElementById('dlg-verify').onclick = e => { if (e.target === e.currentTarget) verifyClose(); };
+
+  render();
+  detectWorkspaceAndBoot();
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// BOOT-TIME BACKEND / STATIC-BUNDLE DETECTION
+// Runs once, after the first paint. Tries, in order: a real backend, then
+// a bundled sample workspace, then falls back to the Welcome screen with
+// the folder picker (today's plain-static-host / no-bundle behavior).
+// ═══════════════════════════════════════════════════════════════════
+async function detectWorkspaceAndBoot() {
+  if (location.protocol === 'file:') return; // folder-picker only, unchanged
+
+  // Is a real dgml-app-sample-server.py backend answering at this origin?
+  try {
+    const r = await fetch('/workspace/_index');
+    if (r.ok) {
+      const data = await r.json();
+      IS_SERVER = true;
+      if (data.root) {
+        S.wsHandle = 'server';
+        S.wsName = data.root.split(/[\\/]/).pop() || data.root;
+        S.wsPath = data.root;
+        await refreshWorkspace(true);
+      }
+      return;
+    }
+  } catch {}
+
+  // No backend — are there sample workspaces to browse, either bundled
+  // next to this file or (falling back) live from dgml-spec on GitHub?
+  // See loadStaticFileList().
+  try {
+    const fileList = await loadStaticFileList();
+    STATIC_SAMPLES = discoverStaticSamples(fileList);
+    if (STATIC_SAMPLES.length) await selectStaticSample(STATIC_SAMPLES[0]);
+  } catch {}
+}
+</script>
+</body>
+</html>

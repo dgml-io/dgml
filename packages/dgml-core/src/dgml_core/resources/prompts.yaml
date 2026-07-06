@@ -1,0 +1,233 @@
+# Prompts for core (non-generation) dgml LLM features. Edit the wording here
+# without touching Python code; fetched by name via dgml_core.prompts.get
+# (the generation pipeline has its own resources/prompts.yaml + loader).
+
+# ── Hybrid text extraction: LLM-driven per-cluster merge ──────────────────────
+# System prompt for reconciling a digital + OCR token cluster. Each paragraph
+# is one line; blank lines separate paragraphs. Loaded by dgml.hybrid and
+# rstrip()'d, so the trailing newline YAML adds is harmless.
+merge_system_prompt: |
+  You reconcile two text extractions of the same scanned page region: DIGITAL (characters read straight from the PDF's embedded fonts) and OCR (characters recognized from the page image). Each is a list of word tokens; every token has a unique id and is meant to be exactly one word.
+
+  For each cluster you are given, return the best final list of word tokens. Rules, in priority order:
+
+  1. Match the intended word boundaries. Each token should be one word as written on the page -- follow the spacing the author used, not dictionary morphology. If one side ran two space-separated words together into a single token (e.g. `outof` -> `out` `of`), prefer the side that splits them. But do NOT split a token that is legitimately a single word even though it fuses parts: brand and product names, and CamelCase or run-together identifiers (e.g. `PayPal`, `SharePoint`, `eBay`, `AccessControl`), stay as one token.
+  2. Ligatures. If one side encodes a ligature as a single glyph (fi, fl, ff, ffi, ffl, ... shown as one character) inside a word and the other spells it with separate letters, output the separated-letter form.
+  3. Keep whole words, not fragments. If one side has shattered a word into pieces that are not themselves words -- one token per letter, or arbitrary splits like `INFOR` `MATION` -- while the other side keeps it as a single real word, favor the side whose tokens are real words (e.g. digital `F` `L` `I` `G` `H` `T` vs OCR `FLIGHT` -> keep `FLIGHT`). A token that is a lone letter or a non-word fragment is the signal of over-splitting.
+  4. Otherwise prefer DIGITAL characters when both sides spell the same word -- digital comes from the font and is more reliable than OCR.
+
+  Every cluster has both a DIGITAL and an OCR side (clusters where one side is missing are resolved without you).
+
+  Output: each final token must set `ref` to an input token id (it inherits that token's position on the page). Set `t` only when the correct text differs from that referenced token's own text (e.g. de-ligaturing, or recombining split pieces); omit `t` to use the referenced token's text unchanged. Emit tokens in natural reading order. Return only a JSON object mapping each cluster id to its list of output tokens, e.g. {"c0": [{"ref": "d0", "t": "file"}], "c1": [{"ref": "o3"}, {"ref": "o4"}]}.
+
+# ── Grounded extraction: schema generation ────────────────────────────────────
+# System + user prompts for proposing a grounded_field JSON Schema from sample
+# PDFs (dgml_core.grounded.generate_schema). `extraction_schema_user_intro_multi`
+# is .format()'d with {n_files}; the *_body and *_system are used verbatim (they
+# contain literal braces, so must NOT be passed through str.format).
+extraction_schema_system: |-
+  You design JSON Schema documents that drive grounded extraction from
+  PDFs. Your output describes what to pull out of a document of this kind
+  so that every extracted value can be traced back to one or more regions
+  of the source page (the "grounded_field" convention).
+
+extraction_schema_user_intro_single: |-
+  Given the attached PDF, propose a JSON Schema (draft-07) that captures the structured information someone would want to extract from this document and from others of the same kind.
+
+extraction_schema_user_intro_multi: |-
+  Given the {n_files} attached PDFs (all of the same kind), propose a JSON Schema (draft-07) that captures the structured information someone would want to extract from documents of this kind. The schema you return must fit ALL of the attached files — favor what generalizes across instances over fields that only appear in one.
+
+extraction_schema_user_body: |-
+  Schema rules — non-negotiable:
+
+  1. The top level is a JSON object (a JSON Schema document).
+  2. Define a reusable ``grounded_field`` in ``definitions``:
+     {
+       "type": "object",
+       "properties": {
+         "text": {"type": "string"},
+         "locations": {
+           "type": "array",
+           "minItems": 1,
+           "items": {
+             "type": "object",
+             "properties": {
+               "page_number": {"type": "integer", "minimum": 1},
+               "bounding_box": {
+                 "type": "array",
+                 "items": {"type": "integer", "minimum": 0},
+                 "minItems": 4,
+                 "maxItems": 4,
+                 "description": "[left, top, right, bottom] in image pixels, top-left origin."
+               }
+             },
+             "required": ["page_number", "bounding_box"]
+           }
+         }
+       },
+       "required": ["text", "locations"]
+     }
+  3. EVERY leaf value in the schema MUST be ``{"$ref": "#/definitions/grounded_field"}``.
+     Do not introduce raw ``string`` / ``number`` leaves. Use the ref so
+     every extracted value carries grounding.
+  4. Repeated entities (line items, list bullets, courses, etc.) become arrays of objects.
+  5. Keep the schema focused on what someone would actually extract. Skip
+     chrome (page numbers, headers/footers) unless it carries meaning.
+
+  When you have your schema, call ``submit_schema`` with it. That tool
+  call IS the answer — do not also reply with prose.
+
+# ── Grounded extraction: value extraction, phase 1 (values + page numbers) ────
+# System prompt is used verbatim (contains literal braces); the user prompt is
+# .format()'d with {schema} (dgml_core.grounded.extract_values).
+extraction_values_phase1_system: |-
+  You extract structured values from a PDF using the provided schema.
+  Each leaf value you return is an object with a ``text`` field (the
+  extracted value) and a ``locations`` array. Each location identifies
+  the ``page_number`` (1-indexed integer) where that value appears.
+  This phase deliberately omits bounding boxes — a later phase will add
+  them.
+
+  ARRAY COMPLETENESS — non-negotiable. Arrays in the schema (transaction
+  lists, line items, courses, etc.) must include EVERY entry the
+  document shows, from EVERY page. Do not stop at the first page; walk
+  every page of the PDF and append every row. A common failure on
+  multi-page ledgers is returning only the rows visible on the first
+  page — keep going.
+
+  TEXT CONTENT CONTRACT — what belongs in the ``text`` field of each
+  leaf:
+
+  1. Extract the VALUE only. Skip visual markup or redundant headings
+     that merely re-identify the schema field. The schema field name
+     already says "this is the obligations_and_restrictions field" —
+     the heading "2. Obligations and Restrictions." above the body is
+     layout chrome, not content. The ``text`` is the body alone.
+
+  2. Skip list-item markers when extracting items of an array. Markers
+     like "(i)", "(ii)", "1.", "•", "*" identify position, not content.
+     For a paragraph that reads "(i) were, at the date of disclosure...",
+     the ``text`` field is "were, at the date of disclosure..." — no
+     "(i)" prefix. Likewise drop trailing "; or" / "; and" connectors
+     that exist only because the list joined items grammatically.
+
+  3. KEEP inner labels that distinguish sub-parts of a value when
+     those sub-parts aren't already broken out as separate schema
+     fields. In a signature block "By: ___ Name: John Doe Title: CEO"
+     captured by a single ``signatures[]`` entry, the "By:" / "Name:" /
+     "Title:" labels stay because they're the only thing distinguishing
+     the parts. If the schema instead breaks the signature into
+     ``signatures[].name`` and ``signatures[].title``, the labels go.
+
+  COMPUTED (REASONED) FIELDS. Some schema fields carry a ``prompt``
+  that describes a derivation rule — "Compute as the sum of ...",
+  "Derive from ...", "Count the number of ..." — rather than a place on
+  the page. For those fields, return the computed alternative instead
+  of a grounded value:
+
+    {"text": "<display form>", "value": "<canonical result>",
+     "computed": true, "derived_from": ["<dotted path>", ...]}
+
+  1. ``derived_from`` lists the OTHER values in this same submission
+     the result was derived from, as dotted paths into ``values``
+     (e.g. "LineItems[0].Quantity", "LineItems[1].UnitPrice"). Only
+     reference values you are actually returning; list every input the
+     derivation used.
+  2. ``value`` is the canonical machine-readable result (e.g.
+     "349.85"); ``text`` is the display form (e.g. "$349.85").
+  3. Computed values carry NO ``locations`` — they are not read off
+     the page.
+  4. Use the computed form ONLY when the field's ``prompt`` says to
+     derive, compute, or reason. A value printed on the document that
+     you merely read is a grounded value with ``locations``, even if
+     you also verified it against a calculation. When a derivation
+     rule says to verify against a printed value and the two disagree,
+     follow the rule and return the computed result.
+
+  Submit final results via the ``submit_values`` tool call. Do not
+  invent values; if a field is not present in the document, omit it
+  unless the schema marks it required.
+
+  LAYOUT HINT — alongside ``values``, return a ``layout`` object that
+  classifies how each array-of-objects in the schema is laid out on the
+  page. Phase 2 uses this to decide whether column-x logic applies; it
+  does not guess from geometry, so the classification matters. Classify
+  **every** array-of-objects in the schema — when in doubt, use
+  ``free_form`` rather than omitting.
+
+  - For a TABLE (each array item is one row of the document, with
+    consistent left-to-right columns aligned across rows — a ledger, a
+    rent roll, a course schedule grid), return:
+      "<array_path>": {
+        "kind": "table",
+        "columns": [<field>, <field>, ...]
+      }
+    where ``columns`` lists the leaf fields in the order their columns
+    appear VISUALLY, left to right. This must reflect the page's actual
+    visual layout, NOT the schema's JSON key order. Only use ``table``
+    when the array's fields really do form aligned vertical columns.
+
+  - For a FREE-FORM array (anything not a column-aligned grid — bullet
+    lists, numbered lists, vertically stacked records like
+    program-of-study course items, party/signature blocks at scattered
+    positions, any structure where fields don't share column x), return:
+      "<array_path>": {"kind": "free_form"}
+
+  Use dotted notation for nested arrays (e.g. ``"company.contacts"``).
+
+extraction_values_phase1_user: |-
+  Extract values from the attached PDF against this JSON Schema. Each grounded leaf value's locations need only carry the page_number (1-indexed); a later phase will add bounding boxes. Fields whose ``prompt`` describes a derivation rule take the computed form instead — ``text``, ``value``, ``computed: true``, ``derived_from`` — with no locations. If any array-of-objects in the schema is laid out as a table on the page, also return a ``layout`` descriptor naming the columns in visual left-to-right order. Submit results via the submit_values tool call when done.
+
+  SCHEMA:
+  {schema}
+
+# ── Grounded extraction: value extraction, phase 3 (attach bounding boxes) ────
+# System prompt is verbatim; the user prompt is .format()'d with {page_number},
+# {ocr_words}, {known_locations}, {needs_locating} (dgml_core.grounded).
+extraction_values_phase3_system: |-
+  You are given one page of a PDF (as an image) plus the OCR words on
+  that page with their bounding boxes, and a list of values that need
+  to be located on this page. For each value, return its bounding box
+  (or several if the text wraps across visual lines) via the
+  ``submit_locations`` tool call.
+
+  BOUNDING BOX CONTRACT — non-negotiable:
+
+  1. Coordinates are ``[left, top, right, bottom]`` in IMAGE PIXELS of the
+     page image (top-left origin) — the same pixel space as the OCR word
+     boxes below. NOT normalized; NOT [ymin,xmin,ymax,xmax].
+  2. Always ``left < right`` AND ``top < bottom``.
+  3. The bbox must FULLY ENCLOSE every word of the text it grounds,
+     edge to edge. Prefer over-covering by a few pixels to clipping the
+     rightmost word.
+  4. For text spanning multiple visual lines, return ONE bbox per line
+     (in reading order), all as separate entries in ``bounding_boxes``.
+
+  The OCR words list is authoritative for word positions — derive each
+  bbox by unioning the OCR word boxes for the words in the value's text,
+  then expand by a small margin so the rectangle strictly contains each
+  word. The page image is provided as a visual fallback when OCR words
+  are ambiguous.
+
+  The KNOWN_LOCATIONS section lists values on this page that have
+  already been located by another pass. Use them as row anchors —
+  unmatched fields in the same table row should share a y band with
+  their already-matched siblings.
+
+  ID DISCIPLINE:
+  - For every id in NEEDS_LOCATING, return exactly one ``locations``
+    entry keyed by that id.
+  - Do NOT echo ids that are not in NEEDS_LOCATING. Do NOT invent ids.
+  - Do NOT change the value text — your only job is to attach bboxes.
+
+extraction_values_phase3_user: |-
+  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool. The OCR words list below carries pixel-accurate positions; the page image is provided as a visual fallback.
+
+  OCR_WORDS (idx, text, [left,top,right,bottom]):
+  {ocr_words}
+
+  KNOWN_LOCATIONS on page {page_number} (already located, for row anchoring — do NOT include these in your output):
+  {known_locations}
+
+  NEEDS_LOCATING (return exactly these ids):
+  {needs_locating}

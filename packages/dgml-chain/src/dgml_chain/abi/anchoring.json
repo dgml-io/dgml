@@ -1,0 +1,143 @@
+[
+  {
+    "type": "function",
+    "name": "addRecord",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      {
+        "name": "record",
+        "type": "tuple",
+        "components": [
+          { "name": "registry", "type": "string" },
+          { "name": "uri", "type": "string" },
+          { "name": "checksum", "type": "string" },
+          { "name": "checksumAlgo", "type": "string" },
+          { "name": "metadata", "type": "string" },
+          { "name": "timestamp", "type": "string" },
+          { "name": "status", "type": "string" },
+          { "name": "recordId", "type": "uint64" },
+          { "name": "index", "type": "uint64" },
+          { "name": "isLatest", "type": "bool" }
+        ]
+      }
+    ],
+    "outputs": [
+      { "name": "recordId", "type": "uint64" }
+    ]
+  },
+  {
+    "type": "function",
+    "name": "addRegistry",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "name", "type": "string" },
+      { "name": "description", "type": "string" },
+      { "name": "metadata", "type": "string" }
+    ],
+    "outputs": [
+      { "name": "registryId", "type": "uint64" }
+    ]
+  },
+  {
+    "type": "function",
+    "name": "grantRole",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "registryId", "type": "uint64" },
+      { "name": "checksum", "type": "string" },
+      { "name": "account", "type": "address" },
+      { "name": "role", "type": "string" }
+    ],
+    "outputs": []
+  },
+  {
+    "type": "function",
+    "name": "records",
+    "stateMutability": "view",
+    "inputs": [
+      { "name": "registry", "type": "string" },
+      { "name": "checksum", "type": "string" },
+      { "name": "recordId", "type": "uint64" },
+      { "name": "index", "type": "uint64" },
+      {
+        "name": "pagination",
+        "type": "tuple",
+        "components": [
+          { "name": "key", "type": "bytes" },
+          { "name": "offset", "type": "uint64" },
+          { "name": "limit", "type": "uint64" },
+          { "name": "countTotal", "type": "bool" },
+          { "name": "reverse", "type": "bool" }
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "records",
+        "type": "tuple[]",
+        "components": [
+          { "name": "registry", "type": "string" },
+          { "name": "uri", "type": "string" },
+          { "name": "checksum", "type": "string" },
+          { "name": "checksumAlgo", "type": "string" },
+          { "name": "metadata", "type": "string" },
+          { "name": "timestamp", "type": "string" },
+          { "name": "status", "type": "string" },
+          { "name": "recordId", "type": "uint64" },
+          { "name": "index", "type": "uint64" },
+          { "name": "isLatest", "type": "bool" }
+        ]
+      },
+      {
+        "name": "pagination",
+        "type": "tuple",
+        "components": [
+          { "name": "nextKey", "type": "bytes" },
+          { "name": "total", "type": "uint64" }
+        ]
+      }
+    ]
+  },
+  {
+    "type": "function",
+    "name": "registries",
+    "stateMutability": "view",
+    "inputs": [
+      { "name": "registryId", "type": "uint64" },
+      { "name": "name", "type": "string" },
+      {
+        "name": "pagination",
+        "type": "tuple",
+        "components": [
+          { "name": "key", "type": "bytes" },
+          { "name": "offset", "type": "uint64" },
+          { "name": "limit", "type": "uint64" },
+          { "name": "countTotal", "type": "bool" },
+          { "name": "reverse", "type": "bool" }
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "registries",
+        "type": "tuple[]",
+        "components": [
+          { "name": "id", "type": "uint64" },
+          { "name": "name", "type": "string" },
+          { "name": "description", "type": "string" },
+          { "name": "creator", "type": "string" },
+          { "name": "createdAt", "type": "string" },
+          { "name": "metadata", "type": "string" }
+        ]
+      },
+      {
+        "name": "pagination",
+        "type": "tuple",
+        "components": [
+          { "name": "nextKey", "type": "bytes" },
+          { "name": "total", "type": "uint64" }
+        ]
+      }
+    ]
+  }
+]

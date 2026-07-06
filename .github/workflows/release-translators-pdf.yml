@@ -1,0 +1,45 @@
+name: Release translators-pdf
+
+on:
+  push:
+    tags:
+      - "translators-pdf-v*"
+
+jobs:
+  build:
+    name: Build & publish wheel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Verify tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#translators-pdf-v}"
+          pkg=$(uv run --with tomli python -c \
+            "import tomli, pathlib; \
+             print(tomli.loads(pathlib.Path('packages/translators-pdf/pyproject.toml').read_text())['project']['version'])")
+          if [ "$tag" != "$pkg" ]; then
+            echo "Tag version ($tag) does not match packages/translators-pdf/pyproject.toml version ($pkg)" >&2
+            exit 1
+          fi
+
+      - name: Build wheel
+        # `--wheel` builds directly from the source tree. Without it, uv
+        # builds an sdist first and then a wheel from that sdist — which
+        # fails because `readme = "../../README.md"` in pyproject.toml
+        # points outside the package and isn't present in the sdist.
+        run: uv build --package translators-pdf --wheel
+
+      - name: Create release and upload wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Build of \`translators-pdf\` from tag \`$GITHUB_REF_NAME\`." \
+            dist/*.whl

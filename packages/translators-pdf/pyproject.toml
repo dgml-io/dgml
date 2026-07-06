@@ -1,0 +1,24 @@
+[project]
+name = "translators-pdf"
+version = "0.1.1"
+description = "Ready-made document-to-PDF translators for DGML (LibreOffice, Aspose.Words, xlsx islands, command)."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Docugami" }]
+readme = "../../README.md"
+dependencies = ["dgml-core>=0.1.0"]
+
+[project.optional-dependencies]
+# Install with `pip install translators-pdf[xlsx]` to enable the xlsx island
+# renderer. reportlab is BSD-3, openpyxl is MIT — both allow-list clean.
+xlsx = ["reportlab>=4.0", "openpyxl>=3.1"]
+
+[tool.uv.sources]
+dgml-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/translators_pdf"]

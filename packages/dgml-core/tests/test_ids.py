@@ -1,0 +1,22 @@
+from __future__ import annotations
+
+from dgml_core.ids import ID_LENGTH, is_valid_id, new_id
+
+
+def test_new_id_format() -> None:
+    for _ in range(100):
+        i = new_id()
+        assert len(i) == ID_LENGTH
+        assert is_valid_id(i)
+
+
+def test_new_id_collisions_rare() -> None:
+    s = {new_id() for _ in range(10_000)}
+    assert len(s) == 10_000
+
+
+def test_is_valid_id_rejects() -> None:
+    assert not is_valid_id("abc")
+    assert not is_valid_id("Z" * ID_LENGTH)
+    assert not is_valid_id("a-b-c-d-e-f-g")
+    assert not is_valid_id("")

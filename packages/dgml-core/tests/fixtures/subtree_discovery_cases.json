@@ -1,0 +1,58 @@
+[
+  {
+    "description": "All filter returns every non-root tag",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><docset:IndemnificationClause><docset:IndemnifyingParty dg:origin=\"2 460 310 1800 355\">Vendor</docset:IndemnifyingParty><docset:LiabilityCap xsi:type=\"decimal\" dg:value=\"500000\" dg:origin=\"2 460 410 1800 455\">$500,000</docset:LiabilityCap><docset:EffectiveDate xsi:type=\"date\" dg:value=\"2024-01-01\" dg:origin=\"2 998 710 1466 755\">January 1, 2024</docset:EffectiveDate></docset:IndemnificationClause><docset:PaymentTerms><docset:InvoiceCycle dg:origin=\"4 460 139 1800 184\">Net 30</docset:InvoiceCycle><docset:LatePaymentPenalty xsi:type=\"decimal\" dg:value=\"0.015\" dg:origin=\"4 460 190 1800 235\">1.5% per month</docset:LatePaymentPenalty></docset:PaymentTerms></dg:chunk>",
+    "filter": "All",
+    "expected_tags": ["IndemnificationClause", "IndemnifyingParty", "LiabilityCap", "EffectiveDate", "PaymentTerms", "InvoiceCycle", "LatePaymentPenalty"],
+    "excluded_tags": []
+  },
+  {
+    "description": "Values filter selects leaf-value elements (text holders, no children)",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><docset:IndemnificationClause><docset:IndemnifyingParty dg:origin=\"2 460 310 1800 355\">Vendor</docset:IndemnifyingParty><docset:LiabilityCap xsi:type=\"decimal\" dg:value=\"500000\" dg:origin=\"2 460 410 1800 455\">$500,000</docset:LiabilityCap><docset:EffectiveDate xsi:type=\"date\" dg:value=\"2024-01-01\" dg:origin=\"2 998 710 1466 755\">January 1, 2024</docset:EffectiveDate></docset:IndemnificationClause><docset:PaymentTerms><docset:InvoiceCycle dg:origin=\"4 460 139 1800 184\">Net 30</docset:InvoiceCycle><docset:LatePaymentPenalty xsi:type=\"decimal\" dg:value=\"0.015\" dg:origin=\"4 460 190 1800 235\">1.5% per month</docset:LatePaymentPenalty></docset:PaymentTerms></dg:chunk>",
+    "filter": "Values",
+    "expected_tags": ["LiabilityCap", "EffectiveDate", "InvoiceCycle", "LatePaymentPenalty", "IndemnifyingParty"],
+    "excluded_tags": ["IndemnificationClause", "PaymentTerms"]
+  },
+  {
+    "description": "Sections filter selects high-betweenness container elements",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\"><docset:Section1><docset:SubA>text a1</docset:SubA><docset:SubB>text b1</docset:SubB><docset:SubC>text c1</docset:SubC></docset:Section1><docset:Section2><docset:SubA>text a2</docset:SubA><docset:SubB>text b2</docset:SubB><docset:SubC>text c2</docset:SubC></docset:Section2><docset:Section3><docset:SubA>text a3</docset:SubA><docset:SubB>text b3</docset:SubB><docset:SubC>text c3</docset:SubC></docset:Section3></dg:chunk>",
+    "filter": "Sections",
+    "expected_tags": ["Section1", "Section2", "Section3"],
+    "excluded_tags": []
+  },
+  {
+    "description": "Density filter selects information-dense branches",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\"><docset:DenseClause><docset:FieldA>alpha beta gamma delta epsilon</docset:FieldA><docset:FieldB>one two three four five six seven</docset:FieldB><docset:FieldC>foo bar baz qux quux corge grault</docset:FieldC></docset:DenseClause><docset:SparseClause><docset:TagX>x</docset:TagX></docset:SparseClause></dg:chunk>",
+    "filter": "Density",
+    "expected_tags": ["DenseClause"],
+    "excluded_tags": []
+  },
+  {
+    "description": "Patterns filter selects tags with highest structural entropy",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\"><docset:ComplexRecord><docset:FieldA>val</docset:FieldA><docset:FieldB>val</docset:FieldB><docset:FieldC>val</docset:FieldC></docset:ComplexRecord><docset:ComplexRecord><docset:FieldA>val</docset:FieldA><docset:FieldD>val</docset:FieldD><docset:FieldE>val</docset:FieldE></docset:ComplexRecord><docset:SimpleRecord><docset:FieldA>just text</docset:FieldA></docset:SimpleRecord></dg:chunk>",
+    "filter": "Patterns",
+    "expected_tags": ["ComplexRecord"],
+    "excluded_tags": []
+  },
+  {
+    "description": "Structural dg: elements excluded by default from all filters",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\"><dg:metadata><dg:source>scan</dg:source></dg:metadata><docset:ContractTitle>Master Service Agreement</docset:ContractTitle><docset:ContractDate>2024-06-01</docset:ContractDate></dg:chunk>",
+    "filter": "All",
+    "expected_tags": ["ContractTitle", "ContractDate"],
+    "excluded_tags": ["metadata", "source"]
+  },
+  {
+    "description": "Single tag type only in document",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\"><docset:Amount dg:origin=\"1 100 200 400 230\">$1,000</docset:Amount><docset:Amount dg:origin=\"1 100 300 400 330\">$2,000</docset:Amount><docset:Amount dg:origin=\"1 100 400 400 430\">$3,000</docset:Amount></dg:chunk>",
+    "filter": "Values",
+    "expected_tags": ["Amount"],
+    "excluded_tags": []
+  },
+  {
+    "description": "Deeply nested content: Values picks innermost leaf elements",
+    "xml": "<?xml version='1.0' encoding='utf-8'?><dg:chunk xmlns:dg=\"http://dgml.io/ns/dg#\" xmlns:docset=\"http://dgml.io/acme-corp/msa#\"><docset:Level1><docset:Level2><docset:Level3><docset:Level4><docset:DeepValue dg:origin=\"3 50 100 500 120\">deep text</docset:DeepValue></docset:Level4></docset:Level3></docset:Level2></docset:Level1></dg:chunk>",
+    "filter": "Values",
+    "expected_tags": ["DeepValue"],
+    "excluded_tags": ["Level1", "Level2", "Level3", "Level4"]
+  }
+]

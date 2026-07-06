@@ -1,0 +1,19 @@
+# @package encoder_image
+# Qwen3-VL-Embedding 2B — the smaller sibling of the 8B preset (same family,
+# same sentence-transformers API, native dim 2048). Cheaper to run; a GPU is
+# still recommended.
+# Select with:  encoder_image=qwen3_vl_embedding_2b
+name: qwen3_vl_embedding_2b
+model_id: Qwen/Qwen3-VL-Embedding-2B
+# Matryoshka (MRL): the native 2048-d embedding is truncated to this width and
+# re-normalized. Any value in [64, 2048] is valid.
+embedding_dim: 1024
+# Single-vector only; late_interaction is rejected — use colpali for multi-vector.
+multi_vector: false
+extra:
+  # Custom-code checkpoint: trust_remote_code is required.
+  trust_remote_code: true
+  # torch_dtype: bfloat16
+  batch_size: 8
+  # Optional instruction (defaults to the model's "Represent the user's input."):
+  # prompt: "Represent this document page for type-based clustering."
