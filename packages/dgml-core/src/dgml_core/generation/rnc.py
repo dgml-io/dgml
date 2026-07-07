@@ -10,7 +10,7 @@ files actually contain:
 - ``dg:structure`` roles and occurrence counts (informative comments).
 
 Every ``schema.json`` field (``role``, ``kind``, ``parent_role``,
-``example``/``examples``, ``siblings_share``, top-level ``notes``) is
+``example``/``examples``, top-level ``notes``) is
 serialized LOSSLESSLY into ``# Field: value`` comment lines (values
 JSON-encoded), so :func:`rnc_to_schema_dict` can reconstruct the exact
 Schema v1 dict from the ``.rnc`` — the RNC doubles as a human-editing
@@ -45,7 +45,7 @@ _XSD_FOR_XSI = {
 }
 
 # The lossless comment contract: `# <Field>: <value>` lines above each define.
-_FIELD_RE = re.compile(r"^# (Description|Kind|Parent|Example|Examples|SiblingsShare|Notes): (.*)$")
+_FIELD_RE = re.compile(r"^# (Description|Kind|Parent|Example|Examples|Notes): (.*)$")
 _DEFINE_RE = re.compile(r"^([A-Za-z][\w.]*)\s*=\s*element\s+([A-Za-z][\w:.*-]*)\s*\{")
 
 
@@ -75,11 +75,10 @@ def _scan_dgml(xml_paths: Sequence[Path]) -> _Observed:
             ns = el.tag.rsplit("}", 1)[0].lstrip("{") if "}" in el.tag else ""
             if "dgml.io" in ns and ns != DG_NS:
                 obs.docset_ns = obs.docset_ns or ns
-            # Concept elements live in the docset: namespace when shared by >=2
-            # docs, and in dg: when private to one (dg:chunk is scaffolding).
-            is_concept = (ns == obs.docset_ns and bool(obs.docset_ns)) or (
-                ns == DG_NS and _local(el.tag) != "chunk"
-            )
+            # Every concept lives in the docset: namespace. dg: is framework-only
+            # (the dg:chunk scaffolding element + dg:* attributes), so a concept
+            # is simply any element in the docset namespace.
+            is_concept = ns == obs.docset_ns and bool(obs.docset_ns)
             if not is_concept:
                 continue
             name = _local(el.tag)
@@ -154,13 +153,14 @@ def build_rnc(
     w("# --- generic structural chunk (unlabeled scaffolding) ----------------")
     w("dg.chunk = element dg:chunk { common.atts, mixed { any.docset* } }")
     w("")
-    w("# a concept private to ONE document renders in the dg: namespace instead")
-    w("# of docset: (the shared-tag rule) — same shape, unshared vocabulary")
-    w("dg.private = element dg:* { common.atts, mixed { any.docset* } }")
+    w("# a docset concept with no individual definition below — a rare/one-off")
+    w("# tag, or one coined during labeling that isn't in schema.json yet. It")
+    w("# stays in the docset vocabulary; nothing semantic is ever emitted in dg:.")
+    w("docset.other = element docset:* { common.atts, mixed { any.docset* } }")
     w("")
     w("# any docset element may appear where structure allows it")
     w("any.docset = dg.chunk")
-    w("  | dg.private")
+    w("  | docset.other")
     for n in names:
         w(f"  | {n}")
     w("")
@@ -186,8 +186,6 @@ def build_rnc(
             w(f"# Example: {json.dumps(t['example'], ensure_ascii=False)}")
         if t.get("examples"):
             w(f"# Examples: {json.dumps(t['examples'], ensure_ascii=False)}")
-        if not t.get("siblings_share", True):
-            w("# SiblingsShare: false")
         if obs_n:
             st = ", ".join(f"{k}({v})" for k, v in obs.structures[n].most_common(3))
             w(f"# Observed: {obs_n} occurrence(s)" + (f"; dg:structure: {st}" if st else ""))
@@ -274,7 +272,6 @@ def rnc_to_schema_dict(text: str) -> dict[str, Any]:
             "example": str(json.loads(pending["Example"])) if "Example" in pending else "",
             "examples": list(json.loads(pending["Examples"])) if "Examples" in pending else [],
             "parent_role": pending.get("Parent", ""),
-            "siblings_share": pending.get("SiblingsShare", "true") != "false",
         }
         pending = {}
     return {"tags": tags, "notes": notes}

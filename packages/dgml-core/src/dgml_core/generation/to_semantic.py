@@ -5,17 +5,19 @@ Two renderers:
 - :func:`render_semantic_xml` — the plain structure-attribute form (plain
   structural tags with ``structure`` attributes), kept as a debug artifact.
 - :func:`render_dgml` — the FINAL ``dg:chunk`` document. Naming convention:
-    * an element with a semantic concept → ``docset:Concept`` (concept shared
-      by ≥2 documents in the batch) or ``dg:Concept`` (concept in one doc),
-      carrying its real structural type in ``structure`` (``section``, ``p``,
-      ``li``, ``tr``);
+    * an element with a semantic concept → ``docset:Concept`` — ALWAYS in the
+      per-docset vocabulary namespace, whether the concept recurs across the
+      docset or appears in a single document. ``dg:`` is reserved for the
+      framework (the ``dg:chunk`` scaffolding element and ``dg:*`` attributes);
+      no concept is ever emitted there. The element carries its real structural
+      type in ``structure`` (``section``, ``p``, ``li``, ``tr``);
     * any element WITHOUT a concept — the structural scaffolding (lists, list
       items, headers, cells, enumerators) → ``dg:chunk`` with its type in
       ``structure`` (``ul``/``ol``/``li``/``header``/``td``/``lim``/…). There
       are no ``h1``…``h6`` depth levels: ``structure`` is the actual type.
-    * inline entity values → ``docset:`` / ``dg:`` concept elements (no
-      ``structure``), with ``xsi:type`` / ``dg:value`` typing for
-      dates/amounts (reused from the shared value-type detector).
+    * inline entity values → ``docset:`` concept elements (no ``structure``),
+      with ``xsi:type`` / ``dg:value`` typing for dates/amounts (reused from
+      the shared value-type detector).
 
 Pure transformation — no LLM calls; reading order (lim before text) and
 verbatim text are preserved by construction.
@@ -24,7 +26,6 @@ verbatim text are preserved by construction.
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-from collections import Counter
 from collections.abc import Mapping
 
 from lxml import etree  # type: ignore[import-untyped]
@@ -187,38 +188,19 @@ def render_semantic_xml(blocks: list[Block]) -> str:
 # ── final dgml ───────────────────────────────────────────────────────────────
 
 
-def collect_shared_concepts(docs: Mapping[str, list[Block]]) -> frozenset[str]:
-    """Concepts appearing in ≥2 documents → namespaced ``docset:`` (vs ``dg:``).
+def _concept_tag(concept: str) -> str | None:
+    """A concept always renders in the per-docset vocabulary namespace.
 
-    A shared-tag rule applied to concepts: block concepts and entity concepts
-    both count, once per document.
+    ``docset:`` is the home of ALL semantic concepts — recurring across the
+    docset or seen in a single document alike. ``dg:`` is framework-only (the
+    ``dg:chunk`` scaffolding element and ``dg:*`` attributes); nothing semantic
+    is ever emitted there. Whether a concept is currently shared is a property
+    of the batch, not of the concept, so it must not drive the namespace.
     """
-    doc_count: Counter[str] = Counter()
-    for blocks in docs.values():
-        seen: set[str] = set()
-        for b in blocks:
-            for raw in (
-                b.concept,
-                b.value_concept,
-                b.lim_concept,
-                b.group_concept,
-                *(s.concept for s in b.entities),
-                *(s.concept for s in b.label_entities),
-                *b.cell_concepts,
-                *(s.concept for spans in b.cell_entities for s in spans),
-            ):
-                name = sanitize_concept(raw)
-                if name:
-                    seen.add(name)
-        doc_count.update(seen)
-    return frozenset(name for name, n in doc_count.items() if n >= 2)
-
-
-def _concept_tag(concept: str, shared: frozenset[str]) -> str | None:
     name = sanitize_concept(concept)
     if not name:
         return None
-    return f"{'docset' if name in shared else 'dg'}:{name}"
+    return f"docset:{name}"
 
 
 def _apply_typing(el: ET.Element, text: str, extra_formats: bool) -> None:
@@ -231,14 +213,12 @@ def _apply_typing(el: ET.Element, text: str, extra_formats: bool) -> None:
         el.set("dg:value", value)
 
 
-def _dgml_lim(
-    parent: ET.Element, block: Block, shared: frozenset[str], extra_formats: bool
-) -> None:
+def _dgml_lim(parent: ET.Element, block: Block, extra_formats: bool) -> None:
     if block.lim:
         # A lim carrying a concept (a date/number used as the list marker) is
         # emitted under its concept tag — dg:structure="lim" keeps the layout
         # role — and typed like any other value; an unlabeled lim stays dg:chunk.
-        tag = (_concept_tag(block.lim_concept, shared) if block.lim_concept else None) or _CP
+        tag = (_concept_tag(block.lim_concept) if block.lim_concept else None) or _CP
         lim = ET.SubElement(parent, tag)
         lim.set(_ST, "lim")
         lim.text = block.lim
@@ -247,9 +227,7 @@ def _dgml_lim(
         lim.tail = " "
 
 
-def _dgml_fill(
-    el: ET.Element, text: str, spans: list[Span], shared: frozenset[str], extra_formats: bool
-) -> None:
+def _dgml_fill(el: ET.Element, text: str, spans: list[Span], extra_formats: bool) -> None:
     """Text after the lim, entity values wrapped in concept elements + typing."""
     children = list(el)
     state = {"last": children[-1] if children else None}
@@ -266,7 +244,7 @@ def _dgml_fill(
     for span in spans:
         write(text[cursor : span.start])
         value = text[span.start : span.end]
-        tag = _concept_tag(span.concept, shared) or _CP
+        tag = _concept_tag(span.concept) or _CP
         inline = ET.SubElement(el, tag)
         if tag == _CP:
             inline.set(_ST, "span")
@@ -277,35 +255,31 @@ def _dgml_fill(
     write(text[cursor:])
 
 
-def _dgml_leaf(
-    parent: ET.Element, structure: str, block: Block, shared: frozenset[str], extra_formats: bool
-) -> None:
-    tag = (_concept_tag(block.concept, shared) if block.concept else None) or _CP
+def _dgml_leaf(parent: ET.Element, structure: str, block: Block, extra_formats: bool) -> None:
+    tag = (_concept_tag(block.concept) if block.concept else None) or _CP
     el = ET.SubElement(parent, tag)
     el.set(_ST, structure)
-    _dgml_lim(el, block, shared, extra_formats)
-    _dgml_fill(el, block.text, block.entities, shared, extra_formats)
+    _dgml_lim(el, block, extra_formats)
+    _dgml_fill(el, block.text, block.entities, extra_formats)
 
 
-def _render_dgml_node(
-    parent: ET.Element, node: Node, shared: frozenset[str], extra_formats: bool
-) -> None:
+def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> None:
     block = node.block
     if node.kind == "h":
         assert block is not None
-        tag = (_concept_tag(block.value_concept, shared) if block.value_concept else None) or _CP
+        tag = (_concept_tag(block.value_concept) if block.value_concept else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "header")
-        _dgml_lim(el, block, shared, extra_formats)
-        _dgml_fill(el, block.text, block.entities, shared, extra_formats)
+        _dgml_lim(el, block, extra_formats)
+        _dgml_fill(el, block.text, block.entities, extra_formats)
         return
     if node.kind in ("p", "li"):
         assert block is not None
-        _dgml_leaf(parent, node.kind, block, shared, extra_formats)
+        _dgml_leaf(parent, node.kind, block, extra_formats)
         return
     if node.kind == "tr":
         assert block is not None
-        tag = (_concept_tag(block.concept, shared) if block.concept else None) or _CP
+        tag = (_concept_tag(block.concept) if block.concept else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "tr")
         for i, cell in enumerate(block.cells):
@@ -326,15 +300,15 @@ def _render_dgml_node(
                 # (when present) as the td tag — same pattern as a concept leaf
                 # with inline entity spans; without one it stays a generic td.
                 cc = block.cell_concepts[i] if i < len(block.cell_concepts) else ""
-                td_tag = (_concept_tag(cc, shared) if cc else None) or _CP
+                td_tag = (_concept_tag(cc) if cc else None) or _CP
                 td = ET.SubElement(el, td_tag)
                 td.set(_ST, "td")
-                _dgml_fill(td, cell, ents, shared, extra_formats)
+                _dgml_fill(td, cell, ents, extra_formats)
                 continue
             # Positional column concept wins (cross-row consistent); a whole-cell
             # entity concept is the fallback when no column concept aligned.
             concept = cell_concept or whole
-            td_tag = (_concept_tag(concept, shared) if concept else None) or _CP
+            td_tag = (_concept_tag(concept) if concept else None) or _CP
             td = ET.SubElement(el, td_tag)
             # Every cell carries the td layout role, regardless of whether it
             # also has a semantic concept tag — same as the tr/header/leaf
@@ -348,23 +322,23 @@ def _render_dgml_node(
         assert block is not None
         el = ET.SubElement(parent, _CP)
         el.set(_ST, "li")
-        _dgml_lim(el, block, shared, extra_formats)
+        _dgml_lim(el, block, extra_formats)
         if block.label:
             label = ET.SubElement(el, _CP)
             label.set(_ST, "header")
             if block.label_entities:
-                _dgml_fill(label, block.label, block.label_entities, shared, extra_formats)
+                _dgml_fill(label, block.label, block.label_entities, extra_formats)
             else:
                 label.text = block.label
         value = ET.SubElement(el, _CP)
         value.set(_ST, "p")
-        value_tag = _concept_tag(block.concept, shared) if block.concept else None
+        value_tag = _concept_tag(block.concept) if block.concept else None
         target = ET.SubElement(value, value_tag) if value_tag else value
         if block.entities:
             # Sub-values packed inside the field's value render as inline
             # concept spans within the (concept-wrapped) value — the same
             # compose pattern as a leaf with inline entities.
-            _dgml_fill(target, block.value, block.entities, shared, extra_formats)
+            _dgml_fill(target, block.value, block.entities, extra_formats)
         else:
             target.text = block.value
             if value_tag:
@@ -376,7 +350,7 @@ def _render_dgml_node(
         # A synthesized entity container carries its concept directly; a normal
         # section hoists it from the heading child.
         concept = node.concept or (head.concept if head and head.concept else "")
-        tag = (_concept_tag(concept, shared) if concept else None) or _CP
+        tag = (_concept_tag(concept) if concept else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "section")
     elif node.kind == "list":
@@ -393,7 +367,7 @@ def _render_dgml_node(
             ),
             "",
         )
-        tag = (_concept_tag(group, shared) if group else None) or _CP
+        tag = (_concept_tag(group) if group else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "table")
     elif node.kind == "form":
@@ -403,14 +377,13 @@ def _render_dgml_node(
         el = ET.SubElement(parent, _CP)
         el.set(_ST, "section")
     for child in node.children:
-        _render_dgml_node(el, child, shared, extra_formats)
+        _render_dgml_node(el, child, extra_formats)
 
 
 def render_dgml(
     blocks: list[Block],
     *,
     header: str,
-    shared_concepts: frozenset[str] = frozenset(),
     extra_formats: bool = True,
     parent_map: Mapping[str, str] | None = None,
 ) -> str:
@@ -420,14 +393,14 @@ def render_dgml(
     ``semantic_transform.build_header`` (declares the namespaces).
 
     *parent_map* (leaf concept → container concept, from a seed schema) drives
-    the entity-container grouping in ``build_tree``. Container concepts are
-    authoritative vocabulary, so they render as ``docset:`` (added to *shared*).
+    the entity-container grouping in ``build_tree``. Every concept renders as
+    ``docset:`` regardless of how often it recurs, so container concepts need
+    no special namespace handling.
     """
     tree = build_tree(blocks, parent_map)
-    shared = shared_concepts | frozenset(parent_map.values()) if parent_map else shared_concepts
     root = ET.Element("doc")
     for child in tree.children:
-        _render_dgml_node(root, child, shared, extra_formats)
+        _render_dgml_node(root, child, extra_formats)
     ET.indent(root)  # safe on mixed content: only blank/None whitespace is set
     if len(root) == 0:
         # No renderable content (e.g. a document that transcribed to zero

@@ -10,7 +10,7 @@ than rewrite the engine, this module is the deterministic bridge:
 
 The RNC handled here is the constrained subset the spec defines — a namespace
 declaration, a ``start`` rule rooted at ``dg:chunk``, and one named pattern per
-tag of the form ``Name = element docset:Name { siblingsShare, content }`` with
+tag of the form ``Name = element docset:Name { content }`` with
 ``##`` doc comments. It is **not** a general RELAX NG implementation; anything
 outside the subset raises :class:`SchemaInvalid`. Full RELAX NG (RNG/Jing)
 validation of instance documents is intentionally out of scope, so this module
@@ -117,7 +117,6 @@ class Tag:
 
     name: str
     kind: str
-    siblings_share: bool = False
     description: str | None = None
     example: str | None = None
     prompt: str | None = None  # `## Prompt:` — where to find / how to derive the value (§13)
@@ -172,13 +171,11 @@ def _node_to_tag(name: str, node: dict[str, Any]) -> Tag:
     description = node.get("description")
     example = node.get("example")
     prompt = node.get("prompt")
-    raw_share = node.get("siblingsShare")
 
     if _grounded_leaf(node):
         return Tag(
             name=tag_name,
             kind="field",
-            siblings_share=bool(raw_share) if raw_share is not None else True,
             description=description,
             example=example,
             prompt=prompt,
@@ -193,7 +190,7 @@ def _node_to_tag(name: str, node: dict[str, Any]) -> Tag:
         if _grounded_leaf(items):
             # A list of grounded text values (spec's uniform short-item list) —
             # the item is a leaf field, not a container of sub-fields.
-            item_tag = Tag(name=item_name, kind="field", siblings_share=True)
+            item_tag = Tag(name=item_name, kind="field")
             children: list[Tag] = []
         else:
             children = _properties_to_tags(items.get("properties"))
@@ -201,7 +198,6 @@ def _node_to_tag(name: str, node: dict[str, Any]) -> Tag:
         return Tag(
             name=tag_name,
             kind="collection",
-            siblings_share=bool(raw_share) if raw_share is not None else False,
             description=description,
             example=example,
             prompt=prompt,
@@ -214,7 +210,6 @@ def _node_to_tag(name: str, node: dict[str, Any]) -> Tag:
         return Tag(
             name=tag_name,
             kind="container",
-            siblings_share=bool(raw_share) if raw_share is not None else False,
             description=description,
             example=example,
             prompt=prompt,
@@ -259,7 +254,7 @@ def json_schema_to_vocabulary(schema: dict[str, Any], *, namespace_uri: str) -> 
 
 
 def _tag_to_node(tag: Tag) -> dict[str, Any]:
-    extra: dict[str, Any] = {"siblingsShare": tag.siblings_share}
+    extra: dict[str, Any] = {}
     if tag.description:
         extra["description"] = tag.description
     if tag.example:
@@ -301,8 +296,8 @@ def _tags_to_properties(tags: list[Tag]) -> dict[str, Any]:
 def vocabulary_to_json_schema(vocab: Vocabulary) -> dict[str, Any]:
     """Render a :class:`Vocabulary` back to a grounded_field JSON Schema.
 
-    Carries ``siblingsShare``/``description``/``example`` onto each property so
-    the RNC ⇄ JSON ⇄ RNC round-trip is lossless. The extraction engine ignores
+    Carries ``description``/``example``/``prompt`` onto each property so the
+    RNC ⇄ JSON ⇄ RNC round-trip is lossless. The extraction engine ignores
     those extra keys (it only walks for grounded_field $refs and properties).
     """
     return {
@@ -328,10 +323,6 @@ def _doc_comment(tag: Tag) -> str:
     return "".join(f"{line}\n" for line in lines)
 
 
-def _share_attr(tag: Tag) -> str:
-    return f'    attribute siblingsShare {{ "{str(tag.siblings_share).lower()}" }},\n'
-
-
 def _emit_tag_defs(tag: Tag, out: list[str], seen: set[str]) -> None:
     """Append the RNC pattern def(s) for *tag* (and its descendants) to *out*.
 
@@ -347,7 +338,7 @@ def _emit_tag_defs(tag: Tag, out: list[str], seen: set[str]) -> None:
         out.append(
             f"{_doc_comment(tag)}{tag.name} =\n"
             f"  element docset:{tag.name} {{\n"
-            f"{_share_attr(tag)}    {content}\n  }}\n"
+            f"    {content}\n  }}\n"
         )
         return
 
@@ -357,7 +348,7 @@ def _emit_tag_defs(tag: Tag, out: list[str], seen: set[str]) -> None:
         out.append(
             f"{_doc_comment(tag)}{tag.name} =\n"
             f"  element docset:{tag.name} {{\n"
-            f"{_share_attr(tag)}    ( {scalar} | ( {group} ) )\n  }}\n"
+            f"    ( {scalar} | ( {group} ) )\n  }}\n"
         )
         for child in tag.children:
             _emit_tag_defs(child, out, seen)
@@ -372,7 +363,7 @@ def _emit_tag_defs(tag: Tag, out: list[str], seen: set[str]) -> None:
         out.append(
             f"{_doc_comment(tag)}{tag.name} =\n"
             f"  element docset:{tag.name} {{\n"
-            f"{_share_attr(tag)}    {item_tag.name}*\n  }}\n"
+            f"    {item_tag.name}*\n  }}\n"
         )
         # Recurse on the singular item (a container) so it and its children are
         # emitted exactly once, carrying the item's own annotations.
@@ -384,7 +375,7 @@ def _emit_tag_defs(tag: Tag, out: list[str], seen: set[str]) -> None:
         out.append(
             f"{_doc_comment(tag)}{tag.name} =\n"
             f"  element docset:{tag.name} {{\n"
-            f"{_share_attr(tag)}    ({refs})*\n  }}\n"
+            f"    ({refs})*\n  }}\n"
         )
         for child in tag.children:
             _emit_tag_defs(child, out, seen)
@@ -418,7 +409,6 @@ def vocabulary_to_rnc(vocab: Vocabulary) -> str:
 _NAMESPACE_RE = re.compile(r'^\s*namespace\s+(\w+)\s*=\s*"([^"]*)"\s*$')
 _DEF_HEAD_RE = re.compile(r"^(\w+)\s*=\s*$")
 _ELEMENT_RE = re.compile(r"^\s*element\s+(\w+):(\w+)\s*\{\s*$")
-_SHARE_RE = re.compile(r'^\s*attribute\s+siblingsShare\s*\{\s*"(true|false)"\s*\}\s*,?\s*$')
 _COLLECTION_RE = re.compile(r"^\s*(\w+)\*\s*,?\s*$")
 _CONTAINER_RE = re.compile(r"^\s*\(\s*(.+?)\s*\)\*\s*,?\s*$")
 _TEXT_RE = re.compile(r"^\s*(?:text|\(\s*text\s*\)\*)\s*,?\s*$")
@@ -434,8 +424,7 @@ class _RawDef:
     description: str | None
     example: str | None
     prompt: str | None
-    siblings_share: bool
-    body_lines: list[str]  # content-model lines after the siblingsShare attr
+    body_lines: list[str]  # the element's content-model lines
 
 
 def _parse_doc_comments(comments: list[str]) -> tuple[str | None, str | None, str | None]:
@@ -514,14 +503,13 @@ def _parse_rnc_defs(rnc: str) -> tuple[str, list[str], dict[str, _RawDef]]:
         if head:
             name = head.group(1)
             block, i = _read_brace_block(lines, i + 1)
-            share, body = _parse_element_block(name, block)
+            body = _parse_element_block(name, block)
             description, example, prompt = _parse_doc_comments(pending_comments)
             defs[name] = _RawDef(
                 name=name,
                 description=description,
                 example=example,
                 prompt=prompt,
-                siblings_share=share,
                 body_lines=body,
             )
             order.append(name)
@@ -581,23 +569,18 @@ def _read_brace_block(lines: list[str], start: int) -> tuple[list[str], int]:
     raise SchemaInvalid("unterminated '{' in RNC definition")
 
 
-def _parse_element_block(name: str, block: list[str]) -> tuple[bool, list[str]]:
+def _parse_element_block(name: str, block: list[str]) -> list[str]:
     if not block:
         raise SchemaInvalid(f"definition '{name}' has an empty body")
     el = _ELEMENT_RE.match(block[0])
     if not el:
         raise SchemaInvalid(f"definition '{name}' must wrap `element docset:{name} {{ ... }}`")
-    share = True
     body: list[str] = []
     for line in block[1:]:
         if not line.strip():
             continue
-        share_m = _SHARE_RE.match(line)
-        if share_m:
-            share = share_m.group(1) == "true"
-            continue
         body.append(line)
-    return share, body
+    return body
 
 
 def _parse_start_block(block: list[str]) -> list[str]:
@@ -626,7 +609,6 @@ def _raw_to_tag(raw: _RawDef, defs: dict[str, _RawDef], stack: tuple[str, ...]) 
         return Tag(
             name=raw.name,
             kind="field",
-            siblings_share=raw.siblings_share,
             description=raw.description,
             example=raw.example,
             prompt=raw.prompt,
@@ -637,7 +619,6 @@ def _raw_to_tag(raw: _RawDef, defs: dict[str, _RawDef], stack: tuple[str, ...]) 
         return Tag(
             name=raw.name,
             kind="field",
-            siblings_share=raw.siblings_share,
             description=raw.description,
             example=raw.example,
             prompt=raw.prompt,
@@ -653,7 +634,6 @@ def _raw_to_tag(raw: _RawDef, defs: dict[str, _RawDef], stack: tuple[str, ...]) 
         return Tag(
             name=raw.name,
             kind="choice",
-            siblings_share=raw.siblings_share,
             description=raw.description,
             example=raw.example,
             prompt=raw.prompt,
@@ -671,7 +651,6 @@ def _raw_to_tag(raw: _RawDef, defs: dict[str, _RawDef], stack: tuple[str, ...]) 
         return Tag(
             name=raw.name,
             kind="collection",
-            siblings_share=raw.siblings_share,
             description=raw.description,
             example=raw.example,
             prompt=raw.prompt,
@@ -686,7 +665,6 @@ def _raw_to_tag(raw: _RawDef, defs: dict[str, _RawDef], stack: tuple[str, ...]) 
         return Tag(
             name=raw.name,
             kind="container",
-            siblings_share=raw.siblings_share,
             description=raw.description,
             example=raw.example,
             prompt=raw.prompt,

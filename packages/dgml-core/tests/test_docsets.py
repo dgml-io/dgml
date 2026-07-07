@@ -24,7 +24,6 @@ start =
 
 Title =
   element docset:Title {
-    attribute siblingsShare { "true" },
     text
   }
 """

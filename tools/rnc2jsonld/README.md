@@ -46,15 +46,14 @@ The output contains a fixed `@context` and a `@graph` of tag and group definitio
     "xsd": "http://www.w3.org/2001/XMLSchema#",
     "Tag":          "docset:Tag",
     "TagGroup":     "docset:TagGroup",
-    "siblingsShare": { "@id": "docset:siblingsShare", "@type": "xsd:boolean" },
     "members":      { "@id": "docset:members", "@type": "@id", "@container": "@set" },
     "description":  "docset:description",
     "example":      "docset:example"
   },
   "@graph": [
     { "@id": "docset:ClauseItemTag", "@type": "docset:TagGroup", "members": ["..."] },
-    { "@id": "docset:LiabilityCap",  "@type": "docset:SharedTag",    "description": "...", "example": "..." },
-    { "@id": "docset:VendorName",    "@type": "docset:NonSharedTag", "description": "..." }
+    { "@id": "docset:LiabilityCap",  "@type": "docset:Tag", "description": "...", "example": "..." },
+    { "@id": "docset:VendorName",    "@type": "docset:Tag", "description": "..." }
   ]
 }
 ```
@@ -64,16 +63,10 @@ The output contains a fixed `@context` and a `@graph` of tag and group definitio
 | RNC construct | JSON-LD result |
 |---|---|
 | `namespace docset = "…"` | `"docset": "…"` entry in `@context` |
-| Element with `siblingsShare { "true" }` | Node with `"@type": "docset:SharedTag"` |
-| Element with `siblingsShare { "false" }` | Node with `"@type": "docset:NonSharedTag"` |
+| Element definition | Node with `"@type": "docset:Tag"` |
 | Named group (alternation of element refs) | Node with `"@type": "docset:TagGroup"` and `"members"` array |
 | `## description line` doc comment | `"description"` property on the tag node |
 | `## Example: …` doc comment line | `"example"` property on the tag node |
-
-`SharedTag` elements identify values that can be extracted and compared across
-documents (e.g. a liability cap, an effective date). `NonSharedTag` elements
-identify structural elements unique to a document instance (e.g. a vendor name,
-a clause section).
 
 ## Sample
 

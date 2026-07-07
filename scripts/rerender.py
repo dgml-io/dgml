@@ -35,7 +35,6 @@ from dgml_core.generation.blocks import Block, Span
 from dgml_core.generation.label import _parse_labels_json, apply_labels, label_documents
 from dgml_core.generation.to_semantic import (
     build_header,
-    collect_shared_concepts,
     render_dgml,
     render_semantic_xml,
 )
@@ -102,14 +101,13 @@ def rerender(
             if n_warn:
                 print(f"{stem[:48]}: {n_warn} label warning(s)")
 
-    shared = collect_shared_concepts(docs)
     semantic_dir = docset_dir / "semantic"
     semantic_dir.mkdir(exist_ok=True)
 
     for stem, blocks in docs.items():
         # Final dgml directly from blocks — the conversion, no Pass 4.
         (docset_dir / f"{stem}.dgml.xml").write_text(
-            render_dgml(blocks, header=header, shared_concepts=shared), encoding="utf-8"
+            render_dgml(blocks, header=header), encoding="utf-8"
         )
         (semantic_dir / f"{stem}.xml").write_text(render_semantic_xml(blocks), encoding="utf-8")
         labeled = sum(1 for b in blocks if b.concept)

@@ -2989,7 +2989,7 @@ _JSON_SCHEMA = {
     "definitions": {"grounded_field": {"type": "object"}},
     "properties": {
         "vendor_name": {"$ref": "#/definitions/grounded_field"},
-        "liability_cap": {"$ref": "#/definitions/grounded_field", "siblingsShare": True},
+        "liability_cap": {"$ref": "#/definitions/grounded_field"},
     },
 }
 
@@ -3004,7 +3004,6 @@ start =
 
 VendorName =
   element docset:VendorName {
-    attribute siblingsShare { "false" },
     text
   }
 """

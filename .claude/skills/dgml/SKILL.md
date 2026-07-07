@@ -381,10 +381,12 @@ generate builds its tree and carries the existing `dg:extraction` over
 are skipped, adding a document and re-running generates only the new one — and
 by default it's labeled seeded with the docset's existing
 `cache/concept_roster.json`, so its tags stay consistent with the rest (no
-`--schema-path` needed). Namespacing is recomputed over the whole docset, so
-any already-generated file whose `docset:`/`dg:` prefix changes is
-deterministically re-rendered (reported under `rerendered` / `summary.rerendered`;
-no re-LLM). Pass `--no-roster` to label the new docs in isolation instead.
+`--schema-path` needed). Every concept is emitted in the `docset:` vocabulary
+namespace (`dg:` is framework-only), so growing the docset never flips a tag's
+prefix; an already-generated file is still re-rendered deterministically when
+its output otherwise changes as the docset's schema/roster grows (reported under
+`rerendered` / `summary.rerendered`; no re-LLM). Pass `--no-roster` to label the
+new docs in isolation instead.
 
 ```bash
 uv run dgml docset add-file "$ds" "$new_fid"
