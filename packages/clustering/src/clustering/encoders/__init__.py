@@ -30,13 +30,17 @@ from clustering.encoders.base import (
     registered_encoders,
 )
 from clustering.encoders.caching import CachingEncoder, encoder_fingerprint
+from clustering.encoders.mrl import SweepResult, mrl_dimension_sweep, mrl_truncate
 
 __all__ = [
     "CachingEncoder",
     "Encoder",
     "EncoderOutput",
+    "SweepResult",
     "build_encoder",
     "encoder_fingerprint",
+    "mrl_dimension_sweep",
+    "mrl_truncate",
     "register_encoder",
     "registered_encoders",
 ]

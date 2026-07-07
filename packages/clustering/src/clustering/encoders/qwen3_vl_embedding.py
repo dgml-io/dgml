@@ -1,34 +1,49 @@
-"""Qwen3-VL-Embedding image encoder (``Qwen/Qwen3-VL-Embedding-8B`` / ``-2B``).
+"""Qwen3-VL-Embedding encoder (``Qwen/Qwen3-VL-Embedding-8B`` / ``-2B``).
 
 Unlike :mod:`clustering.encoders.qwen_vl` — which borrows the *vision tower*
 of a generative Qwen2/2.5-VL checkpoint and mean-pools its patches — this is a
-purpose-built **multimodal embedding** model (base: Qwen3-VL-8B-Instruct). It
-emits a single, already-normalized vector per input in a shared text+image
-space, so we use it directly as a page-image encoder: each page image is sent
-through the model's ``sentence_transformers`` interface and the returned vector
-is ``pooled``.
+purpose-built **multimodal embedding** model (base: Qwen3-VL-*-Instruct). It
+emits a single, already-normalized vector per input in a *shared text+image
+space*, so the same encoder serves both sides of the pipeline:
 
-The model is instruction-aware and Matryoshka-trained (MRL): the native 4096-d
-embedding can be truncated to any width in ``[64, 4096]``. We pass
-``cfg.embedding_dim`` as the SentenceTransformer ``truncate_dim`` so the encoder
-honors the dim the rest of the pipeline (fusion / manifold) is configured for,
-and re-normalize after truncation.
+* as ``encoder_image`` it embeds a page render (``page_1.png``);
+* as ``encoder_text`` it embeds the page's OCR text;
+
+and because both land in one space, the fusion layer combines genuinely
+comparable vectors. An item is a ``str`` (text), a ``PIL.Image`` (page image),
+or — if a caller ever passes one — a ``{"text", "image"}`` dict for a single
+mixed input.
+
+**MRL (Matryoshka).** The native embedding (4096-d for 8B, 2048-d for 2B) can
+be truncated to any width in ``[64, native]`` and re-normalized. We honor
+``cfg.embedding_dim`` as the target width so the rest of the pipeline (fusion /
+manifold) gets the dimensionality it's configured for. See
+:mod:`clustering.encoders.mrl` for the sweep helper that picks a good width.
+
+**Pluggable backend** (``cfg.extra['backend']``):
+
+* ``"local"`` (default) — load the checkpoint in-process via
+  ``sentence_transformers`` and truncate with its ``truncate_dim``. Simplest;
+  a GPU is strongly recommended (the 8B in float32 needs ~32 GB just for
+  weights, so its native dtype / bf16 is used).
+* ``"server"`` — POST to an OpenAI-compatible embeddings endpoint (a vLLM
+  ``--task embed`` or SGLang server hosting the same checkpoint). Keeps torch
+  and the weights out of this process; MRL truncation is applied client-side
+  via :func:`clustering.encoders.mrl.mrl_truncate` so the configured width is
+  honored regardless of whether the server did its own truncation.
 
 Single-vector only: the model exposes one pooled embedding, so
-``multi_vector=True`` (i.e. ``fusion=late_interaction``) is rejected — use
-ColPali for multi-vector page retrieval.
-
-Notes:
-    This is an 8B-parameter checkpoint that ships custom modeling code, so
-    ``trust_remote_code`` is required (defaulted ``True`` here, overridable via
-    ``cfg.extra['trust_remote_code']``) and a GPU is strongly recommended. The
-    checkpoint's native dtype is used unless ``cfg.extra['torch_dtype']`` (e.g.
-    ``"bfloat16"``) overrides it — forcing float32 would need ~32 GB just for
-    weights.
+``multi_vector=True`` (``fusion=late_interaction``) is rejected — use ColPali
+for multi-vector page retrieval.
 """
 
 from __future__ import annotations
 
+import base64
+import io
+import json
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from typing import Any
 
@@ -37,20 +52,134 @@ from PIL import Image
 
 from clustering.config.schema import EncoderConfig
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
+from clustering.encoders.mrl import mrl_truncate
 from clustering.utils import resolve_device
 
+# One item into the model: text, a page image, or a single mixed input.
+Qwen3VLInput = str | Image.Image | dict[str, Any]
 
-class Qwen3VLEmbeddingEncoder(Encoder[Image.Image]):
-    """Qwen3-VL-Embedding page-image encoder. Single-vector (shared space)."""
+
+def _to_mm_input(item: Qwen3VLInput) -> dict[str, Any]:
+    """Normalize one encode input into the model's ``{"text"?, "image"?}`` dict."""
+    if isinstance(item, str):
+        return {"text": item}
+    if isinstance(item, Image.Image):
+        return {"image": item}
+    if isinstance(item, dict):
+        if not ("text" in item or "image" in item):
+            raise ValueError(f"Mixed input dict needs a 'text' and/or 'image' key; got {item!r}.")
+        return item
+    raise TypeError(f"Unsupported Qwen3-VL input type: {type(item).__name__}.")
+
+
+def _image_to_data_url(image: Image.Image) -> str:
+    """Encode a PIL image as a base64 PNG ``data:`` URL for the server backend."""
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _server_input_element(item: dict[str, Any]) -> Any:
+    """Map a ``{"text"?, "image"?}`` item to one OpenAI ``input`` element.
+
+    Text-only inputs become a bare string (the vanilla embeddings contract);
+    anything with an image becomes an OpenAI chat-style content list mixing
+    ``image_url`` and ``text`` parts (the multimodal-embeddings convention).
+    """
+    text = item.get("text")
+    image = item.get("image")
+    if image is None:
+        return text if text is not None else ""
+    url = _image_to_data_url(image) if isinstance(image, Image.Image) else str(image)
+    content: list[dict[str, Any]] = [{"type": "image_url", "image_url": {"url": url}}]
+    if text is not None:
+        content.append({"type": "text", "text": text})
+    return content
+
+
+def build_server_payload(
+    items: Sequence[dict[str, Any]],
+    *,
+    model: str,
+    dim: int | None,
+    prompt: str | None,
+) -> dict[str, Any]:
+    """Build the JSON body for an OpenAI-compatible ``/v1/embeddings`` request.
+
+    Pure (no I/O) so it can be unit-tested offline. ``dim`` is forwarded as the
+    OpenAI ``dimensions`` field *as a hint*; the client still truncates the
+    returned vectors defensively, since not every server honors it for a
+    multimodal pooling model.
+    """
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": [_server_input_element(it) for it in items],
+        "encoding_format": "float",
+    }
+    if dim is not None:
+        payload["dimensions"] = dim
+    if prompt is not None:
+        payload["instruction"] = prompt
+    return payload
+
+
+def parse_server_response(obj: dict[str, Any]) -> list[list[float]]:
+    """Extract embeddings from an OpenAI-compatible response, in request order.
+
+    Pure (no I/O). Sorts by ``index`` when present so an out-of-order server
+    response still lines up with the inputs.
+    """
+    data = obj.get("data")
+    if not isinstance(data, list):
+        raise ValueError(
+            f"Malformed embeddings response: missing 'data' list (got keys {list(obj)})."
+        )
+    rows = sorted(data, key=lambda d: int(d.get("index", 0)))
+    return [[float(x) for x in row["embedding"]] for row in rows]
+
+
+class _ServerBackend:
+    """Thin OpenAI-compatible embeddings client (stdlib ``urllib``, no new deps)."""
+
+    def __init__(self, cfg: EncoderConfig) -> None:
+        base_url = cfg.extra.get("base_url") or cfg.extra.get("endpoint")
+        if not base_url:
+            raise ValueError(
+                "Qwen3-VL-Embedding server backend requires extra['base_url'] "
+                "(e.g. 'http://localhost:8000/v1'). Point it at a vLLM --task embed "
+                "or SGLang server hosting the checkpoint."
+            )
+        base = str(base_url).rstrip("/")
+        self.url = base if base.endswith("/embeddings") else f"{base}/embeddings"
+        # The name the server registered the model under; defaults to the HF id.
+        self.model = str(cfg.extra.get("served_model_name") or cfg.model_id)
+        api_key = cfg.extra.get("api_key")
+        self.api_key: str | None = str(api_key) if api_key else None
+        self.timeout: float = float(cfg.extra.get("timeout", 60.0))
+
+    def embed(
+        self, items: Sequence[dict[str, Any]], *, dim: int | None, prompt: str | None
+    ) -> torch.Tensor:
+        payload = build_server_payload(items, model=self.model, dim=dim, prompt=prompt)
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                obj = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Qwen3-VL embeddings request to {self.url} failed: {exc}") from exc
+        vectors = parse_server_response(obj)
+        return torch.tensor(vectors, dtype=torch.float32)
+
+
+class Qwen3VLEmbeddingEncoder(Encoder[Qwen3VLInput]):
+    """Qwen3-VL-Embedding encoder. Single-vector, shared text+image space."""
 
     def __init__(self, cfg: EncoderConfig, *, device: str = "auto") -> None:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:
-            raise ImportError(
-                "sentence-transformers is not installed. Add the 'encoders' extra "
-                "with: `uv sync --extra encoders`."
-            ) from exc
         if cfg.model_id is None:
             raise ValueError(f"Encoder {cfg.name!r} requires a model_id.")
         if cfg.multi_vector:
@@ -63,23 +192,41 @@ class Qwen3VLEmbeddingEncoder(Encoder[Image.Image]):
         self.cfg = cfg
         self.embedding_dim = cfg.embedding_dim
         self.multi_vector = False
-        # Custom-code checkpoint; trust_remote_code is required to load it.
-        self.trust_remote_code: bool = bool(cfg.extra.get("trust_remote_code", True))
-        # 8B model — keep the per-call image batch small by default to bound
-        # activation memory; tune via ``cfg.extra['batch_size']``.
-        self.batch_size: int = int(cfg.extra.get("batch_size", 8))
+        self.backend_name: str = str(cfg.extra.get("backend", "local"))
         # Optional instruction. The model wraps inputs with a default
         # ("Represent the user's input.") when no prompt is given; override via
         # ``cfg.extra['prompt']`` to steer the embedding toward document type.
         prompt = cfg.extra.get("prompt")
         self.prompt: str | None = str(prompt) if prompt else None
+        # Per-call batch size; the 8B is memory-hungry, so keep it small.
+        self.batch_size: int = int(cfg.extra.get("batch_size", 8))
+
+        if self.backend_name == "server":
+            self._server: _ServerBackend | None = _ServerBackend(cfg)
+            self.model: Any = None
+            return
+        if self.backend_name != "local":
+            raise ValueError(
+                f"Unknown backend {self.backend_name!r} for Qwen3-VL-Embedding; "
+                "expected 'local' or 'server'."
+            )
+
+        self._server = None
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "sentence-transformers is not installed. Add the 'encoders' extra "
+                "with: `uv sync --extra encoders`."
+            ) from exc
+        # Custom-code checkpoint; trust_remote_code is required to load it.
+        self.trust_remote_code: bool = bool(cfg.extra.get("trust_remote_code", True))
         info = resolve_device(device)
         self.device = info.torch_device
-
         st_kwargs: dict[str, Any] = {
             "device": str(self.device),
             "trust_remote_code": self.trust_remote_code,
-            # MRL: truncate the native 4096-d output to the configured width.
+            # MRL: truncate the native output to the configured width.
             "truncate_dim": cfg.embedding_dim,
         }
         model_kwargs: dict[str, Any] = {}
@@ -90,9 +237,8 @@ class Qwen3VLEmbeddingEncoder(Encoder[Image.Image]):
             model_kwargs["torch_dtype"] = str(torch_dtype)
         # MPS (Metal) can't run this model's grouped-query attention through the
         # fused/SDPA path: ``mps_matmul`` rejects the 16-query-vs-8-KV-head
-        # broadcast ("incompatible dimensions"), aborting the process. Eager
-        # attention does the explicit repeat_kv and works. Force it on MPS unless
-        # overridden; leave the fast default (SDPA/flash) on CUDA/CPU.
+        # broadcast, aborting the process. Eager attention does the explicit
+        # repeat_kv and works. Force it on MPS unless overridden.
         attn = cfg.extra.get("attn_implementation")
         if attn is None and self.device.type == "mps":
             attn = "eager"
@@ -103,10 +249,15 @@ class Qwen3VLEmbeddingEncoder(Encoder[Image.Image]):
         self.model = SentenceTransformer(cfg.model_id, **st_kwargs)
 
     @torch.no_grad()
-    def encode(self, batch: Sequence[Image.Image]) -> EncoderOutput:
-        # The multimodal interface takes one dict per input; an image-only
-        # document is ``{"image": <PIL.Image>}``.
-        inputs: list[dict[str, Image.Image]] = [{"image": image} for image in batch]
+    def encode(self, batch: Sequence[Qwen3VLInput]) -> EncoderOutput:
+        inputs = [_to_mm_input(item) for item in batch]
+        if self._server is not None:
+            raw = self._server.embed(inputs, dim=self.embedding_dim, prompt=self.prompt)
+            # The server may or may not have truncated; enforce the width + renorm.
+            pooled = mrl_truncate(raw, self.embedding_dim)
+            return EncoderOutput(pooled=pooled.detach().cpu().float())
+
+        assert self.model is not None  # local backend: model is loaded
         encode_kwargs: dict[str, Any] = {}
         if self.prompt is not None:
             encode_kwargs["prompt"] = self.prompt
@@ -114,12 +265,12 @@ class Qwen3VLEmbeddingEncoder(Encoder[Image.Image]):
             inputs,
             batch_size=self.batch_size,
             convert_to_tensor=True,
-            normalize_embeddings=True,
+            normalize_embeddings=True,  # renormalize after truncate_dim
             show_progress_bar=False,
             **encode_kwargs,
         )
         # .float(): the checkpoint runs in bf16, but the encoder contract is
-        # float32 (numpy/UMAP downstream can't consume bfloat16).
+        # float32 (numpy / UMAP downstream can't consume bfloat16).
         return EncoderOutput(pooled=embeddings.detach().cpu().float())
 
 
@@ -127,10 +278,10 @@ def _factory(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return Qwen3VLEmbeddingEncoder(cfg, device=device)
 
 
-# One model family, one wrapper: both checkpoints share the same
-# sentence-transformers interface and differ only in ``model_id`` (and native
-# dim — 4096 for 8B, 2048 for 2B, both MRL-truncatable). Registered under a
-# size-explicit name each so callers select via ``encoder_image=...`` and the
-# config supplies the matching ``model_id`` / ``embedding_dim``.
+# One model family, one wrapper: both checkpoints share the same interface and
+# differ only in ``model_id`` (and native dim — 4096 for 8B, 2048 for 2B, both
+# MRL-truncatable). Registered under a size-explicit name each; the same name
+# works as ``encoder_text`` or ``encoder_image`` because the encoder embeds
+# both modalities into one shared space.
 register_encoder("qwen3_vl_embedding")(_factory)  # Qwen/Qwen3-VL-Embedding-8B
 register_encoder("qwen3_vl_embedding_2b")(_factory)  # Qwen/Qwen3-VL-Embedding-2B
