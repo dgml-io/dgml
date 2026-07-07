@@ -12,18 +12,18 @@ Merge rules (per page, applied to word bounding boxes):
   digital output as garbage, log a "unicode error", and use OCR for the
   entire page.
 - Otherwise, group digital + OCR words that cover the same region into
-  **clusters** (connected components over a "boxes overlap" graph; see
+  **regions** (connected components over a "boxes overlap" graph; see
   :func:`_boxes_overlap`, which matches on IoU *or* containment so a
-  merged box and the split boxes it contains land in one cluster). Each
-  cluster is resolved as a unit, so split / merge tokenization — one side
+  merged box and the split boxes it contains land in one region). Each
+  region is resolved as a unit, so split / merge tokenization — one side
   splitting a span the other keeps whole — is one decision instead of
   per-word matching:
 
-    * OCR-only cluster (no digital) → keep OCR; log it.
-    * Digital-only cluster (no OCR) → assumed invisible to the human eye
+    * OCR-only region (no digital) → keep OCR; log it.
+    * Digital-only region (no OCR) → assumed invisible to the human eye
       (white-on-white, off-page, hidden form layer, …) and **dropped**
       with a warning.
-    * Mixed cluster → concatenate each side's text in reading order and
+    * Mixed region → concatenate each side's text in reading order and
       compute the (dash-normalized) Levenshtein distance:
 
         - within :data:`LEVENSHTEIN_THRESHOLD` → the two agree on content,
@@ -39,21 +39,21 @@ stored word keeps its original characters.
 
 **LLM-driven merge (optional).** When the workspace declares a
 ``text_extraction`` section (see :mod:`dgml.text_extraction_config`), the
-per-cluster decision is delegated to that LLM instead of the Levenshtein
+per-region decision is delegated to that LLM instead of the Levenshtein
 rule above. The decision tree changes to:
 
-- digital-only cluster → dropped (no LLM call, as before);
-- OCR-only cluster → keep OCR (no LLM call);
-- mixed cluster whose digital and OCR token sequences are *identical*
+- digital-only region → dropped (no LLM call, as before);
+- OCR-only region → keep OCR (no LLM call);
+- mixed region whose digital and OCR token sequences are *identical*
   (dash-normalized) → keep digital (no LLM call);
-- every other (differing) mixed cluster → sent to the LLM, which returns the
+- every other (differing) mixed region → sent to the LLM, which returns the
   final token list (take digital / take OCR / a combination).
 
-A page's to-decide clusters go out in batches of :data:`MERGE_BATCH_SIZE`
-clusters per call (one page-sized call can overrun the model's output-token
+A page's to-decide regions go out in batches of :data:`MERGE_BATCH_SIZE`
+regions per call (one page-sized call can overrun the model's output-token
 budget and come back truncated). A batch whose call fails (model unreachable,
 timeout, unparseable / structurally-invalid response) falls back to the
-heuristic for *that batch's* clusters only; other batches keep their LLM
+heuristic for *that batch's* regions only; other batches keep their LLM
 result, so a flaky local model degrades gracefully. See :func:`_llm_emit_plan`
 for the request/response contract.
 
@@ -100,18 +100,18 @@ LEVENSHTEIN_THRESHOLD = 2
 # glyph IDs to Unicode — we treat the page's digital output as unusable
 # and fall back to OCR for that page.
 MAX_CID_WORDS_PER_PAGE = 10
-# Clusters needing an LLM decision go out in batches of this many per request.
+# Regions needing an LLM decision go out in batches of this many per request.
 # One call for the whole page can overrun the model's output-token limit (or a
 # local model's num_ctx) on dense pages — the reply is truncated mid-JSON and
 # the page falls back to the heuristic. Batching keeps each reply small enough
 # to complete, and isolates a failure to its own batch (only that batch's
-# clusters fall back, not the page). Tune down for small-context local models,
+# regions fall back, not the page). Tune down for small-context local models,
 # up to cut per-call overhead.
 MERGE_BATCH_SIZE = 40
 
-# One cluster queued for the LLM: (sort_key, cluster_id, digital_idxs,
+# One region queued for the LLM: (sort_key, region_id, digital_idxs,
 # ocr_idxs, payload_entry). Sorted by sort_key into page reading order.
-_ClusterToSend = tuple[tuple[int, int], str, list[int], list[int], dict[str, Any]]
+_RegionToSend = tuple[tuple[int, int], str, list[int], list[int], dict[str, Any]]
 
 
 class _LLMMergeError(ValueError):
@@ -148,7 +148,7 @@ def extract_text_hybrid(
     rather than aborting — OCR is the authoritative source in hybrid mode.
     An OCR failure is propagated to the caller (same as ``--text-mode ocr``).
 
-    ``text_extraction_config`` (when not ``None``) switches the per-cluster
+    ``text_extraction_config`` (when not ``None``) switches the per-region
     merge from the Levenshtein heuristic to the configured LLM;
     ``workspace`` is used only to record LLM usage telemetry. Both are
     optional so non-workspace callers keep the heuristic behaviour.
@@ -268,7 +268,7 @@ def _merge_words(
     """Apply the merge rules described in the module docstring.
 
     When ``text_extraction_config`` is ``None`` the deterministic
-    Levenshtein heuristic resolves each cluster (:func:`_heuristic_emit_plan`).
+    Levenshtein heuristic resolves each region (:func:`_heuristic_emit_plan`).
     Otherwise the configured LLM does (:func:`_llm_emit_plan`), with a
     fall-back to the heuristic for the page on any failure. Per-page warnings
     and summary go to stderr only when ``verbose`` is set.
@@ -290,13 +290,13 @@ def _merge_words(
             )
         return list(ocr_words)
 
-    clusters = _cluster_overlaps(digital_words, ocr_words)
+    regions = _region_overlaps(digital_words, ocr_words)
 
     emit_plan: dict[int, list[dict[str, Any]]] | None = None
     if text_extraction_config is not None:
         try:
             emit_plan = _llm_emit_plan(
-                clusters,
+                regions,
                 digital_words,
                 ocr_words,
                 file_id=file_id,
@@ -321,7 +321,7 @@ def _merge_words(
     # Heuristic merge when no LLM is configured, or the LLM merge failed above.
     if emit_plan is None:
         emit_plan = _heuristic_emit_plan(
-            clusters,
+            regions,
             digital_words,
             ocr_words,
             file_id=file_id,
@@ -394,10 +394,10 @@ def _box_overlap_fraction(a: list[int], b: list[int]) -> float:
 
 # `emit_plan[o_idx]` overrides what an OCR word emits: a list of words to
 # splice in at that position, or `[]` to drop it. OCR words absent from the
-# plan (and those with malformed boxes, which never cluster) emit themselves —
+# plan (and those with malformed boxes, which never region) emit themselves —
 # so OCR reading order is preserved. Both resolvers below return one.
 def _heuristic_emit_plan(
-    clusters: list[tuple[list[int], list[int]]],
+    regions: list[tuple[list[int], list[int]]],
     digital_words: list[dict[str, Any]],
     ocr_words: list[dict[str, Any]],
     *,
@@ -405,10 +405,10 @@ def _heuristic_emit_plan(
     page_num: int,
     verbose: bool,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Resolve clusters with the Levenshtein heuristic (the default merge)."""
+    """Resolve regions with the Levenshtein heuristic (the default merge)."""
     emit_plan: dict[int, list[dict[str, Any]]] = {}
 
-    for d_idxs, o_idxs in clusters:
+    for d_idxs, o_idxs in regions:
         if not o_idxs:
             # Digital-only region: no visual counterpart, assume invisible.
             if verbose:
@@ -435,7 +435,7 @@ def _heuristic_emit_plan(
                     )
             continue
 
-        # Mixed cluster. Compare concatenated text (dash-normalized) to decide
+        # Mixed region. Compare concatenated text (dash-normalized) to decide
         # whether the two sides agree, then keep the finer tokenization.
         d_concat = _concat_reading_order([digital_words[i] for i in d_idxs])
         o_concat = _concat_reading_order([ocr_words[j] for j in o_idxs])
@@ -456,7 +456,7 @@ def _heuristic_emit_plan(
                     emit_plan[oi] = []
 
         if verbose:
-            _log_cluster_decision(
+            _log_region_decision(
                 file_id=file_id,
                 page_num=page_num,
                 digital_words=digital_words,
@@ -484,7 +484,7 @@ def _merge_system_prompt() -> str:
 
 
 def _llm_emit_plan(
-    clusters: list[tuple[list[int], list[int]]],
+    regions: list[tuple[list[int], list[int]]],
     digital_words: list[dict[str, Any]],
     ocr_words: list[dict[str, Any]],
     *,
@@ -495,22 +495,22 @@ def _llm_emit_plan(
     verbose: bool,
     debug: bool = False,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Resolve clusters with the configured LLM, batched across requests.
+    """Resolve regions with the configured LLM, batched across requests.
 
-    Decision tree (see module docstring): digital-only clusters are dropped,
-    OCR-only clusters keep OCR, and token-identical mixed clusters keep digital
-    — all without any LLM call. Only differing mixed clusters are sent to the
+    Decision tree (see module docstring): digital-only regions are dropped,
+    OCR-only regions keep OCR, and token-identical mixed regions keep digital
+    — all without any LLM call. Only differing mixed regions are sent to the
     model, in batches of :data:`MERGE_BATCH_SIZE`. A batch whose request
     fails (transport / parse / structural-validation) falls back to the
-    heuristic for *that batch's* clusters only — disjoint from the other
-    batches, so no cluster is resolved twice. Successful batches keep their
+    heuristic for *that batch's* regions only — disjoint from the other
+    batches, so no region is resolved twice. Successful batches keep their
     LLM result; unexpected errors propagate so :func:`_merge_words` can fall
     back to the heuristic for the whole page.
     """
     emit_plan: dict[int, list[dict[str, Any]]] = {}
-    to_send: list[_ClusterToSend] = []
+    to_send: list[_RegionToSend] = []
 
-    for n, (d_idxs, o_idxs) in enumerate(clusters):
+    for n, (d_idxs, o_idxs) in enumerate(regions):
         if not o_idxs:
             # Digital-only region: dropped, same as the heuristic. No LLM call.
             if verbose:
@@ -539,7 +539,7 @@ def _llm_emit_plan(
             continue
 
         if _tokens_identical(d_idxs, o_idxs, digital_words, ocr_words):
-            # Mixed cluster whose tokenization + text already agree → digital.
+            # Mixed region whose tokenization + text already agree → digital.
             anchor = min(o_idxs)
             emit_plan[anchor] = _reading_order([digital_words[i] for i in d_idxs])
             for oi in o_idxs:
@@ -547,9 +547,9 @@ def _llm_emit_plan(
                     emit_plan[oi] = []
             continue
 
-        # Only differing mixed clusters reach the LLM.
-        cid = f"c{n}"
-        entry: dict[str, Any] = {"id": cid, "kind": "mixed"}
+        # Only differing mixed regions reach the LLM.
+        rid = f"r{n}"
+        entry: dict[str, Any] = {"id": rid, "kind": "mixed"}
         entry["digital"] = [
             {"id": f"d{i}", "t": str(digital_words[i].get("t", ""))}
             for i in _reading_order_indices(d_idxs, digital_words)
@@ -558,18 +558,18 @@ def _llm_emit_plan(
             {"id": f"o{j}", "t": str(ocr_words[j].get("t", ""))}
             for j in _reading_order_indices(o_idxs, ocr_words)
         ]
-        sort_key = _cluster_sort_key(d_idxs, o_idxs, digital_words, ocr_words)
-        to_send.append((sort_key, cid, d_idxs, o_idxs, entry))
+        sort_key = _region_sort_key(d_idxs, o_idxs, digital_words, ocr_words)
+        to_send.append((sort_key, rid, d_idxs, o_idxs, entry))
 
     if not to_send:
         return emit_plan
 
-    to_send.sort(key=lambda e: e[0])  # clusters in page reading order
+    to_send.sort(key=lambda e: e[0])  # regions in page reading order
     for start in range(0, len(to_send), MERGE_BATCH_SIZE):
         batch = to_send[start : start + MERGE_BATCH_SIZE]
         try:
             response = _call_merge_llm(
-                {"clusters": [e[4] for e in batch]},
+                {"regions": [e[4] for e in batch]},
                 config=config,
                 workspace=workspace,
                 file_id=file_id,
@@ -579,7 +579,7 @@ def _llm_emit_plan(
             # Resolve into a fragment first: a malformed entry raises before
             # any of the batch's decisions touch emit_plan, so the heuristic
             # fall-back below re-resolves the whole batch without colliding
-            # with clusters that happened to parse.
+            # with regions that happened to parse.
             batch_plan = _resolve_batch_decisions(
                 batch,
                 response,
@@ -594,7 +594,7 @@ def _llm_emit_plan(
                 batch_num = start // MERGE_BATCH_SIZE + 1
                 print(
                     f"warning: file_id={file_id} page={page_num}: LLM merge failed "
-                    f"for batch {batch_num} ({len(batch)} clusters) "
+                    f"for batch {batch_num} ({len(batch)} regions) "
                     f"({type(exc).__name__}: {exc}); falling back to heuristic "
                     f"for this batch",
                     file=sys.stderr,
@@ -607,7 +607,7 @@ def _llm_emit_plan(
                         file=sys.stderr,
                     )
             batch_plan = _heuristic_emit_plan(
-                [(d_idxs, o_idxs) for _key, _cid, d_idxs, o_idxs, _entry in batch],
+                [(d_idxs, o_idxs) for _key, _rid, d_idxs, o_idxs, _entry in batch],
                 digital_words,
                 ocr_words,
                 file_id=file_id,
@@ -620,7 +620,7 @@ def _llm_emit_plan(
 
 
 def _resolve_batch_decisions(
-    batch: list[_ClusterToSend],
+    batch: list[_RegionToSend],
     response: dict[str, Any],
     *,
     digital_words: list[dict[str, Any]],
@@ -631,17 +631,17 @@ def _resolve_batch_decisions(
 ) -> dict[int, list[dict[str, Any]]]:
     """Turn one batch's LLM response into an emit-plan fragment.
 
-    Validates every cluster in the batch, raising :class:`_LLMMergeError` on
+    Validates every region in the batch, raising :class:`_LLMMergeError` on
     the first malformed entry *before* returning, so the caller can fall back
-    to the heuristic for the whole batch without double-resolving the clusters
+    to the heuristic for the whole batch without double-resolving the regions
     that did parse.
     """
     batch_plan: dict[int, list[dict[str, Any]]] = {}
-    for _key, cid, d_idxs, o_idxs, _entry in batch:
-        decision = response.get(cid)
+    for _key, rid, d_idxs, o_idxs, _entry in batch:
+        decision = response.get(rid)
         if not isinstance(decision, list):
             raise _LLMMergeError(
-                f"response missing or malformed entry for cluster {cid!r}",
+                f"response missing or malformed entry for region {rid!r}",
                 raw_output=json.dumps(response, ensure_ascii=False),
             )
         resolved = _resolve_llm_decision(decision, d_idxs, o_idxs, digital_words, ocr_words)
@@ -661,7 +661,7 @@ def _resolve_batch_decisions(
             accepted = [str(w.get("t", "")) for w in resolved]
             print(
                 f"info: file_id={file_id} page={page_num}: LLM resolved mixed "
-                f"cluster {cid} ({len(d_idxs)} digital, {len(o_idxs)} OCR); "
+                f"region {rid} ({len(d_idxs)} digital, {len(o_idxs)} OCR); "
                 f"digital={d_texts!r} ocr={o_texts!r} "
                 f"-> {len(resolved)} token(s): {accepted!r}",
                 file=sys.stderr,
@@ -679,7 +679,7 @@ def _call_merge_llm(
     page_num: int,
     debug: bool = False,
 ) -> dict[str, Any]:
-    """Send one page's clusters to the LLM and return the parsed JSON object.
+    """Send one page's regions to the LLM and return the parsed JSON object.
 
     The call records its own usage row (gated on ``--debug``) from the context
     carried on the config.
@@ -705,7 +705,7 @@ def _call_merge_llm(
 
 
 def _parse_merge_response(text: str) -> dict[str, Any]:
-    """Parse the model's reply into a ``{cluster_id: [tokens]}`` dict.
+    """Parse the model's reply into a ``{region_id: [tokens]}`` dict.
 
     Tolerates a ```` ```json ```` / ```` ``` ```` code fence around the JSON.
     Raises ``ValueError`` on anything that isn't a JSON object.
@@ -740,11 +740,11 @@ def _resolve_llm_decision(
     digital_words: list[dict[str, Any]],
     ocr_words: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Turn one cluster's ``[{ref, t?}]`` decision into output word dicts.
+    """Turn one region's ``[{ref, t?}]`` decision into output word dicts.
 
     Each output word inherits the box of the input token named by ``ref``;
     ``t`` overrides the text. An unknown ``ref`` falls back to the nearest
-    box (the cluster's first reading-order token) rather than emitting a
+    box (the region's first reading-order token) rather than emitting a
     box-less word — the model can lose box *precision* but never produce an
     invalid word dict. Tokens with no resolvable text are skipped. Raises
     ``ValueError`` on a structurally invalid item (caller → page fallback).
@@ -755,8 +755,8 @@ def _resolve_llm_decision(
     for j in o_idxs:
         id_to_word[f"o{j}"] = ocr_words[j]
 
-    cluster_words = [digital_words[i] for i in d_idxs] + [ocr_words[j] for j in o_idxs]
-    ordered = _reading_order(cluster_words)
+    region_words = [digital_words[i] for i in d_idxs] + [ocr_words[j] for j in o_idxs]
+    ordered = _reading_order(region_words)
     fallback_box = ordered[0]["l"] if ordered else None
 
     out: list[dict[str, Any]] = []
@@ -792,7 +792,7 @@ def _tokens_identical(
 ) -> bool:
     """True if the two sides have identical token sequences (dash-normalized).
 
-    Reading-order token texts compared one-for-one. Such clusters skip the
+    Reading-order token texts compared one-for-one. Such regions skip the
     LLM and keep digital (its character codes come straight from the font).
     """
     if len(d_idxs) != len(o_idxs):
@@ -816,20 +816,20 @@ def _reading_order_indices(idxs: list[int], words: list[dict[str, Any]]) -> list
     return sorted(idxs, key=lambda i: (words[i]["l"][1] // band, words[i]["l"][0]))
 
 
-def _cluster_sort_key(
+def _region_sort_key(
     d_idxs: list[int],
     o_idxs: list[int],
     digital_words: list[dict[str, Any]],
     ocr_words: list[dict[str, Any]],
 ) -> tuple[int, int]:
-    """Top-left ``(top, left)`` of a cluster, for ordering clusters in the payload."""
+    """Top-left ``(top, left)`` of a region, for ordering regions in the payload."""
     boxes = [digital_words[i]["l"] for i in d_idxs] + [ocr_words[j]["l"] for j in o_idxs]
     top = min(b[1] for b in boxes)
     left = min(b[0] for b in boxes)
     return (top, left)
 
 
-def _log_cluster_decision(
+def _log_region_decision(
     *,
     file_id: str,
     page_num: int,
@@ -843,7 +843,7 @@ def _log_cluster_decision(
     agree: bool,
     take_digital: bool,
 ) -> None:
-    """Emit the stderr line(s) describing how one mixed cluster was resolved."""
+    """Emit the stderr line(s) describing how one mixed region was resolved."""
     if len(d_idxs) == 1 and len(o_idxs) == 1:
         # Clean 1:1 — digital silently wins when the texts agree; only the
         # disagreement (OCR wins) is worth a warning.
@@ -858,7 +858,7 @@ def _log_cluster_decision(
             )
         return
 
-    # Split / merge cluster.
+    # Split / merge region.
     kept = f"digital's {len(d_idxs)}" if take_digital else f"OCR's {len(o_idxs)}"
     print(
         f"info: file_id={file_id} page={page_num}: tokenization mismatch "
@@ -915,11 +915,11 @@ def _normalize_for_compare(text: str) -> str:
     return text.translate(_DASH_TABLE)
 
 
-def _cluster_overlaps(
+def _region_overlaps(
     digital_words: list[dict[str, Any]],
     ocr_words: list[dict[str, Any]],
 ) -> list[tuple[list[int], list[int]]]:
-    """Group digital & OCR word indices into connected overlap clusters.
+    """Group digital & OCR word indices into connected overlap regions.
 
     Union-Find over a bipartite graph whose edges are "boxes overlap" (see
     :func:`_boxes_overlap`). Returns a list of ``(digital_indices,

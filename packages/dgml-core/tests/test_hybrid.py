@@ -206,7 +206,7 @@ def test_merge_combination_warns_for_each_problem(
 
 
 # ---------------------------------------------------------------------------
-# Split / merge clusters (tokenization mismatch)
+# Split / merge regions (tokenization mismatch)
 # ---------------------------------------------------------------------------
 
 
@@ -258,8 +258,8 @@ def test_merge_digital_split_agreeing_keeps_digital_tokens(
 def test_merge_split_tie_goes_to_digital(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Equal token counts in a mixed cluster with agreeing text → digital."""
-    # Identical boxes force a single 2-vs-2 cluster.
+    """Equal token counts in a mixed region with agreeing text → digital."""
+    # Identical boxes force a single 2-vs-2 region.
     box = [0, 0, 80, 10]
     digital = [{"t": "AB", "l": box}, {"t": "CD", "l": box}]
     ocr = [{"t": "AC", "l": box}, {"t": "BD", "l": box}]
@@ -273,7 +273,7 @@ def test_merge_split_tie_goes_to_digital(
 def test_merge_split_disagreeing_takes_ocr(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Mixed cluster whose concatenations differ beyond threshold → OCR, even
+    """Mixed region whose concatenations differ beyond threshold → OCR, even
     though digital here has fewer tokens."""
     digital = [{"t": "ABCDEFGH", "l": [0, 0, 80, 10]}]
     ocr = [
@@ -614,11 +614,11 @@ def _install_fake_call(
     *,
     raw: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Patch ``dgml_core.hybrid.call`` with a fake that replies per cluster.
+    """Patch ``dgml_core.hybrid.call`` with a fake that replies per region.
 
     Returns a list that records each call's parsed payload, so tests can
     assert whether (and with what) the LLM was invoked. ``decider`` maps a
-    cluster payload dict → its decision list. ``raw`` overrides the reply
+    region payload dict → its decision list. ``raw`` overrides the reply
     with a literal string (to exercise malformed-response handling).
     """
     calls: list[dict[str, Any]] = []
@@ -634,7 +634,7 @@ def _install_fake_call(
         calls.append(payload)
         if raw is not None:
             return raw
-        return json.dumps({c["id"]: decider(c) for c in payload["clusters"]})
+        return json.dumps({c["id"]: decider(c) for c in payload["regions"]})
 
     monkeypatch.setattr("dgml_core.hybrid.call", _fake_call)
     return calls
@@ -654,7 +654,7 @@ def _merge_llm(
 
 
 def test_llm_not_called_for_identical_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A mixed cluster whose tokens already match keeps digital with no call."""
+    """A mixed region whose tokens already match keeps digital with no call."""
     calls = _install_fake_call(monkeypatch, lambda c: [])
     digital = [{"t": "Hello", "l": [10, 10, 60, 30]}]
     ocr = [{"t": "Hello", "l": [11, 11, 61, 31]}]
@@ -666,7 +666,7 @@ def test_llm_not_called_for_identical_tokens(monkeypatch: pytest.MonkeyPatch) ->
 def test_llm_verbose_logs_accepted_text(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The per-cluster verbose line includes the final accepted token text."""
+    """The per-region verbose line includes the final accepted token text."""
     _install_fake_call(monkeypatch, lambda c: [{"ref": c["digital"][0]["id"], "t": "file"}])
     digital = [{"t": "ﬁle", "l": [10, 10, 40, 30]}]
     ocr = [{"t": "file", "l": [11, 11, 41, 31]}]
@@ -686,7 +686,7 @@ def test_llm_verbose_logs_accepted_text(
 
 
 def test_llm_take_digital(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Disagreeing cluster, model picks digital → digital words emitted."""
+    """Disagreeing region, model picks digital → digital words emitted."""
     _install_fake_call(monkeypatch, lambda c: [{"ref": t["id"]} for t in c["digital"]])
     digital = [{"t": "outof", "l": [10, 10, 90, 30]}]
     ocr = [{"t": "out", "l": [10, 10, 45, 30]}, {"t": "of", "l": [50, 10, 80, 30]}]
@@ -713,7 +713,7 @@ def test_llm_deligature_combination(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_llm_ocr_only_kept_without_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """OCR-only clusters keep OCR and never reach the LLM."""
+    """OCR-only regions keep OCR and never reach the LLM."""
     calls = _install_fake_call(monkeypatch, lambda c: [])
     ocr = [{"t": "scanned", "l": [10, 10, 60, 30]}]
     merged = _merge_llm([], ocr)
@@ -733,22 +733,22 @@ def test_llm_ocr_only_noise_kept_not_dropped(monkeypatch: pytest.MonkeyPatch) ->
 def test_llm_digital_only_and_ocr_only_resolved_without_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Single-sided clusters need no LLM call: digital-only dropped, OCR-only kept."""
+    """Single-sided regions need no LLM call: digital-only dropped, OCR-only kept."""
     calls = _install_fake_call(monkeypatch, lambda c: [{"ref": t["id"]} for t in c["ocr"]])
     digital = [{"t": "ghost", "l": [200, 200, 260, 220]}]  # no OCR overlap
     ocr = [{"t": "real", "l": [10, 10, 60, 30]}]
     merged = _merge_llm(digital, ocr)
     assert merged == ocr  # ghost dropped, real kept
-    assert calls == []  # neither single-sided cluster reaches the LLM
+    assert calls == []  # neither single-sided region reaches the LLM
 
 
 def test_llm_unknown_ref_falls_back_to_nearest_box(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An invalid ref keeps the override text but borrows the cluster's box."""
+    """An invalid ref keeps the override text but borrows the region's box."""
     _install_fake_call(monkeypatch, lambda c: [{"ref": "does-not-exist", "t": "file"}])
     digital = [{"t": "ﬁle", "l": [10, 10, 40, 30]}]
     ocr = [{"t": "file", "l": [11, 11, 41, 31]}]
     merged = _merge_llm(digital, ocr)
-    # Box borrowed from the first reading-order token in the cluster (digital).
+    # Box borrowed from the first reading-order token in the region (digital).
     assert merged == [{"t": "file", "l": [10, 10, 40, 30]}]
 
 
@@ -763,8 +763,8 @@ def test_llm_malformed_response_falls_back_to_heuristic(
     assert merged == ocr
 
 
-def test_llm_missing_cluster_id_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A reply that omits a sent cluster is structurally invalid → heuristic."""
+def test_llm_missing_region_id_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reply that omits a sent region is structurally invalid → heuristic."""
     _install_fake_call(monkeypatch, lambda c: [], raw='{"nonexistent": []}')
     digital = [{"t": "Hello", "l": [10, 10, 60, 30]}]
     ocr = [{"t": "Greetings", "l": [11, 11, 61, 31]}]
@@ -794,16 +794,16 @@ def test_llm_failed_merge_logs_raw_output(
 
 
 # ---------------------------------------------------------------------------
-# Cluster batching (one page → several bounded LLM calls)
+# Region batching (one page → several bounded LLM calls)
 # ---------------------------------------------------------------------------
 
 
-def _row_clusters(n: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Build ``n`` non-overlapping mixed clusters, one per row, that disagree.
+def _row_regions(n: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build ``n`` non-overlapping mixed regions, one per row, that disagree.
 
     Each row's digital and OCR text differ enough that the heuristic takes OCR
     while the LLM is free to pick either — so a row's output reveals which
-    resolver handled it. Rows are 40px apart (height 30) so they never cluster
+    resolver handled it. Rows are 40px apart (height 30) so they never region
     together, and increasing-y means reading order matches row order.
     """
     digital: list[dict[str, Any]] = []
@@ -816,24 +816,24 @@ def _row_clusters(n: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 
 def test_llm_batches_large_page(monkeypatch: pytest.MonkeyPatch) -> None:
-    """More than MERGE_BATCH_SIZE clusters go out in several calls, all resolved."""
+    """More than MERGE_BATCH_SIZE regions go out in several calls, all resolved."""
     calls = _install_fake_call(monkeypatch, lambda c: [{"ref": t["id"]} for t in c["ocr"]])
     n = MERGE_BATCH_SIZE + 5
-    digital, ocr = _row_clusters(n)
+    digital, ocr = _row_regions(n)
     merged = _merge_llm(digital, ocr)
-    assert merged == ocr  # model kept OCR for every cluster
+    assert merged == ocr  # model kept OCR for every region
     assert len(calls) == 2  # ceil(n / MERGE_BATCH_SIZE)
-    # Every cluster was sent exactly once, none dropped or duplicated.
-    assert sum(len(c["clusters"]) for c in calls) == n
+    # Every region was sent exactly once, none dropped or duplicated.
+    assert sum(len(c["regions"]) for c in calls) == n
 
 
 def test_llm_failed_batch_falls_back_without_double_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed batch falls back to the heuristic for *its* clusters only.
+    """A failed batch falls back to the heuristic for *its* regions only.
 
-    Successful batches keep their LLM result and no cluster is emitted twice —
-    the regression this guards against is the heuristic re-resolving clusters
+    Successful batches keep their LLM result and no region is emitted twice —
+    the regression this guards against is the heuristic re-resolving regions
     the LLM already handled.
     """
     calls: list[dict[str, Any]] = []
@@ -851,13 +851,13 @@ def test_llm_failed_batch_falls_back_without_double_write(
             return "not json {{{"
         # First batch: model picks digital (heuristic would pick OCR).
         return json.dumps(
-            {c["id"]: [{"ref": t["id"]} for t in c["digital"]] for c in payload["clusters"]}
+            {c["id"]: [{"ref": t["id"]} for t in c["digital"]] for c in payload["regions"]}
         )
 
     monkeypatch.setattr("dgml_core.hybrid.call", _fake_call)
 
     n = MERGE_BATCH_SIZE + 3
-    digital, ocr = _row_clusters(n)
+    digital, ocr = _row_regions(n)
     merged = _merge_llm(digital, ocr)
 
     assert len(calls) == 2
@@ -865,4 +865,4 @@ def test_llm_failed_batch_falls_back_without_double_write(
     # Batch 2 (the rest): failed → heuristic → OCR.
     expected = digital[:MERGE_BATCH_SIZE] + ocr[MERGE_BATCH_SIZE:]
     assert merged == expected
-    assert len(merged) == n  # one token per cluster — nothing written twice
+    assert len(merged) == n  # one token per region — nothing written twice
