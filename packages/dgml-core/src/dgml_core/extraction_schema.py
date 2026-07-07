@@ -409,10 +409,6 @@ def vocabulary_to_rnc(vocab: Vocabulary) -> str:
 _NAMESPACE_RE = re.compile(r'^\s*namespace\s+(\w+)\s*=\s*"([^"]*)"\s*$')
 _DEF_HEAD_RE = re.compile(r"^(\w+)\s*=\s*$")
 _ELEMENT_RE = re.compile(r"^\s*element\s+(\w+):(\w+)\s*\{\s*$")
-# Any leading `attribute X { ... },` line inside an element body is ignored:
-# the format has no attributes in its content model, but older schemas may
-# carry one, so we tolerate (and drop) it when reading.
-_ATTR_RE = re.compile(r"^\s*attribute\s+\w+\s*\{[^{}]*\}\s*,?\s*$")
 _COLLECTION_RE = re.compile(r"^\s*(\w+)\*\s*,?\s*$")
 _CONTAINER_RE = re.compile(r"^\s*\(\s*(.+?)\s*\)\*\s*,?\s*$")
 _TEXT_RE = re.compile(r"^\s*(?:text|\(\s*text\s*\)\*)\s*,?\s*$")
@@ -583,8 +579,6 @@ def _parse_element_block(name: str, block: list[str]) -> list[str]:
     for line in block[1:]:
         if not line.strip():
             continue
-        if _ATTR_RE.match(line):
-            continue  # tolerate (and drop) a legacy attribute line
         body.append(line)
     return body
 

@@ -116,6 +116,21 @@ def test_json_schema_without_properties_rejected() -> None:
         json_schema_to_rnc({"type": "object"}, workspace="ws", docset_name="d")
 
 
+def test_attribute_in_element_body_rejected() -> None:
+    """The RNC subset has no attributes in element bodies — a stray one is a
+    hard failure, never silently dropped (no back compat: this is v1)."""
+    rnc = (
+        'namespace docset = "http://dgml.io/x/y#"\n\n'
+        "VendorName =\n"
+        "  element docset:VendorName {\n"
+        '    attribute anyAttr { "true" },\n'
+        "    text\n"
+        "  }\n"
+    )
+    with pytest.raises(SchemaInvalid):
+        parse_rnc(rnc)
+
+
 # Spec §13 form: no `start`/`dg:chunk` rule, a single root concept, `## Prompt:`
 # annotations. The parser must accept it and round-trip it byte-for-byte.
 _SPEC_RNC = """\

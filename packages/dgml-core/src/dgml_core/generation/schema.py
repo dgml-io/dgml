@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -72,11 +72,11 @@ class Schema:
     def load(cls, path: Path | str) -> Schema:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         schema = cls(notes=data.get("notes", ""))
-        # Tolerate stale keys in older schema.json files (e.g. a dropped field)
-        # by keeping only what SchemaTag still declares.
-        known = {f.name for f in fields(SchemaTag)}
+        # Strict by design: an unknown key (stale field, typo) raises instead of
+        # being silently dropped — a caller must never think a field was set
+        # when it wasn't.
         for tag in data.get("tags", {}).values():
-            schema.add(SchemaTag(**{k: v for k, v in tag.items() if k in known}))
+            schema.add(SchemaTag(**tag))
         return schema
 
     def save(self, path: Path | str) -> None:

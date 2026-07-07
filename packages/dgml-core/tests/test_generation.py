@@ -434,6 +434,22 @@ def test_load_labeled_docs_from_cache_roundtrip(tmp_path: Path) -> None:
     assert docs["doc"][0].concept == "PaymentObligation"
 
 
+def test_schema_load_rejects_unknown_keys(tmp_path: Path) -> None:
+    """A stale or typo'd field in schema.json is a hard failure, never a silent
+    drop (no back compat: this is v1) — a caller must not think a field was set
+    when it wasn't. The CLI maps this to INVALID_ARGUMENT for --schema-path."""
+    from dgml_core.generation.schema import Schema
+
+    payload = {
+        "tags": {"Foo": {"name": "Foo", "role": "a foo", "kind": "inline", "exmaple": "typo"}},
+        "notes": "",
+    }
+    path = tmp_path / "schema.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(TypeError):
+        Schema.load(path)
+
+
 def test_cache_write_gates_on_debug_flag(tmp_path: Path) -> None:
     """cache_write(debug=False) is a no-op; the default (debug=True) and
     explicit debug=True always write when a cache dir is set."""
