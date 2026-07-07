@@ -52,16 +52,6 @@ def _parse_docs(doc_nodes: list[Any]) -> tuple[str | None, str | None]:
     return description, example
 
 
-def _siblings_share(define_node: Any) -> bool | None:
-    """Return True/False from siblingsShare attribute, or None if absent."""
-    for attr in _deep(define_node, "ATTR"):
-        names = _find(attr, "NAME")
-        literals = _find(attr, "LITERAL")
-        if names and names[0].name == "siblingsShare" and literals:
-            return literals[0].name == "true"
-    return None
-
-
 def _elem_name(define_node: Any) -> str | None:
     """Return the element tag name (e.g. 'docset:LiabilityCap') or None."""
     for elem in _deep(define_node, "ELEM"):
@@ -120,7 +110,6 @@ def rnc_to_jsonld(source: str | Path) -> dict[str, Any]:
             "xsd": "http://www.w3.org/2001/XMLSchema#",
             "Tag": f"{p}:Tag",
             "TagGroup": f"{p}:TagGroup",
-            "siblingsShare": {"@id": f"{p}:siblingsShare", "@type": "xsd:boolean"},
             "members": {"@id": f"{p}:members", "@type": "@id", "@container": "@set"},
             "description": f"{p}:description",
             "example": f"{p}:example",
@@ -157,17 +146,9 @@ def rnc_to_jsonld(source: str | Path) -> dict[str, Any]:
 
         if elem_tag is not None:
             # Element definition → Tag node
-            share = _siblings_share(define)
-            tag_type = (
-                f"{p}:SharedTag"
-                if share is True
-                else f"{p}:NonSharedTag"
-                if share is False
-                else f"{p}:Tag"
-            )
             node: dict[str, Any] = {
                 "@id": name_to_id[name],
-                "@type": tag_type,
+                "@type": f"{p}:Tag",
             }
             description, example = _parse_docs(doc_nodes)
             if description:

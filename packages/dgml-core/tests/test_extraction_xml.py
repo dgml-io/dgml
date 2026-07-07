@@ -162,19 +162,16 @@ namespace docset = "http://www.dgml.io/acme/programs#"
 
 TotalCredits =
   element docset:TotalCredits {
-    attribute siblingsShare { "true" },
     ( xsd:integer | ( MinTotalCredits, MaxTotalCredits ) )
   }
 
 MinTotalCredits =
   element docset:MinTotalCredits {
-    attribute siblingsShare { "true" },
     xsd:integer
   }
 
 MaxTotalCredits =
   element docset:MaxTotalCredits {
-    attribute siblingsShare { "true" },
     xsd:integer
   }
 """
@@ -244,44 +241,37 @@ namespace docset = "http://www.dgml.io/acme/invoices#"
 
 Invoice =
   element docset:Invoice {
-    attribute siblingsShare { "false" },
     (text | VendorName | LineItems | InvoiceTotal)*
   }
 
 VendorName =
   element docset:VendorName {
-    attribute siblingsShare { "false" },
     text
   }
 
 LineItems =
   element docset:LineItems {
-    attribute siblingsShare { "false" },
     LineItem*
   }
 
 LineItem =
   element docset:LineItem {
-    attribute siblingsShare { "false" },
     (text | Quantity | UnitPrice)*
   }
 
 Quantity =
   element docset:Quantity {
-    attribute siblingsShare { "true" },
     xsd:integer
   }
 
 UnitPrice =
   element docset:UnitPrice {
-    attribute siblingsShare { "true" },
     xsd:decimal
   }
 
 ## Prompt: Compute as sum of Quantity times UnitPrice for each LineItem
 InvoiceTotal =
   element docset:InvoiceTotal {
-    attribute siblingsShare { "true" },
     xsd:decimal
   }
 """

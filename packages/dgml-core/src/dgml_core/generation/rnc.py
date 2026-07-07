@@ -10,7 +10,7 @@ files actually contain:
 - ``dg:structure`` roles and occurrence counts (informative comments).
 
 Every ``schema.json`` field (``role``, ``kind``, ``parent_role``,
-``example``/``examples``, ``siblings_share``, top-level ``notes``) is
+``example``/``examples``, top-level ``notes``) is
 serialized LOSSLESSLY into ``# Field: value`` comment lines (values
 JSON-encoded), so :func:`rnc_to_schema_dict` can reconstruct the exact
 Schema v1 dict from the ``.rnc`` — the RNC doubles as a human-editing
@@ -45,7 +45,7 @@ _XSD_FOR_XSI = {
 }
 
 # The lossless comment contract: `# <Field>: <value>` lines above each define.
-_FIELD_RE = re.compile(r"^# (Description|Kind|Parent|Example|Examples|SiblingsShare|Notes): (.*)$")
+_FIELD_RE = re.compile(r"^# (Description|Kind|Parent|Example|Examples|Notes): (.*)$")
 _DEFINE_RE = re.compile(r"^([A-Za-z][\w.]*)\s*=\s*element\s+([A-Za-z][\w:.*-]*)\s*\{")
 
 
@@ -186,8 +186,6 @@ def build_rnc(
             w(f"# Example: {json.dumps(t['example'], ensure_ascii=False)}")
         if t.get("examples"):
             w(f"# Examples: {json.dumps(t['examples'], ensure_ascii=False)}")
-        if not t.get("siblings_share", True):
-            w("# SiblingsShare: false")
         if obs_n:
             st = ", ".join(f"{k}({v})" for k, v in obs.structures[n].most_common(3))
             w(f"# Observed: {obs_n} occurrence(s)" + (f"; dg:structure: {st}" if st else ""))
@@ -274,7 +272,6 @@ def rnc_to_schema_dict(text: str) -> dict[str, Any]:
             "example": str(json.loads(pending["Example"])) if "Example" in pending else "",
             "examples": list(json.loads(pending["Examples"])) if "Examples" in pending else [],
             "parent_role": pending.get("Parent", ""),
-            "siblings_share": pending.get("SiblingsShare", "true") != "false",
         }
         pending = {}
     return {"tags": tags, "notes": notes}

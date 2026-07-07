@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +52,6 @@ class SchemaTag:
     example: str = ""  # one representative example (single-value convenience alongside `examples`)
     examples: list[str] = field(default_factory=list)  # 1+ representative examples
     parent_role: str = ""  # name of the container tag this sits inside (closed ref)
-    siblings_share: bool = True  # if True, repeated sibling instances must share this tag
 
     def all_examples(self) -> list[str]:
         """Examples to display: the list if present, else the single ``example``."""
@@ -73,8 +72,11 @@ class Schema:
     def load(cls, path: Path | str) -> Schema:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         schema = cls(notes=data.get("notes", ""))
+        # Tolerate stale keys in older schema.json files (e.g. a dropped field)
+        # by keeping only what SchemaTag still declares.
+        known = {f.name for f in fields(SchemaTag)}
         for tag in data.get("tags", {}).values():
-            schema.add(SchemaTag(**tag))
+            schema.add(SchemaTag(**{k: v for k, v in tag.items() if k in known}))
         return schema
 
     def save(self, path: Path | str) -> None:
@@ -164,7 +166,6 @@ class Schema:
                     example=example,
                     examples=examples,
                     parent_role=item.get("parent_role", ""),
-                    siblings_share=bool(item.get("siblings_share", True)),
                 )
             )
         return schema

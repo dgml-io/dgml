@@ -19,7 +19,6 @@ _SCHEMA = {
             "example": "",
             "examples": [],
             "parent_role": "",
-            "siblings_share": False,
         },
         "InvoiceNumber": {
             "name": "InvoiceNumber",
@@ -28,7 +27,6 @@ _SCHEMA = {
             "example": "INV-001",
             "examples": ["INV-001", "INV-002"],
             "parent_role": "Invoice",
-            "siblings_share": True,
         },
     },
     "notes": "synthetic test schema",
@@ -86,7 +84,6 @@ def test_rnc_reverse_defaults_without_comments() -> None:
         "example": "",
         "examples": [],
         "parent_role": "",
-        "siblings_share": True,
     }
     assert data["notes"] == ""
 

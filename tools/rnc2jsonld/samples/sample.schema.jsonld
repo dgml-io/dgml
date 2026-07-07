@@ -4,10 +4,6 @@
     "xsd": "http://www.w3.org/2001/XMLSchema#",
     "Tag": "docset:Tag",
     "TagGroup": "docset:TagGroup",
-    "siblingsShare": {
-      "@id": "docset:siblingsShare",
-      "@type": "xsd:boolean"
-    },
     "members": {
       "@id": "docset:members",
       "@type": "@id",
@@ -75,87 +71,87 @@
     },
     {
       "@id": "docset:IndemnificationClause",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Indemnification clause section"
     },
     {
       "@id": "docset:PaymentTerms",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Payment terms section"
     },
     {
       "@id": "docset:BilledCharges",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Table of billed charges"
     },
     {
       "@id": "docset:LiabilityCap",
-      "@type": "docset:SharedTag",
+      "@type": "docset:Tag",
       "description": "Agreed maximum liability exposure under the contract",
       "example": "$500,000"
     },
     {
       "@id": "docset:EffectiveDate",
-      "@type": "docset:SharedTag",
+      "@type": "docset:Tag",
       "description": "Effective date of the contract",
       "example": "January 1, 2024"
     },
     {
       "@id": "docset:VendorName",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Legal name of the vendor party",
       "example": "MagicSoft, Inc."
     },
     {
       "@id": "docset:IndemnifyingParty",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Party responsible for providing indemnification",
       "example": "Vendor"
     },
     {
       "@id": "docset:IndemnifiedParty",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Party receiving indemnification protection",
       "example": "Client"
     },
     {
       "@id": "docset:InvoiceCycle",
-      "@type": "docset:SharedTag",
+      "@type": "docset:Tag",
       "description": "Payment cycle for invoices",
       "example": "Net 30"
     },
     {
       "@id": "docset:LatePaymentPenalty",
-      "@type": "docset:SharedTag",
+      "@type": "docset:Tag",
       "description": "Penalty rate applied to late payments",
       "example": "1.5% per month"
     },
     {
       "@id": "docset:BilledCharge",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "A single billed charge line item"
     },
     {
       "@id": "docset:ProductName",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Name of a billed product or service",
       "example": "Widget"
     },
     {
       "@id": "docset:UnitPrice",
-      "@type": "docset:SharedTag",
+      "@type": "docset:Tag",
       "description": "Unit price of a billed item",
       "example": "$9.95"
     },
     {
       "@id": "docset:OrderedQuantity",
-      "@type": "docset:SharedTag",
+      "@type": "docset:Tag",
       "description": "Quantity of units ordered",
       "example": "3"
     },
     {
       "@id": "docset:SignatoryName",
-      "@type": "docset:NonSharedTag",
+      "@type": "docset:Tag",
       "description": "Name of a signatory",
       "example": "Jane Smith"
     }
