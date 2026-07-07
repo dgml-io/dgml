@@ -1,9 +1,9 @@
 """Optional LLM configuration for hybrid text-extraction merging.
 
 Hybrid mode (``--text-mode hybrid``) reconciles digital and OCR word
-streams per page. By default it uses a deterministic Levenshtein/cluster
+streams per page. By default it uses a deterministic Levenshtein/region
 heuristic (see :mod:`dgml.hybrid`). When a workspace declares a
-``text_extraction`` section in ``config.json``, the per-cluster merge
+``text_extraction`` section in ``config.json``, the per-region merge
 decision is delegated to the configured LLM instead — letting it choose
 digital text, OCR text, or a combination (e.g. de-ligaturing, fixing a
 run-together word).
