@@ -170,6 +170,28 @@
     .tree-preview { margin-left: 8px; font-size: 12px; color: #6b7280; }
     .tree-placeholder { font-size: 12px; color: #9ca3af; padding: 12px; font-style: italic; }
 
+    /* ── Extracted Fields Panel ──────────────────────────────── */
+    .ef-panel { flex-shrink: 0; display: flex; flex-direction: column; max-height: 40%; overflow: hidden; background: #fff; border-bottom: 1px solid #e5e7eb; }
+    .ef-hdr { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: var(--dg-700); padding: 8px 12px; border-bottom: 1px solid #e5e7eb; background: var(--dg-50); flex-shrink: 0; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+    .ef-hdr:hover { background: var(--dg-100); }
+    .ef-hdr-caret { font-size: 9px; color: var(--dg-600); width: 9px; }
+    .ef-hdr-count { margin-left: auto; font-weight: 500; text-transform: none; letter-spacing: 0; color: #9ca3af; font-size: 11px; }
+    .ef-scroll { flex: 1; overflow: auto; padding: 4px 0 6px; }
+    .ef-group { font-family: monospace; font-size: 11px; font-weight: 600; color: var(--dg-700); padding: 6px 8px 2px; text-transform: none; }
+    .ef-group-n { color: #9ca3af; font-weight: 400; }
+    .ef-row { padding: 3px 8px; border-radius: 4px; margin: 0 4px; }
+    .ef-row.clickable { cursor: pointer; }
+    .ef-row.clickable:hover { background: #f3f4f6; }
+    .ef-row.sel { background: #bbf7d0; outline: 1px solid #6dd89a; }
+    .ef-line { display: flex; align-items: baseline; gap: 8px; }
+    .ef-name { font-family: monospace; font-size: 12px; color: var(--dg-600); font-weight: 500; flex-shrink: 0; }
+    .ef-val { font-size: 13px; color: #111827; margin-left: auto; text-align: right; word-break: break-word; }
+    .ef-type { font-size: 9px; font-family: monospace; color: #9ca3af; border: 1px solid #e5e7eb; border-radius: 3px; padding: 0 4px; flex-shrink: 0; }
+    .ef-badge { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: #92400e; background: #fef3c7; border: 1px solid #fde68a; border-radius: 3px; padding: 1px 5px; flex-shrink: 0; }
+    .ef-row.computed .ef-name { color: #b45309; }
+    .ef-derived { font-size: 11px; color: #9ca3af; margin-top: 1px; padding-left: 2px; }
+    .ef-src { font-family: monospace; color: #78716c; }
+
     /* ── Anchor strip ────────────────────────────────────────── */
     .anchor-strip { flex-shrink: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 12px; border-top: 1px solid #e5e7eb; background: #fff; min-height: 36px; }
     .anchor-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #9ca3af; white-space: nowrap; }
@@ -425,6 +447,8 @@ const S = {
   hovTag: null, hovNodeId: null,
   // basket / anchor history
   basket: [], anchorHistory: [],
+  // extracted-fields panel
+  efCollapsed: false,
   // tag panel
   tagFilter: 'All', tagSearch: '', semanticMap: {}, semanticLoading: false, semanticError: null,
   describeResults: null, describeLoading: false,
@@ -816,7 +840,7 @@ function renderOverlay() {
       S.selNodeId = S.selNodeId === nid ? null : nid;
       S.selTag = tag;
       if (S.selNodeId) expandAncestorsOf(S.selNodeId);
-      refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+      refreshTagChips(); renderTreePanel(); renderExtractedPanel(); renderAnchorStrip(); renderOverlay();
       const treeBtn = document.querySelector(`[data-tree-id="${CSS.escape(nid)}"]`);
       treeBtn?.scrollIntoView({ block: 'nearest' });
     });
@@ -1758,6 +1782,7 @@ function renderFileViewer(main) {
             <div class="tdp-chips" id="tdp-chips"></div>
           </div>
           <div class="right-resize-handle" id="right-rh"></div>
+          <div class="ef-panel" id="ef-panel" style="display:none"></div>
           <div class="tree-panel">
             <div class="tree-hdr">DGML</div>
             <div class="tree-scroll" id="tree-scroll"><div class="tree-placeholder">Loading…</div></div>
@@ -1808,6 +1833,7 @@ async function loadFileContent(fileId, docsetId, pageCount) {
     refreshFilterBtns();
     refreshTagChips();
     renderTreePanel();
+    renderExtractedPanel();
     renderAnchorStrip();
     renderOverlay();
 
@@ -1815,7 +1841,7 @@ async function loadFileContent(fileId, docsetId, pageCount) {
   } catch (e) {
     console.error('loadFileContent error:', e);
     S.xmlStr = null; S.overlaysByPage = new Map(); _metrics = [];
-    refreshFilterBtns(); refreshTagChips(); renderTreePanel(); renderAnchorStrip();
+    refreshFilterBtns(); refreshTagChips(); renderTreePanel(); renderExtractedPanel(); renderAnchorStrip();
   }
 
   // Load page images
@@ -1952,7 +1978,7 @@ function refreshTagChips() {
     chip.addEventListener('mouseleave', () => { S.hovTag = null; updateChipStyles(); renderAnchorStrip(); updateOverlayStyles(); });
     chip.addEventListener('click', () => {
       S.selTag = S.selTag === tag ? null : tag;  // toggle selTag only, never touch selNodeId
-      refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+      refreshTagChips(); renderTreePanel(); renderExtractedPanel(); renderAnchorStrip(); renderOverlay();
     });
   });
 }
@@ -2003,6 +2029,101 @@ function expandAncestorsOf(nodeId) {
   }
 }
 
+// ── Extracted Fields panel ──────────────────────────────────
+// Reads the dg:extraction block (spec §13) the extraction pipeline writes into
+// the core .dgml.xml and surfaces it as a values panel: grounded leaves show
+// their normalized dg:value (clickable → jump + highlight on the page), and
+// computed leaves (dg:origin="computed") show a badge plus the source fields
+// named by dg:href/dg:itemprop="computedFrom".
+function efAttr(el, name) {
+  // These files use prefix `dg`/`xsi`; DG_NS constant differs, so match by
+  // qualified name (the same fallback the overlay/tree code relies on).
+  return el.getAttribute(name);
+}
+function buildExtractedFields(xmlStr) {
+  const doc = new DOMParser().parseFromString(xmlStr, 'application/xml');
+  if (doc.querySelector('parsererror')) return null;
+  const all = [...doc.getElementsByTagName('*')];
+  const ext = all.find(e => stripNs(e.tagName) === 'extraction');
+  if (!ext || !ext.children.length) return null;
+
+  // nodeId map (same 'r'/'r/i' scheme as buildOverlaysByPage → overlay highlight matches)
+  const nodeIds = new Map();
+  (function walkId(el, id) { nodeIds.set(el, id); for (let i = 0; i < el.children.length; i++) walkId(el.children[i], `${id}/${i}`); })(doc.documentElement, 'r');
+  // xml:id → element, to render dg:href targets as readable tag names
+  const byId = new Map();
+  for (const el of all) { const id = el.getAttribute('xml:id'); if (id) byId.set(id, el); }
+  const resolveRefs = href => (href || '').split(';').map(s => s.trim().replace(/^#/, '')).filter(Boolean)
+    .map(id => byId.has(id) ? stripNs(byId.get(id).tagName) : id);
+
+  const rows = [];
+  let leafCount = 0, computedCount = 0;
+  function walk(el, depth) {
+    const name = stripNs(el.tagName);
+    const nid = nodeIds.get(el);
+    if (el.children.length) {
+      rows.push({ kind: 'group', name, depth, count: el.children.length });
+      for (let i = 0; i < el.children.length; i++) walk(el.children[i], depth + 1);
+      return;
+    }
+    const origin = efAttr(el, 'dg:origin') || '';
+    const computed = origin === 'computed';
+    const dgVal = efAttr(el, 'dg:value');
+    const rawText = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+    const boxes = parseOriginAttr(origin);
+    leafCount++; if (computed) computedCount++;
+    rows.push({
+      kind: 'leaf', name, depth, nodeId: nid,
+      value: (dgVal != null && dgVal !== '') ? dgVal : rawText,
+      computed, xsiType: efAttr(el, 'xsi:type') || '',
+      derived: computed ? resolveRefs(efAttr(el, 'dg:href')) : [],
+      page: boxes[0] ? boxes[0].page : null, hasBox: boxes.length > 0,
+    });
+  }
+  for (let i = 0; i < ext.children.length; i++) walk(ext.children[i], 0);
+  return { rows, leafCount, computedCount };
+}
+
+function renderExtractedPanel() {
+  const el = document.getElementById('ef-panel');
+  if (!el) return;
+  const data = S.xmlStr ? buildExtractedFields(S.xmlStr) : null;
+  if (!data) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'flex';
+  const countLbl = `${data.leafCount} field${data.leafCount === 1 ? '' : 's'}${data.computedCount ? ` · ${data.computedCount} computed` : ''}`;
+  let html = `<div class="ef-hdr" id="ef-hdr"><span class="ef-hdr-caret">${S.efCollapsed ? '▸' : '▾'}</span>Extracted Fields<span class="ef-hdr-count">${countLbl}</span></div>`;
+  if (!S.efCollapsed) {
+    html += '<div class="ef-scroll">' + data.rows.map(r => {
+      const pad = 8 + r.depth * 14;
+      if (r.kind === 'group')
+        return `<div class="ef-group" style="padding-left:${pad}px">${esc(r.name)} <span class="ef-group-n">(${r.count})</span></div>`;
+      const sel = S.selNodeId && r.nodeId === S.selNodeId;
+      const tail = r.computed ? '<span class="ef-badge">computed</span>' : (r.xsiType ? `<span class="ef-type">${esc(r.xsiType)}</span>` : '');
+      const derived = (r.computed && r.derived.length)
+        ? `<div class="ef-derived">⟵ ${r.derived.map(d => `<span class="ef-src">${esc(d)}</span>`).join(', ')}</div>` : '';
+      return `<div class="ef-row${sel ? ' sel' : ''}${r.hasBox ? ' clickable' : ''}${r.computed ? ' computed' : ''}" data-ef="${esc(r.nodeId || '')}" data-page="${r.page || ''}" style="padding-left:${pad}px">`
+        + `<div class="ef-line"><span class="ef-name">${esc(r.name)}</span><span class="ef-val">${esc(r.value || '—')}</span>${tail}</div>${derived}</div>`;
+    }).join('') + '</div>';
+  }
+  el.innerHTML = html;
+  document.getElementById('ef-hdr').onclick = () => { S.efCollapsed = !S.efCollapsed; renderExtractedPanel(); };
+  el.querySelectorAll('.ef-row.clickable').forEach(row => {
+    const nid = row.getAttribute('data-ef');
+    row.addEventListener('click', () => {
+      S.selNodeId = S.selNodeId === nid ? null : nid;
+      S.selTag = null;
+      if (S.selNodeId) {
+        expandAncestorsOf(nid);
+        const p = parseInt(row.getAttribute('data-page'), 10);
+        if (p) jumpToPage(p);
+      }
+      refreshTagChips(); renderTreePanel(); renderExtractedPanel(); renderAnchorStrip(); renderOverlay();
+    });
+    row.addEventListener('mouseenter', () => { S.hovNodeId = nid; updateOverlayStyles(); });
+    row.addEventListener('mouseleave', () => { S.hovNodeId = null; updateOverlayStyles(); });
+  });
+}
+
 function renderTreePanel() {
   const scroll = document.getElementById('tree-scroll');
   if (!scroll) return;
@@ -2051,7 +2172,7 @@ function renderTreePanel() {
           jumpToPage(nearestPageForNodeId(nid));
         }
       }
-      refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+      refreshTagChips(); renderTreePanel(); renderExtractedPanel(); renderAnchorStrip(); renderOverlay();
     });
   });
 }
@@ -2129,7 +2250,7 @@ function renderAnchorStrip() {
       S.selTag = el.dataset.bt;
       S.selNodeId = el.dataset.btNid || null;
     }
-    refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
+    refreshTagChips(); renderTreePanel(); renderExtractedPanel(); renderAnchorStrip(); renderOverlay();
   }));
   area.querySelectorAll('[data-rm]').forEach(btn => btn.addEventListener('click', e => {
     e.stopPropagation(); S.basket = S.basket.filter(b => b.tag !== btn.dataset.rm); renderAnchorStrip();
