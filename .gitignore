@@ -256,8 +256,4 @@ samples/*.jsonl
 
 #include for samples
 !samples/*/dgml-workspace
-/evaluation/clustering/workspace
-/evaluation/data_clustering_test
-.claude/projects/-Users-louisenaud-src-docugami-dgml/memory/dgml-cluster-ignores-scenario.md
-.claude/projects/-Users-louisenaud-src-docugami-dgml/memory/MEMORY.md
 /dgml-spec
