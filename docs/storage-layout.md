@@ -466,7 +466,7 @@ one from sample PDFs. RNC is the only on-disk form. Replacing it overwrites
 the file atomically; clearing it removes the file.
 
 The schema describes the fields to extract as a docset vocabulary — element
-definitions of the form `Name = element docset:Name { siblingsShare, content }`
+definitions of the form `Name = element docset:Name { content }`
 with `##` doc comments (`## description`, `## Example:`, `## Prompt:`) — within
 the constrained subset the toolkit understands (`dgml_core.extraction_schema`).
 It follows the spec §12/§13 form (a `namespace docset` declaration plus element

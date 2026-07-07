@@ -19,7 +19,6 @@ _SCHEMA = {
             "example": "",
             "examples": [],
             "parent_role": "",
-            "siblings_share": False,
         },
         "InvoiceNumber": {
             "name": "InvoiceNumber",
@@ -28,7 +27,6 @@ _SCHEMA = {
             "example": "INV-001",
             "examples": ["INV-001", "INV-002"],
             "parent_role": "Invoice",
-            "siblings_share": True,
         },
     },
     "notes": "synthetic test schema",
@@ -41,7 +39,7 @@ _XML = (
     ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
     '<docset:Invoice dg:structure="section">'
     '<docset:InvoiceNumber xsi:type="integer" dg:value="1001">1001</docset:InvoiceNumber>'
-    "<dg:CoinedTag>free text</dg:CoinedTag>"
+    "<docset:CoinedTag>free text</docset:CoinedTag>"
     "</docset:Invoice>"
     "</dg:chunk>"
 )
@@ -66,8 +64,13 @@ def test_build_rnc_pins_observed_types_and_shapes(tmp_path: Path) -> None:
     assert "attribute dg:value { xsd:integer }" in rnc
     # container renders mixed; leaf with children observed nowhere stays text
     assert "Invoice = element Invoice {" in rnc
-    # a dg:-namespaced concept observed but absent from the schema is reported
+    # a concept observed but absent from the schema (coined during labeling) is
+    # reported — and it lives in docset:, never dg:
     assert "CoinedTag" in rnc
+    # the catch-all for undefined concepts is docset:*, and nothing semantic is
+    # ever emitted in the framework dg: namespace
+    assert "element docset:* {" in rnc
+    assert "element dg:* {" not in rnc
 
 
 def test_rnc_reverse_defaults_without_comments() -> None:
@@ -81,7 +84,6 @@ def test_rnc_reverse_defaults_without_comments() -> None:
         "example": "",
         "examples": [],
         "parent_role": "",
-        "siblings_share": True,
     }
     assert data["notes"] == ""
 

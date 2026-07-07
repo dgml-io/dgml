@@ -11,7 +11,7 @@ from dgml_core.extraction_schema import (
 )
 
 # A grounded_field JSON Schema exercising every shape: leaf, container,
-# collection, and the description/example/siblingsShare metadata.
+# collection, and the description/example metadata.
 _SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
@@ -20,12 +20,10 @@ _SCHEMA = {
         "vendor_name": {
             "$ref": "#/definitions/grounded_field",
             "description": "Legal name of the vendor",
-            "siblingsShare": False,
         },
         "liability_cap": {
             "$ref": "#/definitions/grounded_field",
             "example": "$500,000",
-            "siblingsShare": True,
         },
         "indemnification": {
             "type": "object",
@@ -58,9 +56,6 @@ def test_json_to_rnc_basic_shape() -> None:
     # collection emits a plural element holding repeated singular items
     assert "LineItem*" in rnc
     assert "element docset:LineItem" in rnc
-    # siblingsShare carries through
-    assert 'attribute siblingsShare { "true" }' in rnc
-    assert 'attribute siblingsShare { "false" }' in rnc
     # doc comments carry through
     assert "## Legal name of the vendor" in rnc
     assert "## Example: $500,000" in rnc
@@ -121,6 +116,21 @@ def test_json_schema_without_properties_rejected() -> None:
         json_schema_to_rnc({"type": "object"}, workspace="ws", docset_name="d")
 
 
+def test_attribute_in_element_body_rejected() -> None:
+    """The RNC subset has no attributes in element bodies — a stray one is a
+    hard failure."""
+    rnc = (
+        'namespace docset = "http://dgml.io/x/y#"\n\n'
+        "VendorName =\n"
+        "  element docset:VendorName {\n"
+        '    attribute anyAttr { "true" },\n'
+        "    text\n"
+        "  }\n"
+    )
+    with pytest.raises(SchemaInvalid):
+        parse_rnc(rnc)
+
+
 # Spec §13 form: no `start`/`dg:chunk` rule, a single root concept, `## Prompt:`
 # annotations. The parser must accept it and round-trip it byte-for-byte.
 _SPEC_RNC = """\
@@ -129,7 +139,6 @@ namespace docset = "http://www.dgml.io/acme/invoices#"
 ## Invoice root
 Invoice =
   element docset:Invoice {
-    attribute siblingsShare { "false" },
     (text | VendorName | LineItems)*
   }
 
@@ -138,21 +147,18 @@ Invoice =
 ## Prompt: Look for the company name at the top of the invoice
 VendorName =
   element docset:VendorName {
-    attribute siblingsShare { "false" },
     text
   }
 
 ## Collection of line items
 LineItems =
   element docset:LineItems {
-    attribute siblingsShare { "false" },
     LineItem*
   }
 
 ## Single line item
 LineItem =
   element docset:LineItem {
-    attribute siblingsShare { "false" },
     (text | ProductName)*
   }
 
@@ -160,7 +166,6 @@ LineItem =
 ## Prompt: The description column of the line item
 ProductName =
   element docset:ProductName {
-    attribute siblingsShare { "false" },
     text
   }
 """
@@ -188,19 +193,16 @@ namespace docset = "http://www.dgml.io/acme/programs#"
 ## Total credits — a single integer or a min/max range
 TotalCredits =
   element docset:TotalCredits {
-    attribute siblingsShare { "true" },
     ( xsd:integer | ( MinTotalCredits, MaxTotalCredits ) )
   }
 
 MinTotalCredits =
   element docset:MinTotalCredits {
-    attribute siblingsShare { "true" },
     xsd:integer
   }
 
 MaxTotalCredits =
   element docset:MaxTotalCredits {
-    attribute siblingsShare { "true" },
     xsd:integer
   }
 """

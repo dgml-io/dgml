@@ -49,7 +49,6 @@ start =
 
 title =
   element docset:title {
-    attribute siblingsShare { "true" },
     text
   }
 """
@@ -1197,14 +1196,12 @@ start =
 
 title =
   element docset:title {
-    attribute siblingsShare { "true" },
     text
   }
 
 ## Prompt: Compute as the number of words in the title
 word_count =
   element docset:word_count {
-    attribute siblingsShare { "true" },
     xsd:integer
   }
 """

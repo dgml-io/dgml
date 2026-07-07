@@ -13,21 +13,18 @@ AnyTag = ContractLevelTag | ClauseItemTag | TableRowTag | TableCellTag | InlineT
 ## Indemnification clause section
 IndemnificationClause =
   element docset:IndemnificationClause {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
 ## Payment terms section
 PaymentTerms =
   element docset:PaymentTerms {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
 ## Table of billed charges
 BilledCharges =
   element docset:BilledCharges {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
@@ -35,7 +32,6 @@ BilledCharges =
 ## Example: $500,000
 LiabilityCap =
   element docset:LiabilityCap {
-    attribute siblingsShare { "true" },
     (text | AnyTag)*
   }
 
@@ -43,7 +39,6 @@ LiabilityCap =
 ## Example: January 1, 2024
 EffectiveDate =
   element docset:EffectiveDate {
-    attribute siblingsShare { "true" },
     (text | AnyTag)*
   }
 
@@ -51,7 +46,6 @@ EffectiveDate =
 ## Example: MagicSoft, Inc.
 VendorName =
   element docset:VendorName {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
@@ -59,7 +53,6 @@ VendorName =
 ## Example: Vendor
 IndemnifyingParty =
   element docset:IndemnifyingParty {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
@@ -67,7 +60,6 @@ IndemnifyingParty =
 ## Example: Client
 IndemnifiedParty =
   element docset:IndemnifiedParty {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
@@ -75,7 +67,6 @@ IndemnifiedParty =
 ## Example: Net 30
 InvoiceCycle =
   element docset:InvoiceCycle {
-    attribute siblingsShare { "true" },
     (text | AnyTag)*
   }
 
@@ -83,14 +74,12 @@ InvoiceCycle =
 ## Example: 1.5% per month
 LatePaymentPenalty =
   element docset:LatePaymentPenalty {
-    attribute siblingsShare { "true" },
     (text | AnyTag)*
   }
 
 ## A single billed charge line item
 BilledCharge =
   element docset:BilledCharge {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
@@ -98,7 +87,6 @@ BilledCharge =
 ## Example: Widget
 ProductName =
   element docset:ProductName {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }
 
@@ -106,7 +94,6 @@ ProductName =
 ## Example: $9.95
 UnitPrice =
   element docset:UnitPrice {
-    attribute siblingsShare { "true" },
     (text | AnyTag)*
   }
 
@@ -114,7 +101,6 @@ UnitPrice =
 ## Example: 3
 OrderedQuantity =
   element docset:OrderedQuantity {
-    attribute siblingsShare { "true" },
     (text | AnyTag)*
   }
 
@@ -122,6 +108,5 @@ OrderedQuantity =
 ## Example: Jane Smith
 SignatoryName =
   element docset:SignatoryName {
-    attribute siblingsShare { "false" },
     (text | AnyTag)*
   }

@@ -52,7 +52,6 @@ class SchemaTag:
     example: str = ""  # one representative example (single-value convenience alongside `examples`)
     examples: list[str] = field(default_factory=list)  # 1+ representative examples
     parent_role: str = ""  # name of the container tag this sits inside (closed ref)
-    siblings_share: bool = True  # if True, repeated sibling instances must share this tag
 
     def all_examples(self) -> list[str]:
         """Examples to display: the list if present, else the single ``example``."""
@@ -73,6 +72,9 @@ class Schema:
     def load(cls, path: Path | str) -> Schema:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         schema = cls(notes=data.get("notes", ""))
+        # Strict by design: an unknown key (stale field, typo) raises instead of
+        # being silently dropped — a caller must never think a field was set
+        # when it wasn't.
         for tag in data.get("tags", {}).values():
             schema.add(SchemaTag(**tag))
         return schema
@@ -164,7 +166,6 @@ class Schema:
                     example=example,
                     examples=examples,
                     parent_role=item.get("parent_role", ""),
-                    siblings_share=bool(item.get("siblings_share", True)),
                 )
             )
         return schema
