@@ -117,7 +117,8 @@ def main() -> None:
     from sklearn.cluster import KMeans
 
     def cluster_fn(feats: np.ndarray) -> np.ndarray:
-        return KMeans(n_clusters=args.k, n_init=10, random_state=0).fit_predict(feats)
+        labels: np.ndarray = KMeans(n_clusters=args.k, n_init=10, random_state=0).fit_predict(feats)
+        return labels
 
     result = mrl_dimension_sweep(embeddings, args.sweep, cluster_fn)
     print("\nMRL dimension sweep (cosine silhouette; higher = better):")

@@ -102,7 +102,8 @@ class SweepResult:
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(x, axis=-1, keepdims=True)
-    return x / np.clip(norms, a_min=1e-12, a_max=None)
+    normalized: np.ndarray = x / np.clip(norms, a_min=1e-12, a_max=None)
+    return normalized
 
 
 def _default_score(features: np.ndarray, labels: np.ndarray) -> float:

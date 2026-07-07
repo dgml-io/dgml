@@ -74,7 +74,8 @@ def test_dimension_sweep_prefers_informative_prefix() -> None:
     embeddings = _clustered_embeddings()
 
     def cluster_fn(feats: np.ndarray) -> np.ndarray:
-        return KMeans(n_clusters=3, n_init=10, random_state=0).fit_predict(feats)
+        labels: np.ndarray = KMeans(n_clusters=3, n_init=10, random_state=0).fit_predict(feats)
+        return labels
 
     result = mrl_dimension_sweep(embeddings, [2, 4, 8, 16], cluster_fn)
     assert isinstance(result, SweepResult)
@@ -91,10 +92,14 @@ def test_dimension_sweep_ties_pick_smaller_dim() -> None:
     embeddings = np.random.default_rng(1).normal(size=(30, 8)).astype(np.float32)
 
     def constant_labels(feats: np.ndarray) -> np.ndarray:
-        # Same partition regardless of width ⇒ identical scores ⇒ tie.
         return np.array([0, 1] * (feats.shape[0] // 2))
 
-    result = mrl_dimension_sweep(embeddings, [4, 8], constant_labels)
+    # A feature-independent score makes every width score identically ⇒ a
+    # genuine tie, which must be broken toward the cheaper (smaller) width.
+    def constant_score(feats: np.ndarray, labels: np.ndarray) -> float:
+        return 1.0
+
+    result = mrl_dimension_sweep(embeddings, [4, 8], constant_labels, score_fn=constant_score)
     assert result.best_dim == 4
 
 

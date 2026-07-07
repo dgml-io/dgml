@@ -77,7 +77,7 @@ def test_parse_server_response_rejects_malformed() -> None:
 
 # ── server backend construction + encode (no network) ─────────────────────
 def _server_cfg(**extra: object) -> EncoderConfig:
-    base = {"backend": "server", "base_url": "http://localhost:8000/v1"}
+    base: dict[str, object] = {"backend": "server", "base_url": "http://localhost:8000/v1"}
     base.update(extra)
     return EncoderConfig(
         name="qwen3_vl_embedding",
