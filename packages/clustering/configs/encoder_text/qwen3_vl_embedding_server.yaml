@@ -1,0 +1,18 @@
+# @package encoder_text
+# Qwen3-VL-Embedding (8B) as the TEXT encoder via the "server" backend — an
+# OpenAI-compatible embeddings endpoint (vLLM `--task embed` / SGLang). Pair
+# with encoder_image=qwen3_vl_embedding_server pointing at the same server to
+# keep text and page images in one shared space without loading weights here.
+# Select with:  encoder_text=qwen3_vl_embedding_server
+name: qwen3_vl_embedding
+model_id: Qwen/Qwen3-VL-Embedding-8B
+embedding_dim: 1024
+multi_vector: false
+extra:
+  backend: server
+  base_url: http://localhost:8000/v1
+  # served_model_name: Qwen/Qwen3-VL-Embedding-8B
+  # api_key: sk-...
+  timeout: 60
+  batch_size: 16
+  # prompt: "Represent this document's text for type-based clustering."

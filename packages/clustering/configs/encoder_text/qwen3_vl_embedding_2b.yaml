@@ -1,0 +1,16 @@
+# @package encoder_text
+# Qwen3-VL-Embedding 2B as the TEXT encoder (native dim 2048). Cheaper sibling
+# of the 8B text preset; pair with encoder_image=qwen3_vl_embedding_2b for a
+# single shared text+image space. Select with:  encoder_text=qwen3_vl_embedding_2b
+name: qwen3_vl_embedding_2b
+model_id: Qwen/Qwen3-VL-Embedding-2B
+# Matryoshka (MRL): the native 2048-d embedding is truncated to this width and
+# re-normalized. Any value in [64, 2048] is valid.
+embedding_dim: 1024
+multi_vector: false
+extra:
+  backend: local
+  trust_remote_code: true
+  # torch_dtype: bfloat16
+  batch_size: 16
+  # prompt: "Represent this document's text for type-based clustering."

@@ -1,0 +1,21 @@
+# @package encoder_image
+# Qwen3-VL-Embedding (8B) served over HTTP — the "server" backend. Talks to an
+# OpenAI-compatible embeddings endpoint (a vLLM `--task embed` or SGLang server
+# hosting the checkpoint) instead of loading weights in-process, so this host
+# needs no GPU and no torch model download. MRL truncation to `embedding_dim`
+# is applied client-side, so the configured width is honored regardless of
+# whether the server truncated. Select with:  encoder_image=qwen3_vl_embedding_server
+name: qwen3_vl_embedding
+model_id: Qwen/Qwen3-VL-Embedding-8B
+embedding_dim: 1024
+multi_vector: false
+extra:
+  backend: server
+  # Base URL of the OpenAI-compatible API (…/v1 or …/v1/embeddings both work):
+  base_url: http://localhost:8000/v1
+  # Name the server registered the model under (defaults to model_id):
+  # served_model_name: Qwen/Qwen3-VL-Embedding-8B
+  # api_key: sk-...        # only if the server requires auth
+  timeout: 60
+  batch_size: 16
+  # prompt: "Represent this document page for type-based clustering."

@@ -1,0 +1,21 @@
+# @package encoder_text
+# Qwen3-VL-Embedding (8B) as the TEXT encoder. Because this model embeds text
+# and images into ONE shared space, pairing it with the matching
+# encoder_image=qwen3_vl_embedding gives a fusion of genuinely comparable
+# vectors (rather than gluing a separate text embedder to a separate image
+# embedder). Select with:  encoder_text=qwen3_vl_embedding
+name: qwen3_vl_embedding
+model_id: Qwen/Qwen3-VL-Embedding-8B
+# Matryoshka (MRL): the native 4096-d embedding is truncated to this width and
+# re-normalized. Any value in [64, 4096] is valid; smaller ⇒ cheaper downstream.
+# Keep this equal to the encoder_image width when fusing the two shared-space
+# views.
+embedding_dim: 1024
+multi_vector: false
+extra:
+  backend: local
+  trust_remote_code: true
+  # torch_dtype: bfloat16
+  batch_size: 16
+  # Optional instruction to steer the embedding toward document type:
+  # prompt: "Represent this document's text for type-based clustering."
