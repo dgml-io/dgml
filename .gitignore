@@ -236,6 +236,11 @@ out/
 
 # Local on-chain staking receipts (contain document content; not source)
 dgmlx-receipts/
+
+# Evaluation code lives in the private `dgml-eval` repo; a local working copy
+# is checked out / symlinked here for dev but must never enter the public repo.
+# No trailing slash so this also ignores a symlink named `evaluation`.
+/evaluation
 /evaluation/clustering/reports_clustering_set
 /dgml-workspace1/cache/embeddings
 /dgml-workspace1
