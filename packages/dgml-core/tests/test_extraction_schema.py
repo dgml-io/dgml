@@ -118,7 +118,7 @@ def test_json_schema_without_properties_rejected() -> None:
 
 def test_attribute_in_element_body_rejected() -> None:
     """The RNC subset has no attributes in element bodies — a stray one is a
-    hard failure, never silently dropped (no back compat: this is v1)."""
+    hard failure."""
     rnc = (
         'namespace docset = "http://dgml.io/x/y#"\n\n'
         "VendorName =\n"
