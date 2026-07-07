@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 from dgml_core import llm
 from dgml_core.generation import blocks as blocks_mod
-from dgml_core.generation.blocks import Block, Span, build_tree, parse_block, sanitize_concept
+from dgml_core.generation.blocks import (
+    Block,
+    Span,
+    build_tree,
+    parse_block,
+    sanitize_concept,
+)
 from dgml_core.generation.label import (
     apply_labels,
     label_documents,
@@ -320,7 +326,9 @@ def test_label_documents_plans_then_labels_with_roster(
     assert docs["a.pdf"][1].concept == docs["b.pdf"][1].concept == "PaymentTerms"
 
 
-def test_label_documents_roster_seed_skips_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_label_documents_roster_seed_skips_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A roster_seed (from --schema-path) is used as-is; Pass B.1 is skipped."""
     docs = _docs()
     label_inputs: list[str] = []
@@ -370,7 +378,8 @@ def test_convert_batch_skips_failed_document(
     from dgml_core.generation import pipeline as pl
 
     monkeypatch.setattr(
-        "dgml_core.generation.document.load_document_as_pdf", lambda path, *, converters: b"%PDF-"
+        "dgml_core.generation.document.load_document_as_pdf",
+        lambda path, *, converters: b"%PDF-",
     )
 
     def fake_transcribe(pdf_bytes: bytes, *, doc_name: str, **kw: object) -> list[Block]:
@@ -401,7 +410,8 @@ def test_convert_batch_streams_to_sink_without_accumulating(
     from dgml_core.generation import pipeline as pl
 
     monkeypatch.setattr(
-        "dgml_core.generation.document.load_document_as_pdf", lambda path, *, converters: b"%PDF-"
+        "dgml_core.generation.document.load_document_as_pdf",
+        lambda path, *, converters: b"%PDF-",
     )
     monkeypatch.setattr(
         pl,
@@ -424,10 +434,12 @@ def test_load_labeled_docs_from_cache_roundtrip(tmp_path: Path) -> None:
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
 
     (tmp_path / "doc_blocks.json").write_text(
-        json.dumps([{"id": "b1", "structure": "p", "text": "Acme owes $5"}]), encoding="utf-8"
+        json.dumps([{"id": "b1", "structure": "p", "text": "Acme owes $5"}]),
+        encoding="utf-8",
     )
     (tmp_path / "label_doc_c01_raw.json").write_text(
-        json.dumps({"labels": {"b1": {"concept": "PaymentObligation"}}}), encoding="utf-8"
+        json.dumps({"labels": {"b1": {"concept": "PaymentObligation"}}}),
+        encoding="utf-8",
     )
     docs = load_labeled_docs_from_cache(tmp_path, ["doc", "missing"])
     assert set(docs) == {"doc"}  # 'missing' has no _blocks.json → skipped
@@ -436,7 +448,7 @@ def test_load_labeled_docs_from_cache_roundtrip(tmp_path: Path) -> None:
 
 def test_schema_load_rejects_unknown_keys(tmp_path: Path) -> None:
     """A stale or typo'd field in schema.json is a hard failure, never a silent
-    drop (no back compat: this is v1) — a caller must not think a field was set
+    drop — a caller must not think a field was set
     when it wasn't. The CLI maps this to INVALID_ARGUMENT for --schema-path."""
     from dgml_core.generation.schema import Schema
 
@@ -475,7 +487,8 @@ def test_convert_batch_concepts_always_docset_namespaced(
     from dgml_core.generation.to_semantic import render_dgml
 
     monkeypatch.setattr(
-        "dgml_core.generation.document.load_document_as_pdf", lambda path, *, converters: b"%PDF-"
+        "dgml_core.generation.document.load_document_as_pdf",
+        lambda path, *, converters: b"%PDF-",
     )
     monkeypatch.setattr(
         pl,
@@ -510,7 +523,9 @@ def test_convert_batch_concepts_always_docset_namespaced(
     assert "old.pdf" not in seen
 
 
-def test_plan_concept_roster_caps_to_largest_docs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_plan_concept_roster_caps_to_largest_docs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Over the cap, only the largest-skeleton docs feed the planning call."""
     from dgml_core.generation.label import _PLAN_MAX_DOCS, plan_concept_roster
 
@@ -543,7 +558,14 @@ def test_render_block_listing_one_line_per_block() -> None:
 
 def test_render_xml_structure_and_concepts() -> None:
     seq = [
-        _b("heading", "b1", text="Payment Terms", level=1, lim="4.2", concept="payment-terms"),
+        _b(
+            "heading",
+            "b1",
+            text="Payment Terms",
+            level=1,
+            lim="4.2",
+            concept="payment-terms",
+        ),
         _b(
             "p",
             "b2",
@@ -584,7 +606,12 @@ def test_render_xml_structure_and_concepts() -> None:
 def test_render_xml_text_is_verbatim() -> None:
     text = "Late payments accrue interest at 2% per month."
     seq = [
-        _b("p", "b1", text=text, entities=[Span(start=33, end=45, concept="interest-rate")]),
+        _b(
+            "p",
+            "b1",
+            text=text,
+            entities=[Span(start=33, end=45, concept="interest-rate")],
+        ),
     ]
     root = etree.fromstring(render_xml(seq).encode())
     p = root.find("p")
@@ -682,7 +709,14 @@ def test_render_semantic_xml_concept_tags_only_where_labeled() -> None:
     from dgml_core.generation.to_semantic import render_semantic_xml
 
     seq = [
-        _b("heading", "b1", text="Payment Terms", level=1, lim="4.2", concept="PaymentTerms"),
+        _b(
+            "heading",
+            "b1",
+            text="Payment Terms",
+            level=1,
+            lim="4.2",
+            concept="PaymentTerms",
+        ),
         _b(
             "p",
             "b2",
@@ -753,7 +787,14 @@ def test_render_semantic_xml_feeds_pass4(tmp_path: Path) -> None:
     from dgml_core.generation.to_semantic import render_semantic_xml
 
     seq = [
-        _b("heading", "b1", text="Payment Terms", level=1, lim="4.2", concept="PaymentTerms"),
+        _b(
+            "heading",
+            "b1",
+            text="Payment Terms",
+            level=1,
+            lim="4.2",
+            concept="PaymentTerms",
+        ),
         _b("p", "b2", text="payable within 30 days"),
     ]
     semantic_dir = tmp_path / "semantic"
@@ -783,7 +824,10 @@ def test_apply_labels_container_named_after_value_keeps_all_leaves() -> None:
                 "concept": "Supplier",
                 "entities": [
                     {"quote": "Acme Pty Ltd", "concept": "Supplier"},
-                    {"quote": "1 Example Street, Springfield", "concept": "SupplierAddress"},
+                    {
+                        "quote": "1 Example Street, Springfield",
+                        "concept": "SupplierAddress",
+                    },
                 ],
             }
         },
@@ -1139,7 +1183,12 @@ def test_salvage_window_json_none_without_blocks() -> None:
 def test_build_tree_groups_entity_leaves_under_container() -> None:
     """Contiguous leaves sharing a container-parent wrap in one section node."""
     blocks = [
-        Block(id="b1", structure="p", text="Acme Distributing", concept="PartyOrganizationName"),
+        Block(
+            id="b1",
+            structure="p",
+            text="Acme Distributing",
+            concept="PartyOrganizationName",
+        ),
         Block(id="b2", structure="p", text="1 Sample St, Town ST", concept="PartyAddress"),
         Block(id="b3", structure="p", text="(555) 000-0000", concept="PartyPhone"),
         Block(id="b4", structure="p", text="unrelated body text", concept=""),
@@ -1167,11 +1216,19 @@ def test_render_dgml_entity_container_wraps_leaves() -> None:
     from dgml_core.generation.to_semantic import render_dgml
 
     blocks = [
-        Block(id="b1", structure="p", text="Acme Distributing", concept="PartyOrganizationName"),
+        Block(
+            id="b1",
+            structure="p",
+            text="Acme Distributing",
+            concept="PartyOrganizationName",
+        ),
         Block(id="b2", structure="p", text="1 Sample St, Town ST", concept="PartyAddress"),
         Block(id="b3", structure="p", text="unrelated body text", concept=""),
     ]
-    pm = {"PartyOrganizationName": "PartyInformation", "PartyAddress": "PartyInformation"}
+    pm = {
+        "PartyOrganizationName": "PartyInformation",
+        "PartyAddress": "PartyInformation",
+    }
     out = render_dgml(blocks, header="<dg:chunk>", parent_map=pm)
     assert '<docset:PartyInformation dg:structure="section">' in out
     inner = out[out.index("<docset:PartyInformation") : out.index("</docset:PartyInformation>")]
@@ -1275,7 +1332,10 @@ def test_count_matched_row_keeps_positional_and_partial_entities() -> None:
         "cells": ["ProductName", "LinePrice"],
         "entities": [
             {"quote": "25 seats", "concept": "SeatCount"},  # partial → kept
-            {"quote": "$500", "concept": "OriginalPrice"},  # whole-cell conflict → dropped
+            {
+                "quote": "$500",
+                "concept": "OriginalPrice",
+            },  # whole-cell conflict → dropped
         ],
     }
     apply_labels([b], {"r1": payload}, doc_name="d.pdf")
@@ -1307,8 +1367,14 @@ def test_field_secondary_entities_render_inside_value() -> None:
     payload = {
         "concept": "LicenseNumber",
         "entities": [
-            {"quote": "Sample Org LLC", "concept": "OrganizationName"},  # partial → kept
-            {"quote": "No. 0000 - Sample Org LLC", "concept": "LicenseLine"},  # whole → drop
+            {
+                "quote": "Sample Org LLC",
+                "concept": "OrganizationName",
+            },  # partial → kept
+            {
+                "quote": "No. 0000 - Sample Org LLC",
+                "concept": "LicenseLine",
+            },  # whole → drop
         ],
     }
     apply_labels([b], {"f1": payload}, doc_name="d.pdf")
