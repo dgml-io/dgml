@@ -25,50 +25,35 @@ def parse(rnc: str) -> dict:
 def test_context_fixed_keys() -> None:
     result = parse("""
         namespace docset = "http://dgml.io/acme-corp/msa#"
-        Foo = element docset:Foo { attribute siblingsShare { "true" }, text* }
+        Foo = element docset:Foo { text* }
     """)
     ctx = result["@context"]
     assert ctx["docset"] == "http://dgml.io/acme-corp/msa#"  # URI used as-is from RNC
     assert ctx["xsd"] == "http://www.w3.org/2001/XMLSchema#"
     assert ctx["Tag"] == "docset:Tag"
     assert ctx["TagGroup"] == "docset:TagGroup"
-    assert ctx["siblingsShare"] == {"@id": "docset:siblingsShare", "@type": "xsd:boolean"}
     assert ctx["members"] == {"@id": "docset:members", "@type": "@id", "@container": "@set"}
     assert ctx["description"] == "docset:description"
     assert ctx["example"] == "docset:example"
 
 
 # ---------------------------------------------------------------------------
-# 2. siblingsShare true → SharedTag
+# 2. Element definition → Tag node
 # ---------------------------------------------------------------------------
 
 
-def test_siblings_share_true() -> None:
+def test_element_definition_becomes_tag() -> None:
     result = parse("""
         namespace docset = "http://dgml.io/x/y#"
-        LiabilityCap = element docset:LiabilityCap { attribute siblingsShare { "true" }, text* }
+        LiabilityCap = element docset:LiabilityCap { text* }
     """)
     node = result["@graph"][0]
     assert node["@id"] == "docset:LiabilityCap"
-    assert node["@type"] == "docset:SharedTag"
+    assert node["@type"] == "docset:Tag"
 
 
 # ---------------------------------------------------------------------------
-# 3. siblingsShare false → NonSharedTag
-# ---------------------------------------------------------------------------
-
-
-def test_siblings_share_false() -> None:
-    result = parse("""
-        namespace docset = "http://dgml.io/x/y#"
-        VendorName = element docset:VendorName { attribute siblingsShare { "false" }, text* }
-    """)
-    node = result["@graph"][0]
-    assert node["@type"] == "docset:NonSharedTag"
-
-
-# ---------------------------------------------------------------------------
-# 4. Doc comment → description and example
+# 3. Doc comment → description and example
 # ---------------------------------------------------------------------------
 
 
@@ -77,7 +62,7 @@ def test_doc_comment_description_and_example() -> None:
         namespace docset = "http://dgml.io/x/y#"
         ## Agreed maximum liability exposure
         ## Example: $500,000
-        LiabilityCap = element docset:LiabilityCap { attribute siblingsShare { "true" }, text* }
+        LiabilityCap = element docset:LiabilityCap { text* }
     """)
     node = result["@graph"][0]
     assert node["description"] == "Agreed maximum liability exposure"
@@ -85,14 +70,14 @@ def test_doc_comment_description_and_example() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. No doc comment → description and example absent
+# 4. No doc comment → description and example absent
 # ---------------------------------------------------------------------------
 
 
 def test_no_doc_comment() -> None:
     result = parse("""
         namespace docset = "http://dgml.io/x/y#"
-        Foo = element docset:Foo { attribute siblingsShare { "true" }, text* }
+        Foo = element docset:Foo { text* }
     """)
     node = result["@graph"][0]
     assert "description" not in node
@@ -100,7 +85,7 @@ def test_no_doc_comment() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Group definition → TagGroup with members
+# 5. Group definition → TagGroup with members
 # ---------------------------------------------------------------------------
 
 
@@ -108,8 +93,8 @@ def test_group_becomes_tag_group() -> None:
     result = parse("""
         namespace docset = "http://dgml.io/x/y#"
         ClauseItemTag = LiabilityCap | EffectiveDate
-        LiabilityCap = element docset:LiabilityCap { attribute siblingsShare { "true" }, text* }
-        EffectiveDate = element docset:EffectiveDate { attribute siblingsShare { "true" }, text* }
+        LiabilityCap = element docset:LiabilityCap { text* }
+        EffectiveDate = element docset:EffectiveDate { text* }
     """)
     groups = [n for n in result["@graph"] if n.get("@type") == "docset:TagGroup"]
     assert len(groups) == 1
@@ -119,29 +104,27 @@ def test_group_becomes_tag_group() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. Namespace URI trailing # is normalised
+# 6. Namespace URI trailing # is normalised
 # ---------------------------------------------------------------------------
 
 
 def test_namespace_trailing_hash_normalised() -> None:
     result = parse("""
         namespace docset = "http://dgml.io/x/y#"
-        Foo = element docset:Foo { attribute siblingsShare { "true" }, text* }
+        Foo = element docset:Foo { text* }
     """)
     assert result["@context"]["docset"] == "http://dgml.io/x/y#"
 
 
 # ---------------------------------------------------------------------------
-# 8. Full sample schema — tag count and group count
+# 7. Full sample schema — tag count and group count
 # ---------------------------------------------------------------------------
 
 
 def test_full_sample_schema() -> None:
     sample = Path(__file__).parent.parent / "samples" / "sample.schema.rnc"
     result = rnc_to_jsonld(sample)
-    tags = [
-        n for n in result["@graph"] if n.get("@type") in ("docset:SharedTag", "docset:NonSharedTag")
-    ]
+    tags = [n for n in result["@graph"] if n.get("@type") == "docset:Tag"]
     groups = [n for n in result["@graph"] if n.get("@type") == "docset:TagGroup"]
     assert len(tags) == 15  # 15 element definitions
     assert (

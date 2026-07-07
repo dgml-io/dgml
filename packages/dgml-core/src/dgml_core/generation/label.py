@@ -833,9 +833,6 @@ def derive_schema(
     - ``kind``         — section (containers/clauses), row (table rows), or
                          inline (atomic values: entities, value-headings, cells);
     - ``parent_role``  — the nearest enclosing concept in the labeled tree.
-
-    ``siblings_share`` is not inferable post-hoc without the planner's judgement,
-    so it takes the schema default (True); refine later if needed.
     """
     examples: dict[str, list[str]] = {}
     kinds: dict[str, str] = {}
