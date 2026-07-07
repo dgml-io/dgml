@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dgml_core.conversion import ConverterConfig, convert_to_pdf_bytes
-from dgml_core.pages import PAGE_FILENAME_TEMPLATE, PAGE_GLOB, extract_pdf_pages
+from dgml_core.pages import extract_pdf_pages
 
 
 @dataclass
@@ -58,25 +58,6 @@ def load_document_as_pdf(
     return convert_to_pdf_bytes(path, converters)
 
 
-def count_pages_for(
-    name: str,
-    *,
-    page_images_dirs: Mapping[str, Path] | None = None,
-) -> int:
-    """Page count for one document, from the pre-rendered workspace images.
-
-    In a workspace ghostscript already rendered one PNG per page at file-add
-    time, so the page count is implied by the files in ``page_images/`` — we
-    count those instead of re-parsing the PDF. Raises if no page images are
-    available for ``name``.
-    """
-    if page_images_dirs is not None and name in page_images_dirs:
-        rendered = len(list(page_images_dirs[name].glob(PAGE_GLOB)))
-        if rendered:
-            return rendered
-    raise ValueError(f"No page images found for {name!r}")
-
-
 def slice_pdf(pdf_bytes: bytes, page_indices: list[int]) -> bytes:
     """Extract the given 0-based page indices into a new PDF and return its bytes.
 
@@ -112,37 +93,3 @@ def iter_windows(total_pages: int, window_size: int, overlap: int) -> list[list[
             break
         start = end - overlap
     return windows
-
-
-def sample_page_indices(total_pages: int, max_sample: int) -> list[int]:
-    """Pick up to `max_sample` representative page indices spanning the document.
-
-    For documents at or below the budget every page is returned. Otherwise the
-    first and last pages are always included and the rest are spread evenly.
-    """
-    if max_sample <= 0:
-        return []
-    if total_pages <= max_sample:
-        return list(range(total_pages))
-    if max_sample == 1:
-        return [0]
-    step = (total_pages - 1) / (max_sample - 1)
-    return sorted({round(i * step) for i in range(max_sample)})
-
-
-def resolve_page_image_paths(
-    name: str,
-    total_pages: int,
-    *,
-    page_images_dirs: Mapping[str, Path] | None,
-) -> list[Path]:
-    """Return one PNG path per page (0-indexed list, parallel to PDF pages).
-
-    Builds the path list from the pre-rendered workspace images: pages were
-    rendered at ``file add`` time and never re-rasterized here. Raises if no
-    page images are available for ``name``.
-    """
-    if page_images_dirs is not None and name in page_images_dirs:
-        ws_dir = page_images_dirs[name]
-        return [ws_dir / (PAGE_FILENAME_TEMPLATE % (i + 1)) for i in range(total_pages)]
-    raise ValueError(f"No page images found for {name!r}")

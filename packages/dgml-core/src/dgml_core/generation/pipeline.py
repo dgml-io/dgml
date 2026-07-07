@@ -1,11 +1,10 @@
-"""Orchestration: transcribe each document, label the batch, render.
+"""Orchestration: transcribe each document into flat typed blocks, label the
+whole batch in one pass, then render to DGML.
 
-Compare with ``dgml.generation.pipeline``: there is no schema lock, no
-registry, no drift warnings, no seam-reopen, no dedup, no repair, no
-re-nesting, no per-window recovery loop, and no harmonization pass — the
-block contract (flat, typed, verbatim) plus the single batch-wide labeling
-call replace all of them. Coverage can still be measured on the rendered
-XML with the existing ``dgml.generation.coverage`` tools.
+The flat, verbatim block contract leaves no open elements across window
+boundaries, so a single batch-wide labeling call suffices — no per-window
+seam-repair or harmonization. Coverage is measured on the rendered XML via
+``dgml_core.generation.coverage``.
 """
 
 from __future__ import annotations
@@ -90,11 +89,10 @@ class ConvertOptions:
     # label_*_cNN_raw.json, concept_roster.json) are always written when
     # cache_dir is set, regardless of this flag.
     debug: bool = False
-    # When set, convert_batch returns the FINAL dgml (dg:chunk, concept tags +
-    # dg:chunk scaffolding, value typing) instead of the windowed-shape
-    # intermediate. This is the standard dg:chunk opening tag from
-    # semantic_transform.build_header; this path does not route through
-    # Pass 4. Empty → return the intermediate (library/test shape).
+    # When set, convert_batch returns the FINAL dg:chunk dgml (concept tags +
+    # dg:chunk scaffolding, value typing) — the standard dg:chunk opening tag
+    # from semantic_transform.build_header. Empty → return the plain
+    # structure-shaped intermediate (library/test shape).
     dgml_header: str = ""
     # Documents transcribed concurrently. Windows WITHIN a document stay
     # serial (window N+1 receives window N's tail for the `continues`
