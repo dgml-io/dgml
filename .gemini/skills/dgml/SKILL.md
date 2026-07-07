@@ -381,10 +381,12 @@ generate builds its tree and carries the existing `dg:extraction` over
 are skipped, adding a document and re-running generates only the new one — and
 by default it's labeled seeded with the docset's existing
 `cache/concept_roster.json`, so its tags stay consistent with the rest (no
-`--schema-path` needed). Namespacing is recomputed over the whole docset, so
-any already-generated file whose `docset:`/`dg:` prefix changes is
-deterministically re-rendered (reported under `rerendered` / `summary.rerendered`;
-no re-LLM). Pass `--no-roster` to label the new docs in isolation instead.
+`--schema-path` needed). Every concept is emitted in the `docset:` vocabulary
+namespace (`dg:` is framework-only), so growing the docset never flips a tag's
+prefix; an already-generated file is still re-rendered deterministically when
+its output otherwise changes as the docset's schema/roster grows (reported under
+`rerendered` / `summary.rerendered`; no re-LLM). Pass `--no-roster` to label the
+new docs in isolation instead.
 
 ```bash
 uv run dgml docset add-file "$ds" "$new_fid"
@@ -651,15 +653,22 @@ attests one element of the generated DGML XML: it emits the node's
 hash, the document tree's Merkle root, the RFC 6962 inclusion proof
 connecting them, the element's canonical XPath, and the node's
 canonical XML. `--docset` is required (the XML is docset-scoped);
-select the element with `--leaf <n>` (0-based pre-order Merkle leaf
-index) or `--xpath <expr>` (must match exactly one element — the UX
-tree view's "Copy XPath" gives a canonical one).
+select the element with exactly one of `--leaf <n>` (0-based pre-order
+Merkle leaf index), `--xpath <expr>` (must match exactly one element —
+the UX tree view's "Copy XPath" gives a canonical one), or
+`--child-path <path>` (slash-separated 0-based child-element indices
+from the root, e.g. `1/1` — useful when a caller only has a DOM
+position, such as a browser tree view's `Element.children` path, and
+no ready-made XPath or leaf index).
 
 ```bash
 # Export the attestation payload for one element.
 uv run dgml node export "$fid" --docset "$ds" \
   --xpath '/dg:chunk/docset:Entry[2]/docset:Amount' > node-proof.json
 jq '{node_hash, root_hash, leaf_index}' node-proof.json
+
+# Equivalent, addressed by DOM child-index path instead of XPath.
+uv run dgml node export "$fid" --docset "$ds" --child-path '1/1' | jq .xpath
 
 # Later: does the current workspace XML still contain exactly this node?
 uv run dgml node prove "$fid" --docset "$ds" --proof node-proof.json | jq .valid
