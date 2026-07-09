@@ -125,6 +125,8 @@
     .fv-right-col { flex-shrink: 0; width: 300px; display: flex; flex-direction: column; border-left: 1px solid #e5e7eb; background: #fff; overflow: hidden; }
     .right-resize-handle { height: 4px; flex-shrink: 0; cursor: row-resize; transition: background .1s; }
     .right-resize-handle:hover { background: var(--dg-200); }
+    .rc-resize-handle { width: 4px; flex-shrink: 0; cursor: col-resize; transition: background .12s; }
+    .rc-resize-handle:hover, .rc-resize-handle.drag { background: var(--dg-300); }
 
     /* ── Tag Discovery Panel ─────────────────────────────────── */
     .tdp { display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; border-bottom: 1px solid #e5e7eb; background: #fff; }
@@ -437,6 +439,11 @@ const S = {
 // per-render panel heights
 let tagPanelH = 220;
 const TAG_PANEL_MIN = 140;
+
+// per-render right-column width (holds the Tag Discovery panel + DGML tree)
+let rightColW = 300;
+const RIGHT_COL_MIN = 220;
+const RIGHT_COL_MAX = 640;
 
 // tag metrics cache for current file
 let _metrics = [];
@@ -1748,7 +1755,8 @@ function renderFileViewer(main) {
         <div class="fv-page-col" id="fv-page-col">
           <div style="color:#9ca3af;padding:40px;font-size:13px;text-align:center"><span class="spinner"></span></div>
         </div>
-        <div class="fv-right-col" id="fv-right">
+        <div class="rc-resize-handle" id="rc-rh"></div>
+        <div class="fv-right-col" id="fv-right" style="width:${rightColW}px">
           <div id="tdp-wrap" style="height:${tagPanelH}px;min-height:${TAG_PANEL_MIN}px;flex-shrink:0;display:flex;flex-direction:column;overflow:hidden;border-bottom:1px solid #e5e7eb">
             <div class="tdp-filters" id="tdp-filters"></div>
             <div class="tdp-search-wrap">
@@ -1776,6 +1784,7 @@ function renderFileViewer(main) {
 
   // Right panel resize
   initRightResize();
+  initRightColResize();
 
   // Wire tag search
   const searchInp = document.getElementById('tdp-search');
@@ -2406,19 +2415,48 @@ function initSidebarResize() {
   document.addEventListener('mouseup', () => { drag = false; handle.classList.remove('drag'); });
 }
 
+function initRightColResize() {
+  const handle = document.getElementById('rc-rh');
+  const col = document.getElementById('fv-right');
+  if (!handle || !col) return;
+  handle.addEventListener('mousedown', e => {
+    const sx = e.clientX, sw = col.offsetWidth;
+    handle.classList.add('drag');
+    e.preventDefault();
+    const onMove = ev => {
+      // handle is on the column's left edge, so dragging left widens it
+      rightColW = Math.max(RIGHT_COL_MIN, Math.min(RIGHT_COL_MAX, sw - (ev.clientX - sx)));
+      col.style.width = rightColW + 'px';
+    };
+    const onUp = () => {
+      handle.classList.remove('drag');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
 function initRightResize() {
   const handle = document.getElementById('right-rh');
   if (!handle) return;
-  let drag = false, sy = 0, sh = 0;
-  handle.addEventListener('mousedown', e => { drag = true; sy = e.clientY; sh = tagPanelH; e.preventDefault(); });
-  document.addEventListener('mousemove', e => {
-    if (!drag) return;
-    const wrap = document.getElementById('tdp-wrap');
-    if (!wrap) return;
-    tagPanelH = Math.max(TAG_PANEL_MIN, sh + e.clientY - sy);
-    wrap.style.height = tagPanelH + 'px';
+  handle.addEventListener('mousedown', e => {
+    const sy = e.clientY, sh = tagPanelH;
+    e.preventDefault();
+    const onMove = ev => {
+      const wrap = document.getElementById('tdp-wrap');
+      if (!wrap) return;
+      tagPanelH = Math.max(TAG_PANEL_MIN, sh + ev.clientY - sy);
+      wrap.style.height = tagPanelH + 'px';
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
   });
-  document.addEventListener('mouseup', () => { drag = false; });
 }
 
 // ═══════════════════════════════════════════════════════════════════
