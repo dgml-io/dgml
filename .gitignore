@@ -220,6 +220,11 @@ __marimo__/
 # CLI generated test workspace
 **/dgml-workspace/
 
+# Local clustering eval scratch (scripts/cluster_eval.py, run.sh)
+/reit-ws/
+/run.sh
+/labels.json
+
 # OS-generated files
 .DS_Store
 Thumbs.db
@@ -257,3 +262,7 @@ samples/*.jsonl
 #include for samples
 !samples/*/dgml-workspace
 /dgml-spec
+/ws1
+/ws2
+/ws3
+/ws4
