@@ -403,11 +403,11 @@ def test_clustering_internal_incremental_without_docsets_raises(workspace: Works
 
 
 # ---------------------------------------------------------------------------
-# config presets — light / medium / heavy + override resolution
+# config presets — small / light / medium / heavy + override resolution
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["light", "medium", "heavy"])
+@pytest.mark.parametrize("name", ["small", "light", "medium", "heavy"])
 def test_load_clustering_preset_known(name: str) -> None:
     preset = load_clustering_preset(name)
     assert isinstance(preset, dict)
