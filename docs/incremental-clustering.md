@@ -62,18 +62,20 @@ JSON output shape (including the additive `mode`, `n_assigned_existing`,
 
 ## Config presets (compute tiers)
 
-Three bundled presets tune the encoder/manifold/algorithm stack for a compute
-budget. Each is a complete, self-contained clustering config, resolvable by
+Four bundled presets tune the encoder/manifold/algorithm stack for a compute
+budget. Higher tiers add **image/vision embeddings** rather than a denser text
+encoder. Each is a complete, self-contained clustering config, resolvable by
 name via `--config`:
 
-| Preset | Target | Text encoder | Clustering |
+| Preset | Target | Representation | Clustering |
 |---|---|---|---|
-| `light` | CPU-only (default) | `tfidf` (256-d) | Leiden + UMAP |
-| `medium` | large CPU / Apple MPS | `bge-small` (384-d) | Leiden + UMAP |
-| `heavy` | GPU | `e5-large` (1024-d) | HDBSCAN + UMAP |
+| `small` | CPU-only, tiny corpora | `tfidf` text (256-d) | Leiden, no UMAP |
+| `light` | CPU-only (default) | `tfidf` text (256-d) | Leiden + UMAP |
+| `medium` | large CPU / Apple MPS | `tfidf` text + 2B vision, fused (1280-d) | Leiden + UMAP |
+| `heavy` | GPU | 8B vision only (1024-d) | Leiden + UMAP |
 
 They live alongside the library at
-`packages/dgml-core/src/dgml_core/clustering_preset_{light,medium,heavy}.json`.
+`packages/dgml-core/src/dgml_core/clustering_preset_{small,light,medium,heavy}.json`.
 Copy one and pass it as `--config <path>` as a starting point for a custom
 config. The presets are also the sweep targets in the evaluation harness — the
 sweep writes the best config it finds for each tier back into these files.
