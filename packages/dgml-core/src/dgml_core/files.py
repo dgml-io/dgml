@@ -338,7 +338,7 @@ class FileStore:
         PDF alongside the original at ``<stem>.pdf`` in the file directory. That
         persisted PDF is what page rendering / count / text extraction run on
         here, and what generation later reuses (see
-        :func:`dgml.generation.document.load_document_as_pdf`) — so the document
+        :func:`dgml_core.generation.document.load_document_as_pdf`) — so the document
         is converted exactly once, and the bytes the page images were rendered
         from are byte-identical to those generation slices.
 

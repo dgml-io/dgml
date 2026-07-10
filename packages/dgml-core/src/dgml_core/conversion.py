@@ -60,7 +60,7 @@ from .storage import Workspace, read_config
 
 # Format families and the source suffixes that belong to each. ``.pdf`` is
 # absent on purpose: it needs no converter. Shared with the add-time ingestion
-# gate (dgml.files) and the generation dispatch (dgml.generation.document) so
+# gate (dgml_core.files) and the generation dispatch (dgml_core.generation.document) so
 # the supported-input surface lives in one place.
 FAMILY_BY_SUFFIX: dict[str, str] = {
     ".docx": "docx",

@@ -31,9 +31,8 @@ consistent:
   calls inside it into a single row for multi-call operations. All recording is
   gated on ``--debug``.
 
-Originally lived under :mod:`dgml.generation`; promoted to the
-top-level :mod:`dgml.llm` so the four non-generation sites can share
-it.
+Lives at the package root (:mod:`dgml_core.llm`) so generation and the
+non-generation call sites share one implementation.
 """
 
 from __future__ import annotations
