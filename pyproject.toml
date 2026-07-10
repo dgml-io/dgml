@@ -84,7 +84,6 @@ module = [
     "pdfminer.*",
     "boto3.*",
     "botocore.*",
-    "colpali_engine.*",
     "sklearn.*",
     "scipy.*",
     "igraph.*",

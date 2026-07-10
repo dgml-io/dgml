@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Registration + construction-guard tests for the SigLIP / Qwen-VL /
+"""Registration + construction-guard tests for the Qwen-VL /
 Qwen3-VL-Embedding encoders.
 
 These run without network access or model weights: every assertion fires
@@ -25,24 +25,18 @@ from clustering.config.schema import EncoderConfig
 from clustering.encoders import build_encoder, registered_encoders
 
 
-@pytest.mark.parametrize(
-    "name", ["siglip", "qwen_vl", "qwen3_vl_embedding", "qwen3_vl_embedding_2b"]
-)
+@pytest.mark.parametrize("name", ["qwen_vl", "qwen3_vl_embedding", "qwen3_vl_embedding_2b"])
 def test_encoder_is_registered(name: str) -> None:
     assert name in registered_encoders()
 
 
-@pytest.mark.parametrize(
-    "name", ["siglip", "qwen_vl", "qwen3_vl_embedding", "qwen3_vl_embedding_2b"]
-)
+@pytest.mark.parametrize("name", ["qwen_vl", "qwen3_vl_embedding", "qwen3_vl_embedding_2b"])
 def test_schema_accepts_name(name: str) -> None:
     cfg = EncoderConfig(name=name, model_id="some/model")  # type: ignore[arg-type]
     assert cfg.name == name
 
 
-@pytest.mark.parametrize(
-    "name", ["siglip", "qwen_vl", "qwen3_vl_embedding", "qwen3_vl_embedding_2b"]
-)
+@pytest.mark.parametrize("name", ["qwen_vl", "qwen3_vl_embedding", "qwen3_vl_embedding_2b"])
 def test_missing_model_id_raises(name: str) -> None:
     cfg = EncoderConfig(name=name, model_id=None)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="requires a model_id"):

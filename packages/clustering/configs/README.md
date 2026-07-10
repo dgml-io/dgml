@@ -12,18 +12,12 @@ each file slots its contents into the `encoder_image` key, so you select one on
 the command line:
 
 ```bash
-# SigLIP single-vector page embeddings
-... encoder_image=siglip
-
 # Qwen2.5-VL vision-tower embeddings
 ... encoder_image=qwen_vl
 
 # Qwen3-VL-Embedding multimodal embeddings (MRL-truncatable dim); 8B or 2B
 ... encoder_image=qwen3_vl_embedding
 ... encoder_image=qwen3_vl_embedding_2b
-
-# ColPali multi-vector + late-interaction fusion
-... encoder_image=colpali fusion=late_interaction
 ```
 
 `embedding_dim` **must** match the checkpoint you point `model_id` at — the

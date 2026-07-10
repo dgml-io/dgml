@@ -14,8 +14,8 @@
 
 All fusions take ``(text: EncoderOutput, image: EncoderOutput)`` and return
 a :class:`FusionOutput` whose ``pooled`` field is the downstream embedding.
-``late_interaction`` is the only variant that *also* fills ``tokens`` — its
-multi-vector representation is consumed by the scorer at categorization time.
+A fusion may *also* fill ``tokens`` when carrying a multi-vector
+representation forward for a scorer to consume at categorization time.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ class FusionOutput:
     """Output of a :class:`Fusion` forward pass."""
 
     pooled: torch.Tensor  # [B, D_out]
-    tokens: torch.Tensor | None = None  # [B, N, D] for late_interaction
+    tokens: torch.Tensor | None = None  # [B, N, D] for multi-vector fusions
 
     @property
     def is_multi_vector(self) -> bool:

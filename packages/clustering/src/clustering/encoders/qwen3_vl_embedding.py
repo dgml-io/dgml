@@ -45,8 +45,7 @@ manifold) gets the dimensionality it's configured for. See
   honored regardless of whether the server did its own truncation.
 
 Single-vector only: the model exposes one pooled embedding, so
-``multi_vector=True`` (``fusion=late_interaction``) is rejected — use ColPali
-for multi-vector page retrieval.
+``multi_vector=True`` is rejected.
 """
 
 from __future__ import annotations
@@ -197,8 +196,7 @@ class Qwen3VLEmbeddingEncoder(Encoder[Qwen3VLInput]):
         if cfg.multi_vector:
             raise ValueError(
                 "Qwen3-VL-Embedding is single-vector only: it emits one pooled "
-                "embedding per input, not per-patch tokens. Use "
-                "encoder_image=colpali for fusion=late_interaction."
+                "embedding per input, not per-patch tokens."
             )
 
         self.cfg = cfg

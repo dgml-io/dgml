@@ -13,8 +13,8 @@
 """Encoder ABC, :class:`EncoderOutput` dataclass, and a name-keyed registry.
 
 The pooled/tokens split is the single place in the codebase where the
-multi-vector / single-vector distinction lives. ``late_interaction`` fusion
-consumes ``tokens``; every other fusion variant consumes ``pooled``.
+multi-vector / single-vector distinction lives. Multi-vector consumers read
+``tokens``; single-vector fusion variants consume ``pooled``.
 """
 
 from __future__ import annotations
@@ -39,7 +39,8 @@ class EncoderOutput:
     Attributes:
         pooled: ``[B, D]`` per-sample embedding. Always present.
         tokens: ``[B, N, D]`` per-token (or per-patch) embeddings.
-            ``None`` for single-vector encoders; populated by ColPali.
+            ``None`` for single-vector encoders; populated by
+            multi-vector encoders.
     """
 
     pooled: torch.Tensor

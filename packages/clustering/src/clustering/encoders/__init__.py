@@ -10,11 +10,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Text + image + multi-vector (ColPali) encoders.
+"""Text + image encoders.
 
 All encoders implement :class:`Encoder` returning :class:`EncoderOutput`
-``(pooled, tokens?)``. Single-vector encoders leave ``tokens=None``; ColPali
-fills both.
+``(pooled, tokens?)``. Single-vector encoders leave ``tokens=None``;
+multi-vector encoders fill both.
 
 Importing this module registers every built-in encoder with the registry.
 """
@@ -25,13 +25,11 @@ from __future__ import annotations
 # `text` registers every SentenceTransformer-compatible name:
 # st_minilm, e5, bge, gte, stella, jina.
 from clustering.encoders import (
-    colpali,  # noqa: F401  (registers "colpali")
     dummy,  # noqa: F401  (registers "dummy")
     image,  # noqa: F401  (registers "dit", "vit", "donut")
     lexical,  # noqa: F401  (registers "tfidf")
     qwen3_vl_embedding,  # noqa: F401  (registers "qwen3_vl_embedding")
     qwen_vl,  # noqa: F401  (registers "qwen_vl")
-    siglip,  # noqa: F401  (registers "siglip")
     text,  # noqa: F401
 )
 from clustering.encoders.base import (

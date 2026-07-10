@@ -20,8 +20,7 @@ visual tokens are mean-pooled into a single ``pooled`` vector — the signal
 clustering consumes.
 
 Because the per-image token grids are ragged (no common ``N``), this encoder
-is single-vector only: ``multi_vector=True`` (i.e. ``fusion=late_interaction``)
-is rejected. Use ColPali for multi-vector page retrieval.
+is single-vector only: ``multi_vector=True`` is rejected.
 
 Notes:
     The Qwen-VL transformers classes have been renamed across releases: the
@@ -109,8 +108,7 @@ class QwenVLEncoder(Encoder[Image.Image]):
             raise ValueError(
                 "Qwen-VL is single-vector only: its dynamic-resolution visual "
                 "tokens form ragged per-image grids that cannot be stacked into "
-                "a uniform [B, N, D] tensor. Use encoder_image=colpali for "
-                "fusion=late_interaction."
+                "a uniform [B, N, D] tensor."
             )
 
         self.cfg = cfg

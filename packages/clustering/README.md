@@ -42,9 +42,9 @@ DocumentDataset
 
 - **Encoders** (`clustering.encoders`) — text: `st_minilm`, `e5`, `bge`,
   `gte`, `stella`, `jina`; image: `dit`, `vit`, `donut`, `layoutlm`;
-  multimodal: `colpali`; plus `dummy` for tests.
-- **Fusion** (`clustering.fusion`) — `none`, `late_concat`,
-  `cross_attention`, `gated`, `late_interaction`.
+  multimodal: `qwen_vl`, `qwen3_vl_embedding`; plus `dummy` for tests.
+- **Fusion** (`clustering.fusion`) — `none`, `concat_norm`, `late_concat`,
+  `cross_attention`, `gated`.
 - **Manifolds** (`clustering.manifolds`) — `euclidean`, `spherical`,
   `hyperbolic` (Poincaré ball), `product`. Forward math is pure torch;
   use [`geoopt`](https://github.com/geoopt/geoopt) wrappers for

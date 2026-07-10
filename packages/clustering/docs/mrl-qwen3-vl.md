@@ -65,8 +65,7 @@ dependencies (the server backend uses only the standard library).
     is applied **client-side** via `mrl_truncate`, so the configured
     `embedding_dim` is honored whether or not the server truncated.
 
-The single-vector guard is unchanged: `multi_vector=True`
-(`fusion=late_interaction`) is rejected — use ColPali for that.
+The single-vector guard is unchanged: `multi_vector=True` is rejected.
 
 ### 3. Configs
 

@@ -1,9 +1,0 @@
-# @package encoder_image
-# ColPali multi-vector page encoder (PaliGemma-based).
-# Select with:  encoder_image=colpali fusion=late_interaction
-name: colpali
-model_id: vidore/colpali-v1.3
-# ColPali emits one 128-d embedding per image patch.
-embedding_dim: 128
-# Always multi-vector — required by fusion=late_interaction.
-multi_vector: true
