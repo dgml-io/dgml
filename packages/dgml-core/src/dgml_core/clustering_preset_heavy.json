@@ -8,7 +8,7 @@
   },
   "fusion": {"name": "none", "prefer_modality": "image"},
   "manifold": {"name": "euclidean", "dim": 1024},
-  "device": "cuda",
+  "device": "auto",
   "corpus": {"root": "."},
   "logger": {"name": "none"},
   "training": {
