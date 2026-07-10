@@ -9,5 +9,5 @@ name: qwen_vl
 model_id: Qwen/Qwen2.5-VL-3B-Instruct
 embedding_dim: 2048
 # Single-vector only: dynamic-resolution token grids are ragged, so
-# multi_vector=true (fusion=late_interaction) is rejected — use colpali instead.
+# multi_vector=true is rejected.
 multi_vector: false

@@ -24,9 +24,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ── Enum-like literals (also used as ClearML / W&B tags) ─────────────────
-FusionName = Literal[
-    "none", "concat_norm", "late_concat", "cross_attention", "gated", "late_interaction"
-]
+FusionName = Literal["none", "concat_norm", "late_concat", "cross_attention", "gated"]
 ManifoldName = Literal["euclidean", "spherical", "hyperbolic", "product"]
 ScenarioName = Literal["s1", "s2", "s3", "s4", "s5"]
 # Text-encoder names that share the SentenceTransformer adapter — the
@@ -47,11 +45,9 @@ EncoderName = Literal[
     "dit",
     "vit",
     "donut",
-    "siglip",
     "qwen_vl",
     "qwen3_vl_embedding",
     "qwen3_vl_embedding_2b",
-    "colpali",
 ]
 LoggerName = Literal["none", "clearml", "wandb", "multi"]
 LossName = Literal[
@@ -91,7 +87,7 @@ class EncoderConfig(_StrictModel):
     embedding_dim: int = 384
     max_length: int | None = None
     # Whether this encoder emits multi-vector ``tokens`` in addition to
-    # ``pooled``. Set explicitly so `late_interaction` can validate at
+    # ``pooled``. Set explicitly so downstream consumers can be validated at
     # construction time without instantiating the model.
     multi_vector: bool = False
     # ── Instruction-prefix templates (E5 / BGE / GTE / Stella / Jina) ─────
@@ -510,19 +506,6 @@ class Config(_StrictModel):
     # encoder forward pass. ``None`` disables caching. See
     # ``clustering.encoders.caching``.
     cache_dir: Path | None = None
-
-    @model_validator(mode="after")
-    def _check_late_interaction_has_tokens(self) -> Config:
-        """`late_interaction` requires at least one multi-vector encoder."""
-        if self.fusion.name == "late_interaction" and not (
-            self.encoder_text.multi_vector or self.encoder_image.multi_vector
-        ):
-            raise ValueError(
-                "fusion=late_interaction requires at least one encoder with "
-                "multi_vector=True (e.g. encoder_image=colpali). "
-                "Got text.multi_vector=False, image.multi_vector=False."
-            )
-        return self
 
     def tags(self) -> list[str]:
         """Tags written to ClearML / W&B for run-comparison filters."""

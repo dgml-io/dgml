@@ -170,7 +170,7 @@ failed operations.
 
 Requires `pip install dgml[clustering]`. The extra pulls in the
 `dgml-clustering` workspace package and its ML stack (embedding models,
-`leidenalg`, `scipy`, `sklearn`, `colpali_engine`); without it the
+`leidenalg`, `scipy`, `sklearn`); without it the
 command exits 1 with `MISSING_EXTRA`.
 
 `--skip-existing` makes the command a no-op when **every** file is already

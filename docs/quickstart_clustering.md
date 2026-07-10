@@ -17,8 +17,7 @@ sudo apt-get install ghostscript    # Debian/Ubuntu
 ```
 
 Install DGML with the `clustering` extra (pulls in `dgml-clustering`
-and its ML stack — embedding models, `leidenalg`, `scipy`, `sklearn`,
-`colpali_engine`):
+and its ML stack — embedding models, `leidenalg`, `scipy`, `sklearn`):
 
 ```bash
 pip install "dgml[clustering]"

@@ -40,7 +40,7 @@ macos = [
 ]
 # Install with `pip install dgml-core[clustering]` to enable the clustering
 # pipelines (S1/S2 scenario pipelines, embedding models, networkx, scipy,
-# sklearn, colpali_engine — a heavyweight ML stack that not all users need).
+# sklearn — a heavyweight ML stack that not all users need).
 clustering = ["dgml-clustering"]
 # Install with `pip install dgml-core[chain]` to enable on-chain attestation.
 # Pulls eth-account + eth-abi for EVM transaction signing and calldata

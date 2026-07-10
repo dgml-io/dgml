@@ -8,7 +8,7 @@ model_id: Qwen/Qwen3-VL-Embedding-2B
 # Matryoshka (MRL): the native 2048-d embedding is truncated to this width and
 # re-normalized. Any value in [64, 2048] is valid.
 embedding_dim: 1024
-# Single-vector only; late_interaction is rejected — use colpali for multi-vector.
+# Single-vector only; multi_vector=true is rejected.
 multi_vector: false
 extra:
   # Custom-code checkpoint: trust_remote_code is required.

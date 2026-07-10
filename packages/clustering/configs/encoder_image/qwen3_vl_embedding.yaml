@@ -7,8 +7,8 @@ model_id: Qwen/Qwen3-VL-Embedding-8B
 # Matryoshka (MRL): the native 4096-d embedding is truncated to this width and
 # re-normalized. Any value in [64, 4096] is valid; smaller ⇒ cheaper downstream.
 embedding_dim: 1024
-# Single-vector only (one pooled embedding per input); late_interaction is
-# rejected — use colpali for multi-vector.
+# Single-vector only (one pooled embedding per input); multi_vector=true is
+# rejected.
 multi_vector: false
 extra:
   # 8B custom-code checkpoint: trust_remote_code is required, and a GPU is

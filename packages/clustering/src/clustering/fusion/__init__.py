@@ -13,8 +13,7 @@
 """Fusion — Research Axis #1.
 
 Importing this module registers all fusion variants: ``none``,
-``concat_norm``, ``late_concat``, ``cross_attention``, ``gated``,
-``late_interaction``.
+``concat_norm``, ``late_concat``, ``cross_attention``, ``gated``.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ from clustering.fusion import (
     cross_attention,  # noqa: F401
     gated,  # noqa: F401
     late_concat,  # noqa: F401
-    late_interaction,  # noqa: F401
     none_,  # noqa: F401
 )
 from clustering.fusion.base import (
