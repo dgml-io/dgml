@@ -1525,3 +1525,30 @@ def test_all_text_table_keeps_its_first_row() -> None:
     ]
     propagate_table_consistency(rows)
     assert rows[0].cell_concepts == ["PartyName", "PartyCity"]  # untouched
+
+
+def test_parse_block_choice_group() -> None:
+    """A checkbox/radio group parses with its printed options; a checked entry
+    outside the printed choices is a hallucinated mark and is dropped; a
+    single selection also fills `value`."""
+    from dgml_core.generation.blocks import parse_block
+
+    b = parse_block(
+        {
+            "structure": "field",
+            "label": "REQUESTED ACTION",
+            "options": ["APPLY", "AMEND", "WITHDRAW"],
+            "checked": ["APPLY", "NOPE"],
+        },
+        block_id="b1",
+    )
+    assert b is not None
+    assert b.options == ["APPLY", "AMEND", "WITHDRAW"]
+    assert b.checked == ["APPLY"]  # hallucinated 'NOPE' dropped
+    assert b.value == "APPLY"  # single selection fills value
+    # an unmarked group still survives (options alone carry content)
+    empty = parse_block(
+        {"structure": "field", "label": "KIND", "options": ["A", "B"], "checked": []},
+        block_id="b2",
+    )
+    assert empty is not None and empty.checked == [] and empty.value == ""

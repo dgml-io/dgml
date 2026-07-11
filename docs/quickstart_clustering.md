@@ -164,7 +164,7 @@ schema:
 - **Per run** — `dgml cluster --config PATH` points at a standalone JSON
   with the same fields (drop the `clustering` wrapper); it *replaces* the
   section for that run. `--config` also accepts a bundled preset **name**
-  (`light` / `medium` / `heavy`).
+  (`small` / `light` / `medium` / `heavy`).
 
 ```jsonc
 // <workspace>/config.json — change only what you need
@@ -189,14 +189,21 @@ state, so overriding those is ignored — but every algorithm knob
 ### Compute presets
 
 Each preset is a complete, self-contained config tuned for a hardware
-budget. Higher tiers use a stronger (denser) text encoder — better
-separation, more compute.
+budget. Higher tiers add **image/vision embeddings** for better separation
+at the cost of more compute (and a model download / GPU).
 
-| Preset | Target hardware | Text encoder | Clustering |
+| Preset | Target hardware | Representation | Clustering |
 |---|---|---|---|
-| `light` (default) | CPU-only | `tfidf`, 256-d | Leiden + UMAP |
-| `medium` | large CPU / Apple MPS | `bge-small`, 384-d | Leiden + UMAP |
-| `heavy` | GPU | `e5-large`, 1024-d | HDBSCAN + UMAP |
+| `small` | CPU-only, tiny corpora | `tfidf` text, 256-d | Leiden, no UMAP |
+| `light` (default) | CPU-only | `tfidf` text, 256-d | Leiden + UMAP |
+| `medium` | large CPU / Apple MPS | `tfidf` text + 2B vision, fused 1280-d | Leiden + UMAP |
+| `heavy` | GPU | 8B vision only, 1024-d | Leiden + UMAP |
+
+`small` drops UMAP (`reduce_method: none`) and uses a small k-NN graph
+(`k=5`) — meant for corpora too small for UMAP to help. `medium` fuses the
+tf-idf text vector with a `Qwen3-VL-Embedding-2B` image embedding
+(`fusion: concat_norm`); `heavy` clusters on the larger
+`Qwen3-VL-Embedding-8B` image embedding alone.
 
 ```bash
 dgml cluster --config medium
@@ -217,7 +224,7 @@ under its config section (e.g. `scenario.leiden_resolution`,
 
 | Parameter (section) | What it controls | Default | Raise / switch up when… | Lower / switch down when… |
 |---|---|---|---|---|
-| `encoder_text.name` | Text embedding model. `tfidf` (bag-of-words, fast, CPU) vs dense sentence encoders `bge` / `e5` / `gte` (semantic, need a model download). | `tfidf` | Categories differ by *meaning*, not vocabulary; short docs; TF-IDF under-separates. Move to `bge` (→ `medium`) or `e5` (→ `heavy`). | You want zero downloads / CPU-only speed and the vocabularies are already distinctive. |
+| `encoder_text.name` | Text embedding model. `tfidf` (bag-of-words, fast, CPU) vs dense sentence encoders `bge` / `e5` / `gte` (semantic, need a model download). | `tfidf` | Categories differ by *meaning*, not vocabulary; short docs; TF-IDF under-separates. Switch to a dense encoder (`bge` / `e5`), or add a vision encoder as the `medium` / `heavy` presets do. | You want zero downloads / CPU-only speed and the vocabularies are already distinctive. |
 | `encoder_text.embedding_dim` + `manifold.dim` | Vector width. Must match the encoder (`tfidf` 256, `bge` 384, `e5` 1024). Keep these two equal. | 256 | Switching to a wider encoder. | Switching to a narrower encoder. |
 | `encoder_text.extra.text_view` | Which text is embedded: `page1` (first page only) or the full document. | `page1` | The first page doesn't characterize the doc (cover pages, boilerplate); use full text. | First pages are highly distinctive (forms, letterheads) — cheaper and less noisy. |
 
@@ -238,9 +245,10 @@ knob to reach for is `leiden_resolution`.*
 | `leiden_graph_method` | Graph construction: `knn`, `mutual_knn` (stricter, drops one-way edges), `radius`. | `knn` | Use `mutual_knn` to break weak bridges when unrelated docs get glued together. | Stay on `knn` for well-connected small corpora. |
 | `leiden_min_cluster_size` | Communities smaller than this are dropped to the noise bucket (`-1`). | `2` | Raise to suppress tiny splinter clusters. | Set to `1` to keep every singleton community. |
 
-**HDBSCAN — density-based, the `heavy` preset's algorithm**
+**HDBSCAN — density-based, an alternative to Leiden**
 (`scenario.*`, active when `cluster_algorithm: hdbscan`). Non-parametric
-in cluster count; routes low-density docs to a noise bucket.
+in cluster count; routes low-density docs to a noise bucket. All bundled
+presets use Leiden, but HDBSCAN pairs well with dense (vision) encoders.
 
 | Parameter | What it controls | Default | Raise it when… | Lower it when… |
 |---|---|---|---|---|

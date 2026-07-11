@@ -292,9 +292,9 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PRESET|PATH",
         default=None,
         help="Clustering configuration for this run. Either a bundled preset "
-        "name (light | medium | heavy) or a path to a standalone config JSON "
-        "(same shape as the 'clustering' section of <workspace>/config.json — "
-        "e.g. encoder_text, encoder_image, fusion, scenario). Replaces the "
+        "name (small | light | medium | heavy) or a path to a standalone config "
+        "JSON (same shape as the 'clustering' section of <workspace>/config.json "
+        "— e.g. encoder_text, encoder_image, fusion, scenario). Replaces the "
         "workspace config's clustering section for this run. Defaults to the "
         "workspace config, or the bundled light preset when none is set.",
     )
