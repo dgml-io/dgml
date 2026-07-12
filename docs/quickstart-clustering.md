@@ -17,17 +17,26 @@ sudo apt-get install ghostscript    # Debian/Ubuntu
 ```
 
 Install DGML with the `clustering` extra (pulls in `dgml-clustering`
-and its ML stack — embedding models, `leidenalg`, `scipy`, `sklearn`):
+and its ML stack — embedding models, `leidenalg`, `scipy`, `sklearn`).
+DGML is not published to PyPI yet, so install from a clone of this
+repository:
 
 ```bash
-pip install "dgml[clustering]"
+git clone https://github.com/dgml-io/dgml.git
+cd dgml
+uv sync --extra clustering
 ```
+
+(Once DGML is on PyPI this becomes `pip install "dgml[clustering]"`.)
 
 Sanity-check the CLI:
 
 ```bash
-dgml --help
+uv run dgml --help
 ```
+
+The commands below assume the repo venv is active (`source .venv/bin/activate`)
+or that you prefix each `dgml` invocation with `uv run`.
 
 ## 2. Create a workspace
 
@@ -92,13 +101,17 @@ are also configured in `<workspace>/config.json` (see
 schema), while macOS Apple Vision runs on-device with no config:
 
 ```bash
-pip install "dgml[macos]"     # Apple Vision — on-device, macOS only, zero-config
+# `uv sync` makes the venv match exactly what you list, so keep the
+# clustering extra from step 1 and add the OCR provider you need:
+uv sync --extra clustering --extra macos   # Apple Vision — on-device, macOS only, zero-config
 # or, for cloud OCR (add an `ocr` section to config.json first):
-pip install "dgml[azure]"     # Azure Document Intelligence
-pip install "dgml[aws]"       # AWS Textract
+uv sync --extra clustering --extra azure   # Azure Document Intelligence
+uv sync --extra clustering --extra aws     # AWS Textract
 
 dgml file add /path/to/pdfs --recursive --on-conflict skip --text-mode hybrid
 ```
+
+(Once DGML is on PyPI these become `pip install "dgml[macos]"` etc.)
 
 On macOS, Apple Vision is the default OCR engine even with no `ocr`
 section in `config.json` — just install the extra. `hybrid` runs

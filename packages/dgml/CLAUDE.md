@@ -21,7 +21,7 @@ codes are part of `dgml`'s API. Schema changes are breaking.
 2. [tests/test_cli.py](tests/test_cli.py) — locks the JSON shape; update assertions for the new payload
 3. [../../docs/cli-reference.md](../../docs/cli-reference.md) — human and agent reference
 4. [../../.claude/skills/dgml/SKILL.md](../../.claude/skills/dgml/SKILL.md) — Claude skill that teaches agents *when* and *how* to invoke the CLI
-5. [../../get-started/getstarted.md](../../get-started/getstarted.md) — the end-to-end tutorial; update any command invocation the change touches (e.g. new required flags, renamed args, changed setup steps) so a reader following it top-to-bottom doesn't hit a broken command
+5. [../../get-started/get-started.md](../../get-started/get-started.md) — the end-to-end tutorial; update any command invocation the change touches (e.g. new required flags, renamed args, changed setup steps) so a reader following it top-to-bottom doesn't hit a broken command
 
 Also grep the rest of `docs/` for the affected command — reference pages like [../../docs/storage-layout.md](../../docs/storage-layout.md) may show the same invocation or its on-disk output.
 

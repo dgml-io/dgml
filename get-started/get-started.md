@@ -2,9 +2,7 @@
 
 Welcome to the **DGML Get Started Guide**. 
 
-**DGML** (Document Graph Markup Language) is a semantic XML representation of business documents. Where raw source files give you layout and pixels, DGML gives you meaning: tags that describe what each element *is* in the document's domain — a contract clause, an invoice line item, a policy definition — not how it appeared on the page. Spec can be found in the [DGML Repo](https://github.com/dgml-io/dgml-spec).
-
-)
+**DGML** (Document Graph Markup Language) is a semantic XML representation of business documents. Where raw source files give you layout and pixels, DGML gives you meaning: tags that describe what each element *is* in the document's domain — a contract clause, an invoice line item, a policy definition — not how it appeared on the page. Spec can be found in the [DGML-Spec Repo](https://github.com/dgml-io/dgml-spec).
 
 The headline feature is **cross-document tag consistency**: documents of the same kind share the same semantic vocabulary — what separates DGML from a raw extraction or structural transcription, and what makes it suitable for reasoning over a corpus rather than a single file.
 
@@ -108,7 +106,57 @@ review and edit that shared config before any workspace is created; re-run
 `dgml workspace create --force` to re-sync an edited config into an existing
 workspace.*
 
-### 1.4 Ingest Sample Documents
+### 1.4 Configure Models and API Keys
+Ingesting files needs no configuration, but every LLM-backed command you will
+run later in this guide — `dgml docset generate` (Phase 1), the cluster
+auto-naming (Phase 2), and value extraction — reads its model and credentials
+from `<workspace>/config.json`. There are **no in-code model defaults**: an
+unconfigured section fails the command with an error like
+`GENERATION_CONFIG_MISSING` rather than silently making a paid LLM call you
+didn't set up. Configure it now so the later phases run through cleanly.
+
+Open `<workspace>/config.json` (seeded by `workspace create` in the previous
+step) and review these sections:
+
+```json
+{
+  "generation": {
+    "model": "anthropic/claude-haiku-4-5",
+    "label_model": "anthropic/claude-sonnet-4-6",
+    "api_key_env": "ANTHROPIC_API_KEY"
+  },
+  "classification": {
+    "model": "gemini/gemini-2.5-flash",
+    "api_key_env": "GEMINI_API_KEY"
+  }
+}
+```
+
+- **`generation`** — required by `dgml docset generate`. `model` runs the
+  per-page transcription (the bulk of the calls); `label_model` runs the single
+  batch-wide semantic-labeling call. Any provider-prefixed litellm model id
+  works.
+- **`classification`** — a vision-capable model used to auto-name clusters in
+  Phase 2 (and by `dgml file add --auto-classify`).
+- **`grounded`** — only needed for schema-driven value extraction
+  (`dgml extraction …`, see the interlude before Phase 3).
+
+Each section names its API key indirectly via `api_key_env` — the **name** of
+an environment variable, never the secret itself. Export the matching key in
+your shell before running the commands:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-…"
+export GEMINI_API_KEY="…"
+```
+
+*Tip: edits to `<workspace>/config.json` apply to this workspace only. To make
+your configuration the default for future workspaces, edit the shared
+`local_config.json` (a peer of the workspace directory) and re-run
+`dgml workspace create --force` to re-sync it. The full schema of every config
+section is in [docs/storage-layout.md](../docs/storage-layout.md).*
+
+### 1.5 Ingest Sample Documents
 Let's add the non-traded REIT PDF documents from `dgml-spec/samples/1-NonTraded-NAV-REITs/files`. We use `--recursive` to walk folders and `--on-conflict skip` to ensure our run is idempotent (safely resuming if interrupted):
 
 ```bash
@@ -126,7 +174,7 @@ You can inspect the summary of this ingestion pass by piping the output to `jq`:
 uv run dgml file add "dgml-spec/samples/1-NonTraded-NAV-REITs/files" --recursive --on-conflict skip | jq .summary
 ```
 
-### 1.5 Workspace Control: Navigating Files and DocSets
+### 1.6 Workspace Control: Navigating Files and DocSets
 DGML organizes your workspace around two primary entities: **Files** and **DocSets**.
 
 - **Files** are the raw, physical documents.
@@ -166,7 +214,8 @@ uv run dgml docset add-file <file_id> --docset <docset_id>
 ```
 
 #### Generate DGML XML for the DocSet
-With files assigned, you can run the PDF → DGML semantic pipeline:
+With files assigned, you can run the PDF → DGML semantic pipeline. It uses the
+`generation` models you configured in §1.4:
 ```bash
 uv run dgml docset generate <docset_id>
 ```
@@ -176,28 +225,21 @@ This transcribes pages window-by-window, plans a shared semantic labeling schema
 
 ## Phase 2: Automated Document Clustering
 
-Manually categorizing and labeling hundreds of incoming files is tedious. DGML solves this with **automated clustering**, which groups files based on visual layout and text semantics, then auto-names the groups using an LLM.
+Manually categorizing and labeling hundreds of incoming files is tedious. DGML solves this with **automated clustering**, which groups files by the similarity of their content, then auto-names the groups using a vision LLM.
 
 To demonstrate, we will use the `dgml-spec/samples/4-Infrastructure-Funds/files` directory, which contains a larger set of files (including loan agreements, quarterly reports, and valuation memos across multiple sets).
 
 ### 2.1 Set Up Clustering Dependencies
-Clustering requires the `clustering` extra, which installs machine learning and embedding libraries:
+Clustering requires the `clustering` extra, which installs machine learning and embedding libraries. DGML is not published to PyPI yet, so install the extra from your repository checkout:
 
 ```bash
-pip install "dgml[clustering]"
+# From the repository root
+uv sync --extra clustering
 ```
 
-Additionally, auto-naming the resulting clusters requires a Vision LLM configuration in your `<workspace>/config.json`. Add a `classification` section using your preferred LLM provider:
+*(Once DGML is published to PyPI, this will become `pip install "dgml[clustering]"`.)*
 
-```json
-{
-  "classification": {
-    "model": "gemini/gemini-2.5-flash",
-    "api_key_env": "GEMINI_API_KEY"
-  }
-}
-```
-*Make sure your `GEMINI_API_KEY` (or chosen provider key) is exported in your terminal environment.*
+Additionally, auto-naming the resulting clusters requires a vision-capable LLM in the `classification` section of your `<workspace>/config.json` — you set this up in §1.4. Make sure the matching API key (e.g. `GEMINI_API_KEY`) is exported in your terminal environment.
 
 ### 2.2 Ingest the Infrastructure Funds
 First, let's ingest the large batch of Infrastructure Fund PDFs into our workspace:
@@ -206,32 +248,71 @@ First, let's ingest the large batch of Infrastructure Fund PDFs into our workspa
 uv run dgml file add "dgml-spec/samples/4-Infrastructure-Funds/files" --recursive --on-conflict skip
 ```
 
+The folder holds three document kinds for each of eleven deals: loan agreements (`deal_<name>_la.pdf`), quarterly reports (`deal_<name>_qr.pdf`), and valuation memos (`deal_<name>_vm.pdf`).
+
+*Note: one deal's documents (`deal_aegis_*`) ship as Word/Excel files rather than PDFs. Ingesting those requires a configured document converter (see [docs/conversion.md](../docs/conversion.md)); without one they are recorded with a conversion error and skipped by the clusterer. The walkthrough works fine with just the 30 PDFs of the other ten deals.*
+
 ### 2.3 Run the Clusterer
-Now, execute the clustering command. This operates on all unassigned files in the workspace:
+Now, execute the clustering command over the unassigned files. Because Phase 1 already created a DocSet, the default `--mode auto` would run *incremental* clustering and pull the new files toward that existing DocSet — so pass `--mode fresh` to cluster the unassigned files from scratch into new groups:
 
 ```bash
-uv run dgml cluster --skip-existing
+uv run dgml cluster --mode fresh
 ```
 
-Under the hood, the clusterer runs an **unsupervised (S1)** pipeline:
-1. It extracts visual features from the first page of each document using a vision-aware encoder.
-2. It combines these with semantic text embeddings of the document's content.
-3. It maps the files into a joint manifold space and runs the **Leiden community detection algorithm** to identify distinct clusters.
-4. For each detected cluster, it collects a few sample page images and sends them to your Vision LLM.
-5. The LLM analyzes the layouts and proposes a cohesive **Name** (e.g., "Loan Agreements", "Valuation Memos") and **Description** for each group.
-6. The CLI automatically creates the DocSets in your workspace and assigns the respective files to them!
+Under the hood, the clusterer:
+1. Embeds each unassigned document from its first-page text (the default is a corpus-fitted TF-IDF text encoder; a file also needs a rendered first-page image to be eligible).
+2. Reduces the embeddings with UMAP and runs the **Leiden community detection algorithm** to identify distinct clusters.
+3. Assigns any cluster whose name matches an existing DocSet to that DocSet.
+4. For each remaining cluster, collects a few sample page images and sends them to the vision LLM configured in `classification` (§1.4), which proposes a cohesive **Name** (e.g., "Loan Agreements", "Valuation Memos") and **Description** for the group.
+5. Creates the new DocSets in your workspace and assigns the respective files to them.
+
+Partial success is the contract: if the `classification` config is missing or an LLM call fails, the affected files land in `failed_file_ids` while every other cluster is still assigned — fix the config and re-run.
 
 Verify the auto-created DocSets and assignments:
 ```bash
 uv run dgml docset list
 ```
-You will find that files like `set1_loan_agreement.pdf` and `set2_loan_agreement.pdf` have been grouped under a single, auto-labeled DocSet!
+You will find that files of the same kind — for example the loan agreements `deal_alpha_la.pdf`, `deal_apex_la.pdf`, and `deal_titan_la.pdf` — have been grouped under a single, auto-labeled DocSet, with the quarterly reports and valuation memos in DocSets of their own.
+
+---
+
+## Interlude: Generation, Extraction, and the DGMLX Bundle
+
+Before anchoring anything, it helps to understand the two LLM-backed processing passes DGML offers, because what you run determines what ends up in the tamper-evident bundle you anchor.
+
+**Generation** (`dgml docset generate`, used in Phase 1) transcribes the *whole* document into a semantic XML tree — every clause, table, and value typed, labeled with the DocSet's shared vocabulary, and grounded to its source-page position (`dg:origin`). Use it when the full document needs to stay queryable and verifiable.
+
+**Extraction** (`dgml extraction …`) pulls a *defined set of fields* out of a document against an extraction schema, and grounds each value back to the source page. The schema can be proposed by an LLM (`dgml extraction generate-schema <docset_id>`) or supplied by you (`set-schema`); `dgml extraction extract <docset_id> <file_id>` then writes the values as a `dg:extraction` element **inside the file's core `<stem>.dgml.xml`** — there is no separate values file. It uses the `grounded` config section (§1.4). See the [extraction commands](../docs/cli-reference.md#extraction-commands) for details.
+
+When to use which:
+
+| You run… | You get… |
+|---|---|
+| **Generation only** | The complete semantic tree. Any value can be located and proven later, without deciding fields upfront. |
+| **Extraction only** | A minimal core XML holding just the schema's fields, each grounded. Cheaper when you only ever need a known field set. |
+| **Both** (either order) | The full tree *plus* the `dg:extraction` element alongside it — full queryability and a stable, schema-shaped view of the key fields. |
+| **Neither** | The file is still ingested, hashed, organized, and page-rendered — and can still be anchored at whole-file granularity. |
+
+**The DGMLX bundle** is the portable, tamper-evident export of everything DGML knows about a file: the source document, its page images, and — when a DocSet is named — the DocSet schema(s) and the generated `<stem>.dgml.xml`. All of it is rolled up into a single SHA-256 Merkle root recorded in the bundle's `META-INF/dgml-attestation.xml`, so any alteration to any artifact breaks verification. A bundle exists in two forms — zipped into a single `<stem>.dgmlx` archive, or *unpacked* as a plain directory with the same layout — and `dgml dgmlx verify` accepts either. The bundle format is specified in Part II of the [DGML spec](https://github.com/dgml-io/dgml-spec/blob/main/spec.md).
+
+DGMLX bundles are **optional**, and the two commands that build one produce the two forms:
+
+- `dgml dgmlx export` writes the portable `.dgmlx` archive — use it when you want to hand a self-contained, verifiable document package to another party.
+- `dgml stake file` (Phase 3) builds the bundle implicitly, because its Merkle root is exactly what gets anchored on-chain — but it materializes the bundle **unpacked**, as a directory under `dgmlx-bundles/<file_id>[-<docset_id>]/` in your workspace, so the exact artifacts that were hashed stay directly inspectable and the on-chain receipt (`record.json`) is saved alongside them. It never writes a `.dgmlx` archive; if you also want the portable file, run `dgml dgmlx export` — both forms carry the identical Merkle root.
+
+What the root covers follows from what you ran:
+
+- **Neither pass:** the root covers the source document and page images only — whole-file anchoring still works.
+- **Generation** adds the DocSet's `full-schema.rnc` and the semantic XML to the root — and enables *element-level* anchoring (`stake node`), which needs the generated tree.
+- **Extraction** adds `extraction-schema.rnc` and the `dg:extraction` values (inside the core XML) to what is attested.
+
+A missing artifact is simply an absent slot (a smaller bundle), never an error. The flip side: re-running generation or extraction changes the Merkle root, so anchor *after* the document has reached the state you want to attest — and re-stake if you deliberately reprocess it.
 
 ---
 
 ## Phase 3: Anchoring (Staking) to the NVNM Blockchain
 
-Once you have generated DGML XML for a file, you can **stake (anchor)** it to a blockchain. This establishes a permanent, cryptographic proof of the document's layout and content without uploading the actual PDF or XML contents to the public ledger.
+Once a file is in your workspace — ideally with generated DGML XML — you can **stake (anchor)** it to a blockchain. This establishes a permanent, cryptographic proof of the document's content without uploading the actual PDF or XML contents to the public ledger.
 
 DGML achieves this using a **SHA-256 Merkle Tree**:
 - Every element node in the generated XML is canonicalized using **Exclusive XML Canonicalization (C14N)** and hashed.
@@ -239,74 +320,16 @@ DGML achieves this using a **SHA-256 Merkle Tree**:
 - Only the 64-character Merkle Root Hash is written on-chain.
 - Off-chain, you maintain the XML elements and an **Inclusion Proof**, which allows you or a third party to prove that a specific sentence, table cell, or clause was part of the original staked document.
 
-Let's anchor a document on the **NVNM Chain testnet**!
+Rather than duplicate the walkthrough here, follow the dedicated
+**[chaining quickstart](../docs/chaining/quickstart-chaining.md)**. It takes
+you from absolute zero to an anchored document on the **NVNM Chain testnet**:
 
-### 3.1 Network Details
-We will connect to the EVM-compatible NVNM Chain testnet:
+1. Install MetaMask, create a throwaway wallet, add the NVNM testnet, and fund it from the faucet (steps 1–7).
+2. Install the chain extra — from this repo checkout that is `uv sync --extra chain` (the quickstart's `pip install "dgml[chain]"` applies once DGML is on PyPI) — and point the CLI at your workspace (steps 8–10).
+3. Export your private key and store it in your OS keyring (steps 11–12).
+4. Pick a file with generated DGML from your workspace, create a registry, and stake the file — or a single XML element of it (steps 13–15).
 
-- **Network name:** `NVNM testnet`
-- **Chain ID:** `787111`
-- **RPC URL:** `https://evm.testnet.nvnmchain.io`
-- **Block explorer:** `https://explorer.evm.testnet.nvnmchain.io/`
-- **Faucet:** `https://faucet.testnet.nvnmchain.io/`
-
-### 3.2 Enable Chaining and Setup MetaMask Wallet
-1. Install MetaMask in your browser.
-2. Create a fresh, throwaway wallet and add the **NVNM testnet** as a custom network using the parameters above.
-3. Visit the **faucet** (`faucet.testnet.nvnmchain.io`) and enter your EVM address (starts with `0x`) to receive **10 $ (wmantraUSD)** of testnet gas.
-4. Install the CLI chain extension:
-   ```bash
-   pip install "dgml[chain]"
-   ```
-
-### 3.3 Securely Store your Private Key
-To sign transactions, the CLI needs access to your account's private key. Export the **Ethereum private key** from MetaMask.
-
-We use the cross-platform `keyring` library bundled with DGML to store the key in your operating system's native secure credential manager (macOS Keychain, Windows Credential Manager, or GNOME Keyring). This ensures your key never leaks into terminal logs or history:
-
-```bash
-keyring set nvnm-wallet default
-# When prompted, paste your MetaMask private key and hit Enter (characters will not echo)
-```
-
-Confirm that the CLI can securely resolve your address and check your balance:
-```bash
-uv run dgml wallet status --chain nvnm-testnet
-```
-This should print your wallet address and show a balance of `10` ($) with `"funded": true`.
-
-### 3.4 Create an On-Chain Registry
-Staked documents reside in registries on the chain. Let's create a unique registry. Replace `my-unique-registry` with a unique name of your choice (it must be globally unique):
-
-```bash
-uv run dgml registry create --chain nvnm-testnet \
-  --name "my-unique-registry-12345" \
-  --description "Registry for REIT and Infrastructure document anchors"
-```
-
-### 3.5 Stake the Document
-Now let's anchor one of our processed files. Pick a DocSet ID (`ds`) and a File ID (`fid`) from your workspace:
-
-```bash
-uv run dgml stake file "<file_id>" --docset "<docset_id>" \
-  --chain nvnm-testnet --registry "my-unique-registry-12345"
-```
-
-This command:
-1. Formulates the Merkle Tree of the entire document bundle (PDF, images, schema, and XML).
-2. Broadcasts a transaction pinning the Merkle Root Hash under the URI schema `dgmlx://<file_id>/<docset_id>`.
-3. Waits for the blockchain transaction to commit.
-4. Saves a `record.json` file in the document's workspace directory containing the block receipt, on-chain checksum, and the Merkle structure.
-
-### 3.6 Stake a Single Node (Optional)
-You can also anchor just **one specific XML element** (e.g., a critical lease rate or termination clause). Identify the element path (using `--xpath`) and stake it:
-
-```bash
-uv run dgml stake node "<file_id>" --docset "<docset_id>" \
-  --xpath '/dg:chunk/docset:Entry[2]/docset:Amount' \
-  --chain nvnm-testnet --registry "my-unique-registry-12345"
-```
-The metadata will preserve the document's overall Merkle Root alongside a compact inclusion proof, saving the receipt as `record-node-<leaf_index>.json`.
+Staking saves a `record.json` receipt (or `record-node-<leaf>.json` for a single element) in the bundle directory — keep it, Phase 4 uses it.
 
 ---
 
@@ -342,7 +365,7 @@ If you do not have the local `record.json` file, you can fetch the anchored stat
 
 ```bash
 uv run dgml prove file --chain nvnm-testnet \
-  --registry "my-unique-registry-12345" --checksum <checksum_from_staking_phase>
+  --registry "<your-registry-name>" --checksum <checksum_from_staking_phase>
 ```
 
 ### 4.3 Witness Tamper-Proofing in Action
@@ -354,7 +377,7 @@ Change a single letter inside any tag or text node, then save the file and re-ru
 uv run dgml prove file --chain nvnm-testnet --record-json record.json
 ```
 
-The CLI will detect the tamper instantly, outputting `"valid": false` and exiting with code `2`!
+The CLI will detect the tamper instantly, outputting `"valid": false` and exiting with code `2`.
 
 ---
 
@@ -362,7 +385,7 @@ The CLI will detect the tamper instantly, outputting `"valid": false` and exitin
 
 Congratulations! You have completed the comprehensive getting started walkthrough for DGML. You have:
 1. Initialized a workspace and mastered **files** and **docsets**.
-2. Automated classification with **multimodal ML clustering** on a larger sample set.
+2. Automated classification with **ML clustering** on a larger sample set.
 3. Created secure on-chain **registries** using MetaMask, `keyring`, and NVNM Testnet.
 4. Cryptographically staked and validated documents using **SHA-256 Merkle proofs**.
 

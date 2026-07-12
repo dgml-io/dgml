@@ -16,13 +16,13 @@ Usage::
 
     export AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=...
     export AZURE_DOCUMENT_INTELLIGENCE_KEY=...
-    uv run python scripts/compare_render_formats.py \\
+    uv run python scripts/compare-render-formats.py \\
         examples/course-descriptions/documents/.../*.pdf \\
         --out /tmp/comparison_report.md
 
 Skip OCR for a quick local sanity check on the wiring::
 
-    uv run python scripts/compare_render_formats.py path/to.pdf --skip-ocr
+    uv run python scripts/compare-render-formats.py path/to.pdf --skip-ocr
 """
 
 from __future__ import annotations
