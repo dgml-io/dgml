@@ -35,9 +35,10 @@ _CONCEPT_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
 
 # Structural/discourse words carry no semantics — the block's `structure`
 # field already says what shape the content has. A concept ending in one of
-# these is the suffix-conflation the format analysis measured at ~70% of all
-# tag variation; stripping is deterministic and replay-safe. A concept that
-# is ONLY structural words normalizes to '' (i.e. unlabeled).
+# these is a common source of spurious tag variation — the same role labeled
+# with and without a structural suffix; stripping is deterministic and
+# replay-safe. A concept that is ONLY structural words normalizes to ''
+# (i.e. unlabeled).
 _STRUCTURAL_SUFFIX_RE = re.compile(
     r"(Sections?|Subsections?|SubSections?|Clauses?|Paragraphs?|Items?|Lists?|"
     r"Headings?|Titles?|Texts?|Blocks?|Contents?|Body|Lines?|Rows?|Entry|"
