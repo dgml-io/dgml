@@ -31,7 +31,7 @@ from typing import Any
 
 from dgml_core import llm
 from dgml_core.generation import document
-from dgml_core.generation.blocks import Block, parse_block
+from dgml_core.generation.blocks import Block, Span, parse_block
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.pages import pdf_page_count
 
@@ -80,6 +80,31 @@ def cache_write(
 def blocks_to_json(blocks: list[Block]) -> str:
     """Serialize blocks (with labels/entities) for snapshot files."""
     return json.dumps([dataclasses.asdict(b) for b in blocks], indent=2, ensure_ascii=False)
+
+
+def _load_cached_blocks(cache_dir: Path | str | None, doc_name: str) -> list[Block] | None:
+    """Reload a document's transcription from ``<stem>_blocks.json`` if present.
+
+    The blocks cache is written right after transcription (pre-labeling), so
+    reloading it replays Pass A exactly: a re-run whose outputs were removed
+    (or that crashed after transcription) re-labels and re-renders without
+    paying for transcription again. Delete the file to force a fresh Pass A.
+    ``None`` (no/unreadable cache) means transcribe normally.
+    """
+    if cache_dir is None:
+        return None
+    stem = _UNSAFE_FNAME_RE.sub("_", f"{Path(doc_name).stem}_blocks.json")
+    blocks_file = Path(cache_dir) / stem
+    if not blocks_file.exists():
+        return None
+    try:
+        raw_blocks = json.loads(blocks_file.read_text(encoding="utf-8"))
+        return [
+            Block(**{**b, "entities": [Span(**sp) for sp in b.get("entities", [])]})
+            for b in raw_blocks
+        ]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None  # unreadable cache — fall through to a fresh transcription
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
@@ -224,7 +249,15 @@ def transcribe_document(
     *debug* additionally set, each window's RAW model return is written as
     ``<stem>_wNN_raw.json`` (pre-parse, so truncation/JSON damage is
     inspectable).
+
+    A cached ``<stem>_blocks.json`` short-circuits the whole pass: the blocks
+    are reloaded verbatim and no LLM call is made — so a re-run only pays for
+    labeling and rendering. Delete the cache file to force re-transcription.
     """
+    cached = _load_cached_blocks(cache_dir, doc_name)
+    if cached is not None:
+        log(f"{doc_name}: reusing cached transcription ({len(cached)} block(s))")
+        return cached
     total = _count_pages(pdf_bytes)
     windows = document.iter_windows(total, window_size, overlap=0)
     log(f"{doc_name}: {total} pages → {len(windows)} window(s)")

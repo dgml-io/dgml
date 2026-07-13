@@ -82,7 +82,15 @@ class Schema:
 
     @classmethod
     def load(cls, path: Path | str) -> Schema:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Schema:
+        """Build a Schema from a v1-format dict (the ``schema.json`` shape).
+
+        Also used for the dict reconstructed from ``full-schema.rnc`` by
+        ``rnc.rnc_to_schema_dict``.
+        """
         schema = cls(notes=data.get("notes", ""))
         # Strict by design: an unknown key (stale field, typo) raises instead of
         # being silently dropped — a caller must never think a field was set

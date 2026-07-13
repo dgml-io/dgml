@@ -24,7 +24,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
 from dgml_core.classification import (
     ClassificationConfig,
@@ -39,6 +39,9 @@ from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
 from dgml_core.models import DocSet
 from dgml_core.storage import Workspace, read_json
 from dgml_core.text_extraction import TextMode
+
+if TYPE_CHECKING:
+    from dgml_core.generation.schema import Schema
 
 
 def _emit(payload: dict[str, Any], fmt: str, stream: IO[str] | None = None) -> None:
@@ -1769,17 +1772,19 @@ def _load_schema_roster(path: Path) -> dict[str, str]:
     return roster
 
 
-def _load_schema_seed(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+def _load_schema_seed(path: Path) -> tuple[Schema, dict[str, str]]:
     """Load an exported schema — ``schema.json`` or ``full-schema.rnc`` — into
-    ``(roster, parent_map)``.
+    ``(schema, parent_map)``.
 
     ``--schema-path`` accepts the two formats ``docset generate`` emits at the
     docset root: ``schema.json`` (Schema v1: a ``tags`` map of ``name ->
     {role, kind, parent_role, ...}``) or its lossless RELAX NG Compact render
     ``full-schema.rnc`` (a ``.rnc`` suffix; the ``# Field: value`` comment contract
-    carries the same fields). Each tag's ``role`` seeds the labeling
-    vocabulary; its ``parent_role`` becomes the leaf → container
-    ``parent_map`` that drives entity-container grouping in ``render_dgml``.
+    carries the same fields). The full schema seeds the labeling vocabulary —
+    role descriptions, curated examples, kind, hierarchy (via
+    ``ConvertOptions.schema_seed``); each tag's ``parent_role`` also becomes
+    the leaf → container ``parent_map`` that drives entity-container grouping
+    in ``render_dgml``.
 
     Raises ``InvalidArgument`` on a missing / malformed file, or one with no
     tags (e.g. a flat ``{concept: description}`` mapping — that shape is not
@@ -1787,43 +1792,32 @@ def _load_schema_seed(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     """
     from dgml_core.errors import InvalidArgument
     from dgml_core.generation.blocks import sanitize_concept
+    from dgml_core.generation.schema import Schema
 
-    pairs: list[tuple[str, str, str]]  # (name, role, parent_role)
     try:
         if Path(path).suffix.lower() == ".rnc":
             from dgml_core.generation.rnc import rnc_to_schema_dict
 
-            data = rnc_to_schema_dict(Path(path).read_text(encoding="utf-8"))
-            pairs = [
-                (str(t.get("name", "")), str(t.get("role", "")), str(t.get("parent_role", "")))
-                for t in data["tags"].values()
-            ]
+            schema = Schema.from_dict(rnc_to_schema_dict(Path(path).read_text(encoding="utf-8")))
         else:
-            from dgml_core.generation.schema import Schema
-
             schema = Schema.load(path)
-            pairs = [(tag.name, tag.role, tag.parent_role) for tag in schema.tags.values()]
     except FileNotFoundError as exc:
         raise InvalidArgument(f"--schema-path file not found: {path}") from exc
     except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
         raise InvalidArgument(f"--schema-path is not a valid schema ({path}): {exc}") from exc
 
-    roster: dict[str, str] = {}
     parent_map: dict[str, str] = {}
-    for name, role, parent_role in pairs:
-        concept = sanitize_concept(name)
-        if not concept:
-            continue
-        roster[concept] = (role or "")[:60]
-        parent = sanitize_concept(parent_role or "")
-        if parent:
+    for tag in schema.tags.values():
+        concept = sanitize_concept(tag.name)
+        parent = sanitize_concept(tag.parent_role or "")
+        if concept and parent:
             parent_map[concept] = parent
-    if not roster:
+    if not schema.tags:
         raise InvalidArgument(
             f"--schema-path has no tags — expected an exported schema.json or full-schema.rnc "
             f"(a flat {{concept: description}} mapping is not accepted) ({path})"
         )
-    return roster, parent_map
+    return schema, parent_map
 
 
 def _file_result(status: str, file_id: str, source: str, **extra: Any) -> dict[str, Any]:
@@ -2172,21 +2166,36 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         # (threaded via ConvertOptions.debug below).
         cache_dir = args.cache_dir or output_dir / "cache"
         roster_path = Path(cache_dir) / "concept_roster.json"
+        schema_seed = None
+        roster_seed: dict[str, str] | None = None
         parent_map_seed: dict[str, str] = {}
         if args.schema_path:
-            roster_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
+            schema_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
             _diag(
-                f"Loaded schema: {len(roster_seed)} concept(s), "
+                f"Loaded schema: {len(schema_seed.tags)} concept(s), "
                 f"{len(parent_map_seed)} container link(s) from {args.schema_path}"
             )
-        elif not args.no_roster and roster_path.exists():
-            try:
-                roster_seed = _load_schema_roster(roster_path)
-                _diag(f"Reusing docset roster: {len(roster_seed)} concept(s)")
-            except InvalidArgument:
-                roster_seed = None
-        else:
-            roster_seed = None
+        elif not args.no_roster:
+            # Incremental reuse prefers the docset's own schema.json — full
+            # fidelity (role descriptions, observed examples, kind, hierarchy)
+            # — over the flat cache/concept_roster.json fallback. Unlike
+            # --schema-path, no parent_map is derived here: entity-container
+            # grouping stays an explicit opt-in.
+            from dgml_core.generation.schema import Schema
+
+            schema_json_path = Path(cache_dir).parent / "schema.json"
+            if schema_json_path.exists():
+                try:
+                    schema_seed = Schema.load(schema_json_path)
+                    _diag(f"Reusing docset schema: {len(schema_seed.tags)} tag(s)")
+                except (json.JSONDecodeError, TypeError, ValueError, OSError):
+                    schema_seed = None
+            if schema_seed is None and roster_path.exists():
+                try:
+                    roster_seed = _load_schema_roster(roster_path)
+                    _diag(f"Reusing docset roster: {len(roster_seed)} concept(s)")
+                except InvalidArgument:
+                    roster_seed = None
 
         # Reload already-generated docs from cache so the whole docset stays
         # consistent as its schema/roster grows; changed originals re-render
@@ -2212,6 +2221,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             dgml_header=build_header(ws.organization, ds.name),
             converters=load_conversion_config(ws),
             roster_seed=roster_seed,
+            schema_seed=schema_seed,
             parent_map=parent_map_seed or None,
             progress=_diag,
         )

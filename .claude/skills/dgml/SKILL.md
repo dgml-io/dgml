@@ -249,9 +249,11 @@ semantic-labeling call assigns concept tags across all of the docset's
 documents at once (`generation.label_model`), and the result is rendered
 deterministically into namespaced `dg:chunk` XML. The labeling vocabulary
 (the "roster") is planned automatically from the documents, or pinned up
-front with `--schema-path` (see below). There is no separate transform
-pass. The pipeline is part of the base `dgml` install and reuses the
-workspace's pre-rendered `page_images/`.
+front with `--schema-path` (see below). Unseeded runs are staged: the largest
+documents label first (a pilot) and their observed evidence — verbatim
+examples, kinds, hierarchy — confirms the vocabulary the rest of the batch
+labels against. There is no separate transform pass. The pipeline is part of
+the base `dgml` install and reuses the workspace's pre-rendered `page_images/`.
 
 **Choose the models — config only, no flags.** The models are not CLI flags:
 `generate` reads them solely from the `generation` section of
@@ -312,11 +314,12 @@ prior run exported — `schema.json` (Schema v1: a `tags` map of concept name �
 `{role, kind, parent_role, …}`) or its RELAX NG Compact render `full-schema.rnc`
 (both land at the docset root; the `.rnc` is the human-friendly editing
 surface and reverses losslessly). The planning pass is skipped and that
-vocabulary is used as-is — its tag hierarchy (`parent_role`) also seeds
-entity-container grouping — and per-document labeling still extends it for
-roles it doesn't cover. Only these exported formats are accepted (not a flat
-`{concept: description}` mapping). The natural loop is "generate once,
-review/curate the schema, then reuse it":
+vocabulary is used as-is with full fidelity — role descriptions, curated
+examples, and kind all feed the labeling prompt, and the tag hierarchy
+(`parent_role`) also seeds entity-container grouping — and per-document
+labeling still extends it for roles it doesn't cover. Only these exported
+formats are accepted (not a flat `{concept: description}` mapping). The
+natural loop is "generate once, review/curate the schema, then reuse it":
 
 ```bash
 # 1) first run plans the vocabulary and exports it to docsets/<id>/schema.json
@@ -379,9 +382,10 @@ generate builds its tree and carries the existing `dg:extraction` over
 
 **Growing a docset (add docs later, stay consistent).** Because existing files
 are skipped, adding a document and re-running generates only the new one — and
-by default it's labeled seeded with the docset's existing
-`cache/concept_roster.json`, so its tags stay consistent with the rest (no
-`--schema-path` needed). Every concept is emitted in the `docset:` vocabulary
+by default it's labeled seeded with the docset's own `schema.json` (full
+fidelity: descriptions, observed examples, kind, hierarchy; falls back to the
+flat `cache/concept_roster.json`), so its tags stay consistent with the rest
+(no `--schema-path` needed). Every concept is emitted in the `docset:` vocabulary
 namespace (`dg:` is framework-only), so growing the docset never flips a tag's
 prefix; an already-generated file is still re-rendered deterministically when
 its output otherwise changes as the docset's schema/roster grows (reported under
@@ -390,7 +394,7 @@ new docs in isolation instead.
 
 ```bash
 uv run dgml docset add-file "$ds" "$new_fid"
-uv run dgml docset generate "$ds"   # only the new file; reuses the docset roster
+uv run dgml docset generate "$ds"   # only the new file; reuses the docset schema
 ```
 
 **Output.** Like every other `dgml` command, `docset generate` emits a

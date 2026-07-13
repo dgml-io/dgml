@@ -1359,8 +1359,8 @@ def test_docset_generate_models_from_config(
 def test_docset_generate_schema_path_seeds_roster(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """--schema-path loads a schema.json (Schema v1 `tags` map) and threads its
-    roles to ConvertOptions.roster_seed and its parent_role hierarchy to
+    """--schema-path loads a schema.json (Schema v1 `tags` map) and threads the
+    full schema to ConvertOptions.schema_seed and its parent_role hierarchy to
     ConvertOptions.parent_map."""
     ws = tmp_path / "ws"
     did = _init_with_docset(ws, capsys)
@@ -1399,10 +1399,11 @@ def test_docset_generate_schema_path_seeds_roster(
         )
     assert rc == 0
     _, kwargs = mock_batch.call_args
-    assert kwargs["options"].roster_seed == {
-        "PaymentTerms": "the payment clause",
-        "DueDate": "when payment is due",
-    }
+    seed = kwargs["options"].schema_seed
+    assert seed is not None and set(seed.tags) == {"PaymentTerms", "DueDate"}
+    assert seed.tags["PaymentTerms"].role == "the payment clause"
+    assert seed.tags["DueDate"].parent_role == "PaymentTerms"
+    assert kwargs["options"].roster_seed is None  # full-fidelity seed, no flat roster
     assert kwargs["options"].parent_map == {"DueDate": "PaymentTerms"}
 
 
@@ -1476,6 +1477,58 @@ def test_docset_generate_reuses_docset_roster_by_default(
     with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
         main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage", "--no-roster"])
     assert mock_batch.call_args.kwargs["options"].roster_seed is None
+
+
+def test_docset_generate_reuse_prefers_schema_json(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When the docset has BOTH schema.json and cache/concept_roster.json, an
+    incremental generate seeds from schema.json (full fidelity: examples, kind,
+    hierarchy) and leaves the flat roster unused. Entity-container grouping
+    stays a --schema-path opt-in: no parent_map is derived from the reuse."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    docset_dir = ws / "docsets" / did
+    cache = docset_dir / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "concept_roster.json").write_text(
+        json.dumps({"ClientName": "the client"}), encoding="utf-8"
+    )
+    (docset_dir / "schema.json").write_text(
+        json.dumps(
+            {
+                "tags": {
+                    "ClientName": {
+                        "name": "ClientName",
+                        "role": "the client",
+                        "kind": "inline",
+                        "examples": ["Acme Pty Ltd"],
+                        "parent_role": "PartyInformation",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"])
+    options = mock_batch.call_args.kwargs["options"]
+    seed = options.schema_seed
+    assert seed is not None and seed.tags["ClientName"].examples == ["Acme Pty Ltd"]
+    assert options.roster_seed is None
+    assert options.parent_map is None  # grouping stays --schema-path opt-in
 
 
 @needs_gs
@@ -2940,9 +2993,10 @@ def test_load_schema_seed_json_builds_roster_and_parent_map(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    roster, parent_map = _load_schema_seed(p)
-    assert {"PartyInformation", "PartyAddress", "OrderDate"} <= set(roster)
-    assert roster["PartyAddress"] == "address"
+    schema, parent_map = _load_schema_seed(p)
+    assert {"PartyInformation", "PartyAddress", "OrderDate"} <= set(schema.tags)
+    assert schema.tags["PartyAddress"].role == "address"
+    assert schema.tags["PartyInformation"].kind == "section"  # fidelity kept, not flattened
     assert parent_map["PartyAddress"] == "PartyInformation"  # via parent_role
     assert "OrderDate" not in parent_map  # top-level, no container
 
@@ -2966,8 +3020,11 @@ def test_load_schema_seed_accepts_rnc(tmp_path: Path) -> None:
         "PartyAddress = element PartyAddress {\n  common.atts,\n  text\n}\n",
         encoding="utf-8",
     )
-    roster, parent_map = _load_schema_seed(p)
-    assert roster == {"PartyInformation": "party block", "PartyAddress": "address"}
+    schema, parent_map = _load_schema_seed(p)
+    assert {tag.name: tag.role for tag in schema.tags.values()} == {
+        "PartyInformation": "party block",
+        "PartyAddress": "address",
+    }
     assert parent_map == {"PartyAddress": "PartyInformation"}
 
 

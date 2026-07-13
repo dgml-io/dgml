@@ -173,6 +173,8 @@
   {"concepts": {"<concept>": "<one-line role description>", ...}}
 "roster_intro": |-
   CONCEPTS ALREADY IN USE in this document set — reuse these names verbatim where the role matches:
+"roster_planned_intro": |-
+  PLANNED CONCEPTS for this document set — proposed from the documents' shared structure, not yet observed; reuse one when its role matches rather than coining a new name:
 "section_retry": |-
   These section headings were left unlabeled. Give each a concept naming its section's role:
 "describe_concepts": |

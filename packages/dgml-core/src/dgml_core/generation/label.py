@@ -36,13 +36,14 @@ import json
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from dgml_core import llm
 from dgml_core.generation.blocks import Block, Node, Span, build_tree, sanitize_concept
 from dgml_core.generation.prompts import get as prompt
-from dgml_core.generation.schema import Schema, SchemaTag
+from dgml_core.generation.schema import VALID_KINDS, Schema, SchemaTag
 from dgml_core.generation.transcribe import cache_write, loads_tolerant, strip_fences
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
@@ -68,6 +69,36 @@ _VALUE_SCAN_RE = re.compile(
     r"|\d{1,3}(?:,\d{3})*(?:\.\d+)?\s?[$€£¥₹]"
     r"|\d+(?:\.\d+)?\s?%"
 )
+
+
+@dataclass
+class RosterEntry:
+    """One concept in the labeling vocabulary (the roster).
+
+    ``description`` is the planned/seeded role description; ``examples`` are
+    observed VERBATIM values (never invented — filled from labeled blocks or a
+    seed schema's curated examples). ``kind``/``parent`` mirror the schema.json
+    fields when known, so seeding and re-deriving the schema is lossless.
+    ``confirmed`` marks entries with evidence — a seed (authoritative by
+    construction) or an observation in this run — and drives the two-tier
+    prompt rendering. ``frozen`` pins schema-seeded entries: observations never
+    mutate them, so a seeded run's rendered roster stays byte-stable (which is
+    what lets the roster prompt block cache across calls).
+    """
+
+    description: str = ""
+    examples: list[str] = field(default_factory=list)
+    kind: str = ""  # "", or one of schema.VALID_KINDS
+    parent: str = ""
+    confirmed: bool = False
+    frozen: bool = False
+
+
+# Observed example values kept per roster entry / shown per rendered line.
+_ROSTER_EXAMPLE_CHARS = 60
+_ROSTER_RENDER_EXAMPLES = 2
+# Kind marker shown on confirmed roster lines ("inline" reads better as value).
+_KIND_LABELS = {"section": "section", "row": "row", "inline": "value"}
 
 
 def _needs_label(block: Block) -> bool:
@@ -99,13 +130,67 @@ def render_block_listing(doc_name: str, blocks: list[Block]) -> str:
     return "\n".join(lines)
 
 
-def render_roster(roster: Mapping[str, str]) -> str:
-    """The accumulated concept roster, shown to every subsequent call."""
-    lines = [prompt("roster_intro")]
-    for concept, example in list(roster.items())[:_ROSTER_MAX_ENTRIES]:
-        hint = str(example)[:60]
-        lines.append(f"- {concept}" + (f' (e.g. "{hint}")' if hint else ""))
+def _roster_line(concept: str, entry: RosterEntry, *, confirmed: bool) -> str:
+    """One rendered roster line: name, kind marker, role, observed examples."""
+    line = f"- {concept}"
+    if confirmed and entry.kind in _KIND_LABELS:
+        line += f" [{_KIND_LABELS[entry.kind]}]"
+    if entry.description:
+        line += f" — {entry.description[:100]}"
+    if confirmed and entry.examples:
+        shown = "; ".join(f'"{ex}"' for ex in entry.examples[:_ROSTER_RENDER_EXAMPLES])
+        line += f" (seen: {shown})"
+    return line
+
+
+def render_roster(roster: Mapping[str, RosterEntry]) -> str:
+    """The concept roster, shown to every labeling call — two tiers.
+
+    CONFIRMED concepts (seeded, or observed in this run) render rich — kind
+    marker, role description, observed example values — under the strong
+    reuse-verbatim intro. PLANNED concepts (proposed by the roster planner but
+    not yet observed) render as name + description only, under a softer intro.
+    The split gives the labeler an honest confidence signal instead of one
+    uniform list; descriptions and examples are never conflated (the old
+    single-string roster rendered planned descriptions inside an "e.g." hint).
+    Confirmed entries fill the size cap first.
+    """
+    confirmed = [(n, e) for n, e in roster.items() if e.confirmed]
+    planned = [(n, e) for n, e in roster.items() if not e.confirmed]
+    lines: list[str] = []
+    budget = _ROSTER_MAX_ENTRIES
+    if confirmed:
+        lines.append(prompt("roster_intro"))
+        lines.extend(_roster_line(n, e, confirmed=True) for n, e in confirmed[:budget])
+        budget -= len(confirmed[:budget])
+    if planned and budget > 0:
+        if lines:
+            lines.append("")
+        lines.append(prompt("roster_planned_intro"))
+        lines.extend(_roster_line(n, e, confirmed=False) for n, e in planned[:budget])
     return "\n".join(lines)
+
+
+def _roster_content_blocks(
+    roster: Mapping[str, RosterEntry], *, model: str
+) -> list[dict[str, Any]]:
+    """The rendered roster as a user-content block, marked cacheable.
+
+    Rendered once per document and reused by every call for that document
+    (chunks and the section retry), the block is byte-identical across calls
+    while the roster is unchanged — so on Anthropic models a ``cache_control``
+    marker lets the provider replay it instead of re-reading it. Seeded runs
+    (frozen entries) hit for the whole batch; unseeded runs hit whenever no new
+    concept/example landed between calls. Non-Anthropic providers cache stable
+    prefixes implicitly, so the marker is omitted (litellm would reject it).
+    """
+    text = render_roster(roster)
+    if not text:
+        return []
+    block: dict[str, Any] = {"type": "text", "text": text}
+    if llm.is_anthropic_model(model):
+        block["cache_control"] = {"type": "ephemeral"}
+    return [block]
 
 
 def _parse_labels_json(raw: str) -> dict[str, Any]:
@@ -610,6 +695,11 @@ _PLAN_MAX_LINES_PER_DOC = 400
 # seeds it; every document is still fully labeled in Pass B (which extends the
 # roster). This bounds the planning prompt for large docsets.
 _PLAN_MAX_DOCS = 20
+# Unseeded runs label this many documents (the largest, same sort as planning)
+# as a PILOT first; their observed evidence promotes the planned roster to
+# confirmed before the rest of the batch labels against it. Seeded runs skip
+# staging — the seed is already confirmed.
+_PILOT_MAX_DOCS = 5
 
 
 def render_skeleton_listing(docs: Mapping[str, list[Block]]) -> str:
@@ -760,15 +850,54 @@ def _chunks(blocks: list[Block]) -> list[list[Block]]:
     ]
 
 
-def _update_roster(roster: dict[str, str], blocks: list[Block]) -> None:
+def _observe(roster: dict[str, RosterEntry], concept: str, kind: str, example: str) -> None:
+    """Record one observed use of *concept*: example, kind, confirmation.
+
+    Planned entries keep their description AND gain observed verbatim examples;
+    coined concepts enter with an example and no description (described later by
+    ``describe_concepts``). Frozen (schema-seeded) entries are never mutated —
+    the seed is authoritative and its rendered text stays cache-stable.
+    """
+    if not concept:
+        return
+    entry = roster.setdefault(concept, RosterEntry())
+    if entry.frozen:
+        return
+    entry.confirmed = True
+    if kind and not entry.kind:
+        entry.kind = kind
+    ex = example.strip()[:_ROSTER_EXAMPLE_CHARS]
+    if ex and ex not in entry.examples and len(entry.examples) < _SCHEMA_MAX_EXAMPLES:
+        entry.examples.append(ex)
+
+
+def _update_roster(roster: dict[str, RosterEntry], blocks: list[Block]) -> None:
+    """Enrich the roster from labeled blocks (kind mapping mirrors derive_schema)."""
     for b in blocks:
-        if b.concept and b.concept not in roster:
-            roster[b.concept] = b.flat_text()[:60]
-        if b.value_concept and b.value_concept not in roster:
-            roster[b.value_concept] = b.text[:60]
+        if b.concept:
+            if b.structure == "row":
+                _observe(roster, b.concept, "row", "")
+            elif b.structure == "field":
+                _observe(roster, b.concept, "inline", b.value)
+            else:
+                _observe(roster, b.concept, "section", b.flat_text())
+        if b.value_concept:
+            _observe(roster, b.value_concept, "inline", b.text)
+        if b.group_concept:
+            _observe(roster, b.group_concept, "section", "")
+        if b.lim_concept:
+            _observe(roster, b.lim_concept, "inline", b.lim)
         for span in b.entities:
-            if span.concept and span.concept not in roster:
-                roster[span.concept] = b.text[span.start : span.end][:60]
+            _observe(roster, span.concept, "inline", b.text[span.start : span.end])
+        for span in b.label_entities:
+            _observe(roster, span.concept, "inline", b.label[span.start : span.end])
+        for i, cell_concept in enumerate(b.cell_concepts):
+            if cell_concept:
+                _observe(roster, cell_concept, "inline", b.cells[i] if i < len(b.cells) else "")
+        for i, spans in enumerate(b.cell_entities):
+            cell = b.cells[i] if i < len(b.cells) else ""
+            for span in spans:
+                _observe(roster, span.concept, "inline", cell[span.start : span.end])
 
 
 def describe_concepts(
@@ -831,7 +960,7 @@ def _humanize_concept(name: str) -> str:
 
 def derive_schema(
     docs: Mapping[str, list[Block]],
-    roster: Mapping[str, str],
+    roster: Mapping[str, RosterEntry],
     descriptions: Mapping[str, str],
 ) -> Schema:
     """Build a v1-format ``Schema`` from the already-labeled blocks.
@@ -845,6 +974,11 @@ def derive_schema(
     - ``kind``         — section (containers/clauses), row (table rows), or
                          inline (atomic values: entities, value-headings, cells);
     - ``parent_role``  — the nearest enclosing concept in the labeled tree.
+
+    Observation wins; a roster entry's seeded ``kind``/``examples``/``parent``
+    fill the gaps for concepts NOT observed in *docs* (e.g. an incremental run
+    whose new documents never use an old tag), so re-deriving the schema never
+    degrades fields a previous run established.
     """
     examples: dict[str, list[str]] = {}
     kinds: dict[str, str] = {}
@@ -908,18 +1042,172 @@ def derive_schema(
 
     schema = Schema()
     for name in sorted(set(roster) | set(kinds)):
-        exs = examples.get(name, [])
+        entry = roster.get(name)
+        exs = examples.get(name) or (list(entry.examples) if entry else [])
+        kind = kinds.get(name) or (entry.kind if entry else "") or "inline"
+        parent = parents.get(name) or (entry.parent if entry else "")
         schema.add(
             SchemaTag(
                 name=name,
                 role=str(descriptions.get(name) or _humanize_concept(name)),
-                kind=kinds.get(name, "inline"),
+                kind=kind,
                 example=exs[0] if exs else "",
                 examples=exs,
-                parent_role=parents.get(name, ""),
+                parent_role=parent,
             )
         )
     return schema
+
+
+def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
+    """Roster entries from an exported schema — full fidelity, frozen.
+
+    Names/parents are normalized through ``sanitize_concept`` so a hand-edited
+    schema meets the labeling vocabulary's naming rules; ``kind`` is kept only
+    when valid. Entries are confirmed (the seed is authoritative) and frozen
+    (observations never mutate them, keeping the rendered roster cache-stable
+    for the whole batch).
+    """
+    roster: dict[str, RosterEntry] = {}
+    for tag in schema.tags.values():
+        name = sanitize_concept(tag.name)
+        if not name:
+            continue
+        roster[name] = RosterEntry(
+            description=str(tag.role or ""),
+            examples=[str(ex).strip()[:_ROSTER_EXAMPLE_CHARS] for ex in tag.all_examples()][
+                :_SCHEMA_MAX_EXAMPLES
+            ],
+            kind=tag.kind if tag.kind in VALID_KINDS else "",
+            parent=sanitize_concept(tag.parent_role or ""),
+            confirmed=True,
+            frozen=True,
+        )
+    return roster
+
+
+def _label_one_document(
+    doc_name: str,
+    blocks: list[Block],
+    roster: dict[str, RosterEntry],
+    *,
+    config: llm.LLMConfig,
+    cache_dir: Path | str | None,
+    debug: bool,
+    log: Callable[[str], None],
+) -> list[str]:
+    """Label one document's blocks against (and into) the shared roster."""
+    warnings: list[str] = []
+    stem = Path(doc_name).stem
+    # One roster snapshot per document: every call for this document reuses the
+    # same rendered block, so it stays byte-stable (and cacheable) across the
+    # document's chunks and its section retry.
+    roster_blocks = _roster_content_blocks(roster, model=config.model)
+    for chunk_idx, chunk in enumerate(_chunks(blocks)):
+        listing = render_block_listing(doc_name, chunk)
+        user_content = [*roster_blocks, {"type": "text", "text": listing}]
+        user_text = "\n\n".join(str(part["text"]) for part in user_content)
+        cache_write(
+            cache_dir, f"label_{stem}_c{chunk_idx + 1:02d}_input.txt", user_text, debug=debug
+        )
+        for attempt in range(2):
+            try:
+                raw = llm.call(
+                    config,
+                    system_prompt=SYSTEM_PROMPT,
+                    user_content=user_content,
+                    cache=True,
+                )
+                # Functional file the next run reloads — written regardless of --debug.
+                cache_write(
+                    cache_dir,
+                    f"label_{stem}_c{chunk_idx + 1:02d}_raw.json",
+                    strip_fences(raw),
+                    debug=True,
+                )
+                payload = _parse_labels_json(raw)
+                warnings.extend(
+                    apply_labels(chunk, payload.get("labels", {}) or {}, doc_name=doc_name)
+                )
+            except Exception as exc:  # labeling must never lose the transcription
+                msg = f"labeling failed for {doc_name} chunk {chunk_idx + 1}: {exc}"
+                log(f"[label] {msg}")
+                if attempt:
+                    warnings.append(msg)
+                continue
+            labeled = sum(1 for b in chunk if b.concept)
+            if attempt or labeled >= len(chunk) * _MIN_LABELED_FRACTION:
+                break
+            log(
+                f"[label] {doc_name} chunk {chunk_idx + 1} under-labeled "
+                f"({labeled}/{len(chunk)}); retrying"
+            )
+        _update_roster(roster, chunk)
+    # Force coverage of untagged sections: an unlabeled heading drops a
+    # whole section's concept — meaningful information left untagged.
+    # Re-label just those blocks (at most one extra call, only when gaps
+    # exist); the model still supplies the concept name.
+    missing = [b for b in blocks if _needs_label(b)]
+    if missing:
+        listing = prompt("section_retry") + "\n\n" + render_block_listing(doc_name, missing)
+        user_content = [*roster_blocks, {"type": "text", "text": listing}]
+        user_text = "\n\n".join(str(part["text"]) for part in user_content)
+        cache_write(cache_dir, f"label_{stem}_section_retry_input.txt", user_text, debug=debug)
+        try:
+            raw = llm.call(
+                config,
+                system_prompt=SYSTEM_PROMPT,
+                user_content=user_content,
+                cache=True,
+            )
+            cache_write(
+                cache_dir,
+                f"label_{stem}_section_retry_raw.json",
+                strip_fences(raw),
+                debug=debug,
+            )
+            warnings.extend(
+                apply_labels(
+                    missing, _parse_labels_json(raw).get("labels", {}) or {}, doc_name=doc_name
+                )
+            )
+            _update_roster(roster, missing)
+        except Exception as exc:
+            warnings.append(f"section retry failed for {doc_name}: {exc}")
+        recovered = sum(1 for b in missing if b.concept)
+        log(f"Pass B: {doc_name}: section retry labeled {recovered}/{len(missing)}")
+    # Enforce the consistency the model can't be trusted to hold: uniform
+    # table columns/rows and uniform short-list-item roles.
+    propagate_table_consistency(blocks)
+    propagate_list_consistency(blocks)
+    wrap_detected_values(blocks)
+    labeled = sum(1 for b in blocks if b.concept)
+    log(f"Pass B: {doc_name}: {labeled}/{len(blocks)} block(s) labeled")
+    return warnings
+
+
+def _promote_pilot(
+    docs: Mapping[str, list[Block]],
+    pilot: list[str],
+    roster: dict[str, RosterEntry],
+    descriptions: Mapping[str, str],
+    log: Callable[[str], None],
+) -> None:
+    """Fold the pilot documents' observations into the roster.
+
+    Kind, examples, and confirmation already accumulated via ``_update_roster``
+    while the pilot labeled; what only the labeled TREE knows is each concept's
+    parent. One pure ``derive_schema`` call (no LLM) recovers it, so schema.json
+    keeps hierarchy even for concepts the later documents never nest — and the
+    remaining documents label against a confirmed vocabulary.
+    """
+    schema = derive_schema({name: docs[name] for name in pilot}, roster, descriptions)
+    for tag in schema.tags.values():
+        entry = roster.get(tag.name)
+        if entry is not None and not entry.frozen and not entry.parent:
+            entry.parent = tag.parent_role
+    confirmed = sum(1 for e in roster.values() if e.confirmed)
+    log(f"Pass B: pilot confirmed {confirmed}/{len(roster)} concept(s)")
 
 
 def label_documents(
@@ -930,7 +1218,8 @@ def label_documents(
     debug: bool = False,
     log: Callable[[str], None] = lambda _m: None,
     roster_refine: bool = True,
-    roster_seed: dict[str, str] | None = None,
+    roster_seed: Mapping[str, str] | None = None,
+    schema_seed: Schema | None = None,
 ) -> list[str]:
     """Label every document, chunked, carrying the roster between calls.
 
@@ -938,10 +1227,19 @@ def label_documents(
     valid, renderable document) and is reported as a warning; later chunks
     proceed with whatever roster exists so far.
 
-    *roster_seed* (from a user-supplied ``--schema-path``) is used as the
-    starting roster INSTEAD of the planning call (Pass B.1). This makes the
-    vocabulary deterministic and authoritative; per-document labeling still
-    extends it for roles the seed does not cover.
+    *schema_seed* (from a user-supplied ``--schema-path`` or the docset's own
+    ``schema.json`` on an incremental run) is used as the starting roster with
+    FULL fidelity — role descriptions, curated examples, kind, hierarchy —
+    INSTEAD of the planning call (Pass B.1). This makes the vocabulary
+    deterministic and authoritative; per-document labeling still extends it for
+    roles the seed does not cover. *roster_seed* is the legacy flat
+    ``{concept: description}`` seed (``cache/concept_roster.json``) — same
+    semantics, no examples/kind/hierarchy; ignored when *schema_seed* is given.
+
+    Unseeded runs are STAGED: after planning, the largest documents label
+    first (a pilot), their observations promote the planned roster to
+    confirmed — real examples, observed kinds, tree-derived parents — and the
+    rest of the batch labels against that confirmed vocabulary.
 
     With *cache_dir* set, each call's RAW return is written as
     ``label_<stem>_cNN_raw.json`` and the final concept roster as
@@ -959,112 +1257,68 @@ def label_documents(
     # otherwise one planning call sees every document's skeleton side by side
     # and names the SHARED roles. Either way the per-document calls below apply
     # it and may extend it for roles it missed, which propagate to later docs.
-    roster: dict[str, str]
-    if roster_seed is not None:
-        roster = dict(roster_seed)
+    roster: dict[str, RosterEntry]
+    if schema_seed is not None:
+        roster = _seed_entries_from_schema(schema_seed)
+        log(f"Pass B.1: seeded roster from schema ({len(roster)} concept(s)); planning skipped")
+    elif roster_seed is not None:
+        # Legacy flat seed: confirmed (it is a prior run's vocabulary) but not
+        # frozen — it carries no examples, so observed ones still enrich it.
+        roster = {
+            name: RosterEntry(description=str(desc), confirmed=True)
+            for name, desc in roster_seed.items()
+        }
         log(f"Pass B.1: seeded roster from schema ({len(roster)} concept(s)); planning skipped")
     else:
-        roster = plan_concept_roster(
+        planned = plan_concept_roster(
             docs, config=config, cache_dir=cache_dir, debug=debug, log=log, refine=roster_refine
         )
+        roster = {name: RosterEntry(description=desc) for name, desc in planned.items()}
     # The planned/seeded descriptions are real role descriptions. Snapshot them
-    # before per-document labeling extends the roster with value snippets, so the
+    # before per-document labeling coins description-less concepts, so the
     # schema `role` comes from descriptions (never a leaked value).
-    descriptions = dict(roster)
-    for doc_name, blocks in docs.items():
-        stem = Path(doc_name).stem
-        for chunk_idx, chunk in enumerate(_chunks(blocks)):
-            sections = []
-            if roster:
-                sections.append(render_roster(roster))
-            sections.append(render_block_listing(doc_name, chunk))
-            user_text = "\n\n".join(sections)
-            cache_write(
-                cache_dir, f"label_{stem}_c{chunk_idx + 1:02d}_input.txt", user_text, debug=debug
+    descriptions = {name: entry.description for name, entry in roster.items() if entry.description}
+
+    # Pilot staging (unseeded runs only): the LARGEST documents (same sort as
+    # planning) label first, then _promote_pilot folds their observations into
+    # the roster so the remainder labels against confirmed concepts. Seeded
+    # runs skip staging — every seed entry is already confirmed.
+    order = list(docs)
+    pilot: list[str] = []
+    if schema_seed is None and roster_seed is None and len(docs) > _PILOT_MAX_DOCS:
+        largest = sorted(docs.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:_PILOT_MAX_DOCS]
+        chosen = {name for name, _ in largest}
+        pilot = [name for name in docs if name in chosen]
+        order = pilot + [name for name in docs if name not in chosen]
+        log(f"Pass B: pilot stage — labeling the {len(pilot)} largest doc(s) first")
+
+    for idx, doc_name in enumerate(order):
+        warnings.extend(
+            _label_one_document(
+                doc_name,
+                docs[doc_name],
+                roster,
+                config=config,
+                cache_dir=cache_dir,
+                debug=debug,
+                log=log,
             )
-            for attempt in range(2):
-                try:
-                    raw = llm.call(
-                        config,
-                        system_prompt=SYSTEM_PROMPT,
-                        user_content=[{"type": "text", "text": user_text}],
-                        cache=True,
-                    )
-                    # Functional file the next run reloads — written regardless of --debug.
-                    cache_write(
-                        cache_dir,
-                        f"label_{stem}_c{chunk_idx + 1:02d}_raw.json",
-                        strip_fences(raw),
-                        debug=True,
-                    )
-                    payload = _parse_labels_json(raw)
-                    warnings.extend(
-                        apply_labels(chunk, payload.get("labels", {}) or {}, doc_name=doc_name)
-                    )
-                except Exception as exc:  # labeling must never lose the transcription
-                    msg = f"labeling failed for {doc_name} chunk {chunk_idx + 1}: {exc}"
-                    log(f"[label] {msg}")
-                    if attempt:
-                        warnings.append(msg)
-                    continue
-                labeled = sum(1 for b in chunk if b.concept)
-                if attempt or labeled >= len(chunk) * _MIN_LABELED_FRACTION:
-                    break
-                log(
-                    f"[label] {doc_name} chunk {chunk_idx + 1} under-labeled "
-                    f"({labeled}/{len(chunk)}); retrying"
-                )
-            _update_roster(roster, chunk)
-        # Force coverage of untagged sections: an unlabeled heading drops a
-        # whole section's concept — meaningful information left untagged.
-        # Re-label just those blocks (at most one extra call, only when gaps
-        # exist); the model still supplies the concept name.
-        missing = [b for b in blocks if _needs_label(b)]
-        if missing:
-            sections = []
-            if roster:
-                sections.append(render_roster(roster))
-            sections.append(
-                prompt("section_retry") + "\n\n" + render_block_listing(doc_name, missing)
-            )
-            user_text = "\n\n".join(sections)
-            cache_write(cache_dir, f"label_{stem}_section_retry_input.txt", user_text, debug=debug)
-            try:
-                raw = llm.call(
-                    config,
-                    system_prompt=SYSTEM_PROMPT,
-                    user_content=[{"type": "text", "text": user_text}],
-                    cache=True,
-                )
-                cache_write(
-                    cache_dir,
-                    f"label_{stem}_section_retry_raw.json",
-                    strip_fences(raw),
-                    debug=debug,
-                )
-                warnings.extend(
-                    apply_labels(
-                        missing, _parse_labels_json(raw).get("labels", {}) or {}, doc_name=doc_name
-                    )
-                )
-                _update_roster(roster, missing)
-            except Exception as exc:
-                warnings.append(f"section retry failed for {doc_name}: {exc}")
-            recovered = sum(1 for b in missing if b.concept)
-            log(f"Pass B: {doc_name}: section retry labeled {recovered}/{len(missing)}")
-        # Enforce the consistency the model can't be trusted to hold: uniform
-        # table columns/rows and uniform short-list-item roles.
-        propagate_table_consistency(blocks)
-        propagate_list_consistency(blocks)
-        wrap_detected_values(blocks)
-        labeled = sum(1 for b in blocks if b.concept)
-        log(f"Pass B: {doc_name}: {labeled}/{len(blocks)} block(s) labeled")
+        )
+        if pilot and idx == len(pilot) - 1:
+            _promote_pilot(docs, pilot, roster, descriptions, log)
+
     log(f"Pass B: roster holds {len(roster)} concept(s)")
     # Functional file the next run reloads — written regardless of --debug.
+    # Kept in the legacy flat {concept: description-or-example} shape (the
+    # full-fidelity vocabulary lives in schema.json).
+    flat = {
+        name: (entry.description or (entry.examples[0] if entry.examples else ""))
+        for name, entry in roster.items()
+    }
     cache_write(
         cache_dir,
         "concept_roster.json",
-        json.dumps(roster, indent=2, ensure_ascii=False),
+        json.dumps(flat, indent=2, ensure_ascii=False),
         debug=True,
     )
     # Final artifact: the docset vocabulary in the schema.json format
@@ -1074,9 +1328,13 @@ def label_documents(
     if cache_dir is not None:
         try:
             # Concepts coined during labeling have no planned description; get a
-            # real one-line role for them (their roster value is an example),
-            # so the schema role is a description, not a humanized name.
-            undescribed = {n: roster[n] for n in roster if n not in descriptions}
+            # real one-line role for them (their roster entry holds observed
+            # examples), so the schema role is a description, not a humanized name.
+            undescribed = {
+                name: (entry.examples[0] if entry.examples else "")
+                for name, entry in roster.items()
+                if not entry.description
+            }
             if undescribed:
                 descriptions.update(
                     describe_concepts(

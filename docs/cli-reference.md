@@ -345,13 +345,18 @@ concept tags across all of the docset's documents at once
 into a namespaced `dg:chunk`
 document. The labeling vocabulary (the "roster") is planned automatically
 from the documents, or supplied up front with `--schema-path` to make labels
-deterministic. There is no separate transform pass.
+deterministic. Unseeded runs are staged: the largest documents label first (a
+pilot), their observed evidence — verbatim example values, kinds, hierarchy —
+confirms the planned vocabulary, and the rest of the batch labels against it.
+There is no separate transform pass.
 
 **Incremental, consistent growth.** Already-generated files are skipped (see
 resume below), so adding a document and re-running generates only the new one.
 To keep its tags consistent with the existing docset, the new document is
-labeled seeded with the docset's existing `cache/concept_roster.json` (default;
-disable with `--no-roster`). Every concept is emitted in the per-docset
+labeled seeded with the docset's own `schema.json` — full fidelity: role
+descriptions, observed examples, kind, hierarchy — falling back to the flat
+`cache/concept_roster.json` when no schema exists (default; disable both with
+`--no-roster`). Every concept is emitted in the per-docset
 `docset:` vocabulary namespace (`dg:` is framework-only), so growing the docset
 never flips a tag's prefix. An already-generated file is still re-rendered
 deterministically when its output changes as the docset's schema/roster grows
@@ -477,14 +482,20 @@ The global `--debug` flag also writes the per-file
 ungrounded snippets); the `dg:origin` boxes themselves are always written
 into `<stem>.dgml.xml` regardless.
 | `--max-parallel-calls <n>` | `4` | Max documents transcribed concurrently (windows *within* a document stay serial). The LLM call is network-bound, so threads overlap the latency. Set to `1` to disable. Tune to your provider's RPM tier — e.g. Gemini free ~10-15 RPM, Gemini paid Flash 500 RPM, OpenAI free 500 RPM, Anthropic tier-1 ~50 RPM. |
-| `--schema-path <f>` | none | Exported schema to seed labeling with — either `docsets/<id>/schema.json` (Schema v1: a `tags` map of `name -> {role, kind, parent_role, …}`) or its lossless RELAX NG Compact render `docsets/<id>/full-schema.rnc` (both written by `docset generate`). When given, this vocabulary is used as-is and the planning pass is **skipped**, making labels deterministic across runs; the tag hierarchy (`parent_role`) also seeds entity-container grouping. Per-document labeling still extends it for roles the schema doesn't cover. A flat `{concept: description}` mapping is **not** accepted. |
-| `--no-roster` | off | Disable automatic roster reuse. By default, when the docset already has a `cache/concept_roster.json` (from a prior run), an incremental generate seeds labeling with it so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. Ignored when `--schema-path` is given. |
+| `--schema-path <f>` | none | Exported schema to seed labeling with — either `docsets/<id>/schema.json` (Schema v1: a `tags` map of `name -> {role, kind, parent_role, …}`) or its lossless RELAX NG Compact render `docsets/<id>/full-schema.rnc` (both written by `docset generate`). When given, this vocabulary is used as-is with **full fidelity** — role descriptions, curated examples, and kind all feed the labeling prompt — and the planning pass is **skipped**, making labels deterministic across runs; the tag hierarchy (`parent_role`) also seeds entity-container grouping. Per-document labeling still extends it for roles the schema doesn't cover. A flat `{concept: description}` mapping is **not** accepted. |
+| `--no-roster` | off | Disable automatic vocabulary reuse. By default an incremental generate seeds labeling from the docset's own `schema.json` (full fidelity: descriptions, observed examples, kind, hierarchy), falling back to the flat `cache/concept_roster.json` from a prior run, so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. Unlike `--schema-path`, automatic reuse does **not** seed entity-container grouping. Ignored when `--schema-path` is given. |
 | `--no-semlinks` | off | Skip the final semantic-link pass. By default each grounded `<stem>.dgml.xml` gets semantic links added in place — relationships the tree's nesting can't capture, written as `dg:itemprop` (predicate) + `dg:href` (`#id`, or space-separated `#id`s) on the subject, with `xml:id`s assigned to both ends. Covers references (`references`, `incorporates`, `signatoryOf`, …), relative dates (`relativeTo`/`effectiveOn`, ISO-8601 offset in `dg:value`), and derived values (`greaterOf`/`lesserOf` formulas, `escalates`, `valueFrom`). The model proposes links on the labeling model (`generation.label_model`), then a skeptical pass verifies them. Each converted file's `results` entry carries a `links` count. |
 
 **Document-level resume.** If a file's per-(docset, file)
 `<stem>.dgml.xml` already holds a generated document tree, that file is
 skipped — a crashed run can be re-invoked with the same arguments and only
-unfinished documents are re-processed. When *every* assigned file is already
+unfinished documents are re-processed. Within a re-processed document,
+transcription itself also resumes: a cached `cache/<stem>_blocks.json`
+(written right after Pass A) is reloaded verbatim instead of re-transcribing,
+so re-running a document whose output was removed — or relabeling a docset
+after deleting its `.dgml.xml` outputs and label caches — pays only for
+labeling and rendering. Delete the `_blocks.json` file to force a fresh
+transcription. When *every* assigned file is already
 converted the command exits 0 with the same envelope
 (`summary.converted == 0`, each file a `skipped` entry in `results`) and no
 LLM call is made. An **extraction-only** file (a `dg:extraction` with no

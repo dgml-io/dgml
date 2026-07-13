@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 from dgml_core import llm
@@ -332,9 +333,19 @@ def test_label_documents_plans_then_labels_with_roster(
     # call_with_refinement); then one labeling call per document carries it.
     assert len(calls) == 2
     assert "== a.pdf ==" in plan["listing"] and "== b.pdf ==" in plan["listing"]
-    for _system, text in calls:
-        assert "CONCEPTS ALREADY IN USE" in text
-        assert "- PaymentTerms" in text
+    first, second = (text for _system, text in calls)
+    # Doc 1 labels against the PLANNED tier — the roster is proposed, not yet
+    # observed, and the description is never dressed up as an example.
+    assert "PLANNED CONCEPTS" in first
+    assert "- PaymentTerms — payment obligations section" in first
+    assert "CONCEPTS ALREADY IN USE" not in first
+    # Doc 2 sees PaymentTerms CONFIRMED — observed in doc 1, with its kind and
+    # a verbatim observed example alongside the planned description.
+    assert "CONCEPTS ALREADY IN USE" in second
+    assert (
+        "- PaymentTerms [section] — payment obligations section "
+        '(seen: "Invoices are payable within 30 days of receipt.")'
+    ) in second
     assert docs["a.pdf"][1].concept == docs["b.pdf"][1].concept == "PaymentTerms"
 
 
@@ -362,6 +373,145 @@ def test_label_documents_roster_seed_skips_planning(
     # The seeded concept is carried into the per-document labeling calls.
     assert all("- PaymentTerms" in text for text in label_inputs)
     assert docs["a.pdf"][0].concept == "PaymentTerms"
+
+
+def test_label_documents_schema_seed_full_fidelity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schema_seed carries kind + curated examples into the labeling prompt
+    (confirmed tier), skips planning, and stays frozen — observations never
+    mutate seeded entries, so the rendered roster is byte-stable per batch."""
+    from dgml_core.generation.schema import Schema, SchemaTag
+
+    docs = _docs()
+    label_inputs: list[str] = []
+
+    def no_plan(config: llm.LLMConfig, **kwargs: object) -> tuple[str, str]:
+        raise AssertionError("planning must be skipped when schema_seed is given")
+
+    def fake_call(config: llm.LLMConfig, **kwargs: Any) -> str:
+        label_inputs.append("\n\n".join(str(part["text"]) for part in kwargs["user_content"]))
+        return json.dumps({"labels": {"b0001": {"concept": "PaymentTerms"}}})
+
+    monkeypatch.setattr(llm, "call_with_refinement", no_plan)
+    monkeypatch.setattr(llm, "call", fake_call)
+    schema = Schema()
+    schema.add(
+        SchemaTag(
+            name="PaymentTerms",
+            role="the payment clause",
+            kind="section",
+            examples=["net 30"],
+            parent_role="Agreement",
+        )
+    )
+    label_documents(
+        docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"), schema_seed=schema
+    )
+    line = '- PaymentTerms [section] — the payment clause (seen: "net 30")'
+    assert all("CONCEPTS ALREADY IN USE" in text for text in label_inputs)
+    # The exact seeded line appears in EVERY call: doc 1's observation of
+    # PaymentTerms did not append its text as a new example (frozen seed).
+    assert all(line in text for text in label_inputs)
+    assert all("PLANNED CONCEPTS" not in text for text in label_inputs)
+    assert docs["a.pdf"][0].concept == "PaymentTerms"
+
+
+def test_label_documents_pilot_stage_confirms_roster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unseeded runs label the LARGEST docs first (the pilot); the rest of the
+    batch then labels against the CONFIRMED tier with observed examples."""
+    _patch_roster(monkeypatch, {"PaymentTerms": "payment obligations"})
+    docs: dict[str, list[Block]] = {"small.pdf": [_b("heading", "b0001", text="Payment Terms")]}
+    for i in range(5):
+        docs[f"big{i}.pdf"] = [
+            _b("heading", "b0001", text="Payment Terms"),
+            _b("p", "b0002", text=f"Invoices are payable within {30 + i} days."),
+        ]
+    seen: list[tuple[str, str]] = []
+
+    def fake_call(config: llm.LLMConfig, **kwargs: Any) -> str:
+        text = "\n\n".join(str(part["text"]) for part in kwargs["user_content"])
+        name = text.rsplit("== ", 1)[1].split(" ==", 1)[0]
+        seen.append((name, text))
+        return json.dumps({"labels": {"b0001": {"concept": "PaymentTerms"}}})
+
+    monkeypatch.setattr(llm, "call", fake_call)
+    label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
+    # The five 2-block docs labeled first (the pilot); small.pdf — first in
+    # input order but smallest — went last.
+    assert [name for name, _ in seen] == [f"big{i}.pdf" for i in range(5)] + ["small.pdf"]
+    # The pilot's first call saw only the PLANNED tier; the post-pilot call
+    # labels against CONFIRMED concepts carrying observed verbatim examples.
+    assert "PLANNED CONCEPTS" in seen[0][1]
+    assert "CONCEPTS ALREADY IN USE" not in seen[0][1]
+    post = seen[-1][1]
+    assert "CONCEPTS ALREADY IN USE" in post
+    assert '- PaymentTerms [section] — payment obligations (seen: "Payment Terms")' in post
+
+
+def test_derive_schema_seed_fallback_for_unobserved_tags() -> None:
+    """Re-deriving schema.json never degrades seeded fields: a tag not observed
+    in this batch keeps its seeded kind/examples/parent; observation wins where
+    it exists."""
+    from dgml_core.generation.label import RosterEntry, derive_schema
+
+    roster = {
+        "OldTag": RosterEntry(
+            description="an old role",
+            examples=["ex1"],
+            kind="row",
+            parent="OldParent",
+            confirmed=True,
+            frozen=True,
+        ),
+        "FreshTag": RosterEntry(),
+    }
+    docs = {"a.pdf": [_b("p", "b0001", text="hello world", concept="FreshTag")]}
+    schema = derive_schema(docs, roster, {"OldTag": "an old role"})
+    old = schema.tags["OldTag"]
+    assert old.kind == "row" and old.parent_role == "OldParent" and old.examples == ["ex1"]
+    fresh = schema.tags["FreshTag"]
+    assert fresh.kind == "section" and fresh.examples == ["hello world"]
+
+
+def test_transcribe_document_reuses_cached_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached <stem>_blocks.json short-circuits Pass A entirely — no LLM call,
+    no PDF parsing — so a re-run only pays for labeling and rendering."""
+    from dgml_core.generation.transcribe import blocks_to_json, transcribe_document
+
+    (tmp_path / "doc_blocks.json").write_text(
+        blocks_to_json([_b("p", "b0001", text="hello world")]), encoding="utf-8"
+    )
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise AssertionError("must not transcribe when the blocks cache exists")
+
+    monkeypatch.setattr(llm, "call_continued", boom)
+    blocks = transcribe_document(
+        b"not-even-a-pdf",  # never parsed: the cache short-circuits before page counting
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path,
+    )
+    assert [b.text for b in blocks] == ["hello world"]
+
+
+def test_roster_content_blocks_cache_marker_is_anthropic_only() -> None:
+    """The rendered roster block carries a cache_control marker only for
+    Anthropic models (other providers cache stable prefixes implicitly);
+    an empty roster contributes no block at all."""
+    from dgml_core.generation.label import RosterEntry, _roster_content_blocks
+
+    roster = {"Foo": RosterEntry(description="a role")}
+    (block,) = _roster_content_blocks(roster, model="anthropic/claude-haiku-4-5")
+    assert block["cache_control"] == {"type": "ephemeral"}
+    (block,) = _roster_content_blocks(roster, model="gemini/gemini-2.5-pro")
+    assert "cache_control" not in block
+    assert _roster_content_blocks({}, model="anthropic/claude-haiku-4-5") == []
 
 
 def test_label_documents_failure_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -678,6 +828,9 @@ def test_label_documents_writes_cache_artifacts(
     assert "plan_roster_raw.json" not in names and "plan_roster_draft_raw.json" not in names
     roster = json.loads((cache / "concept_roster.json").read_text())
     assert "PaymentTerms" in roster
+    # The reload contract is the legacy flat {concept: string} shape — the
+    # full-fidelity vocabulary lives in schema.json, never here.
+    assert all(isinstance(v, str) for v in roster.values())
 
     # debug=True: the input listings and roster-planning dumps are captured too.
     dbg = tmp_path / "cache_debug"

@@ -43,6 +43,7 @@ from dgml_core.generation.label import (
     wrap_detected_values,
 )
 from dgml_core.generation.render import render_xml
+from dgml_core.generation.schema import Schema
 from dgml_core.generation.to_semantic import (
     render_dgml,
     render_semantic_xml,
@@ -117,8 +118,14 @@ class ConvertOptions:
     # `conversion` config. Passed to load_document_as_pdf so non-PDF inputs
     # convert; None/empty means PDF-only (every input must already be a PDF).
     converters: dict[str, ConverterConfig] | None = None
-    # Optional concept roster (the docset's "schema") loaded from --schema-path.
-    # When set, it seeds the roster and Pass B.1 planning is skipped.
+    # Optional full-fidelity schema seed (from --schema-path or the docset's
+    # own schema.json on an incremental run). Seeds the roster with role
+    # descriptions, curated examples, kind, and hierarchy; Pass B.1 planning
+    # is skipped. Takes precedence over roster_seed.
+    schema_seed: Schema | None = None
+    # Legacy flat {concept: description} roster seed (cache/concept_roster.json
+    # fallback). When set (and schema_seed is not), it seeds the roster and
+    # Pass B.1 planning is skipped.
     roster_seed: dict[str, str] | None = None
     # Optional leaf-concept → container-concept map (from a seed schema's
     # parent/children). Drives the entity-container grouping in render_dgml
@@ -239,6 +246,7 @@ def convert_batch(
             debug=opts.debug,
             log=log,
             roster_seed=opts.roster_seed,
+            schema_seed=opts.schema_seed,
         )
 
     outputs: dict[str, str] = {}
