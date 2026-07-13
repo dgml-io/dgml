@@ -730,6 +730,89 @@ def test_cluster_config_preset_name_passes_preset_overrides(
     assert overrides["fusion"]["name"] == "concat_norm"
 
 
+def _llm_partition(fid: str) -> Any:
+    """A one-cluster LLMClusteringResult that names its emergent bucket in the
+    same call (so clustering() needs no second naming round-trip)."""
+    from dgml_core.classification import ClassificationDecision
+    from dgml_core.llm_clustering import LLMClusteringResult
+
+    return LLMClusteringResult(
+        clusters={fid: "unknown_0"},
+        proposals={
+            "unknown_0": ClassificationDecision(
+                decision="new",
+                new_name="Sample Documents",
+                new_description="test docs",
+                new_key_questions=("What is this document about?",),
+            )
+        },
+        failed_file_ids=[],
+    )
+
+
+@needs_gs
+def test_cluster_method_llm_routes_to_llm_partitioner(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cluster --method llm` sends the corpus to the vision-LLM partitioner
+    (never the embedding pipeline) and creates DocSets from the proposals it
+    returns in a single call."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-3.1-flash-lite", "max_pages": 1}
+    )
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    with (
+        patch(
+            "dgml_core.clustering.llm_cluster_files", return_value=_llm_partition(fid)
+        ) as mock_llm,
+        patch("dgml_core.clustering.run_clustering_detailed") as mock_embed,
+    ):
+        rc = main(_ws_args(ws) + ["cluster", "--method", "llm"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["clusters"] == {fid: "Sample Documents"}
+    assert payload["failed_file_ids"] == []
+    assert payload["n_new_clusters"] == 1
+    # The LLM partitioner ran; the embedding pipeline was never touched.
+    mock_llm.assert_called_once()
+    mock_embed.assert_not_called()
+
+
+@needs_gs
+def test_cluster_method_auto_small_corpus_uses_llm(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cluster --method auto` routes a corpus at/below --small-corpus-threshold
+    to the LLM partitioner rather than the embedding pipeline."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-3.1-flash-lite", "max_pages": 1}
+    )
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    # One clusterable file, threshold 8 → auto resolves to the LLM partitioner.
+    with (
+        patch(
+            "dgml_core.clustering.llm_cluster_files", return_value=_llm_partition(fid)
+        ) as mock_llm,
+        patch("dgml_core.clustering.run_clustering_detailed") as mock_embed,
+    ):
+        rc = main(_ws_args(ws) + ["cluster", "--method", "auto", "--small-corpus-threshold", "8"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["clusters"] == {fid: "Sample Documents"}
+    mock_llm.assert_called_once()
+    mock_embed.assert_not_called()
+
+
 @needs_gs
 def test_cluster_partial_success_when_llm_fails(
     tmp_path: Path,
