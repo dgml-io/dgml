@@ -1494,7 +1494,8 @@ def test_header_row_labeled_as_data_is_demoted() -> None:
         ),
     ]
     propagate_table_consistency(rows)
-    assert rows[0].cell_concepts == [] and rows[0].concept == ""  # header demoted
+    assert rows[0].cell_concepts == []  # cell-level concepts demoted
+    assert rows[0].concept == ""  # concept copied from data rows -> cleared
     assert rows[1].cell_concepts == ["ItemCode", "ItemQty", "ItemPrice"]  # data intact
 
 
@@ -1525,6 +1526,40 @@ def test_all_text_table_keeps_its_first_row() -> None:
     ]
     propagate_table_consistency(rows)
     assert rows[0].cell_concepts == ["PartyName", "PartyCity"]  # untouched
+
+
+def test_header_row_with_distinct_role_keeps_it() -> None:
+    """A header row whose OWN concept differs from the data rows' shared
+    concept was labeled deliberately (e.g. a table-header role) — the row
+    concept survives demotion; only the cell concepts are cleared."""
+    from dgml_core.generation.label import propagate_table_consistency
+
+    rows = [
+        Block(
+            id="r0",
+            structure="row",
+            cells=["Code", "Qty", "Price"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="PricingHeader",
+        ),
+        Block(
+            id="r1",
+            structure="row",
+            cells=["A100", "2", "$10.00"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="LineItem",
+        ),
+        Block(
+            id="r2",
+            structure="row",
+            cells=["B200", "5", "$25.00"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="LineItem",
+        ),
+    ]
+    propagate_table_consistency(rows)
+    assert rows[0].cell_concepts == []
+    assert rows[0].concept == "PricingHeader"  # distinct role preserved
 
 
 def test_parse_block_choice_group() -> None:
