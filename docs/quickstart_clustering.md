@@ -152,6 +152,38 @@ Response (truncated):
 }
 ```
 
+### Only a handful of documents?
+
+The embedding pipeline above needs a corpus large enough for its statistics to
+mean something — tf-idf has almost nothing to weight on a few documents, k-NN
+graphs are dominated by noise, and clusters collapse into one bucket (or all
+noise). For very small corpora, skip embeddings entirely and let the vision LLM
+partition the documents directly:
+
+```bash
+dgml cluster --method llm
+```
+
+`--method llm` sends every document's rendered first pages to the LLM in a
+single call and asks it to group them by document type, then names each
+emergent group — the same vision machinery `dgml file add --auto-classify`
+uses, so it needs the same `classification` section in `<workspace>/config.json`
+(without it, every file lands in `failed_file_ids`). It partitions *and* names
+in one round-trip, and a single call covers up to 24 files.
+
+Prefer `--method auto` to let DGML choose: it routes corpora of at most
+`--small-corpus-threshold` files (default 8) to the LLM and larger ones to the
+embedding pipeline — the right default for a folder whose size you don't know
+up front.
+
+```bash
+dgml cluster --method auto                          # LLM for ≤8 files, else embedding
+dgml cluster --method auto --small-corpus-threshold 12   # raise the cutoff
+```
+
+The `--method embedding` default (used by the plain `dgml cluster` above) is
+unchanged, so existing large-corpus runs behave exactly as before.
+
 ## 5. Tune the clustering (optional)
 
 The defaults cluster a folder sensibly out of the box; everything here is

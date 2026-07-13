@@ -166,7 +166,7 @@ failed operations.
 > (derived from it at add time) are checked as usual; if the converted PDF is
 > gone, generation falls back to re-converting from the original.
 
-### `dgml cluster [--skip-existing] [--config PRESET|PATH] [--mode auto|fresh|incremental]`
+### `dgml cluster [--skip-existing] [--config PRESET|PATH] [--mode auto|fresh|incremental] [--method auto|embedding|llm] [--small-corpus-threshold N]`
 
 Requires `pip install dgml[clustering]`. The extra pulls in the
 `dgml-clustering` workspace package and its ML stack (embedding models,
@@ -209,6 +209,34 @@ run.
   `INCREMENTAL_WITHOUT_CLUSTERS`.
 - `auto` — resolves to `incremental` when the workspace already has DocSets,
   else `fresh`.
+
+`--method auto|embedding|llm` selects *how* documents are grouped, orthogonal
+to `--mode` (default `embedding`):
+
+- `embedding` — the statistical pipeline (encode → project → cluster) described
+  below. The right choice once a corpus is large enough for tf-idf / neighbor
+  statistics to be meaningful.
+- `llm` — send **every** document's rendered first pages to the vision LLM in a
+  single call and let it partition them by document type. Built for **very small
+  corpora**, where the embedding pipeline has too little signal to cluster
+  reliably (tf-idf has almost nothing to weight, k-NN graphs are dominated by
+  noise). The model partitions *and* names emergent groups in the one call, so
+  no second per-cluster naming round-trip is needed. `--config` is ignored on
+  this path (there is no embedding pipeline to configure).
+- `auto` — route to `llm` when at most `--small-corpus-threshold` files are
+  clusterable, else `embedding`.
+
+`--small-corpus-threshold N` (default `8`) is the cutoff `--method auto` uses:
+corpora of at most `N` clusterable files go to the LLM partitioner, larger ones
+to the embedding pipeline. Ignored for `--method embedding` / `--method llm`.
+
+Both `--method llm` and `--method auto` (when it routes to the LLM) require the
+same `classification` config as `--auto-classify` (see "Auto-classification"
+above) — the LLM partitioner *is* the classifier's vision machinery. A missing
+`classification` section makes the LLM path soft-fail: every clusterable file
+lands in `failed_file_ids`. The LLM path caps a single call at 24 files; any
+beyond that are reported in `failed_file_ids` so you can fall back to the
+embedding pipeline for larger corpora.
 
 Cluster files not currently assigned to any DocSet, and **assign each
 clustered file to a DocSet**. Runs in two passes:
