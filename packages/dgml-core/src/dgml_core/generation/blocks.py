@@ -165,7 +165,10 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
         checked = [c for c in checked if c in options]
     if not value and len(checked) == 1:
         value = checked[0]
-    if not text and not cells and not (label or value) and not options:
+    # A lim alone is content: numbered-but-untitled headings ("6.4.1" + body)
+    # must survive, or the sub-section they open is silently flattened.
+    lim = str(raw.get("lim", "") or "").strip()
+    if not text and not cells and not (label or value) and not options and not lim:
         return None
     try:
         level = max(1, min(6, int(raw.get("level", 1))))
@@ -176,7 +179,7 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
         structure=structure,
         text=text,
         level=level,
-        lim=str(raw.get("lim", "") or "").strip(),
+        lim=lim,
         cells=cells,
         label=label,
         value=value,
