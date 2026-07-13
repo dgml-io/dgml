@@ -11,8 +11,8 @@
     "name": "s1",
     "cluster_algorithm": "leiden",
     "leiden_graph_method": "knn",
-    "leiden_k_neighbors": 25,
-    "leiden_resolution": 1.0,
+    "leiden_k_neighbors": 15,
+    "leiden_resolution": 0.75,
     "reduce_method": "umap",
     "reduce_dim": 10
   }

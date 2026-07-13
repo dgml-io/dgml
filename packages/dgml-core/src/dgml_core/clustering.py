@@ -82,16 +82,18 @@ MAX_SUPPORT_SAMPLES_PER_DOCSET = 64
 ClusterMode = Literal["auto", "fresh", "incremental"]
 CLUSTER_MODES: tuple[str, ...] = get_args(ClusterMode)
 
-# Named, bundled config presets. ``light`` mirrors the bundled default
-# (CPU-only tf-idf + Leiden/UMAP); ``medium`` uses a dense sentence
-# encoder (large CPU / Apple MPS); ``heavy`` uses a large dense encoder +
-# HDBSCAN (GPU). Each maps to a ``clustering_preset_<name>.json`` resource
+# Named, bundled config presets, ordered by compute budget. The tiers scale
+# by adding image/vision embeddings: ``small`` and ``light`` are CPU-only,
+# text-only (tf-idf + Leiden), ``small`` skipping UMAP for tiny corpora and
+# ``light`` (the default) reducing with UMAP; ``medium`` fuses a 2B vision
+# encoder into the text signal; ``heavy`` clusters on an 8B vision encoder
+# alone (GPU). Each maps to a ``clustering_preset_<name>.json`` resource
 # shipped alongside this module.
-CONFIG_PRESETS: tuple[str, ...] = ("light", "medium", "heavy")
+CONFIG_PRESETS: tuple[str, ...] = ("small", "light", "medium", "heavy")
 
 
 def load_clustering_preset(name: str) -> dict[str, Any]:
-    """Load a bundled config preset (``light`` / ``medium`` / ``heavy``).
+    """Load a bundled config preset (``small`` / ``light`` / ``medium`` / ``heavy``).
 
     Returns the preset's overrides dict (same shape as the ``clustering``
     section of ``<workspace>/config.json``). Raises
@@ -120,7 +122,7 @@ def resolve_clustering_overrides(
 
     - ``None`` → the ``clustering`` section of ``<workspace>/config.json``
       (:func:`load_clustering_overrides`), or ``{}`` when absent.
-    - a preset name (``light`` / ``medium`` / ``heavy``) →
+    - a preset name (``small`` / ``light`` / ``medium`` / ``heavy``) →
       :func:`load_clustering_preset`.
     - anything else → treated as a path to a standalone config JSON
       (:func:`load_clustering_config_file`).
@@ -257,8 +259,8 @@ def clustering(
 
     ``config`` selects the clustering configuration: ``None`` uses the
     workspace ``config.json`` ``clustering`` section (bundled defaults when
-    absent); a preset name (``light`` / ``medium`` / ``heavy``) loads a
-    bundled preset; anything else is treated as a path to a standalone
+    absent); a preset name (``small`` / ``light`` / ``medium`` / ``heavy``)
+    loads a bundled preset; anything else is treated as a path to a standalone
     config JSON. See :func:`resolve_clustering_overrides`.
 
     ``mode`` selects fresh vs incremental clustering; see the module

@@ -1560,3 +1560,30 @@ def test_header_row_with_distinct_role_keeps_it() -> None:
     propagate_table_consistency(rows)
     assert rows[0].cell_concepts == []
     assert rows[0].concept == "PricingHeader"  # distinct role preserved
+
+
+def test_parse_block_choice_group() -> None:
+    """A checkbox/radio group parses with its printed options; a checked entry
+    outside the printed choices is a hallucinated mark and is dropped; a
+    single selection also fills `value`."""
+    from dgml_core.generation.blocks import parse_block
+
+    b = parse_block(
+        {
+            "structure": "field",
+            "label": "REQUESTED ACTION",
+            "options": ["APPLY", "AMEND", "WITHDRAW"],
+            "checked": ["APPLY", "NOPE"],
+        },
+        block_id="b1",
+    )
+    assert b is not None
+    assert b.options == ["APPLY", "AMEND", "WITHDRAW"]
+    assert b.checked == ["APPLY"]  # hallucinated 'NOPE' dropped
+    assert b.value == "APPLY"  # single selection fills value
+    # an unmarked group still survives (options alone carry content)
+    empty = parse_block(
+        {"structure": "field", "label": "KIND", "options": ["A", "B"], "checked": []},
+        block_id="b2",
+    )
+    assert empty is not None and empty.checked == [] and empty.value == ""

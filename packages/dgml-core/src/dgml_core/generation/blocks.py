@@ -108,6 +108,12 @@ class Block:
     lim_concept: str = ""
     cells: list[str] = field(default_factory=list)
     label: str = ""
+    # Field blocks only: a printed CHOICE GROUP (checkboxes/radio). `options`
+    # are the printed choice labels in reading order; `checked` the subset
+    # whose box carries a mark. The mark character itself (X, tick) is never
+    # content. `value` remains the single-selection convenience.
+    options: list[str] = field(default_factory=list)
+    checked: list[str] = field(default_factory=list)
     # Field blocks only: inline entity spans WITHIN the label text. A packed
     # "label" often carries real values (a code and a name in one line); the
     # renderer wraps each span so they stay tagged. Unlike value spans there is
@@ -151,7 +157,15 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
     cells = [str(c) for c in raw.get("cells", []) or []]
     label = str(raw.get("label", "") or "")
     value = str(raw.get("value", "") or "")
-    if not text and not cells and not (label or value):
+    options = [str(o).strip() for o in raw.get("options", []) or [] if str(o).strip()]
+    checked = [str(c).strip() for c in raw.get("checked", []) or [] if str(c).strip()]
+    if options:
+        # a selection can only be one of the PRINTED choices — a checked
+        # entry outside the options is a hallucinated mark and is dropped
+        checked = [c for c in checked if c in options]
+    if not value and len(checked) == 1:
+        value = checked[0]
+    if not text and not cells and not (label or value) and not options:
         return None
     try:
         level = max(1, min(6, int(raw.get("level", 1))))
@@ -166,6 +180,8 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
         cells=cells,
         label=label,
         value=value,
+        options=options,
+        checked=checked,
     )
 
 

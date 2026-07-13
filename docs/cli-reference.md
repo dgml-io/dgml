@@ -181,9 +181,10 @@ one file is still unassigned) the command clusters as normal and reports
 `skipped: false`.
 
 `--config PRESET|PATH` selects the clustering configuration for this run.
-It is either a **bundled preset name** — `light` (CPU-only tf-idf + Leiden/
-UMAP; the default), `medium` (dense `bge` sentence encoder, large CPU / Apple
-MPS), or `heavy` (large dense `e5` encoder + HDBSCAN, GPU) — or a **path** to a
+It is either a **bundled preset name** — `small` (CPU-only tf-idf + Leiden, no
+UMAP; for tiny corpora), `light` (CPU-only tf-idf + Leiden/UMAP; the default),
+`medium` (tf-idf text fused with a 2B vision encoder, large CPU / Apple MPS),
+or `heavy` (8B vision encoder alone + Leiden/UMAP, GPU) — or a **path** to a
 standalone clustering config JSON. The JSON holds the same fields as the
 `clustering` section of `<workspace>/config.json` (`encoder_text`,
 `encoder_image`, `fusion`, `manifold`, `training`, `scenario`); it is

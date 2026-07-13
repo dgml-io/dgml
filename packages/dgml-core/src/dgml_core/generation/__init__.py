@@ -15,10 +15,10 @@
 The design rationale is in ``docs/new_pipeline.md``. The pipeline has three
 deterministic-by-construction properties:
 
-1. **No malformed structure.** The model emits a FLAT list of typed JSON
-   blocks per window; nesting is derived deterministically from heading
-   levels and block runs (`blocks.build_tree`). There is nothing to
-   balance, so there is no repair/recover/seam-reopen machinery.
+1. **Well-formed structure by construction.** The model emits a FLAT list of
+   typed JSON blocks per window; nesting is derived deterministically from
+   heading levels and block runs (`blocks.build_tree`), so every tree is
+   balanced the moment it is built.
 2. **Trivial window merging.** Windows are disjoint; a window that starts
    mid-element returns a `continues` string that is appended to the previous
    window's last text block. Merging is list concatenation plus one splice.
