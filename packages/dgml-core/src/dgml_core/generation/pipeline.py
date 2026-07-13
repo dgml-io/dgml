@@ -12,12 +12,11 @@
 
 """Orchestration: transcribe each document, label the batch, render.
 
-Compare with ``dgml.generation.pipeline``: there is no schema lock, no
-registry, no drift warnings, no seam-reopen, no dedup, no repair, no
-re-nesting, no per-window recovery loop, and no harmonization pass — the
-block contract (flat, typed, verbatim) plus the single batch-wide labeling
-call replace all of them. Coverage can still be measured on the rendered
-XML with the existing ``dgml.generation.coverage`` tools.
+The block contract (flat, typed, verbatim) carries a document end to end:
+transcription emits typed blocks per page window, one batch-wide labeling
+call assigns concepts across every document at once, and the tree and final
+XML are assembled deterministically in plain code. Coverage is measured on
+the rendered XML with the ``dgml_core.generation.coverage`` tools.
 """
 
 from __future__ import annotations

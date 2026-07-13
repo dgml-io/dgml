@@ -724,8 +724,10 @@ def test_cluster_config_preset_name_passes_preset_overrides(
         rc = main(_ws_args(ws) + ["cluster", "--config", "medium"])
     assert rc == 0
     overrides = mock_cluster.call_args.kwargs["overrides"]
-    # The medium preset uses the dense bge text encoder.
-    assert overrides["encoder_text"]["name"] == "bge"
+    # The medium preset fuses a dense image encoder into the text signal —
+    # distinct from the default light preset (image "dummy" / fusion "none").
+    assert overrides["encoder_image"]["name"] == "qwen3_vl_embedding_2b"
+    assert overrides["fusion"]["name"] == "concat_norm"
 
 
 @needs_gs

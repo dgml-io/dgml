@@ -516,7 +516,16 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
         header: Block | None = None
         if eligible >= 2 and votes == eligible:
             header = first
-            first.concept = ""
+            # Cell concepts are always poison on a header row (column titles
+            # becoming the columns' first values). The row-level concept is
+            # kept ONLY when it differs from the data rows' shared concept —
+            # a distinct role (e.g. "...TableHeader") is deliberate labeling;
+            # sharing the data rows' concept just means the labeler treated
+            # the header as one more data row, and that tag would wrap header
+            # text in a data role.
+            data_concept = _most_common([b.concept for b in run[1:]])
+            if first.concept and first.concept == data_concept:
+                first.concept = ""
             first.cell_concepts = []
             first.cell_entities = []
         # Table name: the one the model gave (first non-empty), shared by all.

@@ -1,25 +1,26 @@
 {
-  "encoder_text": {
-    "name": "bge",
-    "model_id": "BAAI/bge-small-en-v1.5",
-    "embedding_dim": 384,
-    "query_prefix": "Represent this sentence for searching relevant passages: ",
-    "extra": {"text_view": "page1"}
+  "encoder_text": {"name": "tfidf", "model_id": "tfidf", "embedding_dim": 256, "extra": {"text_view": "page1"}},
+  "encoder_image": {
+    "name": "qwen3_vl_embedding_2b",
+    "model_id": "Qwen/Qwen3-VL-Embedding-2B",
+    "embedding_dim": 1024,
+    "extra": {"trust_remote_code": true}
   },
-  "encoder_image": {"name": "dummy", "model_id": "dummy", "embedding_dim": 1},
-  "fusion": {"name": "none", "prefer_modality": "text"},
-  "manifold": {"name": "euclidean", "dim": 384},
+  "fusion": {"name": "concat_norm", "prefer_modality": "text", "image_weight": 0.45, "output_dim": 1280},
+  "manifold": {"name": "euclidean", "dim": 1280},
   "corpus": {"root": "."},
   "logger": {"name": "none"},
-  "device": "auto",
-  "training": {"epochs": 0, "identity_projector": true},
+  "training": {
+    "epochs": 0,
+    "identity_projector": true
+  },
   "scenario": {
     "name": "s1",
     "cluster_algorithm": "leiden",
-    "leiden_graph_method": "mutual_knn",
-    "leiden_k_neighbors": 20,
-    "leiden_resolution": 1.0,
+    "leiden_graph_method": "knn",
+    "leiden_k_neighbors": 30,
+    "leiden_resolution": 0.75,
     "reduce_method": "umap",
-    "reduce_dim": 15
+    "reduce_dim": 10
   }
 }

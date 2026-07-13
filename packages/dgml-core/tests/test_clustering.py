@@ -403,16 +403,18 @@ def test_clustering_internal_incremental_without_docsets_raises(workspace: Works
 
 
 # ---------------------------------------------------------------------------
-# config presets — light / medium / heavy + override resolution
+# config presets — small / light / medium / heavy + override resolution
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["light", "medium", "heavy"])
+@pytest.mark.parametrize("name", ["small", "light", "medium", "heavy"])
 def test_load_clustering_preset_known(name: str) -> None:
     preset = load_clustering_preset(name)
     assert isinstance(preset, dict)
-    # Every preset is a complete, self-contained clustering config.
-    assert {"encoder_text", "fusion", "manifold", "scenario"} <= set(preset)
+    # Presets are lean override files deep-merged over the bundled defaults;
+    # they only spell out the keys that differ, so these are the ones common
+    # to every tier (each may also override the encoders on top).
+    assert {"fusion", "manifold", "scenario"} <= set(preset)
 
 
 def test_load_clustering_preset_unknown_raises() -> None:
