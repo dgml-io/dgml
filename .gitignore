@@ -246,12 +246,6 @@ dgmlx-receipts/
 # is checked out / symlinked here for dev but must never enter the public repo.
 # No trailing slash so this also ignores a symlink named `evaluation`.
 /evaluation
-/evaluation/clustering/reports_clustering_set
-/dgml-workspace1/cache/embeddings
-/dgml-workspace1
-evaluation/clustering/run_inveniam_docs.sh
-evaluation/clustering/run.sh
-config.json
 # Shared per-user config seeded by `dgml init`; lives beside the workspace.
 # The .bak is written by `dgml init --refresh`.
 local_config.json
@@ -262,7 +256,3 @@ samples/*.jsonl
 #include for samples
 !samples/*/dgml-workspace
 /dgml-spec
-/ws1
-/ws2
-/ws3
-/ws4
