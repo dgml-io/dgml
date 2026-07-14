@@ -309,6 +309,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "otherwise. 'fresh' always clusters from scratch; 'incremental' forces "
         "the incremental path and errors if no DocSets exist yet.",
     )
+    cluster_p.add_argument(
+        "--method",
+        dest="method",
+        choices=("auto", "embedding", "llm"),
+        default="embedding",
+        help="How documents are grouped, orthogonal to --mode. 'embedding' "
+        "(default) uses the statistical encode → project → cluster pipeline — "
+        "the right choice once a corpus is large enough for tf-idf / neighbor "
+        "statistics to be meaningful. 'llm' sends every document's page images "
+        "to the vision LLM in one call and lets it partition them — built for "
+        "very small corpora where the embedding pipeline has too little signal. "
+        "'auto' picks 'llm' when at most --small-corpus-threshold files are "
+        "clusterable, else 'embedding'. Both 'llm' and 'auto' (when it routes "
+        "to the LLM) need the same `classification` config as --auto-classify.",
+    )
+    cluster_p.add_argument(
+        "--small-corpus-threshold",
+        dest="small_corpus_threshold",
+        type=int,
+        metavar="N",
+        # Keep in sync with dgml_core.clustering.SMALL_CORPUS_MAX_FILES (8).
+        default=8,
+        help="With --method auto, route corpora of at most N clusterable files "
+        "to the LLM partitioner, and larger ones to the embedding pipeline "
+        "(default 8). Ignored for --method embedding / llm.",
+    )
 
     docset = sub.add_parser("docset", parents=[common], help="DocSet management.").add_subparsers(
         dest="docset_command", required=True
@@ -1067,6 +1093,8 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 skip_existing=getattr(args, "skip_existing", False),
                 config=getattr(args, "config", None),
                 mode=getattr(args, "mode", "auto"),
+                method=getattr(args, "method", "embedding"),
+                small_corpus_threshold=getattr(args, "small_corpus_threshold", 8),
                 debug=args.debug,
             ),
             fmt,
