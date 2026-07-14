@@ -53,6 +53,7 @@ from .classification import (
 from .errors import ClassificationFailed
 from .llm import LLMConfig, call_with_tools
 from .models import DocSet
+from .prompts import get as prompt
 from .storage import Workspace
 from .usage import OPERATION_CLUSTER
 from .utils import gather_file_pages, image_to_data_url
@@ -158,10 +159,10 @@ def llm_cluster_files(
             "LLM clustering requires successfully rendered pages"
         )
 
-    prompt = _build_grouping_prompt(list(labels), docsets)
+    grouping_prompt = _build_grouping_prompt(list(labels), docsets)
     tools = [_group_documents_tool(docsets)]
     api_key = _resolve_api_key(config)
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}, *doc_blocks]
+    content: list[dict[str, Any]] = [{"type": "text", "text": grouping_prompt}, *doc_blocks]
 
     llm_config = LLMConfig(
         model=config.model,
@@ -360,73 +361,34 @@ def _extract_groups(response: Any) -> list[Any]:
 
 
 def _build_grouping_prompt(doc_labels: list[str], docsets: list[DocSet]) -> str:
-    lines = [
-        "You are clustering a small corpus of documents into DocSets.",
-        "",
-        "A DocSet groups documents of the **same document type** — documents "
-        "that could plausibly share a single extraction schema. Two documents "
-        "belong in the same group if, and only if, the same set of structured "
-        'questions ("what is X?", "when did Y happen?") could be answered from '
-        "each of them. Topical similarity is NOT enough: a property tax bill "
-        "and a tax-abatement agreement both concern property taxes but answer "
-        "different questions, so they belong in **different** groups. Use the "
-        "document type, not the topic.",
-        "",
-        f"There are {len(doc_labels)} documents: "
-        f"{', '.join(doc_labels)}. Each document's rendered first pages are "
-        "attached below, immediately after a line naming it "
-        '(e.g. "=== Document doc_1 ===").',
-        "",
+    """Assemble the partition prompt from the fixed pieces in ``prompts.yaml``.
+
+    The wording lives in ``dgml_core/resources/prompts.yaml`` (keys
+    ``cluster_grouping_*``) so it can be tuned without touching code; this
+    function only interpolates the runtime data — the document count/labels
+    and, in incremental mode, the existing DocSets offered as categories —
+    and joins the pieces with blank lines.
+    """
+    parts = [
+        prompt("cluster_grouping_intro"),
+        prompt("cluster_grouping_doc_manifest").format(
+            count=len(doc_labels), labels=", ".join(doc_labels)
+        ),
     ]
     if docsets:
-        lines.append(
-            "Some DocSets already exist. If a group of documents matches one "
-            "of these existing DocSets (they answer the same key questions), "
-            "assign that group to it by setting `existing_docset_id`:"
-        )
+        listing = [prompt("cluster_grouping_existing_intro")]
         for ds in docsets:
-            lines.append(f"- id={ds.id}")
-            lines.append(f"  name: {ds.name}")
+            listing.append(f"- id={ds.id}")
+            listing.append(f"  name: {ds.name}")
             if ds.description:
-                lines.append(f"  description: {ds.description}")
+                listing.append(f"  description: {ds.description}")
             if ds.key_questions:
-                lines.append("  key questions this DocSet's documents answer:")
+                listing.append("  key questions this DocSet's documents answer:")
                 for q in ds.key_questions:
-                    lines.append(f"    - {q}")
-        lines.append("")
-    lines.extend(
-        [
-            f"Call `{_TOOL_GROUP}` exactly once with a `groups` array that "
-            "partitions ALL of the documents above. Every document label must "
-            "appear in exactly one group's `members`; do not omit any and do "
-            "not repeat any.",
-            "",
-            "For each group, either:",
-            "  - set `existing_docset_id` to the id of the existing DocSet it "
-            "matches (only when one genuinely fits), OR",
-            "  - describe a new document type with:",
-            "    - `name`: a short, document-type-specific name (2-5 words; "
-            'prefer the document\'s own type, e.g. "Property Tax Bill" or '
-            '"PILOT Agreement", not a topical bucket like "Property Tax '
-            'Records"),',
-            "    - `description`: a one-sentence description of what kind of "
-            "document this group holds, and",
-            "    - `key_questions`: 3-7 concrete, type-discriminating questions "
-            "answerable from the first pages of this kind of document.",
-            "",
-            "Group by the underlying document type, not by surface appearance. "
-            "Two documents belong in the SAME group whenever the same core "
-            "questions could be answered from each — even if they differ in "
-            "layout, length, section order, formatting, issuer, or which "
-            "optional sections are present. Those are variations of one type, "
-            "not separate types. Create a separate group only when a document "
-            "answers a genuinely different set of questions (a different "
-            "extraction schema). When two documents are borderline, put them "
-            "TOGETHER. Prefer fewer, larger groups; do not split a type into "
-            "sub-variants.",
-        ]
-    )
-    return "\n".join(lines)
+                    listing.append(f"    - {q}")
+        parts.append("\n".join(listing))
+    parts.append(prompt("cluster_grouping_instructions").format(tool=_TOOL_GROUP))
+    return "\n\n".join(parts)
 
 
 def _group_documents_tool(docsets: list[DocSet]) -> dict[str, Any]:
