@@ -104,8 +104,8 @@ class ConvertOptions:
     # When set, convert_batch returns the FINAL dgml (dg:chunk, concept tags +
     # dg:chunk scaffolding, value typing) instead of the windowed-shape
     # intermediate. This is the standard dg:chunk opening tag from
-    # semantic_transform.build_header; this path does not route through
-    # Pass 4. Empty → return the intermediate (library/test shape).
+    # semantic_transform.build_header. Empty → return the intermediate
+    # (library/test shape).
     dgml_header: str = ""
     # Documents transcribed concurrently. Windows WITHIN a document stay
     # serial (window N+1 receives window N's tail for the `continues`

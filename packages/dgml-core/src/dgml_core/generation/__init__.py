@@ -12,8 +12,7 @@
 
 """PDF→DGML generation: typed-block transcription + batch-wide labeling.
 
-The design rationale is in ``docs/new_pipeline.md``. The pipeline has three
-deterministic-by-construction properties:
+The pipeline has three deterministic-by-construction properties:
 
 1. **Well-formed structure by construction.** The model emits a FLAT list of
    typed JSON blocks per window; nesting is derived deterministically from
