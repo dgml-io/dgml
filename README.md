@@ -42,7 +42,6 @@ See [CLAUDE.md](CLAUDE.md) for the full workspace/package layout and contributor
 | [`packages/`](packages) | UV workspace members: `dgml` (the CLI), `dgml-core` (the library — PDF→DGML pipeline, OCR, rendering, generation, grounding, storage), `clustering` (`dgml-clustering`, ML document clustering), `dgml-chain` (blockchain staking/attestation), `translators-pdf` (translates other formats, e.g. DOCX, XLSX, to PDF so they can flow through the same PDF→DGML pipeline). |
 | [`tools/`](tools) | Standalone, dependency-light CLIs for working with DGML XML directly: [`dgml2html`](tools/dgml2html) (render as styled HTML), [`dgml2jsonld`](tools/dgml2jsonld) (convert to JSON-LD/XAST), [`dgml4models`](tools/dgml4models) (strip layout attributes before sending to an LLM), [`rnc2jsonld`](tools/rnc2jsonld) (convert a docset's RNC schema to a JSON-LD vocabulary). |
 | [`docs/`](docs) | Long-form docs: CLI reference, on-disk storage layout, conversion, Merkle attestation, blockchain chaining quickstart, clustering quickstarts. |
-| [`evaluation/`](evaluation) | Offline evaluation harnesses and metrics for the DGML generation pipeline and the clustering pipelines (not shipped as part of the package). |
 | [`app-sample/`](app-sample) | Single-file sample web app for browsing and rendering DGML documents. |
 | [`scripts/`](scripts) | Repo-wide dev scripts — `verify.sh` mirrors what CI runs; also rendering/grounding utilities. |
 | [`.github/workflows/`](.github/workflows) | CI: lint, type-check, test, license audit. |
