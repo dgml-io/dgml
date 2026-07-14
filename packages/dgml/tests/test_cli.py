@@ -2661,8 +2661,9 @@ def test_stake_file_dry_run_does_not_broadcast(
     monkeypatch.setattr("dgml_chain.signer.load_key", lambda service="", account="": _TEST_KEY)
 
     # Stub the local export so the test needs no real PDF/artifacts. Mirrors
-    # export_attestation's signature: (attestation, attestation_path, archive_path);
-    # staking calls it with unpacked=True, so the loose attestation path is set.
+    # export_attestation's signature and mode contract: (attestation,
+    # attestation_path, archive_path) with exactly one of the paths set —
+    # the archive by default, the loose attestation path under --unpacked.
     def _fake_export(  # type: ignore[no-untyped-def]
         ws: Any,
         file_id: str,
@@ -2672,7 +2673,9 @@ def test_stake_file_dry_run_does_not_broadcast(
         unpacked: bool = False,
     ):
         attestation = SimpleNamespace(root="deadbeef", leaves=[1, 2, 3])
-        return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        if unpacked:
+            return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        return attestation, None, out_dir / "doc.dgmlx"
 
     monkeypatch.setattr("dgml_core.staking.export_attestation", _fake_export)
 
@@ -2698,8 +2701,60 @@ def test_stake_file_dry_run_does_not_broadcast(
     assert out["uri"] == "dgmlx://f00000"
     assert out["signed_tx"].startswith("0x")
     assert "unsigned_tx" in out
+    # Default is the portable archive: payload carries `dgmlx`, not `attestation`.
+    assert out["dgmlx"].endswith("doc.dgmlx")
+    assert "attestation" not in out
     # Crucially: nothing was sent to the chain.
     assert fake.broadcast == []
+
+
+def test_stake_file_unpacked_reports_loose_attestation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    fake = _FakeRpc()
+    monkeypatch.setattr("dgml_core.staking.EvmRpc", lambda *a, **k: fake)
+    monkeypatch.setattr("dgml_chain.signer.load_key", lambda service="", account="": _TEST_KEY)
+
+    def _fake_export(  # type: ignore[no-untyped-def]
+        ws: Any,
+        file_id: str,
+        out_dir: Path,
+        docset_id: str | None = None,
+        *,
+        unpacked: bool = False,
+    ):
+        attestation = SimpleNamespace(root="deadbeef", leaves=[1, 2, 3])
+        if unpacked:
+            return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        return attestation, None, out_dir / "doc.dgmlx"
+
+    monkeypatch.setattr("dgml_core.staking.export_attestation", _fake_export)
+
+    rc = main(
+        _ws_args(ws)
+        + [
+            "stake",
+            "file",
+            "f00000",
+            "--chain",
+            "nvnm-testnet",
+            "--registry",
+            "myreg",
+            "--from",
+            _test_addr(),
+            "--dry-run",
+            "--unpacked",
+        ]
+    )
+    assert rc == 0
+    out = _read_stdout(capsys)
+    # --unpacked surfaces the loose attestation path and no archive.
+    assert out["attestation"].endswith("dgml-attestation.xml")
+    assert "dgmlx" not in out
 
 
 def test_prove_file_missing_record_json_is_structured_error(

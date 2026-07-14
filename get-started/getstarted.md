@@ -293,10 +293,10 @@ uv run dgml stake file "<file_id>" --docset "<docset_id>" \
 ```
 
 This command:
-1. Formulates the Merkle Tree of the entire document bundle (PDF, images, schema, and XML).
+1. Formulates the Merkle Tree of the entire document bundle (PDF, images, schema, and XML) and writes it as a single portable `<stem>.dgmlx` archive (pass `--unpacked` to write the loose bundle tree instead).
 2. Broadcasts a transaction pinning the Merkle Root Hash under the URI schema `dgmlx://<file_id>/<docset_id>`.
 3. Waits for the blockchain transaction to commit.
-4. Saves a `record.json` file in the document's workspace directory containing the block receipt, on-chain checksum, and the Merkle structure.
+4. Saves a `record.json` file in the document's workspace directory (alongside the archive) containing the block receipt, on-chain checksum, and the Merkle structure.
 
 ### 3.6 Stake a Single Node (Optional)
 You can also anchor just **one specific XML element** (e.g., a critical lease rate or termination clause). Identify the element path (using `--xpath`) and stake it:

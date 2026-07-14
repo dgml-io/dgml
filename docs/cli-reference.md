@@ -1510,19 +1510,25 @@ success returns `{chain, registry, from, tx_hash, broadcast,
 receipt_status, block_number, explorer_url}`. `list` decodes the
 on-chain `registries` view.
 
-### `dgml stake file <file_id> [--docset <id>] --chain <name> --registry <name>`
+### `dgml stake file <file_id> [--docset <id>] [--unpacked] --chain <name> --registry <name>`
 
 Export the file's DGMLX bundle, anchor its Merkle root as the record
 checksum (URI `dgmlx://<file_id>[/<docset_id>]`), broadcast, await the
 receipt, then fetch and save the anchored record to `record.json` in the
-bundle dir. Success payload includes `checksum` (the Merkle root),
+output dir. Success payload includes `checksum` (the Merkle root),
 `uri`, `tx_hash`, `receipt_status`, `record`, `record_path`,
-`explorer_url`. `--output-dir` overrides the bundle location.
+`explorer_url`, and `bundle_dir` (the output directory). By default the
+bundle is written as a single portable `<stem>.dgmlx` archive whose path
+is reported in `dgmlx`; pass `--unpacked` to write the loose bundle tree
+instead, in which case the payload reports the loose attestation-file path
+in `attestation` (and no `dgmlx`). `--output-dir` overrides the output
+location (default `<workspace>/dgmlx-bundles/<ids>`); the archive (or loose
+tree) and `record.json` are written there.
 
-The saved file path is reported in `record_path`; keep it for offline
+The saved record path is reported in `record_path`; keep it for offline
 proving. Bundle records save as `record.json`; node records save as
 `record-node-<leaf>.json` so a file's bundle and its nodes never clobber
-each other in the shared bundle dir.
+each other in the shared output dir.
 
 ### `dgml stake node <file_id> --docset <id> (--leaf <n> | --xpath <expr>) --chain <name> --registry <name>`
 

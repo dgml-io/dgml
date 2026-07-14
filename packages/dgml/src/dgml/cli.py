@@ -881,7 +881,20 @@ def _add_chain_subparsers(
         type=Path,
         default=None,
         dest="output_dir",
-        help="Bundle dir (default <workspace>/dgmlx-bundles/<ids>).",
+        help=(
+            "Directory to write the <stem>.dgmlx archive (and record.json) into "
+            "(default <workspace>/dgmlx-bundles/<ids>)."
+        ),
+    )
+    st_file.add_argument(
+        "--unpacked",
+        action="store_true",
+        help=(
+            "Write the unpacked bundle tree (source/, page_images/, META-INF/, "
+            "[Content_Types].xml, _rels/, …) into --output-dir instead of the archive. "
+            "By default only the .dgmlx archive is written; these two modes are mutually "
+            "exclusive."
+        ),
     )
     _chain_config_arg(st_file)
     _add_write_args(st_file)
@@ -1289,6 +1302,7 @@ def _chain_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 config_path=cfg,
                 dry_run=args.dry_run,
                 legacy=args.legacy,
+                unpacked=args.unpacked,
                 service=args.keychain_service,
                 account=args.keychain_account,
             )
