@@ -411,8 +411,10 @@ def test_clustering_internal_incremental_without_docsets_raises(workspace: Works
 def test_load_clustering_preset_known(name: str) -> None:
     preset = load_clustering_preset(name)
     assert isinstance(preset, dict)
-    # Every preset is a complete, self-contained clustering config.
-    assert {"encoder_text", "fusion", "manifold", "scenario"} <= set(preset)
+    # Presets are lean override files deep-merged over the bundled defaults;
+    # they only spell out the keys that differ, so these are the ones common
+    # to every tier (each may also override the encoders on top).
+    assert {"fusion", "manifold", "scenario"} <= set(preset)
 
 
 def test_load_clustering_preset_unknown_raises() -> None:

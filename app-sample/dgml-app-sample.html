@@ -171,6 +171,9 @@
     .tree-tag { font-family: monospace; font-size: 12px; color: var(--dg-600); font-weight: 500; }
     .tree-preview { margin-left: 8px; font-size: 12px; color: #6b7280; }
     .tree-placeholder { font-size: 12px; color: #9ca3af; padding: 12px; font-style: italic; }
+    .computed-badge { display: inline-flex; align-items: center; margin-left: 6px; padding: 0 5px; border-radius: 3px; font-size: 10px; font-weight: 600; background: #f5f3ff; color: #7c3aed; border: 1px solid #ddd6fe; }
+    .tree-node-btn.computed .tree-tag { color: #7c3aed; }
+    .extraction-badge { display: inline-flex; align-items: center; margin-left: 6px; padding: 0 5px; border-radius: 3px; font-size: 10px; font-weight: 600; background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
 
     /* ── Anchor strip ────────────────────────────────────────── */
     .anchor-strip { flex-shrink: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 12px; border-top: 1px solid #e5e7eb; background: #fff; min-height: 36px; }
@@ -448,6 +451,10 @@ const RIGHT_COL_MAX = 640;
 // tag metrics cache for current file
 let _metrics = [];
 let _descDebounce = null;
+// computed-field index for current file: nodeId -> { hrefIds, hrefTargets, hrefTags }
+// (dg:origin="computed" elements — derived values with no page box of their own;
+// hrefTargets/hrefTags resolve their dg:href to the real grounded fields they came from)
+let _computedMap = new Map();
 
 function resetFileState() {
   S.fileId = null; S.docsetId = null; S.pageCount = 0;
@@ -456,7 +463,7 @@ function resetFileState() {
   S.selTag = null; S.selNodeId = null; S.hovTag = null; S.hovNodeId = null; S.basket = [];
   S.tagFilter = 'All'; S.tagSearch = ''; S.semanticMap = {};
   S.semanticLoading = false; S.semanticError = null; S.describeResults = null; S.describeLoading = false;
-  _metrics = [];
+  _metrics = []; _computedMap = new Map();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -766,6 +773,46 @@ function jumpToPage(page) {
   if (page && page !== S.currentPage) { S.currentPage = page; showPage(); }
 }
 
+// A dg:href value is a "; "-separated (React port also tolerates bare
+// whitespace) list of "#xml:id" references — same separator convention as
+// dg:origin's own multi-box lists.
+function parseHrefIds(href) {
+  return (href || '').split(/[;\s]+/).map(s => s.trim().replace(/^#/, '')).filter(Boolean);
+}
+
+// dg:origin="computed" marks a derived value (e.g. a computed total) that was
+// never read off the page — there is no box to draw for it. Its provenance is
+// carried by dg:href, which names the xml:id of each field it was computed
+// from. This walks the doc once to build xml:id -> nodeId (the same 'r/i0/i1'
+// scheme buildOverlaysByPage/buildTreeNodes use) so those references resolve
+// to real, groundable nodes.
+function buildComputedIndex(xmlStr) {
+  const doc = new DOMParser().parseFromString(xmlStr, 'application/xml');
+  if (doc.querySelector('parsererror')) return new Map();
+  const idToNodeId = new Map();
+  const nodeIdToTag = new Map();
+  const computedEntries = [];
+  function walk(el, nodeId) {
+    const xmlId = el.getAttribute('xml:id');
+    if (xmlId) idToNodeId.set(xmlId, nodeId);
+    nodeIdToTag.set(nodeId, el.tagName);
+    const origin = (el.getAttributeNS(DG_NS, 'origin') ?? el.getAttribute('dg:origin') ?? '').trim();
+    if (origin === 'computed') {
+      const href = el.getAttributeNS(DG_NS, 'href') ?? el.getAttribute('dg:href') ?? '';
+      computedEntries.push({ nodeId, hrefIds: parseHrefIds(href) });
+    }
+    for (let i = 0; i < el.children.length; i++) walk(el.children[i], `${nodeId}/${i}`);
+  }
+  walk(doc.documentElement, 'r');
+  const map = new Map();
+  for (const { nodeId, hrefIds } of computedEntries) {
+    const hrefTargets = hrefIds.map(id => idToNodeId.get(id)).filter(Boolean);
+    const hrefTags = hrefTargets.map(nid => stripNs(nodeIdToTag.get(nid) || '')).filter(Boolean);
+    map.set(nodeId, { hrefIds, hrefTargets, hrefTags });
+  }
+  return map;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // SVG OVERLAY
 // viewBox="0 0 100 100" + rects at percent coords + CSS inset:0 fill parent.
@@ -786,6 +833,11 @@ function renderOverlay() {
   const imgW = pgImg?.naturalWidth || 0;
   const imgH = pgImg?.naturalHeight || 0;
 
+  // If the current selection is a computed field, its own value has no box —
+  // highlight the real, grounded fields it was derived from instead.
+  const computedInfo = selNodeId ? _computedMap.get(selNodeId) : null;
+  const sourceNodeIds = computedInfo ? new Set(computedInfo.hrefTargets) : null;
+
   svg.innerHTML = rects.map(r => {
     if (!imgW || !imgH) return ''; // image not decoded yet; onload will re-render
     const x = r.x * 100 / imgW, y = r.y * 100 / imgH;
@@ -794,11 +846,13 @@ function renderOverlay() {
     // Exact React OR logic: selected = nodeId match OR tag match
     const isSel = (!!selNodeId && r.nodeId === selNodeId) || (!!selTag && tag === selTag);
     const isHov = !isSel && ((!!hovNodeId && r.nodeId === hovNodeId) || (!!hovTag && tag === hovTag));
-    const isBasket = !isSel && !isHov && basket.includes(tag);
+    const isSource = !isSel && !isHov && !!sourceNodeIds && sourceNodeIds.has(r.nodeId);
+    const isBasket = !isSel && !isHov && !isSource && basket.includes(tag);
 
     let fill, stroke, sw;
     if      (isSel)    { fill = 'rgba(40,160,94,0.25)';  stroke = 'rgb(30,116,68)';        sw = 0.28; }
     else if (isHov)    { fill = 'rgba(40,160,94,0.15)';  stroke = 'rgb(40,160,94)';        sw = 0.22; }
+    else if (isSource) { fill = 'rgba(168,85,247,0.18)'; stroke = 'rgb(147,51,234)';       sw = 0.24; }
     else if (isBasket) { fill = 'rgba(59,130,246,0.08)'; stroke = 'rgba(59,130,246,0.55)'; sw = 0.14; }
     else               { fill = 'transparent';            stroke = 'rgba(40,160,94,0.5)';   sw = 0.10; }
 
@@ -834,15 +888,19 @@ function updateOverlayStyles() {
   const svg = document.getElementById('pg-svg');
   if (!svg) return;
   const { selTag, selNodeId, hovTag, hovNodeId, basket } = S;
+  const computedInfo = selNodeId ? _computedMap.get(selNodeId) : null;
+  const sourceNodeIds = computedInfo ? new Set(computedInfo.hrefTargets) : null;
   svg.querySelectorAll('rect[data-tag]').forEach(rect => {
     const tag = rect.dataset.tag;
     const nid = rect.dataset.nid;
     const isSel = (!!selNodeId && nid === selNodeId) || (!!selTag && tag === selTag);
     const isHov = !isSel && ((!!hovNodeId && nid === hovNodeId) || (!!hovTag && tag === hovTag));
-    const isBasket = !isSel && !isHov && basket.includes(tag);
+    const isSource = !isSel && !isHov && !!sourceNodeIds && sourceNodeIds.has(nid);
+    const isBasket = !isSel && !isHov && !isSource && basket.includes(tag);
     let fill, stroke, sw;
     if      (isSel)    { fill = 'rgba(40,160,94,0.25)';  stroke = 'rgb(30,116,68)';        sw = 0.28; }
     else if (isHov)    { fill = 'rgba(40,160,94,0.15)';  stroke = 'rgb(40,160,94)';        sw = 0.22; }
+    else if (isSource) { fill = 'rgba(168,85,247,0.18)'; stroke = 'rgb(147,51,234)';       sw = 0.24; }
     else if (isBasket) { fill = 'rgba(59,130,246,0.08)'; stroke = 'rgba(59,130,246,0.55)'; sw = 0.14; }
     else               { fill = 'transparent';            stroke = 'rgba(40,160,94,0.5)';   sw = 0.10; }
     rect.setAttribute('fill', fill);
@@ -1813,6 +1871,7 @@ async function loadFileContent(fileId, docsetId, pageCount) {
     S.xmlStr = xmlStr;
     S.overlaysByPage = xmlStr ? buildOverlaysByPage(xmlStr) : new Map();
     _metrics = xmlStr ? computeTagMetrics(xmlStr) : [];
+    _computedMap = xmlStr ? buildComputedIndex(xmlStr) : new Map();
 
     refreshFilterBtns();
     refreshTagChips();
@@ -1823,7 +1882,7 @@ async function loadFileContent(fileId, docsetId, pageCount) {
     if (xmlStr && _metrics.length) runSemanticClassification(); // background, no await
   } catch (e) {
     console.error('loadFileContent error:', e);
-    S.xmlStr = null; S.overlaysByPage = new Map(); _metrics = [];
+    S.xmlStr = null; S.overlaysByPage = new Map(); _metrics = []; _computedMap = new Map();
     refreshFilterBtns(); refreshTagChips(); renderTreePanel(); renderAnchorStrip();
   }
 
@@ -1985,8 +2044,15 @@ function buildTreeNodes(el, id) {
   const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
   const preview = text.length > PREVIEW_MAX ? text.slice(0, PREVIEW_MAX - 1) + '…' : text;
   const originAttr = (el.getAttributeNS(DG_NS, 'origin') ?? el.getAttribute('dg:origin') ?? '').trim();
-  const hasBoxes = !!originAttr;
-  return { id, tag: el.tagName, preview, hasBoxes, children };
+  // dg:origin="computed" is a marker string, not a box — it has no page location
+  // of its own (see buildComputedIndex).
+  const isComputed = originAttr === 'computed';
+  const hasBoxes = !!originAttr && !isComputed;
+  // The one <dg:extraction> element (schema-driven field values, sibling of
+  // the generated document tree) — marked so it doesn't blend into the rest
+  // of the tree at a glance.
+  const isExtraction = el.tagName === 'dg:extraction';
+  return { id, tag: el.tagName, preview, hasBoxes, isComputed, isExtraction, children };
 }
 
 function defaultTreeExpanded(node, depth) {
@@ -2032,6 +2098,7 @@ function renderTreePanel() {
     const tag = btn.dataset.treeTag;
     const nid = btn.dataset.treeId || null;
     const hasBoxes = !!btn.dataset.hasBoxes;
+    const isComputed = !!btn.dataset.computed;
     btn.addEventListener('pointerenter', () => {
       S.hovNodeId = nid; S.hovTag = tag;
       refreshTagChips(); renderAnchorStrip(); renderOverlay();
@@ -2059,6 +2126,13 @@ function renderTreePanel() {
         } else {
           jumpToPage(nearestPageForNodeId(nid));
         }
+      } else if (isComputed && S.selNodeId === nid) {
+        // A computed value has no box of its own to jump to — jump to
+        // wherever its first source field lives instead; renderOverlay()
+        // highlights all of its sources once selNodeId is set.
+        const info = _computedMap.get(nid);
+        const firstTarget = info?.hrefTargets[0];
+        if (firstTarget) jumpToPage(nearestPageForNodeId(firstTarget));
       }
       refreshTagChips(); renderTreePanel(); renderAnchorStrip(); renderOverlay();
     });
@@ -2075,13 +2149,23 @@ function renderTreeNode(node, depth) {
   let btnCls = 'tree-node-btn';
   if (isSel) btnCls += ' tag-sel';
   else if (isHov) btnCls += ' tag-hov';
-  if (!node.hasBoxes) btnCls += ' no-boxes';
+  // Computed nodes have no box of their own but ARE clickable (they jump to
+  // their source fields instead) — only true boxless/unrooted nodes get the
+  // "not actionable" cursor.
+  if (!node.hasBoxes && !node.isComputed) btnCls += ' no-boxes';
+  if (node.isComputed) btnCls += ' computed';
   let h = `<div class="tree-node-wrap"><div class="tree-node-row" style="padding-left:${indent}px">`;
   h += hasKids
     ? `<span class="tree-toggle" data-toggle="${esc(node.id)}">${expanded ? '▾' : '▸'}</span>`
     : `<span class="tree-toggle invisible">▸</span>`;
-  h += `<button class="${btnCls}" data-tree-tag="${esc(tag)}" data-tree-id="${esc(node.id)}" data-has-boxes="${node.hasBoxes ? '1' : ''}">`;
+  h += `<button class="${btnCls}" data-tree-tag="${esc(tag)}" data-tree-id="${esc(node.id)}" data-has-boxes="${node.hasBoxes ? '1' : ''}" data-computed="${node.isComputed ? '1' : ''}">`;
   h += `<span class="tree-tag">${esc(tag)}</span>`;
+  if (node.isComputed) {
+    const info = _computedMap.get(node.id);
+    const title = info && info.hrefTags.length ? `Computed from: ${info.hrefTags.join(', ')}` : 'Computed value — source fields not resolved';
+    h += `<span class="computed-badge" title="${esc(title)}">Σ computed</span>`;
+  }
+  if (node.isExtraction) h += `<span class="extraction-badge" title="Schema-driven extracted field values">extraction</span>`;
   if (node.preview) h += `<span class="tree-preview">${esc(node.preview)}</span>`;
   h += `</button></div>`;
   if (hasKids && expanded) {

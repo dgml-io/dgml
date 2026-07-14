@@ -53,6 +53,22 @@ def _normalize(text: str) -> str:
     return " ".join(text.split())
 
 
+def _collapse(text: str) -> str:
+    """Collapse internal whitespace runs to single spaces, preserving one
+    leading/trailing space when present; '' for all-whitespace input.
+
+    Unlike _normalize, this keeps the boundary space that separates an inline
+    element (e.g. a span) from its neighbours, while still dropping the
+    pretty-print indentation between block elements.
+    """
+    core = " ".join(text.split())
+    if not core:
+        return ""
+    lead = " " if text[0].isspace() else ""
+    trail = " " if text[-1].isspace() else ""
+    return f"{lead}{core}{trail}"
+
+
 def _all_text(element: ET.Element) -> str:
     return "".join(element.itertext())
 
@@ -82,7 +98,14 @@ def _render_element(
     out: list[str],
     parent_structure: str | None = None,
     depth: int = 0,
-) -> None:
+) -> bool:
+    """Render *element* into *out*; return True if it rendered as a block.
+
+    The return value lets the caller decide how to place this element's tail:
+    a block child's tail goes on its own indented line, while an inline child's
+    tail stays in the same text flow (so a following comma hugs the element and
+    source spacing is preserved).
+    """
     structure = element.attrib.get(_STRUCTURE)
     style = element.attrib.get(_STYLE)
     style_attr = f' style="{html_mod.escape(style)}"' if style else ""
@@ -91,7 +114,7 @@ def _render_element(
         text = _normalize(_all_text(element))
         if text:
             out.append(html_mod.escape(text) + " ")
-        return
+        return False
 
     if structure in _STRUCTURE_TO_TAG:
         tag = _STRUCTURE_TO_TAG[structure]
@@ -109,7 +132,7 @@ def _render_element(
         out.append(f"<{tag}{style_attr}>")
 
     if element.text:
-        text = _normalize(element.text)
+        text = _collapse(element.text)
         if text:
             if is_block:
                 out.append(f"\n{child_indent}{html_mod.escape(text)}")
@@ -117,21 +140,40 @@ def _render_element(
                 out.append(html_mod.escape(text))
 
     for child in element:
-        child_structure = child.attrib.get(_STRUCTURE)
-        _render_element(child, out, parent_structure=structure, depth=child_depth)
-        if child.tail:
-            tail = _normalize(child.tail)
+        child_is_block = _render_element(child, out, parent_structure=structure, depth=child_depth)
+        if not child.tail:
+            continue
+        tail = _collapse(child.tail)
+        if is_block and child_is_block:
+            # Block child: its tail opens a fresh indented line. A whitespace-only
+            # tail is just pretty-print indentation between blocks, so drop it.
             if tail:
-                # After a lim, keep tail inline — it's part of the same text flow.
-                if is_block and child_structure != "lim":
-                    out.append(f"\n{child_indent}{html_mod.escape(tail)}")
-                else:
-                    out.append(html_mod.escape(tail))
+                out.append(f"\n{child_indent}{html_mod.escape(tail)}")
+        elif child.attrib.get(_STRUCTURE) == "lim":
+            # A lim already appended its own trailing space, so drop any leading
+            # whitespace from its tail (and add nothing for a whitespace-only
+            # tail) to leave exactly one space after the marker.
+            tail = tail.lstrip(" ")
+            if tail:
+                out.append(html_mod.escape(tail))
+        elif tail:
+            # Inline child: keep the tail in the same text flow so the source's own
+            # spacing is preserved — a leading space, or none before punctuation.
+            out.append(html_mod.escape(tail))
+        else:
+            # Inline child with a whitespace-only tail — e.g. sibling spans placed
+            # on separate source lines. The (empty tail) collapse means there was
+            # no real space, but the newline still separates two inline tokens, so
+            # emit a single space. A genuinely glued run has an empty tail (handled
+            # by the `continue` above) and stays glued.
+            out.append(" ")
 
     if is_block:
         out.append(f"\n{indent}</{tag}>")
     else:
         out.append(f"</{tag}>")
+
+    return is_block
 
 
 def _to_html(source: str) -> str:
