@@ -166,7 +166,7 @@ failed operations.
 > (derived from it at add time) are checked as usual; if the converted PDF is
 > gone, generation falls back to re-converting from the original.
 
-### `dgml cluster [--skip-existing] [--config PRESET|PATH] [--mode auto|fresh|incremental]`
+### `dgml cluster [--skip-existing] [--config PRESET|PATH] [--mode auto|fresh|incremental] [--method auto|embedding|llm] [--small-corpus-threshold N]`
 
 Requires `pip install dgml[clustering]`. The extra pulls in the
 `dgml-clustering` workspace package and its ML stack (embedding models,
@@ -181,9 +181,10 @@ one file is still unassigned) the command clusters as normal and reports
 `skipped: false`.
 
 `--config PRESET|PATH` selects the clustering configuration for this run.
-It is either a **bundled preset name** — `light` (CPU-only tf-idf + Leiden/
-UMAP; the default), `medium` (dense `bge` sentence encoder, large CPU / Apple
-MPS), or `heavy` (large dense `e5` encoder + HDBSCAN, GPU) — or a **path** to a
+It is either a **bundled preset name** — `small` (CPU-only tf-idf + Leiden, no
+UMAP; for tiny corpora), `light` (CPU-only tf-idf + Leiden/UMAP; the default),
+`medium` (tf-idf text fused with a 2B vision encoder, large CPU / Apple MPS),
+or `heavy` (8B vision encoder alone + Leiden/UMAP, GPU) — or a **path** to a
 standalone clustering config JSON. The JSON holds the same fields as the
 `clustering` section of `<workspace>/config.json` (`encoder_text`,
 `encoder_image`, `fusion`, `manifold`, `training`, `scenario`); it is
@@ -208,6 +209,34 @@ run.
   `INCREMENTAL_WITHOUT_CLUSTERS`.
 - `auto` — resolves to `incremental` when the workspace already has DocSets,
   else `fresh`.
+
+`--method auto|embedding|llm` selects *how* documents are grouped, orthogonal
+to `--mode` (default `embedding`):
+
+- `embedding` — the statistical pipeline (encode → project → cluster) described
+  below. The right choice once a corpus is large enough for tf-idf / neighbor
+  statistics to be meaningful.
+- `llm` — send **every** document's rendered first pages to the vision LLM in a
+  single call and let it partition them by document type. Built for **very small
+  corpora**, where the embedding pipeline has too little signal to cluster
+  reliably (tf-idf has almost nothing to weight, k-NN graphs are dominated by
+  noise). The model partitions *and* names emergent groups in the one call, so
+  no second per-cluster naming round-trip is needed. `--config` is ignored on
+  this path (there is no embedding pipeline to configure).
+- `auto` — route to `llm` when at most `--small-corpus-threshold` files are
+  clusterable, else `embedding`.
+
+`--small-corpus-threshold N` (default `8`) is the cutoff `--method auto` uses:
+corpora of at most `N` clusterable files go to the LLM partitioner, larger ones
+to the embedding pipeline. Ignored for `--method embedding` / `--method llm`.
+
+Both `--method llm` and `--method auto` (when it routes to the LLM) require the
+same `classification` config as `--auto-classify` (see "Auto-classification"
+above) — the LLM partitioner *is* the classifier's vision machinery. A missing
+`classification` section makes the LLM path soft-fail: every clusterable file
+lands in `failed_file_ids`. The LLM path caps a single call at 24 files; any
+beyond that are reported in `failed_file_ids` so you can fall back to the
+embedding pipeline for larger corpora.
 
 Cluster files not currently assigned to any DocSet, and **assign each
 clustered file to a DocSet**. Runs in two passes:
@@ -1492,19 +1521,25 @@ success returns `{chain, registry, from, tx_hash, broadcast,
 receipt_status, block_number, explorer_url}`. `list` decodes the
 on-chain `registries` view.
 
-### `dgml stake file <file_id> [--docset <id>] --chain <name> --registry <name>`
+### `dgml stake file <file_id> [--docset <id>] [--unpacked] --chain <name> --registry <name>`
 
 Export the file's DGMLX bundle, anchor its Merkle root as the record
 checksum (URI `dgmlx://<file_id>[/<docset_id>]`), broadcast, await the
 receipt, then fetch and save the anchored record to `record.json` in the
-bundle dir. Success payload includes `checksum` (the Merkle root),
+output dir. Success payload includes `checksum` (the Merkle root),
 `uri`, `tx_hash`, `receipt_status`, `record`, `record_path`,
-`explorer_url`. `--output-dir` overrides the bundle location.
+`explorer_url`, and `bundle_dir` (the output directory). By default the
+bundle is written as a single portable `<stem>.dgmlx` archive whose path
+is reported in `dgmlx`; pass `--unpacked` to write the loose bundle tree
+instead, in which case the payload reports the loose attestation-file path
+in `attestation` (and no `dgmlx`). `--output-dir` overrides the output
+location (default `<workspace>/dgmlx-bundles/<ids>`); the archive (or loose
+tree) and `record.json` are written there.
 
-The saved file path is reported in `record_path`; keep it for offline
+The saved record path is reported in `record_path`; keep it for offline
 proving. Bundle records save as `record.json`; node records save as
 `record-node-<leaf>.json` so a file's bundle and its nodes never clobber
-each other in the shared bundle dir.
+each other in the shared output dir.
 
 ### `dgml stake node <file_id> --docset <id> (--leaf <n> | --xpath <expr>) --chain <name> --registry <name>`
 

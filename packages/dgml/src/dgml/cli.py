@@ -295,9 +295,9 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PRESET|PATH",
         default=None,
         help="Clustering configuration for this run. Either a bundled preset "
-        "name (light | medium | heavy) or a path to a standalone config JSON "
-        "(same shape as the 'clustering' section of <workspace>/config.json — "
-        "e.g. encoder_text, encoder_image, fusion, scenario). Replaces the "
+        "name (small | light | medium | heavy) or a path to a standalone config "
+        "JSON (same shape as the 'clustering' section of <workspace>/config.json "
+        "— e.g. encoder_text, encoder_image, fusion, scenario). Replaces the "
         "workspace config's clustering section for this run. Defaults to the "
         "workspace config, or the bundled light preset when none is set.",
     )
@@ -311,6 +311,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "clusters, open new clusters for the rest) and fresh clustering "
         "otherwise. 'fresh' always clusters from scratch; 'incremental' forces "
         "the incremental path and errors if no DocSets exist yet.",
+    )
+    cluster_p.add_argument(
+        "--method",
+        dest="method",
+        choices=("auto", "embedding", "llm"),
+        default="embedding",
+        help="How documents are grouped, orthogonal to --mode. 'embedding' "
+        "(default) uses the statistical encode → project → cluster pipeline — "
+        "the right choice once a corpus is large enough for tf-idf / neighbor "
+        "statistics to be meaningful. 'llm' sends every document's page images "
+        "to the vision LLM in one call and lets it partition them — built for "
+        "very small corpora where the embedding pipeline has too little signal. "
+        "'auto' picks 'llm' when at most --small-corpus-threshold files are "
+        "clusterable, else 'embedding'. Both 'llm' and 'auto' (when it routes "
+        "to the LLM) need the same `classification` config as --auto-classify.",
+    )
+    cluster_p.add_argument(
+        "--small-corpus-threshold",
+        dest="small_corpus_threshold",
+        type=int,
+        metavar="N",
+        # Keep in sync with dgml_core.clustering.SMALL_CORPUS_MAX_FILES (8).
+        default=8,
+        help="With --method auto, route corpora of at most N clusterable files "
+        "to the LLM partitioner, and larger ones to the embedding pipeline "
+        "(default 8). Ignored for --method embedding / llm.",
     )
 
     docset = sub.add_parser("docset", parents=[common], help="DocSet management.").add_subparsers(
@@ -858,7 +884,20 @@ def _add_chain_subparsers(
         type=Path,
         default=None,
         dest="output_dir",
-        help="Bundle dir (default <workspace>/dgmlx-bundles/<ids>).",
+        help=(
+            "Directory to write the <stem>.dgmlx archive (and record.json) into "
+            "(default <workspace>/dgmlx-bundles/<ids>)."
+        ),
+    )
+    st_file.add_argument(
+        "--unpacked",
+        action="store_true",
+        help=(
+            "Write the unpacked bundle tree (source/, page_images/, META-INF/, "
+            "[Content_Types].xml, _rels/, …) into --output-dir instead of the archive. "
+            "By default only the .dgmlx archive is written; these two modes are mutually "
+            "exclusive."
+        ),
     )
     _chain_config_arg(st_file)
     _add_write_args(st_file)
@@ -1070,6 +1109,8 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 skip_existing=getattr(args, "skip_existing", False),
                 config=getattr(args, "config", None),
                 mode=getattr(args, "mode", "auto"),
+                method=getattr(args, "method", "embedding"),
+                small_corpus_threshold=getattr(args, "small_corpus_threshold", 8),
                 debug=args.debug,
             ),
             fmt,
@@ -1264,6 +1305,7 @@ def _chain_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 config_path=cfg,
                 dry_run=args.dry_run,
                 legacy=args.legacy,
+                unpacked=args.unpacked,
                 service=args.keychain_service,
                 account=args.keychain_account,
             )

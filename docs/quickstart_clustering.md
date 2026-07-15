@@ -152,6 +152,38 @@ Response (truncated):
 }
 ```
 
+### Only a handful of documents?
+
+The embedding pipeline above needs a corpus large enough for its statistics to
+mean something — tf-idf has almost nothing to weight on a few documents, k-NN
+graphs are dominated by noise, and clusters collapse into one bucket (or all
+noise). For very small corpora, skip embeddings entirely and let the vision LLM
+partition the documents directly:
+
+```bash
+dgml cluster --method llm
+```
+
+`--method llm` sends every document's rendered first pages to the LLM in a
+single call and asks it to group them by document type, then names each
+emergent group — the same vision machinery `dgml file add --auto-classify`
+uses, so it needs the same `classification` section in `<workspace>/config.json`
+(without it, every file lands in `failed_file_ids`). It partitions *and* names
+in one round-trip, and a single call covers up to 24 files.
+
+Prefer `--method auto` to let DGML choose: it routes corpora of at most
+`--small-corpus-threshold` files (default 8) to the LLM and larger ones to the
+embedding pipeline — the right default for a folder whose size you don't know
+up front.
+
+```bash
+dgml cluster --method auto                          # LLM for ≤8 files, else embedding
+dgml cluster --method auto --small-corpus-threshold 12   # raise the cutoff
+```
+
+The `--method embedding` default (used by the plain `dgml cluster` above) is
+unchanged, so existing large-corpus runs behave exactly as before.
+
 ## 5. Tune the clustering (optional)
 
 The defaults cluster a folder sensibly out of the box; everything here is
@@ -164,7 +196,7 @@ schema:
 - **Per run** — `dgml cluster --config PATH` points at a standalone JSON
   with the same fields (drop the `clustering` wrapper); it *replaces* the
   section for that run. `--config` also accepts a bundled preset **name**
-  (`light` / `medium` / `heavy`).
+  (`small` / `light` / `medium` / `heavy`).
 
 ```jsonc
 // <workspace>/config.json — change only what you need
@@ -189,14 +221,21 @@ state, so overriding those is ignored — but every algorithm knob
 ### Compute presets
 
 Each preset is a complete, self-contained config tuned for a hardware
-budget. Higher tiers use a stronger (denser) text encoder — better
-separation, more compute.
+budget. Higher tiers add **image/vision embeddings** for better separation
+at the cost of more compute (and a model download / GPU).
 
-| Preset | Target hardware | Text encoder | Clustering |
+| Preset | Target hardware | Representation | Clustering |
 |---|---|---|---|
-| `light` (default) | CPU-only | `tfidf`, 256-d | Leiden + UMAP |
-| `medium` | large CPU / Apple MPS | `bge-small`, 384-d | Leiden + UMAP |
-| `heavy` | GPU | `e5-large`, 1024-d | HDBSCAN + UMAP |
+| `small` | CPU-only, tiny corpora | `tfidf` text, 256-d | Leiden, no UMAP |
+| `light` (default) | CPU-only | `tfidf` text, 256-d | Leiden + UMAP |
+| `medium` | large CPU / Apple MPS | `tfidf` text + 2B vision, fused 1280-d | Leiden + UMAP |
+| `heavy` | GPU | 8B vision only, 1024-d | Leiden + UMAP |
+
+`small` drops UMAP (`reduce_method: none`) and uses a small k-NN graph
+(`k=5`) — meant for corpora too small for UMAP to help. `medium` fuses the
+tf-idf text vector with a `Qwen3-VL-Embedding-2B` image embedding
+(`fusion: concat_norm`); `heavy` clusters on the larger
+`Qwen3-VL-Embedding-8B` image embedding alone.
 
 ```bash
 dgml cluster --config medium
@@ -217,7 +256,7 @@ under its config section (e.g. `scenario.leiden_resolution`,
 
 | Parameter (section) | What it controls | Default | Raise / switch up when… | Lower / switch down when… |
 |---|---|---|---|---|
-| `encoder_text.name` | Text embedding model. `tfidf` (bag-of-words, fast, CPU) vs dense sentence encoders `bge` / `e5` / `gte` (semantic, need a model download). | `tfidf` | Categories differ by *meaning*, not vocabulary; short docs; TF-IDF under-separates. Move to `bge` (→ `medium`) or `e5` (→ `heavy`). | You want zero downloads / CPU-only speed and the vocabularies are already distinctive. |
+| `encoder_text.name` | Text embedding model. `tfidf` (bag-of-words, fast, CPU) vs dense sentence encoders `bge` / `e5` / `gte` (semantic, need a model download). | `tfidf` | Categories differ by *meaning*, not vocabulary; short docs; TF-IDF under-separates. Switch to a dense encoder (`bge` / `e5`), or add a vision encoder as the `medium` / `heavy` presets do. | You want zero downloads / CPU-only speed and the vocabularies are already distinctive. |
 | `encoder_text.embedding_dim` + `manifold.dim` | Vector width. Must match the encoder (`tfidf` 256, `bge` 384, `e5` 1024). Keep these two equal. | 256 | Switching to a wider encoder. | Switching to a narrower encoder. |
 | `encoder_text.extra.text_view` | Which text is embedded: `page1` (first page only) or the full document. | `page1` | The first page doesn't characterize the doc (cover pages, boilerplate); use full text. | First pages are highly distinctive (forms, letterheads) — cheaper and less noisy. |
 
@@ -238,9 +277,10 @@ knob to reach for is `leiden_resolution`.*
 | `leiden_graph_method` | Graph construction: `knn`, `mutual_knn` (stricter, drops one-way edges), `radius`. | `knn` | Use `mutual_knn` to break weak bridges when unrelated docs get glued together. | Stay on `knn` for well-connected small corpora. |
 | `leiden_min_cluster_size` | Communities smaller than this are dropped to the noise bucket (`-1`). | `2` | Raise to suppress tiny splinter clusters. | Set to `1` to keep every singleton community. |
 
-**HDBSCAN — density-based, the `heavy` preset's algorithm**
+**HDBSCAN — density-based, an alternative to Leiden**
 (`scenario.*`, active when `cluster_algorithm: hdbscan`). Non-parametric
-in cluster count; routes low-density docs to a noise bucket.
+in cluster count; routes low-density docs to a noise bucket. All bundled
+presets use Leiden, but HDBSCAN pairs well with dense (vision) encoders.
 
 | Parameter | What it controls | Default | Raise it when… | Lower it when… |
 |---|---|---|---|---|

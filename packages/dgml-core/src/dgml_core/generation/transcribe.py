@@ -15,8 +15,6 @@
 Per document: disjoint page windows, one LLM call each, JSON out. Merging is
 list concatenation; a window that starts mid-sentence returns the remainder
 in `continues`, which is appended to the previous window's last text block.
-No overlap pages, no dedup, no XML repair — the contract makes those
-concepts inapplicable.
 """
 
 from __future__ import annotations

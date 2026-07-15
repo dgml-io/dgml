@@ -39,6 +39,7 @@ from .storage import Workspace
 
 # Operation identifiers — keep these stable; the UX filters by them.
 OPERATION_CLASSIFY = "classify"
+OPERATION_CLUSTER = "cluster"
 OPERATION_SCHEMA_GENERATE = "schema_generate"
 OPERATION_EXTRACT_VALUES = "extract_values"
 OPERATION_HYBRID_MERGE = "hybrid_merge"

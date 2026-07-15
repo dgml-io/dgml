@@ -35,9 +35,10 @@ _CONCEPT_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
 
 # Structural/discourse words carry no semantics — the block's `structure`
 # field already says what shape the content has. A concept ending in one of
-# these is the suffix-conflation the format analysis measured at ~70% of all
-# tag variation; stripping is deterministic and replay-safe. A concept that
-# is ONLY structural words normalizes to '' (i.e. unlabeled).
+# these is a common source of spurious tag variation — the same role labeled
+# with and without a structural suffix; stripping is deterministic and
+# replay-safe. A concept that is ONLY structural words normalizes to ''
+# (i.e. unlabeled).
 _STRUCTURAL_SUFFIX_RE = re.compile(
     r"(Sections?|Subsections?|SubSections?|Clauses?|Paragraphs?|Items?|Lists?|"
     r"Headings?|Titles?|Texts?|Blocks?|Contents?|Body|Lines?|Rows?|Entry|"
@@ -108,6 +109,12 @@ class Block:
     lim_concept: str = ""
     cells: list[str] = field(default_factory=list)
     label: str = ""
+    # Field blocks only: a printed CHOICE GROUP (checkboxes/radio). `options`
+    # are the printed choice labels in reading order; `checked` the subset
+    # whose box carries a mark. The mark character itself (X, tick) is never
+    # content. `value` remains the single-selection convenience.
+    options: list[str] = field(default_factory=list)
+    checked: list[str] = field(default_factory=list)
     # Field blocks only: inline entity spans WITHIN the label text. A packed
     # "label" often carries real values (a code and a name in one line); the
     # renderer wraps each span so they stay tagged. Unlike value spans there is
@@ -132,6 +139,14 @@ class Block:
     # transcribed cell count disagrees with the labeler's column model.
     cell_entities: list[list[Span]] = field(default_factory=list)
     group_concept: str = ""
+    # Row blocks only, set by propagate_table_consistency. `header_row` marks a
+    # demoted printed-title row so the renderer emits its cells as `ColumnHeader`
+    # structure-td elements; `kv_table` marks the rows of a key-value run (no
+    # column concept repeats across data rows) so the renderer emits a uniform
+    # generic td with the value concept as an inner span — a stable td localname
+    # (no per-column tag collision) that still keeps the leaf concept tag.
+    header_row: bool = False
+    kv_table: bool = False
 
     def flat_text(self) -> str:
         """Every character this block contributes to the document."""
@@ -151,10 +166,18 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
     cells = [str(c) for c in raw.get("cells", []) or []]
     label = str(raw.get("label", "") or "")
     value = str(raw.get("value", "") or "")
+    options = [str(o).strip() for o in raw.get("options", []) or [] if str(o).strip()]
+    checked = [str(c).strip() for c in raw.get("checked", []) or [] if str(c).strip()]
+    if options:
+        # a selection can only be one of the PRINTED choices — a checked
+        # entry outside the options is a hallucinated mark and is dropped
+        checked = [c for c in checked if c in options]
+    if not value and len(checked) == 1:
+        value = checked[0]
     # A lim alone is content: numbered-but-untitled headings ("6.4.1" + body)
     # must survive, or the sub-section they open is silently flattened.
     lim = str(raw.get("lim", "") or "").strip()
-    if not text and not cells and not (label or value) and not lim:
+    if not text and not cells and not (label or value) and not options and not lim:
         return None
     try:
         level = max(1, min(6, int(raw.get("level", 1))))
@@ -169,6 +192,8 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
         cells=cells,
         label=label,
         value=value,
+        options=options,
+        checked=checked,
     )
 
 

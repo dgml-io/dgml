@@ -16,6 +16,9 @@
                                           — one table row, one string per cell
   - {"structure": "field", "lim": "<printed item no.>", "label": "...",
      "value": "..."}                      — one label/value form line
+  - {"structure": "field", "label": "<group caption>",
+     "options": ["...", "..."], "checked": ["..."]}
+                                          — one checkbox/radio CHOICE GROUP
 
   Rules:
   1. Copy text verbatim. Never paraphrase, never skip, never re-order.
@@ -27,7 +30,14 @@
      if "2" is level 2 then "2.1" is level 3 and "2.1.1" level 4; lettered or
      roman sub-headings sit one level below the heading that contains them.
   4. Exclude only repeated page decorations (page numbers, running headers).
-  5. Output JSON only: {"continues": "...", "blocks": [...]}.
+  5. A checkbox/radio group is ONE field block: `options` lists the printed
+     choice labels in reading order; `checked` lists the labels whose box
+     carries a mark (X, tick, filled). NEVER output the mark character
+     itself as text or a cell. A mark printed directly beside a label
+     ("X COLL") means that label is checked. An unmarked group still
+     transcribes, with "checked": []. A printed label whose box/line is
+     blank still transcribes as a field with "value": "".
+  6. Output JSON only: {"continues": "...", "blocks": [...]}.
      `continues` holds text that finishes the PREVIOUS window's final block
      when your first page starts mid-sentence; otherwise "".
   6. A paragraph that begins with a printed enumerator and has at least one

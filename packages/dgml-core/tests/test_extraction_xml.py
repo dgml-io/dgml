@@ -200,6 +200,16 @@ def test_choice_scalar_branch() -> None:
     assert dgml_xml_to_values(xml, vocab=vocab)["TotalCredits"]["value"] == "181"
 
 
+def test_integer_strips_thousands_separator() -> None:
+    """An xsd:integer with a grouped source like '8,500' normalizes to '8500',
+    not '8' (regression: the integer branch used to match \\d+ before the comma)."""
+    vocab = parse_rnc(_CHOICE_RNC)
+    values = {"TotalCredits": {"text": "8,500", "locations": []}}
+    xml = standalone_extraction_doc(values, vocab=vocab)
+    assert '<docset:TotalCredits xsi:type="integer" dg:value="8500"' in xml
+    assert dgml_xml_to_values(xml, vocab=vocab)["TotalCredits"]["value"] == "8500"
+
+
 def test_choice_range_branch() -> None:
     """The group alternative: a MinTotalCredits/MaxTotalCredits pair of integers."""
     vocab = parse_rnc(_CHOICE_RNC)

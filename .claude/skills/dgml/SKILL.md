@@ -563,6 +563,22 @@ A/B configs or drive a GPU encoder on a single run without editing
 uv run dgml cluster --config ./clustering_gpu.json
 ```
 
+`--method` selects *how* documents are grouped, orthogonal to `--mode`
+(default `embedding`, the statistical pipeline). For a **very small corpus** —
+a handful of documents, where tf-idf/neighbor statistics have too little signal
+and clusters collapse into one bucket — use `--method llm`: it sends every
+document's first pages to the vision LLM in one call and lets it partition *and*
+name the groups (no embedding step, `--config` ignored). It needs the same
+`classification` config as `--auto-classify` (missing config ⇒ every file in
+`failed_file_ids`) and caps one call at 24 files. Prefer `--method auto` when
+the corpus size is unknown: it routes ≤ `--small-corpus-threshold` files
+(default 8) to the LLM and larger corpora to the embedding pipeline.
+
+```bash
+# Let DGML pick the engine by corpus size (LLM for tiny folders, embedding otherwise)
+uv run dgml cluster --method auto
+```
+
 Sample payload:
 
 ```json

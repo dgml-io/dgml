@@ -724,8 +724,93 @@ def test_cluster_config_preset_name_passes_preset_overrides(
         rc = main(_ws_args(ws) + ["cluster", "--config", "medium"])
     assert rc == 0
     overrides = mock_cluster.call_args.kwargs["overrides"]
-    # The medium preset uses the dense bge text encoder.
-    assert overrides["encoder_text"]["name"] == "bge"
+    # The medium preset fuses a dense image encoder into the text signal —
+    # distinct from the default light preset (image "dummy" / fusion "none").
+    assert overrides["encoder_image"]["name"] == "qwen3_vl_embedding_2b"
+    assert overrides["fusion"]["name"] == "concat_norm"
+
+
+def _llm_partition(fid: str) -> Any:
+    """A one-cluster LLMClusteringResult that names its emergent bucket in the
+    same call (so clustering() needs no second naming round-trip)."""
+    from dgml_core.classification import ClassificationDecision
+    from dgml_core.llm_clustering import LLMClusteringResult
+
+    return LLMClusteringResult(
+        clusters={fid: "unknown_0"},
+        proposals={
+            "unknown_0": ClassificationDecision(
+                decision="new",
+                new_name="Sample Documents",
+                new_description="test docs",
+                new_key_questions=("What is this document about?",),
+            )
+        },
+        failed_file_ids=[],
+    )
+
+
+@needs_gs
+def test_cluster_method_llm_routes_to_llm_partitioner(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cluster --method llm` sends the corpus to the vision-LLM partitioner
+    (never the embedding pipeline) and creates DocSets from the proposals it
+    returns in a single call."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-3.1-flash-lite", "max_pages": 1}
+    )
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    with (
+        patch(
+            "dgml_core.clustering.llm_cluster_files", return_value=_llm_partition(fid)
+        ) as mock_llm,
+        patch("dgml_core.clustering.run_clustering_detailed") as mock_embed,
+    ):
+        rc = main(_ws_args(ws) + ["cluster", "--method", "llm"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["clusters"] == {fid: "Sample Documents"}
+    assert payload["failed_file_ids"] == []
+    assert payload["n_new_clusters"] == 1
+    # The LLM partitioner ran; the embedding pipeline was never touched.
+    mock_llm.assert_called_once()
+    mock_embed.assert_not_called()
+
+
+@needs_gs
+def test_cluster_method_auto_small_corpus_uses_llm(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cluster --method auto` routes a corpus at/below --small-corpus-threshold
+    to the LLM partitioner rather than the embedding pipeline."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-3.1-flash-lite", "max_pages": 1}
+    )
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    # One clusterable file, threshold 8 → auto resolves to the LLM partitioner.
+    with (
+        patch(
+            "dgml_core.clustering.llm_cluster_files", return_value=_llm_partition(fid)
+        ) as mock_llm,
+        patch("dgml_core.clustering.run_clustering_detailed") as mock_embed,
+    ):
+        rc = main(_ws_args(ws) + ["cluster", "--method", "auto", "--small-corpus-threshold", "8"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["clusters"] == {fid: "Sample Documents"}
+    mock_llm.assert_called_once()
+    mock_embed.assert_not_called()
 
 
 @needs_gs
@@ -2629,8 +2714,9 @@ def test_stake_file_dry_run_does_not_broadcast(
     monkeypatch.setattr("dgml_chain.signer.load_key", lambda service="", account="": _TEST_KEY)
 
     # Stub the local export so the test needs no real PDF/artifacts. Mirrors
-    # export_attestation's signature: (attestation, attestation_path, archive_path);
-    # staking calls it with unpacked=True, so the loose attestation path is set.
+    # export_attestation's signature and mode contract: (attestation,
+    # attestation_path, archive_path) with exactly one of the paths set —
+    # the archive by default, the loose attestation path under --unpacked.
     def _fake_export(  # type: ignore[no-untyped-def]
         ws: Any,
         file_id: str,
@@ -2640,7 +2726,9 @@ def test_stake_file_dry_run_does_not_broadcast(
         unpacked: bool = False,
     ):
         attestation = SimpleNamespace(root="deadbeef", leaves=[1, 2, 3])
-        return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        if unpacked:
+            return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        return attestation, None, out_dir / "doc.dgmlx"
 
     monkeypatch.setattr("dgml_core.staking.export_attestation", _fake_export)
 
@@ -2666,8 +2754,60 @@ def test_stake_file_dry_run_does_not_broadcast(
     assert out["uri"] == "dgmlx://f00000"
     assert out["signed_tx"].startswith("0x")
     assert "unsigned_tx" in out
+    # Default is the portable archive: payload carries `dgmlx`, not `attestation`.
+    assert out["dgmlx"].endswith("doc.dgmlx")
+    assert "attestation" not in out
     # Crucially: nothing was sent to the chain.
     assert fake.broadcast == []
+
+
+def test_stake_file_unpacked_reports_loose_attestation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    fake = _FakeRpc()
+    monkeypatch.setattr("dgml_core.staking.EvmRpc", lambda *a, **k: fake)
+    monkeypatch.setattr("dgml_chain.signer.load_key", lambda service="", account="": _TEST_KEY)
+
+    def _fake_export(  # type: ignore[no-untyped-def]
+        ws: Any,
+        file_id: str,
+        out_dir: Path,
+        docset_id: str | None = None,
+        *,
+        unpacked: bool = False,
+    ):
+        attestation = SimpleNamespace(root="deadbeef", leaves=[1, 2, 3])
+        if unpacked:
+            return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        return attestation, None, out_dir / "doc.dgmlx"
+
+    monkeypatch.setattr("dgml_core.staking.export_attestation", _fake_export)
+
+    rc = main(
+        _ws_args(ws)
+        + [
+            "stake",
+            "file",
+            "f00000",
+            "--chain",
+            "nvnm-testnet",
+            "--registry",
+            "myreg",
+            "--from",
+            _test_addr(),
+            "--dry-run",
+            "--unpacked",
+        ]
+    )
+    assert rc == 0
+    out = _read_stdout(capsys)
+    # --unpacked surfaces the loose attestation path and no archive.
+    assert out["attestation"].endswith("dgml-attestation.xml")
+    assert "dgmlx" not in out
 
 
 def test_prove_file_missing_record_json_is_structured_error(
