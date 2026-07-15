@@ -40,6 +40,7 @@ name DocSets for unmatched clusters.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from importlib import resources
@@ -107,6 +108,56 @@ CLUSTER_METHODS: tuple[str, ...] = get_args(ClusterMethod)
 # bigger corpora, where embeddings start to pay off, take the statistical
 # path.
 SMALL_CORPUS_MAX_FILES = 8
+
+# The three composable novelty gates on ``ScenarioConfig`` (see
+# ``clustering.config.schema``). A document is routed to the "unknown" bucket
+# — i.e. treated as *novel* and allowed to open a new DocSet — iff any active
+# gate flags it. In the framework all three default to ``None`` (no gating),
+# which is the right library default but the wrong *product* default for
+# incremental runs: with every gate off, S2/S3 force every incoming document
+# into its nearest existing DocSet and nothing is ever novel.
+_NOVELTY_GATE_KEYS: tuple[str, ...] = ("threshold", "threshold_confidence", "threshold_quantile")
+
+# Conservative novelty gate shipped by default on the incremental CLI path so
+# "none fit" and "some fit" can actually happen out of the box. We use the
+# *quantile* gate because it is the most corpus-robust of the three: it
+# auto-calibrates a distance cutoff to the incoming batch's own nearest-
+# prototype distance distribution, so it needs no hand-tuned, manifold-unit-
+# dependent number and travels across encoders/manifolds unchanged. ``0.9``
+# keeps the closest 90 % of a batch as "known" and flags only the farthest
+# 10 % as novel — deliberately cautious, so a genuinely homogeneous batch is
+# barely disturbed while clear out-of-distribution documents can still open a
+# new category. Users override it (or turn gating off with an explicit
+# ``threshold_quantile: null``) via the ``scenario`` config section.
+DEFAULT_INCREMENTAL_NOVELTY_QUANTILE = 0.9
+
+
+def _with_incremental_novelty_default(overrides: dict[str, Any]) -> dict[str, Any]:
+    """Return ``overrides`` with a conservative novelty gate for incremental runs.
+
+    The framework's three novelty gates all default to ``None`` (see
+    :data:`_NOVELTY_GATE_KEYS`), which in incremental mode absorbs every
+    incoming document into its nearest existing DocSet. When the caller has not
+    set *any* gate, inject :data:`DEFAULT_INCREMENTAL_NOVELTY_QUANTILE` as
+    ``scenario.threshold_quantile`` so new categories can emerge out of the box.
+
+    Any explicit gate the user provides — including ``threshold_quantile: null``
+    to deliberately disable gating — wins and suppresses the default. The input
+    is never mutated; a fresh dict is returned.
+    """
+    scenario = overrides.get("scenario")
+    if isinstance(scenario, dict) and any(k in scenario for k in _NOVELTY_GATE_KEYS):
+        # The user spoke about novelty gating (even setting a gate to null to
+        # turn it off) — respect their choice and don't layer a default on top.
+        return overrides
+    merged = copy.deepcopy(overrides)
+    scenario_out = merged.get("scenario")
+    if not isinstance(scenario_out, dict):
+        scenario_out = {}
+    scenario_out["threshold_quantile"] = DEFAULT_INCREMENTAL_NOVELTY_QUANTILE
+    merged["scenario"] = scenario_out
+    return merged
+
 
 # Named, bundled config presets, ordered by compute budget. The tiers scale
 # by adding image/vision embeddings: ``small`` and ``light`` are CPU-only,
@@ -534,6 +585,14 @@ def clustering_internal(
     # and the bundled defaults stand. A malformed file/section/preset raises
     # ClusteringConfigInvalid, which the CLI surfaces as an error envelope.
     overrides = resolve_clustering_overrides(workspace, config=config)
+    # Incremental runs assign into existing DocSets via S2/S3's nearest-
+    # prototype gate. With the framework's all-``None`` gate defaults that gate
+    # never fires, so every new document is forced into its closest DocSet and
+    # nothing is ever novel. Ship a conservative quantile gate by default (only
+    # when the user hasn't set one) so new categories can emerge. Fresh mode
+    # clusters from scratch (S1, no prototypes) and needs no gate.
+    if effective_mode == "incremental":
+        overrides = _with_incremental_novelty_default(overrides)
     # Point corpus-fitted text encoders at the workspace files/ dir and
     # learn the text view the configured encoder expects, so the dataset
     # assembles record.text under that same view.
