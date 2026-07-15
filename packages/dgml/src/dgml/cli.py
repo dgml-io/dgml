@@ -2217,6 +2217,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             max_parallel_docs=args.max_parallel_calls,
             cache_dir=cache_dir,
             debug=args.debug,
+            page_text_dirs=page_text_dirs,
             workspace=ws,
             dgml_header=build_header(ws.organization, ds.name),
             converters=load_conversion_config(ws),

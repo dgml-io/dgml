@@ -1678,3 +1678,151 @@ def test_all_text_table_keeps_its_first_row() -> None:
     ]
     propagate_table_consistency(rows)
     assert rows[0].cell_concepts == ["PartyName", "PartyCity"]  # untouched
+
+
+def _fake_window_json(words: list[str]) -> str:
+    return json.dumps({"continues": "", "blocks": [{"structure": "p", "text": " ".join(words)}]})
+
+
+def _write_page_text(tmp_path: Path, words: list[str]) -> Path:
+    pt_dir = tmp_path / "page_text"
+    pt_dir.mkdir()
+    (pt_dir / "page_1.json").write_text(
+        json.dumps({"page": 1, "words": [{"t": w} for w in words]}), encoding="utf-8"
+    )
+    return pt_dir
+
+
+def test_transcribe_window_gate_retries_early_stopped_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window that comes back as VALID JSON covering only a fraction of its
+    pages' words (silent early-stop) is re-requested; the fuller retry wins."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    words = [f"word{i:02d}" for i in range(60)]
+    pt_dir = _write_page_text(tmp_path, words)
+    monkeypatch.setattr(transcribe_mod, "pdf_page_count", lambda _p: 1)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda _b, _idx: b"window-pdf")
+
+    instructions: list[str] = []
+
+    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
+        content = kwargs["user_content"]
+        instructions.append(content[0]["text"])  # type: ignore[index]
+        if len(instructions) == 1:
+            return _fake_window_json(words[:8])  # early stop: 8 of 60 words
+        return _fake_window_json(words)
+
+    monkeypatch.setattr(llm, "call_continued", fake_call)
+    blocks = transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path,
+        page_text_dir=pt_dir,
+    )
+    assert len(instructions) == 2
+    assert [b.text for b in blocks] == [" ".join(words)]
+    # The retry carries the nudge with the measured shortfall; the first
+    # attempt does not.
+    assert "previous attempt" not in instructions[0]
+    assert "previous attempt transcribed only about 13%" in instructions[1]
+    assert "pages 1-1" in instructions[1]
+
+
+def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete window costs exactly one call; without a page_text_dir the
+    gate is off and even a sparse window is accepted as-is (old behavior)."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    words = [f"word{i:02d}" for i in range(60)]
+    pt_dir = _write_page_text(tmp_path, words)
+    monkeypatch.setattr(transcribe_mod, "pdf_page_count", lambda _p: 1)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda _b, _idx: b"window-pdf")
+
+    calls: list[int] = []
+
+    def complete(config: llm.LLMConfig, **kwargs: object) -> str:
+        calls.append(1)
+        return _fake_window_json(words)
+
+    monkeypatch.setattr(llm, "call_continued", complete)
+    transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path / "a",
+        page_text_dir=pt_dir,
+    )
+    assert len(calls) == 1
+
+    calls.clear()
+
+    def sparse(config: llm.LLMConfig, **kwargs: object) -> str:
+        calls.append(1)
+        return _fake_window_json(words[:8])
+
+    monkeypatch.setattr(llm, "call_continued", sparse)
+    blocks = transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path / "b",
+        page_text_dir=None,
+    )
+    assert len(calls) == 1
+    assert [b.text for b in blocks] == [" ".join(words[:8])]
+
+
+def test_transcribe_window_gate_splits_stubborn_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the retry reproduces the early stop, the gate's stage-2 fallback
+    splits the page range and keeps the merged halves."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    page1 = [f"alpha{i:02d}" for i in range(40)]
+    page2 = [f"bravo{i:02d}" for i in range(40)]
+    pt_dir = tmp_path / "page_text"
+    pt_dir.mkdir()
+    for n, words in ((1, page1), (2, page2)):
+        (pt_dir / f"page_{n}.json").write_text(
+            json.dumps({"page": n, "words": [{"t": w} for w in words]})
+        )
+    monkeypatch.setattr(transcribe_mod, "pdf_page_count", lambda _p: 2)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda _b, idx: bytes(idx))
+
+    instructions: list[str] = []
+
+    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
+        instr = kwargs["user_content"][0]["text"]  # type: ignore[index]
+        instructions.append(instr)
+        if "pages 1-2" in instr:  # full window: stubborn stop
+            return _fake_window_json(page2[-6:])
+        if "pages 1-1" in instr:  # half A: complete
+            return _fake_window_json(page1)
+        return _fake_window_json(page2)  # half B: complete
+
+    monkeypatch.setattr(llm, "call_continued", fake_call)
+    blocks = transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path,
+        debug=True,  # raw window writes are debug-gated
+        page_text_dir=pt_dir,
+    )
+    # 2 full-window attempts (initial + nudged retry), then one per half
+    assert sum("pages 1-2" in i for i in instructions) == 2
+    assert sum("pages 1-1" in i for i in instructions) == 1
+    assert sum("pages 2-2" in i for i in instructions) == 1
+    assert [b.text for b in blocks] == [" ".join(page1), " ".join(page2)]
+    # the kept unsuffixed raw is the merged split payload
+    kept = json.loads((tmp_path / "doc_w01_raw.json").read_text())
+    assert len(kept["blocks"]) == 2

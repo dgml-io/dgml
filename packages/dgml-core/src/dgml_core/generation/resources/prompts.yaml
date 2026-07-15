@@ -35,6 +35,12 @@
   If your first page begins mid-sentence, put the completing text in "continues" and do NOT repeat anything inside <TAIL>.
 "transcribe_window_json": |-
   Return JSON only: {"continues": "...", "blocks": [...]}.
+"transcribe_window_retry": |-
+  IMPORTANT: your previous attempt transcribed only about {pct}% of the words
+  on pages {first}-{last} — it skipped most of their content. Do not resume
+  from where a previous section seemed to end: transcribe ALL content of ALL
+  pages {first}-{last}, in reading order, starting from the top of page {first},
+  without skipping any page or clause.
 "label_system": |
   You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
   belong to one document set; your single most important job is to use the

@@ -97,6 +97,11 @@ class ConvertOptions:
     temperature: float = 0.0
     max_tokens: int = 32000
     cache_dir: Path | str | None = None
+    # document name → its page_text/ dir (per-page word JSONs written before
+    # generation). When a document has one, each transcription window is
+    # completeness-checked against its pages' words and retried once if the
+    # model stopped early (see transcribe._GATE_RECALL). None disables the gate.
+    page_text_dirs: Mapping[str, Path] | None = None
     # When True, also write the debug-only cache artifacts (raw LLM dumps,
     # intermediate .concept.xml/.semantic.xml renders, prompt listings). The
     # functional cache files the next run reloads (_blocks.json,
@@ -205,6 +210,7 @@ def convert_batch(
                 cache_dir=opts.cache_dir,
                 debug=opts.debug,
                 log=log,
+                page_text_dir=(opts.page_text_dirs or {}).get(path.name),
             )
         except Exception as exc:
             log(f"[transcribe] {path.name} FAILED: {exc}; skipping")
