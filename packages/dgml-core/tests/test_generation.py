@@ -1494,7 +1494,8 @@ def test_header_row_labeled_as_data_is_demoted() -> None:
         ),
     ]
     propagate_table_consistency(rows)
-    assert rows[0].cell_concepts == [] and rows[0].concept == ""  # header demoted
+    assert rows[0].cell_concepts == []  # cell-level concepts demoted
+    assert rows[0].concept == ""  # concept copied from data rows -> cleared
     assert rows[1].cell_concepts == ["ItemCode", "ItemQty", "ItemPrice"]  # data intact
 
 
@@ -1525,3 +1526,64 @@ def test_all_text_table_keeps_its_first_row() -> None:
     ]
     propagate_table_consistency(rows)
     assert rows[0].cell_concepts == ["PartyName", "PartyCity"]  # untouched
+
+
+def test_header_row_with_distinct_role_keeps_it() -> None:
+    """A header row whose OWN concept differs from the data rows' shared
+    concept was labeled deliberately (e.g. a table-header role) — the row
+    concept survives demotion; only the cell concepts are cleared."""
+    from dgml_core.generation.label import propagate_table_consistency
+
+    rows = [
+        Block(
+            id="r0",
+            structure="row",
+            cells=["Code", "Qty", "Price"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="PricingHeader",
+        ),
+        Block(
+            id="r1",
+            structure="row",
+            cells=["A100", "2", "$10.00"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="LineItem",
+        ),
+        Block(
+            id="r2",
+            structure="row",
+            cells=["B200", "5", "$25.00"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="LineItem",
+        ),
+    ]
+    propagate_table_consistency(rows)
+    assert rows[0].cell_concepts == []
+    assert rows[0].concept == "PricingHeader"  # distinct role preserved
+
+
+def test_parse_block_choice_group() -> None:
+    """A checkbox/radio group parses with its printed options; a checked entry
+    outside the printed choices is a hallucinated mark and is dropped; a
+    single selection also fills `value`."""
+    from dgml_core.generation.blocks import parse_block
+
+    b = parse_block(
+        {
+            "structure": "field",
+            "label": "REQUESTED ACTION",
+            "options": ["APPLY", "AMEND", "WITHDRAW"],
+            "checked": ["APPLY", "NOPE"],
+        },
+        block_id="b1",
+    )
+    assert b is not None
+    assert b.options == ["APPLY", "AMEND", "WITHDRAW"]
+    assert b.checked == ["APPLY"]  # hallucinated 'NOPE' dropped
+    assert b.value == "APPLY"  # single selection fills value
+    # an unmarked group still survives (options alone carry content)
+    empty = parse_block(
+        {"structure": "field", "label": "KIND", "options": ["A", "B"], "checked": []},
+        block_id="b2",
+    )
+    assert empty is not None and empty.checked == [] and empty.value == ""

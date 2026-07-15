@@ -347,9 +347,12 @@ dgml stake file "$fid" --docset "$ds" \
 
 One command exports the bundle, anchors its Merkle root under the URI
 `dgmlx://<file_id>/<docset_id>`, broadcasts, awaits the receipt, then fetches
-and **saves the record** to `record.json` in the bundle directory. The result
-JSON carries `checksum`, `uri`, `tx_hash`, `receipt_status`, `record_path`,
-and `explorer_url`. Keep the `record.json` — proving works from it offline.
+and **saves the record** to `record.json` in the output directory. By default
+the bundle is written there as a single portable `<stem>.dgmlx` archive (its
+path in the payload's `dgmlx`); pass `--unpacked` to write the loose bundle
+tree instead. The result JSON carries `checksum`, `uri`, `tx_hash`,
+`receipt_status`, `record_path`, and `explorer_url`. Keep the `record.json` —
+proving works from it offline.
 
 > `stake` signs with your keyring key and defaults `--from` to that key's
 > address (the wallet you funded). It refuses to sign if the key doesn't

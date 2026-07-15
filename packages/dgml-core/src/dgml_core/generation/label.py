@@ -19,9 +19,8 @@ matches". Cross-document consistency comes from the roster, while each call
 stays small enough that the model can label *densely* instead of
 cherry-picking a handful of values.
 
-Density contract (learned from the first live run, which labeled 2% of
-blocks): every heading block MUST receive a section-role concept; repeating
-items/rows/fields receive their shared role; only connective prose may stay
+Density contract: every heading block MUST receive a section-role concept;
+repeating items/rows/fields receive their shared role; only connective prose may stay
 unlabeled. Option I still applies — boilerplate paragraphs with no
 queryable role legitimately get nothing — but "skip almost everything" is
 not a permitted reading anymore.
@@ -542,7 +541,16 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
         detected = eligible >= 2 and votes == eligible
         if detected:
             header = first
-            first.concept = ""
+            # Cell concepts are always poison on a header row (column titles
+            # becoming the columns' first values). The row-level concept is
+            # kept ONLY when it differs from the data rows' shared concept —
+            # a distinct role (e.g. "...TableHeader") is deliberate labeling;
+            # sharing the data rows' concept just means the labeler treated
+            # the header as one more data row, and that tag would wrap header
+            # text in a data role.
+            data_concept = _most_common([b.concept for b in run[1:]])
+            if first.concept and first.concept == data_concept:
+                first.concept = ""
             first.cell_concepts = []
             first.cell_entities = []
             # Remember this row is a demoted printed-title row so the renderer can
@@ -737,10 +745,9 @@ def plan_concept_roster(
     a failure returns an empty roster and labeling proceeds roster-free.
 
     With ``refine=True`` (default) a grounded second turn asks the model to ADD
-    recurring roles it missed in the draft (add-only — no merge/rename). Paired
-    with the reuse-first labeling prompt it raised mean EM ~7 pts and tightened
-    the spread on the stability benchmark (see docs/labeling-stability-handoff.md),
-    at the cost of one extra call. Set ``refine=False`` to skip it.
+    recurring roles it missed in the draft (add-only — no merge/rename), which
+    improves roster completeness and cross-run stability at the cost of one
+    extra call. Set ``refine=False`` to skip it.
     """
     # Cap the planning input. Sample the LARGEST documents (most blocks): a
     # richer skeleton seeds a more complete roster, so the biggest docs cover
@@ -777,7 +784,7 @@ def plan_concept_roster(
                 cache_dir, "plan_roster_draft_raw.json", strip_fences(draft_raw), debug=debug
             )
         else:
-            # Single-call roster (pre-completion baseline, for A/B comparison).
+            # Single-call roster: the draft only, without the add-only completion turn.
             raw = llm.call(
                 config,
                 system_prompt=PLAN_SYSTEM_PROMPT,

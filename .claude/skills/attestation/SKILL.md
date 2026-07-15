@@ -65,8 +65,11 @@ One command exports the bundle, anchors its Merkle root (URI
 `dgmlx://<fid>/<ds>`), broadcasts, waits for the receipt, then fetches
 and saves the record. The result JSON carries `checksum` (the root),
 `uri`, `tx_hash`, `receipt_status`, `record`, `record_path`, and
-`explorer_url`. Add `--dry-run` to stop after signing (emits
-`unsigned_tx` + `signed_tx`, broadcasts nothing).
+`explorer_url`. By default the bundle is written as a single portable
+`<stem>.dgmlx` archive (path in `dgmlx`); add `--unpacked` to write the
+loose bundle tree instead (path in `attestation`, no `dgmlx`). Add
+`--dry-run` to stop after signing (emits `unsigned_tx` + `signed_tx`,
+broadcasts nothing).
 
 ## Stake a node (one DGML XML element)
 

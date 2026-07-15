@@ -231,3 +231,34 @@ extraction_values_phase3_user: |-
 
   NEEDS_LOCATING (return exactly these ids):
   {needs_locating}
+
+# ── LLM clustering: small-corpus vision partitioner ──────────────────────────
+# Fixed prompt pieces for dgml_core.llm_clustering._build_grouping_prompt, which
+# asks the vision model to partition a small corpus into DocSets in one call.
+# The Python side interpolates the doc count/labels and any existing DocSets
+# between these pieces and joins them with blank lines. `..._doc_manifest` is
+# .format()'d with {count}/{labels} and `..._instructions` with {tool}; none of
+# these contain literal braces, so str.format is safe. The other two are
+# used verbatim.
+cluster_grouping_intro: |-
+  You are clustering a small corpus of documents into DocSets.
+
+  A DocSet groups documents of the **same document type** — documents that could plausibly share a single extraction schema. Two documents belong in the same group if, and only if, the same set of structured questions ("what is X?", "when did Y happen?") could be answered from each of them. Topical similarity is NOT enough: a property tax bill and a tax-abatement agreement both concern property taxes but answer different questions, so they belong in **different** groups. Use the document type, not the topic.
+
+cluster_grouping_doc_manifest: |-
+  There are {count} documents: {labels}. Each document's rendered first pages are attached below, immediately after a line naming it (e.g. "=== Document doc_1 ===").
+
+cluster_grouping_existing_intro: |-
+  Some DocSets already exist. If a group of documents matches one of these existing DocSets (they answer the same key questions), assign that group to it by setting `existing_docset_id`:
+
+cluster_grouping_instructions: |-
+  Call `{tool}` exactly once with a `groups` array that partitions ALL of the documents above. Every document label must appear in exactly one group's `members`; do not omit any and do not repeat any.
+
+  For each group, either:
+    - set `existing_docset_id` to the id of the existing DocSet it matches (only when one genuinely fits), OR
+    - describe a new document type with:
+      - `name`: a short, document-type-specific name (2-5 words; prefer the document's own type, e.g. "Property Tax Bill" or "PILOT Agreement", not a topical bucket like "Property Tax Records"),
+      - `description`: a one-sentence description of what kind of document this group holds, and
+      - `key_questions`: 3-7 concrete, type-discriminating questions answerable from the first pages of this kind of document.
+
+  Group by the underlying document type, not by surface appearance. Two documents belong in the SAME group whenever the same core questions could be answered from each — even if they differ in layout, length, section order, formatting, issuer, or which optional sections are present. Those are variations of one type, not separate types. Create a separate group only when a document answers a genuinely different set of questions (a different extraction schema). When two documents are borderline, put them TOGETHER. Prefer fewer, larger groups; do not split a type into sub-variants.

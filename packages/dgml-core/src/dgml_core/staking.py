@@ -371,6 +371,7 @@ def stake_file(
     config_path: Path | None,
     dry_run: bool,
     legacy: bool,
+    unpacked: bool = False,
     service: str = DEFAULT_SERVICE,
     account: str = DEFAULT_ACCOUNT,
 ) -> dict[str, Any]:
@@ -379,12 +380,23 @@ def stake_file(
     rpc, anchor = _clients(chain)
 
     out_dir = output_dir or _default_bundle_dir(ws, file_id, docset_id)
-    # --unpacked: materialize the loose bundle tree in out_dir (the default
-    # writes only the .dgmlx archive). attestation_path is the loose
-    # META-INF/dgml-attestation.xml; archive_path is None here.
-    attestation, attestation_path, _ = export_attestation(
-        ws, file_id, out_dir, docset_id, unpacked=True
+    # Default writes only the portable <stem>.dgmlx archive into out_dir;
+    # --unpacked materializes the loose bundle tree there instead. Exactly one of
+    # attestation_path (loose META-INF/dgml-attestation.xml) / archive_path is set,
+    # matching the mode. record.json is saved into out_dir either way.
+    attestation, attestation_path, archive_path = export_attestation(
+        ws, file_id, out_dir, docset_id, unpacked=unpacked
     )
+    extra: dict[str, Any] = {
+        "kind": "dgmlx",
+        "file_id": file_id,
+        "docset_id": docset_id,
+        "bundle_dir": str(out_dir),
+    }
+    if unpacked:
+        extra["attestation"] = str(attestation_path)
+    else:
+        extra["dgmlx"] = str(archive_path)
     return _anchor_record(
         rpc,
         anchor,
@@ -394,13 +406,7 @@ def stake_file(
         uri=build_uri(file_id, docset_id),
         checksum=attestation.root,
         metadata=bundle_metadata(len(attestation.leaves)),
-        extra={
-            "kind": "dgmlx",
-            "file_id": file_id,
-            "docset_id": docset_id,
-            "bundle_dir": str(out_dir),
-            "attestation": str(attestation_path),
-        },
+        extra=extra,
         save_dir=out_dir,
         record_name="record.json",
         dry_run=dry_run,

@@ -102,7 +102,9 @@ def _typed_value(text: str, value_type: str) -> tuple[str | None, str | None]:
     ``xsd:integer`` on "181 CREDITS" yields ``dg:value="181"``.
     """
     if value_type == "integer":
-        m = re.search(r"-?\d+", text)
+        # Strip thousands separators first so "8,500" → "8500", not "8"
+        # (mirrors the decimal branch below).
+        m = re.search(r"-?\d+", text.replace(",", ""))
         return ("integer", m.group()) if m else (None, None)
     if value_type == "decimal":
         m = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
