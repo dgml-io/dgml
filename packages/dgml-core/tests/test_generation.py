@@ -1877,3 +1877,28 @@ def test_transcribe_window_gate_splits_stubborn_window(
     # the kept unsuffixed raw is the merged split payload
     kept = json.loads((tmp_path / "doc_w01_raw.json").read_text())
     assert len(kept["blocks"]) == 2
+
+
+def test_derive_schema_examples_are_consistent() -> None:
+    """Inline examples are observed VALUES (caption text like 'Effective Date'
+    for EffectiveDate is filtered); a section labeled via its heading keeps
+    only heading examples, not member-body snippets."""
+    from dgml_core.generation.label import RosterEntry, derive_schema
+
+    roster = {
+        "EffectiveDate": RosterEntry(description="agreement start"),
+        "SupplierNoticeAddress": RosterEntry(description="notice address"),
+    }
+    head = _b("heading", "b1", text="If to Supplier:", level=2, concept="SupplierNoticeAddress")
+    member = _b(
+        "p", "b2", text="Xing Xing Inc., Noho Tower, Suzhou City", concept="SupplierNoticeAddress"
+    )
+    caption = _b(
+        "p", "b3", text="Effective Date", entities=[Span(start=0, end=14, concept="EffectiveDate")]
+    )
+    value = _b(
+        "p", "b4", text="March 01, 2022", entities=[Span(start=0, end=14, concept="EffectiveDate")]
+    )
+    schema = derive_schema({"a.pdf": [head, member, caption, value]}, roster, {})
+    assert schema.tags["EffectiveDate"].examples == ["March 01, 2022"]
+    assert schema.tags["SupplierNoticeAddress"].examples == ["If to Supplier:"]

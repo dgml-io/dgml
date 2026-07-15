@@ -984,19 +984,34 @@ def derive_schema(
     whose new documents never use an old tag), so re-deriving the schema never
     degrades fields a previous run established.
     """
+    # Examples must be internally consistent per concept: an inline concept's
+    # examples are observed VALUES, a section concept's examples are how the
+    # section announces itself (its heading). Body snippets of blocks labeled
+    # with a section concept are kept in a fallback bucket, used only when the
+    # concept never appears as a heading — never mixed with heading examples.
     examples: dict[str, list[str]] = {}
+    body_examples: dict[str, list[str]] = {}
     kinds: dict[str, str] = {}
     parents: dict[str, str] = {}
 
-    def record(raw: str, kind: str, parent: str, example: str) -> str:
+    def _squash(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    def _caption_like(name: str, text: str) -> bool:
+        """'Effective Date' is the CAPTION of EffectiveDate, not a value."""
+        t = _squash(text)
+        return bool(t) and (t == _squash(name) or t == _squash(_humanize_concept(name)))
+
+    def record(raw: str, kind: str, parent: str, example: str, *, body: bool = False) -> str:
         name = sanitize_concept(raw)
         if not name:
             return ""
         kinds.setdefault(name, kind)
         parents.setdefault(name, parent)
         ex = (example or "").strip()[:80]
-        if ex:
-            seen = examples.setdefault(name, [])
+        if ex and not (kind == "inline" and _caption_like(name, ex)):
+            store = body_examples if body else examples
+            seen = store.setdefault(name, [])
             if ex not in seen and len(seen) < _SCHEMA_MAX_EXAMPLES:
                 seen.append(ex)
         return name
@@ -1022,7 +1037,8 @@ def derive_schema(
         if node.kind in ("p", "li") and block is not None:
             own = ""
             if block.concept:
-                own = record(block.concept, "section", parent_concept, block.text)
+                # body snippet: fallback example only (see buckets above)
+                own = record(block.concept, "section", parent_concept, block.text, body=True)
             for sp in block.entities:
                 value = block.text[sp.start : sp.end]
                 record(sp.concept, "inline", own or parent_concept, value)
@@ -1047,7 +1063,9 @@ def derive_schema(
     schema = Schema()
     for name in sorted(set(roster) | set(kinds)):
         entry = roster.get(name)
-        exs = examples.get(name) or (list(entry.examples) if entry else [])
+        exs = (
+            examples.get(name) or body_examples.get(name) or (list(entry.examples) if entry else [])
+        )
         kind = kinds.get(name) or (entry.kind if entry else "") or "inline"
         parent = parents.get(name) or (entry.parent if entry else "")
         schema.add(

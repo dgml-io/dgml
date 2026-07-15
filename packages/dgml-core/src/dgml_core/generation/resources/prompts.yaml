@@ -140,6 +140,9 @@
   - If a block is only a short label followed by its value (a "label: value"
     line), the value carries the concept and the block stays unlabeled — tag the
     value, not the whole line.
+  - An entity "quote" is always the VALUE text itself, never its caption or
+    label: in "Effective Date: March 1, 2022" the quote is "March 1, 2022" —
+    never "Effective Date". A caption with no value on the block gets no entity.
   - Distinct value kinds in one block always get distinct concepts (a date is
     never the same concept as an amount, a name never the same as an address).
 
