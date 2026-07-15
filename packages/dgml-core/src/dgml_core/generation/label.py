@@ -689,12 +689,16 @@ PLAN_SYSTEM_PROMPT = prompt("plan_system")
 # Block structures that define the document's role skeleton — what the
 # concept planner needs to see from every document.
 _SKELETON_STRUCTURES = {"heading", "field", "row"}
-_PLAN_MAX_LINES_PER_DOC = 400
-# Max documents whose skeleton feeds the single roster-planning call. The
-# roster only needs the RECURRING roles of a same-kind docset, so a sample
-# seeds it; every document is still fully labeled in Pass B (which extends the
-# roster). This bounds the planning prompt for large docsets.
-_PLAN_MAX_DOCS = 20
+# Effectively "the whole document" for real corpora (observed skeletons run
+# 25-420 lines; Underlease-style docs sat just past the old 400 cap and were
+# truncated) while still bounding a pathological 500-page manual.
+_PLAN_MAX_LINES_PER_DOC = 2000
+# Max documents whose skeleton feeds the single roster-planning call. Depth
+# beats breadth: planning sees FEW documents IN FULL rather than many
+# truncated ones (same worst-case line budget as the old 20 x 400). The
+# roster only needs the RECURRING roles of a same-kind docset; every document
+# is still fully labeled in Pass B (which extends the roster).
+_PLAN_MAX_DOCS = 4
 # Unseeded runs label this many documents (the largest, same sort as planning)
 # as a PILOT first; their observed evidence promotes the planned roster to
 # confirmed before the rest of the batch labels against it. Seeded runs skip
