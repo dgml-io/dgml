@@ -29,7 +29,12 @@ Incremental clustering handles all three ways a new batch can land:
 Whether a document "fits" is decided by the nearest-prototype gates on the
 scenario (`threshold`, `threshold_confidence`, `threshold_quantile`) — a
 document too far from every existing prototype is routed to the emergent
-bucket.
+bucket. The incremental CLI ships a conservative default,
+`threshold_quantile: 0.9` (the closest 90 % of a batch count as fitting, the
+farthest 10 % become novel), so "some fit" and "none fit" happen out of the
+box; without it every document would always be forced into its nearest DocSet.
+Override it — or disable gating with `threshold_quantile: null` — in the
+`scenario` section of your clustering config.
 
 ## How prototypes are built
 
