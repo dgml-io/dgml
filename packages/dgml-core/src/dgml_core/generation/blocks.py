@@ -139,6 +139,14 @@ class Block:
     # transcribed cell count disagrees with the labeler's column model.
     cell_entities: list[list[Span]] = field(default_factory=list)
     group_concept: str = ""
+    # Row blocks only, set by propagate_table_consistency. `header_row` marks a
+    # demoted printed-title row so the renderer emits its cells as `ColumnHeader`
+    # structure-td elements; `kv_table` marks the rows of a key-value run (no
+    # column concept repeats across data rows) so the renderer emits a uniform
+    # generic td with the value concept as an inner span — a stable td localname
+    # (no per-column tag collision) that still keeps the leaf concept tag.
+    header_row: bool = False
+    kv_table: bool = False
 
     def flat_text(self) -> str:
         """Every character this block contributes to the document."""

@@ -478,6 +478,31 @@ def _most_common(values: list[str]) -> str:
     return counts.most_common(1)[0][0] if counts else ""
 
 
+def _effective_cell_concepts(block: Block) -> list[str]:
+    """The concept ``to_semantic`` would actually tag on each cell.
+
+    Mirrors the renderer's ``cell_concept or whole`` rule: the positional
+    ``cell_concepts[i]`` when present, else a whole-cell entity concept (a lone
+    span covering the entire cell). Used by the key-value classification so a
+    data table whose column roles arrived as whole-cell ENTITIES
+    (``cell_concepts`` empty) is still recognized as a data table — not
+    mis-classified key-value just because the positional slot is unset.
+    """
+    out: list[str] = []
+    for i, cell in enumerate(block.cells):
+        cc = block.cell_concepts[i] if i < len(block.cell_concepts) else ""
+        if not cc:
+            ents = block.cell_entities[i] if i < len(block.cell_entities) else []
+            if (
+                len(ents) == 1
+                and cell.strip()
+                and cell[ents[0].start : ents[0].end].strip() == cell.strip()
+            ):
+                cc = ents[0].concept
+        out.append(cc)
+    return out
+
+
 def propagate_table_consistency(blocks: list[Block]) -> None:
     """Make each table's row/column concepts consistent (record vs key-value).
 
@@ -513,7 +538,8 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
                 if not any(ch.isdigit() for ch in cell):
                     votes += 1
         header: Block | None = None
-        if eligible >= 2 and votes == eligible:
+        detected = eligible >= 2 and votes == eligible
+        if detected:
             header = first
             # Cell concepts are always poison on a header row (column titles
             # becoming the columns' first values). The row-level concept is
@@ -527,6 +553,11 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
                 first.concept = ""
             first.cell_concepts = []
             first.cell_entities = []
+            # Remember this row is a demoted printed-title row so the renderer can
+            # emit its cells as ColumnHeader structure-td elements (gold's
+            # <ColumnHeader structure="td"> shape) instead of anonymous dg:chunk
+            # tds, which the recall check counts as a headerless table.
+            first.header_row = True
         # Table name: the one the model gave (first non-empty), shared by all.
         group = _most_common([b.group_concept for b in run])
         if group:
@@ -539,9 +570,50 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
                 if not b.concept and b is not header:
                     b.concept = row_concept
         # Columns: per position, propagate a concept that repeats across rows.
-        width = max(len(b.cell_concepts) for b in run)
+        # Data-row-aware column election: the demoted header and any non-full-
+        # width rows (banner/spanning/subtotal rows carry FEWER cells — faithful
+        # structure, never padded) are dropped from the vote so they can't poison
+        # it, and a run in which no column concept repeats across the data rows is
+        # a KEY-VALUE run whose rows are marked kv_table and left per-row (the
+        # renderer emits a uniform td with the value concept as an inner span).
+        election = run
+        data_rows = [b for b in run if b is not header and b.cells]
+        if data_rows:
+            modal = Counter(len(b.cells) for b in data_rows).most_common(1)[0][0]
+            # "Full-width" DATA rows, matching table_recall's own definition
+            # (len > modal/2): rows with far fewer cells are banner/span rows,
+            # but ragged transcription can leave a real data row a cell or two
+            # off the mode, so a strict ==modal filter would wrongly drop the
+            # rows that actually carry the column concepts (mis-flagging the
+            # table key-value). Excludes true spans without losing data rows.
+            election = [b for b in data_rows if len(b.cells) > modal / 2] or data_rows
+            # KEY-VALUE run: no EFFECTIVE column concept repeats across the
+            # data rows (each row is its own label→value). The effective
+            # concept is what the renderer tags — positional cell concept OR
+            # a whole-cell entity — so a data table whose roles arrived as
+            # whole-cell entities is NOT mis-classified key-value.
+            eff = [_effective_cell_concepts(b) for b in election]
+            w = max((len(e) for e in eff), default=0)
+            repeats = False
+            for col in range(w):
+                cc = [e[col] for e in eff if col < len(e) and e[col]]
+                u = _most_common(cc)
+                if u and sum(c == u for c in cc) >= 2:
+                    repeats = True
+                    break
+            # Require >= 3 full-width data rows before calling a run key-value:
+            # with only 2 rows "no column concept repeats" is unreliable (a
+            # small or slightly mis-aligned DATA table trips it), and
+            # mis-rendering a data table as key-value moves its values a level
+            # deeper and costs F1. 3 rows is the same floor table_recall uses
+            # for its row-level table checks.
+            if not repeats and len(election) >= 3:
+                for b in run:
+                    b.kv_table = True
+                continue
+        width = max(len(b.cell_concepts) for b in election)
         for col in range(width):
-            col_concepts = [b.cell_concepts[col] for b in run if col < len(b.cell_concepts)]
+            col_concepts = [b.cell_concepts[col] for b in election if col < len(b.cell_concepts)]
             uniform = _most_common(col_concepts)
             if uniform and sum(c == uniform for c in col_concepts) >= 2:
                 for b in run:
