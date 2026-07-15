@@ -102,10 +102,18 @@ class Schema:
     def save(self, path: Path | str) -> None:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
+
+        def _tag_dict(tag: SchemaTag) -> dict[str, Any]:
+            # `example` is redundant with `examples[0]` (add() keeps them in
+            # sync), so the saved JSON carries only the list.
+            d = asdict(tag)
+            d.pop("example", None)
+            return d
+
         p.write_text(
             json.dumps(
                 {
-                    "tags": {name: asdict(tag) for name, tag in self.tags.items()},
+                    "tags": {name: _tag_dict(tag) for name, tag in self.tags.items()},
                     "notes": self.notes,
                 },
                 indent=2,
@@ -118,6 +126,11 @@ class Schema:
         tag.name = sanitize_tag_name(tag.name)
         if tag.kind not in VALID_KINDS:
             tag.kind = "inline"
+        # The single-value convenience mirrors examples[0] for in-memory
+        # consumers (extraction prompts, RNC rendering); the saved JSON only
+        # carries `examples`, so reloads re-derive it here.
+        if not tag.example and tag.examples:
+            tag.example = tag.examples[0]
         self.tags[tag.name] = tag
 
     def names(self) -> set[str]:

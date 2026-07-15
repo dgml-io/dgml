@@ -1902,3 +1902,19 @@ def test_derive_schema_examples_are_consistent() -> None:
     schema = derive_schema({"a.pdf": [head, member, caption, value]}, roster, {})
     assert schema.tags["EffectiveDate"].examples == ["March 01, 2022"]
     assert schema.tags["SupplierNoticeAddress"].examples == ["If to Supplier:"]
+
+
+def test_schema_save_omits_singular_example(tmp_path: Path) -> None:
+    """The saved schema.json carries only `examples`; the in-memory
+    single-value convenience is re-derived on load."""
+    from dgml_core.generation.schema import Schema, SchemaTag
+
+    schema = Schema()
+    schema.add(SchemaTag(name="Foo", role="r", kind="inline", examples=["v1", "v2"]))
+    out = tmp_path / "schema.json"
+    schema.save(out)
+    data = json.loads(out.read_text())
+    assert "example" not in data["tags"]["Foo"]
+    assert data["tags"]["Foo"]["examples"] == ["v1", "v2"]
+    loaded = Schema.load(out)
+    assert loaded.tags["Foo"].example == "v1"  # backfilled for consumers
