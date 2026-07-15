@@ -172,6 +172,117 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
     )
 
 
+# ── post-transcription normalization ─────────────────────────────────────────
+# Two deterministic passes that remove the model's per-run degrees of freedom
+# where the printed page already encodes the answer. Both are no-ops on input
+# that is already consistent.
+
+_DOTTED_LIM_RE = re.compile(r"^\d+(?:\.\d+)*\.?$")
+
+
+def anchor_heading_levels(blocks: list[Block]) -> None:
+    """Make dotted-numbered heading levels a pure function of the printed lim.
+
+    The model assigns ``level`` per window, so the same numbering scheme can
+    land at different depths in different windows/runs ("2.1" as level 2 here,
+    level 3 there) — and since build_tree derives ALL <sec> nesting from the
+    levels, that flips the tree. The printed enumerator is copied verbatim and
+    encodes depth exactly: the first dotted-numeric heading fixes the scheme's
+    base level, and every other dotted heading sits at base + (extra dotted
+    components). Headings without a dotted-numeric lim are untouched.
+    """
+    base: int | None = None
+    for b in blocks:
+        if b.structure != "heading" or not _DOTTED_LIM_RE.match(b.lim):
+            continue
+        depth = b.lim.rstrip(".").count(".")  # "2" -> 0, "2.1" -> 1, "6.4.1" -> 2
+        if base is None:
+            base = max(1, b.level - depth)
+        # Deliberately NOT capped at the prompt's 1-6 scale: an anchored level
+        # is exact, and capping would flatten sub-clauses deeper than 6 into
+        # siblings of their parents. 12 only bounds pathological lims.
+        b.level = min(12, base + depth)
+
+
+# Paragraph-initial enumerators that mark a list entry when they appear as a
+# sequential series: "(a) ...", "(i) ...", "(1) ...", "1) ...". Conservative on
+# purpose — bare "a." or "1." starts are too common in prose to convert.
+_ENUM_RES: list[tuple[str, re.Pattern[str]]] = [
+    ("alpha", re.compile(r"^\(([a-z])\)\s*")),
+    ("roman", re.compile(r"^\(([ivxlc]+)\)\s*")),
+    ("digit", re.compile(r"^\((\d+)\)\s*")),
+    ("digit", re.compile(r"^(\d+)\)\s*")),
+]
+_ROMAN_VAL = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100}
+
+
+def _enum_ordinal(family: str, marker: str) -> int:
+    if family == "alpha":
+        return ord(marker) - ord("a") + 1
+    if family == "digit":
+        return int(marker)
+    total = 0
+    for ch, nxt in zip(marker, marker[1:] + " ", strict=True):
+        v = _ROMAN_VAL[ch]
+        total += -v if nxt in _ROMAN_VAL and _ROMAN_VAL[nxt] > v else v
+    return total
+
+
+def normalize_enumerated_paragraphs(blocks: list[Block]) -> None:
+    """Turn sequential enumerated ``p`` runs into ``item`` blocks.
+
+    "(a) ...", "(b) ..." emitted as paragraphs in one run and as list items in
+    another is the single biggest structural flip between runs. A run of >= 2
+    CONSECUTIVE p blocks whose texts start with the same enumerator family in
+    strictly increasing sequence is unambiguous — convert each to an item and
+    lift the printed marker into ``lim``. Isolated markers (a lone "(a) ..."
+    paragraph, prose cross-references) never match the series requirement.
+    """
+    run: list[tuple[Block, str, str]] = []  # (block, stripped text, printed marker)
+    run_family, run_ordinal = "", 0
+
+    def flush() -> None:
+        if len(run) >= 2:
+            for blk, stripped, marker in run:
+                blk.structure = "item"
+                blk.lim = marker
+                blk.text = stripped
+        run.clear()
+
+    for b in blocks:
+        candidates = []
+        if b.structure == "p" and not b.lim:
+            for family, rx in _ENUM_RES:
+                m = rx.match(b.text)
+                if m:
+                    candidates.append((family, m.group(1), m.group(0)))
+        if not candidates:
+            flush()
+            continue
+        # "(i)" parses as alpha AND roman, "(c)" as alpha and roman-100: prefer
+        # whichever continues the current series; otherwise roman for "i" (the
+        # usual roman list opener), first match for everything else.
+        matched = next(
+            (
+                c
+                for c in candidates
+                if run and c[0] == run_family and _enum_ordinal(c[0], c[1]) == run_ordinal + 1
+            ),
+            None,
+        )
+        if matched is None:
+            matched = next(
+                (c for c in candidates if c[0] == "roman" and c[1] == "i"), candidates[0]
+            )
+        family, marker, prefix = matched
+        ordinal = _enum_ordinal(family, marker)
+        if run and not (family == run_family and ordinal == run_ordinal + 1):
+            flush()
+        run_family, run_ordinal = family, ordinal
+        run.append((b, b.text[len(prefix) :], prefix.strip()))
+    flush()
+
+
 # ── flat → tree ──────────────────────────────────────────────────────────────
 
 

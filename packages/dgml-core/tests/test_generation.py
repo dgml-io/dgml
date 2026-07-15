@@ -1779,6 +1779,57 @@ def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
     assert [b.text for b in blocks] == [" ".join(words[:8])]
 
 
+def test_anchor_heading_levels_follows_dotted_lims() -> None:
+    """Dotted-numeric lims fix heading depth deterministically: the first
+    dotted heading sets the scheme's base, extra components add depth, and
+    unnumbered headings keep the model's level."""
+    from dgml_core.generation.blocks import anchor_heading_levels
+
+    hs = [
+        _b("heading", "b1", text="TERMS", level=4),  # unnumbered: untouched
+        _b("heading", "b2", text="Scope", lim="1", level=2),  # base = 2
+        _b("heading", "b3", text="Sub", lim="1.1", level=2),  # wrong: -> 3
+        _b("heading", "b4", text="SubSub", lim="1.1.1", level=6),  # -> 4
+        _b("heading", "b5", text="Next", lim="2.", level=5),  # trailing dot -> 2
+        # anchored depth may exceed the prompt's 1-6 scale (base 2 + 5 dots)
+        _b("heading", "b6", text="Deep", lim="1.1.1.1.1.1", level=6),
+    ]
+    anchor_heading_levels(hs)
+    assert [h.level for h in hs] == [4, 2, 3, 4, 2, 7]
+
+
+def test_normalize_enumerated_paragraphs_series() -> None:
+    """Sequential '(a) …'/'(b) …' paragraph runs become items with the marker
+    lifted into lim; isolated or non-sequential markers stay paragraphs."""
+    from dgml_core.generation.blocks import normalize_enumerated_paragraphs
+
+    bs = [
+        _b("p", "b1", text="(a) first entry of the series"),
+        _b("p", "b2", text="(b) second entry of the series"),
+        _b("heading", "b3", text="Between", level=2),
+        _b("p", "b4", text="(a) lone marker stays a paragraph"),
+        _b("p", "b5", text="(i) roman one"),
+        _b("p", "b6", text="(ii) roman two"),
+        _b("p", "b7", text="(iii) roman three"),
+        _b("p", "b8", text="plain paragraph"),
+    ]
+    normalize_enumerated_paragraphs(bs)
+    assert [b.structure for b in bs] == [
+        "item",
+        "item",
+        "heading",
+        "p",
+        "item",
+        "item",
+        "item",
+        "p",
+    ]
+    assert (bs[0].lim, bs[0].text) == ("(a)", "first entry of the series")
+    assert (bs[1].lim, bs[1].text) == ("(b)", "second entry of the series")
+    assert bs[4].lim == "(i)" and bs[6].lim == "(iii)"
+    assert bs[3].structure == "p" and bs[3].text.startswith("(a)")
+
+
 def test_transcribe_window_gate_splits_stubborn_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

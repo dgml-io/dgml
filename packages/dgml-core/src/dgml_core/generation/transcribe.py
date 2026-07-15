@@ -32,7 +32,13 @@ from typing import Any
 
 from dgml_core import llm
 from dgml_core.generation import coverage, document
-from dgml_core.generation.blocks import Block, Span, parse_block
+from dgml_core.generation.blocks import (
+    Block,
+    Span,
+    anchor_heading_levels,
+    normalize_enumerated_paragraphs,
+    parse_block,
+)
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.pages import pdf_page_count
 
@@ -487,6 +493,12 @@ def transcribe_document(
                     blocks.append(block)
                     kept += 1
             log(f"{doc_name} {wlog}: {kept} block(s)")
+    # Deterministic normalization: printed enumerators already encode the
+    # answer, so remove the model's per-run degrees of freedom (p-vs-item on
+    # sequential "(a)…" runs; heading depth of dotted numbering) before the
+    # blocks become the document of record.
+    normalize_enumerated_paragraphs(blocks)
+    anchor_heading_levels(blocks)
     # Functional file the next run reloads — written regardless of --debug.
     cache_write(cache_dir, f"{Path(doc_name).stem}_blocks.json", blocks_to_json(blocks), debug=True)
     return blocks

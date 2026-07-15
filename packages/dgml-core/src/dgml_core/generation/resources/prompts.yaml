@@ -22,11 +22,22 @@
   2. `lim` holds the PRINTED enumerator exactly as shown ("2.13", "(a)",
      "ITEM 3", "•"). Empty when nothing is printed.
   3. Heading levels reflect the document's own hierarchy (a clause heading
-     under a part heading gets a higher level number).
+     under a part heading gets a higher level number). When headings carry
+     printed numbers, deeper numbering means a deeper level, consistently:
+     if "2" is level 2 then "2.1" is level 3 and "2.1.1" level 4; lettered or
+     roman sub-headings sit one level below the heading that contains them.
   4. Exclude only repeated page decorations (page numbers, running headers).
   5. Output JSON only: {"continues": "...", "blocks": [...]}.
      `continues` holds text that finishes the PREVIOUS window's final block
      when your first page starts mid-sentence; otherwise "".
+  6. A paragraph that begins with a printed enumerator and has at least one
+     sibling in the same series ("(a) …" followed by "(b) …"; "(i) …" then
+     "(ii) …") is one `item` per entry — never a `p`.
+  7. `field` is only for label/value lines whose value is short data (a name,
+     date, amount, address — a few words). A numbered clause whose body is
+     full sentences is a `heading` plus `p` block(s), never a `field`.
+  8. `row` is only for genuinely tabular content (ruled or visibly aligned
+     columns). A two-column running list without column meaning is `item`s.
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
 "transcribe_window_tail": |-
