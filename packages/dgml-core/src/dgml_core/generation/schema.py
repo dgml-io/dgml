@@ -25,6 +25,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 # Tag names become XML element names downstream (`el.tag = name`), so they must
 # be valid XML Names. The planner LLM occasionally emits names with spaces or
