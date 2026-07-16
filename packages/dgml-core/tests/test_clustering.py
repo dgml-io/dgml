@@ -27,7 +27,9 @@ from unittest.mock import patch
 
 import pytest
 from dgml_core.clustering import (
+    DEFAULT_INCREMENTAL_NOVELTY_QUANTILE,
     _resolve_mode,
+    _with_incremental_novelty_default,
     clustering_internal,
     load_clustering_overrides,
     load_clustering_preset,
@@ -304,6 +306,101 @@ def test_clustering_internal_passes_empty_overrides_when_no_config(workspace: Wo
     assert mock_run.call_args.kwargs["overrides"] == {
         "encoder_text": {"extra": {"corpus_dir": str(workspace.files_dir)}}
     }
+
+
+# ---------------------------------------------------------------------------
+# incremental novelty-gate default — _with_incremental_novelty_default
+# ---------------------------------------------------------------------------
+
+
+def test_novelty_default_injected_when_no_gate() -> None:
+    """With no gate set, a conservative quantile gate is injected."""
+    out = _with_incremental_novelty_default({})
+    assert out == {"scenario": {"threshold_quantile": DEFAULT_INCREMENTAL_NOVELTY_QUANTILE}}
+
+
+def test_novelty_default_merges_into_existing_scenario() -> None:
+    """The gate is added alongside unrelated scenario knobs, not replacing them."""
+    out = _with_incremental_novelty_default({"scenario": {"leiden_resolution": 1.5}})
+    assert out["scenario"] == {
+        "leiden_resolution": 1.5,
+        "threshold_quantile": DEFAULT_INCREMENTAL_NOVELTY_QUANTILE,
+    }
+
+
+@pytest.mark.parametrize("gate", ["threshold", "threshold_confidence", "threshold_quantile"])
+def test_novelty_default_suppressed_by_any_explicit_gate(gate: str) -> None:
+    """Any explicit gate the user set wins; no default is layered on top."""
+    overrides = {"scenario": {gate: 0.5}}
+    assert _with_incremental_novelty_default(overrides) == overrides
+
+
+def test_novelty_default_respects_explicit_null_gate() -> None:
+    """Setting a gate to ``null`` deliberately disables gating — the default
+    must not override that choice."""
+    overrides = {"scenario": {"threshold_quantile": None}}
+    assert _with_incremental_novelty_default(overrides) == overrides
+
+
+def test_novelty_default_does_not_mutate_input() -> None:
+    original = {"scenario": {"leiden_resolution": 1.0}}
+    _with_incremental_novelty_default(original)
+    assert original == {"scenario": {"leiden_resolution": 1.0}}
+
+
+def test_clustering_internal_incremental_injects_novelty_default(workspace: Workspace) -> None:
+    """The incremental embedding path forwards the conservative quantile gate
+    so new categories can emerge instead of every doc being absorbed."""
+    DocSetStore(workspace).create(name="Contracts")
+    _seed_file(workspace, "u1")
+    _seed_page_image(workspace, "u1")
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"u1": _dp("Contracts", 0.7)},
+    ) as mock_run:
+        result = clustering_internal(workspace)
+
+    assert result.mode == "incremental"
+    scenario = mock_run.call_args.kwargs["overrides"]["scenario"]
+    assert scenario["threshold_quantile"] == DEFAULT_INCREMENTAL_NOVELTY_QUANTILE
+
+
+def test_clustering_internal_fresh_does_not_inject_novelty_default(workspace: Workspace) -> None:
+    """Fresh mode clusters from scratch (S1, no prototypes) — no gate injected."""
+    DocSetStore(workspace).create(name="Contracts")
+    _seed_file(workspace, "u1")
+    _seed_page_image(workspace, "u1")
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"u1": _dp("unknown_0")},
+    ) as mock_run:
+        clustering_internal(workspace, mode="fresh")
+
+    scenario = mock_run.call_args.kwargs["overrides"].get("scenario", {})
+    assert "threshold_quantile" not in scenario
+
+
+def test_clustering_internal_incremental_respects_user_gate(workspace: Workspace) -> None:
+    """A user-set gate in config.json wins over the injected default."""
+    DocSetStore(workspace).create(name="Contracts")
+    _seed_file(workspace, "u1")
+    _seed_page_image(workspace, "u1")
+    workspace.config_path.write_text(
+        json.dumps({"clustering": {"scenario": {"threshold_confidence": 0.5}}}),
+        encoding="utf-8",
+    )
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"u1": _dp("Contracts", 0.7)},
+    ) as mock_run:
+        clustering_internal(workspace)
+
+    scenario = mock_run.call_args.kwargs["overrides"]["scenario"]
+    assert scenario["threshold_confidence"] == 0.5
+    assert "threshold_quantile" not in scenario
 
 
 # ---------------------------------------------------------------------------
