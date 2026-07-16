@@ -1176,9 +1176,10 @@ def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
             continue
         roster[name] = RosterEntry(
             description=str(tag.role or ""),
-            examples=[str(ex).strip()[:_ROSTER_EXAMPLE_CHARS] for ex in tag.all_examples()][
-                :_SCHEMA_MAX_EXAMPLES
-            ],
+            examples=[
+                str(ex).strip()[:_ROSTER_EXAMPLE_CHARS]
+                for ex in (tag.examples or ([tag.example] if tag.example else []))
+            ][:_SCHEMA_MAX_EXAMPLES],
             kind=tag.kind if tag.kind in VALID_KINDS else "",
             parent=sanitize_concept(tag.parent_role or ""),
             confirmed=True,
