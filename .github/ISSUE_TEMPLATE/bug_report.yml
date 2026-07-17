@@ -1,0 +1,83 @@
+name: Bug report
+description: Something in dgml/dgml-core doesn't work the way it should.
+title: "[Bug]: "
+labels:
+  - bug
+  - triage
+body:
+  - type: checkboxes
+    id: existing-issue
+    attributes:
+      label: Checked for existing issues
+      options:
+        - label: I searched open and closed issues and didn't find a duplicate
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which package or pipeline stage is this in?
+      options:
+        - CLI / workspace (init, add, docset, storage)
+        - PDF ingestion & page rendering (ghostscript)
+        - OCR
+        - DGML generation (PDF → XML)
+        - Grounding (dg:origin bounding boxes)
+        - Semantic tagging / cross-document consistency
+        - Extraction (schema generation or value extraction)
+        - Attestation / chain (dgml-chain)
+        - Clustering (dgml-clustering)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: >
+        Steps to reproduce, what you expected, and what happened instead.
+        Include the exact command(s) you ran.
+      placeholder: |
+        1. dgml init
+        2. dgml file add sample.pdf
+        3. dgml generate sample.pdf
+
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Paste the output of each command listed.
+      value: |
+        - OS + version:
+        - dgml / dgml-core version (`dgml --version`):
+        - Python version (`python3 --version`):
+        - Ghostscript version (`gs --version`, if PDF-related):
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro-artifact
+    attributes:
+      label: Reproduction input (optional)
+      description: >
+        If you can share a sanitized/synthetic document that triggers this, attach it here.
+        If not (most documents are confidential), that's fine — instead describe the shape
+        that matters: scanned vs. native text, page count, language, table/form-heavy, etc.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / traceback (optional)
+      render: shell
+    validations:
+      required: false
