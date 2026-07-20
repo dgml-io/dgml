@@ -489,14 +489,18 @@ def apply_labels(
 def _find_verbatim(haystack: str, needle: str, start: int) -> int:
     """First index of *needle* at/after *start* not embedded in a larger token.
 
-    A short value (e.g. a single digit) must not match inside a larger token;
-    require the match to be flanked by non-alphanumeric characters (or edges).
+    An edge is embedding only when the quote's edge char and its neighbour are
+    both alphanumeric; a punctuation-edged quote isn't extended by a neighbour.
     """
+    if not needle:
+        return haystack.find(needle, start)
     i = haystack.find(needle, start)
     while i != -1:
         before = haystack[i - 1] if i > 0 else ""
         after = haystack[i + len(needle)] if i + len(needle) < len(haystack) else ""
-        if not (before.isalnum() or after.isalnum()):
+        left_bad = before.isalnum() and needle[0].isalnum()
+        right_bad = after.isalnum() and needle[-1].isalnum()
+        if not (left_bad or right_bad):
             return i
         i = haystack.find(needle, i + 1)
     return -1

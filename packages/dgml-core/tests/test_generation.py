@@ -30,6 +30,7 @@ from dgml_core.generation.blocks import (
     sanitize_concept,
 )
 from dgml_core.generation.label import (
+    _find_verbatim,
     apply_labels,
     label_documents,
     propagate_table_consistency,
@@ -278,6 +279,17 @@ def test_apply_labels_short_quote_respects_token_boundary() -> None:
     (span,) = block.entities
     assert block.text[span.start : span.end] == "C"
     assert span.start == block.text.index('"') + 1  # the grade, not the C of "Completion"
+
+
+def test_find_verbatim_skips_embedding_keeps_punct_edged() -> None:
+    # embedded in a larger word/number -> skip to the standalone value
+    assert _find_verbatim("Completion, grade C", "C", 0) == "Completion, grade C".rindex("C")
+    assert _find_verbatim("Na 137, K 3", "3", 0) == "Na 137, K 3".rindex("3")
+    assert _find_verbatim("over 120,000 or 20,000", "20,000", 0) == "over 120,000 or 20,000".rindex(
+        "20,000"
+    )
+    # a punctuation-edged quote is not extended by a neighbour (possessive 's)
+    assert _find_verbatim("from 'Le Lyrial's'", "'Le Lyrial'", 0) == 5
 
 
 def test_label_prompt_schema_elicits_occurrence() -> None:
