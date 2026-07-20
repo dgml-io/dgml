@@ -204,8 +204,9 @@ def _locate_quote(text: str, raw_span: Mapping[str, Any]) -> tuple[int, int] | N
 
     The model COPIES the value; the pipeline does the arithmetic — models
     cannot count positions reliably (the earlier offset contract cut values
-    mid-token in live runs). The quote must occur verbatim; ``occurrence``
-    (1-based) picks among repeats, defaulting to the first.
+    mid-token in live runs). The quote must occur verbatim on token boundaries
+    (via :func:`_find_verbatim`); ``occurrence`` (1-based) picks among
+    boundary-valid repeats, defaulting to the first.
     """
     quote = str(raw_span.get("quote", "") or "")
     if not quote:
@@ -216,7 +217,7 @@ def _locate_quote(text: str, raw_span: Mapping[str, Any]) -> tuple[int, int] | N
         occurrence = 1
     start = -1
     for _ in range(occurrence):
-        start = text.find(quote, start + 1)
+        start = _find_verbatim(text, quote, start + 1)
         if start == -1:
             return None
     return start, start + len(quote)

@@ -271,6 +271,15 @@ def test_apply_labels_quote_occurrence_picks_the_right_match() -> None:
     assert block.text[span.start : span.end] == "5%"
 
 
+def test_apply_labels_short_quote_respects_token_boundary() -> None:
+    block = _b("p", "b1", text='Completion of BAS with a grade of "C", or better')
+    warnings = apply_labels([block], {"b1": {"entities": [{"quote": "C", "concept": "Grade"}]}})
+    assert warnings == []
+    (span,) = block.entities
+    assert block.text[span.start : span.end] == "C"
+    assert span.start == block.text.index('"') + 1  # the grade, not the C of "Completion"
+
+
 def test_label_prompt_schema_elicits_occurrence() -> None:
     # Prose alone doesn't elicit it; occurrence must be in the entities schema.
     entities_schema = get_prompt("label_system").partition('"entities"')[2]
