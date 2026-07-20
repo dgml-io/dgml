@@ -30,12 +30,14 @@ from dgml_core.generation.blocks import (
     sanitize_concept,
 )
 from dgml_core.generation.label import (
+    _find_verbatim,
     apply_labels,
     label_documents,
     propagate_table_consistency,
     render_block_listing,
     wrap_detected_values,
 )
+from dgml_core.generation.prompts import get as get_prompt
 from dgml_core.generation.render import render_xml
 from dgml_core.generation.transcribe import (
     _append_continuation,
@@ -268,6 +270,29 @@ def test_apply_labels_quote_occurrence_picks_the_right_match() -> None:
     (span,) = block.entities
     assert (span.start, span.end) == (15, 17)
     assert block.text[span.start : span.end] == "5%"
+
+
+def test_apply_labels_short_quote_respects_token_boundary() -> None:
+    block = _b("p", "b1", text='Baseline value is "B" here')
+    warnings = apply_labels([block], {"b1": {"entities": [{"quote": "B", "concept": "Grade"}]}})
+    assert warnings == []
+    (span,) = block.entities
+    assert block.text[span.start : span.end] == "B"
+    assert span.start == block.text.index('"') + 1  # the quoted value, not the B in "Baseline"
+
+
+def test_find_verbatim_skips_embedding_keeps_punct_edged() -> None:
+    # a short value embedded in a larger word / number -> skip to the standalone one
+    assert _find_verbatim("Baseline B", "B", 0) == "Baseline B".rindex("B")
+    assert _find_verbatim("150 and 50", "50", 0) == "150 and 50".rindex("50")
+    # a punctuation-edged quote is not extended by a neighbour (possessive 's)
+    assert _find_verbatim("'Acme's report", "'Acme'", 0) == 0
+
+
+def test_label_prompt_schema_elicits_occurrence() -> None:
+    # Prose alone doesn't elicit it; occurrence must be in the entities schema.
+    entities_schema = get_prompt("label_system").partition('"entities"')[2]
+    assert '"occurrence"' in entities_schema
 
 
 def test_apply_labels_offsets_without_quote_are_rejected() -> None:

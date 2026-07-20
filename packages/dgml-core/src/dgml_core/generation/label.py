@@ -204,8 +204,9 @@ def _locate_quote(text: str, raw_span: Mapping[str, Any]) -> tuple[int, int] | N
 
     The model COPIES the value; the pipeline does the arithmetic — models
     cannot count positions reliably (the earlier offset contract cut values
-    mid-token in live runs). The quote must occur verbatim; ``occurrence``
-    (1-based) picks among repeats, defaulting to the first.
+    mid-token in live runs). The quote must occur verbatim on token boundaries
+    (via :func:`_find_verbatim`); ``occurrence`` (1-based) picks among
+    boundary-valid repeats, defaulting to the first.
     """
     quote = str(raw_span.get("quote", "") or "")
     if not quote:
@@ -216,7 +217,7 @@ def _locate_quote(text: str, raw_span: Mapping[str, Any]) -> tuple[int, int] | N
         occurrence = 1
     start = -1
     for _ in range(occurrence):
-        start = text.find(quote, start + 1)
+        start = _find_verbatim(text, quote, start + 1)
         if start == -1:
             return None
     return start, start + len(quote)
@@ -488,14 +489,18 @@ def apply_labels(
 def _find_verbatim(haystack: str, needle: str, start: int) -> int:
     """First index of *needle* at/after *start* not embedded in a larger token.
 
-    A short value (e.g. a single digit) must not match inside a larger token;
-    require the match to be flanked by non-alphanumeric characters (or edges).
+    An edge is embedding only when the quote's edge char and its neighbour are
+    both alphanumeric; a punctuation-edged quote isn't extended by a neighbour.
     """
+    if not needle:
+        return haystack.find(needle, start)
     i = haystack.find(needle, start)
     while i != -1:
         before = haystack[i - 1] if i > 0 else ""
         after = haystack[i + len(needle)] if i + len(needle) < len(haystack) else ""
-        if not (before.isalnum() or after.isalnum()):
+        left_bad = before.isalnum() and needle[0].isalnum()
+        right_bad = after.isalnum() and needle[-1].isalnum()
+        if not (left_bad or right_bad):
             return i
         i = haystack.find(needle, i + 1)
     return -1
