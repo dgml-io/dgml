@@ -36,6 +36,7 @@ from dgml_core.generation.label import (
     render_block_listing,
     wrap_detected_values,
 )
+from dgml_core.generation.prompts import get as get_prompt
 from dgml_core.generation.render import render_xml
 from dgml_core.generation.transcribe import (
     _append_continuation,
@@ -268,6 +269,12 @@ def test_apply_labels_quote_occurrence_picks_the_right_match() -> None:
     (span,) = block.entities
     assert (span.start, span.end) == (15, 17)
     assert block.text[span.start : span.end] == "5%"
+
+
+def test_label_prompt_schema_elicits_occurrence() -> None:
+    # Prose alone doesn't elicit it; occurrence must be in the entities schema.
+    entities_schema = get_prompt("label_system").partition('"entities"')[2]
+    assert '"occurrence"' in entities_schema
 
 
 def test_apply_labels_offsets_without_quote_are_rejected() -> None:

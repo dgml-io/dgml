@@ -158,7 +158,9 @@
 
   Output JSON only:
   {"labels": {"<block_id>": {"concept": "...",
-    "entities": [{"quote": "<exact substring>", "concept": "..."}]}}}
+    "entities": [{"quote": "<exact substring>", "concept": "...",
+      "occurrence": <1-based; include ONLY when the same value string repeats
+      in the block, to pick which instance — omit otherwise>}]}}}
   Every key must be a block id from the input. Label densely per the rules
   above; omit only connective prose.
 "plan_system": |
