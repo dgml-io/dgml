@@ -1087,7 +1087,9 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         return 0
 
     if cmd == "check":
-        report = check_workspace(ws, retry_errors=args.retry_errors, verbose=args.verbose)
+        report = check_workspace(
+            ws, retry_errors=args.retry_errors, verbose=args.verbose, debug=args.debug
+        )
         _emit(report.to_json(), fmt)
         return 0 if report.ok else 2
 
