@@ -32,6 +32,17 @@ logging = [
     "clearml>=1.16",
     "wandb>=0.17",
 ]
+# Powers `reduce_method: umap` in the clustering scenarios (the default
+# `light`/`medium`/`heavy` presets use it). Gated behind `try: import umap`
+# at runtime, so it's an opt-in extra rather than a core dep — but the
+# documented install path pulls it (see dgml-core `[clustering]`). The
+# `numba>=0.61` floor is load-bearing: older numba "accepts" numpy 2 via
+# loose metadata but crashes at import; 0.61 is the first that builds against
+# numpy 2. Pulls numba / llvmlite / pynndescent (all BSD).
+umap = [
+    "umap-learn>=0.5.6",
+    "numba>=0.61",
+]
 
 [build-system]
 requires = ["hatchling"]
