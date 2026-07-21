@@ -163,6 +163,7 @@ def convert_batch(
     options: ConvertOptions,
     on_output: Callable[[str, str], None] | None = None,
     on_error: Callable[[str, str], None] | None = None,
+    on_label_error: Callable[[str, dict[str, str]], None] | None = None,
     prior_docs: Mapping[str, list[Block]] | None = None,
     prior_outputs: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
@@ -181,6 +182,14 @@ def convert_batch(
     compact cause it can put in a machine-readable payload. Called once per
     failed document, serially, after the (possibly concurrent) transcription
     pass — so the callback need not be thread-safe.
+
+    Pass *on_label_error* — called ``(name, {code, message})`` — to learn that a
+    document's *labeling* could not reach the model at all (auth, bad model id,
+    connection), as distinct from a soft "produced few/no labels" outcome. The
+    document still renders (unlabeled), so this lets the caller surface a
+    misconfigured ``label_model`` without discarding the transcription. Labeling
+    completes before any ``on_output`` fires, so a per-file result built in
+    ``on_output`` can read whatever this reported.
 
     *prior_docs* (already-generated docs from cache) are re-rendered so the
     whole docset stays consistent as its schema/roster grows; any whose render
@@ -252,6 +261,7 @@ def convert_batch(
             log=log,
             roster_seed=opts.roster_seed,
             schema_seed=opts.schema_seed,
+            on_label_error=on_label_error,
         )
 
     outputs: dict[str, str] = {}
