@@ -41,7 +41,6 @@ EncoderName = Literal[
     "stella",
     "jina",
     "tfidf",
-    "layoutlm",
     "dit",
     "vit",
     "donut",
