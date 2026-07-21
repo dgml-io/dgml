@@ -27,8 +27,9 @@ from typing import Any, cast
 import torch
 
 from clustering.config.schema import Config
-from clustering.data.datasets import DocumentDataset
+from clustering.data.datasets import DocumentDataset, DocumentRecord
 from clustering.encoders import build_encoder
+from clustering.encoders.base import EncoderOutput
 from clustering.fusion import build_fusion
 from clustering.manifolds import build_manifold
 from clustering.utils.runid import run_id_for
@@ -108,6 +109,28 @@ class Scenario(ABC):
         self.projector.eval()
 
     # ── Shared pipeline pieces ────────────────────────────────────────────
+    def _encode_images(self, records: list[DocumentRecord]) -> EncoderOutput:
+        """Encode one image per record, optionally mean-pooling the first N pages.
+
+        With ``scenario.pooling_pages == 1`` (default) this is exactly the old
+        ``image_encoder.encode([r.image for r in records])`` — page 1 only. With
+        ``> 1`` it flattens the first ``pooling_pages`` renders of every record
+        into one encode call, then averages each record's page embeddings back
+        into a single ``[D]`` vector. Records with an empty ``page_images`` fall
+        back to ``[image]``. ``tokens`` are dropped under pooling (the pooled
+        vector is what the single-vector fusions consume)."""
+        pool_n = self.config.scenario.pooling_pages
+        if pool_n <= 1:
+            return self.image_encoder.encode([r.image for r in records])
+        per_doc = [list(r.page_images[:pool_n]) or [r.image] for r in records]
+        flat_pooled = self.image_encoder.encode([img for pages in per_doc for img in pages]).pooled
+        rows: list[torch.Tensor] = []
+        offset = 0
+        for pages in per_doc:
+            rows.append(flat_pooled[offset : offset + len(pages)].mean(dim=0))
+            offset += len(pages)
+        return EncoderOutput(pooled=torch.stack(rows, dim=0))
+
     def fused_embeddings(
         self,
         dataset: DocumentDataset,
@@ -134,10 +157,9 @@ class Scenario(ABC):
                 stop = min(start + batch_size, n)
                 records = [dataset[i] for i in range(start, stop)]
                 texts = [r.text or "" for r in records]
-                images = [r.image for r in records]
 
                 text_out = self.text_encoder.encode(texts)
-                image_out = self.image_encoder.encode(images)
+                image_out = self._encode_images(records)
                 fused = self.fusion(text_out, image_out)
 
                 all_fused.append(fused.pooled)
@@ -175,10 +197,11 @@ class Scenario(ABC):
                 stop = min(start + batch_size, n)
                 records = [dataset[i] for i in range(start, stop)]
                 texts = [r.text or r.doc_id for r in records]
-                images = [r.image for r in records]
 
                 text_parts.append(self.text_encoder.encode(texts).pooled)
-                image_parts.append(self.image_encoder.encode(images).pooled)
+                # Same multi-page pooling as fused_embeddings, so fusion is
+                # trained on the exact image representation it is scored on.
+                image_parts.append(self._encode_images(records).pooled)
                 all_ids.extend(r.doc_id for r in records)
                 all_labels.extend(r.label for r in records)
 

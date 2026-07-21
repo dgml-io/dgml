@@ -37,6 +37,11 @@ class DocumentRecord:
     image: Image.Image
     text: str  # OCR text — empty string in Phase 2; populated by OCR pass later.
     thumbnail_path: Path | None
+    # First few page renders in order (page 1, 2, …), for optional multi-page
+    # pooling. Empty by default → consumers fall back to ``[image]`` (page 1
+    # only), which is today's behaviour. Datasets populate it; the encode path
+    # pools the first ``scenario.pooling_pages`` of them on the image side.
+    page_images: tuple[Image.Image, ...] = ()
 
 
 class DocumentDataset(ABC):
