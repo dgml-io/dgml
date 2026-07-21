@@ -129,14 +129,56 @@ def strip_fences(text: str) -> str:
 SYSTEM_PROMPT = prompt("transcribe_system")
 
 
-def _window_instruction(first_page: int, last_page: int, total: int, tail: str) -> str:
+def _heading_breadcrumb(blocks: list[Block]) -> list[str]:
+    """The chain of still-open headings (a level stack, like ``build_tree``)."""
+    stack: list[tuple[int, str]] = []
+    for b in blocks:
+        if b.structure == "heading":
+            while stack and stack[-1][0] >= b.level:
+                stack.pop()
+            label = f"{b.lim} {b.text}".strip() if b.lim else b.text
+            if label:
+                stack.append((b.level, label))
+    return [label for _, label in stack]
+
+
+def _open_table_header(blocks: list[Block]) -> list[str]:
+    """Cells of the first row of a table still open at the window's end, else []."""
+    if not blocks or blocks[-1].structure != "row":
+        return []
+    i = len(blocks) - 1
+    while i > 0 and blocks[i - 1].structure == "row":
+        i -= 1
+    return [c for c in blocks[i].cells if c]
+
+
+def _window_context(blocks: list[Block], tail_chars: int = 300) -> str:
+    """Structural continuity for the next window: section path, an open table's
+    columns, and the trailing text — richer than a bare text tail so a clause or
+    table spanning a page seam keeps its heading levels and column model."""
+    if not blocks:
+        return ""
+    parts: list[str] = []
+    crumb = _heading_breadcrumb(blocks)
+    if crumb:
+        parts.append("Section path: " + " > ".join(crumb))
+    header = _open_table_header(blocks)
+    if header:
+        parts.append("Open table columns: " + " | ".join(header))
+    tail = blocks[-1].flat_text()[-tail_chars:]
+    if tail:
+        parts.append(f'Ends with: "{tail}"')
+    return "\n".join(parts)
+
+
+def _window_instruction(first_page: int, last_page: int, total: int, context: str) -> str:
     parts = [
         prompt("transcribe_window_header").format(
             first=first_page + 1, last=last_page + 1, total=total
         )
     ]
-    if tail:
-        parts.append(prompt("transcribe_window_tail").format(tail=tail))
+    if context:
+        parts.append(prompt("transcribe_window_context").format(context=context))
     parts.append(prompt("transcribe_window_json"))
     return "\n\n".join(parts)
 
@@ -375,11 +417,11 @@ def transcribe_document(
     with llm.record_usage_for(config):
 
         def run_attempts(
-            pages: list[int], page_tail: str, wlog: str, wfile: str
+            pages: list[int], context: str, wlog: str, wfile: str
         ) -> tuple[float, str, dict[str, Any]] | None:
             """Gated attempt loop for one page range; best (recall, raw, payload)."""
             pdf_slice = document.slice_pdf(pdf_bytes, pages)
-            instr = _window_instruction(pages[0], pages[-1], total, page_tail)
+            instr = _window_instruction(pages[0], pages[-1], total, context)
             exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
             n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)
             found: tuple[float, str, dict[str, Any]] | None = None
@@ -442,11 +484,11 @@ def transcribe_document(
             return found
 
         for w_idx, page_indices in enumerate(windows):
-            tail = blocks[-1].flat_text()[-300:] if blocks else ""
+            context = _window_context(blocks)
             wlog, wfile = f"w{w_idx + 1}", f"w{w_idx + 1:02d}"
             expected = [t for p in page_indices if p < len(page_tokens) for t in page_tokens[p]]
             gate_on = len(expected) >= _GATE_MIN_TOKENS
-            best = run_attempts(page_indices, tail, wlog, wfile)
+            best = run_attempts(page_indices, context, wlog, wfile)
             if best is None:
                 log(f"{doc_name} {wlog}: window skipped")
                 continue
@@ -456,9 +498,9 @@ def transcribe_document(
             if gate_on and best[0] < _GATE_RECALL and len(page_indices) >= 2:
                 log(f"{doc_name} {wlog}: still short after retry; splitting the window")
                 mid = (len(page_indices) + 1) // 2
-                half_a = run_attempts(page_indices[:mid], tail, f"{wlog}a", f"{wfile}a")
-                tail_b = _payload_tail(half_a[2]) if half_a else tail
-                half_b = run_attempts(page_indices[mid:], tail_b, f"{wlog}b", f"{wfile}b")
+                half_a = run_attempts(page_indices[:mid], context, f"{wlog}a", f"{wfile}a")
+                context_b = _payload_tail(half_a[2]) if half_a else context
+                half_b = run_attempts(page_indices[mid:], context_b, f"{wlog}b", f"{wfile}b")
                 if half_a and half_b:
                     merged = _merge_payloads(half_a[2], half_b[2])
                     merged_recall = _window_recall(merged, expected)
