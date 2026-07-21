@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import litellm
 import pytest
 from dgml_core import llm
 from dgml_core.generation import blocks as blocks_mod
@@ -554,6 +555,71 @@ def test_label_documents_failure_is_noop(monkeypatch: pytest.MonkeyPatch) -> Non
     # Planning fails soft (empty roster); each doc chunk fails soft too.
     assert sum("labeling failed" in w for w in warnings) == 2
     assert all(not b.concept for blocks in docs.values() for b in blocks)
+
+
+def test_is_model_reachability_error_splits_hard_from_soft() -> None:
+    auth = litellm.exceptions.AuthenticationError(
+        message="bad key", llm_provider="anthropic", model="anthropic/claude-haiku-4-5"
+    )
+    bad_req = litellm.exceptions.BadRequestError(
+        message="unknown model", llm_provider="anthropic", model="anthropic/claude-typo"
+    )
+    assert llm.is_model_reachability_error(auth) is True
+    assert llm.is_model_reachability_error(bad_req) is True
+    # A successful-but-unusable response parses to a plain ValueError/JSONDecodeError
+    # — soft, must NOT be flagged as a config problem.
+    assert llm.is_model_reachability_error(ValueError("no labels key")) is False
+    assert llm.is_model_reachability_error(json.JSONDecodeError("x", "y", 0)) is False
+
+
+def test_label_documents_reports_unreachable_model_per_doc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A label-model auth failure fires on_label_error per document (a hard config
+    problem) while still leaving the transcription intact and the warnings
+    string-contract unchanged."""
+    docs = _docs()
+
+    def auth_boom(config: llm.LLMConfig, **kwargs: object) -> str:
+        raise litellm.exceptions.AuthenticationError(
+            message="invalid x-api-key", llm_provider="anthropic", model=config.model
+        )
+
+    def auth_boom_refine(config: llm.LLMConfig, **kwargs: object) -> tuple[str, str]:
+        raise litellm.exceptions.AuthenticationError(
+            message="invalid x-api-key", llm_provider="anthropic", model=config.model
+        )
+
+    monkeypatch.setattr(llm, "call", auth_boom)
+    monkeypatch.setattr(llm, "call_with_refinement", auth_boom_refine)
+    errors: dict[str, dict[str, str]] = {}
+    warnings = label_documents(
+        docs,
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        on_label_error=lambda name, err: errors.__setitem__(name, err),
+    )
+    # Fired once per document, with the registry code.
+    assert set(errors) == set(docs)
+    assert all(e["code"] == "LABEL_MODEL_UNREACHABLE" for e in errors.values())
+    assert all("AuthenticationError" in e["message"] for e in errors.values())
+    # Warnings contract preserved; transcription untouched.
+    assert sum("labeling failed" in w for w in warnings) == 2
+    assert all(not b.concept for blocks in docs.values() for b in blocks)
+
+
+def test_label_documents_no_labels_is_soft_no_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call that SUCCEEDS but returns no labels is a soft outcome — the doc is
+    simply sparse — and must NOT fire on_label_error."""
+    docs = _docs()
+    _patch_roster(monkeypatch, {"PaymentTerms": "payment obligations section"})
+    monkeypatch.setattr(llm, "call", lambda config, **kw: json.dumps({"labels": {}}))
+    errors: dict[str, dict[str, str]] = {}
+    label_documents(
+        docs,
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        on_label_error=lambda name, err: errors.__setitem__(name, err),
+    )
+    assert errors == {}
 
 
 @pytest.mark.parametrize("max_parallel_docs", [1, 2])

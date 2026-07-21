@@ -631,10 +631,14 @@ def clustering_internal(
             n_samples_per_category=max_shots,
             support_dataset=support_dataset,
             overrides=overrides,
+            cache_dir=workspace.embedding_cache_dir,
         )
     else:
         detailed = run_clustering_detailed(
-            dataset, known_categories=known_categories, overrides=overrides
+            dataset,
+            known_categories=known_categories,
+            overrides=overrides,
+            cache_dir=workspace.embedding_cache_dir,
         )
 
     clusters = {doc_id: pred.cluster_name for doc_id, pred in detailed.items()}

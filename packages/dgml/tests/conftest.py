@@ -226,3 +226,17 @@ def _stub_add_links(monkeypatch: pytest.MonkeyPatch) -> None:
         "dgml_core.generation.links.add_links",
         lambda xml, config, **kw: (xml, []),
     )
+
+
+@pytest.fixture(autouse=True)
+def _dummy_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic provider keys for the whole suite.
+
+    `docset generate`'s pre-flight (validate_generation_models) checks that the
+    configured models' API keys are present *before* mocking bites, so without
+    this the mocked-convert_batch generate tests would pass locally (developer
+    key present) but fail in CI (no key). Set dummy keys for the providers the
+    test configs name so the check is env-independent; a test that needs the key
+    *absent* (a pre-flight AUTH_ERROR) can delenv it itself."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-dummy")

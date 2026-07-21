@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from dgml_core import llm
+from dgml_core.errors import LabelModelUnreachable, short_error_message
 from dgml_core.generation.blocks import Block, Node, Span, build_tree, sanitize_concept
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.generation.schema import VALID_KINDS, Schema, SchemaTag
@@ -1202,9 +1203,19 @@ def _label_one_document(
     cache_dir: Path | str | None,
     debug: bool,
     log: Callable[[str], None],
-) -> list[str]:
-    """Label one document's blocks against (and into) the shared roster."""
+) -> tuple[list[str], dict[str, str] | None]:
+    """Label one document's blocks against (and into) the shared roster.
+
+    Returns ``(warnings, label_error)``. ``label_error`` is a ``{code, message}``
+    set only when a label-model call *could not be reached at all* (auth, bad
+    model id, connection) — the first such failure for this document. A call
+    that succeeds but returns few/no labels is a soft outcome and leaves
+    ``label_error`` ``None``; the transcription is never lost either way.
+    """
     warnings: list[str] = []
+    # Populated on the first model-reachability failure (see is_model_reachability_error);
+    # recorded once because such failures (e.g. a bad key) recur on every chunk.
+    label_error: dict[str, str] | None = None
     stem = Path(doc_name).stem
     # One roster snapshot per document: every call for this document reuses the
     # same rendered block, so it stays byte-stable (and cacheable) across the
@@ -1239,6 +1250,11 @@ def _label_one_document(
             except Exception as exc:  # labeling must never lose the transcription
                 msg = f"labeling failed for {doc_name} chunk {chunk_idx + 1}: {exc}"
                 log(f"[label] {msg}")
+                if label_error is None and llm.is_model_reachability_error(exc):
+                    label_error = {
+                        "code": LabelModelUnreachable.code,
+                        "message": short_error_message(exc),
+                    }
                 if attempt:
                     warnings.append(msg)
                 continue
@@ -1280,6 +1296,11 @@ def _label_one_document(
             )
             _update_roster(roster, missing)
         except Exception as exc:
+            if label_error is None and llm.is_model_reachability_error(exc):
+                label_error = {
+                    "code": LabelModelUnreachable.code,
+                    "message": short_error_message(exc),
+                }
             warnings.append(f"section retry failed for {doc_name}: {exc}")
         recovered = sum(1 for b in missing if b.concept)
         log(f"Pass B: {doc_name}: section retry labeled {recovered}/{len(missing)}")
@@ -1290,7 +1311,7 @@ def _label_one_document(
     wrap_detected_values(blocks)
     labeled = sum(1 for b in blocks if b.concept)
     log(f"Pass B: {doc_name}: {labeled}/{len(blocks)} block(s) labeled")
-    return warnings
+    return warnings, label_error
 
 
 def _promote_pilot(
@@ -1327,12 +1348,23 @@ def label_documents(
     roster_refine: bool = True,
     roster_seed: Mapping[str, str] | None = None,
     schema_seed: Schema | None = None,
+    on_label_error: Callable[[str, dict[str, str]], None] | None = None,
 ) -> list[str]:
     """Label every document, chunked, carrying the roster between calls.
 
     Best-effort per chunk: a failed call leaves that chunk unlabeled (still a
     valid, renderable document) and is reported as a warning; later chunks
     proceed with whatever roster exists so far.
+
+    *on_label_error* — called ``(doc_name, {code, message})`` — is invoked once
+    per document whose label model *could not be reached at all* (auth, bad
+    model id, connection), so the caller can surface a misconfigured
+    ``label_model`` in machine-readable output without discarding the
+    transcription. A soft outcome (call succeeded but produced few/no labels)
+    does NOT fire it. Planning (``plan_concept_roster``) needs no separate hook:
+    if the model is unreachable at planning time the same config makes every
+    per-document chunk raise too, so per-document detection covers it. Warnings
+    are still returned unchanged.
 
     *schema_seed* (from a user-supplied ``--schema-path`` or the docset's own
     ``schema.json`` on an incremental run) is used as the starting roster with
@@ -1400,17 +1432,18 @@ def label_documents(
         log(f"Pass B: pilot stage — labeling the {len(pilot)} largest doc(s) first")
 
     for idx, doc_name in enumerate(order):
-        warnings.extend(
-            _label_one_document(
-                doc_name,
-                docs[doc_name],
-                roster,
-                config=config,
-                cache_dir=cache_dir,
-                debug=debug,
-                log=log,
-            )
+        warns, label_err = _label_one_document(
+            doc_name,
+            docs[doc_name],
+            roster,
+            config=config,
+            cache_dir=cache_dir,
+            debug=debug,
+            log=log,
         )
+        warnings.extend(warns)
+        if label_err is not None and on_label_error is not None:
+            on_label_error(doc_name, label_err)
         if pilot and idx == len(pilot) - 1:
             _promote_pilot(docs, pilot, roster, descriptions, log)
 
