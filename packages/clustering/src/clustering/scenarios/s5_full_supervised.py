@@ -19,6 +19,8 @@ then assigned to its nearest prototype.
 
 from __future__ import annotations
 
+import torch
+
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes
@@ -29,6 +31,26 @@ class S5FullSupervised(Scenario):
     # If ``config.scenario.n_shots`` is unset, take at most this many
     # support samples per category when building prototypes.
     DEFAULT_N_SHOTS = 8
+
+    @staticmethod
+    def _blend_prototypes(
+        support_protos: torch.Tensor, name_protos: torch.Tensor, alpha: float
+    ) -> torch.Tensor:
+        """Convex-combine name and support prototypes in unit-direction space.
+
+        Both inputs are L2-normalized, mixed ``alpha*name + (1-alpha)*support``,
+        then renormalized -- a direction-space blend so a name-only prototype and
+        a support mean, which have very different norms, contribute by direction
+        rather than magnitude. The result is a unit vector; the caller restricts
+        this to a euclidean manifold (``fit_predict``). ``alpha`` is assumed
+        validated to ``[0, 1]`` by :class:`ScenarioConfig`.
+        """
+
+        def _unit(x: torch.Tensor) -> torch.Tensor:
+            unit: torch.Tensor = x / x.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            return unit
+
+        return _unit(alpha * _unit(name_protos) + (1.0 - alpha) * _unit(support_protos))
 
     def fit_predict(
         self,
@@ -56,6 +78,26 @@ class S5FullSupervised(Scenario):
             n_shots=n_shots,
         )
 
+        # ── Optionally blend in a name prototype (few-shot prior) ────────
+        blend = self.config.scenario.name_prototype_blend
+        prototype_source = "support_mean"
+        if blend:
+            # The blend mixes a name prototype with the support mean in the
+            # unit-direction space. That is only geometrically sound on a flat
+            # (euclidean) manifold, where the projector output equals the
+            # on-manifold representation; on spherical/hyperbolic heads the two
+            # operands live in different spaces (one on-manifold, one ambient)
+            # and averaging them is meaningless. It is also the only manifold the
+            # gain was measured on — so require it rather than misbehave silently.
+            if self.config.manifold.name != "euclidean":
+                raise ValueError(
+                    "scenario.name_prototype_blend is only supported with a euclidean "
+                    f"manifold; got manifold.name={self.config.manifold.name!r}."
+                )
+            name_protos = self.encode_texts(list(cats))
+            prototypes = self._blend_prototypes(prototypes, name_protos, blend)
+            prototype_source = f"name_support_blend(alpha={blend:g})"
+
         # ── Embed unknown set + assign to prototypes ─────────────────────
         doc_ids, fused, true_labels = self.fused_embeddings(unknown_dataset)
         embeddings = self.projector(fused)
@@ -78,7 +120,7 @@ class S5FullSupervised(Scenario):
             scores=probs_t,
             class_names=list(cats),
             metadata={
-                "prototype_source": "support_mean",
+                "prototype_source": prototype_source,
                 "n_shots": n_shots,
                 "n_support": len(support_dataset),
                 "categories": list(cats),
