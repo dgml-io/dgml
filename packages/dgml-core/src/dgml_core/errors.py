@@ -194,6 +194,14 @@ class GroundingFailed(DgmlError):
     code = "GROUNDING_FAILED"
 
 
+class LabelModelUnreachable(DgmlError):
+    # Never raised — labeling must never propagate, or it would discard a good
+    # transcription. Exists so the per-file `label_error` payload surfaced by
+    # `docset generate` draws its `code` from this registry (mirroring how
+    # `grounding_error` reads `code` off a raised DgmlError).
+    code = "LABEL_MODEL_UNREACHABLE"
+
+
 class ChainConfigError(DgmlError):
     code = "CHAIN_CONFIG"
 
