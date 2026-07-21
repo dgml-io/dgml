@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from dgml_core.consistency import check_workspace
+import pytest
+from dgml_core.consistency import _reextract, check_workspace
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     RecordedError,
@@ -253,3 +255,37 @@ def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Pat
     )
     report = check_workspace(workspace)
     assert not [i for i in report.issues if i.kind == "computed_field_unattributed"]
+
+
+@pytest.mark.parametrize("debug", [True, False])
+def test_reextract_hybrid_threads_debug(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, debug: bool
+) -> None:
+    """The hybrid re-extraction branch forwards ``debug`` to
+    ``extract_text_hybrid`` so ``dgml check --debug`` records hybrid_merge
+    usage (and plain ``check`` records nothing)."""
+    import dgml_core.consistency as consistency
+    from dgml_core.text_extraction import ExtractDigitalResult
+
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(consistency, "load_ocr_config", lambda ws: object())
+    monkeypatch.setattr(consistency, "load_text_extraction_config", lambda ws: object())
+
+    def fake_hybrid(*args: Any, **kwargs: Any) -> ExtractDigitalResult:
+        captured["debug"] = kwargs.get("debug")
+        return ExtractDigitalResult(pages_written=1, pages_with_words=1, total_words=1)
+
+    monkeypatch.setattr(consistency, "extract_text_hybrid", fake_hybrid)
+
+    _reextract(
+        workspace,
+        Path("x.pdf"),
+        workspace.file_text_dir("fid"),
+        "fid",
+        "hybrid",
+        verbose=False,
+        debug=debug,
+    )
+
+    assert captured["debug"] is debug

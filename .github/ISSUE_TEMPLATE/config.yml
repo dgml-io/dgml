@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: DGML format/spec proposal
+    url: https://github.com/dgml-io/dgml-spec/issues/new
+    about: Changes to the format spec itself (tag definitions, schema, versioning) belong in dgml-spec, not here.
