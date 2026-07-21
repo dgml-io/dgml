@@ -584,6 +584,30 @@ A `failed` entry looks like:
   "error": { "code": "FILE_NOT_FOUND", "message": "source not found at ..." } }
 ```
 
+A `converted` entry carries `output` (the written DGML path), `links` (the
+semantic-link count), the grounding fields (`grounded`, then either
+`matched_token_pct` + `elements_annotated` or `grounding_error`), and — **only
+when that file's labeling could not reach the model at all** (a wrong/absent
+`generation.label_model` key, a bad model id, or a network error) — a
+`label_error`:
+
+```json
+{ "status": "converted", "file_id": "k7q3xb91pmrf", "source": "contract-a.pdf",
+  "output": "/ws/.../contract-a.dgml.xml", "links": 0, "grounded": true,
+  "matched_token_pct": 99.6, "elements_annotated": 445,
+  "label_error": { "code": "LABEL_MODEL_UNREACHABLE", "message": "AuthenticationError: ..." } }
+```
+
+The document still converts (`status: "converted"`, exit 0) — it just renders
+without concept tags. `label_error` makes a misconfigured `label_model` visible
+in the normal JSON, not only under `--verbose`. It is present *only* on affected
+files (like `grounding_error`), and only for a hard "couldn't reach the model"
+failure — a model that runs but simply produces few/no labels is a normal soft
+outcome and is not flagged. Most misconfigurations are caught earlier by the
+pre-flight check below; `label_error` covers the runtime failures that slip past
+it (a transient network/rate-limit error, or a well-formed but nonexistent model
+id).
+
 Errors (run-level, error envelope + exit 1):
 
 | Code | Cause |
@@ -591,7 +615,8 @@ Errors (run-level, error envelope + exit 1):
 | `DOCSET_NOT_FOUND` | `<docset_id>` does not exist. |
 | `EMPTY_DOCSET` | DocSet exists but has no files assigned. |
 | `GENERATION_CONFIG_MISSING` | No `generation` section (or a missing `model` / `label_model`) in `<workspace>/config.json`. |
-| `GENERATION_CONFIG_INVALID` | The `generation` section is malformed (bad model string, both `api_key` and `api_key_env` set, etc.). |
+| `GENERATION_CONFIG_INVALID` | The `generation` section is malformed (bad model string, both `api_key` and `api_key_env` set, etc.). A **pre-flight check** (before any transcription spend) also raises this for a model string with no resolvable provider. |
+| `AUTH_ERROR` | Pre-flight check: the API key for `model` or `label_model`'s provider is absent (and no `api_key` / `api_key_env` set). Skipped when `generation.api_base` is set, since a custom endpoint may authenticate differently. |
 
 > stdout is a single JSON object. The transcription / labeling / render
 > progress lines go to stderr, and only when `--verbose` is passed.
@@ -1592,6 +1617,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CLASSIFICATION_FAILED` | soft | The classification LLM call failed; lands in `classification.error`. |
 | `CLUSTERING_CONFIG_INVALID` | hard | The optional `clustering` config section failed validation. |
 | `GROUNDING_FAILED` | soft | Grounding a file failed; surfaces as `grounded: false` with a `grounding_error` on that file's `docset generate` result entry. |
+| `LABEL_MODEL_UNREACHABLE` | soft | A file's labeling could not reach the `label_model` at all (auth / bad model id / network); surfaces as a `label_error` on that file's `docset generate` result entry. The file still converts, unlabeled. |
 | `GENERATION_FAILED` | soft | `docset generate` produced no output for a file (transcription failed) or two files shared a filename; per-item `failed` entry in `results`. |
 | `SCHEMA_NOT_FOUND` | hard | An `extraction` command needs an `extraction-schema.rnc` the DocSet doesn't have. |
 | `SCHEMA_INVALID` | hard | A schema passed to `extraction set-schema` is not valid RNC (within the supported subset) or not a JSON object. |

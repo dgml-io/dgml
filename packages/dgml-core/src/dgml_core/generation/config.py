@@ -30,6 +30,7 @@ from dgml_core.errors import (
     CorruptMetadata,
     GenerationConfigInvalid,
     GenerationConfigMissing,
+    short_error_message,
 )
 from dgml_core.storage import Workspace, read_config
 
@@ -143,3 +144,55 @@ def resolve_generation_api_key(config: GenerationConfig) -> str | None:
             "(referenced by 'generation.api_key_env' in config.json)"
         )
     return key
+
+
+def validate_generation_models(config: GenerationConfig, resolved_key: str | None) -> None:
+    """Pre-flight the generation models, before any transcription spend.
+
+    Fails fast on the two misconfigurations detectable offline, so a run whose
+    labeling is doomed doesn't first burn the transcription budget:
+
+    * a wholly-malformed model string (no resolvable provider) — raises
+      :class:`GenerationConfigInvalid`;
+    * a missing API key for a model's provider — raises :class:`AuthError`.
+
+    It CANNOT catch a *present-but-wrong* key or a *well-formed-but-nonexistent*
+    model id (e.g. ``anthropic/claude-typo``): both resolve a provider and are
+    rejected only when the model is actually called. Those surface per file as a
+    ``label_error`` during ``docset generate`` rather than here.
+
+    *resolved_key* is the key from :func:`resolve_generation_api_key` (already
+    authoritative for ``api_key`` / ``api_key_env``); passing it to litellm means
+    an explicitly-configured key satisfies the presence check. The key check is
+    SKIPPED entirely when ``api_base`` is set — a custom endpoint (proxy /
+    gateway / self-hosted) may authenticate differently, and litellm would
+    otherwise report the provider's conventional env var as missing (a false
+    abort). Both ``model`` and ``label_model`` are checked (they may name
+    different providers).
+    """
+    import litellm
+
+    # dict.fromkeys dedupes while preserving order — the two models are often
+    # the same provider, and frequently the same string.
+    for model in dict.fromkeys((config.model, config.label_model)):
+        try:
+            litellm.get_llm_provider(model)
+        except Exception as exc:
+            # get_llm_provider only parses the provider prefix, so this fires
+            # only for a string with no resolvable provider (''/'::::'/bare
+            # typo) — NOT for a valid-provider/bad-model id, which passes here.
+            raise GenerationConfigInvalid(
+                f"'{model}' is not a recognized model string "
+                "(expected e.g. 'anthropic/claude-sonnet-4-6'): "
+                f"{short_error_message(exc)}"
+            ) from exc
+        if config.api_base is not None:
+            continue
+        env = litellm.validate_environment(model=model, api_key=resolved_key)
+        if not env.get("keys_in_environment", False):
+            missing = ", ".join(env.get("missing_keys") or []) or "the provider API key"
+            raise AuthError(
+                f"no API key for model '{model}': {missing} not set. Set it in the "
+                "environment, or configure 'generation.api_key' / "
+                "'generation.api_key_env' in config.json."
+            )

@@ -1932,6 +1932,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         convert_batch,
         load_generation_config,
         resolve_generation_api_key,
+        validate_generation_models,
     )
     from dgml_core.generation import coverage as cov_mod
     from dgml_core.generation.blocks import Block
@@ -1984,6 +1985,17 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     label_model = gen_cfg.label_model
     gen_api_key = resolve_generation_api_key(gen_cfg)
     gen_api_base = gen_cfg.api_base
+
+    # Pre-flight — fail fast BEFORE any transcription spend on the two model
+    # misconfigurations detectable offline: a malformed model string, or a
+    # missing API key for either model's provider. A present-but-wrong key or a
+    # well-formed-but-nonexistent model id can't be caught here; those surface
+    # per file as label_error (see _on_label_error below). Mirrors the style-
+    # config pre-flight above.
+    try:
+        validate_generation_models(gen_cfg, gen_api_key)
+    except DgmlError as exc:
+        return _emit_error(exc.code, str(exc), fmt)
 
     # The semantic-link pass runs on the labeling model.
     link_config = llm.LLMConfig(
@@ -2109,9 +2121,19 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # of the generic "produced no output" message. The full error still goes to
     # stderr under --verbose via _diag (convert_batch's progress log).
     gen_errors: dict[str, str] = {}
+    # name → {code, message} when a file's labeling couldn't reach the model at
+    # all (bad model id, wrong/absent key, network). Surfaced as label_error on
+    # the converted entry so a misconfigured label_model is visible without
+    # --verbose; the document still renders (unlabeled). Labeling completes
+    # before any _on_output fires, so the entry below can read this.
+    label_errors: dict[str, dict[str, str]] = {}
 
     def _on_error(name: str, message: str) -> None:
         gen_errors[name] = message
+
+    def _on_label_error(name: str, err: dict[str, str]) -> None:
+        label_errors[name] = err
+        _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
 
     def _on_output(name: str, xml: str) -> None:
         out_xml = dgml_xml_paths[name]
@@ -2192,6 +2214,10 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             result = cov_mod.compute_coverage(xml, name, page_text_dir=pt_dir)
             _diag(cov_mod.coverage_summary_line(result))
             cov_results.append(result)
+        # Present only on files whose labeling couldn't reach the model — like
+        # grounding_error, which appears only when grounded is False.
+        label_error = label_errors.get(name)
+        label_extra = {"label_error": label_error} if label_error is not None else {}
         written.append(
             _file_result(
                 "converted",
@@ -2200,6 +2226,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 output=str(out_xml),
                 links=links_added,
                 **grounding,
+                **label_extra,
             )
         )
 
@@ -2275,6 +2302,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             options=options,
             on_output=_on_output,
             on_error=_on_error,
+            on_label_error=_on_label_error,
             prior_docs=prior_docs,
             prior_outputs=prior_outputs,
         )
