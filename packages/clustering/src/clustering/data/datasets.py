@@ -35,7 +35,7 @@ class DocumentRecord:
     doc_id: str
     label: str | None
     image: Image.Image
-    text: str  # OCR text — empty string in Phase 2; populated by OCR pass later.
+    text: str  # document text assembled from the file's page_text/ extraction
     thumbnail_path: Path | None
 
 
