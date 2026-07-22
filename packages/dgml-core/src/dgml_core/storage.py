@@ -57,6 +57,13 @@ class Workspace:
     def files_dir(self) -> Path:
         return self.root / "files"
 
+    @property
+    def embedding_cache_dir(self) -> Path:
+        """Where clustering encoders cache content-hashed embeddings so
+        re-embedding unchanged files across runs is cheap. Per-workspace and
+        safe to delete."""
+        return self.root / ".cache" / "embeddings"
+
     def docset_dir(self, docset_id: str) -> Path:
         return self.docsets_dir / docset_id
 

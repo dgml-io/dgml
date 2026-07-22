@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose new functionality or an improvement to dgml/dgml-core.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - triage
+body:
+  - type: checkboxes
+    id: existing-issue
+    attributes:
+      label: Checked for existing issues
+      options:
+        - label: I searched open and closed issues and didn't find a duplicate
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI / workspace
+        - dgml-core (library / pipeline)
+        - Extraction (schemas / value extraction)
+        - Attestation / chain
+        - Clustering
+        - DGML format/spec (file at dgml-spec instead, if that's the only thing affected)
+        - Not sure / spans multiple
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Lead with the need, not the solution — what can't you do today?
+      placeholder: When processing a corpus of X-type documents, I can't currently...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you'd imagine this working, and any alternatives you've already tried.
+    validations:
+      required: false
+
+  - type: textarea
+    id: tag-consistency
+    attributes:
+      label: Tag / vocabulary impact (optional)
+      description: >
+        Fill this in only if the change touches semantic tags or how documents get tagged —
+        e.g. new tags, renamed tags, or tagging that could vary by document type. Cross-document
+        tag consistency is DGML's headline property, so changes here need a rationale.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to submit a PR for this
+          required: false

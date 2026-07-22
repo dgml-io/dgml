@@ -128,6 +128,7 @@ def run_clustering(
     n_samples_per_category: int = 0,
     support_dataset: DocumentDataset | None = None,
     overrides: dict[str, Any] | None = None,
+    cache_dir: Path | None = None,
 ) -> dict[str, str]:
     """Cluster ``dataset`` and return ``{doc_id: cluster_name}``.
 
@@ -144,6 +145,7 @@ def run_clustering(
             n_samples_per_category=n_samples_per_category,
             support_dataset=support_dataset,
             overrides=overrides,
+            cache_dir=cache_dir,
         ).items()
     }
 
@@ -156,6 +158,7 @@ def run_clustering_detailed(
     n_samples_per_category: int = 0,
     support_dataset: DocumentDataset | None = None,
     overrides: dict[str, Any] | None = None,
+    cache_dir: Path | None = None,
 ) -> dict[str, DocPrediction]:
     """Cluster ``dataset`` and return ``{doc_id: DocPrediction}``.
 
@@ -193,6 +196,7 @@ def run_clustering_detailed(
         all_categories_known=all_categories_known,
         n_samples_per_category=n_samples_per_category,
         overrides=overrides,
+        cache_dir=cache_dir,
     )
     scenario = _pick_scenario(
         config,
@@ -250,6 +254,7 @@ def _build_config(
     all_categories_known: bool,
     n_samples_per_category: int,
     overrides: dict[str, Any] | None = None,
+    cache_dir: Path | None = None,
 ) -> Config:
     """Build a complete :class:`Config` from the bundled config plus a
     dynamic scenario section, with optional user overrides merged in.
@@ -280,6 +285,11 @@ def _build_config(
     fields: dict[str, Any] = json.loads(config_text)
     if overrides:
         fields = _deep_merge(fields, overrides)
+    if cache_dir is not None:
+        # Infrastructure, not a user knob: wire the workspace embedding cache so
+        # re-embedding unchanged files across runs is cheap. Set after the merge
+        # so a workspace config.json can't accidentally clobber it.
+        fields["cache_dir"] = str(cache_dir)
     # The scenario *regime* — ``name`` plus ``known_categories`` / ``n_shots``
     # — is dynamic per call (driven by the arguments above) and always wins, so
     # callers can't pin the wrong scenario for their inputs. The clustering-

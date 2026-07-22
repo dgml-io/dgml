@@ -32,6 +32,7 @@ from dgml_core.generation.config import (
     GenerationConfig,
     load_generation_config,
     resolve_generation_api_key,
+    validate_generation_models,
 )
 from dgml_core.generation.label import label_documents
 from dgml_core.generation.pipeline import ConvertOptions, convert_batch
@@ -52,4 +53,5 @@ __all__ = [
     "render_xml",
     "resolve_generation_api_key",
     "transcribe_document",
+    "validate_generation_models",
 ]
