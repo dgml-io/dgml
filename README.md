@@ -16,7 +16,7 @@ License: **Apache 2.0**.
 
 ## Get started
 
-New here? Start with **[`get-started/getstarted.md`](get-started/getstarted.md)** — a hands-on walkthrough that takes you from zero to a cryptographically staked, tamper-verified document using the real sample PDFs in this repo. It covers all four phases of the toolchain:
+New here? Start with **[`get-started/get-started.md`](get-started/get-started.md)** — a hands-on walkthrough that takes you from zero to a cryptographically staked, tamper-verified document using the real sample PDFs in this repo. It covers all four phases of the toolchain:
 
 1. Workspace setup and file ingestion
 2. Automated document clustering
@@ -29,8 +29,13 @@ It's the fastest way to see the whole system work end to end.
 
 ```bash
 uv sync              # install the full workspace into one venv
-uv run dgml --help   # or: pip install dgml
+uv run dgml --help
 ```
+
+Optional features live behind extras — e.g. `uv sync --extra clustering` for
+`dgml cluster`, `uv sync --extra chain` for on-chain attestation. (DGML is not
+on PyPI yet; once published, `pip install dgml` and `pip install "dgml[extra]"`
+will work too.)
 
 See [CLAUDE.md](CLAUDE.md) for the full workspace/package layout and contributor conventions.
 

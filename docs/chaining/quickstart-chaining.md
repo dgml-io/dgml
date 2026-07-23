@@ -19,7 +19,7 @@ By the end of these first steps you'll have:
 already have the `dgml` CLI set up with a workspace, DocSets, and generated
 DGML — you'll just pick the file to anchor by its IDs. If you're starting
 from scratch on the document side, work through the
-[clustering quickstart](../quickstart_clustering.md) first.
+[clustering quickstart](../quickstart-clustering.md) first.
 
 NVNM Chain testnet connection details (you'll need these later):
 
@@ -132,13 +132,18 @@ Your wallet is now set up and funded on the NVNM Chain testnet.
 
 This guide assumes you already use the `dgml` CLI with a workspace, DocSets,
 and generated DGML. (If not, start with the
-[clustering quickstart](../quickstart_clustering.md) to build a workspace
+[clustering quickstart](../quickstart-clustering.md) to build a workspace
 first.) The on-chain commands (`chain`, `wallet`, `registry`, `stake`,
-`prove`) ship in the `chain` extra, so make sure it's installed:
+`prove`) ship in the `chain` extra, so make sure it's installed. DGML is not
+published to PyPI yet, so install the extra from your repository checkout
+(add any other extras you already use to the same command — `uv sync` makes
+the venv match exactly what you list):
 
 ```bash
-pip install "dgml[chain]"
+uv sync --extra chain
 ```
+
+(Once DGML is on PyPI this becomes `pip install "dgml[chain]"`.)
 
 Sanity-check that the chain commands are available:
 
@@ -362,8 +367,11 @@ proving works from it offline.
 
 You can also anchor just **one element** of the DGML XML — proving that node
 belongs to the document without revealing the rest. Identify the element by
-its `--xpath` (copy it from the DGML viewer's tree, or read it out of the
-`<stem>.dgml.xml` file) or by its `--leaf <n>` index:
+its `--xpath` — copy it from the DGML viewer's tree (the sample web app in
+[`app-sample/`](../../app-sample/README.md), which renders a workspace
+document's element tree and shows the XPath of any element you select for
+anchoring), or read it out of the `<stem>.dgml.xml` file — or by its
+`--leaf <n>` index:
 
 ```bash
 dgml stake node "$fid" --docset "$ds" \
@@ -403,7 +411,7 @@ DGML changed since you staked). Use `prove node` for a node record.
 
 ---
 
-## You've anchored DGML on-chain 🎉
+## You've anchored DGML on-chain
 
 End to end, you went from nothing to a verifiable on-chain anchor:
 

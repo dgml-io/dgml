@@ -168,7 +168,9 @@ failed operations.
 
 ### `dgml cluster [--skip-existing] [--config PRESET|PATH] [--mode auto|fresh|incremental] [--method auto|embedding|llm] [--small-corpus-threshold N]`
 
-Requires `pip install dgml[clustering]`. The extra pulls in the
+Requires the `clustering` extra — `uv sync --extra clustering` from a repo
+checkout (`pip install dgml[clustering]` once DGML is published to PyPI).
+The extra pulls in the
 `dgml-clustering` workspace package and its ML stack (embedding models,
 `leidenalg`, `scipy`, `sklearn`); without it the
 command exits 1 with `MISSING_EXTRA`.
@@ -291,7 +293,7 @@ LLM naming requires the same workspace setup as `--auto-classify`:
 
 - A `classification` section in `<workspace>/config.json` (see
   "Auto-classification" above).
-- `pip install dgml[classification]` (provides `litellm`).
+- `litellm`, which ships with the base `dgml` install (no extra needed).
 
 If neither is in place, every unmatched cluster's files end up in
 `failed_file_ids`; matched files still get assigned. The clustering
@@ -422,7 +424,7 @@ alignment (rare-n-gram anchoring + windowed diff), with a
 weighted-similarity recovery pass for OCR noise, a span-search rescue for
 repeated content, and a row-context pass for punctuation-only cells,
 interleaved multi-line table cells, and digit-discrepant text. A file
-with no `page_text/` (added without `--text-mode digital`/`ocr`/`hybrid`)
+with no `page_text/`
 is written but left ungrounded, with a warning — it does not fail the run.
 
 **The `dg:origin` attribute.** Qualified to whatever URI the document binds
@@ -808,7 +810,7 @@ ignored when `<path>` is a single file.
 | `--text-mode` | Behavior |
 |---|---|
 | `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). |
-| `ocr` | Send each rendered page image to the cloud provider configured in `<workspace>/config.json`. Requires `pip install dgml[azure]` or `pip install dgml[aws]`. See "OCR configuration" below. |
+| `ocr` | Send each rendered page image to the cloud provider configured in `<workspace>/config.json`. Requires the `azure` or `aws` extra (`uv sync --extra azure` / `uv sync --extra aws` from a repo checkout; `pip install dgml[azure]`/`dgml[aws]` once DGML is published to PyPI). See "OCR configuration" below. |
 | `hybrid` | Run `digital` then `ocr` and merge the two per-page results by grouping words covering the same area into overlap regions (boxes overlap on IoU > 0.5 *or* one mostly contained in the other, so split/merge tokenization is resolved as a unit). Each region is resolved as a whole: OCR-only regions are kept; digital-only regions (no overlapping OCR) are assumed invisible to the human eye and dropped; mixed regions compare both sides' concatenated text by dash-normalized Levenshtein distance — if they agree (distance ≤ 2) digital wins (its characters come straight from the PDF font, more reliable than OCR even when OCR's tokenization is finer), and if they disagree OCR wins. A page whose digital text is mostly unresolved glyphs (pdfminer `(cid:N)` sentinels) falls back to OCR entirely. Default is silent — pass the global `--verbose` flag to surface per-page warnings and the merge summary on stderr. Requires the same `ocr` workspace config as `--text-mode ocr`. Optionally, an LLM can make the per-region decision instead of this heuristic — declare a `text_extraction` section in `config.json` (e.g. a local Ollama model); see [storage-layout.md](storage-layout.md#text_extraction-optional). Any LLM failure falls back to the heuristic for that page. |
 
 Conflict types recorded in the success payload as `conflict_kind`:
@@ -1491,7 +1493,8 @@ filter was requested, `dgml discover` warns on stderr and falls back to
 
 Anchor a DGMLX bundle's Merkle root, or a single node's hash, directly
 on an EVM chain — no MCP server. These commands require the `chain`
-extra (`pip install dgml[chain]`); without it they return a
+extra (`uv sync --extra chain` from a repo checkout; `pip install
+dgml[chain]` once DGML is published to PyPI); without it they return a
 `MISSING_EXTRA` error envelope. The local Merkle/hashing is identical to
 the `dgmlx`/`node` commands; these add the chain transport (a stdlib
 JSON-RPC client, anchor-precompile ABI encoding, EIP-1559 signing).
