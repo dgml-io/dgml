@@ -56,7 +56,7 @@ from .models import DocSet
 from .prompts import get as prompt
 from .storage import Workspace
 from .usage import OPERATION_CLUSTER
-from .utils import gather_file_pages, image_to_data_url
+from .utils import MANY_IMAGE_MAX_EDGE, gather_file_pages, image_to_data_url
 
 _TOOL_GROUP = "group_documents"
 
@@ -151,7 +151,11 @@ def llm_cluster_files(
         usable.append(fid)
         doc_blocks.append({"type": "text", "text": f"=== Document {label} ==="})
         for img in pages:
-            doc_blocks.append({"type": "image_url", "image_url": {"url": image_to_data_url(img)}})
+            # Whole corpus goes in one many-image request → downscale each page
+            # under the provider's per-image cap (Anthropic rejects >2000 px in a
+            # many-image request; full page renders are ~2500-3500 px).
+            url = image_to_data_url(img, max_edge=MANY_IMAGE_MAX_EDGE)
+            doc_blocks.append({"type": "image_url", "image_url": {"url": url}})
 
     if not usable:
         raise ClassificationFailed(
