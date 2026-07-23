@@ -13,10 +13,10 @@
 """ManifoldHead ABC + registry.
 
 The forward math (``project`` / ``dist`` / ``expmap`` / ``logmap``) is
-implemented in pure torch in each concrete subclass. For Riemannian
-gradient updates (RSGD, RAdam), wire the head's parameters through
-``geoopt`` — that's a future task; the framework's forward path does not
-require geoopt to be installed.
+implemented in pure torch in each concrete subclass. Riemannian gradient
+updates (RSGD, RAdam) are wired through ``geoopt`` (a required dependency):
+the projector exposes its manifold parameters as ``geoopt.ManifoldParameter``
+and the trainer optimizes them with ``geoopt.optim.RiemannianAdam``.
 """
 
 from __future__ import annotations

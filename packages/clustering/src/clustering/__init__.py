@@ -12,8 +12,9 @@
 
 """clustering — research-grade Document AI categorization framework.
 
-See PROJECT_PLAN.md for the architectural overview and DESIGN.md for the
-key decisions.
+Encoder + fusion + manifold projection feed the S1-S5 scenario pipelines
+(unsupervised through fully-supervised). The public surface is what this
+module re-exports; anything else is internal and may change pre-1.0.
 """
 
 from __future__ import annotations
