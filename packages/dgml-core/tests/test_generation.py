@@ -220,6 +220,23 @@ def test_append_continuation_targets_last_text_block() -> None:
     assert seq2[0].text == "The fee is payable within 30 days."
 
 
+def test_window_context_gives_section_path_and_open_table_header() -> None:
+    from dgml_core.generation.transcribe import _window_context
+
+    blocks = [
+        _b("heading", "b1", text="Payments", level=1, lim="4"),
+        _b("heading", "b2", text="Fees", level=2, lim="4.2"),
+        _b("heading", "b3", text="Part II", level=1),  # sibling L1 closes the above
+        _b("row", "b4", cells=["Item", "Qty"]),
+        _b("row", "b5", cells=["Widget", "2"]),
+    ]
+    ctx = _window_context(blocks)
+    assert "Section path: Part II" in ctx
+    assert "4 Payments" not in ctx
+    assert "Open table columns: Item | Qty" in ctx
+    assert _window_context([]) == ""
+
+
 # ── labeling ─────────────────────────────────────────────────────────────────
 
 
