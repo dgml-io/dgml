@@ -47,6 +47,14 @@ class S5FullSupervised(Scenario):
 
         # ── Embed support set (drives projector training + prototypes) ──
         _, support_fused, support_labels = self.fused_embeddings(support_dataset)
+        invalid_labels = sorted(
+            {repr(label) for label in support_labels if label is None or label not in cats}
+        )
+        if invalid_labels:
+            raise ValueError(
+                "S5 support_dataset labels must all be members of known_categories; "
+                f"invalid labels: {', '.join(invalid_labels)}."
+            )
         train_history = self.maybe_train_projector(support_fused, support_labels)
         support_embeddings = self.projector(support_fused)
         prototypes = self._support_prototypes(
