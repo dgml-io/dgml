@@ -165,6 +165,38 @@ Response (truncated):
 }
 ```
 
+### Only a handful of documents?
+
+The embedding pipeline above needs a corpus large enough for its statistics to
+mean something — tf-idf has almost nothing to weight on a few documents, k-NN
+graphs are dominated by noise, and clusters collapse into one bucket (or all
+noise). For very small corpora, skip embeddings entirely and let the vision LLM
+partition the documents directly:
+
+```bash
+dgml cluster --method llm
+```
+
+`--method llm` sends every document's rendered first pages to the LLM in a
+single call and asks it to group them by document type, then names each
+emergent group — the same vision machinery `dgml file add --auto-classify`
+uses, so it needs the same `classification` section in `<workspace>/config.json`
+(without it, every file lands in `failed_file_ids`). It partitions *and* names
+in one round-trip, and a single call covers up to 24 files.
+
+Prefer `--method auto` to let DGML choose: it routes corpora of at most
+`--small-corpus-threshold` files (default 8) to the LLM and larger ones to the
+embedding pipeline — the right default for a folder whose size you don't know
+up front.
+
+```bash
+dgml cluster --method auto                          # LLM for ≤8 files, else embedding
+dgml cluster --method auto --small-corpus-threshold 12   # raise the cutoff
+```
+
+The `--method embedding` default (used by the plain `dgml cluster` above) is
+unchanged, so existing large-corpus runs behave exactly as before.
+
 ## 5. Tune the clustering (optional)
 
 The defaults cluster a folder sensibly out of the box; everything here is
@@ -270,14 +302,23 @@ presets use Leiden, but HDBSCAN pairs well with dense (vision) encoders.
 
 **Incremental novelty gate** (`scenario.*`, `--mode incremental`). These
 decide whether a *new* document fits an existing DocSet or is "novel" and
-opens a new cluster. All default to `None` — meaning **every** incoming
-doc is forced into its nearest existing DocSet (nothing is ever treated as
-novel). Set one to let new categories emerge.
+opens a new cluster. The `dgml cluster --mode incremental` path ships a
+**conservative default**: `threshold_quantile: 0.9`, which keeps the closest
+90 % of each incoming batch as "known" and lets the farthest 10 % open new
+categories. The quantile gate is used because it auto-calibrates to the
+corpus's own distance scale (no manifold-unit tuning). The three gates
+compose — a doc is novel if **any** active gate flags it. Set any gate
+explicitly to override the default; set `threshold_quantile: null` to turn
+gating off and force every doc into its nearest DocSet.
 
-| Parameter | What it controls | Default | Raise it when… | Lower it when… |
+At the framework level (the `clustering` package, outside the CLI) all three
+gates still default to `None`; the conservative default is applied only by the
+incremental CLI path.
+
+| Parameter | What it controls | Default (incremental CLI) | Raise it when… | Lower it when… |
 |---|---|---|---|---|
+| `threshold_quantile` | Auto-calibrates a distance cutoff to keep the closest `q` fraction as "known"; the rest become novel. Manifold-independent — adapts to the batch's distance scale. | `0.9` | Too many new clusters opening — raise toward 0.95 to keep more docs as known. | Genuinely new categories are being absorbed — lower toward 0.8 to flag more as novel. |
 | `threshold_confidence` | Softmax-confidence floor in `[0,1]`; docs whose nearest-prototype confidence is below it become novel (new cluster). Manifold-independent — the easiest to reason about. | `None` | Genuinely new categories are being absorbed into existing DocSets — raise it (e.g. 0.4–0.5) to reject more as novel. | New clusters are opening for docs that really belong to an existing DocSet — lower it. |
-| `threshold_quantile` | Auto-calibrates a distance cutoff to keep the closest `q` fraction as "known". | `None` | Prefer auto-tuning over hand-picking a confidence (e.g. `0.8`). | — |
 | `threshold` | Absolute manifold-distance cutoff (unit depends on `manifold`; needs re-tuning if you change it). | `None` | You want a hard distance gate and know the scale. | — |
 
 ### Symptom → knob
@@ -291,7 +332,12 @@ novel). Set one to let new categories emerge.
 - **Lots of tiny/noise clusters** → raise `leiden_min_cluster_size` (or
   `hdbscan_min_cluster_size`); lower `reduce_dim`.
 - **Incremental run assigns every new doc to old DocSets, never opens new
-  ones** → set `scenario.threshold_confidence` (start ~0.4).
+  ones** → the default `threshold_quantile: 0.9` should already let outliers
+  through; lower it toward 0.8, or add `scenario.threshold_confidence`
+  (start ~0.4). Check you didn't set `threshold_quantile: null`.
+- **Incremental run opens too many new DocSets** → raise
+  `scenario.threshold_quantile` toward 0.95, or disable gating with
+  `threshold_quantile: null`.
 
 ## 6. Inspect what came out
 

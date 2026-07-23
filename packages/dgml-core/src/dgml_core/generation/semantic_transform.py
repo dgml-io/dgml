@@ -72,7 +72,7 @@ def _strip_stray_close_tags(xml_text: str) -> str:
     """Drop unmatched ``</Tag>`` closers before parsing.
 
     lxml's recover parser silently discards the rest of the document on a single
-    tag mismatch (sometimes 50%+ of the content). This linear scan keeps an
+    tag mismatch (often a large fraction of the content). This linear scan keeps an
     open-tag stack and drops any close tag that doesn't match the top, so the
     surrounding content survives.
     """

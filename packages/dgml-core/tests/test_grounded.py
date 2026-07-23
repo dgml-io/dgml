@@ -321,14 +321,43 @@ def test_get_page_words_rejects_zero_page(workspace: Workspace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_generate_schema_returns_submitted_schema(workspace: Workspace) -> None:
+# A minimal valid typed field tree the model might submit, and a richer one that
+# exercises datatypes / collections. generate_schema now renders these to RNC.
+_MIN_FIELDS = [{"name": "title", "kind": "field", "datatype": "text"}]
+_TYPED_FIELDS = [
+    {"name": "due_date", "kind": "field", "datatype": "date"},
+    {
+        "name": "line_items",
+        "kind": "collection",
+        "item": {
+            "name": "line_item",
+            "kind": "container",
+            "fields": [
+                {"name": "description", "kind": "field", "datatype": "text"},
+                {"name": "amount", "kind": "field", "datatype": "decimal"},
+            ],
+        },
+    },
+]
+
+
+def test_generate_schema_returns_typed_rnc(workspace: Workspace) -> None:
     _seed_file(workspace, "f1aaaaaaaaaa")
-    schema = {"type": "object", "properties": {"title": {"type": "string"}}}
-    response = _tool_call_response("submit_schema", {"schema": schema})
+    response = _tool_call_response("submit_schema", {"fields": _TYPED_FIELDS})
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", return_value=response) as mock_completion:
-        result = generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
-    assert result == schema
+        rnc = generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="Invoice")
+    # The field tree is rendered straight to at-rest RNC — datatypes preserved,
+    # no grounded_field JSON Schema in between.
+    assert isinstance(rnc, str)
+    assert 'namespace docset = "http://dgml.io/' in rnc
+    assert "element docset:DueDate {\n    xsd:date" in rnc
+    assert "element docset:Amount {\n    xsd:decimal" in rnc
+    assert "LineItem*" in rnc  # collection expanded to a repeated item
+    # It round-trips through the parser (i.e. it is valid RNC).
+    from dgml_core.extraction_schema import parse_rnc
+
+    assert [t.name for t in parse_rnc(rnc).roots] == ["DueDate", "LineItems"]
     # tool_choice forced to submit_schema, the PDF was passed inline.
     _, kwargs = mock_completion.call_args
     assert kwargs["model"] == DEFAULT_SCHEMA_MODEL
@@ -342,25 +371,37 @@ def test_generate_schema_no_tool_call_errors(workspace: Workspace) -> None:
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", return_value=_no_tool_call_response()):
         with pytest.raises(SchemaGenerationFailed):
-            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
+            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
 
 
 def test_generate_schema_wrong_tool_errors(workspace: Workspace) -> None:
     _seed_file(workspace, "f1aaaaaaaaaa")
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
-    response = _tool_call_response("not_the_right_tool", {"schema": {}})
+    response = _tool_call_response("not_the_right_tool", {"fields": []})
     with patch("litellm.completion", return_value=response):
         with pytest.raises(SchemaGenerationFailed):
-            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
+            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
 
 
-def test_generate_schema_non_object_errors(workspace: Workspace) -> None:
+def test_generate_schema_non_list_fields_errors(workspace: Workspace) -> None:
     _seed_file(workspace, "f1aaaaaaaaaa")
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
-    response = _tool_call_response("submit_schema", {"schema": "not a dict"})
+    response = _tool_call_response("submit_schema", {"fields": "not a list"})
     with patch("litellm.completion", return_value=response):
         with pytest.raises(SchemaGenerationFailed):
-            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
+            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
+
+
+def test_generate_schema_invalid_field_tree_errors(workspace: Workspace) -> None:
+    """A malformed field tree (bad datatype) surfaces as SchemaGenerationFailed,
+    not a raw SchemaInvalid leaking out of the render step."""
+    _seed_file(workspace, "f1aaaaaaaaaa")
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    bad = [{"name": "x", "kind": "field", "datatype": "not-a-type"}]
+    response = _tool_call_response("submit_schema", {"fields": bad})
+    with patch("litellm.completion", return_value=response):
+        with pytest.raises(SchemaGenerationFailed):
+            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
 
 
 def test_generate_schema_provider_exception_wrapped(workspace: Workspace) -> None:
@@ -368,7 +409,7 @@ def test_generate_schema_provider_exception_wrapped(workspace: Workspace) -> Non
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", side_effect=RuntimeError("network down")):
         with pytest.raises(SchemaGenerationFailed) as exc:
-            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
+            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
     assert "network down" in str(exc.value)
 
 
@@ -382,9 +423,9 @@ def test_generate_schema_api_key_resolved(
         schema_api_key_env="MY_ANTHROPIC_KEY",
     )
     monkeypatch.setenv("MY_ANTHROPIC_KEY", "sk-test")
-    response = _tool_call_response("submit_schema", {"schema": {"x": 1}})
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
     with patch("litellm.completion", return_value=response) as mock_completion:
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
+        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
     _, kwargs = mock_completion.call_args
     assert kwargs["api_key"] == "sk-test"
 
@@ -395,7 +436,7 @@ def test_generate_schema_omits_reasoning_for_anthropic(workspace: Workspace) -> 
     Anthropic-routed models. Other providers still get it.
     """
     _seed_file(workspace, "f1aaaaaaaaaa")
-    response = _tool_call_response("submit_schema", {"schema": {"x": 1}})
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
 
     # Anthropic — reasoning_effort must be stripped.
     anthropic_cfg = GroundedConfig(
@@ -403,7 +444,7 @@ def test_generate_schema_omits_reasoning_for_anthropic(workspace: Workspace) -> 
         values_model=DEFAULT_VALUES_MODEL,
     )
     with patch("litellm.completion", return_value=response) as m:
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=anthropic_cfg)
+        generate_schema(workspace, ["f1aaaaaaaaaa"], config=anthropic_cfg, docset_name="D")
     assert "reasoning_effort" not in m.call_args.kwargs
 
     # Gemini — kept.
@@ -412,7 +453,7 @@ def test_generate_schema_omits_reasoning_for_anthropic(workspace: Workspace) -> 
         values_model=DEFAULT_VALUES_MODEL,
     )
     with patch("litellm.completion", return_value=response) as m:
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=gemini_cfg)
+        generate_schema(workspace, ["f1aaaaaaaaaa"], config=gemini_cfg, docset_name="D")
     assert m.call_args.kwargs["reasoning_effort"] == "high"
 
 
@@ -453,7 +494,7 @@ def test_generate_schema_rejects_empty_file_list(workspace: Workspace) -> None:
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion") as mock_completion:
         with pytest.raises(SchemaGenerationFailed):
-            generate_schema(workspace, [], config=config)
+            generate_schema(workspace, [], config=config, docset_name="D")
     mock_completion.assert_not_called()
 
 
@@ -463,12 +504,13 @@ def test_generate_schema_sends_all_files(workspace: Workspace) -> None:
     _seed_file(workspace, "f2aaaaaaaaaa", pdf_bytes=b"%PDF-1.4 two\n")
     _seed_file(workspace, "f3aaaaaaaaaa", pdf_bytes=b"%PDF-1.4 three\n")
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
-    response = _tool_call_response("submit_schema", {"schema": {"ok": True}})
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
     with patch("litellm.completion", return_value=response) as mock_completion:
         generate_schema(
             workspace,
             ["f1aaaaaaaaaa", "f2aaaaaaaaaa", "f3aaaaaaaaaa"],
             config=config,
+            docset_name="D",
         )
     _, kwargs = mock_completion.call_args
     user_content = kwargs["messages"][1]["content"]
@@ -488,9 +530,9 @@ def test_generate_schema_literal_api_key_used_directly(workspace: Workspace) -> 
         values_model=DEFAULT_VALUES_MODEL,
         schema_api_key="sk-direct-literal",
     )
-    response = _tool_call_response("submit_schema", {"schema": {"ok": True}})
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
     with patch("litellm.completion", return_value=response) as mock_completion:
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
+        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
     _, kwargs = mock_completion.call_args
     assert kwargs["api_key"] == "sk-direct-literal"
 
@@ -539,7 +581,7 @@ def test_generate_schema_api_key_env_unset_raises_auth_error(
         schema_api_key_env="MY_ANTHROPIC_KEY",
     )
     with pytest.raises(AuthError):
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)
+        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D")
 
 
 # ---------------------------------------------------------------------------
@@ -887,11 +929,11 @@ def test_generate_schema_records_usage_on_success(workspace: Workspace) -> None:
 
     _seed_file(workspace, "f1aaaaaaaaaa")
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
-    response = _tool_call_response("submit_schema", {"schema": {"ok": True}})
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
     response._hidden_params = {"response_cost": 0.012}
     response.usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
     with patch("litellm.completion", return_value=response):
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, debug=True)
+        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D", debug=True)
 
     events = read_events(workspace)
     assert len(events) == 1
@@ -912,7 +954,7 @@ def test_generate_schema_records_usage_on_provider_exception(workspace: Workspac
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", side_effect=RuntimeError("network down")):
         with pytest.raises(SchemaGenerationFailed):
-            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, debug=True)
+            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D", debug=True)
 
     events = read_events(workspace)
     assert len(events) == 1
@@ -930,11 +972,13 @@ def test_generate_schema_no_usage_recording_without_debug(workspace: Workspace) 
 
     _seed_file(workspace, "f1aaaaaaaaaa")
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
-    response = _tool_call_response("submit_schema", {"schema": {"ok": True}})
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
     response._hidden_params = {"response_cost": 0.012}
     response.usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
     with patch("litellm.completion", return_value=response):
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config)  # debug defaults False
+        generate_schema(
+            workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D"
+        )  # debug defaults False
 
     assert read_events(workspace) == []
 

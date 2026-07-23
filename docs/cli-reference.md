@@ -166,7 +166,7 @@ failed operations.
 > (derived from it at add time) are checked as usual; if the converted PDF is
 > gone, generation falls back to re-converting from the original.
 
-### `dgml cluster [--skip-existing] [--config PRESET|PATH] [--mode auto|fresh|incremental]`
+### `dgml cluster [--skip-existing] [--config PRESET|PATH] [--mode auto|fresh|incremental] [--method auto|embedding|llm] [--small-corpus-threshold N]`
 
 Requires the `clustering` extra — `uv sync --extra clustering` from a repo
 checkout (`pip install dgml[clustering]` once DGML is published to PyPI).
@@ -211,6 +211,34 @@ run.
   `INCREMENTAL_WITHOUT_CLUSTERS`.
 - `auto` — resolves to `incremental` when the workspace already has DocSets,
   else `fresh`.
+
+`--method auto|embedding|llm` selects *how* documents are grouped, orthogonal
+to `--mode` (default `embedding`):
+
+- `embedding` — the statistical pipeline (encode → project → cluster) described
+  below. The right choice once a corpus is large enough for tf-idf / neighbor
+  statistics to be meaningful.
+- `llm` — send **every** document's rendered first pages to the vision LLM in a
+  single call and let it partition them by document type. Built for **very small
+  corpora**, where the embedding pipeline has too little signal to cluster
+  reliably (tf-idf has almost nothing to weight, k-NN graphs are dominated by
+  noise). The model partitions *and* names emergent groups in the one call, so
+  no second per-cluster naming round-trip is needed. `--config` is ignored on
+  this path (there is no embedding pipeline to configure).
+- `auto` — route to `llm` when at most `--small-corpus-threshold` files are
+  clusterable, else `embedding`.
+
+`--small-corpus-threshold N` (default `8`) is the cutoff `--method auto` uses:
+corpora of at most `N` clusterable files go to the LLM partitioner, larger ones
+to the embedding pipeline. Ignored for `--method embedding` / `--method llm`.
+
+Both `--method llm` and `--method auto` (when it routes to the LLM) require the
+same `classification` config as `--auto-classify` (see "Auto-classification"
+above) — the LLM partitioner *is* the classifier's vision machinery. A missing
+`classification` section makes the LLM path soft-fail: every clusterable file
+lands in `failed_file_ids`. The LLM path caps a single call at 24 files; any
+beyond that are reported in `failed_file_ids` so you can fall back to the
+embedding pipeline for larger corpora.
 
 Cluster files not currently assigned to any DocSet, and **assign each
 clustered file to a DocSet**. Runs in two passes:
@@ -348,13 +376,18 @@ concept tags across all of the docset's documents at once
 into a namespaced `dg:chunk`
 document. The labeling vocabulary (the "roster") is planned automatically
 from the documents, or supplied up front with `--schema-path` to make labels
-deterministic. There is no separate transform pass.
+deterministic. Unseeded runs are staged: the largest documents label first (a
+pilot), their observed evidence — verbatim example values, kinds, hierarchy —
+confirms the planned vocabulary, and the rest of the batch labels against it.
+There is no separate transform pass.
 
 **Incremental, consistent growth.** Already-generated files are skipped (see
 resume below), so adding a document and re-running generates only the new one.
 To keep its tags consistent with the existing docset, the new document is
-labeled seeded with the docset's existing `cache/concept_roster.json` (default;
-disable with `--no-roster`). Every concept is emitted in the per-docset
+labeled seeded with the docset's own `schema.json` — full fidelity: role
+descriptions, observed examples, kind, hierarchy — falling back to the flat
+`cache/concept_roster.json` when no schema exists (default; disable both with
+`--no-roster`). Every concept is emitted in the per-docset
 `docset:` vocabulary namespace (`dg:` is framework-only), so growing the docset
 never flips a tag's prefix. An already-generated file is still re-rendered
 deterministically when its output changes as the docset's schema/roster grows
@@ -480,14 +513,20 @@ The global `--debug` flag also writes the per-file
 ungrounded snippets); the `dg:origin` boxes themselves are always written
 into `<stem>.dgml.xml` regardless.
 | `--max-parallel-calls <n>` | `4` | Max documents transcribed concurrently (windows *within* a document stay serial). The LLM call is network-bound, so threads overlap the latency. Set to `1` to disable. Tune to your provider's RPM tier — e.g. Gemini free ~10-15 RPM, Gemini paid Flash 500 RPM, OpenAI free 500 RPM, Anthropic tier-1 ~50 RPM. |
-| `--schema-path <f>` | none | Exported schema to seed labeling with — either `docsets/<id>/schema.json` (Schema v1: a `tags` map of `name -> {role, kind, parent_role, …}`) or its lossless RELAX NG Compact render `docsets/<id>/full-schema.rnc` (both written by `docset generate`). When given, this vocabulary is used as-is and the planning pass is **skipped**, making labels deterministic across runs; the tag hierarchy (`parent_role`) also seeds entity-container grouping. Per-document labeling still extends it for roles the schema doesn't cover. A flat `{concept: description}` mapping is **not** accepted. |
-| `--no-roster` | off | Disable automatic roster reuse. By default, when the docset already has a `cache/concept_roster.json` (from a prior run), an incremental generate seeds labeling with it so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. Ignored when `--schema-path` is given. |
+| `--schema-path <f>` | none | Exported schema to seed labeling with — either `docsets/<id>/schema.json` (Schema v1: a `tags` map of `name -> {role, kind, parent_role, …}`) or its lossless RELAX NG Compact render `docsets/<id>/full-schema.rnc` (both written by `docset generate`). When given, this vocabulary is used as-is with **full fidelity** — role descriptions, curated examples, and kind all feed the labeling prompt — and the planning pass is **skipped**, making labels deterministic across runs; the tag hierarchy (`parent_role`) also seeds entity-container grouping. Per-document labeling still extends it for roles the schema doesn't cover. A flat `{concept: description}` mapping is **not** accepted. |
+| `--no-roster` | off | Disable automatic vocabulary reuse. By default an incremental generate seeds labeling from the docset's own `schema.json` (full fidelity: descriptions, observed examples, kind, hierarchy), falling back to the flat `cache/concept_roster.json` from a prior run, so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. Unlike `--schema-path`, automatic reuse does **not** seed entity-container grouping. Ignored when `--schema-path` is given. |
 | `--no-semlinks` | off | Skip the final semantic-link pass. By default each grounded `<stem>.dgml.xml` gets semantic links added in place — relationships the tree's nesting can't capture, written as `dg:itemprop` (predicate) + `dg:href` (`#id`, or space-separated `#id`s) on the subject, with `xml:id`s assigned to both ends. Covers references (`references`, `incorporates`, `signatoryOf`, …), relative dates (`relativeTo`/`effectiveOn`, ISO-8601 offset in `dg:value`), and derived values (`greaterOf`/`lesserOf` formulas, `escalates`, `valueFrom`). The model proposes links on the labeling model (`generation.label_model`), then a skeptical pass verifies them. Each converted file's `results` entry carries a `links` count. |
 
 **Document-level resume.** If a file's per-(docset, file)
 `<stem>.dgml.xml` already holds a generated document tree, that file is
 skipped — a crashed run can be re-invoked with the same arguments and only
-unfinished documents are re-processed. When *every* assigned file is already
+unfinished documents are re-processed. Within a re-processed document,
+transcription itself also resumes: a cached `cache/<stem>_blocks.json`
+(written right after Pass A) is reloaded verbatim instead of re-transcribing,
+so re-running a document whose output was removed — or relabeling a docset
+after deleting its `.dgml.xml` outputs and label caches — pays only for
+labeling and rendering. Delete the `_blocks.json` file to force a fresh
+transcription. When *every* assigned file is already
 converted the command exits 0 with the same envelope
 (`summary.converted == 0`, each file a `skipped` entry in `results`) and no
 LLM call is made. An **extraction-only** file (a `dg:extraction` with no
@@ -547,6 +586,30 @@ A `failed` entry looks like:
   "error": { "code": "FILE_NOT_FOUND", "message": "source not found at ..." } }
 ```
 
+A `converted` entry carries `output` (the written DGML path), `links` (the
+semantic-link count), the grounding fields (`grounded`, then either
+`matched_token_pct` + `elements_annotated` or `grounding_error`), and — **only
+when that file's labeling could not reach the model at all** (a wrong/absent
+`generation.label_model` key, a bad model id, or a network error) — a
+`label_error`:
+
+```json
+{ "status": "converted", "file_id": "k7q3xb91pmrf", "source": "contract-a.pdf",
+  "output": "/ws/.../contract-a.dgml.xml", "links": 0, "grounded": true,
+  "matched_token_pct": 99.6, "elements_annotated": 445,
+  "label_error": { "code": "LABEL_MODEL_UNREACHABLE", "message": "AuthenticationError: ..." } }
+```
+
+The document still converts (`status: "converted"`, exit 0) — it just renders
+without concept tags. `label_error` makes a misconfigured `label_model` visible
+in the normal JSON, not only under `--verbose`. It is present *only* on affected
+files (like `grounding_error`), and only for a hard "couldn't reach the model"
+failure — a model that runs but simply produces few/no labels is a normal soft
+outcome and is not flagged. Most misconfigurations are caught earlier by the
+pre-flight check below; `label_error` covers the runtime failures that slip past
+it (a transient network/rate-limit error, or a well-formed but nonexistent model
+id).
+
 Errors (run-level, error envelope + exit 1):
 
 | Code | Cause |
@@ -554,7 +617,8 @@ Errors (run-level, error envelope + exit 1):
 | `DOCSET_NOT_FOUND` | `<docset_id>` does not exist. |
 | `EMPTY_DOCSET` | DocSet exists but has no files assigned. |
 | `GENERATION_CONFIG_MISSING` | No `generation` section (or a missing `model` / `label_model`) in `<workspace>/config.json`. |
-| `GENERATION_CONFIG_INVALID` | The `generation` section is malformed (bad model string, both `api_key` and `api_key_env` set, etc.). |
+| `GENERATION_CONFIG_INVALID` | The `generation` section is malformed (bad model string, both `api_key` and `api_key_env` set, etc.). A **pre-flight check** (before any transcription spend) also raises this for a model string with no resolvable provider. |
+| `AUTH_ERROR` | Pre-flight check: the API key for `model` or `label_model`'s provider is absent (and no `api_key` / `api_key_env` set). Skipped when `generation.api_base` is set, since a custom endpoint may authenticate differently. |
 
 > stdout is a single JSON object. The transcription / labeling / render
 > progress lines go to stderr, and only when `--verbose` is passed.
@@ -599,6 +663,13 @@ Ask the configured `schema_model` to propose an extraction schema from one or
 more sample PDFs, then store it as `extraction-schema.rnc`. `--from-file` is repeatable and
 defaults to every file in the DocSet. Errors `NO_FILES` if the DocSet is empty
 and no `--from-file` is given.
+
+The model submits a **typed field tree** — each leaf carries the XSD datatype it
+chose (`date`, `decimal`, `integer`, `boolean`, `gYear`, …, or `text`) — which
+is rendered straight to the at-rest RNC (leaves emit `xsd:date`, `xsd:decimal`,
+etc.). There is no grounded-field JSON Schema intermediate; datatypes are native
+to the generated schema, and downstream extraction normalizes each typed value
+to a `dg:value`/`xsi:type`. The output shape is unchanged.
 
 ```json
 {
@@ -1485,19 +1556,25 @@ success returns `{chain, registry, from, tx_hash, broadcast,
 receipt_status, block_number, explorer_url}`. `list` decodes the
 on-chain `registries` view.
 
-### `dgml stake file <file_id> [--docset <id>] --chain <name> --registry <name>`
+### `dgml stake file <file_id> [--docset <id>] [--unpacked] --chain <name> --registry <name>`
 
 Export the file's DGMLX bundle, anchor its Merkle root as the record
 checksum (URI `dgmlx://<file_id>[/<docset_id>]`), broadcast, await the
 receipt, then fetch and save the anchored record to `record.json` in the
-bundle dir. Success payload includes `checksum` (the Merkle root),
+output dir. Success payload includes `checksum` (the Merkle root),
 `uri`, `tx_hash`, `receipt_status`, `record`, `record_path`,
-`explorer_url`. `--output-dir` overrides the bundle location.
+`explorer_url`, and `bundle_dir` (the output directory). By default the
+bundle is written as a single portable `<stem>.dgmlx` archive whose path
+is reported in `dgmlx`; pass `--unpacked` to write the loose bundle tree
+instead, in which case the payload reports the loose attestation-file path
+in `attestation` (and no `dgmlx`). `--output-dir` overrides the output
+location (default `<workspace>/dgmlx-bundles/<ids>`); the archive (or loose
+tree) and `record.json` are written there.
 
-The saved file path is reported in `record_path`; keep it for offline
+The saved record path is reported in `record_path`; keep it for offline
 proving. Bundle records save as `record.json`; node records save as
 `record-node-<leaf>.json` so a file's bundle and its nodes never clobber
-each other in the shared bundle dir.
+each other in the shared output dir.
 
 ### `dgml stake node <file_id> --docset <id> (--leaf <n> | --xpath <expr>) --chain <name> --registry <name>`
 
@@ -1550,6 +1627,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CLASSIFICATION_FAILED` | soft | The classification LLM call failed; lands in `classification.error`. |
 | `CLUSTERING_CONFIG_INVALID` | hard | The optional `clustering` config section failed validation. |
 | `GROUNDING_FAILED` | soft | Grounding a file failed; surfaces as `grounded: false` with a `grounding_error` on that file's `docset generate` result entry. |
+| `LABEL_MODEL_UNREACHABLE` | soft | A file's labeling could not reach the `label_model` at all (auth / bad model id / network); surfaces as a `label_error` on that file's `docset generate` result entry. The file still converts, unlabeled. |
 | `GENERATION_FAILED` | soft | `docset generate` produced no output for a file (transcription failed) or two files shared a filename; per-item `failed` entry in `results`. |
 | `SCHEMA_NOT_FOUND` | hard | An `extraction` command needs an `extraction-schema.rnc` the DocSet doesn't have. |
 | `SCHEMA_INVALID` | hard | A schema passed to `extraction set-schema` is not valid RNC (within the supported subset) or not a JSON object. |

@@ -14,11 +14,14 @@
 
 This module powers two CLI surfaces:
 
-- ``dgml docset schema generate`` — Claude is given a PDF from the docset
-  and asked to propose a JSON schema describing the structured information
-  to extract. The schema's leaf values use the ``grounded_field`` form
-  (``{text, locations: [{page_number, bounding_box}]}``) so downstream
-  extraction can attribute every value back to a region of the source.
+- ``dgml extraction generate-schema`` — Claude is given a PDF from the docset
+  and asked to propose a *typed field tree* describing the structured
+  information to extract, choosing an ``xsd`` datatype for each leaf. That tree
+  is rendered straight to the at-rest RELAX NG Compact schema
+  (:func:`dgml_core.extraction_schema.field_tree_to_rnc`) — no grounded_field
+  JSON Schema intermediate. Downstream extraction attributes every value back
+  to a region of the source via the ``grounded_field`` form
+  (``{text, locations: [{page_number, bounding_box}]}``).
 
 - ``dgml file extract`` (and the auto-extract hook on
   ``dgml docset add-file``) — Gemini is given a PDF plus the docset's
@@ -56,10 +59,11 @@ from .errors import (
     GroundedConfigInvalid,
     GroundedConfigMissing,
     SchemaGenerationFailed,
+    SchemaInvalid,
     ValuesExtractionFailed,
     now_iso,
 )
-from .extraction_schema import parse_rnc, rnc_to_json_schema
+from .extraction_schema import field_tree_to_rnc, parse_rnc, rnc_to_json_schema
 from .extraction_xml import (
     count_dropped_refs,
     embed_extraction_into,
@@ -341,10 +345,18 @@ def generate_schema(
     file_ids: list[str],
     *,
     config: GroundedConfig,
+    docset_name: str,
     debug: bool = False,
-) -> dict[str, Any]:
+) -> str:
     """Ask the configured LLM to propose an extraction schema from one or
-    more PDFs of the same kind.
+    more PDFs of the same kind, returning the at-rest RELAX NG Compact form.
+
+    The model submits a *typed field tree* — each leaf carrying an ``xsd``
+    datatype it chose (``date``, ``decimal``, ``integer``, …) — which we render
+    straight to RNC via :func:`field_tree_to_rnc`. There is no grounded_field
+    JSON Schema intermediate: types are native and the returned RNC is the
+    canonical on-disk schema. *docset_name* (with ``workspace.organization``)
+    fixes the docset namespace so it matches the generated docset's.
 
     Sending multiple examples lets the model see what's stable across
     instances vs. what's per-document — the schema it returns is meant
@@ -405,11 +417,14 @@ def generate_schema(
         raise SchemaGenerationFailed(
             f"schema generation call failed: {type(exc).__name__}: {exc}"
         ) from exc
-    schema = _parse_submit_call(result.response, expected_tool=_TOOL_SUBMIT_SCHEMA, field="schema")
+    fields = _parse_submit_call(result.response, expected_tool=_TOOL_SUBMIT_SCHEMA, field="fields")
 
-    if not isinstance(schema, dict):
-        raise SchemaGenerationFailed("LLM returned a non-object schema")
-    return schema
+    if not isinstance(fields, list):
+        raise SchemaGenerationFailed("LLM returned a non-list 'fields' — expected a field tree")
+    try:
+        return field_tree_to_rnc(fields, workspace=workspace.organization, docset_name=docset_name)
+    except SchemaInvalid as exc:
+        raise SchemaGenerationFailed(f"LLM returned an invalid field tree: {exc}") from exc
 
 
 def _schema_user_prompt(n_files: int) -> str:
@@ -421,24 +436,37 @@ def _schema_user_prompt(n_files: int) -> str:
 
 
 def _submit_schema_tool() -> dict[str, Any]:
+    # The tree structure is documented in the prompt and enforced by the
+    # deterministic Python parser (``field_tree_to_vocabulary``); the tool
+    # schema keeps ``fields`` a free-form array of objects so providers don't
+    # have to support a recursive JSON Schema.
     return {
         "type": "function",
         "function": {
             "name": _TOOL_SUBMIT_SCHEMA,
-            "description": "Submit the final JSON Schema for this docset.",
+            "description": (
+                "Submit the docset's extraction schema as a typed field tree "
+                "(the list of top-level fields)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "schema": {
-                        "type": "object",
+                    "fields": {
+                        "type": "array",
                         "description": (
-                            "The complete JSON Schema document, with a "
-                            "'grounded_field' definition and every leaf "
-                            "value as a $ref to it."
+                            "Top-level fields. Each node is an object "
+                            "{name, kind, datatype?, description?, example?, prompt?, "
+                            "fields?, item?}. kind is 'field' (a grounded leaf; give "
+                            "its datatype), 'container' (groups child 'fields'), or "
+                            "'collection' (a repeated entity — describe the item via "
+                            "'item' or its 'fields'). datatype is one of "
+                            "'text', 'date', 'dateTime', 'decimal', 'integer', "
+                            "'boolean', 'gYear', 'time', 'anyURI'."
                         ),
+                        "items": {"type": "object"},
                     }
                 },
-                "required": ["schema"],
+                "required": ["fields"],
             },
         },
     }

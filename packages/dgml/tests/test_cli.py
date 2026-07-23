@@ -730,6 +730,89 @@ def test_cluster_config_preset_name_passes_preset_overrides(
     assert overrides["fusion"]["name"] == "concat_norm"
 
 
+def _llm_partition(fid: str) -> Any:
+    """A one-cluster LLMClusteringResult that names its emergent bucket in the
+    same call (so clustering() needs no second naming round-trip)."""
+    from dgml_core.classification import ClassificationDecision
+    from dgml_core.llm_clustering import LLMClusteringResult
+
+    return LLMClusteringResult(
+        clusters={fid: "unknown_0"},
+        proposals={
+            "unknown_0": ClassificationDecision(
+                decision="new",
+                new_name="Sample Documents",
+                new_description="test docs",
+                new_key_questions=("What is this document about?",),
+            )
+        },
+        failed_file_ids=[],
+    )
+
+
+@needs_gs
+def test_cluster_method_llm_routes_to_llm_partitioner(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cluster --method llm` sends the corpus to the vision-LLM partitioner
+    (never the embedding pipeline) and creates DocSets from the proposals it
+    returns in a single call."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-3.1-flash-lite", "max_pages": 1}
+    )
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    with (
+        patch(
+            "dgml_core.clustering.llm_cluster_files", return_value=_llm_partition(fid)
+        ) as mock_llm,
+        patch("dgml_core.clustering.run_clustering_detailed") as mock_embed,
+    ):
+        rc = main(_ws_args(ws) + ["cluster", "--method", "llm"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["clusters"] == {fid: "Sample Documents"}
+    assert payload["failed_file_ids"] == []
+    assert payload["n_new_clusters"] == 1
+    # The LLM partitioner ran; the embedding pipeline was never touched.
+    mock_llm.assert_called_once()
+    mock_embed.assert_not_called()
+
+
+@needs_gs
+def test_cluster_method_auto_small_corpus_uses_llm(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cluster --method auto` routes a corpus at/below --small-corpus-threshold
+    to the LLM partitioner rather than the embedding pipeline."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-3.1-flash-lite", "max_pages": 1}
+    )
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    # One clusterable file, threshold 8 → auto resolves to the LLM partitioner.
+    with (
+        patch(
+            "dgml_core.clustering.llm_cluster_files", return_value=_llm_partition(fid)
+        ) as mock_llm,
+        patch("dgml_core.clustering.run_clustering_detailed") as mock_embed,
+    ):
+        rc = main(_ws_args(ws) + ["cluster", "--method", "auto", "--small-corpus-threshold", "8"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["clusters"] == {fid: "Sample Documents"}
+    mock_llm.assert_called_once()
+    mock_embed.assert_not_called()
+
+
 @needs_gs
 def test_cluster_partial_success_when_llm_fails(
     tmp_path: Path,
@@ -1361,8 +1444,8 @@ def test_docset_generate_models_from_config(
 def test_docset_generate_schema_path_seeds_roster(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """--schema-path loads a schema.json (Schema v1 `tags` map) and threads its
-    roles to ConvertOptions.roster_seed and its parent_role hierarchy to
+    """--schema-path loads a schema.json (Schema v1 `tags` map) and threads the
+    full schema to ConvertOptions.schema_seed and its parent_role hierarchy to
     ConvertOptions.parent_map."""
     ws = tmp_path / "ws"
     did = _init_with_docset(ws, capsys)
@@ -1401,10 +1484,11 @@ def test_docset_generate_schema_path_seeds_roster(
         )
     assert rc == 0
     _, kwargs = mock_batch.call_args
-    assert kwargs["options"].roster_seed == {
-        "PaymentTerms": "the payment clause",
-        "DueDate": "when payment is due",
-    }
+    seed = kwargs["options"].schema_seed
+    assert seed is not None and set(seed.tags) == {"PaymentTerms", "DueDate"}
+    assert seed.tags["PaymentTerms"].role == "the payment clause"
+    assert seed.tags["DueDate"].parent_role == "PaymentTerms"
+    assert kwargs["options"].roster_seed is None  # full-fidelity seed, no flat roster
     assert kwargs["options"].parent_map == {"DueDate": "PaymentTerms"}
 
 
@@ -1478,6 +1562,58 @@ def test_docset_generate_reuses_docset_roster_by_default(
     with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
         main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage", "--no-roster"])
     assert mock_batch.call_args.kwargs["options"].roster_seed is None
+
+
+def test_docset_generate_reuse_prefers_schema_json(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When the docset has BOTH schema.json and cache/concept_roster.json, an
+    incremental generate seeds from schema.json (full fidelity: examples, kind,
+    hierarchy) and leaves the flat roster unused. Entity-container grouping
+    stays a --schema-path opt-in: no parent_map is derived from the reuse."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    docset_dir = ws / "docsets" / did
+    cache = docset_dir / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "concept_roster.json").write_text(
+        json.dumps({"ClientName": "the client"}), encoding="utf-8"
+    )
+    (docset_dir / "schema.json").write_text(
+        json.dumps(
+            {
+                "tags": {
+                    "ClientName": {
+                        "name": "ClientName",
+                        "role": "the client",
+                        "kind": "inline",
+                        "examples": ["Acme Pty Ltd"],
+                        "parent_role": "PartyInformation",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"])
+    options = mock_batch.call_args.kwargs["options"]
+    seed = options.schema_seed
+    assert seed is not None and seed.tags["ClientName"].examples == ["Acme Pty Ltd"]
+    assert options.roster_seed is None
+    assert options.parent_map is None  # grouping stays --schema-path opt-in
 
 
 @needs_gs
@@ -2029,19 +2165,45 @@ def _seed_file_for_generate(
     return ws
 
 
-def _generate_with_xml(ws_root: Path, ds_id: str, xml: str, *, debug: bool = False) -> int:
+def _generate_with_xml(
+    ws_root: Path,
+    ds_id: str,
+    xml: str,
+    *,
+    debug: bool = False,
+    label_error: dict[str, str] | None = None,
+) -> int:
     """Run `docset generate` with convert_batch mocked to emit one rendered
-    doc (`xml`) for the seeded contract.pdf. Returns the exit code."""
+    doc (`xml`) for the seeded contract.pdf. When *label_error* is given, the
+    mock also fires the labeling-failure callback for that file. Returns the
+    exit code."""
 
     def fake_convert(
-        paths: object, *, options: object, on_output: Any, **_kw: object
+        paths: object,
+        *,
+        options: object,
+        on_output: Any,
+        on_label_error: Any = None,
+        **_kw: object,
     ) -> dict[str, str]:
+        if label_error is not None and on_label_error is not None:
+            on_label_error("contract.pdf", label_error)
         on_output("contract.pdf", xml)
         return {}
 
     # generate reads the models from config.json's 'generation' section (no flags).
+    # Real-provider model strings so the pre-flight check (get_llm_provider)
+    # accepts them; convert_batch is mocked, so no call is ever made. The dummy
+    # ANTHROPIC_API_KEY from conftest satisfies the pre-flight key check.
     Workspace(root=ws_root).config_path.write_text(
-        json.dumps({"generation": {"model": "test/model", "label_model": "test/label-model"}}),
+        json.dumps(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-4-5",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                }
+            }
+        ),
         encoding="utf-8",
     )
     extra = ["--debug"] if debug else []
@@ -2074,6 +2236,8 @@ def test_docset_generate_grounds_in_place(
     assert entry["matched_token_pct"] == 100.0
     # The Body leaf plus the root dg:chunk container (page-union box).
     assert entry["elements_annotated"] == 2
+    # No labeling failure → no label_error field on the entry (like grounding_error).
+    assert "label_error" not in entry
 
     content = out_xml.read_text(encoding="utf-8")
     assert 'dg:origin="1 ' in content  # bound to the document's dg prefix
@@ -2121,6 +2285,136 @@ def test_docset_generate_leaves_file_ungrounded_without_page_text(
     assert entry["grounding_error"]["code"] == "FILE_NOT_FOUND"
     assert out_xml.exists()  # still written, just not grounded
     assert "dg:origin" not in out_xml.read_text(encoding="utf-8")
+
+
+def test_docset_generate_surfaces_label_error_but_still_converts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When labeling can't reach the model at runtime, the file still converts —
+    status converted, exit 0, DGML written — and the failure is surfaced as
+    label_error on the entry, so a misconfigured label_model is visible in the
+    normal (non --verbose) JSON."""
+    ws_root = tmp_path / "ws"
+    _init_ws(ws_root)
+    capsys.readouterr()
+    main(_ws_args(ws_root) + ["docset", "create", "--name", "Contracts"])
+    ds_id = _read_stdout(capsys)["id"]
+    ws = _seed_file_for_generate(ws_root, ds_id, "f1aaaaaaaaaa")
+    out_xml = ws.file_dgml_xml_path(ds_id, "f1aaaaaaaaaa", "contract")
+
+    rc = _generate_with_xml(
+        ws_root,
+        ds_id,
+        _GROUNDABLE_XML,
+        label_error={
+            "code": "LABEL_MODEL_UNREACHABLE",
+            "message": "AuthenticationError: invalid x-api-key",
+        },
+    )
+    assert rc == 0
+    payload = _read_generate_stdout(capsys)
+    assert payload["summary"] == {"total": 1, "converted": 1, "skipped": 0, "failed": 0}
+    (entry,) = payload["results"]
+    assert entry["status"] == "converted"
+    assert entry["label_error"]["code"] == "LABEL_MODEL_UNREACHABLE"
+    assert "AuthenticationError" in entry["label_error"]["message"]
+    assert out_xml.exists()  # transcription/DGML never discarded
+
+
+def _seed_docset_with_one_file(ws_root: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    """Init a workspace + docset with one hermetically-seeded file; return the
+    docset id. No generation config is written — the caller sets one to exercise
+    the pre-flight check."""
+    _init_ws(ws_root)
+    capsys.readouterr()
+    main(_ws_args(ws_root) + ["docset", "create", "--name", "Contracts"])
+    ds_id = str(_read_stdout(capsys)["id"])
+    _seed_file_for_generate(ws_root, ds_id, "f1aaaaaaaaaa")
+    return ds_id
+
+
+def test_docset_generate_preflight_rejects_malformed_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pre-flight: a model string with no resolvable provider fails fast with
+    GENERATION_CONFIG_INVALID before any transcription — convert_batch is never
+    called."""
+    ws_root = tmp_path / "ws"
+    ds_id = _seed_docset_with_one_file(ws_root, capsys)
+    Workspace(root=ws_root).config_path.write_text(
+        json.dumps({"generation": {"model": "::::", "label_model": "anthropic/claude-sonnet-4-6"}}),
+        encoding="utf-8",
+    )
+    with patch("dgml_core.generation.convert_batch") as mock_batch:
+        rc = main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "GENERATION_CONFIG_INVALID"
+    mock_batch.assert_not_called()
+
+
+def test_docset_generate_preflight_rejects_missing_api_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-flight: a well-formed model whose provider key is absent fails fast
+    with AUTH_ERROR before any transcription."""
+    ws_root = tmp_path / "ws"
+    ds_id = _seed_docset_with_one_file(ws_root, capsys)
+    # Undo the conftest dummy key so the provider key is genuinely absent.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    Workspace(root=ws_root).config_path.write_text(
+        json.dumps(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-4-5",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with patch("dgml_core.generation.convert_batch") as mock_batch:
+        rc = main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "AUTH_ERROR"
+    mock_batch.assert_not_called()
+
+
+def test_docset_generate_preflight_skips_key_check_when_api_base_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-flight: with api_base set (proxy / self-hosted endpoint) the
+    key-presence check is skipped, so a run with no provider key still proceeds —
+    guards against a false abort on custom endpoints."""
+    ws_root = tmp_path / "ws"
+    _init_ws(ws_root)
+    capsys.readouterr()
+    main(_ws_args(ws_root) + ["docset", "create", "--name", "Contracts"])
+    ds_id = str(_read_stdout(capsys)["id"])
+    _seed_file_for_generate(ws_root, ds_id, "f1aaaaaaaaaa")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    Workspace(root=ws_root).config_path.write_text(
+        json.dumps(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-4-5",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                    "api_base": "http://localhost:8000",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output("contract.pdf", _GROUNDABLE_XML)
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        rc = main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage"])
+    assert rc == 0
+    mock_batch.assert_called_once()  # pre-flight did not abort
 
 
 # --- dgmlx export / verify --------------------------------------------------
@@ -2578,8 +2872,9 @@ def test_stake_file_dry_run_does_not_broadcast(
     monkeypatch.setattr("dgml_chain.signer.load_key", lambda service="", account="": _TEST_KEY)
 
     # Stub the local export so the test needs no real PDF/artifacts. Mirrors
-    # export_attestation's signature: (attestation, attestation_path, archive_path);
-    # staking calls it with unpacked=True, so the loose attestation path is set.
+    # export_attestation's signature and mode contract: (attestation,
+    # attestation_path, archive_path) with exactly one of the paths set —
+    # the archive by default, the loose attestation path under --unpacked.
     def _fake_export(  # type: ignore[no-untyped-def]
         ws: Any,
         file_id: str,
@@ -2589,7 +2884,9 @@ def test_stake_file_dry_run_does_not_broadcast(
         unpacked: bool = False,
     ):
         attestation = SimpleNamespace(root="deadbeef", leaves=[1, 2, 3])
-        return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        if unpacked:
+            return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        return attestation, None, out_dir / "doc.dgmlx"
 
     monkeypatch.setattr("dgml_core.staking.export_attestation", _fake_export)
 
@@ -2615,8 +2912,60 @@ def test_stake_file_dry_run_does_not_broadcast(
     assert out["uri"] == "dgmlx://f00000"
     assert out["signed_tx"].startswith("0x")
     assert "unsigned_tx" in out
+    # Default is the portable archive: payload carries `dgmlx`, not `attestation`.
+    assert out["dgmlx"].endswith("doc.dgmlx")
+    assert "attestation" not in out
     # Crucially: nothing was sent to the chain.
     assert fake.broadcast == []
+
+
+def test_stake_file_unpacked_reports_loose_attestation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    fake = _FakeRpc()
+    monkeypatch.setattr("dgml_core.staking.EvmRpc", lambda *a, **k: fake)
+    monkeypatch.setattr("dgml_chain.signer.load_key", lambda service="", account="": _TEST_KEY)
+
+    def _fake_export(  # type: ignore[no-untyped-def]
+        ws: Any,
+        file_id: str,
+        out_dir: Path,
+        docset_id: str | None = None,
+        *,
+        unpacked: bool = False,
+    ):
+        attestation = SimpleNamespace(root="deadbeef", leaves=[1, 2, 3])
+        if unpacked:
+            return attestation, out_dir / "META-INF" / "dgml-attestation.xml", None
+        return attestation, None, out_dir / "doc.dgmlx"
+
+    monkeypatch.setattr("dgml_core.staking.export_attestation", _fake_export)
+
+    rc = main(
+        _ws_args(ws)
+        + [
+            "stake",
+            "file",
+            "f00000",
+            "--chain",
+            "nvnm-testnet",
+            "--registry",
+            "myreg",
+            "--from",
+            _test_addr(),
+            "--dry-run",
+            "--unpacked",
+        ]
+    )
+    assert rc == 0
+    out = _read_stdout(capsys)
+    # --unpacked surfaces the loose attestation path and no archive.
+    assert out["attestation"].endswith("dgml-attestation.xml")
+    assert "dgmlx" not in out
 
 
 def test_prove_file_missing_record_json_is_structured_error(
@@ -2942,9 +3291,10 @@ def test_load_schema_seed_json_builds_roster_and_parent_map(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    roster, parent_map = _load_schema_seed(p)
-    assert {"PartyInformation", "PartyAddress", "OrderDate"} <= set(roster)
-    assert roster["PartyAddress"] == "address"
+    schema, parent_map = _load_schema_seed(p)
+    assert {"PartyInformation", "PartyAddress", "OrderDate"} <= set(schema.tags)
+    assert schema.tags["PartyAddress"].role == "address"
+    assert schema.tags["PartyInformation"].kind == "section"  # fidelity kept, not flattened
     assert parent_map["PartyAddress"] == "PartyInformation"  # via parent_role
     assert "OrderDate" not in parent_map  # top-level, no container
 
@@ -2968,8 +3318,11 @@ def test_load_schema_seed_accepts_rnc(tmp_path: Path) -> None:
         "PartyAddress = element PartyAddress {\n  common.atts,\n  text\n}\n",
         encoding="utf-8",
     )
-    roster, parent_map = _load_schema_seed(p)
-    assert roster == {"PartyInformation": "party block", "PartyAddress": "address"}
+    schema, parent_map = _load_schema_seed(p)
+    assert {tag.name: tag.role for tag in schema.tags.values()} == {
+        "PartyInformation": "party block",
+        "PartyAddress": "address",
+    }
     assert parent_map == {"PartyAddress": "PartyInformation"}
 
 
@@ -3006,6 +3359,14 @@ _JSON_SCHEMA = {
         "liability_cap": {"$ref": "#/definitions/grounded_field"},
     },
 }
+
+# The typed field tree the schema-generation LLM now submits (rendered straight
+# to RNC by generate_schema — no JSON Schema hop).
+_FIELD_TREE = [
+    {"name": "vendor_name", "kind": "field", "datatype": "text"},
+    {"name": "liability_cap", "kind": "field", "datatype": "decimal"},
+    {"name": "effective_date", "kind": "field", "datatype": "date"},
+]
 
 _RNC_SCHEMA = """\
 namespace dg = "http://dgml.io/ns/dg#"
@@ -3182,8 +3543,9 @@ def test_extraction_generate_schema_no_files(
 def test_extraction_generate_schema_happy_path(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """generate-schema converts the LLM's JSON Schema to RNC and stores it.
-    The sample PDF is placed directly (no ghostscript needed for schema-gen)."""
+    """generate-schema renders the LLM's typed field tree straight to RNC and
+    stores it — datatypes preserved, no JSON Schema hop. The sample PDF is placed
+    directly (no ghostscript needed for schema-gen)."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
@@ -3196,13 +3558,16 @@ def test_extraction_generate_schema_happy_path(
     file_dir.mkdir(parents=True, exist_ok=True)
     _write_blank_pdf(file_dir / "doc.pdf", 1)
 
-    response = _tool_response("submit_schema", {"schema": _JSON_SCHEMA})
+    response = _tool_response("submit_schema", {"fields": _FIELD_TREE})
     with patch("litellm.completion", return_value=response):
         rc = main(_ws_args(ws) + ["extraction", "generate-schema", ds_id, "--from-file", fid])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["schema_format"] == "rnc"
     assert "element docset:VendorName" in payload["schema"]
+    # Datatypes chosen by the model are carried into the RNC leaves.
+    assert "element docset:LiabilityCap {\n    xsd:decimal" in payload["schema"]
+    assert "element docset:EffectiveDate {\n    xsd:date" in payload["schema"]
     assert payload["from_file_ids"] == [fid]
     assert (
         Workspace(root=ws).docset_schema_path(ds_id).read_text(encoding="utf-8")

@@ -12,12 +12,11 @@
 
 """Orchestration: transcribe each document, label the batch, render.
 
-Compare with ``dgml.generation.pipeline``: there is no schema lock, no
-registry, no drift warnings, no seam-reopen, no dedup, no repair, no
-re-nesting, no per-window recovery loop, and no harmonization pass — the
-block contract (flat, typed, verbatim) plus the single batch-wide labeling
-call replace all of them. Coverage can still be measured on the rendered
-XML with the existing ``dgml.generation.coverage`` tools.
+The block contract (flat, typed, verbatim) carries a document end to end:
+transcription emits typed blocks per page window, one batch-wide labeling
+call assigns concepts across every document at once, and the tree and final
+XML are assembled deterministically in plain code. Coverage is measured on
+the rendered XML with the ``dgml_core.generation.coverage`` tools.
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ from dgml_core.generation.label import (
     wrap_detected_values,
 )
 from dgml_core.generation.render import render_xml
+from dgml_core.generation.schema import Schema
 from dgml_core.generation.to_semantic import (
     render_dgml,
     render_semantic_xml,
@@ -96,6 +96,11 @@ class ConvertOptions:
     temperature: float = 0.0
     max_tokens: int = 32000
     cache_dir: Path | str | None = None
+    # document name → its page_text/ dir (per-page word JSONs written before
+    # generation). When a document has one, each transcription window is
+    # completeness-checked against its pages' words and retried once if the
+    # model stopped early (see transcribe._GATE_RECALL). None disables the gate.
+    page_text_dirs: Mapping[str, Path] | None = None
     # When True, also write the debug-only cache artifacts (raw LLM dumps,
     # intermediate .concept.xml/.semantic.xml renders, prompt listings). The
     # functional cache files the next run reloads (_blocks.json,
@@ -105,8 +110,8 @@ class ConvertOptions:
     # When set, convert_batch returns the FINAL dgml (dg:chunk, concept tags +
     # dg:chunk scaffolding, value typing) instead of the windowed-shape
     # intermediate. This is the standard dg:chunk opening tag from
-    # semantic_transform.build_header; this path does not route through
-    # Pass 4. Empty → return the intermediate (library/test shape).
+    # semantic_transform.build_header. Empty → return the intermediate
+    # (library/test shape).
     dgml_header: str = ""
     # Documents transcribed concurrently. Windows WITHIN a document stay
     # serial (window N+1 receives window N's tail for the `continues`
@@ -117,8 +122,14 @@ class ConvertOptions:
     # `conversion` config. Passed to load_document_as_pdf so non-PDF inputs
     # convert; None/empty means PDF-only (every input must already be a PDF).
     converters: dict[str, ConverterConfig] | None = None
-    # Optional concept roster (the docset's "schema") loaded from --schema-path.
-    # When set, it seeds the roster and Pass B.1 planning is skipped.
+    # Optional full-fidelity schema seed (from --schema-path or the docset's
+    # own schema.json on an incremental run). Seeds the roster with role
+    # descriptions, curated examples, kind, and hierarchy; Pass B.1 planning
+    # is skipped. Takes precedence over roster_seed.
+    schema_seed: Schema | None = None
+    # Legacy flat {concept: description} roster seed (cache/concept_roster.json
+    # fallback). When set (and schema_seed is not), it seeds the roster and
+    # Pass B.1 planning is skipped.
     roster_seed: dict[str, str] | None = None
     # Optional leaf-concept → container-concept map (from a seed schema's
     # parent/children). Drives the entity-container grouping in render_dgml
@@ -152,6 +163,7 @@ def convert_batch(
     options: ConvertOptions,
     on_output: Callable[[str, str], None] | None = None,
     on_error: Callable[[str, str], None] | None = None,
+    on_label_error: Callable[[str, dict[str, str]], None] | None = None,
     prior_docs: Mapping[str, list[Block]] | None = None,
     prior_outputs: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
@@ -170,6 +182,14 @@ def convert_batch(
     compact cause it can put in a machine-readable payload. Called once per
     failed document, serially, after the (possibly concurrent) transcription
     pass — so the callback need not be thread-safe.
+
+    Pass *on_label_error* — called ``(name, {code, message})`` — to learn that a
+    document's *labeling* could not reach the model at all (auth, bad model id,
+    connection), as distinct from a soft "produced few/no labels" outcome. The
+    document still renders (unlabeled), so this lets the caller surface a
+    misconfigured ``label_model`` without discarding the transcription. Labeling
+    completes before any ``on_output`` fires, so a per-file result built in
+    ``on_output`` can read whatever this reported.
 
     *prior_docs* (already-generated docs from cache) are re-rendered so the
     whole docset stays consistent as its schema/roster grows; any whose render
@@ -198,6 +218,7 @@ def convert_batch(
                 cache_dir=opts.cache_dir,
                 debug=opts.debug,
                 log=log,
+                page_text_dir=(opts.page_text_dirs or {}).get(path.name),
             )
         except Exception as exc:
             log(f"[transcribe] {path.name} FAILED: {exc}; skipping")
@@ -239,6 +260,8 @@ def convert_batch(
             debug=opts.debug,
             log=log,
             roster_seed=opts.roster_seed,
+            schema_seed=opts.schema_seed,
+            on_label_error=on_label_error,
         )
 
     outputs: dict[str, str] = {}

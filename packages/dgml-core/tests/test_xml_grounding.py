@@ -692,6 +692,205 @@ def test_fragmented_amount_box_covers_currency_symbols(
     assert res.stats["absorbed_fragments"] >= 3
 
 
+def test_transposed_tables_stranded_header_assembled(workspace: Workspace, tmp_path: Path) -> None:
+    """Regression (the utility-bill meter-table headers): two tables
+    share their header labels, and the XML serializes the sections in
+    the opposite order from the page. Monotone alignment then maps each
+    XML table onto the *other* page table (identical labels make the
+    blocks interchangeable), so every window-based pass looks away from
+    the true location of the first table's unique wrapped column
+    headers — which also have no contiguous span, because the wrapped
+    columns' lines interleave in reading order. Only the last-resort
+    page-wide assembly can ground them; the boxes must land on the
+    page-top table, one box per wrapped line, confined to each column."""
+    _seed_pages(
+        workspace,
+        {
+            1: [
+                *_line("Quarterly consumption report", 20),
+                # Table A (page top). Two wrapped unique columns whose
+                # line-1 words are 10px apart — the cell builder merges
+                # them, interleaving their lines in the stream.
+                {"t": "Monthly", "l": [100, 100, 150, 120]},
+                {"t": "Annual", "l": [160, 100, 210, 120]},
+                {"t": "Rent", "l": [100, 125, 150, 145]},
+                {"t": "Fee", "l": [160, 125, 210, 145]},
+                # Shared header labels (identical in both tables), far
+                # enough right to stay separate cells.
+                *_line("Rate Schedule Meter Number Read Type", 100)[0:0],
+                {"t": "Rate", "l": [300, 100, 350, 120]},
+                {"t": "Schedule", "l": [360, 100, 410, 120]},
+                {"t": "Meter", "l": [470, 100, 520, 120]},
+                {"t": "Number", "l": [530, 100, 580, 120]},
+                {"t": "Read", "l": [640, 100, 690, 120]},
+                {"t": "Type", "l": [700, 100, 750, 120]},
+                *_line("A1 901 902 M7", 160),
+                # Table B (page bottom) with the same shared labels.
+                {"t": "Rate", "l": [100, 300, 150, 320]},
+                {"t": "Schedule", "l": [160, 300, 210, 320]},
+                {"t": "Meter", "l": [270, 300, 320, 320]},
+                {"t": "Number", "l": [330, 300, 380, 320]},
+                {"t": "Read", "l": [440, 300, 490, 320]},
+                {"t": "Type", "l": [500, 300, 550, 320]},
+                *_line("B1 421 422 423 424 M9", 360),
+                *_line("End of quarterly report", 500),
+            ]
+        },
+    )
+    # XML order: TableB first, TableA last — transposed vs the page.
+    xml = """\
+<root>
+  <Title>Quarterly consumption report</Title>
+  <TableB>
+    <Hdr><R>Rate Schedule</R><M>Meter Number</M><T>Read Type</T></Hdr>
+    <Data>B1 421 422 423 424 M9</Data>
+  </TableB>
+  <Footer>End of quarterly report</Footer>
+  <TableA>
+    <Hdr><R>Rate Schedule</R><ColA>Monthly Rent</ColA>\
+<ColB>Annual Fee</ColB><M>Meter Number</M><T>Read Type</T></Hdr>
+    <Data>A1 901 902 M7</Data>
+  </TableA>
+</root>
+"""
+    res = _ground(workspace, tmp_path, xml)
+    root = etree.parse(str(res.output_path)).getroot()
+
+    (col_a,) = _boxes(root, "ColA")
+    (col_b,) = _boxes(root, "ColB")
+    assert col_a is not None and col_b is not None
+    a_boxes = [_parse_box(b) for b in col_a.split("; ")]
+    b_boxes = [_parse_box(b) for b in col_b.split("; ")]
+    # One box per wrapped line, at the page-TOP table, each confined to
+    # its own 50px column.
+    assert [(b[2], b[4]) for b in a_boxes] == [(100, 120), (125, 145)]
+    assert [(b[2], b[4]) for b in b_boxes] == [(100, 120), (125, 145)]
+    assert all(b[1] == 100 and b[3] == 150 for b in a_boxes)
+    assert all(b[1] == 160 and b[3] == 210 for b in b_boxes)
+    # Grounded by subsequence assembly — via the row-context window when
+    # a sibling stayed honest and it can reach, else via the page-wide
+    # stranded pass. Which one fires depends on how the aligner splits
+    # the duplicated labels; the boxes above are the real contract.
+    assert res.stats["interleaved_cell_tokens"] + res.stats["assembled_tokens"] >= 4
+    assert res.stats["matched_token_pct"] == 100.0
+
+
+def test_stranded_segs_assembled_page_wide() -> None:
+    """Unit: the last-resort pass grounds a fully-unmatched interleaved
+    segment from unclaimed page words — in order, one spatial cell —
+    when every window-based pass pointed elsewhere (here: no siblings
+    at all, only distant aligned neighbors)."""
+    from dgml_core.textmatch import Word, fuzzy_norm
+    from dgml_core.xml_grounding import _assemble_stranded_segs, _OTok, _TextSeg
+
+    def word(idx: int, text: str, left: int, top: int) -> Word:
+        return Word(
+            idx=idx,
+            text=text,
+            text_norm=fuzzy_norm(text),
+            left=left,
+            top=top,
+            right=left + 50,
+            bottom=top + 20,
+        )
+
+    words = [
+        word(0, "Intro", 100, 20),
+        # Two wrapped columns whose lines interleave in stream order.
+        word(1, "Monthly", 100, 100),
+        word(2, "Annual", 160, 100),
+        word(3, "Rent", 100, 125),
+        word(4, "Fee", 160, 125),
+        word(5, "Outro", 100, 500),
+    ]
+    page_words = {1: words}
+    otoks = [_OTok(page=1, word=w) for w in words]
+
+    intro = _TextSeg(owner=None, raw="Intro", token_start=0, n_tokens=1, matched_tokens=1)
+    intro.matched_words = [(1, words[0])]
+    col_a = _TextSeg(owner=None, raw="Monthly Rent", token_start=1, n_tokens=2)
+    col_b = _TextSeg(owner=None, raw="Annual Fee", token_start=3, n_tokens=2)
+    outro = _TextSeg(owner=None, raw="Outro", token_start=5, n_tokens=1, matched_tokens=1)
+    outro.matched_words = [(1, words[5])]
+    pairs = {0: 0, 5: 5}  # xml token idx -> otok idx for the two anchors
+
+    grounded = _assemble_stranded_segs([intro, col_a, col_b, outro], otoks, pairs, page_words)
+    assert grounded == 4
+    assert [w.text for _p, w in col_a.matched_words] == ["Monthly", "Rent"]
+    assert [w.text for _p, w in col_b.matched_words] == ["Annual", "Fee"]
+    assert col_a.matched_tokens == 2 and col_b.matched_tokens == 2
+    assert col_a.pinned and col_b.pinned
+
+
+def test_page_assembly_prefix_grounds_label_without_value() -> None:
+    """Unit: a label-plus-value segment whose trailing value the page
+    never rendered as words (a chart-only number) assembles its longest
+    label prefix — never below 3 cores / ~60% — and reports how many
+    cores matched so the caller commits a partial."""
+    from dgml_core.textmatch import Word, fuzzy_norm
+    from dgml_core.xml_grounding import _page_assembly_candidates, _TextSeg
+
+    def word(idx: int, text: str, left: int) -> Word:
+        return Word(
+            idx=idx,
+            text=text,
+            text_norm=fuzzy_norm(text),
+            left=left,
+            top=100,
+            right=left + 50,
+            bottom=120,
+        )
+
+    words = [word(i, t, 100 + i * 60) for i, t in enumerate("Average daily kilowatt hours".split())]
+    page_words = {1: words}
+
+    seg = _TextSeg(owner=None, raw="Average daily kilowatt hours — 46.86", n_tokens=5)
+    found, k = _page_assembly_candidates(seg, 1, 1, page_words, set(), set())
+    assert k == 4  # the four label cores; "46.86" is nowhere on the page
+    (candidate,) = found
+    page, picked = candidate
+    assert page == 1
+    assert [w.text for _p, w in picked] == ["Average", "daily", "kilowatt", "hours"]
+
+    # Too little character mass to be distinctive page-wide — refused.
+    tiny = _TextSeg(owner=None, raw="a b", n_tokens=2)
+    assert _page_assembly_candidates(tiny, 1, 1, page_words, set(), set()) == ([], 0)
+
+
+def test_currency_symbols_absent_from_page_still_ground(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    """Regression (the utility-bill charges row): the page renders bare
+    amounts ("381 . 47" shattered by tokenization) while the XML carries
+    "$381.47". Every amount must still ground, each to its own digits,
+    in column order."""
+    _seed_pages(
+        workspace,
+        {
+            1: (
+                _line("Current charges summary", 20)
+                + _line("Electric 381 . 47 127 . 22 508 . 69", 100)
+                + _line("End of statement", 200)
+            )
+        },
+    )
+    xml = """\
+<root>
+  <Title>Current charges summary</Title>
+  <Row>Electric <A>$381.47</A> <B>$127.22</B> <C>$508.69</C></Row>
+  <Footer>End of statement</Footer>
+</root>
+"""
+    res = _ground(workspace, tmp_path, xml)
+    root = etree.parse(str(res.output_path)).getroot()
+    boxes = [_boxes(root, t) for t in ("A", "B", "C")]
+    assert all(b != [None] for b in boxes)
+    lefts = [_parse_box(b[0])[1] for b in boxes]
+    assert lefts == sorted(lefts)  # column order preserved
+    assert all(_parse_box(b[0])[0] == 1 and _parse_box(b[0])[2] == 100 for b in boxes)
+    assert res.stats["matched_token_pct"] == 100.0
+
+
 def test_short_cell_outlier_words_pruned(workspace: Workspace, tmp_path: Path) -> None:
     """Unit: a cell-sized segment keeps only its dominant x-cluster of
     box words — a stray fragment a column away is attribution noise."""

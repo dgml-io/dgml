@@ -17,7 +17,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
+import litellm
 import pytest
 from dgml_core import llm
 from dgml_core.generation import blocks as blocks_mod
@@ -29,12 +31,14 @@ from dgml_core.generation.blocks import (
     sanitize_concept,
 )
 from dgml_core.generation.label import (
+    _find_verbatim,
     apply_labels,
     label_documents,
     propagate_table_consistency,
     render_block_listing,
     wrap_detected_values,
 )
+from dgml_core.generation.prompts import get as get_prompt
 from dgml_core.generation.render import render_xml
 from dgml_core.generation.transcribe import (
     _append_continuation,
@@ -269,6 +273,29 @@ def test_apply_labels_quote_occurrence_picks_the_right_match() -> None:
     assert block.text[span.start : span.end] == "5%"
 
 
+def test_apply_labels_short_quote_respects_token_boundary() -> None:
+    block = _b("p", "b1", text='Baseline value is "B" here')
+    warnings = apply_labels([block], {"b1": {"entities": [{"quote": "B", "concept": "Grade"}]}})
+    assert warnings == []
+    (span,) = block.entities
+    assert block.text[span.start : span.end] == "B"
+    assert span.start == block.text.index('"') + 1  # the quoted value, not the B in "Baseline"
+
+
+def test_find_verbatim_skips_embedding_keeps_punct_edged() -> None:
+    # a short value embedded in a larger word / number -> skip to the standalone one
+    assert _find_verbatim("Baseline B", "B", 0) == "Baseline B".rindex("B")
+    assert _find_verbatim("150 and 50", "50", 0) == "150 and 50".rindex("50")
+    # a punctuation-edged quote is not extended by a neighbour (possessive 's)
+    assert _find_verbatim("'Acme's report", "'Acme'", 0) == 0
+
+
+def test_label_prompt_schema_elicits_occurrence() -> None:
+    # Prose alone doesn't elicit it; occurrence must be in the entities schema.
+    entities_schema = get_prompt("label_system").partition('"entities"')[2]
+    assert '"occurrence"' in entities_schema
+
+
 def test_apply_labels_offsets_without_quote_are_rejected() -> None:
     block = _b("p", "b1", text="payable within 30 days")
     warnings = apply_labels(
@@ -332,9 +359,19 @@ def test_label_documents_plans_then_labels_with_roster(
     # call_with_refinement); then one labeling call per document carries it.
     assert len(calls) == 2
     assert "== a.pdf ==" in plan["listing"] and "== b.pdf ==" in plan["listing"]
-    for _system, text in calls:
-        assert "CONCEPTS ALREADY IN USE" in text
-        assert "- PaymentTerms" in text
+    first, second = (text for _system, text in calls)
+    # Doc 1 labels against the PLANNED tier — the roster is proposed, not yet
+    # observed, and the description is never dressed up as an example.
+    assert "PLANNED CONCEPTS" in first
+    assert "- PaymentTerms — payment obligations section" in first
+    assert "CONCEPTS ALREADY IN USE" not in first
+    # Doc 2 sees PaymentTerms CONFIRMED — observed in doc 1, with its kind and
+    # a verbatim observed example alongside the planned description.
+    assert "CONCEPTS ALREADY IN USE" in second
+    assert (
+        "- PaymentTerms [section] — payment obligations section "
+        '(seen: "Invoices are payable within 30 days of receipt.")'
+    ) in second
     assert docs["a.pdf"][1].concept == docs["b.pdf"][1].concept == "PaymentTerms"
 
 
@@ -364,6 +401,145 @@ def test_label_documents_roster_seed_skips_planning(
     assert docs["a.pdf"][0].concept == "PaymentTerms"
 
 
+def test_label_documents_schema_seed_full_fidelity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schema_seed carries kind + curated examples into the labeling prompt
+    (confirmed tier), skips planning, and stays frozen — observations never
+    mutate seeded entries, so the rendered roster is byte-stable per batch."""
+    from dgml_core.generation.schema import Schema, SchemaTag
+
+    docs = _docs()
+    label_inputs: list[str] = []
+
+    def no_plan(config: llm.LLMConfig, **kwargs: object) -> tuple[str, str]:
+        raise AssertionError("planning must be skipped when schema_seed is given")
+
+    def fake_call(config: llm.LLMConfig, **kwargs: Any) -> str:
+        label_inputs.append("\n\n".join(str(part["text"]) for part in kwargs["user_content"]))
+        return json.dumps({"labels": {"b0001": {"concept": "PaymentTerms"}}})
+
+    monkeypatch.setattr(llm, "call_with_refinement", no_plan)
+    monkeypatch.setattr(llm, "call", fake_call)
+    schema = Schema()
+    schema.add(
+        SchemaTag(
+            name="PaymentTerms",
+            role="the payment clause",
+            kind="section",
+            examples=["net 30"],
+            parent_role="Agreement",
+        )
+    )
+    label_documents(
+        docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"), schema_seed=schema
+    )
+    line = '- PaymentTerms [section] — the payment clause (seen: "net 30")'
+    assert all("CONCEPTS ALREADY IN USE" in text for text in label_inputs)
+    # The exact seeded line appears in EVERY call: doc 1's observation of
+    # PaymentTerms did not append its text as a new example (frozen seed).
+    assert all(line in text for text in label_inputs)
+    assert all("PLANNED CONCEPTS" not in text for text in label_inputs)
+    assert docs["a.pdf"][0].concept == "PaymentTerms"
+
+
+def test_label_documents_pilot_stage_confirms_roster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unseeded runs label the LARGEST docs first (the pilot); the rest of the
+    batch then labels against the CONFIRMED tier with observed examples."""
+    _patch_roster(monkeypatch, {"PaymentTerms": "payment obligations"})
+    docs: dict[str, list[Block]] = {"small.pdf": [_b("heading", "b0001", text="Payment Terms")]}
+    for i in range(5):
+        docs[f"big{i}.pdf"] = [
+            _b("heading", "b0001", text="Payment Terms"),
+            _b("p", "b0002", text=f"Invoices are payable within {30 + i} days."),
+        ]
+    seen: list[tuple[str, str]] = []
+
+    def fake_call(config: llm.LLMConfig, **kwargs: Any) -> str:
+        text = "\n\n".join(str(part["text"]) for part in kwargs["user_content"])
+        name = text.rsplit("== ", 1)[1].split(" ==", 1)[0]
+        seen.append((name, text))
+        return json.dumps({"labels": {"b0001": {"concept": "PaymentTerms"}}})
+
+    monkeypatch.setattr(llm, "call", fake_call)
+    label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
+    # The five 2-block docs labeled first (the pilot); small.pdf — first in
+    # input order but smallest — went last.
+    assert [name for name, _ in seen] == [f"big{i}.pdf" for i in range(5)] + ["small.pdf"]
+    # The pilot's first call saw only the PLANNED tier; the post-pilot call
+    # labels against CONFIRMED concepts carrying observed verbatim examples.
+    assert "PLANNED CONCEPTS" in seen[0][1]
+    assert "CONCEPTS ALREADY IN USE" not in seen[0][1]
+    post = seen[-1][1]
+    assert "CONCEPTS ALREADY IN USE" in post
+    assert '- PaymentTerms [section] — payment obligations (seen: "Payment Terms")' in post
+
+
+def test_derive_schema_seed_fallback_for_unobserved_tags() -> None:
+    """Re-deriving schema.json never degrades seeded fields: a tag not observed
+    in this batch keeps its seeded kind/examples/parent; observation wins where
+    it exists."""
+    from dgml_core.generation.label import RosterEntry, derive_schema
+
+    roster = {
+        "OldTag": RosterEntry(
+            description="an old role",
+            examples=["ex1"],
+            kind="row",
+            parent="OldParent",
+            confirmed=True,
+            frozen=True,
+        ),
+        "FreshTag": RosterEntry(),
+    }
+    docs = {"a.pdf": [_b("p", "b0001", text="hello world", concept="FreshTag")]}
+    schema = derive_schema(docs, roster, {"OldTag": "an old role"})
+    old = schema.tags["OldTag"]
+    assert old.kind == "row" and old.parent_role == "OldParent" and old.examples == ["ex1"]
+    fresh = schema.tags["FreshTag"]
+    assert fresh.kind == "section" and fresh.examples == ["hello world"]
+
+
+def test_transcribe_document_reuses_cached_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached <stem>_blocks.json short-circuits Pass A entirely — no LLM call,
+    no PDF parsing — so a re-run only pays for labeling and rendering."""
+    from dgml_core.generation.transcribe import blocks_to_json, transcribe_document
+
+    (tmp_path / "doc_blocks.json").write_text(
+        blocks_to_json([_b("p", "b0001", text="hello world")]), encoding="utf-8"
+    )
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise AssertionError("must not transcribe when the blocks cache exists")
+
+    monkeypatch.setattr(llm, "call_continued", boom)
+    blocks = transcribe_document(
+        b"not-even-a-pdf",  # never parsed: the cache short-circuits before page counting
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path,
+    )
+    assert [b.text for b in blocks] == ["hello world"]
+
+
+def test_roster_content_blocks_cache_marker_is_anthropic_only() -> None:
+    """The rendered roster block carries a cache_control marker only for
+    Anthropic models (other providers cache stable prefixes implicitly);
+    an empty roster contributes no block at all."""
+    from dgml_core.generation.label import RosterEntry, _roster_content_blocks
+
+    roster = {"Foo": RosterEntry(description="a role")}
+    (block,) = _roster_content_blocks(roster, model="anthropic/claude-haiku-4-5")
+    assert block["cache_control"] == {"type": "ephemeral"}
+    (block,) = _roster_content_blocks(roster, model="gemini/gemini-2.5-pro")
+    assert "cache_control" not in block
+    assert _roster_content_blocks({}, model="anthropic/claude-haiku-4-5") == []
+
+
 def test_label_documents_failure_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     docs = _docs()
 
@@ -379,6 +555,71 @@ def test_label_documents_failure_is_noop(monkeypatch: pytest.MonkeyPatch) -> Non
     # Planning fails soft (empty roster); each doc chunk fails soft too.
     assert sum("labeling failed" in w for w in warnings) == 2
     assert all(not b.concept for blocks in docs.values() for b in blocks)
+
+
+def test_is_model_reachability_error_splits_hard_from_soft() -> None:
+    auth = litellm.exceptions.AuthenticationError(
+        message="bad key", llm_provider="anthropic", model="anthropic/claude-haiku-4-5"
+    )
+    bad_req = litellm.exceptions.BadRequestError(
+        message="unknown model", llm_provider="anthropic", model="anthropic/claude-typo"
+    )
+    assert llm.is_model_reachability_error(auth) is True
+    assert llm.is_model_reachability_error(bad_req) is True
+    # A successful-but-unusable response parses to a plain ValueError/JSONDecodeError
+    # — soft, must NOT be flagged as a config problem.
+    assert llm.is_model_reachability_error(ValueError("no labels key")) is False
+    assert llm.is_model_reachability_error(json.JSONDecodeError("x", "y", 0)) is False
+
+
+def test_label_documents_reports_unreachable_model_per_doc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A label-model auth failure fires on_label_error per document (a hard config
+    problem) while still leaving the transcription intact and the warnings
+    string-contract unchanged."""
+    docs = _docs()
+
+    def auth_boom(config: llm.LLMConfig, **kwargs: object) -> str:
+        raise litellm.exceptions.AuthenticationError(
+            message="invalid x-api-key", llm_provider="anthropic", model=config.model
+        )
+
+    def auth_boom_refine(config: llm.LLMConfig, **kwargs: object) -> tuple[str, str]:
+        raise litellm.exceptions.AuthenticationError(
+            message="invalid x-api-key", llm_provider="anthropic", model=config.model
+        )
+
+    monkeypatch.setattr(llm, "call", auth_boom)
+    monkeypatch.setattr(llm, "call_with_refinement", auth_boom_refine)
+    errors: dict[str, dict[str, str]] = {}
+    warnings = label_documents(
+        docs,
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        on_label_error=lambda name, err: errors.__setitem__(name, err),
+    )
+    # Fired once per document, with the registry code.
+    assert set(errors) == set(docs)
+    assert all(e["code"] == "LABEL_MODEL_UNREACHABLE" for e in errors.values())
+    assert all("AuthenticationError" in e["message"] for e in errors.values())
+    # Warnings contract preserved; transcription untouched.
+    assert sum("labeling failed" in w for w in warnings) == 2
+    assert all(not b.concept for blocks in docs.values() for b in blocks)
+
+
+def test_label_documents_no_labels_is_soft_no_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call that SUCCEEDS but returns no labels is a soft outcome — the doc is
+    simply sparse — and must NOT fire on_label_error."""
+    docs = _docs()
+    _patch_roster(monkeypatch, {"PaymentTerms": "payment obligations section"})
+    monkeypatch.setattr(llm, "call", lambda config, **kw: json.dumps({"labels": {}}))
+    errors: dict[str, dict[str, str]] = {}
+    label_documents(
+        docs,
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        on_label_error=lambda name, err: errors.__setitem__(name, err),
+    )
+    assert errors == {}
 
 
 @pytest.mark.parametrize("max_parallel_docs", [1, 2])
@@ -678,6 +919,9 @@ def test_label_documents_writes_cache_artifacts(
     assert "plan_roster_raw.json" not in names and "plan_roster_draft_raw.json" not in names
     roster = json.loads((cache / "concept_roster.json").read_text())
     assert "PaymentTerms" in roster
+    # The reload contract is the legacy flat {concept: string} shape — the
+    # full-fidelity vocabulary lives in schema.json, never here.
+    assert all(isinstance(v, str) for v in roster.values())
 
     # debug=True: the input listings and roster-planning dumps are captured too.
     dbg = tmp_path / "cache_debug"
@@ -1494,7 +1738,8 @@ def test_header_row_labeled_as_data_is_demoted() -> None:
         ),
     ]
     propagate_table_consistency(rows)
-    assert rows[0].cell_concepts == [] and rows[0].concept == ""  # header demoted
+    assert rows[0].cell_concepts == []  # cell-level concepts demoted
+    assert rows[0].concept == ""  # concept copied from data rows -> cleared
     assert rows[1].cell_concepts == ["ItemCode", "ItemQty", "ItemPrice"]  # data intact
 
 
@@ -1525,6 +1770,280 @@ def test_all_text_table_keeps_its_first_row() -> None:
     ]
     propagate_table_consistency(rows)
     assert rows[0].cell_concepts == ["PartyName", "PartyCity"]  # untouched
+
+
+def _fake_window_json(words: list[str]) -> str:
+    return json.dumps({"continues": "", "blocks": [{"structure": "p", "text": " ".join(words)}]})
+
+
+def _write_page_text(tmp_path: Path, words: list[str]) -> Path:
+    pt_dir = tmp_path / "page_text"
+    pt_dir.mkdir()
+    (pt_dir / "page_1.json").write_text(
+        json.dumps({"page": 1, "words": [{"t": w} for w in words]}), encoding="utf-8"
+    )
+    return pt_dir
+
+
+def test_transcribe_window_gate_retries_early_stopped_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window that comes back as VALID JSON covering only a fraction of its
+    pages' words (silent early-stop) is re-requested; the fuller retry wins."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    words = [f"word{i:02d}" for i in range(60)]
+    pt_dir = _write_page_text(tmp_path, words)
+    monkeypatch.setattr(transcribe_mod, "pdf_page_count", lambda _p: 1)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda _b, _idx: b"window-pdf")
+
+    instructions: list[str] = []
+
+    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
+        content = kwargs["user_content"]
+        instructions.append(content[0]["text"])  # type: ignore[index]
+        if len(instructions) == 1:
+            return _fake_window_json(words[:8])  # early stop: 8 of 60 words
+        return _fake_window_json(words)
+
+    monkeypatch.setattr(llm, "call_continued", fake_call)
+    blocks = transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path,
+        page_text_dir=pt_dir,
+    )
+    assert len(instructions) == 2
+    assert [b.text for b in blocks] == [" ".join(words)]
+    # The retry carries the nudge with the measured shortfall; the first
+    # attempt does not.
+    assert "previous attempt" not in instructions[0]
+    assert "previous attempt transcribed only about 13%" in instructions[1]
+    assert "pages 1-1" in instructions[1]
+
+
+def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete window costs exactly one call; without a page_text_dir the
+    gate is off and even a sparse window is accepted as-is (old behavior)."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    words = [f"word{i:02d}" for i in range(60)]
+    pt_dir = _write_page_text(tmp_path, words)
+    monkeypatch.setattr(transcribe_mod, "pdf_page_count", lambda _p: 1)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda _b, _idx: b"window-pdf")
+
+    calls: list[int] = []
+
+    def complete(config: llm.LLMConfig, **kwargs: object) -> str:
+        calls.append(1)
+        return _fake_window_json(words)
+
+    monkeypatch.setattr(llm, "call_continued", complete)
+    transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path / "a",
+        page_text_dir=pt_dir,
+    )
+    assert len(calls) == 1
+
+    calls.clear()
+
+    def sparse(config: llm.LLMConfig, **kwargs: object) -> str:
+        calls.append(1)
+        return _fake_window_json(words[:8])
+
+    monkeypatch.setattr(llm, "call_continued", sparse)
+    blocks = transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path / "b",
+        page_text_dir=None,
+    )
+    assert len(calls) == 1
+    assert [b.text for b in blocks] == [" ".join(words[:8])]
+
+
+def test_anchor_heading_levels_follows_dotted_lims() -> None:
+    """Dotted-numeric lims fix heading depth deterministically: the first
+    dotted heading sets the scheme's base, extra components add depth, and
+    unnumbered headings keep the model's level."""
+    from dgml_core.generation.blocks import anchor_heading_levels
+
+    hs = [
+        _b("heading", "b1", text="TERMS", level=4),  # unnumbered: untouched
+        _b("heading", "b2", text="Scope", lim="1", level=2),  # base = 2
+        _b("heading", "b3", text="Sub", lim="1.1", level=2),  # wrong: -> 3
+        _b("heading", "b4", text="SubSub", lim="1.1.1", level=6),  # -> 4
+        _b("heading", "b5", text="Next", lim="2.", level=5),  # trailing dot -> 2
+        # anchored depth may exceed the prompt's 1-6 scale (base 2 + 5 dots)
+        _b("heading", "b6", text="Deep", lim="1.1.1.1.1.1", level=6),
+    ]
+    anchor_heading_levels(hs)
+    assert [h.level for h in hs] == [4, 2, 3, 4, 2, 7]
+
+
+def test_normalize_enumerated_paragraphs_series() -> None:
+    """Sequential '(a) …'/'(b) …' paragraph runs become items with the marker
+    lifted into lim; isolated or non-sequential markers stay paragraphs."""
+    from dgml_core.generation.blocks import normalize_enumerated_paragraphs
+
+    bs = [
+        _b("p", "b1", text="(a) first entry of the series"),
+        _b("p", "b2", text="(b) second entry of the series"),
+        _b("heading", "b3", text="Between", level=2),
+        _b("p", "b4", text="(a) lone marker stays a paragraph"),
+        _b("p", "b5", text="(i) roman one"),
+        _b("p", "b6", text="(ii) roman two"),
+        _b("p", "b7", text="(iii) roman three"),
+        _b("p", "b8", text="plain paragraph"),
+    ]
+    normalize_enumerated_paragraphs(bs)
+    assert [b.structure for b in bs] == [
+        "item",
+        "item",
+        "heading",
+        "p",
+        "item",
+        "item",
+        "item",
+        "p",
+    ]
+    assert (bs[0].lim, bs[0].text) == ("(a)", "first entry of the series")
+    assert (bs[1].lim, bs[1].text) == ("(b)", "second entry of the series")
+    assert bs[4].lim == "(i)" and bs[6].lim == "(iii)"
+    assert bs[3].structure == "p" and bs[3].text.startswith("(a)")
+
+
+def test_transcribe_window_gate_splits_stubborn_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the retry reproduces the early stop, the gate's stage-2 fallback
+    splits the page range and keeps the merged halves."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    page1 = [f"alpha{i:02d}" for i in range(40)]
+    page2 = [f"bravo{i:02d}" for i in range(40)]
+    pt_dir = tmp_path / "page_text"
+    pt_dir.mkdir()
+    for n, words in ((1, page1), (2, page2)):
+        (pt_dir / f"page_{n}.json").write_text(
+            json.dumps({"page": n, "words": [{"t": w} for w in words]})
+        )
+    monkeypatch.setattr(transcribe_mod, "pdf_page_count", lambda _p: 2)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda _b, idx: bytes(idx))
+
+    instructions: list[str] = []
+
+    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
+        instr = kwargs["user_content"][0]["text"]  # type: ignore[index]
+        instructions.append(instr)
+        if "pages 1-2" in instr:  # full window: stubborn stop
+            return _fake_window_json(page2[-6:])
+        if "pages 1-1" in instr:  # half A: complete
+            return _fake_window_json(page1)
+        return _fake_window_json(page2)  # half B: complete
+
+    monkeypatch.setattr(llm, "call_continued", fake_call)
+    blocks = transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=tmp_path,
+        debug=True,  # raw window writes are debug-gated
+        page_text_dir=pt_dir,
+    )
+    # 2 full-window attempts (initial + nudged retry), then one per half
+    assert sum("pages 1-2" in i for i in instructions) == 2
+    assert sum("pages 1-1" in i for i in instructions) == 1
+    assert sum("pages 2-2" in i for i in instructions) == 1
+    assert [b.text for b in blocks] == [" ".join(page1), " ".join(page2)]
+    # the kept unsuffixed raw is the merged split payload
+    kept = json.loads((tmp_path / "doc_w01_raw.json").read_text())
+    assert len(kept["blocks"]) == 2
+
+
+def test_derive_schema_examples_are_consistent() -> None:
+    """Inline examples are observed VALUES (caption text like 'Effective Date'
+    for EffectiveDate is filtered); a section labeled via its heading keeps
+    only heading examples, not member-body snippets."""
+    from dgml_core.generation.label import RosterEntry, derive_schema
+
+    roster = {
+        "EffectiveDate": RosterEntry(description="agreement start"),
+        "SupplierNoticeAddress": RosterEntry(description="notice address"),
+    }
+    head = _b("heading", "b1", text="If to Supplier:", level=2, concept="SupplierNoticeAddress")
+    member = _b(
+        "p", "b2", text="Xing Xing Inc., Noho Tower, Suzhou City", concept="SupplierNoticeAddress"
+    )
+    caption = _b(
+        "p", "b3", text="Effective Date", entities=[Span(start=0, end=14, concept="EffectiveDate")]
+    )
+    value = _b(
+        "p", "b4", text="March 01, 2022", entities=[Span(start=0, end=14, concept="EffectiveDate")]
+    )
+    schema = derive_schema({"a.pdf": [head, member, caption, value]}, roster, {})
+    assert schema.tags["EffectiveDate"].examples == ["March 01, 2022"]
+    assert schema.tags["SupplierNoticeAddress"].examples == ["If to Supplier:"]
+
+
+def test_schema_save_omits_singular_example(tmp_path: Path) -> None:
+    """The saved schema.json carries only `examples`; the in-memory
+    single-value convenience is re-derived on load."""
+    from dgml_core.generation.schema import Schema, SchemaTag
+
+    schema = Schema()
+    schema.add(SchemaTag(name="Foo", role="r", kind="inline", examples=["v1", "v2"]))
+    out = tmp_path / "schema.json"
+    schema.save(out)
+    data = json.loads(out.read_text())
+    assert "example" not in data["tags"]["Foo"]
+    assert data["tags"]["Foo"]["examples"] == ["v1", "v2"]
+    loaded = Schema.load(out)
+    assert loaded.tags["Foo"].example == "v1"  # backfilled for consumers
+
+
+def test_header_row_with_distinct_role_keeps_it() -> None:
+    """A header row whose OWN concept differs from the data rows' shared
+    concept was labeled deliberately (e.g. a table-header role) — the row
+    concept survives demotion; only the cell concepts are cleared."""
+    from dgml_core.generation.label import propagate_table_consistency
+
+    rows = [
+        Block(
+            id="r0",
+            structure="row",
+            cells=["Code", "Qty", "Price"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="PricingHeader",
+        ),
+        Block(
+            id="r1",
+            structure="row",
+            cells=["A100", "2", "$10.00"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="LineItem",
+        ),
+        Block(
+            id="r2",
+            structure="row",
+            cells=["B200", "5", "$25.00"],
+            cell_concepts=["ItemCode", "ItemQty", "ItemPrice"],
+            concept="LineItem",
+        ),
+    ]
+    propagate_table_consistency(rows)
+    assert rows[0].cell_concepts == []
+    assert rows[0].concept == "PricingHeader"  # distinct role preserved
 
 
 def test_parse_block_choice_group() -> None:

@@ -66,6 +66,16 @@ style:
    generator transcribed as "Jun 18" where the page reads "Jun 16")
    grounds to the digit-masked-equal span in its row — the location
    is not in question there, only the digits.
+6. **Assemble stranded cells.** Whatever remains gets one last
+   page-wide subsequence assembly with the same safety gates as pass
+   5's interleave handling (exact cores, unclaimed words, one-cell
+   coherence). This is for the doubly-unlucky cell: interleaved (no
+   contiguous span anywhere) AND with every window pointing away —
+   two tables sharing header labels serialize transposed vs. the
+   page, so the cell's siblings all mis-ground onto the other table.
+   A longest-prefix variant grounds label-plus-value text whose
+   trailing value the page never rendered as words (chart-only
+   numbers), committed as a partial.
 
 Boxes aggregate bottom-up: an element's region is the union of its
 subtree's matched words. Elements with text-node children (leaves and
@@ -109,6 +119,7 @@ from .textmatch import (
     core_token,
     find_fuzzy_spans,
     find_spans,
+    find_spans_lenient,
     fuzzy_norm,
     line_groups,
     load_page_words,
@@ -178,6 +189,13 @@ _ASSEMBLE_MAX_WINDOW = 400
 # are never a stranded table-cell duplicate (same posture as
 # _PRUNE_MAX_TOKENS).
 _RELOCATE_MAX_TOKENS = 8
+
+# Rescue-assembly guards: only multi-token segments with enough
+# character mass to be distinctive on a whole page (a two-letter pair
+# could frankenmatch), and only pages small enough for the quadratic
+# subsequence scan.
+_RESCUE_ASSEMBLE_MIN_CHARS = 6
+_RESCUE_ASSEMBLE_MAX_PAGE_WORDS = 2000
 
 
 # ---- Data shapes -----------------------------------------------------------
@@ -528,6 +546,7 @@ def ground_dgml_xml(
     punct_grounded, shape_tokens, interleaved_tokens, band_relocations = _ground_row_context_segs(
         segs, page_words
     )
+    assembled_tokens = _assemble_stranded_segs(segs, otoks, pairs, page_words)
     # Absorb BEFORE pruning: a cell's own unmatched punctuation ("Cash
     # & Liquid" — the '&' is invisible to alignment) sits between its
     # matched words, and pruning would read that occupied space as an
@@ -595,6 +614,10 @@ def ground_dgml_xml(
         # generator transcribed a digit differently than OCR read it.
         # Worth auditing: the BOX is right, the XML text may not be.
         "shape_matched_tokens": shape_tokens,
+        # Tokens grounded by the last-resort page-wide assembly — a
+        # stranded interleaved cell every windowed pass pointed away
+        # from (see _assemble_stranded_segs).
+        "assembled_tokens": assembled_tokens,
         # Segments moved off a sibling-contained duplicate onto the
         # unclaimed identical copy (charge-code vs memo-prefix).
         "sibling_relocations": relocated,
@@ -1108,6 +1131,108 @@ def _relocate_column_outliers(
     return relocated
 
 
+def _one_visual_line(picked: list[tuple[int, Word]]) -> bool:
+    """All picked words on a single visual line of one page."""
+    pages = {p for p, _w in picked}
+    if len(pages) != 1:
+        return False
+    return len(line_groups([w for _p, w in picked])) == 1
+
+
+def _one_spatial_cell(picked: list[tuple[int, Word]]) -> bool:
+    return words_form_one_cell([w for _p, w in picked])
+
+
+def _assemble_subsequence(
+    flat_words: list[tuple[int, Word]],
+    lo: int,
+    hi: int,
+    cores: list[str],
+    claimed: set[tuple[int, int]],
+    own: set[tuple[int, int]],
+    coherent: Callable[[list[tuple[int, Word]]], bool] | None = None,
+    max_window: int = _ASSEMBLE_MAX_WINDOW,
+) -> list[tuple[int, Word]] | None:
+    """In-order subsequence of unclaimed window words whose cores
+    assemble ``cores``, accepted only when the picked words satisfy
+    ``coherent`` — by default, forming one spatially-connected cell on a
+    single page. One token core may be consumed by a *consecutive* run
+    of words (OCR shatters "3.5%" into ``3 . 5 %``); words may be
+    skipped freely between cores (that's the interleave) but never
+    inside one. Every position that can start the first core is tried;
+    within a start, each core takes the leftmost run. Windows larger
+    than ``max_window`` are refused."""
+    if hi - lo > max_window:
+        return None
+    if not cores:
+        return None
+    if coherent is None:
+        coherent = _one_spatial_cell
+
+    def eligible(gp: int, page0: int) -> str | None:
+        """The word's core, or None when it can't participate: off
+        the start page, or claimed by another element. Empty-core
+        words (bare punctuation) return '' — transparent inside a
+        run because the alignment stream never sees them either."""
+        p, w = flat_words[gp]
+        if p != page0:
+            return None
+        if (p, w.idx) in claimed and (p, w.idx) not in own:
+            return None
+        return core_token(w.text)
+
+    def consume(
+        gp: int, page0: int, c: str, scan: bool = True
+    ) -> tuple[int, list[tuple[int, Word]]] | None:
+        """Leftmost consecutive run at-or-after ``gp`` whose
+        concatenated cores equal ``c``; returns (next position,
+        run words). With ``scan=False`` the run must begin exactly
+        at ``gp`` (used by the outer start loop, which otherwise
+        would rescan the whole window from every start)."""
+        for start in range(gp, gp + 1 if not scan else hi):
+            wc = eligible(start, page0)
+            if not wc or not c.startswith(wc):
+                continue
+            acc = wc
+            run = [flat_words[start]]
+            j = start + 1
+            while len(acc) < len(c) and j < hi:
+                nc = eligible(j, page0)
+                if nc is None:
+                    break
+                j += 1
+                if not nc:
+                    continue  # transparent punctuation fragment
+                if not c.startswith(acc + nc):
+                    break
+                acc += nc
+                run.append(flat_words[j - 1])
+            if acc == c:
+                return j, run
+        return None
+
+    for start in range(lo, hi):
+        page0 = flat_words[start][0]
+        first = consume(start, page0, cores[0], scan=False)
+        if first is None:
+            continue  # only positions that *start* the first core
+        gp, picked = first
+        ok = True
+        for c in cores[1:]:
+            nxt = consume(gp, page0, c)
+            if nxt is None:
+                ok = False
+                break
+            gp = nxt[0]
+            picked.extend(nxt[1])
+        if not ok:
+            continue
+        if not coherent(picked):
+            continue
+        return picked
+    return None
+
+
 def _ground_row_context_segs(
     segs: list[_TextSeg],
     page_words: dict[int, list[Word]],
@@ -1261,16 +1386,6 @@ def _ground_row_context_segs(
         # Center distance swapped same-shape sibling columns.
         return min(candidates, key=lambda c: (c[0], c[1]))[2]
 
-    def one_visual_line(picked: list[tuple[int, Word]]) -> bool:
-        """All picked words on a single visual line of one page."""
-        pages = {p for p, _w in picked}
-        if len(pages) != 1:
-            return False
-        return len(line_groups([w for _p, w in picked])) == 1
-
-    def one_spatial_cell(picked: list[tuple[int, Word]]) -> bool:
-        return words_form_one_cell([w for _p, w in picked])
-
     def same_line_pick_safe(seg: _TextSeg, span: list[tuple[int, Word]]) -> bool:
         """Refuse a same-line completion whose pick skipped over a
         *claimed twin* — a word with the same core, owned by another
@@ -1305,84 +1420,10 @@ def _ground_row_context_segs(
         own: set[tuple[int, int]],
         coherent: Callable[[list[tuple[int, Word]]], bool] | None = None,
     ) -> list[tuple[int, Word]] | None:
-        """In-order subsequence of unclaimed window words whose cores
-        assemble the segment's token cores, accepted only when the
-        picked words satisfy ``coherent`` — by default, forming one
-        spatially-connected cell on a single page. One token core may
-        be consumed by a *consecutive* run of
-        words (OCR shatters "3.5%" into ``3 . 5 %``); words may be
-        skipped freely between cores (that's the interleave) but never
-        inside one. Every position that can start the first core is
-        tried; within a start, each core takes the leftmost run.
-        Windows larger than ``_ASSEMBLE_MAX_WINDOW`` are refused."""
-        if hi - lo > _ASSEMBLE_MAX_WINDOW:
-            return None
-        if coherent is None:
-            coherent = one_spatial_cell
+        """See :func:`_assemble_subsequence` — this binds the pass's
+        reading-order stream and claim state to the segment's cores."""
         cores = [c for t in seg.raw.split() if (c := core_token(t))]
-
-        def eligible(gp: int, page0: int) -> str | None:
-            """The word's core, or None when it can't participate: off
-            the start page, or claimed by another element. Empty-core
-            words (bare punctuation) return '' — transparent inside a
-            run because the alignment stream never sees them either."""
-            p, w = flat_words[gp]
-            if p != page0:
-                return None
-            if (p, w.idx) in claimed and (p, w.idx) not in own:
-                return None
-            return core_token(w.text)
-
-        def consume(
-            gp: int, page0: int, c: str, scan: bool = True
-        ) -> tuple[int, list[tuple[int, Word]]] | None:
-            """Leftmost consecutive run at-or-after ``gp`` whose
-            concatenated cores equal ``c``; returns (next position,
-            run words). With ``scan=False`` the run must begin exactly
-            at ``gp`` (used by the outer start loop, which otherwise
-            would rescan the whole window from every start)."""
-            for start in range(gp, gp + 1 if not scan else hi):
-                wc = eligible(start, page0)
-                if not wc or not c.startswith(wc):
-                    continue
-                acc = wc
-                run = [flat_words[start]]
-                j = start + 1
-                while len(acc) < len(c) and j < hi:
-                    nc = eligible(j, page0)
-                    if nc is None:
-                        break
-                    j += 1
-                    if not nc:
-                        continue  # transparent punctuation fragment
-                    if not c.startswith(acc + nc):
-                        break
-                    acc += nc
-                    run.append(flat_words[j - 1])
-                if acc == c:
-                    return j, run
-            return None
-
-        for start in range(lo, hi):
-            page0 = flat_words[start][0]
-            first = consume(start, page0, cores[0], scan=False)
-            if first is None:
-                continue  # only positions that *start* the first core
-            gp, picked = first
-            ok = True
-            for c in cores[1:]:
-                nxt = consume(gp, page0, c)
-                if nxt is None:
-                    ok = False
-                    break
-                gp = nxt[0]
-                picked.extend(nxt[1])
-            if not ok:
-                continue
-            if not coherent(picked):
-                continue
-            return picked
-        return None
+        return _assemble_subsequence(flat_words, lo, hi, cores, claimed, own, coherent)
 
     def pick_numeric(
         candidates: list[tuple[float, float, list[tuple[int, Word]]]],
@@ -1595,7 +1636,7 @@ def _ground_row_context_segs(
                 own_pos = [gpos(p, w) for p, w in seg.matched_words]
                 lo2 = max(0, min(own_pos) - _SAME_LINE_SLACK)
                 hi2 = min(len(flat_words), max(own_pos) + 1 + _SAME_LINE_SLACK)
-                span = assemble_interleaved(lo2, hi2, seg, old, coherent=one_visual_line)
+                span = assemble_interleaved(lo2, hi2, seg, old, coherent=_one_visual_line)
                 if span is not None and not same_line_pick_safe(seg, span):
                     span = None
             if span is not None:
@@ -1637,6 +1678,121 @@ def _ground_row_context_segs(
             claimed.update((p, w.idx) for p, w in span)
             note_ctx(seg, span)
     return punct_grounded, shape_tokens, interleaved_tokens, band_relocations
+
+
+def _page_assembly_candidates(
+    seg: _TextSeg,
+    lo_page: int,
+    hi_page: int,
+    page_words: dict[int, list[Word]],
+    claimed: set[tuple[int, int]],
+    own: set[tuple[int, int]],
+) -> tuple[list[tuple[int, list[tuple[int, Word]]]], int]:
+    """Page-wide one-cell subsequence assemblies for a segment that no
+    contiguous span search could place, as ``(candidates, cores_matched)``.
+
+    When the full token list assembles nowhere, progressively shorter
+    *prefixes* are tried (longest wins, never below 3 cores or ~60% of
+    the segment) — for label-plus-value text whose trailing value the
+    page never rendered as words (a chart-only number). The caller
+    commits such a match as a partial."""
+    cores = [c for t in seg.raw.split() if (c := core_token(t))]
+    n = len(cores)
+    if n < 2 or sum(len(c) for c in cores) < _RESCUE_ASSEMBLE_MIN_CHARS:
+        return [], 0
+    min_k = n if n < 4 else max(3, (3 * n + 4) // 5)
+    for k in range(n, min_k - 1, -1):
+        found: list[tuple[int, list[tuple[int, Word]]]] = []
+        for page in range(lo_page, hi_page + 1):
+            words = page_words.get(page, [])
+            if not words or len(words) > _RESCUE_ASSEMBLE_MAX_PAGE_WORDS:
+                continue
+            flat = [(page, w) for w in words]
+            picked = _assemble_subsequence(
+                flat, 0, len(flat), cores[:k], claimed, own, max_window=len(flat)
+            )
+            if picked is not None:
+                found.append((page, picked))
+        if found:
+            return found, k
+    return [], 0
+
+
+def _assemble_stranded_segs(
+    segs: list[_TextSeg],
+    otoks: list[_OTok],
+    pairs: dict[int, int],
+    page_words: dict[int, list[Word]],
+) -> int:
+    """Last-resort page-wide subsequence assembly for segments every
+    earlier pass left (fully or partly) unmatched. Returns the number of
+    tokens grounded.
+
+    The case this exists for: a wrapped multi-line table cell whose
+    neighbor columns nearly touch gets merged into one reading-order
+    component, so its words interleave with the neighbors' line-by-line
+    and *no page offers a contiguous span* — and its sibling cells all
+    mis-grounded onto a duplicate table elsewhere (identical header
+    labels two tables share), so the row-context windows point away from
+    the true location. Page-wide assembly with the row-context pass's
+    own safety gates — exact core equality, unclaimed words only,
+    one-cell coherence on a single page — finds the words where they
+    actually sit. Runs AFTER the row-context pass so in-window
+    interleaves keep their richer sibling-window semantics; this pass
+    only sees the stranded remainder. Candidate pages and the expected
+    stream position come from the segment's aligned neighbors, same as
+    duplicate rescue."""
+    if not pairs:
+        return 0
+    sorted_x = sorted(pairs)
+    pos_in_page, page_offset, flat_words = _reading_index(page_words)
+    cum = len(flat_words)
+
+    def gpos(page: int, word: Word) -> float:
+        return page_offset[page] + pos_in_page[(page, word.idx)]
+
+    claimed = _claimed_words(segs)
+    grounded = 0
+    for seg in segs:
+        if not seg.n_tokens or seg.matched_tokens == seg.n_tokens:
+            continue
+        lo_tok = seg.token_start
+        hi_tok = seg.token_start + seg.n_tokens - 1
+        k = bisect_right(sorted_x, lo_tok) - 1
+        prev_ot = otoks[pairs[sorted_x[k]]] if k >= 0 else None
+        k2 = bisect_right(sorted_x, hi_tok)
+        next_ot = otoks[pairs[sorted_x[k2]]] if k2 < len(sorted_x) else None
+        prev_page = prev_ot.page if prev_ot else min(page_words)
+        next_page = next_ot.page if next_ot else max(page_words)
+        lo_page = max(min(page_words), min(prev_page, next_page) - _RESCUE_PAGE_SLACK)
+        hi_page = min(max(page_words), max(prev_page, next_page) + _RESCUE_PAGE_SLACK)
+        prev_gpos = gpos(prev_ot.page, prev_ot.word) if prev_ot else 0.0
+        next_gpos = gpos(next_ot.page, next_ot.word) if next_ot else float(cum)
+        expected_gpos = (prev_gpos + next_gpos) / 2
+
+        own = {(p, w.idx) for p, w in seg.matched_words}
+        assembled, n_cores = _page_assembly_candidates(
+            seg, lo_page, hi_page, page_words, claimed, own
+        )
+        if not assembled or n_cores <= seg.matched_tokens:
+            continue
+
+        def assembly_distance(
+            cand: tuple[int, list[tuple[int, Word]]],
+            expected: float = expected_gpos,
+        ) -> float:
+            _page, picked = cand
+            mid = sum(gpos(p, w) for p, w in picked) / len(picked)
+            return abs(mid - expected)
+
+        _best_page, picked = min(assembled, key=assembly_distance)
+        claimed.difference_update(own)
+        grounded += n_cores - seg.matched_tokens
+        seg.matched_tokens = n_cores
+        seg.matched_words = list(picked)
+        seg.pinned = True
+        claimed.update((p, w.idx) for p, w in picked)
+    return grounded
 
 
 def _rescue_unmatched_segs(
@@ -1708,17 +1864,25 @@ def _rescue_unmatched_segs(
         next_gpos = gpos(next_ot.page, next_ot.word) if next_ot else float(cum)
         expected_gpos = (prev_gpos + next_gpos) / 2
 
-        candidates: list[tuple[int, tuple[int, int]]] = []  # (page, span)
-        for page in range(lo_page, hi_page + 1):
-            words = page_words.get(page, [])
-            spans = find_spans(seg.raw, words) or find_fuzzy_spans(seg.raw, words)
-            candidates.extend((page, s) for s in spans)
-        if not candidates:
-            continue  # no clean span — keep whatever partial match exists
-
         # The segment's own (possibly misattributed) words must not make
         # their location look "taken" when scoring its candidates.
         own = {(p, w.idx) for p, w in seg.matched_words}
+
+        candidates: list[tuple[int, tuple[int, int]]] = []  # (page, span)
+        for page in range(lo_page, hi_page + 1):
+            words = page_words.get(page, [])
+            spans = (
+                find_spans(seg.raw, words)
+                or find_fuzzy_spans(seg.raw, words)
+                # Boundary-punctuation leniency: a "$" the page tokenizer
+                # glued into "($", a "$" or minus sign the page never
+                # rendered as its own word, a trailing "Label —"
+                # separator dash.
+                or find_spans_lenient(seg.raw, words)
+            )
+            candidates.extend((page, s) for s in spans)
+        if not candidates:
+            continue  # no clean span — keep whatever partial match exists
 
         def score(
             cand: tuple[int, tuple[int, int]],

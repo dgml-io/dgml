@@ -24,7 +24,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
 from dgml_core.classification import (
     ClassificationConfig,
@@ -39,6 +39,9 @@ from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
 from dgml_core.models import DocSet
 from dgml_core.storage import Workspace, read_json
 from dgml_core.text_extraction import TextMode
+
+if TYPE_CHECKING:
+    from dgml_core.generation.schema import Schema
 
 
 def _emit(payload: dict[str, Any], fmt: str, stream: IO[str] | None = None) -> None:
@@ -308,6 +311,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "clusters, open new clusters for the rest) and fresh clustering "
         "otherwise. 'fresh' always clusters from scratch; 'incremental' forces "
         "the incremental path and errors if no DocSets exist yet.",
+    )
+    cluster_p.add_argument(
+        "--method",
+        dest="method",
+        choices=("auto", "embedding", "llm"),
+        default="embedding",
+        help="How documents are grouped, orthogonal to --mode. 'embedding' "
+        "(default) uses the statistical encode → project → cluster pipeline — "
+        "the right choice once a corpus is large enough for tf-idf / neighbor "
+        "statistics to be meaningful. 'llm' sends every document's page images "
+        "to the vision LLM in one call and lets it partition them — built for "
+        "very small corpora where the embedding pipeline has too little signal. "
+        "'auto' picks 'llm' when at most --small-corpus-threshold files are "
+        "clusterable, else 'embedding'. Both 'llm' and 'auto' (when it routes "
+        "to the LLM) need the same `classification` config as --auto-classify.",
+    )
+    cluster_p.add_argument(
+        "--small-corpus-threshold",
+        dest="small_corpus_threshold",
+        type=int,
+        metavar="N",
+        # Keep in sync with dgml_core.clustering.SMALL_CORPUS_MAX_FILES (8).
+        default=8,
+        help="With --method auto, route corpora of at most N clusterable files "
+        "to the LLM partitioner, and larger ones to the embedding pipeline "
+        "(default 8). Ignored for --method embedding / llm.",
     )
 
     docset = sub.add_parser("docset", parents=[common], help="DocSet management.").add_subparsers(
@@ -855,7 +884,20 @@ def _add_chain_subparsers(
         type=Path,
         default=None,
         dest="output_dir",
-        help="Bundle dir (default <workspace>/dgmlx-bundles/<ids>).",
+        help=(
+            "Directory to write the <stem>.dgmlx archive (and record.json) into "
+            "(default <workspace>/dgmlx-bundles/<ids>)."
+        ),
+    )
+    st_file.add_argument(
+        "--unpacked",
+        action="store_true",
+        help=(
+            "Write the unpacked bundle tree (source/, page_images/, META-INF/, "
+            "[Content_Types].xml, _rels/, …) into --output-dir instead of the archive. "
+            "By default only the .dgmlx archive is written; these two modes are mutually "
+            "exclusive."
+        ),
     )
     _chain_config_arg(st_file)
     _add_write_args(st_file)
@@ -1045,7 +1087,9 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         return 0
 
     if cmd == "check":
-        report = check_workspace(ws, retry_errors=args.retry_errors, verbose=args.verbose)
+        report = check_workspace(
+            ws, retry_errors=args.retry_errors, verbose=args.verbose, debug=args.debug
+        )
         _emit(report.to_json(), fmt)
         return 0 if report.ok else 2
 
@@ -1067,6 +1111,8 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 skip_existing=getattr(args, "skip_existing", False),
                 config=getattr(args, "config", None),
                 mode=getattr(args, "mode", "auto"),
+                method=getattr(args, "method", "embedding"),
+                small_corpus_threshold=getattr(args, "small_corpus_threshold", 8),
                 debug=args.debug,
             ),
             fmt,
@@ -1261,6 +1307,7 @@ def _chain_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 config_path=cfg,
                 dry_run=args.dry_run,
                 legacy=args.legacy,
+                unpacked=args.unpacked,
                 service=args.keychain_service,
                 account=args.keychain_account,
             )
@@ -1533,7 +1580,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Dispatch the `extraction` command group."""
     from dataclasses import replace
 
-    from dgml_core.extraction_schema import json_schema_to_rnc, parse_rnc, rnc_to_json_schema
+    from dgml_core.extraction_schema import parse_rnc, rnc_to_json_schema
     from dgml_core.extraction_xml import dgml_xml_to_values
     from dgml_core.grounded import extract_values, generate_schema, load_grounded_config
 
@@ -1552,8 +1599,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 f"docset '{args.docset_id}' has no files; pass --from-file or add files first",
                 fmt,
             )
-        schema = generate_schema(ws, file_ids, config=config)
-        rnc = json_schema_to_rnc(schema, workspace=ws.organization, docset_name=ds.name)
+        rnc = generate_schema(ws, file_ids, config=config, docset_name=ds.name)
         store.set_schema(args.docset_id, rnc)
         _emit(
             {
@@ -1769,17 +1815,19 @@ def _load_schema_roster(path: Path) -> dict[str, str]:
     return roster
 
 
-def _load_schema_seed(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+def _load_schema_seed(path: Path) -> tuple[Schema, dict[str, str]]:
     """Load an exported schema — ``schema.json`` or ``full-schema.rnc`` — into
-    ``(roster, parent_map)``.
+    ``(schema, parent_map)``.
 
     ``--schema-path`` accepts the two formats ``docset generate`` emits at the
     docset root: ``schema.json`` (Schema v1: a ``tags`` map of ``name ->
     {role, kind, parent_role, ...}``) or its lossless RELAX NG Compact render
     ``full-schema.rnc`` (a ``.rnc`` suffix; the ``# Field: value`` comment contract
-    carries the same fields). Each tag's ``role`` seeds the labeling
-    vocabulary; its ``parent_role`` becomes the leaf → container
-    ``parent_map`` that drives entity-container grouping in ``render_dgml``.
+    carries the same fields). The full schema seeds the labeling vocabulary —
+    role descriptions, curated examples, kind, hierarchy (via
+    ``ConvertOptions.schema_seed``); each tag's ``parent_role`` also becomes
+    the leaf → container ``parent_map`` that drives entity-container grouping
+    in ``render_dgml``.
 
     Raises ``InvalidArgument`` on a missing / malformed file, or one with no
     tags (e.g. a flat ``{concept: description}`` mapping — that shape is not
@@ -1787,43 +1835,32 @@ def _load_schema_seed(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     """
     from dgml_core.errors import InvalidArgument
     from dgml_core.generation.blocks import sanitize_concept
+    from dgml_core.generation.schema import Schema
 
-    pairs: list[tuple[str, str, str]]  # (name, role, parent_role)
     try:
         if Path(path).suffix.lower() == ".rnc":
             from dgml_core.generation.rnc import rnc_to_schema_dict
 
-            data = rnc_to_schema_dict(Path(path).read_text(encoding="utf-8"))
-            pairs = [
-                (str(t.get("name", "")), str(t.get("role", "")), str(t.get("parent_role", "")))
-                for t in data["tags"].values()
-            ]
+            schema = Schema.from_dict(rnc_to_schema_dict(Path(path).read_text(encoding="utf-8")))
         else:
-            from dgml_core.generation.schema import Schema
-
             schema = Schema.load(path)
-            pairs = [(tag.name, tag.role, tag.parent_role) for tag in schema.tags.values()]
     except FileNotFoundError as exc:
         raise InvalidArgument(f"--schema-path file not found: {path}") from exc
     except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
         raise InvalidArgument(f"--schema-path is not a valid schema ({path}): {exc}") from exc
 
-    roster: dict[str, str] = {}
     parent_map: dict[str, str] = {}
-    for name, role, parent_role in pairs:
-        concept = sanitize_concept(name)
-        if not concept:
-            continue
-        roster[concept] = (role or "")[:60]
-        parent = sanitize_concept(parent_role or "")
-        if parent:
+    for tag in schema.tags.values():
+        concept = sanitize_concept(tag.name)
+        parent = sanitize_concept(tag.parent_role or "")
+        if concept and parent:
             parent_map[concept] = parent
-    if not roster:
+    if not schema.tags:
         raise InvalidArgument(
             f"--schema-path has no tags — expected an exported schema.json or full-schema.rnc "
             f"(a flat {{concept: description}} mapping is not accepted) ({path})"
         )
-    return roster, parent_map
+    return schema, parent_map
 
 
 def _file_result(status: str, file_id: str, source: str, **extra: Any) -> dict[str, Any]:
@@ -1894,6 +1931,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         convert_batch,
         load_generation_config,
         resolve_generation_api_key,
+        validate_generation_models,
     )
     from dgml_core.generation import coverage as cov_mod
     from dgml_core.generation.blocks import Block
@@ -1946,6 +1984,17 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     label_model = gen_cfg.label_model
     gen_api_key = resolve_generation_api_key(gen_cfg)
     gen_api_base = gen_cfg.api_base
+
+    # Pre-flight — fail fast BEFORE any transcription spend on the two model
+    # misconfigurations detectable offline: a malformed model string, or a
+    # missing API key for either model's provider. A present-but-wrong key or a
+    # well-formed-but-nonexistent model id can't be caught here; those surface
+    # per file as label_error (see _on_label_error below). Mirrors the style-
+    # config pre-flight above.
+    try:
+        validate_generation_models(gen_cfg, gen_api_key)
+    except DgmlError as exc:
+        return _emit_error(exc.code, str(exc), fmt)
 
     # The semantic-link pass runs on the labeling model.
     link_config = llm.LLMConfig(
@@ -2071,9 +2120,19 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # of the generic "produced no output" message. The full error still goes to
     # stderr under --verbose via _diag (convert_batch's progress log).
     gen_errors: dict[str, str] = {}
+    # name → {code, message} when a file's labeling couldn't reach the model at
+    # all (bad model id, wrong/absent key, network). Surfaced as label_error on
+    # the converted entry so a misconfigured label_model is visible without
+    # --verbose; the document still renders (unlabeled). Labeling completes
+    # before any _on_output fires, so the entry below can read this.
+    label_errors: dict[str, dict[str, str]] = {}
 
     def _on_error(name: str, message: str) -> None:
         gen_errors[name] = message
+
+    def _on_label_error(name: str, err: dict[str, str]) -> None:
+        label_errors[name] = err
+        _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
 
     def _on_output(name: str, xml: str) -> None:
         out_xml = dgml_xml_paths[name]
@@ -2154,6 +2213,10 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             result = cov_mod.compute_coverage(xml, name, page_text_dir=pt_dir)
             _diag(cov_mod.coverage_summary_line(result))
             cov_results.append(result)
+        # Present only on files whose labeling couldn't reach the model — like
+        # grounding_error, which appears only when grounded is False.
+        label_error = label_errors.get(name)
+        label_extra = {"label_error": label_error} if label_error is not None else {}
         written.append(
             _file_result(
                 "converted",
@@ -2162,6 +2225,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 output=str(out_xml),
                 links=links_added,
                 **grounding,
+                **label_extra,
             )
         )
 
@@ -2172,21 +2236,36 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         # (threaded via ConvertOptions.debug below).
         cache_dir = args.cache_dir or output_dir / "cache"
         roster_path = Path(cache_dir) / "concept_roster.json"
+        schema_seed = None
+        roster_seed: dict[str, str] | None = None
         parent_map_seed: dict[str, str] = {}
         if args.schema_path:
-            roster_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
+            schema_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
             _diag(
-                f"Loaded schema: {len(roster_seed)} concept(s), "
+                f"Loaded schema: {len(schema_seed.tags)} concept(s), "
                 f"{len(parent_map_seed)} container link(s) from {args.schema_path}"
             )
-        elif not args.no_roster and roster_path.exists():
-            try:
-                roster_seed = _load_schema_roster(roster_path)
-                _diag(f"Reusing docset roster: {len(roster_seed)} concept(s)")
-            except InvalidArgument:
-                roster_seed = None
-        else:
-            roster_seed = None
+        elif not args.no_roster:
+            # Incremental reuse prefers the docset's own schema.json — full
+            # fidelity (role descriptions, observed examples, kind, hierarchy)
+            # — over the flat cache/concept_roster.json fallback. Unlike
+            # --schema-path, no parent_map is derived here: entity-container
+            # grouping stays an explicit opt-in.
+            from dgml_core.generation.schema import Schema
+
+            schema_json_path = Path(cache_dir).parent / "schema.json"
+            if schema_json_path.exists():
+                try:
+                    schema_seed = Schema.load(schema_json_path)
+                    _diag(f"Reusing docset schema: {len(schema_seed.tags)} tag(s)")
+                except (json.JSONDecodeError, TypeError, ValueError, OSError):
+                    schema_seed = None
+            if schema_seed is None and roster_path.exists():
+                try:
+                    roster_seed = _load_schema_roster(roster_path)
+                    _diag(f"Reusing docset roster: {len(roster_seed)} concept(s)")
+                except InvalidArgument:
+                    roster_seed = None
 
         # Reload already-generated docs from cache so the whole docset stays
         # consistent as its schema/roster grows; changed originals re-render
@@ -2208,10 +2287,12 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             max_parallel_docs=args.max_parallel_calls,
             cache_dir=cache_dir,
             debug=args.debug,
+            page_text_dirs=page_text_dirs,
             workspace=ws,
             dgml_header=build_header(ws.organization, ds.name),
             converters=load_conversion_config(ws),
             roster_seed=roster_seed,
+            schema_seed=schema_seed,
             parent_map=parent_map_seed or None,
             progress=_diag,
         )
@@ -2220,6 +2301,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             options=options,
             on_output=_on_output,
             on_error=_on_error,
+            on_label_error=_on_label_error,
             prior_docs=prior_docs,
             prior_outputs=prior_outputs,
         )

@@ -35,9 +35,10 @@ _CONCEPT_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
 
 # Structural/discourse words carry no semantics — the block's `structure`
 # field already says what shape the content has. A concept ending in one of
-# these is the suffix-conflation the format analysis measured at ~70% of all
-# tag variation; stripping is deterministic and replay-safe. A concept that
-# is ONLY structural words normalizes to '' (i.e. unlabeled).
+# these is a common source of spurious tag variation — the same role labeled
+# with and without a structural suffix; stripping is deterministic and
+# replay-safe. A concept that is ONLY structural words normalizes to ''
+# (i.e. unlabeled).
 _STRUCTURAL_SUFFIX_RE = re.compile(
     r"(Sections?|Subsections?|SubSections?|Clauses?|Paragraphs?|Items?|Lists?|"
     r"Headings?|Titles?|Texts?|Blocks?|Contents?|Body|Lines?|Rows?|Entry|"
@@ -138,6 +139,14 @@ class Block:
     # transcribed cell count disagrees with the labeler's column model.
     cell_entities: list[list[Span]] = field(default_factory=list)
     group_concept: str = ""
+    # Row blocks only, set by propagate_table_consistency. `header_row` marks a
+    # demoted printed-title row so the renderer emits its cells as `ColumnHeader`
+    # structure-td elements; `kv_table` marks the rows of a key-value run (no
+    # column concept repeats across data rows) so the renderer emits a uniform
+    # generic td with the value concept as an inner span — a stable td localname
+    # (no per-column tag collision) that still keeps the leaf concept tag.
+    header_row: bool = False
+    kv_table: bool = False
 
     def flat_text(self) -> str:
         """Every character this block contributes to the document."""
@@ -165,7 +174,10 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
         checked = [c for c in checked if c in options]
     if not value and len(checked) == 1:
         value = checked[0]
-    if not text and not cells and not (label or value) and not options:
+    # A lim alone is content: numbered-but-untitled headings ("6.4.1" + body)
+    # must survive, or the sub-section they open is silently flattened.
+    lim = str(raw.get("lim", "") or "").strip()
+    if not text and not cells and not (label or value) and not options and not lim:
         return None
     try:
         level = max(1, min(6, int(raw.get("level", 1))))
@@ -176,13 +188,124 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
         structure=structure,
         text=text,
         level=level,
-        lim=str(raw.get("lim", "") or "").strip(),
+        lim=lim,
         cells=cells,
         label=label,
         value=value,
         options=options,
         checked=checked,
     )
+
+
+# ── post-transcription normalization ─────────────────────────────────────────
+# Two deterministic passes that remove the model's per-run degrees of freedom
+# where the printed page already encodes the answer. Both are no-ops on input
+# that is already consistent.
+
+_DOTTED_LIM_RE = re.compile(r"^\d+(?:\.\d+)*\.?$")
+
+
+def anchor_heading_levels(blocks: list[Block]) -> None:
+    """Make dotted-numbered heading levels a pure function of the printed lim.
+
+    The model assigns ``level`` per window, so the same numbering scheme can
+    land at different depths in different windows/runs ("2.1" as level 2 here,
+    level 3 there) — and since build_tree derives ALL <sec> nesting from the
+    levels, that flips the tree. The printed enumerator is copied verbatim and
+    encodes depth exactly: the first dotted-numeric heading fixes the scheme's
+    base level, and every other dotted heading sits at base + (extra dotted
+    components). Headings without a dotted-numeric lim are untouched.
+    """
+    base: int | None = None
+    for b in blocks:
+        if b.structure != "heading" or not _DOTTED_LIM_RE.match(b.lim):
+            continue
+        depth = b.lim.rstrip(".").count(".")  # "2" -> 0, "2.1" -> 1, "6.4.1" -> 2
+        if base is None:
+            base = max(1, b.level - depth)
+        # Deliberately NOT capped at the prompt's 1-6 scale: an anchored level
+        # is exact, and capping would flatten sub-clauses deeper than 6 into
+        # siblings of their parents. 12 only bounds pathological lims.
+        b.level = min(12, base + depth)
+
+
+# Paragraph-initial enumerators that mark a list entry when they appear as a
+# sequential series: "(a) ...", "(i) ...", "(1) ...", "1) ...". Conservative on
+# purpose — bare "a." or "1." starts are too common in prose to convert.
+_ENUM_RES: list[tuple[str, re.Pattern[str]]] = [
+    ("alpha", re.compile(r"^\(([a-z])\)\s*")),
+    ("roman", re.compile(r"^\(([ivxlc]+)\)\s*")),
+    ("digit", re.compile(r"^\((\d+)\)\s*")),
+    ("digit", re.compile(r"^(\d+)\)\s*")),
+]
+_ROMAN_VAL = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100}
+
+
+def _enum_ordinal(family: str, marker: str) -> int:
+    if family == "alpha":
+        return ord(marker) - ord("a") + 1
+    if family == "digit":
+        return int(marker)
+    total = 0
+    for ch, nxt in zip(marker, marker[1:] + " ", strict=True):
+        v = _ROMAN_VAL[ch]
+        total += -v if nxt in _ROMAN_VAL and _ROMAN_VAL[nxt] > v else v
+    return total
+
+
+def normalize_enumerated_paragraphs(blocks: list[Block]) -> None:
+    """Turn sequential enumerated ``p`` runs into ``item`` blocks.
+
+    "(a) ...", "(b) ..." emitted as paragraphs in one run and as list items in
+    another is the single biggest structural flip between runs. A run of >= 2
+    CONSECUTIVE p blocks whose texts start with the same enumerator family in
+    strictly increasing sequence is unambiguous — convert each to an item and
+    lift the printed marker into ``lim``. Isolated markers (a lone "(a) ..."
+    paragraph, prose cross-references) never match the series requirement.
+    """
+    run: list[tuple[Block, str, str]] = []  # (block, stripped text, printed marker)
+    run_family, run_ordinal = "", 0
+
+    def flush() -> None:
+        if len(run) >= 2:
+            for blk, stripped, marker in run:
+                blk.structure = "item"
+                blk.lim = marker
+                blk.text = stripped
+        run.clear()
+
+    for b in blocks:
+        candidates = []
+        if b.structure == "p" and not b.lim:
+            for family, rx in _ENUM_RES:
+                m = rx.match(b.text)
+                if m:
+                    candidates.append((family, m.group(1), m.group(0)))
+        if not candidates:
+            flush()
+            continue
+        # "(i)" parses as alpha AND roman, "(c)" as alpha and roman-100: prefer
+        # whichever continues the current series; otherwise roman for "i" (the
+        # usual roman list opener), first match for everything else.
+        matched = next(
+            (
+                c
+                for c in candidates
+                if run and c[0] == run_family and _enum_ordinal(c[0], c[1]) == run_ordinal + 1
+            ),
+            None,
+        )
+        if matched is None:
+            matched = next(
+                (c for c in candidates if c[0] == "roman" and c[1] == "i"), candidates[0]
+            )
+        family, marker, prefix = matched
+        ordinal = _enum_ordinal(family, marker)
+        if run and not (family == run_family and ordinal == run_ordinal + 1):
+            flush()
+        run_family, run_ordinal = family, ordinal
+        run.append((b, b.text[len(prefix) :], prefix.strip()))
+    flush()
 
 
 # ── flat → tree ──────────────────────────────────────────────────────────────

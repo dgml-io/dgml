@@ -105,6 +105,14 @@ _OCR_PUNCT_FUZZY = str.maketrans(
         ";": ":",
         "\u2014": "-",  # em dash -> hyphen
         "\u2013": "-",  # en dash -> hyphen
+        # Minus/hyphen codepoint variants: a digital PDF's negative
+        # amount carries U+2212 while OCR (or another extractor) reads
+        # ASCII "-" for the same glyph; word identity must not hinge
+        # on which codepoint the source happened to use.
+        "\u2212": "-",  # minus sign -> hyphen
+        "\u2010": "-",  # hyphen -> hyphen-minus
+        "\u2011": "-",  # non-breaking hyphen -> hyphen-minus
+        "\uff0d": "-",  # fullwidth hyphen-minus -> hyphen-minus
         "\u2018": "'",  # left single quote -> straight
         "\u2019": "'",  # right single quote -> straight
         "\u201c": '"',  # left double quote -> straight
@@ -374,6 +382,93 @@ def find_spans(text: str, page_words: list[Word]) -> list[tuple[int, int]]:
                 spans.append((start, end + 1))
                 break
     return spans
+
+
+def _strip_boundary_punct(s: str, *, leading: bool, trailing: bool) -> str:
+    """Drop non-alphanumeric characters from the requested boundary of
+    an already-normalized string. Interior characters are untouched."""
+    start, end = 0, len(s)
+    if leading:
+        while start < end and not s[start].isalnum():
+            start += 1
+    if trailing:
+        while end > start and not s[end - 1].isalnum():
+            end -= 1
+    return s[start:end]
+
+
+def find_spans_lenient(text: str, page_words: list[Word]) -> list[tuple[int, int]]:
+    """Boundary-punctuation-lenient fallback for :func:`find_spans`.
+
+    Exact span search requires every normalized character to line up, so
+    two *boundary* artifacts defeat it even when the content words match
+    perfectly:
+
+    - the page glues punctuation onto the span's first word (an amount
+      typeset as ``($14.77`` tokenizes to ``($`` + digits — the run of
+      same-class characters stays one token), hiding the ``$`` the
+      target starts with;
+    - the target carries boundary punctuation the page simply doesn't
+      have (a ``$`` the generator added from column context, a
+      ``Label —`` separator the page renders as whitespace or a column
+      gap).
+
+    Both are boundary effects, so the leniency stays there: interior
+    punctuation must still match exactly, and letters/digits are never
+    trimmed — a changed digit still refuses, same as the exact search.
+    Target variants are tried strictest-first (untrimmed, then leading /
+    trailing / both boundaries trimmed) and the first variant yielding
+    any spans wins; within every variant the span's first page word may
+    shed leading punctuation ("($" matching as "$"). Callers should
+    treat the result exactly like :func:`find_spans` output — candidate
+    locations to be scored — but only consult this after both the exact
+    and fuzzy searches came back empty."""
+    target = fuzzy_norm(text)
+    if not target:
+        return []
+    variants = [target]
+    for leading, trailing in ((True, False), (False, True), (True, True)):
+        v = _strip_boundary_punct(target, leading=leading, trailing=trailing)
+        if v and v not in variants:
+            variants.append(v)
+    for tgt in variants:
+        spans: list[tuple[int, int]] = []
+        n = len(page_words)
+        for start in range(n):
+            w0 = page_words[start].text_norm
+            if not w0:
+                continue
+            # The first word may shed leading punctuation one char at a
+            # time — "($" participates as "$"; letters/digits stop the
+            # shedding so content is never silently dropped.
+            inits = [w0]
+            s = w0
+            while s and not s[0].isalnum():
+                s = s[1:]
+                if s and s not in inits:
+                    inits.append(s)
+            seen_end: set[int] = set()
+            for init in inits:
+                if not tgt.startswith(init):
+                    continue
+                if len(init) == len(tgt):
+                    if start + 1 not in seen_end:
+                        spans.append((start, start + 1))
+                        seen_end.add(start + 1)
+                    continue
+                acc = init
+                for end in range(start + 1, n):
+                    acc += page_words[end].text_norm
+                    if not tgt.startswith(acc):
+                        break
+                    if len(acc) == len(tgt):
+                        if end + 1 not in seen_end:
+                            spans.append((start, end + 1))
+                            seen_end.add(end + 1)
+                        break
+        if spans:
+            return spans
+    return []
 
 
 def span_overlaps_any(

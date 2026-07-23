@@ -1,5 +1,4 @@
 {
-  "encoder_text": {"name": "dummy", "model_id": "dummy", "embedding_dim": 1},
   "encoder_image": {
     "name": "qwen3_vl_embedding",
     "model_id": "Qwen/Qwen3-VL-Embedding-8B",

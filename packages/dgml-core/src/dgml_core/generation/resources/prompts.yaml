@@ -25,7 +25,10 @@
   2. `lim` holds the PRINTED enumerator exactly as shown ("2.13", "(a)",
      "ITEM 3", "•"). Empty when nothing is printed.
   3. Heading levels reflect the document's own hierarchy (a clause heading
-     under a part heading gets a higher level number).
+     under a part heading gets a higher level number). When headings carry
+     printed numbers, deeper numbering means a deeper level, consistently:
+     if "2" is level 2 then "2.1" is level 3 and "2.1.1" level 4; lettered or
+     roman sub-headings sit one level below the heading that contains them.
   4. Exclude only repeated page decorations (page numbers, running headers).
   5. A checkbox/radio group is ONE field block: `options` lists the printed
      choice labels in reading order; `checked` lists the labels whose box
@@ -37,6 +40,14 @@
   6. Output JSON only: {"continues": "...", "blocks": [...]}.
      `continues` holds text that finishes the PREVIOUS window's final block
      when your first page starts mid-sentence; otherwise "".
+  6. A paragraph that begins with a printed enumerator and has at least one
+     sibling in the same series ("(a) …" followed by "(b) …"; "(i) …" then
+     "(ii) …") is one `item` per entry — never a `p`.
+  7. `field` is only for label/value lines whose value is short data (a name,
+     date, amount, address — a few words). A numbered clause whose body is
+     full sentences is a `heading` plus `p` block(s), never a `field`.
+  8. `row` is only for genuinely tabular content (ruled or visibly aligned
+     columns). A two-column running list without column meaning is `item`s.
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
 "transcribe_window_tail": |-
@@ -45,6 +56,12 @@
   If your first page begins mid-sentence, put the completing text in "continues" and do NOT repeat anything inside <TAIL>.
 "transcribe_window_json": |-
   Return JSON only: {"continues": "...", "blocks": [...]}.
+"transcribe_window_retry": |-
+  IMPORTANT: your previous attempt transcribed only about {pct}% of the words
+  on pages {first}-{last} — it skipped most of their content. Do not resume
+  from where a previous section seemed to end: transcribe ALL content of ALL
+  pages {first}-{last}, in reading order, starting from the top of page {first},
+  without skipping any page or clause.
 "label_system": |
   You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
   belong to one document set; your single most important job is to use the
@@ -133,12 +150,17 @@
   - If a block is only a short label followed by its value (a "label: value"
     line), the value carries the concept and the block stays unlabeled — tag the
     value, not the whole line.
+  - An entity "quote" is always the VALUE text itself, never its caption or
+    label: in "Effective Date: March 1, 2022" the quote is "March 1, 2022" —
+    never "Effective Date". A caption with no value on the block gets no entity.
   - Distinct value kinds in one block always get distinct concepts (a date is
     never the same concept as an amount, a name never the same as an address).
 
   Output JSON only:
   {"labels": {"<block_id>": {"concept": "...",
-    "entities": [{"quote": "<exact substring>", "concept": "..."}]}}}
+    "entities": [{"quote": "<exact substring>", "concept": "...",
+      "occurrence": <1-based; include ONLY when the same value string repeats
+      in the block, to pick which instance — omit otherwise>}]}}}
   Every key must be a block id from the input. Label densely per the rules
   above; omit only connective prose.
 "plan_system": |
@@ -183,6 +205,8 @@
   {"concepts": {"<concept>": "<one-line role description>", ...}}
 "roster_intro": |-
   CONCEPTS ALREADY IN USE in this document set — reuse these names verbatim where the role matches:
+"roster_planned_intro": |-
+  PLANNED CONCEPTS for this document set — proposed from the documents' shared structure, not yet observed; reuse one when its role matches rather than coining a new name:
 "section_retry": |-
   These section headings were left unlabeled. Give each a concept naming its section's role:
 "describe_concepts": |

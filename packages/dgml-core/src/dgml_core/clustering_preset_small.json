@@ -1,6 +1,5 @@
 {
   "encoder_text": {"name": "tfidf", "model_id": "tfidf", "embedding_dim": 256, "extra": {"text_view": "page1"}},
-  "encoder_image": {"name": "dummy", "model_id": "dummy", "embedding_dim": 1},
   "fusion": {"name": "none", "prefer_modality": "text"},
   "manifold": {"name": "euclidean", "dim": 256},
   "corpus": {"root": "."},

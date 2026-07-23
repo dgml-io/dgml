@@ -262,6 +262,142 @@ def json_schema_to_vocabulary(schema: dict[str, Any], *, namespace_uri: str) -> 
     return Vocabulary(namespace_uri=namespace_uri, roots=roots)
 
 
+# ── Typed field tree → Vocabulary ────────────────────────────────────────────
+#
+# The schema-generation LLM submits a *typed field tree* — a recursive list of
+# ``{name, kind, datatype?, description?, example?, prompt?, fields?, item?}``
+# nodes — which maps one-to-one onto :class:`Tag`. This is the direct path from
+# an LLM proposal to the at-rest RNC (:func:`field_tree_to_rnc`): the model
+# picks a datatype per leaf, so the vocabulary carries ``value_type`` natively
+# and :func:`vocabulary_to_rnc` emits ``xsd:`` typed leaves — no grounded_field
+# JSON Schema in between.
+
+# XSD datatypes a leaf may declare. ``text`` (or an omitted datatype) is the
+# untyped default. The rest all round-trip through the extraction serializer's
+# value normalization (``dgml_core.extraction_xml._typed_value``): ``integer``
+# and ``decimal`` get numeric cleanup, the others keep their declared type with
+# the value detector's normalized ``dg:value``.
+FIELD_DATATYPES: frozenset[str] = frozenset(
+    {"date", "dateTime", "decimal", "integer", "boolean", "gYear", "time", "anyURI"}
+)
+_TEXT_DATATYPES: frozenset[str] = frozenset({"text", "string", ""})
+
+
+def _normalize_datatype(raw: Any, *, tag_name: str) -> str | None:
+    """Map a node's ``datatype`` to a :class:`Tag` ``value_type`` (``None`` = text)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise SchemaInvalid(f"field '{tag_name}' has a non-string datatype {raw!r}")
+    dt = raw.strip()
+    if dt.startswith("xsd:"):
+        dt = dt[4:]
+    if dt in _TEXT_DATATYPES:
+        return None
+    if dt in FIELD_DATATYPES:
+        return dt
+    raise SchemaInvalid(
+        f"field '{tag_name}' has unsupported datatype {raw!r}; "
+        f"use 'text' or one of {sorted(FIELD_DATATYPES)}"
+    )
+
+
+def _field_node_to_tag(node: Any) -> Tag:
+    if not isinstance(node, dict):
+        raise SchemaInvalid(f"schema node must be an object, got {type(node).__name__}")
+    raw_name = node.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise SchemaInvalid(f"schema node is missing a non-empty 'name': {node!r}")
+    name = _pascal_case(raw_name) or "Field"
+
+    kind = node.get("kind", "field")
+    if not isinstance(kind, str):
+        raise SchemaInvalid(f"node '{name}' has a non-string 'kind'")
+    kind = kind.strip().lower()
+
+    description = node.get("description")
+    example = node.get("example")
+    prompt = node.get("prompt")
+
+    if kind == "field":
+        return Tag(
+            name=name,
+            kind="field",
+            description=description,
+            example=example,
+            prompt=prompt,
+            value_type=_normalize_datatype(node.get("datatype"), tag_name=name),
+        )
+
+    if kind == "container":
+        return Tag(
+            name=name,
+            kind="container",
+            description=description,
+            example=example,
+            prompt=prompt,
+            children=_field_nodes_to_tags(node.get("fields"), context=name),
+        )
+
+    if kind == "collection":
+        # The repeated item is either given explicitly as ``item`` (a node) or
+        # implied by the collection's own ``fields`` (the item's fields).
+        raw_item = node.get("item")
+        if isinstance(raw_item, dict):
+            item_tag = _field_node_to_tag(raw_item)
+            if item_tag.kind == "field":
+                # A list of bare typed values: keep the item as a leaf field.
+                children: list[Tag] = []
+            else:
+                children = item_tag.children
+        else:
+            item_name = _singularize(name)
+            children = _field_nodes_to_tags(node.get("fields"), context=name)
+            item_tag = Tag(name=item_name, kind="container", children=children)
+        return Tag(
+            name=name,
+            kind="collection",
+            description=description,
+            example=example,
+            prompt=prompt,
+            children=children,
+            item_name=item_tag.name,
+            item=item_tag,
+        )
+
+    raise SchemaInvalid(
+        f"node '{name}' has unknown kind {kind!r}; use 'field', 'container', or 'collection'"
+    )
+
+
+def _field_nodes_to_tags(nodes: Any, *, context: str) -> list[Tag]:
+    if nodes is None:
+        return []
+    if not isinstance(nodes, list):
+        raise SchemaInvalid(f"'{context}' fields must be a list of nodes")
+    tags: list[Tag] = []
+    seen: set[str] = set()
+    for node in nodes:
+        tag = _field_node_to_tag(node)
+        if tag.name in seen:
+            raise SchemaInvalid(f"duplicate tag name '{tag.name}' under '{context}'")
+        seen.add(tag.name)
+        tags.append(tag)
+    return tags
+
+
+def field_tree_to_vocabulary(fields: Any, *, namespace_uri: str) -> Vocabulary:
+    """Build a :class:`Vocabulary` from an LLM-submitted typed field tree.
+
+    *fields* is the list of top-level nodes (see the module comment above).
+    Raises :class:`SchemaInvalid` for a malformed tree.
+    """
+    roots = _field_nodes_to_tags(fields, context="<root>")
+    if not roots:
+        raise SchemaInvalid("field tree is empty — nothing to extract")
+    return Vocabulary(namespace_uri=namespace_uri, roots=roots)
+
+
 # ── Vocabulary → JSON Schema ─────────────────────────────────────────────────
 
 
@@ -723,6 +859,21 @@ def json_schema_to_rnc(schema: dict[str, Any], *, workspace: str, docset_name: s
     """
     namespace_uri = f"http://dgml.io/{org_ns_segment(workspace)}/{docset_slug(docset_name)}"
     vocab = json_schema_to_vocabulary(schema, namespace_uri=namespace_uri)
+    return vocabulary_to_rnc(vocab)
+
+
+def field_tree_to_rnc(fields: Any, *, workspace: str, docset_name: str) -> str:
+    """Render an LLM-submitted typed field tree straight to the at-rest RNC form.
+
+    This is the schema-generation path: the model proposes a typed field tree
+    (each leaf carrying a datatype), which maps directly onto the vocabulary and
+    its RNC serialization — no grounded_field JSON Schema in between. The docset
+    namespace is built from *workspace* and *docset_name* exactly as
+    :func:`json_schema_to_rnc` does, so extraction and generated docsets share
+    one namespace.
+    """
+    namespace_uri = f"http://dgml.io/{org_ns_segment(workspace)}/{docset_slug(docset_name)}"
+    vocab = field_tree_to_vocabulary(fields, namespace_uri=namespace_uri)
     return vocabulary_to_rnc(vocab)
 
 

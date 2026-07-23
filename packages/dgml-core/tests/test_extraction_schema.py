@@ -15,6 +15,8 @@ from __future__ import annotations
 import pytest
 from dgml_core.errors import SchemaInvalid
 from dgml_core.extraction_schema import (
+    field_tree_to_rnc,
+    field_tree_to_vocabulary,
     json_schema_to_rnc,
     parse_rnc,
     rnc_to_json_schema,
@@ -263,3 +265,117 @@ def test_collection_of_text_leaves() -> None:
     assert lo["type"] == "array"
     assert lo["items"]["anyOf"][0]["$ref"] == "#/definitions/grounded_field"
     assert lo["items"]["anyOf"][1]["$ref"] == "#/definitions/computed_field"
+
+
+# ── Typed field tree → RNC (the schema-generation path) ──────────────────────
+
+# What the schema-generation LLM submits: a typed field tree with a datatype on
+# every leaf, containers, and a collection (both the explicit-`item` form and
+# the implicit-`fields` form).
+_FIELD_TREE = [
+    {"name": "vendor_name", "kind": "field", "datatype": "text"},
+    {
+        "name": "due_date",
+        "kind": "field",
+        "datatype": "date",
+        "description": "When payment is due",
+    },
+    {
+        "name": "bill_summary",
+        "kind": "container",
+        "fields": [
+            {"name": "total_amount_due", "kind": "field", "datatype": "decimal"},
+            {"name": "invoice_count", "kind": "field", "datatype": "integer"},
+        ],
+    },
+    {
+        "name": "line_items",
+        "kind": "collection",
+        "item": {
+            "name": "line_item",
+            "kind": "container",
+            "fields": [
+                {"name": "product_name", "kind": "field", "datatype": "text"},
+                {"name": "unit_price", "kind": "field", "datatype": "decimal"},
+            ],
+        },
+    },
+]
+
+
+def test_field_tree_to_rnc_carries_datatypes() -> None:
+    rnc = field_tree_to_rnc(_FIELD_TREE, workspace="acme-corp", docset_name="Master Services")
+    # Same namespace convention as the JSON-schema path.
+    assert 'namespace docset = "http://dgml.io/acme-corp/MasterServices"' in rnc
+    # Datatypes land as xsd: typed leaves; untyped stays `text`.
+    assert "element docset:DueDate {\n    xsd:date" in rnc
+    assert "element docset:TotalAmountDue {\n    xsd:decimal" in rnc
+    assert "element docset:InvoiceCount {\n    xsd:integer" in rnc
+    assert "element docset:VendorName {\n    text" in rnc
+    # Container + collection expand as usual.
+    assert "element docset:LineItem {" in rnc
+    assert "LineItem*" in rnc
+    # Doc comment preserved.
+    assert "## When payment is due" in rnc
+
+
+def test_field_tree_to_rnc_round_trips() -> None:
+    rnc = field_tree_to_rnc(_FIELD_TREE, workspace="ws", docset_name="d")
+    # Parses as valid RNC and re-serializes identically, and the datatypes
+    # survive the round-trip on the parsed vocabulary.
+    vocab = parse_rnc(rnc)
+    assert vocabulary_to_rnc(vocab) == rnc
+    by_name = {t.name: t for t in vocab.roots}
+    assert by_name["DueDate"].value_type == "date"
+    assert by_name["VendorName"].value_type is None
+    assert [t.name for t in vocab.roots] == [
+        "VendorName",
+        "DueDate",
+        "BillSummary",
+        "LineItems",
+    ]
+
+
+def test_field_tree_collection_implicit_fields() -> None:
+    """A collection may carry the item's fields directly (no explicit `item`);
+    the singular item element is synthesized."""
+    tree = [
+        {
+            "name": "readings",
+            "kind": "collection",
+            "fields": [{"name": "value", "kind": "field", "datatype": "integer"}],
+        }
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+    assert "Reading*" in rnc
+    assert "element docset:Reading {" in rnc
+    assert "element docset:Value {\n    xsd:integer" in rnc
+
+
+def test_field_tree_bad_datatype_rejected() -> None:
+    tree = [{"name": "x", "kind": "field", "datatype": "money"}]
+    with pytest.raises(SchemaInvalid):
+        field_tree_to_vocabulary(tree, namespace_uri="urn:x")
+
+
+def test_field_tree_unknown_kind_rejected() -> None:
+    tree = [{"name": "x", "kind": "widget"}]
+    with pytest.raises(SchemaInvalid):
+        field_tree_to_vocabulary(tree, namespace_uri="urn:x")
+
+
+def test_field_tree_missing_name_rejected() -> None:
+    with pytest.raises(SchemaInvalid):
+        field_tree_to_vocabulary([{"kind": "field"}], namespace_uri="urn:x")
+
+
+def test_field_tree_empty_rejected() -> None:
+    with pytest.raises(SchemaInvalid):
+        field_tree_to_vocabulary([], namespace_uri="urn:x")
+
+
+def test_field_tree_xsd_prefixed_datatype_accepted() -> None:
+    """The model may write `xsd:date` or bare `date`; both normalize."""
+    tree = [{"name": "d", "kind": "field", "datatype": "xsd:date"}]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+    assert "element docset:D {\n    xsd:date" in rnc

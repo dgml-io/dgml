@@ -21,61 +21,68 @@ merge_system_prompt: |
   Output: each final token must set `ref` to an input token id (it inherits that token's position on the page). Set `t` only when the correct text differs from that referenced token's own text (e.g. de-ligaturing, or recombining split pieces); omit `t` to use the referenced token's text unchanged. Emit tokens in natural reading order. Return only a JSON object mapping each region id to its list of output tokens, e.g. {"r0": [{"ref": "d0", "t": "file"}], "r1": [{"ref": "o3"}, {"ref": "o4"}]}.
 
 # ── Grounded extraction: schema generation ────────────────────────────────────
-# System + user prompts for proposing a grounded_field JSON Schema from sample
-# PDFs (dgml_core.grounded.generate_schema). `extraction_schema_user_intro_multi`
-# is .format()'d with {n_files}; the *_body and *_system are used verbatim (they
+# System + user prompts for proposing a typed field tree from sample PDFs
+# (dgml_core.grounded.generate_schema). The tree is rendered straight to the
+# at-rest RELAX NG Compact schema. `extraction_schema_user_intro_multi` is
+# .format()'d with {n_files}; the *_body and *_system are used verbatim (they
 # contain literal braces, so must NOT be passed through str.format).
 extraction_schema_system: |-
-  You design JSON Schema documents that drive grounded extraction from
-  PDFs. Your output describes what to pull out of a document of this kind
-  so that every extracted value can be traced back to one or more regions
-  of the source page (the "grounded_field" convention).
+  You design extraction schemas for business documents. Your output is a
+  typed field tree that describes what to pull out of a document of this
+  kind, with the right data type on every value, so that each extracted
+  value can be traced back to one or more regions of the source page.
 
 extraction_schema_user_intro_single: |-
-  Given the attached PDF, propose a JSON Schema (draft-07) that captures the structured information someone would want to extract from this document and from others of the same kind.
+  Given the attached PDF, propose an extraction schema that captures the structured information someone would want to extract from this document and from others of the same kind.
 
 extraction_schema_user_intro_multi: |-
-  Given the {n_files} attached PDFs (all of the same kind), propose a JSON Schema (draft-07) that captures the structured information someone would want to extract from documents of this kind. The schema you return must fit ALL of the attached files — favor what generalizes across instances over fields that only appear in one.
+  Given the {n_files} attached PDFs (all of the same kind), propose an extraction schema that captures the structured information someone would want to extract from documents of this kind. The schema you return must fit ALL of the attached files — favor what generalizes across instances over fields that only appear in one.
 
 extraction_schema_user_body: |-
-  Schema rules — non-negotiable:
+  Return the schema by calling ``submit_schema`` with ``fields`` — the list
+  of top-level field nodes. Each node is an object:
 
-  1. The top level is a JSON object (a JSON Schema document).
-  2. Define a reusable ``grounded_field`` in ``definitions``:
-     {
-       "type": "object",
-       "properties": {
-         "text": {"type": "string"},
-         "locations": {
-           "type": "array",
-           "minItems": 1,
-           "items": {
-             "type": "object",
-             "properties": {
-               "page_number": {"type": "integer", "minimum": 1},
-               "bounding_box": {
-                 "type": "array",
-                 "items": {"type": "integer", "minimum": 0},
-                 "minItems": 4,
-                 "maxItems": 4,
-                 "description": "[left, top, right, bottom] in image pixels, top-left origin."
-               }
-             },
-             "required": ["page_number", "bounding_box"]
-           }
-         }
-       },
-       "required": ["text", "locations"]
-     }
-  3. EVERY leaf value in the schema MUST be ``{"$ref": "#/definitions/grounded_field"}``.
-     Do not introduce raw ``string`` / ``number`` leaves. Use the ref so
-     every extracted value carries grounding.
-  4. Repeated entities (line items, list bullets, courses, etc.) become arrays of objects.
-  5. Keep the schema focused on what someone would actually extract. Skip
+    {
+      "name": "DueDate",          // required; becomes the tag name
+      "kind": "field",            // "field" | "container" | "collection"
+      "datatype": "date",         // fields only (see the datatype list)
+      "description": "...",        // optional, short
+      "example": "...",            // optional, a real value seen in a document
+      "prompt": "...",             // optional: where to find / how to derive it
+      "fields": [ ... ],           // container: its child nodes
+      "item": { ... }              // collection: the repeated item node
+    }
+
+  kind:
+  - "field"      — a single grounded value (a leaf). Give it a ``datatype``.
+  - "container"  — groups related child fields; put them in ``fields``.
+  - "collection" — a repeated entity (line items, meter reads, bullets).
+                   Describe ONE occurrence via ``item`` (usually a container),
+                   or list the item's fields directly in ``fields``.
+
+  datatype — pick the most specific one that fits the value:
+  - "text"     — names, addresses, ids, phone numbers, free text, and
+                 anything numeric-looking you must NOT normalize (account
+                 numbers, meter serials, and ranges like a billing period).
+  - "date"     — a calendar date (a due date, a reading date).
+  - "dateTime" — a date with a time of day.
+  - "decimal"  — money and measured quantities ($1,234.50, 812.6 kWh).
+  - "integer"  — whole counts.
+  - "boolean"  — yes/no, true/false.
+  - "gYear"    — a bare year.
+  - "time"     — a clock time on its own.
+  - "anyURI"   — a URL or email.
+  Omitting ``datatype`` (or "text") means an untyped text value.
+
+  Rules:
+  1. Choose a real datatype wherever the value is a date, amount, count, or
+     other typed quantity — do not fall back to "text" for those.
+  2. Repeated entities become a "collection", never a numbered set of
+     near-duplicate fields.
+  3. Keep the schema focused on what someone would actually extract. Skip
      chrome (page numbers, headers/footers) unless it carries meaning.
 
-  When you have your schema, call ``submit_schema`` with it. That tool
-  call IS the answer — do not also reply with prose.
+  That ``submit_schema`` call IS the answer — do not also reply with prose.
 
 # ── Grounded extraction: value extraction, phase 1 (values + page numbers) ────
 # System prompt is used verbatim (contains literal braces); the user prompt is
@@ -231,3 +238,34 @@ extraction_values_phase3_user: |-
 
   NEEDS_LOCATING (return exactly these ids):
   {needs_locating}
+
+# ── LLM clustering: small-corpus vision partitioner ──────────────────────────
+# Fixed prompt pieces for dgml_core.llm_clustering._build_grouping_prompt, which
+# asks the vision model to partition a small corpus into DocSets in one call.
+# The Python side interpolates the doc count/labels and any existing DocSets
+# between these pieces and joins them with blank lines. `..._doc_manifest` is
+# .format()'d with {count}/{labels} and `..._instructions` with {tool}; none of
+# these contain literal braces, so str.format is safe. The other two are
+# used verbatim.
+cluster_grouping_intro: |-
+  You are clustering a small corpus of documents into DocSets.
+
+  A DocSet groups documents of the **same document type** — documents that could plausibly share a single extraction schema. Two documents belong in the same group if, and only if, the same set of structured questions ("what is X?", "when did Y happen?") could be answered from each of them. Topical similarity is NOT enough: a property tax bill and a tax-abatement agreement both concern property taxes but answer different questions, so they belong in **different** groups. Use the document type, not the topic.
+
+cluster_grouping_doc_manifest: |-
+  There are {count} documents: {labels}. Each document's rendered first pages are attached below, immediately after a line naming it (e.g. "=== Document doc_1 ===").
+
+cluster_grouping_existing_intro: |-
+  Some DocSets already exist. If a group of documents matches one of these existing DocSets (they answer the same key questions), assign that group to it by setting `existing_docset_id`:
+
+cluster_grouping_instructions: |-
+  Call `{tool}` exactly once with a `groups` array that partitions ALL of the documents above. Every document label must appear in exactly one group's `members`; do not omit any and do not repeat any.
+
+  For each group, either:
+    - set `existing_docset_id` to the id of the existing DocSet it matches (only when one genuinely fits), OR
+    - describe a new document type with:
+      - `name`: a short, document-type-specific name (2-5 words; prefer the document's own type, e.g. "Property Tax Bill" or "PILOT Agreement", not a topical bucket like "Property Tax Records"),
+      - `description`: a one-sentence description of what kind of document this group holds, and
+      - `key_questions`: 3-7 concrete, type-discriminating questions answerable from the first pages of this kind of document.
+
+  Group by the underlying document type, not by surface appearance. Two documents belong in the SAME group whenever the same core questions could be answered from each — even if they differ in layout, length, section order, formatting, issuer, or which optional sections are present. Those are variations of one type, not separate types. Create a separate group only when a document answers a genuinely different set of questions (a different extraction schema). When two documents are borderline, put them TOGETHER. Prefer fewer, larger groups; do not split a type into sub-variants.

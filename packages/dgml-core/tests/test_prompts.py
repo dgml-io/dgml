@@ -63,5 +63,8 @@ def test_templated_prompts_accept_their_placeholders() -> None:
 def test_verbatim_prompts_keep_literal_braces() -> None:
     """The schema body and phase-1 system prompt carry literal JSON braces and
     are used without str.format — the braces must survive intact."""
-    assert '{"$ref": "#/definitions/grounded_field"}' in get("extraction_schema_user_body")
+    # The field-tree node example in the schema body carries literal braces.
+    body = get("extraction_schema_user_body")
+    assert '"name": "DueDate"' in body
+    assert '"kind": "field"' in body
     assert '"kind": "table"' in get("extraction_values_phase1_system")

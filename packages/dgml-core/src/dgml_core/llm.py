@@ -31,9 +31,8 @@ consistent:
   calls inside it into a single row for multi-call operations. All recording is
   gated on ``--debug``.
 
-Originally lived under :mod:`dgml.generation`; promoted to the
-top-level :mod:`dgml.llm` so the four non-generation sites can share
-it.
+Lives at the package root (:mod:`dgml_core.llm`) so generation and the
+non-generation call sites share one implementation.
 """
 
 from __future__ import annotations
@@ -79,6 +78,25 @@ PDF_NATIVE_MODEL_PATTERNS = [
 ]
 
 ANTHROPIC_MODEL_PATTERNS = [r"claude", r"anthropic"]
+
+
+def is_model_reachability_error(exc: BaseException) -> bool:
+    """True when *exc* means the model could not be reached or used at all.
+
+    Auth failure, bad model id, connection error — a config problem worth
+    surfacing — as opposed to a call that *succeeded* but returned unusable or
+    empty content (a soft outcome we don't flag). LiteLLM's documented contract
+    is that every provider-side failure it raises (authentication, bad-request,
+    not-found, connection, rate limit, timeout) is an OpenAI-SDK exception, all
+    of which derive from ``openai.APIError``. (Note ``litellm.exceptions.APIError``
+    is litellm's *own* subclass and is NOT a base of the concrete errors, so it
+    can't be used here.) A ``ValueError`` / ``JSONDecodeError`` from parsing a
+    *successful* response is not an ``openai.APIError``, so a garbage-but-returned
+    payload stays soft.
+    """
+    import openai  # transitive via litellm; its exception classes ARE litellm's
+
+    return isinstance(exc, openai.APIError)
 
 
 def is_anthropic_model(model: str) -> bool:
