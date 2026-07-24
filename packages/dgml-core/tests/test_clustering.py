@@ -536,3 +536,36 @@ def test_resolve_overrides_path(workspace: Workspace, tmp_path: Path) -> None:
     assert resolve_clustering_overrides(workspace, config=str(cfg)) == {
         "scenario": {"leiden_k_neighbors": 9}
     }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"), [({}, 1), ({"scenario": {"pooling_pages": 4}}, 4)]
+)
+def test_clustering_internal_threads_pooling_pages_to_dataset(
+    workspace: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, Any],
+    expected: int,
+) -> None:
+    """`scenario.pooling_pages` must reach WorkspaceFileDataset(max_pages=) — the wiring
+    that makes multi-page pooling actually take effect through the production path."""
+    _seed_file(workspace, "f1")
+    _seed_page_image(workspace, "f1")
+    captured: dict[str, int | None] = {}
+
+    def _spy(*args: Any, **kwargs: Any) -> WorkspaceFileDataset:
+        captured["max_pages"] = kwargs.get("max_pages")
+        return WorkspaceFileDataset(*args, **kwargs)
+
+    monkeypatch.setattr("dgml_core.clustering.WorkspaceFileDataset", _spy)
+    monkeypatch.setattr(
+        "dgml_core.clustering.resolve_clustering_overrides",
+        lambda workspace, config=None: overrides,
+    )
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"f1": _dp("unknown_0")},
+    ):
+        clustering_internal(workspace)
+
+    assert captured["max_pages"] == expected

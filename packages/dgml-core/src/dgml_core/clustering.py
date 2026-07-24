@@ -598,7 +598,12 @@ def clustering_internal(
     # assembles record.text under that same view.
     text_view, overrides = resolve_text_settings(workspace.files_dir, overrides)
 
-    dataset = WorkspaceFileDataset(workspace, usable, text_view=text_view)
+    # Load enough page renders for the scenario's image pooling. ``pooling_pages``
+    # defaults to 1 (page-1 only), so this is a no-op unless the caller opted in;
+    # threading it here is what makes the knob actually take effect end-to-end.
+    pooling_pages = int((overrides.get("scenario") or {}).get("pooling_pages") or 1)
+
+    dataset = WorkspaceFileDataset(workspace, usable, text_view=text_view, max_pages=pooling_pages)
 
     # Build a labeled support set from existing DocSet members: for the
     # incremental path, reconstruct each category's prototype from *all*
@@ -623,7 +628,11 @@ def clustering_internal(
 
     if support_file_ids:
         support_dataset = WorkspaceFileDataset(
-            workspace, support_file_ids, labels=support_labels, text_view=text_view
+            workspace,
+            support_file_ids,
+            labels=support_labels,
+            text_view=text_view,
+            max_pages=pooling_pages,
         )
         detailed = run_clustering_detailed(
             dataset,

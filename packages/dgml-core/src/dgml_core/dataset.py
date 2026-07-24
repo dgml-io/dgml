@@ -57,11 +57,16 @@ class WorkspaceFileDataset(DocumentDataset):
         labels: dict[str, str] | None = None,
         *,
         text_view: str = "full",
+        max_pages: int = 1,
     ) -> None:
         self.workspace = workspace
         self.file_ids = list(file_ids)
         self.labels = dict(labels) if labels else None
         self.text_view = text_view
+        # How many leading page renders to load into ``page_images`` for optional
+        # multi-page pooling. ``1`` (default) loads only page 1 — no extra I/O and
+        # identical to prior behaviour. Set to match ``scenario.pooling_pages``.
+        self.max_pages = max(1, max_pages)
 
     def __len__(self) -> int:
         return len(self.file_ids)
@@ -76,12 +81,13 @@ class WorkspaceFileDataset(DocumentDataset):
         pages = sorted(self.workspace.file_pages_dir(file_id).glob(PAGE_GLOB))
         if not pages:
             raise FileNotFoundError(f"no rendered page images for file '{file_id}'")
-        image = Image.open(pages[0]).convert("RGB")
+        page_images = tuple(Image.open(p).convert("RGB") for p in pages[: self.max_pages])
         text = _build_text(self.workspace.file_dir(file_id), view=self.text_view)
         return DocumentRecord(
             doc_id=file_id,
             label=self.labels.get(file_id) if self.labels else None,
-            image=image,
+            image=page_images[0],
             text=text,
             thumbnail_path=None,
+            page_images=page_images,
         )

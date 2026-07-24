@@ -160,6 +160,15 @@ class ScenarioConfig(_StrictModel):
     k_clusters: int | None = None
     n_shots: int | None = None
     known_categories: list[str] | None = None
+    # ── Multi-page image pooling ──────────────────────────────────────────
+    pooling_pages: int = 1
+    """How many leading page renders to mean-pool on the image side. ``1``
+    (default) = today's behaviour: page 1 only. ``>1`` embeds the first N pages
+    and averages them, which helps corpora whose first page is an ambiguous
+    cover (measured +0.10 S5 accuracy on discovery2's multi-page contracts at
+    N=4) but *hurts* form-like corpora whose page 1 is the discriminative header
+    (claudio -0.14) — so it is opt-in and defaults off. Text is unaffected (it
+    already concatenates every page)."""
     # ── Unknown-bucket gating (S2 / S3) ───────────────────────────────────
     # All three thresholds compose: a document is routed to the "unknown"
     # bucket iff ANY active threshold says so. Leave them all ``None`` to
@@ -324,6 +333,12 @@ class ScenarioConfig(_StrictModel):
         "umap",
     ] = "none"
     reduce_dim: int = 0
+
+    @model_validator(mode="after")
+    def _check_pooling_pages(self) -> ScenarioConfig:
+        if self.pooling_pages < 1:
+            raise ValueError(f"pooling_pages must be >= 1; got {self.pooling_pages}.")
+        return self
 
 
 # ── Corpus ────────────────────────────────────────────────────────────────
