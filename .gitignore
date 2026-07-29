@@ -150,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+docugami.env
 .venv
 env/
 venv/
