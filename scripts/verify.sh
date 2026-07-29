@@ -44,6 +44,10 @@ fi
 
 run uv run ruff check .
 run uv run ruff format --check .
+# Cheap enough to run unconditionally, including under --fast: the two agent
+# skill mirrors are hand-kept copies, and a stale one teaches a CLI surface that
+# no longer exists. `--fix` on the same script resyncs them.
+run scripts/check-agent-skills.sh
 run uv run mypy packages
 
 if [[ $fast -eq 0 ]]; then

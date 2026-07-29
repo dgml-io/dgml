@@ -20,7 +20,7 @@ codes are part of `dgml`'s API. Schema changes are breaking.
 1. [src/dgml/cli.py](src/dgml/cli.py) — implementation
 2. [tests/test_cli.py](tests/test_cli.py) — locks the JSON shape; update assertions for the new payload
 3. [../../docs/cli-reference.md](../../docs/cli-reference.md) — human and agent reference
-4. [../../.claude/skills/dgml/SKILL.md](../../.claude/skills/dgml/SKILL.md) — Claude skill that teaches agents *when* and *how* to invoke the CLI
+4. [../../.claude/skills/dgml/SKILL.md](../../.claude/skills/dgml/SKILL.md) — the agent skill that teaches agents *when* and *how* to invoke the CLI. This is the **canonical** copy; [../../.gemini/skills/dgml/SKILL.md](../../.gemini/skills/dgml/SKILL.md) is a byte-identical mirror. Edit the `.claude` one, then run `scripts/check-agent-skills.sh --fix` and commit both — `verify.sh` and CI fail if they drift
 5. [../../get-started/get-started.md](../../get-started/get-started.md) — the end-to-end tutorial; update any command invocation the change touches (e.g. new required flags, renamed args, changed setup steps) so a reader following it top-to-bottom doesn't hit a broken command
 
 Also grep the rest of `docs/` for the affected command — reference pages like [../../docs/storage-layout.md](../../docs/storage-layout.md) may show the same invocation or its on-disk output.
@@ -38,7 +38,7 @@ For SKILL.md specifically: update the relevant workflow example, not just a refe
 
 ### Downstream CLI consumers
 
-The four files above are the in-package contract. Some sample tools also
+The five files above are the in-package contract. Some sample tools also
 **shell out to the `dgml` CLI** and parse its output, so a surface change can
 break them even though they live outside this package. When you change
 command syntax, flags, payload shapes, or stdout/stderr behavior, grep the
