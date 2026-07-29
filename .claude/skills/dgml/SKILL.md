@@ -300,14 +300,36 @@ examples, kinds, hierarchy — confirms the vocabulary the rest of the batch
 labels against. There is no separate transform pass. The pipeline is part of
 the base `dgml` install and reuses the workspace's pre-rendered `page_images/`.
 
-**Choose the models — config only, no flags.** The models are not CLI flags:
-`generate` reads them solely from the `generation` section of
+**Choose the models — config by default, overridable per run.** By default
+`generate` reads its models solely from the `generation` section of
 `<workspace>/config.toml`, so each is one explicit, visible choice per
-workspace (matching every other model-consuming command). Both are **required**:
-`model` (per-page transcription) and `label_model` (the
-single batch-wide labeling call — a stronger model here is cheap). Without a
-`generation` section, `generate` fails with `GENERATION_CONFIG_MISSING`. See
-the `generation` config in [storage-layout.md](../../../docs/storage-layout.md).
+workspace. Both are **required**: `model` (per-page transcription) and
+`label_model` (the single batch-wide labeling call — a stronger model here is
+cheap). Without a `generation` section, an un-overridden `generate` fails with
+`GENERATION_CONFIG_MISSING`. See the `generation` config in
+[storage-layout.md](../../../docs/storage-layout.md).
+
+To run against an explicit model config **without editing `config.json`** (e.g.
+a cheap smoke-test run, or an A/B), use the override flags — they mirror `dgml
+cluster --config`. Precedence: `--model`/`--label-model` > `--generation-config`
+> the workspace config.
+
+```bash
+# Bundled profile (fast | balanced | quality) — replaces the generation
+# section for this run; works even with no generation config present:
+uv run dgml docset generate "$ds" --generation-config fast
+
+# Or a checked-in standalone config file (same shape as the generation section):
+uv run dgml docset generate "$ds" --generation-config ./configs/gen-quality.json
+
+# Or override just one model string on top of the config:
+uv run dgml docset generate "$ds" --label-model anthropic/claude-opus-4-8
+```
+
+Whatever the source, the run records the effective models in its JSON output's
+`models` block (`{model, label_model, source}`) — so the choice stays visible,
+never silent. `source` is `config`, `profile:<name>`, `file`, `override`, or a
+combination (`profile:fast+override`).
 
 Grounding runs in place as part of `generate`, adding `dg:origin` boxes and —
 when observable in the source — `dg:style` (inline CSS for bold/italic/size/
@@ -359,7 +381,8 @@ for fid in $(jq -r '.results[] | select(.file) | .file.id' <<<"$payload"); do
   uv run dgml docset add-file --workspace "$wid" "$fid" --docset "$ds"
 done
 
-# Models come from config.toml — there are no --model/--label-model flags.
+# Models come from config.toml by default; override per run with
+# --generation-config / --model / --label-model (see "Choose the models" above).
 uv run dgml docset generate --workspace "$wid" "$ds"
 ```
 
@@ -475,8 +498,9 @@ uv run dgml docset generate "$ds"   # only the new file; reuses the docset schem
 single JSON object on stdout — pipe it straight to `jq`. Pass 1/2/4
 progress lines go to stderr and only under `--verbose`. The payload is the
 shared batch envelope: a `summary` count block (`{total, converted, skipped,
-failed}`) plus a per-item `results` array, each entry carrying a
-`status` (`converted` / `skipped` / `failed`). A top-level `rerendered` lists
+failed}`), a `models` block recording the effective models and their `source`
+(`{model, label_model, source}`), plus a per-item `results` array, each entry
+carrying a `status` (`converted` / `skipped` / `failed`). A top-level `rerendered` lists
 already-generated files re-rendered because the docset namespacing shifted. A file whose source has gone
 missing is a `failed` entry (with an `error` object) rather than a run-level
 abort — the batch finishes and exits 0, so check `summary.failed` and surface
