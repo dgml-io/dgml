@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from dgml_core.errors import (
     AuthError,
@@ -20,9 +23,13 @@ from dgml_core.errors import (
     GenerationConfigMissing,
 )
 from dgml_core.generation import (
+    GENERATION_PROFILES,
     GenerationConfig,
     load_generation_config,
+    load_generation_config_file,
+    load_generation_profile,
     resolve_generation_api_key,
+    resolve_generation_config,
     resolve_generation_label_api_key,
 )
 from dgml_core.storage import Workspace
@@ -253,3 +260,145 @@ def test_resolve_raises_when_env_var_unset(monkeypatch: pytest.MonkeyPatch) -> N
     cfg = GenerationConfig(model=MODEL, label_model=LABEL_MODEL, api_key_env="MISSING_GEN_KEY")
     with pytest.raises(AuthError):
         resolve_generation_api_key(cfg)
+
+
+# ---------------------------------------------------------------------------
+# bundled profiles
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", GENERATION_PROFILES)
+def test_bundled_profiles_are_valid(name: str) -> None:
+    # Every bundled profile is a well-formed 'generation' overlay.
+    section = load_generation_profile(name)
+    assert isinstance(section.get("model"), str)
+    assert isinstance(section.get("label_model"), str)
+
+
+@pytest.mark.parametrize("name", GENERATION_PROFILES)
+def test_bundled_profiles_fully_specify_models(workspace: Workspace, name: str) -> None:
+    # Each profile names both models, so it resolves on a workspace with neither a
+    # [generation] section nor [models] tiers — the point of --generation-config.
+    cfg, source = resolve_generation_config(workspace, config=name)
+    assert cfg.model
+    assert cfg.label_model
+    assert source == f"profile:{name}"
+
+
+def test_unknown_profile_rejected() -> None:
+    with pytest.raises(GenerationConfigInvalid):
+        load_generation_profile("turbo")
+
+
+# ---------------------------------------------------------------------------
+# load_generation_config_file
+# ---------------------------------------------------------------------------
+
+
+def test_config_file_bare_section(tmp_path: Path) -> None:
+    path = tmp_path / "gen.json"
+    path.write_text(json.dumps({"model": MODEL, "label_model": LABEL_MODEL}), encoding="utf-8")
+    assert load_generation_config_file(path) == {"model": MODEL, "label_model": LABEL_MODEL}
+
+
+def test_config_file_unwraps_generation_key(tmp_path: Path) -> None:
+    # A full-config file wrapping the section under "generation" is accepted.
+    path = tmp_path / "gen.json"
+    path.write_text(
+        json.dumps({"generation": {"model": MODEL, "label_model": LABEL_MODEL}, "ocr": {}}),
+        encoding="utf-8",
+    )
+    assert load_generation_config_file(path) == {"model": MODEL, "label_model": LABEL_MODEL}
+
+
+def test_config_file_missing_raises(tmp_path: Path) -> None:
+    with pytest.raises(GenerationConfigInvalid):
+        load_generation_config_file(tmp_path / "nope.json")
+
+
+# ---------------------------------------------------------------------------
+# resolve_generation_config
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_no_flags_matches_load(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    cfg, source = resolve_generation_config(workspace)
+    assert cfg == GenerationConfig(model=MODEL, label_model=LABEL_MODEL)
+    assert source == "config"
+
+
+def test_resolve_no_flags_missing_config_raises(workspace: Workspace) -> None:
+    # Preserves the load_generation_config missing-config behavior when nothing
+    # is overridden.
+    with pytest.raises(GenerationConfigMissing):
+        resolve_generation_config(workspace)
+
+
+def test_resolve_profile_replaces_config(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    cfg, source = resolve_generation_config(workspace, config="fast")
+    assert cfg.model == cfg.label_model  # fast uses the cheap tier for both
+    assert source == "profile:fast"
+
+
+def test_resolve_file_replaces_config(workspace: Workspace, tmp_path: Path) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    path = tmp_path / "gen.json"
+    other = "anthropic/claude-opus-4-8"
+    path.write_text(json.dumps({"model": other, "label_model": other}), encoding="utf-8")
+    cfg, source = resolve_generation_config(workspace, config=str(path))
+    assert cfg.model == other
+    assert cfg.label_model == other
+    assert source == "file"
+
+
+def test_resolve_flags_override_config(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    override = "anthropic/claude-opus-4-8"
+    cfg, source = resolve_generation_config(workspace, model=override)
+    assert cfg.model == override
+    assert cfg.label_model == LABEL_MODEL  # untouched
+    assert source == "override"
+
+
+def test_resolve_flags_without_config_file(workspace: Workspace) -> None:
+    # Both models supplied via flags — works with no config.json at all, which
+    # is the point: run generate against an explicit model config without one.
+    cfg, source = resolve_generation_config(workspace, model=MODEL, label_model=LABEL_MODEL)
+    assert cfg == GenerationConfig(model=MODEL, label_model=LABEL_MODEL)
+    assert source == "override"
+
+
+def test_resolve_flags_over_profile(workspace: Workspace) -> None:
+    override = "anthropic/claude-opus-4-8"
+    cfg, source = resolve_generation_config(workspace, config="fast", label_model=override)
+    assert cfg.label_model == override
+    assert source == "profile:fast+override"
+
+
+def test_resolve_partial_flags_without_config_incomplete(workspace: Workspace) -> None:
+    # Only one model via flag, and nothing in the config or the [models] tiers to
+    # resolve the other → still incomplete, rejected.
+    with pytest.raises(GenerationConfigMissing):
+        resolve_generation_config(workspace, model=MODEL)
+
+
+def test_resolve_partial_flag_falls_back_to_tier(workspace: Workspace) -> None:
+    # The overlay is the merged config's top layer, not a replacement: --model
+    # alone leaves labeling to resolve from its [models] tier as usual.
+    write_config(workspace, {"models": {"advanced": LABEL_MODEL}})
+    cfg, source = resolve_generation_config(workspace, model=MODEL)
+    assert cfg.model == MODEL
+    assert cfg.label_model == LABEL_MODEL
+    assert source == "override"
+
+
+def test_resolve_overlay_preserves_unnamed_keys(workspace: Workspace) -> None:
+    # A profile/file overrides the keys it names; a workspace credential the
+    # overlay is silent about survives the run.
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "api_key_env": "MY_KEY"})
+    cfg, source = resolve_generation_config(workspace, config="fast")
+    assert cfg.label_model != LABEL_MODEL  # profile replaced the models...
+    assert cfg.api_key_env == "MY_KEY"  # ...but not the credentials
+    assert source == "profile:fast"
