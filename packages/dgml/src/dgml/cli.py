@@ -2734,10 +2734,46 @@ def _add_generate_subparser(
         ),
     )
     gen.add_argument("docset_id", help="ID of the DocSet whose files will be converted.")
-    # The transcription and labeling models are NOT CLI flags: like every other
-    # model-consuming command (schema generate, file extract, discover), they are
-    # read solely from the workspace's 'generation' config section, so the model
-    # is one visible, deliberate choice per workspace. See load_generation_config.
+    # Model selection. The default source is the workspace's 'generation' config
+    # section, so the model stays one visible, deliberate choice per workspace
+    # (see load_generation_config). These flags let a run name an explicit model
+    # config without hand-editing config.json; the effective models and their
+    # source are echoed into the JSON output's `models` block so the choice
+    # remains visible/recorded. Mirrors `dgml cluster --config PRESET|PATH`.
+    gen.add_argument(
+        "--generation-config",
+        dest="generation_config",
+        metavar="PROFILE|PATH",
+        default=None,
+        help=(
+            "Model config for this run. Either a bundled profile name "
+            "(fast | balanced | quality) or a path to a standalone config JSON "
+            "(same shape as the 'generation' section of <workspace>/config.json — "
+            "'model', 'label_model', optional 'api_key'/'api_key_env'/'api_base'). "
+            "Replaces the workspace config's generation section for this run. "
+            "Defaults to the workspace config."
+        ),
+    )
+    gen.add_argument(
+        "--model",
+        dest="model",
+        default=None,
+        help=(
+            "Override the per-page transcription model for this run (e.g. "
+            "'anthropic/claude-haiku-4-5'). Layers on top of --generation-config / "
+            "the workspace config."
+        ),
+    )
+    gen.add_argument(
+        "--label-model",
+        dest="label_model",
+        default=None,
+        help=(
+            "Override the batch-wide semantic-labeling model for this run (e.g. "
+            "'anthropic/claude-sonnet-4-6'). Layers on top of --generation-config / "
+            "the workspace config."
+        ),
+    )
     gen.add_argument("--window-size", type=int, default=10, help="Pages per transcription window.")
     gen.add_argument("--temperature", type=float, default=0.0)
     gen.add_argument("--max-tokens", type=int, default=32000)
@@ -2929,6 +2965,7 @@ def _generate_payload(
     converted: list[dict[str, Any]],
     output_key: str,
     coverage_report: str | None,
+    models: dict[str, str],
 ) -> dict[str, Any]:
     """The single `docset generate` envelope, built the same way whether or not
     any file actually needed converting (so the two paths can't drift).
@@ -2936,7 +2973,12 @@ def _generate_payload(
     ``output_key`` is the docset's store key (``docsets/<id>``) — the prefix the
     per-file DGML lives under — and ``coverage_report`` its report key or None.
     Both are store-native keys, not local paths, so the envelope is meaningful on
-    any backend."""
+    any backend.
+
+    ``models`` records the effective transcription/labeling models and their
+    ``source`` (workspace config, a --generation-config profile/file, and/or a
+    --model/--label-model override) so every run's model choice is recorded in
+    its output, not just in config.json."""
     return {
         "docset_id": ds.id,
         "docset_name": ds.name,
@@ -2946,6 +2988,7 @@ def _generate_payload(
             "skipped": len(skipped),
             "failed": len(failed),
         },
+        "models": models,
         "output_key": output_key,
         "coverage_report": coverage_report,
         "results": skipped + failed + converted,
@@ -2972,8 +3015,8 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     from dgml_core.generation import (
         ConvertOptions,
         convert_batch,
-        load_generation_config,
         resolve_generation_api_key,
+        resolve_generation_config,
         resolve_generation_label_api_key,
         validate_generation_models,
     )
@@ -3020,17 +3063,27 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     except DgmlError as exc:
         return _emit_error(exc.code, str(exc), fmt)
 
-    # Resolve the LLM models from the merged 'generation' config — there are no
-    # --model flags. Each model (transcription, labeling) resolves from its
-    # per-task field or its [models] tier, with its own credentials (the two may
-    # name different providers), so every model is a deliberate, visible choice.
-    gen_cfg = load_generation_config(ws)
+    # Resolve the effective LLM models: the merged 'generation' config by default
+    # (per-task field or [models] tier, each model with its own credentials since
+    # the two may name different providers), optionally overlaid by
+    # --generation-config (a bundled profile or a config file) and/or --model /
+    # --label-model. With no flags this is load_generation_config and still raises
+    # GENERATION_CONFIG_MISSING when nothing resolves a model. `gen_model_source`
+    # records where the models came from and is echoed into the JSON output so the
+    # choice stays visible/recorded.
+    gen_cfg, gen_model_source = resolve_generation_config(
+        ws,
+        config=args.generation_config,
+        model=args.model,
+        label_model=args.label_model,
+    )
     gen_model = gen_cfg.model
     label_model = gen_cfg.label_model
     gen_api_key = resolve_generation_api_key(gen_cfg)
     gen_api_base = gen_cfg.api_base
     label_api_key = resolve_generation_label_api_key(gen_cfg)
     label_api_base = gen_cfg.label_api_base
+    _diag(f"[models] transcription={gen_model} labeling={label_model} (source: {gen_model_source})")
 
     # Pre-flight — fail fast BEFORE any transcription spend on the two model
     # misconfigurations detectable offline: a malformed model string, or a
@@ -3579,7 +3632,14 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # Report the coverage report key only if a report was actually written.
     coverage_report = cov_report_key if cov_results else None
     payload = _generate_payload(
-        ds, len(file_ids), skipped_results, failed_results, written, output_key, coverage_report
+        ds,
+        len(file_ids),
+        skipped_results,
+        failed_results,
+        written,
+        output_key,
+        coverage_report,
+        {"model": gen_model, "label_model": label_model, "source": gen_model_source},
     )
     payload["rerendered"] = rerendered
     _emit(payload, fmt)
