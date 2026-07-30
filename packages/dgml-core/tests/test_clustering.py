@@ -26,10 +26,13 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from clustering.scenarios.base import UNKNOWN_NOISE_LABEL
+from dgml_core.classification import ClassificationDecision
 from dgml_core.clustering import (
     DEFAULT_INCREMENTAL_NOVELTY_QUANTILE,
     _resolve_mode,
     _with_incremental_novelty_default,
+    clustering,
     clustering_internal,
     load_clustering_overrides,
     load_clustering_preset,
@@ -40,6 +43,8 @@ from dgml_core.docsets import DocSetStore
 from dgml_core.errors import ClusteringConfigInvalid, IncrementalWithoutClusters
 from dgml_core.run_clustering import DocPrediction
 from dgml_core.storage import Workspace
+
+from .conftest import write_classification_config
 
 
 def _dp(cluster_name: str, confidence: float | None = None) -> DocPrediction:
@@ -563,3 +568,70 @@ def test_clustering_internal_threads_pooling_pages_to_dataset(
         clustering_internal(workspace)
 
     assert captured["max_pages"] == expected
+
+
+# ---------------------------------------------------------------------------
+# the clusterer's noise bucket
+# ---------------------------------------------------------------------------
+
+
+def test_clustering_internal_splits_noise_out_of_clusters(workspace: Workspace) -> None:
+    """The density algorithms' noise bucket is not a cluster. It must come
+    back on `unclustered`, never as a cluster name — its members share
+    nothing but the fact that nothing matched them."""
+    for fid in ("real", "noise1", "noise2"):
+        _seed_file(workspace, fid)
+        _seed_page_image(workspace, fid)
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={
+            "real": _dp("unknown_0"),
+            "noise1": _dp(UNKNOWN_NOISE_LABEL),
+            "noise2": _dp(UNKNOWN_NOISE_LABEL),
+        },
+    ):
+        result = clustering_internal(workspace)
+
+    assert result.clusters == {"real": "unknown_0"}
+    assert sorted(result.unclustered) == ["noise1", "noise2"]
+
+
+def test_clustering_does_not_name_the_noise_bucket_into_a_docset(workspace: Workspace) -> None:
+    """End-to-end regression for the real defect: `"unknown_noise"` is one
+    character away from a genuine `"unknown_<n>"`, so the naming pass used to
+    hand the noise bucket to the LLM and turn a bag of unrelated documents
+    into a DocSet — silently, with an empty `failed_file_ids`. The genuine
+    cluster in the same run must still be named."""
+    write_classification_config(workspace, {"model": "gemini/gemini-3.1-flash-lite"})
+    for fid in ("real", "noise1", "noise2"):
+        _seed_file(workspace, fid)
+        _seed_page_image(workspace, fid)
+
+    decision = ClassificationDecision(decision="new", new_name="Invoices", new_description="")
+    with (
+        patch(
+            "dgml_core.clustering.run_clustering_detailed",
+            return_value={
+                "real": _dp("unknown_0"),
+                "noise1": _dp(UNKNOWN_NOISE_LABEL),
+                "noise2": _dp(UNKNOWN_NOISE_LABEL),
+            },
+        ),
+        patch(
+            "dgml_core.clustering.propose_new_docset_for_files", return_value=decision
+        ) as mock_propose,
+    ):
+        result = clustering(workspace)
+
+    # The noise documents are reported as unassigned — a partial success, the
+    # same channel a failed page render uses — and are absent from `clusters`.
+    assert sorted(result["failed_file_ids"]) == ["noise1", "noise2"]
+    assert result["clusters"] == {"real": "Invoices"}
+    assert result["assignments"].keys() == {"real"}
+
+    # Exactly one DocSet, from the one genuine cluster: the noise bucket was
+    # never even shown to the namer.
+    assert result["n_new_clusters"] == 1
+    assert [d.name for d in DocSetStore(workspace).list_all()] == ["Invoices"]
+    assert [call.args[1] for call in mock_propose.call_args_list] == [["real"]]

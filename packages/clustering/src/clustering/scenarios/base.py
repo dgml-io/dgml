@@ -37,6 +37,19 @@ from clustering.utils.runid import run_id_for
 if TYPE_CHECKING:
     from clustering.consolidation import Adjudicator
 
+# Density-based clusterers (HDBSCAN, leiden, graph_cc, …) emit ``-1`` for
+# points they place in no cluster. Scenarios render that as a *named* bucket
+# so consumers don't have to special-case negative integers in a label
+# string. S1 has no known categories, so its buckets are ``cluster_*``; S2
+# clusters only the novel tail, so its buckets are ``unknown_*``.
+#
+# These are named constants rather than literals because a noise bucket is
+# emphatically **not** an ordinary cluster — it is a bag of mutually
+# unrelated documents — and a consumer that can't tell the two apart will
+# treat it as a category.
+CLUSTER_NOISE_LABEL = "cluster_noise"
+UNKNOWN_NOISE_LABEL = "unknown_noise"
+
 
 @dataclass
 class ScenarioResult:

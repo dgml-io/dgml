@@ -291,7 +291,7 @@ the incremental workflow:
 | Field | Meaning |
 |---|---|
 | `clusters` | Map from file id to the DocSet name the file ended up in. Either an existing DocSet's name (the algorithm matched the file to it) or the LLM-proposed name for a newly-created DocSet. Files that failed to assign keep their algorithmic placeholder label (e.g. `"unknown_1"`) here *and* appear in `failed_file_ids`. |
-| `failed_file_ids` | Files whose cluster needed LLM naming and that naming failed (missing config, no page images, provider error, …). Re-run after fixing the underlying cause; assignments are idempotent. |
+| `failed_file_ids` | Files that ended up in no DocSet: their cluster needed LLM naming and that naming failed (missing config, no page images, provider error, …), their first page never rendered, or the clusterer put them in no cluster at all. Re-run after fixing the underlying cause; assignments are idempotent. |
 | `skipped` | `true` only when `--skip-existing` was passed and there were no unassigned files (the clusterer never ran); `false` on every actual clustering run. Always present. |
 | `mode` | The effective run mode after resolving `auto` — `"fresh"` or `"incremental"`. |
 | `n_assigned_existing` | Number of files assigned to a DocSet that already existed before this run (the incremental "fit an existing cluster" case). |
@@ -326,6 +326,14 @@ members, S2 (partial-labels, name-only) when they don't; in fresh mode, S1
 for the full incremental ("S3") workflow and the evaluation harness.
 Files whose first-page image is missing (page render failed at ingest)
 are routed into `failed_file_ids` along with LLM-naming failures.
+
+The clustering algorithms are density-based, so they can also decline to
+place a document in any cluster — it looks like neither an existing DocSet
+nor like the other unassigned files. Those documents are **not** grouped
+into a catch-all DocSet (they have nothing in common but the fact that
+nothing matched them); they are reported in `failed_file_ids` too, and are
+absent from `clusters`. Assign them by hand with `docset add-file`, or
+re-run once more of the corpus has been ingested and they have neighbours.
 
 Algorithm settings (encoder, fusion, manifold, training, …) come from
 the bundled

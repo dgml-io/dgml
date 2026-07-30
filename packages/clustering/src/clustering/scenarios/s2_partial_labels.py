@@ -25,7 +25,7 @@ from typing import ClassVar
 import torch
 
 from clustering.data.datasets import DocumentDataset
-from clustering.scenarios.base import Scenario, ScenarioResult
+from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes, cluster_embeddings
 
 
@@ -133,7 +133,7 @@ class S2PartialLabels(Scenario):
             ulabels_arr = ulabels_t.detach().numpy() if hasattr(ulabels_t, "numpy") else ulabels_t
             for src, dst in zip(ulabels_arr.tolist(), unknown_idx, strict=True):
                 src_i = int(src)
-                predictions[dst] = "unknown_noise" if src_i == -1 else f"unknown_{src_i}"
+                predictions[dst] = UNKNOWN_NOISE_LABEL if src_i == -1 else f"unknown_{src_i}"
                 confidence[dst] = None
         elif n_unknown == 1:
             predictions[unknown_idx[0]] = "unknown_0"

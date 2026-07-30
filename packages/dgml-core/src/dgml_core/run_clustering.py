@@ -62,7 +62,7 @@ from typing import Any
 
 from clustering.config.schema import Config
 from clustering.data.datasets import DocumentDataset
-from clustering.scenarios.base import Scenario
+from clustering.scenarios.base import CLUSTER_NOISE_LABEL, UNKNOWN_NOISE_LABEL, Scenario
 from clustering.scenarios.s1_unsupervised import S1Unsupervised
 from clustering.scenarios.s2_partial_labels import S2PartialLabels
 from clustering.scenarios.s3_partial_few_shot import S3PartialFewShot
@@ -293,7 +293,16 @@ def _identity(label: str) -> str:
 
 def _cluster_to_unknown(label: str) -> str:
     """Rewrite S1's ``"cluster_N"`` → ``"unknown_N"``. Leaves anything else
-    untouched (defensive — should never fire in practice)."""
+    untouched (defensive — should never fire in practice).
+
+    S1's noise bucket is mapped explicitly onto S2's, so that a caller can
+    recognize "the clusterer placed this document nowhere" with a single
+    comparison against :data:`UNKNOWN_NOISE_LABEL` regardless of which
+    scenario ran. (The prefix rewrite below would produce the same string
+    by accident; naming it keeps the two ends from drifting apart.)
+    """
+    if label == CLUSTER_NOISE_LABEL:
+        return UNKNOWN_NOISE_LABEL
     if label.startswith("cluster_"):
         return "unknown_" + label[len("cluster_") :]
     return label

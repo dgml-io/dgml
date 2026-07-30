@@ -47,6 +47,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from clustering.scenarios.base import UNKNOWN_NOISE_LABEL
+
 from .classification import (
     ClassificationConfig,
     ClassificationDecision,
@@ -220,6 +222,12 @@ class _InternalResult:
 
     clusters: dict[str, str]
     render_skipped: list[str]
+    # Files the clusterer embedded but placed in *no* cluster (the density
+    # algorithms' noise bucket). Kept out of ``clusters`` because they share
+    # no category — only the fact that nothing matched them — so they must
+    # not be named into a DocSet. :func:`clustering` reports them alongside
+    # ``render_skipped`` in ``failed_file_ids``.
+    unclustered: list[str] = field(default_factory=list)
     confidences: dict[str, float | None] = field(default_factory=dict)
     # Files whose assignment the run wants a human to confirm. Sparse: only
     # flagged files appear, so an unconfigured run carries an empty dict rather
@@ -312,8 +320,9 @@ def clustering(
     LLM call for a given cluster fails, the files in *that* cluster
     land in ``failed_file_ids`` while every other cluster (matched or
     successfully named) is still assigned. Files whose page rendering
-    failed at ingest time (no ``page_1.png``) also land in
-    ``failed_file_ids``. The function does not raise.
+    failed at ingest time (no ``page_1.png``), and files the clusterer
+    placed in no cluster at all, also land in ``failed_file_ids``. The
+    function does not raise.
 
     Returns a JSON-serializable dict. The first three keys are the core
     contract; the rest are **additive** incremental-workflow fields
@@ -325,11 +334,15 @@ def clustering(
       DocSet name the file landed in — either an existing DocSet's
       name or the new name the LLM proposed. Files that failed to
       assign keep their placeholder label here (and also appear in
-      ``failed_file_ids``).
+      ``failed_file_ids``) — except files that were never in a cluster to
+      begin with (no page image, or the clusterer's noise bucket), which
+      are absent from ``clusters`` entirely.
     - ``failed_file_ids``: file IDs that were not assigned to any
-      DocSet — either because their first-page image was missing or
-      because their cluster needed LLM naming and that naming failed
-      (missing config, no page images, provider error, …).
+      DocSet — because their first-page image was missing, because the
+      clusterer placed them in no cluster (they resemble neither an
+      existing DocSet nor each other), or because their cluster needed
+      LLM naming and that naming failed (missing config, no page images,
+      provider error, …).
     - ``skipped``: ``True`` only when ``skip_existing`` was passed and there
       were no unassigned files (the clusterer never ran); ``False`` on every
       actual clustering run. Always present so callers can read it directly.
@@ -439,7 +452,11 @@ def clustering(
         else:
             unmatched.setdefault(cluster_name, []).append(file_id)
 
-    failed_file_ids: list[str] = list(internal.render_skipped)
+    # Two ways a file can come back unassigned: its page never rendered, so
+    # it was never embedded, or it was embedded and the clusterer put it in
+    # no cluster. Both are partial successes, not errors — the run still
+    # exits 0 and reports the rest.
+    failed_file_ids: list[str] = [*internal.render_skipped, *internal.unclustered]
     n_new_clusters = 0
 
     # Pass 2: for each unmatched cluster, obtain a DocSet proposal, create
@@ -546,7 +563,8 @@ def clustering_internal(
     A cluster name is either the name of an existing DocSet (the file is
     judged to belong with that DocSet's existing members) or
     ``"unknown_<n>"`` (a fresh cluster proposed for files that don't fit
-    any existing DocSet).
+    any existing DocSet). Files the clusterer put in *no* cluster don't get
+    a name at all — see :attr:`_InternalResult.unclustered` below.
 
     ``method`` selects the clustering engine (orthogonal to ``mode``):
 
@@ -569,10 +587,16 @@ def clustering_internal(
       Requires at least one DocSet.
     - **auto** ⇒ incremental when DocSets exist, else fresh.
 
-    Files whose first-page image is missing (page rendering failed at
-    ingest time) can't be embedded; they're returned in
-    :attr:`_InternalResult.render_skipped` so the outer :func:`clustering`
-    can route them into ``failed_file_ids``.
+    Two kinds of file come back without a cluster name, and both are
+    reported separately from ``clusters`` so the outer :func:`clustering`
+    can route them into ``failed_file_ids``:
+
+    - :attr:`_InternalResult.render_skipped` — no first-page image (page
+      rendering failed at ingest time), so they were never embedded.
+    - :attr:`_InternalResult.unclustered` — embedded, but the clusterer's
+      density algorithm assigned them to its noise bucket. They are *not*
+      an emergent cluster: they resemble neither an existing DocSet nor
+      one another, so naming them into a DocSet would invent a category.
 
     Returns an :class:`_InternalResult`. Empty workspace ⇒ an empty
     result carrying the resolved ``mode``.
@@ -695,12 +719,25 @@ def clustering_internal(
             debug=debug,
         )
 
-    clusters = {doc_id: pred.cluster_name for doc_id, pred in detailed.items()}
+    # Split off the noise bucket before it can pass for a cluster name. The
+    # density-based algorithms (the default `leiden` among them) return it
+    # for documents they place nowhere, and its members have nothing in
+    # common with each other — so it is the one label that must not become a
+    # DocSet. Its name is only a hair away from a real ``unknown_<n>``.
+    clusters = {
+        doc_id: pred.cluster_name
+        for doc_id, pred in detailed.items()
+        if pred.cluster_name != UNKNOWN_NOISE_LABEL
+    }
+    unclustered = [
+        doc_id for doc_id, pred in detailed.items() if pred.cluster_name == UNKNOWN_NOISE_LABEL
+    ]
     confidences = {doc_id: pred.confidence for doc_id, pred in detailed.items()}
     review = {doc_id: bool(pred.review) for doc_id, pred in detailed.items() if pred.review}
     return _InternalResult(
         clusters=clusters,
         render_skipped=skipped,
+        unclustered=unclustered,
         confidences=confidences,
         review=review,
         mode=effective_mode,

@@ -67,7 +67,7 @@ import torch
 
 from clustering.config.schema import UNSUPERVISED_LOSSES
 from clustering.data.datasets import DocumentDataset
-from clustering.scenarios.base import Scenario, ScenarioResult
+from clustering.scenarios.base import CLUSTER_NOISE_LABEL, Scenario, ScenarioResult
 from clustering.scenarios.clustering import (
     cluster_confidence,
     cluster_embeddings,
@@ -335,7 +335,7 @@ class S1Unsupervised(Scenario):
         # so consumers don't have to special-case negative integers in
         # category strings.
         predictions: list[str | None] = [
-            "cluster_noise" if li == -1 else f"cluster_{li}" for li in labels_list
+            CLUSTER_NOISE_LABEL if li == -1 else f"cluster_{li}" for li in labels_list
         ]
         # Per-document ordinal confidence from the clustering geometry. Computed
         # in the *clustering* space (``cluster_input`` / ``cluster_manifold``) so
