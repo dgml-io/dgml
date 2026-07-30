@@ -28,9 +28,11 @@ from clustering.config.schema import ManifoldConfig
 from clustering.manifolds import build_manifold
 from clustering.scenarios.clustering import (
     ClusterAlgorithm,
+    _radius_knee,
     cluster_embeddings,
     manifold_affinity_propagation,
     manifold_dbscan,
+    manifold_leiden,
     manifold_meanshift,
     manifold_optics,
 )
@@ -123,3 +125,40 @@ def test_optics_and_affinity_importable_and_run() -> None:
     for fn in (manifold_optics, manifold_affinity_propagation):
         labels, centroids = fn(emb, manifold=manifold)
         _assert_contract(labels, centroids, emb.shape[0], dim)
+
+
+def test_leiden_radius_mode_still_consumes_k_neighbors() -> None:
+    """``k_neighbors`` is not inert under ``graph_method="radius"``.
+
+    With no explicit ``radius`` and the default knee heuristic it is the ``k``
+    of the k-NN-distance knee, so it still sets the radius — the same role
+    ``graph_cc_k_neighbors`` and ``dbscan_k_neighbors`` play for their
+    algorithms, just spelled with the k-NN knob. Pinned because the docstring
+    used to claim the opposite, which sends a reader to tune the wrong knob.
+    """
+    dim = 8
+    emb = _three_blobs(dim=dim)
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    d_np = manifold.pairwise_dist(emb, emb).detach().numpy()
+
+    r_small = _radius_knee(d_np, k=2)
+    r_big = _radius_knee(d_np, k=20)
+    assert r_small != r_big, "the knee must move with k, else this test proves nothing"
+
+    # Auto-radius at k=20 must reproduce the run that is *told* that radius.
+    auto, _ = manifold_leiden(emb, manifold, graph_method="radius", k_neighbors=20, seed=0)
+    explicit, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=r_big, seed=0)
+    assert torch.equal(auto, explicit)
+
+
+def test_leiden_radius_mode_ignores_k_neighbors_once_radius_is_explicit() -> None:
+    """The other half of the contract: an explicit ``radius`` does make
+    ``k_neighbors`` inert, so the docstring's "ignored" is right for that case
+    and wrong only for the auto-radius one.
+    """
+    dim = 8
+    emb = _three_blobs(dim=dim)
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    a, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=1.0, k_neighbors=2, seed=0)
+    b, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=1.0, k_neighbors=20, seed=0)
+    assert torch.equal(a, b)

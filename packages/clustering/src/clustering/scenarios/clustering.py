@@ -869,8 +869,14 @@ def manifold_leiden(
         embeddings: ``[N, D]`` on-manifold points.
         manifold: Active manifold head — supplies ``pairwise_dist``.
         graph_method: How to build the graph (see above).
-        k_neighbors: ``k`` for the (mutual-)k-NN graphs. Ignored when
-            ``graph_method="radius"``. Clamped to ``[1, N-1]``.
+        k_neighbors: ``k`` for the (mutual-)k-NN graphs, clamped to
+            ``[1, N-1]``. **Not** ignored under ``graph_method="radius"``:
+            with ``radius=None`` and ``r_method="knee"`` it is the ``k``
+            of the k-NN-distance knee, so it still sets the radius — the
+            same role ``graph_cc_k_neighbors`` and ``dbscan_k_neighbors``
+            play for their algorithms, but spelled with the k-NN knob
+            rather than a dedicated one. It *is* ignored when an explicit
+            ``radius`` is given, or under ``r_method="mst_gap"``.
         radius: Explicit radius for the ``radius`` graph mode. If
             ``None``, auto-pick via ``r_method``. Ignored for k-NN
             modes.
