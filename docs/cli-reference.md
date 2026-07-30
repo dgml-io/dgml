@@ -290,7 +290,7 @@ the incremental workflow:
 
 | Field | Meaning |
 |---|---|
-| `clusters` | Map from file id to the DocSet name the file ended up in. Either an existing DocSet's name (the algorithm matched the file to it) or the LLM-proposed name for a newly-created DocSet. Files that failed to assign keep their algorithmic placeholder label (e.g. `"unknown_1"`) here *and* appear in `failed_file_ids`. |
+| `clusters` | Map from file id to the DocSet name the file ended up in. Either an existing DocSet's name (the algorithm matched the file to it) or the LLM-proposed name for a newly-created DocSet. A file whose cluster was found but whose *naming* failed keeps its algorithmic placeholder label (e.g. `"unknown_1"`) here *and* appears in `failed_file_ids`. A file that was never in a cluster at all — no page image, or the clusterer placed it nowhere — is **absent from this map** and appears only in `failed_file_ids`, so don't assume `clusters` covers every file in the workspace. |
 | `failed_file_ids` | Files that ended up in no DocSet: their cluster needed LLM naming and that naming failed (missing config, no page images, provider error, …), their first page never rendered, or the clusterer put them in no cluster at all. Re-run after fixing the underlying cause; assignments are idempotent. |
 | `skipped` | `true` only when `--skip-existing` was passed and there were no unassigned files (the clusterer never ran); `false` on every actual clustering run. Always present. |
 | `mode` | The effective run mode after resolving `auto` — `"fresh"` or `"incremental"`. |

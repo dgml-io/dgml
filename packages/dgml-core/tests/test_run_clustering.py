@@ -128,7 +128,12 @@ def test_run_clustering_no_known_categories_picks_s1_and_rewrites_labels() -> No
 
 def test_run_clustering_maps_s1_noise_onto_the_shared_noise_label() -> None:
     """S1's noise bucket must land on the same name S2 uses, so one
-    comparison identifies "placed in no cluster" whichever scenario ran."""
+    comparison identifies "placed in no cluster" whichever scenario ran.
+
+    Today the generic ``cluster_`` → ``unknown_`` prefix rewrite happens to
+    produce this too, so this pins intent rather than catching a live bug:
+    it fails the day either constant is renamed out from under the other.
+    """
     dataset = _FakeDataset(["a", "b"])
     fake = _result(["a", "b"], [CLUSTER_NOISE_LABEL, "cluster_0"])
 

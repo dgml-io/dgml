@@ -27,7 +27,7 @@ import torch
 
 from clustering.calibration import fit_support_calibrator
 from clustering.data.datasets import DocumentDataset
-from clustering.scenarios.base import Scenario, ScenarioResult
+from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes, manifold_kmeans
 
 
@@ -124,7 +124,14 @@ class S3PartialFewShot(Scenario):
             )
             ulabels_arr = ulabels_t.detach().numpy() if hasattr(ulabels_t, "numpy") else ulabels_t
             for src, dst in zip(ulabels_arr.tolist(), unknown_idx, strict=True):
-                predictions[dst] = f"unknown_{int(src)}"
+                src_i = int(src)
+                # ``manifold_kmeans`` assigns every point, so ``-1`` can't
+                # arrive today — but S2 clusters the same bucket through the
+                # ``cluster_embeddings`` dispatcher, which can. Render noise
+                # the way S2 does rather than letting it become the literal
+                # ``"unknown_-1"``, which reads as an ordinary cluster to
+                # every consumer downstream.
+                predictions[dst] = UNKNOWN_NOISE_LABEL if src_i == -1 else f"unknown_{src_i}"
         elif n_unknown == 1:
             predictions[unknown_idx[0]] = "unknown_0"
 

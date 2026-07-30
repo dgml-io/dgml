@@ -36,7 +36,7 @@ import torch
 from clustering.config.schema import Config
 from clustering.data.datasets import DocumentDataset, DocumentRecord
 from clustering.encoders.base import Encoder, EncoderOutput
-from clustering.scenarios.base import Scenario
+from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario
 from clustering.scenarios.s2_partial_labels import S2PartialLabels
 from clustering.scenarios.s3_partial_few_shot import S3PartialFewShot
 from clustering.scenarios.s4_zero_shot import S4ZeroShot
@@ -230,3 +230,42 @@ def test_s3_requires_support_dataset() -> None:
     scenario = _with_encoder(S3PartialFewShot(_config("s3", ["Invoice", "Contract"])), {})
     with pytest.raises(ValueError, match="non-empty support_dataset"):
         scenario.fit_predict(_InMemoryDataset([]), _InMemoryDataset([]))
+
+
+def test_s3_renders_noise_in_the_unknown_bucket_like_s2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3 clusters its unknown bucket with ``manifold_kmeans``, which assigns
+    every point, so ``-1`` cannot arrive today. Pin the rendering anyway: S2
+    clusters the same bucket through the ``cluster_embeddings`` dispatcher,
+    which *can* emit ``-1``, and the day S3 is switched over the unguarded
+    f-string would silently produce ``"unknown_-1"`` — a string that reads as
+    an ordinary cluster to every consumer downstream.
+    """
+    vectors = {
+        "invoice_support_1": (0.0, 0.0),
+        "invoice_support_2": (0.0, 2.0),
+        "contract_support_1": (10.0, 0.0),
+        "contract_support_2": (10.0, 2.0),
+        "far_1": (5.0, 40.0),
+        "far_2": (5.0, 41.0),
+    }
+    support = _InMemoryDataset(
+        [
+            _Record("si1", "invoice_support_1", "Invoice"),
+            _Record("si2", "invoice_support_2", "Invoice"),
+            _Record("sc1", "contract_support_1", "Contract"),
+            _Record("sc2", "contract_support_2", "Contract"),
+        ]
+    )
+    unknown = _InMemoryDataset([_Record("qa", "far_1"), _Record("qb", "far_2")])
+    cfg = _config("s3", ["Invoice", "Contract"], n_shots=2, threshold_confidence=0.9)
+    scenario = _with_encoder(S3PartialFewShot(cfg), vectors)
+
+    def _all_noise(emb: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.full((emb.shape[0],), -1, dtype=torch.long), torch.empty(0, emb.shape[1])
+
+    monkeypatch.setattr("clustering.scenarios.s3_partial_few_shot.manifold_kmeans", _all_noise)
+    result = scenario.fit_predict(unknown, support)
+
+    assert result.predictions == [UNKNOWN_NOISE_LABEL, UNKNOWN_NOISE_LABEL]
