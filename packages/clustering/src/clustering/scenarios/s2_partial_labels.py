@@ -26,7 +26,7 @@ import torch
 
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario, ScenarioResult
-from clustering.scenarios.clustering import assign_to_prototypes, cluster_embeddings
+from clustering.scenarios.clustering import assign_to_prototypes, cluster_emergent_bucket
 
 
 class S2PartialLabels(Scenario):
@@ -86,49 +86,11 @@ class S2PartialLabels(Scenario):
 
         if n_unknown >= 2:
             unknown_emb = embeddings[torch.tensor(unknown_idx)]
-            # For k-means we still need an explicit k; for HDBSCAN it's
-            # ignored. The same dispatcher used by S1 keeps the unknown
-            # bucket honouring ``scenario.cluster_algorithm`` end-to-end.
-            k_unknown = max(2, min(8, n_unknown))
-            ulabels_t, _ = cluster_embeddings(
+            ulabels_t, _ = cluster_emergent_bucket(
                 unknown_emb,
+                scenario=sc,
                 manifold=self.manifold,
-                algorithm=sc.cluster_algorithm,
-                k=k_unknown,
                 seed=self.config.seed,
-                min_cluster_size=sc.hdbscan_min_cluster_size,
-                min_samples=sc.hdbscan_min_samples,
-                cluster_selection_epsilon=sc.hdbscan_cluster_selection_epsilon,
-                cluster_selection_method=sc.hdbscan_cluster_selection_method,
-                allow_single_cluster=sc.hdbscan_allow_single_cluster,
-                graph_cc_radius=sc.graph_cc_radius,
-                graph_cc_r_method=sc.graph_cc_r_method,
-                graph_cc_k_neighbors=sc.graph_cc_k_neighbors,
-                graph_cc_min_cluster_size=sc.graph_cc_min_cluster_size,
-                leiden_graph_method=sc.leiden_graph_method,
-                leiden_k_neighbors=sc.leiden_k_neighbors,
-                leiden_radius=sc.leiden_radius,
-                leiden_r_method=sc.leiden_r_method,
-                leiden_quality=sc.leiden_quality,
-                leiden_resolution=sc.leiden_resolution,
-                leiden_min_cluster_size=sc.leiden_min_cluster_size,
-                leiden_n_iterations=sc.leiden_n_iterations,
-                dbscan_eps=sc.dbscan_eps,
-                dbscan_r_method=sc.dbscan_r_method,
-                dbscan_k_neighbors=sc.dbscan_k_neighbors,
-                dbscan_min_samples=sc.dbscan_min_samples,
-                dbscan_min_cluster_size=sc.dbscan_min_cluster_size,
-                optics_min_samples=sc.optics_min_samples,
-                optics_xi=sc.optics_xi,
-                optics_min_cluster_size=sc.optics_min_cluster_size,
-                affinity_damping=sc.affinity_damping,
-                affinity_preference=sc.affinity_preference,
-                affinity_max_iter=sc.affinity_max_iter,
-                affinity_convergence_iter=sc.affinity_convergence_iter,
-                meanshift_bandwidth=sc.meanshift_bandwidth,
-                meanshift_quantile=sc.meanshift_quantile,
-                meanshift_bin_seeding=sc.meanshift_bin_seeding,
-                meanshift_cluster_all=sc.meanshift_cluster_all,
             )
             ulabels_arr = ulabels_t.detach().numpy() if hasattr(ulabels_t, "numpy") else ulabels_t
             for src, dst in zip(ulabels_arr.tolist(), unknown_idx, strict=True):

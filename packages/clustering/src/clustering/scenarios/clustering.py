@@ -58,6 +58,7 @@ auto-calibration) for routing out-of-distribution documents to the
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -66,6 +67,7 @@ import numpy as np
 import torch
 
 from clustering.calibration import Calibrator
+from clustering.config.schema import ScenarioConfig
 from clustering.manifolds.base import ManifoldHead
 
 _log = logging.getLogger(__name__)
@@ -1645,6 +1647,128 @@ def cluster_confidence(
     peak_vals = [float(p) for p in peak.tolist()]
 
     return [0.0 if label_ints[i] < 0 else peak_vals[i] for i in range(n)]
+
+
+def emergent_bucket_k_neighbors(
+    n: int,
+    configured: int,
+    *,
+    graph_method: LeidenGraphMethod = "knn",
+) -> int:
+    """Graph degree to use when clustering an *emergent bucket* of ``n`` docs.
+
+    ``configured`` is the corpus-level ``leiden_k_neighbors``. It is chosen for
+    the size of a whole corpus, but the unknown bucket that S2/S3 hand to the
+    clusterer is a far smaller sub-problem, and at that scale the corpus-level
+    value meets or exceeds ``n``. The k-NN graph is then *complete*, so the
+    neighbourhood structure — the only thing the ``k`` in k-NN contributes —
+    is gone and the partition rests entirely on the RBF edge weights. Those
+    are normalised by the median edge distance, so a bucket whose groups are
+    only weakly separated ends up with near-uniform weights, and modularity's
+    optimum over a near-uniform complete graph is a single community.
+
+    This is an empirical effect, not an identity: a complete graph over two
+    *strongly* separated groups still splits, because the weight contrast
+    survives the normalisation. Weak separation is the case that matters here
+    — the bucket holds what the assignment gate could not confidently place,
+    which selects for exactly that. Measured leave-one-class-out on four
+    internal corpora at the shipped config's degree of 25, the unknown bucket
+    came back as one cluster on 16 of 24 splits.
+
+    Note the collapse is not avoided by clamping to ``n - 1``: that is what
+    :func:`manifold_leiden` already does internally, so an ``n - 1`` ceiling
+    reproduces the uncapped behaviour exactly (measured: zero differences over
+    the same 24 splits). The degree has to come *down*, and sub-linearly — a
+    linear rule pins to its own floor at this scale.
+
+    The result never exceeds ``configured``, so a config that already asks for
+    a small degree passes through untouched — including values below the floor
+    of 2 that the ``sqrt`` term carries for tiny buckets.
+
+    Only ``graph_method="knn"`` is scaled, deliberately:
+
+    - ``"mutual_knn"`` requires *reciprocal* membership, so the edge count
+      falls off far faster than the degree does; scaling it over-fragments
+      buckets that the unscaled degree partitions correctly.
+    - ``"radius"`` does not build a k-NN graph at all, but ``k_neighbors`` is
+      not inert there either — with ``leiden_radius=None`` it feeds the
+      auto-radius knee heuristic, so scaling it silently retunes the radius.
+
+    Neither mode is covered by the measurement above and both have a plausible
+    mechanism for harm, so both pass through unchanged.
+    """
+    if graph_method != "knn":
+        return configured
+    return min(configured, max(2, math.isqrt(max(n, 0))))
+
+
+def cluster_emergent_bucket(
+    embeddings: torch.Tensor,
+    *,
+    scenario: ScenarioConfig,
+    manifold: ManifoldHead,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cluster the unknown/emergent bucket shared by S2 and S3.
+
+    Both scenarios split their input into documents that matched a known
+    prototype and documents that did not, then partition the leftovers into
+    ``unknown_<i>`` clusters. This is that second step, in one place: it honours
+    ``scenario.cluster_algorithm`` and forwards the algorithm knobs, with the
+    graph degree scaled to the bucket by :func:`emergent_bucket_k_neighbors`.
+
+    ``k`` is still derived as ``max(2, min(8, n))``. Only ``kmeans`` consumes
+    it — every other algorithm derives its own cluster count — and in the 2..8
+    range that formula degenerates to ``k == n``, i.e. one cluster per document.
+    That is a real defect on a ``kmeans`` config and it is deliberately *not*
+    addressed here: no alternative ``k`` rule has yet measured as an improvement
+    across the full corpus set, and guessing one would trade a known bad value
+    for an unmeasured one.
+    """
+    sc = scenario
+    n = int(embeddings.shape[0])
+    return cluster_embeddings(
+        embeddings,
+        manifold=manifold,
+        algorithm=sc.cluster_algorithm,
+        k=max(2, min(8, n)),
+        seed=seed,
+        min_cluster_size=sc.hdbscan_min_cluster_size,
+        min_samples=sc.hdbscan_min_samples,
+        cluster_selection_epsilon=sc.hdbscan_cluster_selection_epsilon,
+        cluster_selection_method=sc.hdbscan_cluster_selection_method,
+        allow_single_cluster=sc.hdbscan_allow_single_cluster,
+        graph_cc_radius=sc.graph_cc_radius,
+        graph_cc_r_method=sc.graph_cc_r_method,
+        graph_cc_k_neighbors=sc.graph_cc_k_neighbors,
+        graph_cc_min_cluster_size=sc.graph_cc_min_cluster_size,
+        leiden_graph_method=sc.leiden_graph_method,
+        leiden_k_neighbors=emergent_bucket_k_neighbors(
+            n, sc.leiden_k_neighbors, graph_method=sc.leiden_graph_method
+        ),
+        leiden_radius=sc.leiden_radius,
+        leiden_r_method=sc.leiden_r_method,
+        leiden_quality=sc.leiden_quality,
+        leiden_resolution=sc.leiden_resolution,
+        leiden_min_cluster_size=sc.leiden_min_cluster_size,
+        leiden_n_iterations=sc.leiden_n_iterations,
+        dbscan_eps=sc.dbscan_eps,
+        dbscan_r_method=sc.dbscan_r_method,
+        dbscan_k_neighbors=sc.dbscan_k_neighbors,
+        dbscan_min_samples=sc.dbscan_min_samples,
+        dbscan_min_cluster_size=sc.dbscan_min_cluster_size,
+        optics_min_samples=sc.optics_min_samples,
+        optics_xi=sc.optics_xi,
+        optics_min_cluster_size=sc.optics_min_cluster_size,
+        affinity_damping=sc.affinity_damping,
+        affinity_preference=sc.affinity_preference,
+        affinity_max_iter=sc.affinity_max_iter,
+        affinity_convergence_iter=sc.affinity_convergence_iter,
+        meanshift_bandwidth=sc.meanshift_bandwidth,
+        meanshift_quantile=sc.meanshift_quantile,
+        meanshift_bin_seeding=sc.meanshift_bin_seeding,
+        meanshift_cluster_all=sc.meanshift_cluster_all,
+    )
 
 
 @dataclass

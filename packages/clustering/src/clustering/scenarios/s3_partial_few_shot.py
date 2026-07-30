@@ -28,7 +28,7 @@ import torch
 from clustering.calibration import fit_support_calibrator
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario, ScenarioResult
-from clustering.scenarios.clustering import assign_to_prototypes, manifold_kmeans
+from clustering.scenarios.clustering import assign_to_prototypes, cluster_emergent_bucket
 
 
 class S3PartialFewShot(Scenario):
@@ -118,17 +118,17 @@ class S3PartialFewShot(Scenario):
 
         if n_unknown >= 2:
             unknown_emb = embeddings[torch.tensor(unknown_idx)]
-            k_unknown = max(2, min(8, n_unknown))
-            ulabels_t, _ = manifold_kmeans(
-                unknown_emb, k=k_unknown, manifold=self.manifold, seed=self.config.seed
+            ulabels_t, _ = cluster_emergent_bucket(
+                unknown_emb,
+                scenario=sc,
+                manifold=self.manifold,
+                seed=self.config.seed,
             )
             ulabels_arr = ulabels_t.detach().numpy() if hasattr(ulabels_t, "numpy") else ulabels_t
             for src, dst in zip(ulabels_arr.tolist(), unknown_idx, strict=True):
                 src_i = int(src)
-                # ``manifold_kmeans`` assigns every point, so ``-1`` can't
-                # arrive today — but S2 clusters the same bucket through the
-                # ``cluster_embeddings`` dispatcher, which can. Render noise
-                # the way S2 does rather than letting it become the literal
+                # The dispatcher can return ``-1`` for noise. Render it the way
+                # S2 does rather than letting it become the literal
                 # ``"unknown_-1"``, which reads as an ordinary cluster to
                 # every consumer downstream.
                 predictions[dst] = UNKNOWN_NOISE_LABEL if src_i == -1 else f"unknown_{src_i}"
