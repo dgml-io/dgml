@@ -48,10 +48,10 @@
      full sentences is a `heading` plus `p` block(s), never a `field`.
   8. `row` is only for genuinely tabular content (ruled or visibly aligned
      columns). A two-column running list without column meaning is `item`s.
+"transcribe_ex_heading": |2
 
-  Worked examples (page text on the left → the exact blocks it becomes):
-
-  A. Multi-level headings — deeper printed number = deeper level, consistently:
+  Worked example — multi-level headings (deeper printed number = deeper level,
+  consistently), and their body prose as `p`:
        2. PAYMENT TERMS
        2.1 Net terms
        Net 30 days from invoice date.
@@ -63,9 +63,10 @@
        {"structure":"p","text":"Net 30 days from invoice date."}
        {"structure":"heading","level":4,"lim":"2.1.1","text":"Late fees"}
        {"structure":"p","text":"1.5% per month on overdue balances."}
+"transcribe_ex_sublist": |2
 
-  B. Nested list — every printed enumerator is its own `item`; keep the marker
-     in `lim`; a sub-series ("(i)/(ii)") is items just like its parent series:
+  Worked example — nested list (every printed enumerator is its own `item`;
+  keep the marker in `lim`; a sub-series "(i)/(ii)" is items like its parent):
        (a) Seller shall deliver the goods; and
            (i) delivery is DDP; and
            (ii) risk passes on delivery.
@@ -75,9 +76,11 @@
        {"structure":"item","lim":"(i)","text":"delivery is DDP; and"}
        {"structure":"item","lim":"(ii)","text":"risk passes on delivery."}
        {"structure":"item","lim":"(b)","text":"Buyer shall pay within 30 days."}
+"transcribe_ex_field": |2
 
-  C. Form fields — each label/value line is one `field`; a choice group is ONE
-     field with `options`/`checked` (never emit the mark character):
+  Worked example — form fields (each label/value line is ONE `field`; a short
+  "Label: value" line is a field, NEVER a heading; a choice group is one field
+  with `options`/`checked`, never the mark character):
        Policy Number: IMA318051B     Effective Date: 05/01/18
        Coverage:  [X] Building   [ ] Contents   [X] Business Income
      →

@@ -128,6 +128,47 @@ def strip_fences(text: str) -> str:
 
 SYSTEM_PROMPT = prompt("transcribe_system")
 
+# ":"-token density above which a document reads as FORM-like (label:value
+# fields dominate). Calibrated to separate forms (ACORD ~0.028) from
+# prose/heading documents (leases ~0.010); a coarse routing knob, not a
+# precise classifier — misrouting only changes which worked example is shown.
+_FORM_COLON_DENSITY = 0.018
+
+
+def _raw_colon_density(page_text_dir: Path | str | None) -> float:
+    """Fraction of raw page-text tokens ending in ":" — a cheap form-ness signal.
+
+    Reads the unnormalized page_text word tokens (coverage's tokenizer strips
+    punctuation, so it can't be used here). Returns 0.0 without a page_text dir.
+    """
+    if page_text_dir is None:
+        return 0.0
+    total = colon = 0
+    for page_file in sorted(Path(page_text_dir).glob("page_*.json")):
+        try:
+            words = json.loads(page_file.read_text(encoding="utf-8")).get("words", [])
+        except (OSError, ValueError):
+            continue
+        for w in words:
+            total += 1
+            if str(w.get("t", "")).endswith(":"):
+                colon += 1
+    return colon / total if total else 0.0
+
+
+def _select_transcription_examples(page_text_dir: Path | str | None) -> str:
+    """Worked few-shot examples routed to the document's dominant structure.
+
+    A one-size-fits-all example block over-fires: heading examples nudge form
+    captions into headings and degrade form structure. So forms (high ":"
+    density) get the field example only; other documents also get the
+    multi-level-heading and nested-list examples.
+    """
+    examples = prompt("transcribe_ex_field")
+    if _raw_colon_density(page_text_dir) < _FORM_COLON_DENSITY:
+        examples += prompt("transcribe_ex_heading") + prompt("transcribe_ex_sublist")
+    return examples
+
 
 def _heading_breadcrumb(blocks: list[Block]) -> list[str]:
     """The chain of still-open headings (a level stack, like ``build_tree``)."""
@@ -406,6 +447,9 @@ def transcribe_document(
     windows = document.iter_windows(total, window_size, overlap=0)
     log(f"{doc_name}: {total} pages → {len(windows)} window(s)")
     page_tokens = _page_token_lists(page_text_dir)
+    # Route worked examples to the document's dominant structure (forms get the
+    # field example only; other docs also get heading/sublist examples).
+    system_prompt = SYSTEM_PROMPT + _select_transcription_examples(page_text_dir)
 
     # One usage row per document, aggregating every window's call (gated on
     # --debug via the config). ``config`` is fresh per document in the pipeline,
@@ -442,7 +486,7 @@ def transcribe_document(
                     )
                 raw = llm.call_continued(
                     config,
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     user_content=llm.build_user_content(
                         instruction_text=attempt_instr, pdf_bytes=pdf_slice
                     ),
