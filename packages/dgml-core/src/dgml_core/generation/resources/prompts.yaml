@@ -52,17 +52,17 @@
 
   Worked example — multi-level headings (deeper printed number = deeper level,
   consistently), and their body prose as `p`:
-       2. PAYMENT TERMS
-       2.1 Net terms
-       Net 30 days from invoice date.
-       2.1.1 Late fees
-       1.5% per month on overdue balances.
+       2. MAINTENANCE OBLIGATIONS
+       2.1 Routine servicing
+       The contractor services the units each quarter.
+       2.1.1 Response times
+       Reported faults are attended within two business days.
      →
-       {"structure":"heading","level":2,"lim":"2.","text":"PAYMENT TERMS"}
-       {"structure":"heading","level":3,"lim":"2.1","text":"Net terms"}
-       {"structure":"p","text":"Net 30 days from invoice date."}
-       {"structure":"heading","level":4,"lim":"2.1.1","text":"Late fees"}
-       {"structure":"p","text":"1.5% per month on overdue balances."}
+       {"structure":"heading","level":2,"lim":"2.","text":"MAINTENANCE OBLIGATIONS"}
+       {"structure":"heading","level":3,"lim":"2.1","text":"Routine servicing"}
+       {"structure":"p","text":"The contractor services the units each quarter."}
+       {"structure":"heading","level":4,"lim":"2.1.1","text":"Response times"}
+       {"structure":"p","text":"Reported faults are attended within two business days."}
 "transcribe_ex_sublist": |2
 
   Worked example — nested list (every printed enumerator is its own `item`;
@@ -81,12 +81,12 @@
   Worked example — form fields (each label/value line is ONE `field`; a short
   "Label: value" line is a field, NEVER a heading; a choice group is one field
   with `options`/`checked`, never the mark character):
-       Policy Number: IMA318051B     Effective Date: 05/01/18
-       Coverage:  [X] Building   [ ] Contents   [X] Business Income
+       Order Number: ORD-4417        Ship Date: 12 March 2024
+       Handling:  [X] Standard   [ ] Overnight   [X] Signature on delivery
      →
-       {"structure":"field","label":"Policy Number","value":"IMA318051B"}
-       {"structure":"field","label":"Effective Date","value":"05/01/18"}
-       {"structure":"field","label":"Coverage","options":["Building","Contents","Business Income"],"checked":["Building","Business Income"]}
+       {"structure":"field","label":"Order Number","value":"ORD-4417"}
+       {"structure":"field","label":"Ship Date","value":"12 March 2024"}
+       {"structure":"field","label":"Handling","options":["Standard","Overnight","Signature on delivery"],"checked":["Standard","Signature on delivery"]}
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
 "transcribe_window_context": |-
