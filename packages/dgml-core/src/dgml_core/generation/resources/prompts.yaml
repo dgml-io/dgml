@@ -48,6 +48,42 @@
      full sentences is a `heading` plus `p` block(s), never a `field`.
   8. `row` is only for genuinely tabular content (ruled or visibly aligned
      columns). A two-column running list without column meaning is `item`s.
+
+  Worked examples (page text on the left → the exact blocks it becomes):
+
+  A. Multi-level headings — deeper printed number = deeper level, consistently:
+       2. PAYMENT TERMS
+       2.1 Net terms
+       Net 30 days from invoice date.
+       2.1.1 Late fees
+       1.5% per month on overdue balances.
+     →
+       {"structure":"heading","level":2,"lim":"2.","text":"PAYMENT TERMS"}
+       {"structure":"heading","level":3,"lim":"2.1","text":"Net terms"}
+       {"structure":"p","text":"Net 30 days from invoice date."}
+       {"structure":"heading","level":4,"lim":"2.1.1","text":"Late fees"}
+       {"structure":"p","text":"1.5% per month on overdue balances."}
+
+  B. Nested list — every printed enumerator is its own `item`; keep the marker
+     in `lim`; a sub-series ("(i)/(ii)") is items just like its parent series:
+       (a) Seller shall deliver the goods; and
+           (i) delivery is DDP; and
+           (ii) risk passes on delivery.
+       (b) Buyer shall pay within 30 days.
+     →
+       {"structure":"item","lim":"(a)","text":"Seller shall deliver the goods; and"}
+       {"structure":"item","lim":"(i)","text":"delivery is DDP; and"}
+       {"structure":"item","lim":"(ii)","text":"risk passes on delivery."}
+       {"structure":"item","lim":"(b)","text":"Buyer shall pay within 30 days."}
+
+  C. Form fields — each label/value line is one `field`; a choice group is ONE
+     field with `options`/`checked` (never emit the mark character):
+       Policy Number: IMA318051B     Effective Date: 05/01/18
+       Coverage:  [X] Building   [ ] Contents   [X] Business Income
+     →
+       {"structure":"field","label":"Policy Number","value":"IMA318051B"}
+       {"structure":"field","label":"Effective Date","value":"05/01/18"}
+       {"structure":"field","label":"Coverage","options":["Building","Contents","Business Income"],"checked":["Building","Business Income"]}
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
 "transcribe_window_context": |-
