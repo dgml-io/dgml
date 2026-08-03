@@ -1,0 +1,630 @@
+namespace docset = "http://dgml.io/eval/Z4ervk9ic0oo8frgx7rlbew3"
+
+## Type of NTSB report
+## Example: Aviation Accident Final Report
+## Prompt: The title beneath 'National Transportation Safety Board' in the header
+ReportType =
+  element docset:ReportType {
+    text
+  }
+
+## NTSB accident/incident number
+## Example: MIA08CA018
+## Prompt: Labeled 'Accident Number' or 'Incident Number' in the header table
+AccidentNumber =
+  element docset:AccidentNumber {
+    text
+  }
+
+## Accident/incident location
+## Example: McKinnon, TN
+Location =
+  element docset:Location {
+    text
+  }
+
+## Date and time of event including time zone
+## Example: 11/18/2007, 1315 EST
+## Prompt: Keep raw since it includes a timezone label like UTC/EST
+DateTime =
+  element docset:DateTime {
+    text
+  }
+
+## Aircraft make/model as shown in header
+## Example: Cessna 172
+Aircraft =
+  element docset:Aircraft {
+    text
+  }
+
+## Aircraft registration (tail number)
+## Example: N5803A
+Registration =
+  element docset:Registration {
+    text
+  }
+
+## Extent of aircraft damage
+## Example: Substantial
+AircraftDamage =
+  element docset:AircraftDamage {
+    text
+  }
+
+## Defining event of the accident/incident
+DefiningEvent =
+  element docset:DefiningEvent {
+    text
+  }
+
+## Summary injuries from header
+## Example: 4 None
+Injuries =
+  element docset:Injuries {
+    text
+  }
+
+## Regulatory part / flight category
+## Example: Part 91: General Aviation - Personal
+FlightConductedUnder =
+  element docset:FlightConductedUnder {
+    text
+  }
+
+## Narrative analysis of the event
+Analysis =
+  element docset:Analysis {
+    text
+  }
+
+## NTSB probable cause determination
+## Example: The pilot's failure to perform a go around.
+ProbableCause =
+  element docset:ProbableCause {
+    text
+  }
+
+## Findings occurrences
+Occurrences =
+  element docset:Occurrences {
+    Occurrence*
+  }
+
+Occurrence =
+  element docset:Occurrence {
+    (text | OccurrenceNumber | OccurrenceDescription | PhaseOfOperation | Findings)*
+  }
+
+## Example: 1
+OccurrenceNumber =
+  element docset:OccurrenceNumber {
+    xsd:integer
+  }
+
+## Example: OVERRUN
+OccurrenceDescription =
+  element docset:OccurrenceDescription {
+    text
+  }
+
+## Example: LANDING
+PhaseOfOperation =
+  element docset:PhaseOfOperation {
+    text
+  }
+
+## Findings listed under this occurrence
+Findings =
+  element docset:Findings {
+    Finding*
+  }
+
+## Example: (C) GO-AROUND - NOT PERFORMED - PILOT IN COMMAND
+Finding =
+  element docset:Finding {
+    text
+  }
+
+PilotInformation =
+  element docset:PilotInformation {
+    (text | Certificate | Age | AirplaneRatings | SeatOccupied | OtherAircraftRatings | RestraintUsed | InstrumentRatings | SecondPilotPresent | InstructorRatings | ToxicologyPerformed | MedicalCertification | LastFAAMedicalExam | OccupationalPilot | LastFlightReview | FlightTime)*
+  }
+
+## Example: Private
+Certificate =
+  element docset:Certificate {
+    text
+  }
+
+## Example: 63, Male
+Age =
+  element docset:Age {
+    text
+  }
+
+## Example: Single-engine Land
+AirplaneRatings =
+  element docset:AirplaneRatings {
+    text
+  }
+
+SeatOccupied =
+  element docset:SeatOccupied {
+    text
+  }
+
+## Example: None
+OtherAircraftRatings =
+  element docset:OtherAircraftRatings {
+    text
+  }
+
+## Example: Seatbelt
+RestraintUsed =
+  element docset:RestraintUsed {
+    text
+  }
+
+## Example: None
+InstrumentRatings =
+  element docset:InstrumentRatings {
+    text
+  }
+
+SecondPilotPresent =
+  element docset:SecondPilotPresent {
+    text
+  }
+
+InstructorRatings =
+  element docset:InstructorRatings {
+    text
+  }
+
+ToxicologyPerformed =
+  element docset:ToxicologyPerformed {
+    text
+  }
+
+## Example: Class 3
+MedicalCertification =
+  element docset:MedicalCertification {
+    text
+  }
+
+## Example: 08/01/2007
+LastFAAMedicalExam =
+  element docset:LastFAAMedicalExam {
+    xsd:date
+  }
+
+OccupationalPilot =
+  element docset:OccupationalPilot {
+    text
+  }
+
+LastFlightReview =
+  element docset:LastFlightReview {
+    text
+  }
+
+## Example: 800 hours (Total, all aircraft), 10 hours (Total, this make and model)
+FlightTime =
+  element docset:FlightTime {
+    text
+  }
+
+AircraftOwnerOperatorInformation =
+  element docset:AircraftOwnerOperatorInformation {
+    (text | AircraftMake | ModelSeries | AircraftCategory | YearOfManufacture | AmateurBuilt | AirworthinessCertificate | SerialNumber | LandingGearType | Seats | DateTypeOfLastInspection | CertifiedMaxGrossWt | TimeSinceLastInspection | Engines | AirframeTotalTime | EngineManufacturer | ELT | EngineModelSeries | RegisteredOwner | RatedPower | Operator | OperatingCertificatesHeld | OperatorDoesBusinessAs | OperatorDesignatorCode)*
+  }
+
+## Example: Cessna
+AircraftMake =
+  element docset:AircraftMake {
+    text
+  }
+
+## Example: 172
+ModelSeries =
+  element docset:ModelSeries {
+    text
+  }
+
+## Example: Airplane
+AircraftCategory =
+  element docset:AircraftCategory {
+    text
+  }
+
+YearOfManufacture =
+  element docset:YearOfManufacture {
+    xsd:gYear
+  }
+
+## Example: No
+AmateurBuilt =
+  element docset:AmateurBuilt {
+    xsd:boolean
+  }
+
+## Example: Utility
+AirworthinessCertificate =
+  element docset:AirworthinessCertificate {
+    text
+  }
+
+## Example: 28403
+SerialNumber =
+  element docset:SerialNumber {
+    text
+  }
+
+## Example: Tricycle
+LandingGearType =
+  element docset:LandingGearType {
+    text
+  }
+
+Seats =
+  element docset:Seats {
+    xsd:integer
+  }
+
+DateTypeOfLastInspection =
+  element docset:DateTypeOfLastInspection {
+    text
+  }
+
+CertifiedMaxGrossWt =
+  element docset:CertifiedMaxGrossWt {
+    text
+  }
+
+TimeSinceLastInspection =
+  element docset:TimeSinceLastInspection {
+    text
+  }
+
+## Example: 1 Reciprocating
+Engines =
+  element docset:Engines {
+    text
+  }
+
+AirframeTotalTime =
+  element docset:AirframeTotalTime {
+    text
+  }
+
+## Example: Continental
+EngineManufacturer =
+  element docset:EngineManufacturer {
+    text
+  }
+
+ELT =
+  element docset:ELT {
+    text
+  }
+
+## Example: O-300
+EngineModelSeries =
+  element docset:EngineModelSeries {
+    text
+  }
+
+## Example: Sam Goodman
+RegisteredOwner =
+  element docset:RegisteredOwner {
+    text
+  }
+
+RatedPower =
+  element docset:RatedPower {
+    text
+  }
+
+## Example: Jerry Whitehead
+Operator =
+  element docset:Operator {
+    text
+  }
+
+## Example: None
+OperatingCertificatesHeld =
+  element docset:OperatingCertificatesHeld {
+    text
+  }
+
+## Example: Philadelphia Flight Academy
+OperatorDoesBusinessAs =
+  element docset:OperatorDoesBusinessAs {
+    text
+  }
+
+OperatorDesignatorCode =
+  element docset:OperatorDesignatorCode {
+    text
+  }
+
+MeteorologicalAndFlightPlan =
+  element docset:MeteorologicalAndFlightPlan {
+    (text | ConditionsAtAccidentSite | ConditionOfLight | ObservationFacilityElevation | DistanceFromAccidentSite | ObservationTime | DirectionFromAccidentSite | LowestCloudCondition | Visibility | LowestCeiling | VisibilityRVR | WindSpeedGusts | TurbulenceTypeForecastActual | WindDirection | TurbulenceSeverityForecastActual | AltimeterSetting | TemperatureDewPoint | PrecipitationAndObscuration | DeparturePoint | TypeOfFlightPlanFiled | Destination | TypeOfClearance | DepartureTime | TypeOfAirspace)*
+  }
+
+## Example: Visual Conditions
+ConditionsAtAccidentSite =
+  element docset:ConditionsAtAccidentSite {
+    text
+  }
+
+## Example: Day
+ConditionOfLight =
+  element docset:ConditionOfLight {
+    text
+  }
+
+## Example: KHOP
+ObservationFacilityElevation =
+  element docset:ObservationFacilityElevation {
+    text
+  }
+
+DistanceFromAccidentSite =
+  element docset:DistanceFromAccidentSite {
+    text
+  }
+
+## Example: 1355
+ObservationTime =
+  element docset:ObservationTime {
+    text
+  }
+
+DirectionFromAccidentSite =
+  element docset:DirectionFromAccidentSite {
+    text
+  }
+
+## Example: Clear
+LowestCloudCondition =
+  element docset:LowestCloudCondition {
+    text
+  }
+
+## Example: 10 Miles
+Visibility =
+  element docset:Visibility {
+    text
+  }
+
+## Example: Broken / 20000 ft agl
+LowestCeiling =
+  element docset:LowestCeiling {
+    text
+  }
+
+VisibilityRVR =
+  element docset:VisibilityRVR {
+    text
+  }
+
+## Example: 5 knots /
+WindSpeedGusts =
+  element docset:WindSpeedGusts {
+    text
+  }
+
+TurbulenceTypeForecastActual =
+  element docset:TurbulenceTypeForecastActual {
+    text
+  }
+
+## Example: 150°
+WindDirection =
+  element docset:WindDirection {
+    text
+  }
+
+TurbulenceSeverityForecastActual =
+  element docset:TurbulenceSeverityForecastActual {
+    text
+  }
+
+## Example: 30.17 inches Hg
+AltimeterSetting =
+  element docset:AltimeterSetting {
+    text
+  }
+
+## Example: 17°C / 7°C
+TemperatureDewPoint =
+  element docset:TemperatureDewPoint {
+    text
+  }
+
+## Example: No Obscuration; No Precipitation
+PrecipitationAndObscuration =
+  element docset:PrecipitationAndObscuration {
+    text
+  }
+
+## Example: Mount Pleasant, TN (MRC)
+DeparturePoint =
+  element docset:DeparturePoint {
+    text
+  }
+
+## Example: None
+TypeOfFlightPlanFiled =
+  element docset:TypeOfFlightPlanFiled {
+    text
+  }
+
+## Example: McKinnon, TN (MP#)
+Destination =
+  element docset:Destination {
+    text
+  }
+
+## Example: None
+TypeOfClearance =
+  element docset:TypeOfClearance {
+    text
+  }
+
+## Example: EST
+DepartureTime =
+  element docset:DepartureTime {
+    text
+  }
+
+TypeOfAirspace =
+  element docset:TypeOfAirspace {
+    text
+  }
+
+AirportInformation =
+  element docset:AirportInformation {
+    (text | Airport | RunwaySurfaceType | AirportElevation | RunwaySurfaceCondition | RunwayUsed | IFRApproach | RunwayLengthWidth | VFRApproachLanding)*
+  }
+
+## Example: Houston County (KM93)
+Airport =
+  element docset:Airport {
+    text
+  }
+
+## Example: Asphalt
+RunwaySurfaceType =
+  element docset:RunwaySurfaceType {
+    text
+  }
+
+AirportElevation =
+  element docset:AirportElevation {
+    text
+  }
+
+## Example: Dry
+RunwaySurfaceCondition =
+  element docset:RunwaySurfaceCondition {
+    text
+  }
+
+## Example: 8
+RunwayUsed =
+  element docset:RunwayUsed {
+    text
+  }
+
+## Example: None
+IFRApproach =
+  element docset:IFRApproach {
+    text
+  }
+
+## Example: 3000 ft / 75 ft
+RunwayLengthWidth =
+  element docset:RunwayLengthWidth {
+    text
+  }
+
+VFRApproachLanding =
+  element docset:VFRApproachLanding {
+    text
+  }
+
+WreckageAndImpactInformation =
+  element docset:WreckageAndImpactInformation {
+    (text | CrewInjuries | AircraftDamage | PassengerInjuries | AircraftFire | GroundInjuries | AircraftExplosion | TotalInjuries | LatitudeLongitude)*
+  }
+
+## Example: 1 None
+CrewInjuries =
+  element docset:CrewInjuries {
+    text
+  }
+
+## Example: 3 None
+PassengerInjuries =
+  element docset:PassengerInjuries {
+    text
+  }
+
+## Example: None
+AircraftFire =
+  element docset:AircraftFire {
+    text
+  }
+
+## Example: N/A
+GroundInjuries =
+  element docset:GroundInjuries {
+    text
+  }
+
+AircraftExplosion =
+  element docset:AircraftExplosion {
+    text
+  }
+
+## Example: 4 None
+TotalInjuries =
+  element docset:TotalInjuries {
+    text
+  }
+
+## Example: 36.316667, -87.916667
+LatitudeLongitude =
+  element docset:LatitudeLongitude {
+    text
+  }
+
+AdministrativeInformation =
+  element docset:AdministrativeInformation {
+    (text | InvestigatorInCharge | ReportDate | AdditionalParticipatingPersons | PublishDate | Note | InvestigationDocket)*
+  }
+
+## Example: Jose Obregon
+InvestigatorInCharge =
+  element docset:InvestigatorInCharge {
+    text
+  }
+
+## Example: 12/20/2007
+ReportDate =
+  element docset:ReportDate {
+    xsd:date
+  }
+
+## Example: Orton Ogborn; FAA/FSDO; Teterboro, NJ
+AdditionalParticipatingPersons =
+  element docset:AdditionalParticipatingPersons {
+    text
+  }
+
+PublishDate =
+  element docset:PublishDate {
+    xsd:date
+  }
+
+Note =
+  element docset:Note {
+    text
+  }
+
+InvestigationDocket =
+  element docset:InvestigationDocket {
+    text
+  }
+
+## Name/address of the foreign authority when investigation is under another government's jurisdiction
+## Example: German Federal Bureau of Aircraft Accidents Investigation (BFU)
+ForeignInvestigatingAuthority =
+  element docset:ForeignInvestigatingAuthority {
+    text
+  }
+
