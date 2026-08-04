@@ -87,6 +87,19 @@
        {"structure":"field","label":"Order Number","value":"ORD-4417"}
        {"structure":"field","label":"Ship Date","value":"12 March 2024"}
        {"structure":"field","label":"Handling","options":["Standard","Overnight","Signature on delivery"],"checked":["Standard","Signature on delivery"]}
+"transcribe_ex_table": |2
+
+  Worked example — tables (aligned or ruled columns): ONE `row` per printed
+  line, one string per cell; the column-header line is a `row` too. A repeating
+  record grid keeps the SAME columns across rows; a two-column label|value grid
+  is still `row`s (not `field`s) when it is laid out as a ruled table:
+       Item Ref  Description        Qty   Unit Price
+       BR-100    Mounting bracket    12       3.40
+       GR-050    Rubber grommet      50       0.18
+     →
+       {"structure":"row","cells":["Item Ref","Description","Qty","Unit Price"]}
+       {"structure":"row","cells":["BR-100","Mounting bracket","12","3.40"]}
+       {"structure":"row","cells":["GR-050","Rubber grommet","50","0.18"]}
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
 "transcribe_window_context": |-

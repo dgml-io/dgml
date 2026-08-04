@@ -164,7 +164,9 @@ def _select_transcription_examples(page_text_dir: Path | str | None) -> str:
     density) get the field example only; other documents also get the
     multi-level-heading and nested-list examples.
     """
-    examples = prompt("transcribe_ex_field")
+    # The table example is shown to every document — tables appear across most
+    # docset kinds (forms, specs, reports), so it is not gated on form-ness.
+    examples = prompt("transcribe_ex_table") + prompt("transcribe_ex_field")
     if _raw_colon_density(page_text_dir) < _FORM_COLON_DENSITY:
         examples += prompt("transcribe_ex_heading") + prompt("transcribe_ex_sublist")
     return examples
