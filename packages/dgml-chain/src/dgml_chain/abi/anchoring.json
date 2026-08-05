@@ -8,7 +8,6 @@
         "name": "record",
         "type": "tuple",
         "components": [
-          { "name": "registry", "type": "string" },
           { "name": "uri", "type": "string" },
           { "name": "checksum", "type": "string" },
           { "name": "checksumAlgo", "type": "string" },
@@ -17,7 +16,8 @@
           { "name": "status", "type": "string" },
           { "name": "recordId", "type": "uint64" },
           { "name": "index", "type": "uint64" },
-          { "name": "isLatest", "type": "bool" }
+          { "name": "isLatest", "type": "bool" },
+          { "name": "registryId", "type": "uint64" }
         ]
       }
     ],
@@ -40,7 +40,31 @@
   },
   {
     "type": "function",
+    "name": "updateRecordStatus",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "registryId", "type": "uint64" },
+      { "name": "recordId", "type": "uint64" },
+      { "name": "index", "type": "uint64" },
+      { "name": "status", "type": "string" }
+    ],
+    "outputs": []
+  },
+  {
+    "type": "function",
     "name": "grantRole",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "registryId", "type": "uint64" },
+      { "name": "checksum", "type": "string" },
+      { "name": "account", "type": "address" },
+      { "name": "role", "type": "string" }
+    ],
+    "outputs": []
+  },
+  {
+    "type": "function",
+    "name": "revokeRole",
     "stateMutability": "nonpayable",
     "inputs": [
       { "name": "registryId", "type": "uint64" },
@@ -55,7 +79,7 @@
     "name": "records",
     "stateMutability": "view",
     "inputs": [
-      { "name": "registry", "type": "string" },
+      { "name": "registryId", "type": "uint64" },
       { "name": "checksum", "type": "string" },
       { "name": "recordId", "type": "uint64" },
       { "name": "index", "type": "uint64" },
@@ -76,7 +100,6 @@
         "name": "records",
         "type": "tuple[]",
         "components": [
-          { "name": "registry", "type": "string" },
           { "name": "uri", "type": "string" },
           { "name": "checksum", "type": "string" },
           { "name": "checksumAlgo", "type": "string" },
@@ -85,7 +108,8 @@
           { "name": "status", "type": "string" },
           { "name": "recordId", "type": "uint64" },
           { "name": "index", "type": "uint64" },
-          { "name": "isLatest", "type": "bool" }
+          { "name": "isLatest", "type": "bool" },
+          { "name": "registryId", "type": "uint64" }
         ]
       },
       {
@@ -104,7 +128,6 @@
     "stateMutability": "view",
     "inputs": [
       { "name": "registryId", "type": "uint64" },
-      { "name": "name", "type": "string" },
       {
         "name": "pagination",
         "type": "tuple",

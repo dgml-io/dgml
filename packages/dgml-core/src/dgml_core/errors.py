@@ -238,6 +238,10 @@ class RecordNotFound(NotFoundError):
     code = "RECORD_NOT_FOUND"
 
 
+class RegistryNotFound(NotFoundError):
+    code = "REGISTRY_NOT_FOUND"
+
+
 @dataclass
 class RecordedError:
     """A persistent record of a fatal failure for a file or docset.
