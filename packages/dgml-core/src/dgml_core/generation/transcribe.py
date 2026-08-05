@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import statistics
 import tempfile
 from collections import Counter
 from collections.abc import Callable
@@ -156,18 +157,65 @@ def _raw_colon_density(page_text_dir: Path | str | None) -> float:
     return colon / total if total else 0.0
 
 
-def _select_transcription_examples(page_text_dir: Path | str | None) -> str:
-    """Worked few-shot examples routed to the document's dominant structure.
+# Line-start numbering density above which a document has a deep enough section
+# hierarchy to benefit from the heading/sublist examples. Deep legal prose runs
+# ~0.18-0.28 (numbered clauses "1.1"/"1.2.1"); flat prose (notes, letters) sits
+# below ~0.06. Showing heading examples to flat prose over-structures it and
+# drifts the output away from a flat-prose gold — hence a separate gate from
+# form-ness (the two axes are independent).
+_DEEP_NUMBERING_DENSITY = 0.10
+# A page line that begins with a hierarchical enumerator: "1.1", "2.", "(a)", "(iv)".
+_LEAD_NUM_RE = re.compile(r"^(\d+\.\d+|\d+\.|\(?[a-z]\)|\(?[ivx]+\))", re.IGNORECASE)
 
-    A one-size-fits-all example block over-fires: heading examples nudge form
-    captions into headings and degrade form structure. So forms (high ":"
-    density) get the field example only; other documents also get the
-    multi-level-heading and nested-list examples.
+
+def _line_numbering_density(page_text_dir: Path | str | None) -> float:
+    """Fraction of page lines that begin with a hierarchical enumerator.
+
+    Reconstructs text lines from the raw page_text word boxes (grouping words
+    into vertical bands, ordering each band left-to-right) and counts those
+    starting with "1.1"/"2."/"(a)"/"(i)" — a pre-transcription proxy for how
+    deep the document's section hierarchy is. Returns 0.0 without a page_text dir.
     """
-    # The table example is shown to every document — tables appear across most
-    # docset kinds (forms, specs, reports), so it is not gated on form-ness.
-    examples = prompt("transcribe_ex_table") + prompt("transcribe_ex_field")
-    if _raw_colon_density(page_text_dir) < _FORM_COLON_DENSITY:
+    if page_text_dir is None:
+        return 0.0
+    total = numbered = 0
+    for page_file in sorted(Path(page_text_dir).glob("page_*.json")):
+        try:
+            words = json.loads(page_file.read_text(encoding="utf-8")).get("words", [])
+        except (OSError, ValueError):
+            continue
+        boxed = [w for w in words if isinstance(w.get("l"), list) and len(w["l"]) == 4]
+        if not boxed:
+            continue
+        line_h = statistics.median(w["l"][3] - w["l"][1] for w in boxed) or 10.0
+        bands: dict[int, list[tuple[float, str]]] = {}
+        for w in boxed:
+            bands.setdefault(round(w["l"][1] / (line_h * 0.7)), []).append(
+                (w["l"][0], str(w.get("t", "")))
+            )
+        for band in bands.values():
+            total += 1
+            if _LEAD_NUM_RE.match("".join(t for _, t in sorted(band))):
+                numbered += 1
+    return numbered / total if total else 0.0
+
+
+def _select_transcription_examples(page_text_dir: Path | str | None) -> str:
+    """Worked few-shot examples routed to the document's structure, by two signals.
+
+    A one-size-fits-all example block over-fires — heading examples over-structure
+    flat prose, and field examples mis-fire on prose. Two independent, cheap,
+    pre-transcription signals route the examples:
+
+    - the table example is shown to every document (tables span most docset kinds);
+    - the field example is added for FORM-like docs (high ":"-token density);
+    - the heading + sublist examples are added for DEEP-HIERARCHY docs (high
+      line-start numbering density) — not for flat prose, which they harm.
+    """
+    examples = prompt("transcribe_ex_table")
+    if _raw_colon_density(page_text_dir) >= _FORM_COLON_DENSITY:
+        examples += prompt("transcribe_ex_field")
+    if _line_numbering_density(page_text_dir) >= _DEEP_NUMBERING_DENSITY:
         examples += prompt("transcribe_ex_heading") + prompt("transcribe_ex_sublist")
     return examples
 
