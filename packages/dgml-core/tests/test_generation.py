@@ -237,6 +237,57 @@ def test_window_context_gives_section_path_and_open_table_header() -> None:
     assert _window_context([]) == ""
 
 
+def test_line_numbering_density_detects_hierarchical_markers(tmp_path: Path) -> None:
+    """Lines that begin with a hierarchical enumerator (1.1 / (a)) count; prose does not."""
+    from dgml_core.generation.transcribe import _line_numbering_density
+
+    def word(text: str, x: int, y: int) -> dict[str, object]:
+        return {"t": text, "l": [x, y, x + 10, y + 12]}
+
+    # 4 reconstructed lines; 2 begin with numbering ("1.1", "(a)"), 2 are plain prose
+    page = {
+        "words": [
+            word("1.1", 0, 0),
+            word("Rent", 20, 0),
+            word("The", 0, 20),
+            word("tenant", 20, 20),
+            word("(a)", 0, 40),
+            word("pays", 20, 40),
+            word("Ordinary", 0, 60),
+            word("prose", 20, 60),
+        ]
+    }
+    (tmp_path / "page_1.json").write_text(json.dumps(page), encoding="utf-8")
+    assert _line_numbering_density(tmp_path) == 0.5
+    assert _line_numbering_density(None) == 0.0
+
+
+def test_select_transcription_examples_routes_by_form_and_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two independent pre-transcription signals gate the worked examples.
+
+    The table example is always shown; the field example is added for FORM-like
+    docs (high ":"-density); the heading+sublist examples for DEEP-HIERARCHY docs
+    (high numbering density). The axes are independent.
+    """
+    from dgml_core.generation import transcribe
+
+    def routed(colon: float, numbering: float) -> tuple[bool, bool]:
+        monkeypatch.setattr(transcribe, "_raw_colon_density", lambda _d: colon)
+        monkeypatch.setattr(transcribe, "_line_numbering_density", lambda _d: numbering)
+        examples = transcribe._select_transcription_examples("ignored")
+        assert "Item Ref" in examples  # table example is shown to every document
+        # heading and sublist are added together
+        assert ("MAINTENANCE OBLIGATIONS" in examples) == ("Seller shall deliver" in examples)
+        return "Order Number" in examples, "MAINTENANCE OBLIGATIONS" in examples
+
+    assert routed(0.05, 0.00) == (True, False)  # form, flat → + field only
+    assert routed(0.005, 0.25) == (False, True)  # deep prose → + heading/sublist only
+    assert routed(0.005, 0.02) == (False, False)  # flat prose → table only
+    assert routed(0.05, 0.25) == (True, True)  # deep-hierarchy form → all examples
+
+
 # ── labeling ─────────────────────────────────────────────────────────────────
 
 
