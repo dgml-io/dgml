@@ -64,7 +64,9 @@ class _FakeAnchor:
     def __init__(self, records: list[dict[str, Any]]) -> None:
         self._records = records
 
-    def get_records(self, registry: str, *, checksum: str = "", **_: Any) -> list[dict[str, Any]]:
+    def get_records(
+        self, registry_id: int, *, checksum: str = "", **_: Any
+    ) -> list[dict[str, Any]]:
         return self._records
 
 
@@ -75,12 +77,13 @@ def test_fetch_record_prefers_is_latest() -> None:
             _rec("ab", "dgmlx://f", is_latest=True),
         ]
     )
-    assert _fetch_record(anchor, "reg", "ab")["is_latest"] is True  # type: ignore[arg-type]
+    picked = _fetch_record(anchor, 1, "ab", registry_name="reg")  # type: ignore[arg-type]
+    assert picked["is_latest"] is True
 
 
 def test_fetch_record_raises_when_empty() -> None:
     with pytest.raises(RecordNotFound):
-        _fetch_record(_FakeAnchor([]), "reg", "ab")  # type: ignore[arg-type]
+        _fetch_record(_FakeAnchor([]), 1, "ab", registry_name="reg")  # type: ignore[arg-type]
 
 
 class _FakeReceiptRpc:
@@ -124,7 +127,7 @@ def test_finish_stake_writes_named_record(tmp_path: Any) -> None:
 
     class _Anchor:
         def get_records(
-            self, registry: str, *, checksum: str = "", **_: Any
+            self, registry_id: int, *, checksum: str = "", **_: Any
         ) -> list[dict[str, Any]]:
             return [record]
 
@@ -136,7 +139,7 @@ def test_finish_stake_writes_named_record(tmp_path: Any) -> None:
         chain,
         signed,
         {"kind": "dgml-node"},
-        "reg",
+        1,
         checksum,
         uri,
         save_dir,

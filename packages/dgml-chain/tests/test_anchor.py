@@ -28,9 +28,9 @@ _ANCHOR = "0x0000000000000000000000000000000000000A00"
 def test_selectors_match_canonical_signatures() -> None:
     # The 4-byte selector is the prefix of the encoded calldata.
     rec = encode_add_record(
-        registry="r", uri="dgmlx://f", checksum="ab", checksum_algo="sha256", metadata="{}"
+        registry_id=1, uri="dgmlx://f", checksum="ab", checksum_algo="sha256", metadata="{}"
     )
-    record_sig = "addRecord((string,string,string,string,string,string,string,uint64,uint64,bool))"
+    record_sig = "addRecord((string,string,string,string,string,string,uint64,uint64,bool,uint64))"
     assert rec.startswith("0x" + function_signature_to_4byte_selector(record_sig).hex())
 
     reg = encode_add_registry("name", "desc", "{}")
@@ -59,9 +59,16 @@ def _encode_records(records: list[tuple[object, ...]]) -> str:
     return "0x" + raw.hex()
 
 
+def _encode_registries(registries: list[tuple[object, ...]]) -> str:
+    # nextKey is empty so a paginating caller stops after one page.
+    raw = encode(_output_types("registries"), [registries, (b"", len(registries))])
+    return "0x" + raw.hex()
+
+
 def test_get_records_decodes_to_snake_case() -> None:
+    # Field order mirrors the on-chain record tuple: registry is gone from the
+    # front and registryId is appended at the end.
     rec = (
-        "myreg",
         "dgmlx://f00000/ds00000",
         "deadbeef",
         "sha256",
@@ -71,9 +78,10 @@ def test_get_records_decodes_to_snake_case() -> None:
         3,
         0,
         True,
+        7,
     )
     anchor = AnchorContract(FakeRpc(_encode_records([rec])), _ANCHOR)  # type: ignore[arg-type]
-    out = anchor.get_records("myreg", checksum="deadbeef")
+    out = anchor.get_records(7, checksum="deadbeef")
     assert len(out) == 1
     r = out[0]
     assert r["checksum"] == "deadbeef"
@@ -81,8 +89,20 @@ def test_get_records_decodes_to_snake_case() -> None:
     assert r["uri"] == "dgmlx://f00000/ds00000"
     assert r["record_id"] == 3
     assert r["is_latest"] is True
+    assert r["registry_id"] == 7
 
 
 def test_get_records_empty() -> None:
     anchor = AnchorContract(FakeRpc(_encode_records([])), _ANCHOR)  # type: ignore[arg-type]
-    assert anchor.get_records("myreg") == []
+    assert anchor.get_records(1) == []
+
+
+def test_resolve_registry_id_matches_name() -> None:
+    # (id, name, description, creator, createdAt, metadata) per the ABI.
+    regs = [
+        (1, "other", "", "", "", ""),
+        (2, "myreg", "", "", "", ""),
+    ]
+    anchor = AnchorContract(FakeRpc(_encode_registries(regs)), _ANCHOR)  # type: ignore[arg-type]
+    assert anchor.resolve_registry_id("myreg") == 2
+    assert anchor.resolve_registry_id("absent") is None

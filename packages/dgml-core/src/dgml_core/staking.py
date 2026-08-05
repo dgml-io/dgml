@@ -55,6 +55,7 @@ from .errors import (
     ChainTxReverted,
     InvalidArgument,
     RecordNotFound,
+    RegistryNotFound,
     WalletKeyMissing,
 )
 from .file_attestation import attest_file, export_attestation
@@ -168,6 +169,24 @@ def _resolve_from(from_address: str | None, service: str, account: str) -> str:
             f"(service={service!r} account={account!r})"
         )
     return addr
+
+
+def _resolve_registry_id(anchor: AnchorContract, name: str) -> int:
+    """Resolve a registry name to its on-chain numeric id.
+
+    The anchor precompile keys records and registries by id, not name, so every
+    stake/prove-by-checksum call must translate the user-facing ``--registry``
+    name first. Raises ``RegistryNotFound`` when no registry carries the name.
+    """
+    try:
+        registry_id = anchor.resolve_registry_id(name)
+    except RpcError as exc:
+        raise ChainRpcFailed(str(exc)) from exc
+    if registry_id is None:
+        raise RegistryNotFound(
+            f"no registry named {name!r} on this chain; create it with `dgml registry create`"
+        )
+    return registry_id
 
 
 def _explorer_tx_url(chain: ChainConfig, tx_hash: str) -> str | None:
@@ -345,9 +364,13 @@ def registry_list(
     chain = get_chain(ws, chain_name, config_path)
     _, anchor = _clients(chain)
     try:
-        registries = anchor.get_registries(name=name or "")
+        registries = anchor.get_registries()
     except RpcError as exc:
         raise ChainRpcFailed(str(exc)) from exc
+    # The precompile dropped its on-chain name filter; filter locally so the
+    # --name flag keeps its documented behavior.
+    if name:
+        registries = [r for r in registries if r.get("name") == name]
     return {"chain": chain.name, "registries": registries}
 
 
@@ -488,8 +511,9 @@ def _anchor_record(
 
     ``extra`` carries the granularity-specific fields (bundle vs node); the
     chain/registry/uri/checksum/tx fields are common to both."""
+    registry_id = _resolve_registry_id(anchor, registry)
     data = encode_add_record(
-        registry=registry,
+        registry_id=registry_id,
         uri=uri,
         checksum=checksum,
         checksum_algo=CHECKSUM_ALGO,
@@ -502,6 +526,7 @@ def _anchor_record(
         **extra,
         "chain": chain.name,
         "registry": registry,
+        "registry_id": registry_id,
         "uri": uri,
         "checksum": checksum,
         "checksum_algo": CHECKSUM_ALGO,
@@ -514,7 +539,7 @@ def _anchor_record(
         out["signed_tx"] = signed["signed_tx"]
         return out
     return _finish_stake(
-        rpc, anchor, chain, signed, out, registry, checksum, uri, save_dir, record_name
+        rpc, anchor, chain, signed, out, registry_id, checksum, uri, save_dir, record_name
     )
 
 
@@ -524,7 +549,7 @@ def _finish_stake(
     chain: ChainConfig,
     signed: dict[str, Any],
     out: dict[str, Any],
-    registry: str,
+    registry_id: int,
     checksum: str,
     uri: str,
     save_dir: Path,
@@ -541,7 +566,7 @@ def _finish_stake(
     out["explorer_url"] = _explorer_tx_url(chain, signed["tx_hash"])
 
     try:
-        records = anchor.get_records(registry, checksum=checksum)
+        records = anchor.get_records(registry_id, checksum=checksum)
     except RpcError as exc:
         raise ChainRpcFailed(str(exc)) from exc
     record = _find_record(records, checksum, uri)
@@ -588,14 +613,17 @@ def _load_record_arg(record_json: str) -> dict[str, Any]:
     return record
 
 
-def _fetch_record(anchor: AnchorContract, registry: str, checksum: str) -> dict[str, Any]:
+def _fetch_record(
+    anchor: AnchorContract, registry_id: int, checksum: str, *, registry_name: str
+) -> dict[str, Any]:
     try:
-        records = anchor.get_records(registry, checksum=checksum)
+        records = anchor.get_records(registry_id, checksum=checksum)
     except RpcError as exc:
         raise ChainRpcFailed(str(exc)) from exc
     if not records:
         raise RecordNotFound(
-            f"no record with checksum {checksum} in registry {registry!r} on this chain"
+            f"no record with checksum {checksum} in registry "
+            f"{registry_name!r} (id {registry_id}) on this chain"
         )
     # Prefer the current version, mirroring _find_record's selection at stake
     # time, so prove verifies against the same record that was anchored.
@@ -617,7 +645,8 @@ def _resolve_record(
     if checksum and registry:
         chain = get_chain(ws, chain_name, config_path)
         _, anchor = _clients(chain)
-        return _fetch_record(anchor, registry, checksum)
+        registry_id = _resolve_registry_id(anchor, registry)
+        return _fetch_record(anchor, registry_id, checksum, registry_name=registry)
     raise InvalidArgument("prove needs either --record-json, or both --registry and --checksum")
 
 

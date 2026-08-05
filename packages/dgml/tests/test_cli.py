@@ -2945,6 +2945,18 @@ class _FakeRpc:
         self.broadcast.append(signed_tx_hex)
         return "0xfeed"
 
+    def call(self, to: str, data: str, block: str = "latest") -> str:
+        # The stake path resolves the registry NAME to its numeric id via the
+        # `registries` view before building addRecord calldata. Return one
+        # registry named "myreg" (id 1) with an empty nextKey so the client's
+        # pagination stops after a single page.
+        from dgml_chain.anchor import _output_types
+        from eth_abi import encode  # type: ignore[attr-defined]
+
+        reg = (1, "myreg", "", "", "", "")
+        raw = encode(_output_types("registries"), [[reg], (b"", 1)])
+        return "0x" + raw.hex()
+
 
 # A throwaway key (Ganache test vector); the address is derived from it.
 _TEST_KEY = "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
