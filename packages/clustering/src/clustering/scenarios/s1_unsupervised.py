@@ -311,6 +311,8 @@ class S1Unsupervised(Scenario):
             leiden_resolution=sc.leiden_resolution,
             leiden_min_cluster_size=sc.leiden_min_cluster_size,
             leiden_n_iterations=sc.leiden_n_iterations,
+            leiden_k_selection=sc.leiden_k_selection,
+            leiden_k_selection_margin=sc.leiden_k_selection_margin,
             dbscan_eps=sc.dbscan_eps,
             dbscan_r_method=sc.dbscan_r_method,
             dbscan_k_neighbors=sc.dbscan_k_neighbors,

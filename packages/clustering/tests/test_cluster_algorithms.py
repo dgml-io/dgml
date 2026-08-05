@@ -162,3 +162,136 @@ def test_leiden_radius_mode_ignores_k_neighbors_once_radius_is_explicit() -> Non
     a, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=1.0, k_neighbors=2, seed=0)
     b, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=1.0, k_neighbors=20, seed=0)
     assert torch.equal(a, b)
+
+
+# ── leiden k selection (opt-in silhouette-chosen graph degree) ────────────────
+
+
+def test_leiden_k_selection_off_is_byte_identical() -> None:
+    """The shipped default (``leiden_k_selection="none"``) must route through the
+    plain single leiden run — byte-identical to calling it directly."""
+    dim = 8
+    emb = _three_blobs(dim=dim, per=12)
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    off, _ = cluster_embeddings(emb, manifold=manifold, algorithm="leiden", leiden_k_neighbors=25)
+    ref, _ = manifold_leiden(emb, manifold, graph_method="knn", k_neighbors=25, seed=0)
+    assert torch.equal(off, ref)
+
+
+def test_leiden_k_selection_large_margin_never_switches() -> None:
+    """A margin the silhouette gap can never clear keeps the configured k, so
+    the result equals the selection-off run — the gate's conservative extreme."""
+    dim = 8
+    emb = _three_blobs(dim=dim, per=12)
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    off, _ = cluster_embeddings(emb, manifold=manifold, algorithm="leiden", leiden_k_neighbors=25)
+    held, _ = cluster_embeddings(
+        emb,
+        manifold=manifold,
+        algorithm="leiden",
+        leiden_k_neighbors=25,
+        leiden_k_selection="silhouette",
+        leiden_k_selection_margin=9.9,
+    )
+    assert torch.equal(held, off)
+
+
+def test_leiden_k_selection_only_fires_on_the_knn_graph() -> None:
+    """Selection is scoped to ``graph_method="knn"`` (what it was measured on);
+    a non-knn graph ignores it and runs the configured k unchanged."""
+    dim = 8
+    emb = _three_blobs(dim=dim, per=12)
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    ref, _ = manifold_leiden(emb, manifold, graph_method="mutual_knn", k_neighbors=25, seed=0)
+    got, _ = cluster_embeddings(
+        emb,
+        manifold=manifold,
+        algorithm="leiden",
+        leiden_graph_method="mutual_knn",
+        leiden_k_neighbors=25,
+        leiden_k_selection="silhouette",
+        leiden_k_selection_margin=0.0,
+    )
+    assert torch.equal(got, ref)
+
+
+def test_leiden_k_selection_is_a_noop_when_the_candidate_would_not_lower_k() -> None:
+    """The sparser candidate is ``max(2, (n-1)//8)``. When the configured k is
+    already at or below it, there is no sparser alternative to weigh, so the
+    configured run is returned unchanged (no wasted second clustering effect)."""
+    dim = 8
+    emb = _three_blobs(dim=dim, per=12)  # n = 36 → candidate k = 4
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    ref, _ = manifold_leiden(emb, manifold, graph_method="knn", k_neighbors=3, seed=0)
+    got, _ = cluster_embeddings(
+        emb,
+        manifold=manifold,
+        algorithm="leiden",
+        leiden_k_neighbors=3,  # <= candidate 4, so selection can't lower it
+        leiden_k_selection="silhouette",
+        leiden_k_selection_margin=0.0,
+    )
+    assert torch.equal(got, ref)
+
+
+def _closish_blobs(dim: int = 8, per: int = 15) -> torch.Tensor:
+    """Three blobs close enough that a dense k-NN graph blurs their boundaries,
+    so the sparser candidate earns a higher silhouette (n = 3*per)."""
+    g = torch.Generator().manual_seed(0)
+    centers = torch.tensor([0.0, 1.2, 2.4])
+    return torch.cat([c + 0.35 * torch.randn(per, dim, generator=g) for c in centers], dim=0)
+
+
+def test_leiden_k_selection_switches_to_the_higher_silhouette_partition() -> None:
+    """The point of the feature: when the sparser candidate degree yields a
+    higher-silhouette partition, the selector returns *that* partition (the
+    candidate k = ``(n-1)//8``), not the configured-k one — and it is never a
+    lower-silhouette choice than leaving k alone."""
+    from clustering.scenarios.clustering import _partition_silhouette
+
+    dim = 8
+    emb = _closish_blobs(dim=dim, per=15)  # n = 45 → candidate k = 5
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    off, _ = cluster_embeddings(emb, manifold=manifold, algorithm="leiden", leiden_k_neighbors=35)
+    candidate, _ = manifold_leiden(emb, manifold, graph_method="knn", k_neighbors=5, seed=0)
+    sel, _ = cluster_embeddings(
+        emb,
+        manifold=manifold,
+        algorithm="leiden",
+        leiden_k_neighbors=35,
+        leiden_k_selection="silhouette",
+        leiden_k_selection_margin=0.0,
+    )
+    # The candidate must genuinely win on silhouette here, else the test proves nothing.
+    assert _partition_silhouette(emb, candidate) > _partition_silhouette(emb, off)
+    assert torch.equal(sel, candidate), "selector returns the higher-silhouette candidate partition"
+    assert _partition_silhouette(emb, sel) >= _partition_silhouette(emb, off)
+
+
+def test_leiden_k_selection_margin_rejects_a_negative_value() -> None:
+    from clustering.config.schema import ScenarioConfig
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="leiden_k_selection_margin must be >= 0"):
+        ScenarioConfig(name="s1", leiden_k_selection_margin=-0.1)
+
+
+def test_leiden_k_selection_does_not_leak_into_the_emergent_bucket() -> None:
+    """The feature is scoped to the S1/fresh path. The S2/S3 emergent bucket
+    already scales its own graph degree (#83's sqrt cap), so enabling
+    ``leiden_k_selection`` must NOT also fire there — the bucket must cluster
+    identically on or off. Guards against a future accidental threading of the
+    flag through ``cluster_emergent_bucket``."""
+    from clustering.config.schema import ScenarioConfig
+    from clustering.scenarios.clustering import cluster_emergent_bucket
+
+    dim = 8
+    emb = _three_blobs(dim=dim, per=12)
+    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    base = ScenarioConfig(name="s2", cluster_algorithm="leiden", leiden_graph_method="knn")
+    on = base.model_copy(
+        update={"leiden_k_selection": "silhouette", "leiden_k_selection_margin": 0.0}
+    )
+    off_labels, _ = cluster_emergent_bucket(emb, scenario=base, manifold=manifold, seed=0)
+    on_labels, _ = cluster_emergent_bucket(emb, scenario=on, manifold=manifold, seed=0)
+    assert torch.equal(off_labels, on_labels)
