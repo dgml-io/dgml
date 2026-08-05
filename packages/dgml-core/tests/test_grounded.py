@@ -826,6 +826,68 @@ def test_extract_values_phase3_resolves_unmatched_via_llm(workspace: Workspace) 
     assert title["locations"] == [{"page_number": 1, "bounding_box": [100, 56, 200, 76]}]
 
 
+@pytest.mark.parametrize(
+    ("env_value", "expect_compact"),
+    [(None, False), ("off", False), ("1", True), ("true", True)],
+)
+def test_extract_values_phase3_compact_words_flag(
+    workspace: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    expect_compact: bool,
+) -> None:
+    """``DGML_COMPACT_EXTRACTION_WORDS`` selects the phase-3 word serialisation
+    end-to-end.
+
+    Off (unset/``off``) embeds the byte-identical ``json.dumps(words, indent=2)``
+    block under the JSON system prompt; on (``1``/``true``) embeds the compact
+    TOON table under the TOON system prompt. The ``submit_locations`` response
+    contract is unchanged in both arms (same mocked reply patches the same
+    bbox)."""
+    if env_value is None:
+        monkeypatch.delenv("DGML_COMPACT_EXTRACTION_WORDS", raising=False)
+    else:
+        monkeypatch.setenv("DGML_COMPACT_EXTRACTION_WORDS", env_value)
+
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    messages = mock_completion.call_args_list[1].kwargs["messages"]
+    system_text = messages[0]["content"]
+    user_text = messages[1]["content"][0]["text"]
+
+    if expect_compact:
+        assert "words[2]{idx,text,left,top,right,bottom}:" in user_text
+        assert "TOON table" in system_text
+        assert '"bounding_box"' not in user_text  # JSON word block is gone
+    else:
+        # Byte-identical to the historical json.dumps(words, indent=2) block.
+        expected_words = get_page_words(workspace, fid, 1)["words"]
+        assert json.dumps(expected_words, indent=2) in user_text
+        assert "words[2]{idx" not in user_text
+        assert "TOON table" not in system_text
+
+    # Response contract unchanged: the bbox is patched in regardless of format.
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 56, 200, 76]}
+    ]
+
+
 def test_extract_values_phase3_merges_costs_across_parallel_pages(
     workspace: Workspace,
 ) -> None:

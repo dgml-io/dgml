@@ -46,6 +46,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +87,7 @@ from .matching import (
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .prompts import get as prompt
 from .storage import Workspace, read_json, write_json_atomic, write_text_atomic
+from .toon import encode_phase3_words
 from .usage import (
     OPERATION_EXTRACT_VALUES,
     OPERATION_SCHEMA_GENERATE,
@@ -941,14 +943,21 @@ def _phase3_call_for_page(
     except FileNotFound:
         page_words = {"page": page_number, "total_words": 0, "words": []}
 
+    compact_words = _compact_extraction_words_enabled()
     user_text = _phase3_user_prompt(
         page_number=page_number,
         items=items,
         page_words=page_words,
         page_anchors=_collect_page_anchors(values, page_number),
+        compact=compact_words,
+    )
+    system_prompt = (
+        "extraction_values_phase3_system_compact"
+        if compact_words
+        else "extraction_values_phase3_system"
     )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": prompt("extraction_values_phase3_system")},
+        {"role": "system", "content": prompt(system_prompt)},
         {
             "role": "user",
             "content": [
@@ -1109,12 +1118,47 @@ def _collect_page_anchors(values: dict[str, Any], page_number: int) -> list[dict
     return out
 
 
+# Boolean flag: when on, the value-extraction grounding step (phase 3) receives
+# its OCR word listing as a compact TOON table (see :mod:`dgml_core.toon`,
+# measured at -72.2% input tokens on that payload) instead of the historical
+# ``json.dumps(..., indent=2)`` array. Off (the default) is byte-identical to
+# before this flag existed. Only the words given TO the model change — the
+# ``submit_locations`` response contract is untouched.
+_COMPACT_EXTRACTION_WORDS_ENV = "DGML_COMPACT_EXTRACTION_WORDS"
+_COMPACT_WORDS_TRUE = frozenset({"1", "true", "yes", "on"})
+_COMPACT_WORDS_FALSE = frozenset({"", "0", "false", "no", "off"})
+
+
+def _compact_extraction_words_enabled() -> bool:
+    """Resolve ``$DGML_COMPACT_EXTRACTION_WORDS`` to a bool.
+
+    Off — unset, ``""``, ``"0"``, ``"false"``, ``"no"``, ``"off"`` — keeps the
+    historical JSON word listing, byte-identical to before this flag existed.
+    On — ``"1"``, ``"true"``, ``"yes"``, ``"on"`` — switches phase 3 to the
+    compact TOON table and its prompt variant. Comparison is case-insensitive
+    and trimmed. Any other value is a loud :class:`ValueError`.
+    """
+    raw = os.environ.get(_COMPACT_EXTRACTION_WORDS_ENV)
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value in _COMPACT_WORDS_TRUE:
+        return True
+    if value in _COMPACT_WORDS_FALSE:
+        return False
+    raise ValueError(
+        f"{_COMPACT_EXTRACTION_WORDS_ENV}={raw!r} is not a valid boolean; "
+        f"expected one of {sorted(_COMPACT_WORDS_TRUE | _COMPACT_WORDS_FALSE)}"
+    )
+
+
 def _phase3_user_prompt(
     *,
     page_number: int,
     items: list[UnmatchedItem],
     page_words: dict[str, Any],
     page_anchors: list[dict[str, Any]],
+    compact: bool = False,
 ) -> str:
     items_lines = [
         f"- id: {it.id}; path: {path_to_str(it.path)}; text: {json.dumps(it.text)}" for it in items
@@ -1123,9 +1167,16 @@ def _phase3_user_prompt(
         f"- {a['path']}: text={json.dumps(a['text'])} bbox={a['bounding_box']}"
         for a in page_anchors
     ] or ["(none — these are the first values located on this page)"]
-    return prompt("extraction_values_phase3_user").format(
+    words = page_words.get("words", [])
+    if compact:
+        ocr_words = encode_phase3_words(words)
+        template = "extraction_values_phase3_user_compact"
+    else:
+        ocr_words = json.dumps(words, indent=2)
+        template = "extraction_values_phase3_user"
+    return prompt(template).format(
         page_number=page_number,
-        ocr_words=json.dumps(page_words.get("words", []), indent=2),
+        ocr_words=ocr_words,
         known_locations="\n".join(anchors_lines),
         needs_locating="\n".join(items_lines),
     )

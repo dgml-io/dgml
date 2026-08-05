@@ -239,6 +239,68 @@ extraction_values_phase3_user: |-
   NEEDS_LOCATING (return exactly these ids):
   {needs_locating}
 
+# Compact (TOON) variants of the two phase-3 prompts above, selected when
+# DGML_COMPACT_EXTRACTION_WORDS is on. The ONLY change is how the OCR word
+# listing is rendered: a compact TOON table (`words[N]{idx,text,left,top,right,bottom}:`
+# then one comma-separated row per word) instead of a JSON array. The bounding
+# box contract, coordinate space, and submit_locations response are identical to
+# the JSON variants — keep these in lock-step with the two prompts above.
+extraction_values_phase3_system_compact: |-
+  You are given one page of a PDF (as an image) plus the OCR words on
+  that page with their bounding boxes, and a list of values that need
+  to be located on this page. For each value, return its bounding box
+  (or several if the text wraps across visual lines) via the
+  ``submit_locations`` tool call.
+
+  The OCR words are given as a TOON table: a header line
+  ``words[N]{idx,text,left,top,right,bottom}:`` naming the N columns,
+  followed by one comma-separated row per word. Each row is
+  ``idx,text,left,top,right,bottom`` where ``idx`` is the word's OCR
+  index, ``text`` is the word (double-quoted when it contains a comma,
+  quote, or other special character), and ``left,top,right,bottom`` are
+  its bounding box in image pixels. There is exactly one row per word.
+
+  BOUNDING BOX CONTRACT — non-negotiable:
+
+  1. Coordinates are ``[left, top, right, bottom]`` in IMAGE PIXELS of the
+     page image (top-left origin) — the same pixel space as the OCR word
+     boxes below. NOT normalized; NOT [ymin,xmin,ymax,xmax].
+  2. Always ``left < right`` AND ``top < bottom``.
+  3. The bbox must FULLY ENCLOSE every word of the text it grounds,
+     edge to edge. Prefer over-covering by a few pixels to clipping the
+     rightmost word.
+  4. For text spanning multiple visual lines, return ONE bbox per line
+     (in reading order), all as separate entries in ``bounding_boxes``.
+
+  The OCR words table is authoritative for word positions — derive each
+  bbox by unioning the ``left,top,right,bottom`` columns for the words in
+  the value's text, then expand by a small margin so the rectangle
+  strictly contains each word. The page image is provided as a visual
+  fallback when OCR words are ambiguous.
+
+  The KNOWN_LOCATIONS section lists values on this page that have
+  already been located by another pass. Use them as row anchors —
+  unmatched fields in the same table row should share a y band with
+  their already-matched siblings.
+
+  ID DISCIPLINE:
+  - For every id in NEEDS_LOCATING, return exactly one ``locations``
+    entry keyed by that id.
+  - Do NOT echo ids that are not in NEEDS_LOCATING. Do NOT invent ids.
+  - Do NOT change the value text — your only job is to attach bboxes.
+
+extraction_values_phase3_user_compact: |-
+  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool. The OCR words table below carries pixel-accurate positions; the page image is provided as a visual fallback.
+
+  OCR_WORDS as a TOON table — a header line names the columns, then one comma-separated row per word (idx = the word's OCR index; left,top,right,bottom = its pixel bounding box). All words are on page {page_number}:
+  {ocr_words}
+
+  KNOWN_LOCATIONS on page {page_number} (already located, for row anchoring — do NOT include these in your output):
+  {known_locations}
+
+  NEEDS_LOCATING (return exactly these ids):
+  {needs_locating}
+
 # ── LLM clustering: small-corpus vision partitioner ──────────────────────────
 # Fixed prompt pieces for dgml_core.llm_clustering._build_grouping_prompt, which
 # asks the vision model to partition a small corpus into DocSets in one call.
