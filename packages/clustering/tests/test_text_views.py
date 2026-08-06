@@ -22,10 +22,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from clustering.config.schema import EncoderConfig
 from clustering.encoders import build_encoder
-from clustering.example import _build_text
+from clustering.example import VIEW_TEXT_SEP, _build_text, split_view_spec
 
 
 def _write_page(
@@ -184,3 +185,205 @@ def test_tfidf_encoder_accepts_a_corpus_where_only_some_files_are_wordless(tmp_p
 
     out = build_encoder(_tfidf_cfg(files)).encode(["rent roll tenant"])
     assert out.pooled.shape == (1, 8)
+
+
+# --- multi-view specs -------------------------------------------------------
+
+
+def test_split_view_spec_single_and_multi() -> None:
+    assert split_view_spec("full") == ("full",)
+    assert split_view_spec("page1+full+salient_boost") == ("page1", "full", "salient_boost")
+
+
+@pytest.mark.parametrize("spec", ["bogus", "page1+bogus", "page1+", "", "page1+page1"])
+def test_split_view_spec_rejects_bad_specs(spec: str) -> None:
+    # `TextView` is a bare `str` alias, so the spec is user input with no
+    # `Literal` behind it — every rejection path is worth pinning.
+    with pytest.raises(ValueError):
+        split_view_spec(spec)
+
+
+def test_build_text_multi_view_joins_each_view(doc_dir: Path) -> None:
+    parts = _build_text(doc_dir, view="page1+full+headers").split(VIEW_TEXT_SEP)
+    assert parts == [
+        _build_text(doc_dir, view="page1"),
+        _build_text(doc_dir, view="full"),
+        _build_text(doc_dir, view="headers"),
+    ]
+
+
+def test_build_text_multi_view_keeps_part_count_when_empty(tmp_path: Path) -> None:
+    # A file with no page_text still has to yield one part per view, or the
+    # encoder can't line its blocks up.
+    empty = tmp_path / "files" / "nodoc"
+    empty.mkdir(parents=True)
+    assert _build_text(empty, view="page1+full").split(VIEW_TEXT_SEP) == ["", ""]
+
+
+def test_build_text_multi_view_strips_stray_separator(tmp_path: Path) -> None:
+    # The separator can't come out of a PDF text layer, but if it ever did it
+    # would desynchronize every subsequent view, so it's normalized away.
+    d = tmp_path / "files" / "weird"
+    _write_page(d, 1, [_w(f"a{VIEW_TEXT_SEP}b", 100, 500, 160, 515)])
+    assert _build_text(d, view="page1+full").split(VIEW_TEXT_SEP) == ["a b", "a b"]
+
+
+def _tiny_corpus(files: Path) -> None:
+    """Nine 2-page docs, three vocabularies, page 1 discriminating and page 2 shared."""
+    for i, body in enumerate(
+        ["rent roll tenant lease unit occupancy"] * 3
+        + ["balance sheet assets liabilities equity"] * 3
+        + ["capital call notice commitment drawdown"] * 3
+    ):
+        d = files / f"doc{i}"
+        _write_page(
+            d,
+            1,
+            [_w(tok, 100 + 50 * j, 100, 140 + 50 * j, 115) for j, tok in enumerate(body.split())],
+        )
+        # A page-2-only term, on two thirds of the corpus so it survives both
+        # `min_df=2` and `max_df=0.9` and can be looked for in the `full` block.
+        tail = "boilerplate" if i < 6 else "appendix"
+        _write_page(d, 2, [_w(tail, 100, 100, 200, 115)])
+
+
+def _encoder(files: Path, view: str, *, dim: int = 8) -> object:
+    return build_encoder(
+        EncoderConfig(
+            name="tfidf",
+            model_id="tfidf",
+            embedding_dim=dim,
+            extra={"corpus_dir": str(files), "text_view": view},
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("dim", "view"),
+    [
+        (8, "page1+full"),  # divides exactly
+        (7, "page1+full"),  # doesn't divide — 3 per view, 6 of 7 used, 1 padded
+        (6, "page1+full+salient_boost"),  # 2 per view, exactly at the floor
+        (256, "page1+full+salient_boost"),  # the shipped width, three views
+        (768, "page1+full+salient_boost"),  # the measured configuration
+    ],
+)
+def test_tfidf_multi_view_keeps_declared_width(tmp_path: Path, dim: int, view: str) -> None:
+    files = tmp_path / "files"
+    _tiny_corpus(files)
+    enc = _encoder(files, view, dim=dim)
+    batch = [_build_text(files / "doc0", view=view)]
+    out = enc.encode(batch)  # type: ignore[attr-defined]
+    # Views share the configured width instead of multiplying it — the fusion and
+    # manifold dims are sized against `embedding_dim`, so this is a contract, and
+    # it has to hold for widths that don't divide by the view count as well as
+    # ones that do. `encode` only pads, so a width that overflowed would ship a
+    # tensor wider than the fusion expects.
+    assert out.pooled.shape == (1, dim)
+    assert abs(float(out.pooled.norm(dim=-1)[0]) - 1.0) < 1e-4
+
+
+def test_tfidf_rejects_width_too_small_for_the_views(tmp_path: Path) -> None:
+    files = tmp_path / "files"
+    _tiny_corpus(files)
+    # Each block needs >= 2 SVD components, so 3 views need >= 6 columns. Below
+    # that there is no valid split and the encoder would emit a row wider than it
+    # declares; it has to refuse instead.
+    with pytest.raises(ValueError, match="too small for the 3 text views"):
+        _encoder(files, "page1+full+salient_boost", dim=5)
+
+
+def test_tfidf_warns_when_named_views_collapse_to_the_same_text(tmp_path: Path) -> None:
+    files = tmp_path / "files"
+    # Single-page docs with uniform font and nothing in the top band: `page1` is
+    # the whole document and there is no salient signal, so all three views
+    # assemble identical text despite being three different names.
+    for i, body in enumerate(["rent roll tenant lease"] * 3 + ["balance sheet assets"] * 3):
+        _write_page(
+            files / f"doc{i}",
+            1,
+            [_w(tok, 100 + 50 * j, 500, 140 + 50 * j, 515) for j, tok in enumerate(body.split())],
+        )
+    with pytest.warns(RuntimeWarning, match="assemble identical text"):
+        _encoder(files, "page1+full+salient_boost", dim=12)
+
+
+def test_tfidf_names_the_empty_view_in_the_error(tmp_path: Path) -> None:
+    files = tmp_path / "files"
+    # Page 1 of every doc is stop words only, so the `page1` block has no
+    # vocabulary while `full` does. sklearn's own message names neither.
+    for i in range(4):
+        d = files / f"doc{i}"
+        _write_page(d, 1, [_w(tok, 100, 500, 140, 515) for tok in ("the", "and", "of")])
+        _write_page(d, 2, [_w(tok, 100, 100, 140, 115) for tok in ("rent", "roll", "tenant")])
+    with pytest.raises(ValueError, match=r"text view 'page1' .* yields no usable vocabulary"):
+        _encoder(files, "page1+full", dim=8)
+
+
+def test_tfidf_multi_view_all_empty_corpus_names_ocr(tmp_path: Path) -> None:
+    # The scanned-PDF guard has to survive multi-view: each corpus entry is the
+    # views joined by VIEW_TEXT_SEP, and the separator is not whitespace, so a
+    # naive `.strip()` would let an all-empty corpus fall through to the less
+    # specific per-view error instead of the OCR message.
+    files = tmp_path / "files"
+    for i in range(3):
+        _write_page(files / f"scan{i}", 1, [])
+    with pytest.raises(ValueError, match="none contain extracted text") as exc:
+        _encoder(files, "page1+full+salient_boost", dim=8)
+    assert "--text-mode ocr|hybrid" in str(exc.value)
+
+
+def test_tfidf_multi_view_blocks_are_independently_fitted(tmp_path: Path) -> None:
+    files = tmp_path / "files"
+    _tiny_corpus(files)
+    enc = _encoder(files, "page1+full")
+    # One fitted (vectorizer, SVD) per view, and they saw different text: page 1
+    # alone never contains the page-2 boilerplate term.
+    vocabs = [v.vocabulary_ for v, _ in enc._blocks]  # type: ignore[attr-defined]
+    assert len(vocabs) == 2
+    assert "boilerplate" not in vocabs[0]
+    assert "boilerplate" in vocabs[1]
+
+
+def test_tfidf_multi_view_encodes_arbitrary_strings(tmp_path: Path) -> None:
+    files = tmp_path / "files"
+    _tiny_corpus(files)
+    enc = _encoder(files, "page1+full")
+    # S4 encodes category-name prototypes and the scenarios encode all-empty
+    # placeholder rows: strings with no document (and so no views) behind them.
+    # They must still produce a full-width row rather than raising.
+    out = enc.encode(["rent roll", ""])  # type: ignore[attr-defined]
+    assert out.pooled.shape == (2, 8)
+    assert abs(float(out.pooled.norm(dim=-1)[0]) - 1.0) < 1e-4
+
+
+def test_tfidf_single_view_output_unchanged_by_multi_view_support(tmp_path: Path) -> None:
+    # The single-view path must be untouched: it is what every shipped config
+    # uses, so it is pinned against a hand-rolled fit of the same pipeline.
+    pytest.importorskip("sklearn")
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    files = tmp_path / "files"
+    _tiny_corpus(files)
+    corpus = [_build_text(files / f"doc{i}", view="page1") for i in range(9)]
+    vec = TfidfVectorizer(
+        stop_words="english", ngram_range=(1, 2), sublinear_tf=True, min_df=2, max_df=0.9
+    )
+    tfidf = vec.fit_transform(corpus)
+    # Both bounds spelled out rather than assumed: SVD rank is capped by the
+    # vocabulary *and* by the corpus size, and hardcoding either would make the
+    # reference silently diverge if `_tiny_corpus` changed size.
+    rank = max(min(8, tfidf.shape[1] - 1, tfidf.shape[0] - 1), 2)
+    svd = TruncatedSVD(n_components=rank, random_state=0)
+    svd.fit(tfidf)
+    batch = corpus[:2]
+    expected = svd.transform(vec.transform(batch))
+    expected = expected / np.linalg.norm(expected, axis=1, keepdims=True)
+
+    pooled = _encoder(files, "page1").encode(batch).pooled.numpy()  # type: ignore[attr-defined]
+    assert pooled.shape == (2, 8)
+    assert np.allclose(pooled[:, :rank], expected, atol=1e-6)
+    # The rest is padding, and asserting it is zero is what would catch a wrong
+    # component count hiding inside a right-width tensor.
+    assert np.array_equal(pooled[:, rank:], np.zeros((2, 8 - rank), dtype=pooled.dtype))

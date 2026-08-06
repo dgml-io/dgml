@@ -22,6 +22,10 @@ jobs:
       - run: uv sync --all-extras --dev --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      # `.gemini/skills/*` are hand-kept mirrors of the canonical `.claude/skills/*`
+      # copies; a stale one teaches an agent a CLI surface that no longer exists.
+      - name: Check agent skill mirrors
+        run: scripts/check-agent-skills.sh
 
   typecheck:
     name: Type check

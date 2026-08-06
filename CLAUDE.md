@@ -87,18 +87,20 @@ bypass with separate venvs.
 
 ### Verify locally before pushing
 
-CI runs four gates: `ruff check`, `ruff format --check`, `mypy packages`,
-`pytest`, and a `pip-licenses` audit (see `.github/workflows/ci.yml`).
-`scripts/verify.sh` runs the same things, in the same order, against
-your local venv — use it before `git push` to avoid the push → CI fails
+CI runs these gates: `ruff check`, `ruff format --check`,
+`scripts/check-agent-skills.sh` (the `.claude`/`.gemini` skill mirrors must
+match — run it with `--fix` to resync), `mypy packages`, `pytest`, and a
+`pip-licenses` audit (see `.github/workflows/ci.yml`, which spreads them over
+four parallel jobs). `scripts/verify.sh` runs the same checks, sequentially,
+against your local venv — use it before `git push` to avoid the push → CI fails
 → fix → push loop:
 
 ```bash
 scripts/verify.sh              # everything CI runs (~15s on a warm venv)
 scripts/verify.sh --no-sync    # skip `uv sync` if pyproject/uv.lock are
                                # unchanged (faster repeats)
-scripts/verify.sh --fast       # lint + format + types only (skip tests
-                               # and license audit — quick feedback loop)
+scripts/verify.sh --fast       # lint + format + skill mirrors + types only
+                               # (skip tests and license audit — quick loop)
 ```
 
 Mirror, don't drift — if you change CI, update `verify.sh`, and vice versa.

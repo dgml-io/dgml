@@ -277,8 +277,23 @@ under its config section (e.g. `scenario.leiden_resolution`,
 | Parameter (section) | What it controls | Default | Raise / switch up when… | Lower / switch down when… |
 |---|---|---|---|---|
 | `encoder_text.name` | Text embedding model. `tfidf` (bag-of-words, fast, CPU) vs dense sentence encoders `bge` / `e5` / `gte` (semantic, need a model download). | `tfidf` | Categories differ by *meaning*, not vocabulary; short docs; TF-IDF under-separates. Switch to a dense encoder (`bge` / `e5`), or add a vision encoder as the `medium` / `heavy` presets do. | You want zero downloads / CPU-only speed and the vocabularies are already distinctive. |
-| `encoder_text.embedding_dim` + `manifold.dim` | Vector width. Must match the encoder (`tfidf` 256, `bge` 384, `e5` 1024). Keep these two equal. | 256 | Switching to a wider encoder. | Switching to a narrower encoder. |
-| `encoder_text.extra.text_view` | Which text is embedded: `page1` (first page only) or the full document. | `page1` | The first page doesn't characterize the doc (cover pages, boilerplate); use full text. | First pages are highly distinctive (forms, letterheads) — cheaper and less noisy. |
+| `encoder_text.embedding_dim` + `manifold.dim` | Vector width. Must match the encoder (`tfidf` 256, `bge` 384, `e5` 1024). Keep these two equal. A multi-view `text_view` (below) shares this width across its views, so give it 256 per view. | 256 | Switching to a wider encoder, or combining text views. | Switching to a narrower encoder. |
+| `encoder_text.extra.text_view` | Which text `tfidf` embeds: `page1` (first page only), `full` (every page), `headers` (just the title/header words, picked out by font size and page position) or `salient_boost` (those headers repeated ahead of the full body). `headers` is not recommended on its own: across four internal corpora it scored below *both* `page1` and `full` on all four, by 0.145 mean NMI against the default. | `page1` | The first page doesn't characterize the doc (cover pages, boilerplate); use `full`. | First pages are highly distinctive (forms, letterheads) — cheaper and less noisy. |
+| `encoder_text.extra.text_view` — **several views at once** | Views can be combined with `+` (`page1+full+salient_boost`). Rather than one bag of words, `tfidf` then fits an independent block per view — its own vocabulary, document frequencies and SVD basis — and stacks them, so the reducer can use whichever view separates a given pair of documents. | one view | You don't know which view suits the corpus, which is the usual case: no single view wins everywhere. Across four internal corpora this raised mean NMI from 0.63 to 0.69 and beat the single-view default on **all four**. | You want the cheapest possible encoder — it costs one TF-IDF fit and one SVD per view — or the corpus is small enough that one view already separates it. |
+
+> **A combined `text_view` needs the width to go with it.** The views *share*
+> `encoder_text.embedding_dim`, so three views at the default 256 leaves each with
+> only 85 components — measured, that is *worse* than a plain `page1` run on a
+> corpus with enough documents for 256 components to be real. Set `embedding_dim`
+> (and `manifold.dim`) to 256 × the number of views:
+>
+> ```json
+> {"clustering": {
+>   "encoder_text": {"name": "tfidf", "embedding_dim": 768,
+>                    "extra": {"text_view": "page1+full+salient_boost"}},
+>   "manifold": {"name": "euclidean", "dim": 768}
+> }}
+> ```
 
 **Reduction — compress before clustering** (`scenario.*`)
 

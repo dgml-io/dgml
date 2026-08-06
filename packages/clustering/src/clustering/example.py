@@ -120,8 +120,53 @@ def _concat_page_text(file_dir: Path) -> str:
 # collapse together. The structure-aware views recover that signal using the
 # per-word bounding boxes (``l = [x0, y0, x1, y1]``) already stored alongside
 # each word — font size is proxied by box height (``y1 - y0``).
-TextView = str  # "full" | "page1" | "headers" | "salient_boost"
+#
+# A view spec may also name *several* views joined by ``+``
+# (e.g. ``"page1+full+salient_boost"``). That is not a fifth view: it asks the
+# encoder to build one independent representation per named view and stack them,
+# so the reducer gets each view's own vocabulary, document-frequency statistics
+# and SVD basis rather than one bag of words in which the views' terms are
+# merged. Only :class:`~clustering.encoders.lexical.TfidfEncoder` acts on the
+# distinction; ``_build_text`` just returns the parts, joined by a separator that
+# cannot occur in extracted text so the encoder can recover them.
+TextView = str  # "full" | "page1" | "headers" | "salient_boost", or "a+b[+c…]"
 _SALIENT_BOOST_REPEAT = 3  # times salient text is repeated ahead of the body
+_TEXT_VIEWS = ("full", "page1", "headers", "salient_boost")
+VIEW_SPEC_SEP = "+"  # separates view names inside a spec
+# NUL never appears in a PDF/OCR text layer, and any that somehow did is
+# replaced at assembly time, so splitting on it always yields exactly one part
+# per named view.
+VIEW_TEXT_SEP = "\x00"
+
+
+def split_view_spec(view: TextView) -> tuple[str, ...]:
+    """Parse a text-view spec into its component view names.
+
+    A single name returns a 1-tuple, so callers need no special case. Raises
+    :class:`ValueError` on an unknown name, an empty component, or a repeated
+    one — ``TextView`` is a bare ``str`` alias with no ``Literal`` to validate
+    against, and a multi-view spec arrives from user config, so it is checked
+    here (once, at assembly) rather than failing deeper in an encoder.
+    """
+    # Surrounding space is stripped: `"page1 + full"` is what a human writes into
+    # a JSON config, and failing it as an unknown view `"page1 "` would be a
+    # confusing way to say "no spaces please".
+    names = tuple(name.strip() for name in view.split(VIEW_SPEC_SEP))
+    if not all(names):
+        raise ValueError(
+            f"text view spec {view!r} has an empty component; expected one or more view "
+            f"names joined by a single {VIEW_SPEC_SEP!r} (e.g. 'page1+full')."
+        )
+    for name in names:
+        if name not in _TEXT_VIEWS:
+            raise ValueError(
+                f"unknown text view {name!r} in spec {view!r}; expected one of "
+                f"{', '.join(_TEXT_VIEWS)}, or several joined by "
+                f"{VIEW_SPEC_SEP!r} (e.g. 'page1+full')."
+            )
+    if len(set(names)) != len(names):
+        raise ValueError(f"text view spec {view!r} repeats a view; each may appear once.")
+    return names
 
 
 @dataclass(frozen=True)
@@ -201,15 +246,30 @@ def _salient_words(pages: list[_Page]) -> list[str]:
 
 
 def _build_text(file_dir: Path, *, view: TextView = "full") -> str:
-    """Assemble the text input for one file under the requested ``view``.
+    """Assemble the text input for one file under the requested ``view`` spec.
 
     - ``full``: every word, every page, in reading order (the original behavior).
     - ``page1``: only the first page (where the type is usually declared).
     - ``headers``: only the salient title/header words (empty ⇒ falls back to full).
     - ``salient_boost``: salient words repeated ahead of the full body, so the
       type tokens dominate the mean-pooled embedding without losing the body.
+
+    A multi-view spec (``"page1+full"``) returns each view's text joined by
+    :data:`VIEW_TEXT_SEP`. Pages are parsed once and shared across the views.
     """
+    names = split_view_spec(view)
     pages = _load_pages(file_dir)
+    if len(names) == 1:
+        return _text_from_pages(pages, names[0])
+    # Strip any separator the source text somehow carried, so the number of
+    # parts an encoder recovers always equals the number of views requested.
+    return VIEW_TEXT_SEP.join(
+        _text_from_pages(pages, name).replace(VIEW_TEXT_SEP, " ") for name in names
+    )
+
+
+def _text_from_pages(pages: list[_Page], view: str) -> str:
+    """Assemble one single-view text from already-parsed pages."""
     if not pages:
         return ""
     if view == "page1":
