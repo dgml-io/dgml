@@ -826,29 +826,16 @@ def test_extract_values_phase3_resolves_unmatched_via_llm(workspace: Workspace) 
     assert title["locations"] == [{"page_number": 1, "bounding_box": [100, 56, 200, 76]}]
 
 
-@pytest.mark.parametrize(
-    ("env_value", "expect_compact"),
-    [(None, False), ("off", False), ("1", True), ("true", True)],
-)
-def test_extract_values_phase3_compact_words_flag(
+def test_extract_values_phase3_words_are_toon_encoded(
     workspace: Workspace,
-    monkeypatch: pytest.MonkeyPatch,
-    env_value: str | None,
-    expect_compact: bool,
 ) -> None:
-    """``DGML_COMPACT_EXTRACTION_WORDS`` selects the phase-3 word serialisation
-    end-to-end.
+    """Phase 3 unconditionally renders the OCR word listing as the compact TOON
+    table under the TOON system prompt — no env flag involved.
 
-    Off (unset/``off``) embeds the byte-identical ``json.dumps(words, indent=2)``
-    block under the JSON system prompt; on (``1``/``true``) embeds the compact
-    TOON table under the TOON system prompt. The ``submit_locations`` response
-    contract is unchanged in both arms (same mocked reply patches the same
-    bbox)."""
-    if env_value is None:
-        monkeypatch.delenv("DGML_COMPACT_EXTRACTION_WORDS", raising=False)
-    else:
-        monkeypatch.setenv("DGML_COMPACT_EXTRACTION_WORDS", env_value)
-
+    The words reach the model as ``words[N]{idx,text,left,top,right,bottom}:``
+    plus one row per word (never the old ``json.dumps(words, indent=2)`` array),
+    the system prompt documents that TOON table, and the ``submit_locations``
+    response contract is unchanged (the mocked reply patches the bbox in)."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
@@ -871,18 +858,12 @@ def test_extract_values_phase3_compact_words_flag(
     system_text = messages[0]["content"]
     user_text = messages[1]["content"][0]["text"]
 
-    if expect_compact:
-        assert "words[2]{idx,text,left,top,right,bottom}:" in user_text
-        assert "TOON table" in system_text
-        assert '"bounding_box"' not in user_text  # JSON word block is gone
-    else:
-        # Byte-identical to the historical json.dumps(words, indent=2) block.
-        expected_words = get_page_words(workspace, fid, 1)["words"]
-        assert json.dumps(expected_words, indent=2) in user_text
-        assert "words[2]{idx" not in user_text
-        assert "TOON table" not in system_text
+    # The word listing is the compact TOON table, and the JSON block is gone.
+    assert "words[2]{idx,text,left,top,right,bottom}:" in user_text
+    assert "TOON table" in system_text
+    assert json.dumps(get_page_words(workspace, fid, 1)["words"], indent=2) not in user_text
 
-    # Response contract unchanged: the bbox is patched in regardless of format.
+    # Response contract unchanged: the bbox is patched in from submit_locations.
     assert result.values["title"]["locations"] == [
         {"page_number": 1, "bounding_box": [100, 56, 200, 76]}
     ]

@@ -10,14 +10,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the phase-3 TOON word-listing codec and its selector flag."""
+"""Tests for the phase-3 TOON word-listing codec."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import pytest
-from dgml_core.grounded import _compact_extraction_words_enabled
 from dgml_core.toon import decode_phase3_words, encode_phase3_words, toon_scalar
 
 _PAGE = 4
@@ -157,45 +156,3 @@ def test_decode_rejects_row_count_mismatch() -> None:
 def test_decode_rejects_wrong_cell_count() -> None:
     with pytest.raises(ValueError, match="cells, expected 6"):
         decode_phase3_words("words[1]{idx,text,left,top,right,bottom}:\n  0,a,1,2,3", _PAGE)
-
-
-# ---------------------------------------------------------------------------
-# flag resolver
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        # Off: unset, empty/whitespace, and the accepted false spellings.
-        (None, False),
-        ("", False),
-        ("  ", False),
-        ("0", False),
-        ("false", False),
-        ("no", False),
-        ("off", False),
-        ("OFF", False),  # case-insensitive
-        # On: the accepted true spellings, case-insensitive and trimmed.
-        ("1", True),
-        ("true", True),
-        ("yes", True),
-        ("on", True),
-        ("On", True),
-        ("  TRUE  ", True),
-    ],
-)
-def test_flag_resolves(monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: bool) -> None:
-    if raw is None:
-        monkeypatch.delenv("DGML_COMPACT_EXTRACTION_WORDS", raising=False)
-    else:
-        monkeypatch.setenv("DGML_COMPACT_EXTRACTION_WORDS", raw)
-    assert _compact_extraction_words_enabled() is expected
-
-
-def test_flag_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DGML_COMPACT_EXTRACTION_WORDS", "yaml")
-    with pytest.raises(
-        ValueError, match="DGML_COMPACT_EXTRACTION_WORDS='yaml' is not a valid boolean"
-    ):
-        _compact_extraction_words_enabled()
