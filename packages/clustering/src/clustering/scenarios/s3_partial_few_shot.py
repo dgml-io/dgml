@@ -82,6 +82,7 @@ class S3PartialFewShot(Scenario):
             coverage=sc.calibration.coverage,
             abstain_threshold=sc.calibration.abstain_threshold,
             n_shots=n_shots,
+            selection=sc.support_selection,
         )
         result = assign_to_prototypes(
             embeddings,

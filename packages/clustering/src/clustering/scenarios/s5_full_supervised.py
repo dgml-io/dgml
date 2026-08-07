@@ -138,6 +138,7 @@ class S5FullSupervised(Scenario):
             coverage=cal.coverage,
             abstain_threshold=cal.abstain_threshold,
             n_shots=n_shots,
+            selection=self.config.scenario.support_selection,
             prototype_transform=prototype_transform,
         )
         result = assign_to_prototypes(

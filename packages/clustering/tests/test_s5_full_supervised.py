@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 import torch
-from clustering.config.schema import Config
+from clustering.config.schema import Config, SupportSelection
 from clustering.data.datasets import DocumentDataset, DocumentRecord
 from clustering.encoders.base import Encoder, EncoderOutput
 from clustering.scenarios.s5_full_supervised import S5FullSupervised
@@ -191,7 +191,7 @@ def test_support_prototypes_central_picks_typical_over_first() -> None:
     labels: list[str | None] = ["Invoice", "Invoice", "Invoice", "Invoice"]
     sc = _scenario({})  # euclidean identity manifold (expmap0 == identity), dim 2
 
-    def proto(selection: str, n_shots: int = 2) -> torch.Tensor:
+    def proto(selection: SupportSelection, n_shots: int = 2) -> torch.Tensor:
         return sc._support_prototypes(
             emb, labels, categories=["Invoice"], n_shots=n_shots, selection=selection
         )
@@ -212,7 +212,7 @@ def test_support_prototypes_central_is_noop_when_within_budget() -> None:
     labels: list[str | None] = ["Invoice", "Invoice"]
     sc = _scenario({})
 
-    def proto(selection: str) -> torch.Tensor:
+    def proto(selection: SupportSelection) -> torch.Tensor:
         return sc._support_prototypes(
             emb, labels, categories=["Invoice"], n_shots=8, selection=selection
         )

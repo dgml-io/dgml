@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from clustering.config.schema import Config
+from clustering.config.schema import Config, SupportSelection
 from clustering.data.datasets import DocumentDataset, DocumentRecord
 from clustering.encoders import build_encoder
 from clustering.encoders.base import EncoderOutput
@@ -394,7 +394,7 @@ class Scenario(ABC):
         *,
         categories: list[str],
         n_shots: int | None = None,
-        selection: str = "order",
+        selection: SupportSelection = "order",
     ) -> torch.Tensor:
         """Build one on-manifold prototype per category from labeled samples.
 
@@ -439,7 +439,7 @@ class Scenario(ABC):
                     # not on whatever happened to come first in the dataset.
                     rows = support_embeddings[torch.tensor(support_idx)]
                     dist = torch.linalg.norm(rows - rows.mean(dim=0, keepdim=True), dim=1)
-                    keep = torch.argsort(dist)[:n_shots].tolist()
+                    keep = torch.argsort(dist, stable=True)[:n_shots].tolist()
                     support_idx = [support_idx[int(j)] for j in keep]
                 else:  # "order" — first n_shots in dataset order (unchanged)
                     support_idx = support_idx[:n_shots]
