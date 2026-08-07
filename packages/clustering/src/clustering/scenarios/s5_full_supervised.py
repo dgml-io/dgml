@@ -87,6 +87,7 @@ class S5FullSupervised(Scenario):
             support_labels,
             categories=cats,
             n_shots=n_shots,
+            selection=self.config.scenario.support_selection,
         )
 
         # ── Optionally blend in a name prototype (few-shot prior) ────────

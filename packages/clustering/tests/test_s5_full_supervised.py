@@ -176,6 +176,54 @@ def test_s5_n_shots_uses_first_samples_per_category() -> None:
     assert result.metadata["n_support"] == 3
 
 
+def test_support_prototypes_central_picks_typical_over_first() -> None:
+    # Invoice: an OUTLIER first in dataset order, then a tight typical cluster.
+    # With n_shots=2, "order" averages the first two (outlier included) while
+    # "central" averages the two nearest the class mean (outlier excluded).
+    emb = torch.tensor(
+        [
+            [0.0, 10.0],  # outlier — first in order
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ]
+    )
+    labels: list[str | None] = ["Invoice", "Invoice", "Invoice", "Invoice"]
+    sc = _scenario({})  # euclidean identity manifold (expmap0 == identity), dim 2
+
+    def proto(selection: str, n_shots: int = 2) -> torch.Tensor:
+        return sc._support_prototypes(
+            emb, labels, categories=["Invoice"], n_shots=n_shots, selection=selection
+        )
+
+    order = proto("order")
+    central = proto("central")
+
+    # order = mean of first two rows, dragged up toward the outlier
+    assert torch.allclose(order[0], torch.tensor([0.0, 5.0]), atol=1e-4)
+    # central = mean of the two rows nearest the class mean (outlier dropped)
+    assert torch.allclose(central[0], torch.tensor([0.0, 0.5]), atol=1e-4)
+    assert not torch.allclose(order[0], central[0])
+
+
+def test_support_prototypes_central_is_noop_when_within_budget() -> None:
+    # <= n_shots samples: nothing to choose, both selections use every row.
+    emb = torch.tensor([[0.0, 0.0], [0.0, 2.0]])
+    labels: list[str | None] = ["Invoice", "Invoice"]
+    sc = _scenario({})
+
+    def proto(selection: str) -> torch.Tensor:
+        return sc._support_prototypes(
+            emb, labels, categories=["Invoice"], n_shots=8, selection=selection
+        )
+
+    assert torch.allclose(proto("order")[0], proto("central")[0])
+
+
+def test_scenario_support_selection_defaults_to_order() -> None:
+    assert _config().scenario.support_selection == "order"
+
+
 def test_s5_requires_non_empty_known_categories() -> None:
     scenario = _scenario({}, categories=[])
 

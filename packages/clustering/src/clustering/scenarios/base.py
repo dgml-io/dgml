@@ -394,13 +394,19 @@ class Scenario(ABC):
         *,
         categories: list[str],
         n_shots: int | None = None,
+        selection: str = "order",
     ) -> torch.Tensor:
         """Build one on-manifold prototype per category from labeled samples.
 
         For each category in ``categories`` we collect the ``support_embeddings``
         rows whose corresponding ``support_labels`` entry matches, optionally
-        cap to the first ``n_shots`` of them (in dataset order), take the
-        ambient mean, then push it onto the manifold via :meth:`expmap0`.
+        cap to ``n_shots`` of them, take the ambient mean, then push it onto the
+        manifold via :meth:`expmap0`. When a category has more than ``n_shots``
+        samples, ``selection`` decides which to keep: ``"order"`` takes the first
+        ``n_shots`` in dataset order (default, unchanged); ``"central"`` takes the
+        ``n_shots`` nearest the category's ambient mean — the most typical, which
+        builds a cleaner prototype from the same budget. Ranking is in the same
+        ambient space the mean is taken in.
         Raises a clear ``ValueError`` when a category has zero samples — the
         caller (S3 / S5) typically wants to know rather than silently dropping
         the class.
@@ -415,6 +421,9 @@ class Scenario(ABC):
                 has one row per category in this order.
             n_shots: Maximum number of samples per category to average.
                 ``None`` (default) means use every matching sample.
+            selection: ``"order"`` (default) or ``"central"`` — how to pick the
+                ``n_shots`` samples when a category has more than that. Ignored
+                when ``n_shots`` is ``None`` or the category has ``<= n_shots``.
 
         Returns:
             ``[len(categories), D]`` on-manifold prototype tensor.
@@ -422,8 +431,18 @@ class Scenario(ABC):
         protos: list[torch.Tensor] = []
         for cat in categories:
             support_idx = [i for i, lbl in enumerate(support_labels) if lbl == cat]
-            if n_shots is not None:
-                support_idx = support_idx[:n_shots]
+            if n_shots is not None and len(support_idx) > n_shots:
+                if selection == "central":
+                    # Keep the n_shots rows nearest the category's ambient mean
+                    # (the most typical), ranked in the same space the mean below
+                    # is taken in — so a capped budget spends on representatives,
+                    # not on whatever happened to come first in the dataset.
+                    rows = support_embeddings[torch.tensor(support_idx)]
+                    dist = torch.linalg.norm(rows - rows.mean(dim=0, keepdim=True), dim=1)
+                    keep = torch.argsort(dist)[:n_shots].tolist()
+                    support_idx = [support_idx[int(j)] for j in keep]
+                else:  # "order" — first n_shots in dataset order (unchanged)
+                    support_idx = support_idx[:n_shots]
             if not support_idx:
                 raise ValueError(
                     f"No support samples for category {cat!r}. "

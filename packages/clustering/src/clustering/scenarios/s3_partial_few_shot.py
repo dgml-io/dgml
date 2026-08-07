@@ -61,6 +61,7 @@ class S3PartialFewShot(Scenario):
             support_labels,
             categories=cats,
             n_shots=n_shots,
+            selection=self.config.scenario.support_selection,
         )
 
         # ── Embed unknown set + initial assignment with composable gates ─
