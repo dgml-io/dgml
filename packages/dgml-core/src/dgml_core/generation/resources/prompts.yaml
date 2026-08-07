@@ -73,6 +73,65 @@
   value field is empty and its INLAND MARINE option carries the printed
   mark, so it is prefixed *; the P line's address types its line breaks as
   \n; the I line keeps its printed "(a)" enumerator in the lim field.)
+"transcribe_ex_heading": |2
+
+  Worked example — headings become H lines (level on the sigil; deeper printed
+  number = deeper level, consistently); body prose is a P line:
+       2. MAINTENANCE OBLIGATIONS
+       2.1 Routine servicing
+       The contractor services the units each quarter.
+       2.1.1 Response times
+     →
+  H2	2.	MAINTENANCE OBLIGATIONS
+  H3	2.1	Routine servicing
+  P	The contractor services the units each quarter.
+  H4	2.1.1	Response times
+"transcribe_ex_sublist": |2
+
+  Worked example — every printed enumerator is its own I line (marker in the lim
+  field); a sub-series "(i)/(ii)" is I lines just like its parent series:
+       (a) Seller shall deliver the goods; and
+           (i) delivery is DDP; and
+           (ii) risk passes on delivery.
+       (b) Buyer shall pay within 30 days.
+     →
+  I	(a)	Seller shall deliver the goods; and
+  I	(i)	delivery is DDP; and
+  I	(ii)	risk passes on delivery.
+  I	(b)	Buyer shall pay within 30 days.
+"transcribe_ex_field": |2
+
+  Worked example — each label/value line is one F line (lim, label, value); a
+  short "Label: value" line is an F, NEVER a heading; a choice group is one O
+  line whose CHECKED options are prefixed with *:
+       Order Number: ORD-4417        Ship Date: 12 March 2024
+       Handling:  [X] Standard   [ ] Overnight   [X] Signature on delivery
+     →
+  F		Order Number	ORD-4417
+  F		Ship Date	12 March 2024
+  O		Handling		*Standard	Overnight	*Signature on delivery
+"transcribe_ex_table": |2
+
+  Worked example — aligned/ruled columns become R lines (one cell per field; the
+  header row is an R line too); a label|value grid laid out as a ruled table is
+  R lines, not F lines:
+       Item Ref  Description        Qty   Unit Price
+       BR-100    Mounting bracket    12       3.40
+       GR-050    Rubber grommet      50       0.18
+     →
+  R	Item Ref	Description	Qty	Unit Price
+  R	BR-100	Mounting bracket	12	3.40
+  R	GR-050	Rubber grommet	50	0.18
+
+  A key/value grid — label|value pairs in ALIGNED columns — is also R lines,
+  one 2-cell R per pair (NOT prose, NOT F lines):
+       Company        Northwind Trading Ltd
+       VAT Number     QX447019823
+       Registration   Zed-90210
+     →
+  R	Company	Northwind Trading Ltd
+  R	VAT Number	QX447019823
+  R	Registration	Zed-90210
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
 "transcribe_window_context": |-

@@ -437,6 +437,52 @@ def test_transcribe_compact_prompt_has_rules_and_worked_example() -> None:
         assert rule in compact
 
 
+def test_transcription_fewshot_flag_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """$DGML_TRANSCRIBE_FEWSHOT is opt-in: unset/empty is OFF, any value turns it on."""
+    from dgml_core.generation.transcribe import _transcription_fewshot_enabled
+
+    monkeypatch.delenv("DGML_TRANSCRIBE_FEWSHOT", raising=False)
+    assert _transcription_fewshot_enabled() is False  # unset -> off
+    monkeypatch.setenv("DGML_TRANSCRIBE_FEWSHOT", "")
+    assert _transcription_fewshot_enabled() is False  # empty -> off
+    monkeypatch.setenv("DGML_TRANSCRIBE_FEWSHOT", "1")
+    assert _transcription_fewshot_enabled() is True  # set -> on
+
+
+def test_structure_detection_routes_examples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detectors read layout from the word boxes; the router gates examples on them."""
+    from dgml_core.generation import transcribe
+    from dgml_core.generation.transcribe import _numbered_heading_count, _tabular_fraction
+
+    def w(text: str, x0: int, y0: int) -> dict[str, object]:
+        return {"t": text, "l": [x0, y0, x0 + 40, y0 + 12]}
+
+    # a 2-column row with a wide internal gap, then a plain prose line
+    two = [w("Label", 0, 0), w("Value", 300, 0), w("plain", 0, 30), w("prose", 45, 30)]
+    (tmp_path / "page_1.json").write_text(json.dumps({"words": two}), encoding="utf-8")
+    assert _tabular_fraction(tmp_path) == 0.5  # 1 of 2 lines has a column gap
+    assert _tabular_fraction(None) == 0.0
+    # lines beginning with an enumerator count; plain prose does not
+    enum = [w("1.1", 0, 0), w("(a)", 0, 30), w("plain", 0, 60)]
+    (tmp_path / "page_1.json").write_text(json.dumps({"words": enum}), encoding="utf-8")
+    assert _numbered_heading_count(tmp_path) == 2
+
+    def routed(tab: float, headings: int) -> tuple[bool, bool]:
+        monkeypatch.setattr(transcribe, "_tabular_fraction", lambda _d: tab)
+        monkeypatch.setattr(transcribe, "_numbered_heading_count", lambda _d: headings)
+        ex = transcribe._select_transcription_examples("ignored")
+        assert ("Order Number" in ex) == ("Item Ref" in ex)  # field + table gated together
+        assert ("MAINTENANCE OBLIGATIONS" in ex) == ("Seller shall deliver" in ex)
+        return "Item Ref" in ex, "MAINTENANCE OBLIGATIONS" in ex
+
+    assert routed(0.5, 0) == (True, False)  # tabular only -> field + table
+    assert routed(0.0, 40) == (False, True)  # numbered only -> heading + sublist
+    assert routed(0.5, 40) == (True, True)  # both -> all
+    assert routed(0.0, 0) == (False, False)  # neither -> none
+
+
 # ── labeling ─────────────────────────────────────────────────────────────────
 
 
