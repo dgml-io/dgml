@@ -311,9 +311,9 @@ def convert_batch(
             )
 
     # Re-render prior docs whose rendered XML changed and emit only those. All
-    # concepts are docset:-namespaced, so sharing no longer shifts prefixes; a
+    # concepts are docset:-namespaced, so sharing does not shift prefixes; a
     # prior render still changes when entity-container grouping moves as the
-    # docset's schema/roster grows (or, once, migrating legacy dg:-namespaced
+    # docset's schema/roster grows (or when migrating legacy dg:-namespaced
     # concepts to docset:).
     if prior_docs and opts.dgml_header and on_output is not None:
         for name, blocks in prior_docs.items():

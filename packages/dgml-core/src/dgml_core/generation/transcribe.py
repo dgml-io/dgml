@@ -432,9 +432,10 @@ def _append_continuation(blocks: list[Block], continuation: str) -> None:
 # caller passes the file's page_text/ directory (per-page words written by
 # digital extraction/OCR before generation), every window's output is checked
 # against the words its pages actually contain, and re-requested when recall
-# falls below _GATE_RECALL. Healthy windows measure >=0.96 on real corpora;
-# observed failures measure 0.13-0.66. Windows whose pages carry fewer than
-# _GATE_MIN_TOKENS extractable words (image-only scans) are never gated.
+# falls below _GATE_RECALL. Healthy windows recall nearly all of their pages'
+# words; windows that stopped early fall far short. Windows whose pages carry
+# fewer than _GATE_MIN_TOKENS extractable words (image-only scans) are never
+# gated.
 _GATE_RECALL = 0.85
 _GATE_MIN_TOKENS = 50
 _GATE_RETRIES = 1

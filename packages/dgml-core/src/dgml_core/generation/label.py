@@ -23,7 +23,7 @@ Density contract: every heading block MUST receive a section-role concept;
 repeating items/rows/fields receive their shared role; only connective prose may stay
 unlabeled. Option I still applies — boilerplate paragraphs with no
 queryable role legitimately get nothing — but "skip almost everything" is
-not a permitted reading anymore.
+not a permitted reading.
 
 Text is never touched; entities are VERBATIM QUOTES of the value, located
 in the block's text by the pipeline — the model never counts positions.
@@ -118,8 +118,8 @@ def render_block_listing(doc_name: str, blocks: list[Block]) -> str:
     """One-line-per-block input for one labeling call — FULL block text.
 
     The labeler must see the complete text: entities are verbatim quotes, so
-    any truncation here is a hard ceiling on what can be labeled (an earlier
-    snippet cap made values past the cut impossible to quote).
+    any truncation here is a hard ceiling on what can be labeled — a value
+    past the cut can never be quoted.
     """
     lines: list[str] = [f"== {doc_name} =="]
     for b in blocks:
@@ -151,9 +151,8 @@ def render_roster(roster: Mapping[str, RosterEntry]) -> str:
     reuse-verbatim intro. PLANNED concepts (proposed by the roster planner but
     not yet observed) render as name + description only, under a softer intro.
     The split gives the labeler an honest confidence signal instead of one
-    uniform list; descriptions and examples are never conflated (the old
-    single-string roster rendered planned descriptions inside an "e.g." hint).
-    Confirmed entries fill the size cap first.
+    uniform list; descriptions and examples are never conflated. Confirmed
+    entries fill the size cap first.
     """
     confirmed = [(n, e) for n, e in roster.items() if e.confirmed]
     planned = [(n, e) for n, e in roster.items() if not e.confirmed]
@@ -204,8 +203,8 @@ def _locate_quote(text: str, raw_span: Mapping[str, Any]) -> tuple[int, int] | N
     """Resolve a verbatim entity quote to a [start, end) span in *text*.
 
     The model COPIES the value; the pipeline does the arithmetic — models
-    cannot count positions reliably (the earlier offset contract cut values
-    mid-token in live runs). The quote must occur verbatim on token boundaries
+    cannot count positions reliably, and a model-emitted offset would cut
+    values mid-token. The quote must occur verbatim on token boundaries
     (via :func:`_find_verbatim`); ``occurrence`` (1-based) picks among
     boundary-valid repeats, defaulting to the first.
     """
@@ -645,9 +644,9 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
             first.cell_concepts = []
             first.cell_entities = []
             # Remember this row is a demoted printed-title row so the renderer can
-            # emit its cells as ColumnHeader structure-td elements (gold's
-            # <ColumnHeader structure="td"> shape) instead of anonymous dg:chunk
-            # tds, which the recall check counts as a headerless table.
+            # emit its cells as ColumnHeader structure-td elements instead of
+            # anonymous dg:chunk tds, which the recall check counts as a
+            # headerless table.
             first.header_row = True
         # Table name: the one the model gave (first non-empty), shared by all.
         group = _most_common([b.group_concept for b in run])
@@ -775,15 +774,13 @@ PLAN_SYSTEM_PROMPT = prompt("plan_system")
 # Block structures that define the document's role skeleton — what the
 # concept planner needs to see from every document.
 _SKELETON_STRUCTURES = {"heading", "field", "row"}
-# Effectively "the whole document" for real corpora (observed skeletons run
-# 25-420 lines; Underlease-style docs sat just past the old 400 cap and were
-# truncated) while still bounding a pathological 500-page manual.
+# Effectively "the whole document" for real corpora (observed skeletons run a
+# few hundred lines) while still bounding a pathological 500-page manual.
 _PLAN_MAX_LINES_PER_DOC = 2000
 # Max documents whose skeleton feeds the single roster-planning call. Depth
-# beats breadth: planning sees FEW documents IN FULL rather than many
-# truncated ones (same worst-case line budget as the old 20 x 400). The
-# roster only needs the RECURRING roles of a same-kind docset; every document
-# is still fully labeled in Pass B (which extends the roster).
+# beats breadth: planning sees FEW documents IN FULL rather than many truncated
+# ones. The roster only needs the RECURRING roles of a same-kind docset; every
+# document is still fully labeled in Pass B (which extends the roster).
 _PLAN_MAX_DOCS = 4
 # Unseeded runs label this many documents (the largest, same sort as planning)
 # as a PILOT first; their observed evidence promotes the planned roster to
@@ -1390,8 +1387,8 @@ def label_documents(
     total_blocks = sum(len(b) for b in docs.values())
     log(f"Pass B: labeling {total_blocks} block(s) across {len(docs)} doc(s)...")
     warnings: list[str] = []
-    # The roster (a.k.a. the docset's concept "schema" — see --schema-path; not
-    # renamed because it ACCUMULATES during labeling, unlike a static schema).
+    # The roster (a.k.a. the docset's concept "schema" — see --schema-path;
+    # called a roster because it ACCUMULATES during labeling, unlike a static schema).
     # When the caller supplies a seed, it IS the roster and planning is skipped;
     # otherwise one planning call sees every document's skeleton side by side
     # and names the SHARED roles. Either way the per-document calls below apply
