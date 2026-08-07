@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
+import statistics
 import tempfile
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ from dgml_core.generation.blocks import (
 )
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.pages import pdf_page_count
+from dgml_core.textmatch import Word, fuzzy_norm, line_groups
 
 _UNSAFE_FNAME_RE = re.compile(r'[<>:"/\\|?*]')
 
@@ -134,6 +137,99 @@ def strip_fences(text: str) -> str:
 # (:func:`parse_window_any`), so legacy JSON replies — including cached raw
 # ``*_wNN_raw.json`` artifacts from older runs — keep parsing unchanged.
 SYSTEM_PROMPT = prompt("transcribe_system_compact")
+
+
+def _page_words(page_text_dir: Path | str | None) -> Iterator[list[Word]]:
+    """Yield each page's words (as :class:`textmatch.Word`) from the page_text JSONs.
+
+    Wraps the raw ``page_text`` word dicts in the shared ``Word`` type so the
+    detectors below can reuse ``textmatch.line_groups`` for line reconstruction.
+    Nothing is yielded without a page_text dir.
+    """
+    if page_text_dir is None:
+        return
+    for page_file in sorted(Path(page_text_dir).glob("page_*.json")):
+        try:
+            raw = json.loads(page_file.read_text(encoding="utf-8")).get("words", [])
+        except (OSError, ValueError):
+            continue
+        words: list[Word] = []
+        for i, w in enumerate(raw):
+            box = w.get("l")
+            if isinstance(box, list) and len(box) == 4:
+                text = str(w.get("t", ""))
+                left, top, right, bottom = box
+                words.append(
+                    Word(
+                        idx=i,
+                        text=text,
+                        text_norm=fuzzy_norm(text),
+                        left=round(left),
+                        top=round(top),
+                        right=round(right),
+                        bottom=round(bottom),
+                    )
+                )
+        yield words
+
+
+# A document reads as TABULAR when at least this fraction of its lines carry an
+# internal column gap — whitespace wider than a line height between two words,
+# i.e. content laid out in aligned columns.
+_TABULAR_MIN = 0.10
+# A document has a NUMBERED section hierarchy when at least this many lines begin
+# with a printed enumerator ("1.1", "2.", "(a)"). Documents with numbered
+# sections clear it; flat prose and unnumbered tables do not.
+_HEADING_MIN = 10
+_LEAD_NUM_RE = re.compile(r"^(\d+\.\d+|\d+\.\s|\(?[a-z]\)|\(?[ivx]+\))", re.IGNORECASE)
+
+
+def _tabular_fraction(page_text_dir: Path | str | None) -> float:
+    """Fraction of page lines that carry an internal column gap (tabular layout)."""
+    total = tab = 0
+    for words in _page_words(page_text_dir):
+        if not words:
+            continue
+        ref = statistics.median(w.height for w in words) or 10.0
+        for line in line_groups(words):
+            total += 1
+            ln = sorted(line, key=lambda w: w.left)
+            if any(ln[i + 1].left - ln[i].right > 1.2 * ref for i in range(len(ln) - 1)):
+                tab += 1
+    return tab / total if total else 0.0
+
+
+def _numbered_heading_count(page_text_dir: Path | str | None) -> int:
+    """Number of page lines that begin with a hierarchical enumerator (1.1 / 2. / (a))."""
+    count = 0
+    for words in _page_words(page_text_dir):
+        for line in line_groups(words):
+            lead = "".join(w.text for w in sorted(line, key=lambda w: w.left))
+            if _LEAD_NUM_RE.match(lead):
+                count += 1
+    return count
+
+
+def _transcription_fewshot_enabled() -> bool:
+    """True when $DGML_TRANSCRIBE_FEWSHOT is set to any non-empty value (like $DGML_DEBUG)."""
+    return bool(os.environ.get("DGML_TRANSCRIBE_FEWSHOT"))
+
+
+def _select_transcription_examples(page_text_dir: Path | str | None) -> str:
+    """Select worked examples for the document's structure, detected from the word boxes:
+
+    - tabular layout (>= _TABULAR_MIN of lines have a column gap) -> field + table;
+    - a numbered section hierarchy (>= _HEADING_MIN enumerated lines) -> heading + sublist.
+
+    A document with neither gets no examples (the compact prompt verbatim), so flat
+    prose is never nudged into inventing tables or headings.
+    """
+    examples = ""
+    if _tabular_fraction(page_text_dir) >= _TABULAR_MIN:
+        examples += prompt("transcribe_ex_field") + prompt("transcribe_ex_table")
+    if _numbered_heading_count(page_text_dir) >= _HEADING_MIN:
+        examples += prompt("transcribe_ex_heading") + prompt("transcribe_ex_sublist")
+    return examples
 
 
 def _heading_breadcrumb(blocks: list[Block]) -> list[str]:
@@ -551,6 +647,11 @@ def transcribe_document(
     windows = document.iter_windows(total, window_size, overlap=0)
     log(f"{doc_name}: {total} pages → {len(windows)} window(s)")
     page_tokens = _page_token_lists(page_text_dir)
+    # Default OFF → the compact prompt verbatim. When $DGML_TRANSCRIBE_FEWSHOT is
+    # on, append the per-document routed worked examples (same TL grammar).
+    system_prompt = SYSTEM_PROMPT
+    if _transcription_fewshot_enabled():
+        system_prompt += _select_transcription_examples(page_text_dir)
 
     # One usage row per document, aggregating every window's call (gated on
     # --debug via the config). ``config`` is fresh per document in the pipeline,
@@ -587,7 +688,7 @@ def transcribe_document(
                     )
                 raw = llm.call_continued(
                     config,
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     user_content=llm.build_user_content(
                         instruction_text=attempt_instr, pdf_bytes=pdf_slice
                     ),
