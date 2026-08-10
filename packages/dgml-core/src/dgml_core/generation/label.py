@@ -670,8 +670,8 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
         data_rows = [b for b in run if b is not header and b.cells]
         if data_rows:
             modal = Counter(len(b.cells) for b in data_rows).most_common(1)[0][0]
-            # "Full-width" DATA rows, matching table_recall's own definition
-            # (len > modal/2): rows with far fewer cells are banner/span rows,
+            # "Full-width" DATA rows (len > modal/2): rows with far fewer
+            # cells are banner/span rows,
             # but ragged transcription can leave a real data row a cell or two
             # off the mode, so a strict ==modal filter would wrongly drop the
             # rows that actually carry the column concepts (mis-flagging the
@@ -695,8 +695,8 @@ def propagate_table_consistency(blocks: list[Block]) -> None:
             # with only 2 rows "no column concept repeats" is unreliable (a
             # small or slightly mis-aligned DATA table trips it), and
             # mis-rendering a data table as key-value moves its values a level
-            # deeper and costs F1. 3 rows is the same floor table_recall uses
-            # for its row-level table checks.
+            # deeper and costs F1. 3 rows is the floor for the row-level
+            # table checks.
             if not repeats and len(election) >= 3:
                 for b in run:
                     b.kv_table = True
@@ -1404,7 +1404,10 @@ def label_documents(
             name: RosterEntry(description=str(desc), confirmed=True)
             for name, desc in roster_seed.items()
         }
-        log(f"Pass B.1: seeded roster from schema ({len(roster)} concept(s)); planning skipped")
+        log(
+            f"Pass B.1: seeded roster from legacy roster seed "
+            f"({len(roster)} concept(s)); planning skipped"
+        )
     else:
         planned = plan_concept_roster(
             docs, config=config, cache_dir=cache_dir, debug=debug, log=log, refine=roster_refine

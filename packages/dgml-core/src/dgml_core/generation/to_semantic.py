@@ -444,8 +444,8 @@ def render_dgml(
 ) -> str:
     """Blocks → final ``dg:chunk`` dgml (the conversion's product).
 
-    *header* is the ``<dg:chunk …>`` opening tag from
-    ``semantic_transform.build_header`` (declares the namespaces).
+    *header* is the ``<dg:chunk …>`` opening tag from this module's
+    ``build_header`` (declares the namespaces).
 
     *parent_map* (leaf concept → container concept, from a seed schema) drives
     the entity-container grouping in ``build_tree``. Every concept renders as
