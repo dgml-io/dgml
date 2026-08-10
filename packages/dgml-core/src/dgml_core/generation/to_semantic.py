@@ -297,8 +297,7 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> No
         el.set(_ST, "tr")
         if block.header_row:
             # A demoted printed-title row renders as ColumnHeader structure-td
-            # cells (gold's <docset:ColumnHeader structure="td">Cases</…> shape),
-            # so the table is no longer counted headerless.
+            # cells, so the table is not counted headerless.
             for cell in block.cells:
                 th = ET.SubElement(el, _concept_tag("ColumnHeader") or _CP)
                 th.set(_ST, "td")
