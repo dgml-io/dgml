@@ -76,7 +76,7 @@ from .extraction_xml import (
     standalone_extraction_doc,
 )
 from .files import FileStore
-from .llm import LLMConfig, call_with_tools
+from .llm import LLMConfig, call_with_tools, is_anthropic_model
 from .matching import (
     UnmatchedItem,
     path_to_str,
@@ -396,6 +396,11 @@ def generate_schema(
             messages=messages,
             tools=tools,
             tool_choice={"type": "function", "function": {"name": _TOOL_SUBMIT_SCHEMA}},
+            # Deliberately NOT cached: the cacheable prefix is tools + system,
+            # and this system prompt is well short of the provider's minimum
+            # cacheable prefix, so a breakpoint would create no entry. Schema
+            # generation also runs once per docset, so there is no reuse to
+            # capture even if it did.
         )
     except Exception as exc:
         raise SchemaGenerationFailed(
@@ -608,12 +613,24 @@ def extract_values(
         phase1_started = time.monotonic()
         phase1_schema = _drop_bboxes_from_schema(schema)
         phase1_values_schema = _expand_refs(phase1_schema)
+        # The schema text is byte-identical for every file in a docset, so a
+        # cache breakpoint here covers tools + system + schema across files;
+        # the per-file PDF that follows it differs per file and stays uncached.
+        schema_text_block: dict[str, Any] = {
+            "type": "text",
+            "text": _values_phase1_user_prompt(phase1_schema),
+        }
+        # ``cache_control`` is Anthropic-specific, so gate on the provider the
+        # same way ``call_with_tools`` gates its own marker — otherwise a
+        # ``gemini/*`` values model gets an Anthropic-only key in user content.
+        if is_anthropic_model(config.values_model):
+            schema_text_block["cache_control"] = {"type": "ephemeral"}
         phase1_messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompt("extraction_values_phase1_system")},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _values_phase1_user_prompt(phase1_schema)},
+                    schema_text_block,
                     _pdf_content_block(pdf_bytes),
                 ],
             },
@@ -711,6 +728,8 @@ def extract_values(
                     prompt_tokens=merged_totals["prompt_tokens"],
                     completion_tokens=merged_totals["completion_tokens"],
                     total_tokens=merged_totals["total_tokens"],
+                    cache_read_tokens=merged_totals["cache_read_tokens"],
+                    cache_creation_tokens=merged_totals["cache_creation_tokens"],
                     duration_s=round(time.monotonic() - started, 3),
                     outcome=outcome,
                     context={
@@ -758,6 +777,11 @@ def _empty_totals() -> dict[str, Any]:
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
+        # Anthropic prompt-cache counters (default 0, summable). These flow
+        # into ``extraction_stats.json`` via the ``**phaseN_totals`` spread
+        # and into the ``usage.jsonl`` row via ``_merge_totals``.
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
 
 
@@ -930,7 +954,16 @@ def _phase3_call_for_page(
 ) -> dict[str, list[dict[str, Any]]]:
     """One litellm call: send the page + ids that need locating, return
     ``{id: [{page_number, bounding_box}, ...]}`` parsed from the model's
-    ``submit_locations`` tool call."""
+    ``submit_locations`` tool call.
+
+    Deliberately uncached, for three independent reasons: the cacheable prefix
+    is tools + system and ``_submit_locations_tool`` is built from *this page's*
+    unmatched ids, so the prefix differs on every call and no read can match;
+    page calls run in parallel, and an entry is only readable once the first
+    response has begun streaming; and the phase-3 system prompt alone is under
+    the minimum cacheable prefix. Marking it only risks paying the cache-write
+    premium for a read that cannot arrive — the same reasoning that keeps the
+    PDF and image blocks untagged."""
     image_path = workspace.file_dir(file_id) / "page_images" / f"page_{page_number}.png"
     if not image_path.exists():
         raise ValuesExtractionFailed(
@@ -1250,7 +1283,11 @@ def _run_extract_loop(
     tool_calls_run = 0
     for _ in range(max_tool_iters):
         try:
-            result = call_with_tools(llm_config, messages=messages, tools=tools)
+            # Always cached: the system prompt and the schema block ahead of the
+            # per-file PDF are byte-identical for every file in the docset, so
+            # each file after the first reads that prefix instead of re-sending
+            # it. ``call_with_tools`` no-ops the marker for non-Anthropic models.
+            result = call_with_tools(llm_config, messages=messages, tools=tools, cache=True)
         except Exception as exc:
             raise ValuesExtractionFailed(
                 f"extraction call failed: {type(exc).__name__}: {exc}"
