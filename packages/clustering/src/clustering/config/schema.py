@@ -27,6 +27,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 FusionName = Literal["none", "concat_norm", "late_concat", "cross_attention", "gated"]
 ManifoldName = Literal["euclidean", "spherical", "hyperbolic", "product"]
 ScenarioName = Literal["s1", "s2", "s3", "s4", "s5"]
+# How the few-shot / supervised scenarios (S3, S5) pick which support samples
+# build each category prototype when a category has more than ``n_shots``:
+# ``order`` keeps the first ``n_shots`` in dataset order (today's behaviour);
+# ``central`` keeps the ``n_shots`` nearest the category mean (the most typical),
+# a measured win over ``order`` when support is capped, largest at low shot counts.
+SupportSelection = Literal["order", "central"]
 # Text-encoder names that share the SentenceTransformer adapter — the
 # instruction-tuned / Matryoshka / MTEB-frontier crew (E5, BGE, GTE,
 # Stella, Jina v3). Distinct registry names rather than a single
@@ -300,6 +306,15 @@ class ScenarioConfig(_StrictModel):
     k_clusters: int | None = None
     n_shots: int | None = None
     known_categories: list[str] | None = None
+    # ── Support-sample selection (S3 / S5) ────────────────────────────────
+    support_selection: SupportSelection = "order"
+    """Which support samples build each prototype when a category has more than
+    ``n_shots`` of them. ``"order"`` (default) keeps the first ``n_shots`` in
+    dataset order — today's behaviour. ``"central"`` keeps the ``n_shots`` nearest
+    the category's ambient mean (the most typical), which builds a cleaner
+    prototype from the same budget; measured to beat ``"order"`` on all four
+    internal corpora, largest at low shot counts. A no-op when a category has
+    ``<= n_shots`` samples (nothing to choose)."""
     # ── Name+support prototype blend (S5) ─────────────────────────────────
     name_prototype_blend: float | None = None
     """Blend weight ``alpha`` in [0, 1] mixing the encoded category-*name* prototype
