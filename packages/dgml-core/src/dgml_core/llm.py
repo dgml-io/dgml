@@ -308,6 +308,55 @@ def _mark_last_block_cacheable(
     return out
 
 
+def _mark_system_message_cacheable(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a shallow copy of *messages* with the system message tagged
+    ``cache_control: {"type": "ephemeral"}`` for Anthropic (tool-call path).
+
+    Mirrors :func:`_build_system_message` for :func:`call_with_tools`, whose
+    callers pass a fully-built ``messages`` list rather than the
+    ``system_prompt`` + ``user_content`` split the text path uses. Only the
+    first ``role == "system"`` message is tagged (the extraction call sites have
+    exactly one, always first): a string ``content`` is wrapped into a single
+    cacheable text block; a list ``content`` gets the marker on its last block.
+
+    The system prompt is the block callers are most likely to share across
+    requests, but a marker is not a guarantee: the provider caches nothing if
+    the prefix ahead of the breakpoint — tools, then system — is shorter than
+    its minimum cacheable length, and nothing is read back unless a later
+    request repeats that prefix exactly.
+
+    Per-request-volatile user content (per-file PDF, per-page image, per-page
+    OCR words) is deliberately left untouched — a caller that also has a
+    *stable* user block (e.g. the docset schema text in phase-1 extraction) tags
+    it itself before calling. A shallow copy is returned so the caller's list,
+    reused across a tool loop, is never mutated.
+    """
+    out: list[dict[str, Any]] = [dict(m) for m in messages]
+    for i, msg in enumerate(out):
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            out[i] = {
+                **msg,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        elif isinstance(content, list) and content:
+            blocks = [dict(b) for b in content]
+            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            out[i] = {**msg, "content": blocks}
+        break
+    return out
+
+
 def call_with_refinement(
     config: LLMConfig,
     *,
@@ -637,6 +686,7 @@ def call_with_tools(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     tool_choice: str | dict[str, Any] | None = None,
+    cache: bool = False,
 ) -> CallResult:
     """Invoke the configured model with tool definitions; return the full
     message plus parsed usage.
@@ -654,7 +704,24 @@ def call_with_tools(
     ``"required"`` or a ``{"type": "function", ...}`` dict to force a
     tool call; the Anthropic ``reasoning_effort`` drop is keyed off
     that forced choice.
+
+    ``cache=True`` enables provider prompt caching. For Anthropic-routed
+    models it tags the system message with ``cache_control: {"type":
+    "ephemeral"}`` (via :func:`_mark_system_message_cacheable`), so the
+    tools + system prefix — identical across every call in a docset —
+    replays at ~10% token cost within the 5-minute TTL. Callers that also
+    carry a *stable* user-content block (e.g. the docset schema text that is
+    byte-identical across every file) tag that block themselves before
+    calling; per-request-volatile blocks (per-file PDF, per-page image/OCR
+    words) are never tagged. litellm forwards ``cache_control`` on system and
+    message content blocks for Anthropic even on tool-carrying requests, so
+    caching composes with ``tools``. Caching changes only billing and
+    latency — the request the model sees, and hence its output, are
+    unaffected. For non-Anthropic providers caching is implicit and the flag
+    is a no-op.
     """
+    if cache and is_anthropic_model(config.model):
+        messages = _mark_system_message_cacheable(messages)
     kwargs = _build_completion_kwargs(
         config,
         messages=messages,

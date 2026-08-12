@@ -1539,3 +1539,129 @@ def test_extract_values_counts_dropped_refs_in_stats(workspace: Workspace) -> No
     )
     assert stats["matching"]["computed_fields"] == 1
     assert stats["matching"]["dropped_refs"] == 2
+
+
+def _cache_control_paths(obj: Any, path: str = "") -> list[str]:
+    """Every location a ``cache_control`` key appears at, for assertions."""
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "cache_control":
+                found.append(path)
+            else:
+                found.extend(_cache_control_paths(v, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            found.extend(_cache_control_paths(v, f"{path}[{i}]"))
+    return found
+
+
+def test_phase1_schema_block_not_cached_off_anthropic(workspace: Workspace) -> None:
+    """The phase-1 schema block is Anthropic-gated, like the transport's marker.
+
+    ``cache_control`` is Anthropic-specific. ``call_with_tools`` guards its own
+    system-message marker with ``is_anthropic_model``; the schema-text block in
+    ``extract_values`` must do the same, or a Gemini values model would get an
+    Anthropic-only key injected into its user content.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": values})
+
+    gemini_cfg = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="gemini/gemini-2.5-pro"
+    )
+    with patch("litellm.completion", return_value=response) as m:
+        extract_values(workspace, ds_id, fid, config=gemini_cfg)
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == []
+
+    anthropic_cfg = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="anthropic/claude-sonnet-4-6"
+    )
+    with patch("litellm.completion", return_value=response) as m:
+        extract_values(workspace, ds_id, fid, config=anthropic_cfg)
+    # System message (tagged by the transport) plus the schema-text block.
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == [
+        "[0].content[0]",
+        "[1].content[0]",
+    ]
+
+
+def test_schema_gen_never_cached(workspace: Workspace) -> None:
+    """Schema generation carries no cache marker.
+
+    Its cacheable prefix (tools + a short system prompt) is below the provider's
+    minimum cacheable length, so a breakpoint creates no entry — and schema-gen
+    runs once per docset, so there is no reuse to capture regardless.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", return_value=response) as m:
+        generate_schema(workspace, [fid], config=config, docset_name="D")
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == []
+
+
+def test_phase3_never_cached(workspace: Workspace) -> None:
+    """Phase-3 page calls carry no cache marker.
+
+    ``_submit_locations_tool`` is built from the page's own unmatched ids, so the
+    tools+system prefix differs on every call and no read can ever match; the
+    calls also run in parallel, and the system prompt alone is under the minimum
+    cacheable prefix. A marker could only cost the write premium.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=1)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "Hello", "l": [0, 0, 10, 10]}])
+    _seed_page_image(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    # A phase-1 value whose text will not match page_text, forcing phase 3.
+    phase1_values = {"title": {"text": "Unmatchable zzzz", "locations": [{"page_number": 1}]}}
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="anthropic/claude-sonnet-4-6"
+    )
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response(
+                "submit_locations",
+                {"locations": [{"id": "a", "bounding_boxes": [[1.0, 2.0, 3.0, 4.0]]}]},
+                call_id="p3",
+            ),
+        ],
+    ) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert len(m.call_args_list) >= 2, "phase 3 did not run; test would be vacuous"
+    for call in m.call_args_list[1:]:
+        assert _cache_control_paths(call.kwargs["messages"]) == []
+
+
+def test_phase1_caches_by_default(workspace: Workspace) -> None:
+    """Phase 1 marks its stable prefix with no configuration required.
+
+    The system prompt and the schema block ahead of the per-file PDF are
+    byte-identical for every file in a docset, so each file after the first
+    reads that prefix. This is on unconditionally for Anthropic values models —
+    the test pins that so a refactor cannot silently drop the marker.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": values})
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="anthropic/claude-sonnet-4-6"
+    )
+    with patch("litellm.completion", return_value=response) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    # System message (tagged by the transport) plus the schema-text block.
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == [
+        "[0].content[0]",
+        "[1].content[0]",
+    ]

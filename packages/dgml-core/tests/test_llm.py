@@ -148,6 +148,136 @@ def test_call_with_refinement_no_cache_markers_off_anthropic(
     assert "cache_control" not in seen[0][1]["content"][-1]
 
 
+def _tool_resp() -> Any:
+    """Attribute-accessible fake response for call_with_tools (no tool call)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="ok", tool_calls=None),
+                finish_reason="stop",
+            )
+        ]
+    )
+
+
+def _extraction_messages() -> list[dict[str, Any]]:
+    """A phase-1-shaped tool-call message list: string system + [schema, PDF]."""
+    return [
+        {"role": "system", "content": "SYS"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "SCHEMA"},
+                {"type": "file", "file": {"file_data": "data:application/pdf;base64,AAA"}},
+            ],
+        },
+    ]
+
+
+def test_call_with_tools_marks_system_cache_on_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cache=True tags the system message for Anthropic; volatile user content
+    (the per-file PDF) is left untouched."""
+    seen: list[list[dict[str, Any]]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs["messages"])
+        return _tool_resp()
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+
+    llm.call_with_tools(
+        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        messages=_extraction_messages(),
+        tools=[{"type": "function", "function": {"name": "t"}}],
+        cache=True,
+    )
+
+    sys_msg, user_msg = seen[0][0], seen[0][1]
+    # System message is wrapped into a cacheable text block.
+    assert sys_msg["content"][0]["cache_control"] == {"type": "ephemeral"}
+    # The per-file PDF block is never tagged by call_with_tools.
+    assert "cache_control" not in user_msg["content"][-1]
+
+
+def test_call_with_tools_preserves_caller_marked_stable_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stable user block the caller pre-tagged (e.g. the docset schema text)
+    passes through untouched alongside the system marker."""
+    seen: list[list[dict[str, Any]]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs["messages"])
+        return _tool_resp()
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+
+    messages = _extraction_messages()
+    messages[1]["content"][0]["cache_control"] = {"type": "ephemeral"}  # schema text
+
+    llm.call_with_tools(
+        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "t"}}],
+        cache=True,
+    )
+
+    user_msg = seen[0][1]
+    assert seen[0][0]["content"][0]["cache_control"] == {"type": "ephemeral"}  # system
+    assert user_msg["content"][0]["cache_control"] == {"type": "ephemeral"}  # schema kept
+    assert "cache_control" not in user_msg["content"][-1]  # PDF still untagged
+
+
+def test_call_with_tools_no_cache_markers_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cache=False leaves the system message as a plain string (uncached path)."""
+    seen: list[list[dict[str, Any]]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs["messages"])
+        return _tool_resp()
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+
+    llm.call_with_tools(
+        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        messages=_extraction_messages(),
+        tools=[{"type": "function", "function": {"name": "t"}}],
+        cache=False,
+    )
+
+    assert seen[0][0]["content"] == "SYS"  # untouched plain string
+    assert "cache_control" not in seen[0][1]["content"][0]
+
+
+def test_call_with_tools_no_cache_markers_off_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-Anthropic providers get plain content even with cache=True (implicit
+    provider caching)."""
+    seen: list[list[dict[str, Any]]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs["messages"])
+        return _tool_resp()
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+
+    llm.call_with_tools(
+        llm.LLMConfig(model="gpt-4o"),
+        messages=_extraction_messages(),
+        tools=[{"type": "function", "function": {"name": "t"}}],
+        cache=True,
+    )
+
+    assert seen[0][0]["content"] == "SYS"  # plain string, no cache blocks
+
+
 def _obj_resp(content: str, finish: str) -> Any:
     """Attribute-accessible fake response (call_continued reads .choices[*])."""
     from types import SimpleNamespace
