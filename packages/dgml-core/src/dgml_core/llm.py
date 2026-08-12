@@ -550,6 +550,8 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
                     prompt_tokens=totals["prompt_tokens"],
                     completion_tokens=totals["completion_tokens"],
                     total_tokens=totals["total_tokens"],
+                    cache_read_tokens=totals["cache_read_tokens"],
+                    cache_creation_tokens=totals["cache_creation_tokens"],
                     duration_s=round(time.monotonic() - started, 3),
                     outcome=outcome,
                     context=config.context or {},
@@ -692,6 +694,8 @@ def empty_usage_totals() -> dict[str, Any]:
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
 
 
@@ -742,6 +746,8 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
                     prompt_tokens=totals["prompt_tokens"],
                     completion_tokens=totals["completion_tokens"],
                     total_tokens=totals["total_tokens"],
+                    cache_read_tokens=totals["cache_read_tokens"],
+                    cache_creation_tokens=totals["cache_creation_tokens"],
                     duration_s=round(time.monotonic() - started, 3),
                     outcome=outcome,
                     context=config.context or {},

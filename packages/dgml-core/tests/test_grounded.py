@@ -149,12 +149,16 @@ def _tool_call_response(
     cost_usd: float | None = None,
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
 ) -> SimpleNamespace:
     """A litellm-shaped completion response with one tool call.
 
     Cost/token fields are optional — when set they get plumbed through
     the same attributes :func:`dgml_core.usage.extract_cost_and_tokens` reads
-    in production, so tests can lock telemetry math."""
+    in production, so tests can lock telemetry math. Cache counters use the
+    litellm source names (``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``)."""
     call = SimpleNamespace(
         id=call_id,
         function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
@@ -163,13 +167,18 @@ def _tool_call_response(
     response = SimpleNamespace(choices=[SimpleNamespace(message=msg)])
     if cost_usd is not None:
         response._hidden_params = {"response_cost": cost_usd}
-    if prompt_tokens is not None or completion_tokens is not None:
+    has_cache = cache_read_tokens is not None or cache_creation_tokens is not None
+    if prompt_tokens is not None or completion_tokens is not None or has_cache:
         total = (prompt_tokens or 0) + (completion_tokens or 0)
         response.usage = SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total,
         )
+        if cache_read_tokens is not None:
+            response.usage.cache_read_input_tokens = cache_read_tokens
+        if cache_creation_tokens is not None:
+            response.usage.cache_creation_input_tokens = cache_creation_tokens
     return response
 
 
@@ -912,6 +921,8 @@ def test_extract_values_phase3_merges_costs_across_parallel_pages(
                 cost_usd=0.02,
                 prompt_tokens=200,
                 completion_tokens=10,
+                cache_read_tokens=150,
+                cache_creation_tokens=20,
             ),
             _tool_call_response(
                 "submit_locations",
@@ -920,6 +931,8 @@ def test_extract_values_phase3_merges_costs_across_parallel_pages(
                 cost_usd=0.04,
                 prompt_tokens=300,
                 completion_tokens=15,
+                cache_read_tokens=250,
+                cache_creation_tokens=0,
             ),
         ],
     ) as mock_completion:
@@ -935,6 +948,10 @@ def test_extract_values_phase3_merges_costs_across_parallel_pages(
     assert stats["phases"]["phase3"]["prompt_tokens"] == 500
     assert stats["phases"]["phase3"]["completion_tokens"] == 25
     assert stats["phases"]["phase3"]["total_tokens"] == 525
+    # Anthropic prompt-cache counters merge across the parallel page-calls
+    # and land in the extraction_stats sidecar alongside the token totals.
+    assert stats["phases"]["phase3"]["cache_read_tokens"] == 400
+    assert stats["phases"]["phase3"]["cache_creation_tokens"] == 20
     # Phase 1's cost stays separate from phase 3's.
     assert stats["phases"]["phase1"]["cost_usd"] == pytest.approx(0.01)
 
@@ -988,6 +1005,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
     }
     assert set(stats["phases"]["phase2"].keys()) == {"duration_s"}
     assert set(stats["phases"]["phase3"].keys()) == {
@@ -997,6 +1016,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
     }
     assert stats["phases"]["phase3"]["page_calls"] == 0
     assert "duration_s" in stats["phases"]["phase2"]

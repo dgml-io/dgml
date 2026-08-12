@@ -711,6 +711,8 @@ def extract_values(
                     prompt_tokens=merged_totals["prompt_tokens"],
                     completion_tokens=merged_totals["completion_tokens"],
                     total_tokens=merged_totals["total_tokens"],
+                    cache_read_tokens=merged_totals["cache_read_tokens"],
+                    cache_creation_tokens=merged_totals["cache_creation_tokens"],
                     duration_s=round(time.monotonic() - started, 3),
                     outcome=outcome,
                     context={
@@ -758,6 +760,11 @@ def _empty_totals() -> dict[str, Any]:
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
+        # Anthropic prompt-cache counters. Reach ``extraction_stats.json`` via
+        # the ``**phaseN_totals`` spread and the ``usage.jsonl`` row via
+        # ``_merge_totals``.
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
 
 
