@@ -149,3 +149,76 @@ def test_openai_config_fingerprint_excludes_api_key() -> None:
     a = encoder_fingerprint(_cfg(api_key="key-1"))
     b = encoder_fingerprint(_cfg(api_key="key-2"))
     assert a == b
+
+
+def test_openai_rejects_a_short_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A response with fewer rows than inputs would misattribute every embedding
+    # after the gap, so it must raise rather than return a misaligned tensor.
+    def short(*, model: str, input: list[str], **kwargs: Any) -> Any:
+        return SimpleNamespace(data=[{"embedding": [1.0, 0.0, 1.0]}])  # 1 row for 2 inputs
+
+    monkeypatch.setattr("litellm.embedding", short)
+    with pytest.raises(ValueError, match="cannot be aligned"):
+        OpenAIEncoder(_cfg()).encode(["a", "b"])
+
+
+def test_openai_does_not_retry_a_deterministic_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An auth failure is deterministic: it must propagate on the first attempt,
+    # not get swept into the transient tuple and slept on.
+    from litellm.exceptions import AuthenticationError
+
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", slept.append)
+    attempts = {"n": 0}
+
+    def auth_fail(**kwargs: Any) -> Any:
+        attempts["n"] += 1
+        raise AuthenticationError("bad key", llm_provider="openai", model=MODEL)
+
+    monkeypatch.setattr("litellm.embedding", auth_fail)
+    with pytest.raises(AuthenticationError):
+        OpenAIEncoder(_cfg(num_retries=3)).encode(["a"])
+    assert attempts["n"] == 1  # not retried
+    assert slept == []  # never backed off
+
+
+def test_openai_gives_up_after_num_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.exceptions import RateLimitError
+
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", slept.append)
+    attempts = {"n": 0}
+
+    def always_429(**kwargs: Any) -> Any:
+        attempts["n"] += 1
+        raise RateLimitError("rate limited", llm_provider="openai", model=MODEL)
+
+    monkeypatch.setattr("litellm.embedding", always_429)
+    with pytest.raises(RateLimitError):
+        OpenAIEncoder(_cfg(num_retries=2)).encode(["a"])
+    assert attempts["n"] == 3  # first + 2 retries, bounded
+    assert len(slept) == 2  # backed off between attempts, not after the last
+
+
+def test_openai_resolves_key_from_env_then_defers_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No literal api_key: read the named env var, else leave None for litellm.
+    cfg_no_key = EncoderConfig(name="openai", model_id=MODEL, embedding_dim=3, extra={})
+    monkeypatch.setenv("OPENAI_API_KEY", "from-env")
+    assert OpenAIEncoder(cfg_no_key).api_key == "from-env"
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert OpenAIEncoder(cfg_no_key).api_key is None
+
+
+def test_openai_accepts_object_style_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    # litellm may return items with an `.embedding` attribute rather than a dict.
+    def object_style(*, model: str, input: list[str], **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            data=[SimpleNamespace(embedding=[float(len(t)), 0.0, 1.0]) for t in input]
+        )
+
+    monkeypatch.setattr("litellm.embedding", object_style)
+    out = OpenAIEncoder(_cfg()).encode(["a", "bb"])
+    assert out.pooled[:, 0].tolist() == [1.0, 2.0]
