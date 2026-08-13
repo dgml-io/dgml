@@ -1009,10 +1009,12 @@ def _write_extraction_stats(
         # array (some models drop optional tool-call parameters).
         "phase1_layout": phase1_layout,
         # "inlined" when the docset schema rode inside the submit_values
-        # tool parameter (provider-enforced shape); "permissive" when the
-        # provider rejected the inlined schema (Gemini "too many states")
-        # and the retry ran with a bare object parameter + code-side
-        # vocabulary pruning.
+        # tool parameter (provider-enforced shape); "single_ref" when it rode
+        # there as one shared definition + $ref leaves (DGML_PHASE1_SINGLE_REF,
+        # Anthropic only — same provider-enforced shape, fewer tokens);
+        # "permissive" when the provider rejected the inlined schema (Gemini
+        # "too many states") and the retry ran with a bare object parameter +
+        # code-side vocabulary pruning.
         "phase1_tool_schema": phase1_tool_schema,
     }
     write_json_atomic(workspace.docset_file_extraction_stats_path(docset_id, file_id), stats)
