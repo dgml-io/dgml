@@ -49,9 +49,12 @@ from dgml_core.generation.transcribe import cache_write, loads_tolerant, strip_f
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
 _SNIPPET_CHARS = 160
-# Blocks per labeling call. Bounds both the listing the model must read and
-# the JSON it must write, so density doesn't collapse under an output cap.
+# Bounds on one labeling call, whichever hits first: a block count and a
+# text-size budget on the rendered listing (a dense chunk's JSON reply would
+# otherwise grow too large to come back valid). Overflow past both is split on a
+# parse failure — see _label_chunk.
 _MAX_BLOCKS_PER_CALL = 1200
+_MAX_CHUNK_CHARS = 20000
 _ROSTER_MAX_ENTRIES = 400
 # A chunk labeled far below this fraction is treated as a failed/truncated call and retried once.
 _MIN_LABELED_FRACTION = 0.3
@@ -931,9 +934,23 @@ def wrap_detected_values(blocks: list[Block]) -> None:
 
 
 def _chunks(blocks: list[Block]) -> list[list[Block]]:
-    return [
-        blocks[i : i + _MAX_BLOCKS_PER_CALL] for i in range(0, len(blocks), _MAX_BLOCKS_PER_CALL)
-    ]
+    """Split blocks into labeling chunks bounded by both a block count and a
+    text-size budget on the rendered listing — count alone is a poor proxy for
+    reply size, since dense blocks carry far more text. A single over-budget
+    block still forms its own chunk."""
+    out: list[list[Block]] = []
+    cur: list[Block] = []
+    cur_chars = 0
+    for b in blocks:
+        n = len(b.flat_text())
+        if cur and (len(cur) >= _MAX_BLOCKS_PER_CALL or cur_chars + n > _MAX_CHUNK_CHARS):
+            out.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(b)
+        cur_chars += n
+    if cur:
+        out.append(cur)
+    return out
 
 
 def _observe(roster: dict[str, RosterEntry], concept: str, kind: str, example: str) -> None:
@@ -1191,6 +1208,98 @@ def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
     return roster
 
 
+def _label_chunk(
+    doc_name: str,
+    chunk: list[Block],
+    roster: dict[str, RosterEntry],
+    roster_blocks: list[dict[str, Any]],
+    *,
+    config: llm.LLMConfig,
+    cache_dir: Path | str | None,
+    debug: bool,
+    log: Callable[[str], None],
+    stem: str,
+    label_tag: str,
+    warnings: list[str],
+) -> dict[str, str] | None:
+    """Label one chunk in place; bisect and recurse on an unparseable reply.
+
+    A malformed JSON reply (output too large to come back valid) halves the
+    chunk and relabels each half — Pass A's window split — rather than retrying
+    the same overflow. Call errors never split (they fail at any size); a
+    reachability error returns its dict, else ``None``.
+    """
+    listing = render_block_listing(doc_name, chunk)
+    user_content = [*roster_blocks, {"type": "text", "text": listing}]
+    user_text = "\n\n".join(str(part["text"]) for part in user_content)
+    cache_write(cache_dir, f"label_{stem}_{label_tag}_input.txt", user_text, debug=debug)
+    for attempt in range(2):
+        msg = f"labeling failed for {doc_name} {label_tag}"
+        try:
+            raw = llm.call(
+                config, system_prompt=SYSTEM_PROMPT, user_content=user_content, cache=True
+            )
+        except Exception as exc:  # call-level failure (network / provider / auth)
+            # Never split on a call error — it fails at any size, so splitting
+            # would fan an outage into 2^depth calls. Reachability short-circuits;
+            # others retry once.
+            log(f"[label] {msg}: {exc}")
+            if llm.is_model_reachability_error(exc):
+                warnings.append(f"{msg}: {exc}")
+                return {"code": LabelModelUnreachable.code, "message": short_error_message(exc)}
+            if attempt:
+                warnings.append(f"{msg}: {exc}")
+            continue
+        # Functional file the next run reloads — written regardless of --debug.
+        cache_write(cache_dir, f"label_{stem}_{label_tag}_raw.json", strip_fences(raw), debug=True)
+        try:
+            payload = _parse_labels_json(raw)
+        except Exception as exc:  # malformed reply — the oversized-output signature
+            # Size-driven: halve the chunk and relabel each half instead of
+            # retrying the same overflow.
+            log(f"[label] {msg}: {exc}")
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                log(f"[label] {doc_name} {label_tag}: reply unparseable; splitting {len(chunk)}")
+                err_a = _label_chunk(
+                    doc_name,
+                    chunk[:mid],
+                    roster,
+                    roster_blocks,
+                    config=config,
+                    cache_dir=cache_dir,
+                    debug=debug,
+                    log=log,
+                    stem=stem,
+                    label_tag=f"{label_tag}a",
+                    warnings=warnings,
+                )
+                err_b = _label_chunk(
+                    doc_name,
+                    chunk[mid:],
+                    roster,
+                    roster_blocks,
+                    config=config,
+                    cache_dir=cache_dir,
+                    debug=debug,
+                    log=log,
+                    stem=stem,
+                    label_tag=f"{label_tag}b",
+                    warnings=warnings,
+                )
+                return err_a or err_b
+            if attempt:
+                warnings.append(f"{msg}: {exc}")
+            continue
+        warnings.extend(apply_labels(chunk, payload.get("labels", {}) or {}, doc_name=doc_name))
+        labeled = sum(1 for b in chunk if b.concept)
+        if attempt or labeled >= len(chunk) * _MIN_LABELED_FRACTION:
+            break
+        log(f"[label] {doc_name} {label_tag} under-labeled ({labeled}/{len(chunk)}); retrying")
+    _update_roster(roster, chunk)
+    return None
+
+
 def _label_one_document(
     doc_name: str,
     blocks: list[Block],
@@ -1219,50 +1328,21 @@ def _label_one_document(
     # document's chunks and its section retry.
     roster_blocks = _roster_content_blocks(roster, model=config.model)
     for chunk_idx, chunk in enumerate(_chunks(blocks)):
-        listing = render_block_listing(doc_name, chunk)
-        user_content = [*roster_blocks, {"type": "text", "text": listing}]
-        user_text = "\n\n".join(str(part["text"]) for part in user_content)
-        cache_write(
-            cache_dir, f"label_{stem}_c{chunk_idx + 1:02d}_input.txt", user_text, debug=debug
+        err = _label_chunk(
+            doc_name,
+            chunk,
+            roster,
+            roster_blocks,
+            config=config,
+            cache_dir=cache_dir,
+            debug=debug,
+            log=log,
+            stem=stem,
+            label_tag=f"c{chunk_idx + 1:02d}",
+            warnings=warnings,
         )
-        for attempt in range(2):
-            try:
-                raw = llm.call(
-                    config,
-                    system_prompt=SYSTEM_PROMPT,
-                    user_content=user_content,
-                    cache=True,
-                )
-                # Functional file the next run reloads — written regardless of --debug.
-                cache_write(
-                    cache_dir,
-                    f"label_{stem}_c{chunk_idx + 1:02d}_raw.json",
-                    strip_fences(raw),
-                    debug=True,
-                )
-                payload = _parse_labels_json(raw)
-                warnings.extend(
-                    apply_labels(chunk, payload.get("labels", {}) or {}, doc_name=doc_name)
-                )
-            except Exception as exc:  # labeling must never lose the transcription
-                msg = f"labeling failed for {doc_name} chunk {chunk_idx + 1}: {exc}"
-                log(f"[label] {msg}")
-                if label_error is None and llm.is_model_reachability_error(exc):
-                    label_error = {
-                        "code": LabelModelUnreachable.code,
-                        "message": short_error_message(exc),
-                    }
-                if attempt:
-                    warnings.append(msg)
-                continue
-            labeled = sum(1 for b in chunk if b.concept)
-            if attempt or labeled >= len(chunk) * _MIN_LABELED_FRACTION:
-                break
-            log(
-                f"[label] {doc_name} chunk {chunk_idx + 1} under-labeled "
-                f"({labeled}/{len(chunk)}); retrying"
-            )
-        _update_roster(roster, chunk)
+        if label_error is None and err is not None:
+            label_error = err
     # Force coverage of untagged sections: an unlabeled heading drops a
     # whole section's concept — meaningful information left untagged.
     # Re-label just those blocks (at most one extra call, only when gaps
