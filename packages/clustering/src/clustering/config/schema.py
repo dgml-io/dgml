@@ -47,6 +47,7 @@ EncoderName = Literal[
     "stella",
     "jina",
     "gemini",
+    "openai",
     "tfidf",
     "dit",
     "vit",

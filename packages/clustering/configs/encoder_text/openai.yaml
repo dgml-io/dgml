@@ -1,0 +1,35 @@
+# @package encoder_text
+# OpenAI text embeddings, called through litellm (no local model). Bring your
+# own key: set the OPENAI_API_KEY env var (or extra.api_key). Select with:
+#   encoder_text=openai
+name: openai
+# Any litellm-routable OpenAI embedding model.
+model_id: openai/text-embedding-3-large
+# Must match the model's output width (3072 for text-embedding-3-large). A
+# mismatch is rejected at encode time. With the default parameter-free projector
+# (training.identity_projector) this also has to equal manifold.dim, so raise
+# that to 3072 too. For a narrower output set both embedding_dim AND
+# extra.dimensions (the text-embedding-3 models are Matryoshka-trained).
+embedding_dim: 3072
+multi_vector: false
+# Token budget per document; the encoder truncates to roughly 4x this many
+# characters. text-embedding-3-* documents an 8191-token limit. Cutting here
+# keeps the run reproducible and the bill bounded, and keeps the kept text at
+# the front of the document, where the type is usually declared. Unset it to
+# send the text through untouched.
+max_length: 2000
+extra:
+  # Name of the env var holding the key (preferred over a literal api_key).
+  # Leave both unset to let litellm resolve credentials itself.
+  api_key_env: OPENAI_API_KEY
+  # Documents per request. Batching is about round-trips, not price: billing is
+  # per token either way.
+  batch_size: 100
+  timeout: 60
+  # Attempts after the first, on 429 / 5xx / timeout only, with exponential
+  # backoff — so one rate-limit response doesn't throw away the embeddings
+  # already paid for in this run. Handled by the encoder itself; litellm's own
+  # num_retries kwarg does not apply to embedding calls.
+  num_retries: 3
+  # Uncomment for a narrower Matryoshka output (must equal embedding_dim):
+  # dimensions: 1024
