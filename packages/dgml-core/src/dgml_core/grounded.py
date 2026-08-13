@@ -47,6 +47,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -642,7 +643,19 @@ def extract_values(
         # stripped — the identical keys remain in the user-prompt copy
         # (phase1_schema), so no guidance is lost, and the smaller schema
         # keeps Gemini's constrained decoder within its state budget.
-        phase1_tool_schema = _strip_annotations(_expand_refs(phase1_schema))
+        # ``DGML_PHASE1_SINGLE_REF`` sends that expanded tree as one shared
+        # definition + ``$ref`` leaves instead of an inlined copy per leaf —
+        # Anthropic-only, since ``_expand_refs`` exists to work around other
+        # providers' loose ``$ref`` handling. Off, or non-Anthropic, keeps the
+        # byte-identical legacy path.
+        phase1_single_ref = _env_flag(_ENV_PHASE1_SINGLE_REF) and is_anthropic_model(
+            config.values_model
+        )
+        if phase1_single_ref:
+            phase1_tool_schema = _strip_annotations(_single_ref_schema(phase1_schema))
+            phase1_tool_schema_mode = "single_ref"
+        else:
+            phase1_tool_schema = _strip_annotations(_expand_refs(phase1_schema))
         # Schema + docset guidance are byte-identical for every file in a
         # docset, so a breakpoint here covers tools + system + schema + guidance
         # across files. Keeping the chunking directive OUT of this block is what
@@ -699,7 +712,11 @@ def extract_values(
                     workspace=workspace,
                     file_id=file_id,
                     messages=_phase1_messages(chunked=chunked),
-                    tools=_phase1_tools(tool_schema, chunked=chunked),
+                    tools=_phase1_tools(
+                        tool_schema,
+                        chunked=chunked,
+                        single_ref=phase1_tool_schema_mode == "single_ref",
+                    ),
                     chunked=chunked,
                     model=config.values_model,
                     api_key=api_key,
@@ -1761,6 +1778,24 @@ def _drop_bboxes_from_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# ---- Phase-1 input-token reduction flags (default OFF = legacy) -----------
+#
+# Phase 1 transmits the docset schema TWICE: once as JSON prose in the user
+# prompt (``_values_phase1_user_prompt``) and once as the ``submit_values``
+# tool parameter (the API-authoritative copy). Both flags below shrink that
+# duplication; each is independent and defaults OFF, so the on-the-wire
+# request is byte-identical to legacy unless explicitly enabled.
+_ENV_PHASE1_SCHEMA_COMPACT = "DGML_PHASE1_SCHEMA_COMPACT"
+_ENV_PHASE1_SINGLE_REF = "DGML_PHASE1_SINGLE_REF"
+
+
+def _env_flag(name: str) -> bool:
+    """True when env var *name* is set to a truthy token (``1``/``true``/
+    ``yes``/``on``, case-insensitive). Unset or anything else is False, so
+    every flag defaults OFF (legacy behavior)."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _values_phase1_user_prompt(schema: dict[str, Any], guidance: str | None = None) -> str:
     """The phase-1 user prompt: instructions + schema, plus the docset's
     extraction guidance (``extraction-guidance.md``) when one is set.
@@ -1769,14 +1804,33 @@ def _values_phase1_user_prompt(schema: dict[str, Any], guidance: str | None = No
     makes this block worth a cache breakpoint. The chunked-submission
     directive is deliberately NOT included: it is appended as its own block by
     the caller, so that adding it on a retry leaves this prefix — and the
-    cache entry written for it — untouched."""
-    text = prompt(PromptKey.VALUES_PHASE1_USER).format(schema=json.dumps(schema, indent=2))
+    cache entry written for it — untouched.
+
+    This is the *second* copy of the schema in the phase-1 request; the
+    ``submit_values`` tool parameter is the API-authoritative one. The prose
+    copy is kept anyway (rather than dropped) because the phase-1 narrative
+    reasons over "this JSON Schema": it points the model at per-field
+    ``description`` and derivation ``prompt`` text to decide what to extract
+    and which leaves take the computed form — guidance the tool copy no longer
+    carries at all, since it is ``_strip_annotations``-ed. Dropping the prose
+    would therefore be a behavior change, not an input-encoding one.
+
+    ``DGML_PHASE1_SCHEMA_COMPACT`` shrinks this copy losslessly: compact
+    ``,``/``:`` separators with no indent instead of ``indent=2``. Same keys,
+    same values, no whitespace — every bit of guidance preserved."""
+    if _env_flag(_ENV_PHASE1_SCHEMA_COMPACT):
+        rendered = json.dumps(schema, separators=(",", ":"))
+    else:
+        rendered = json.dumps(schema, indent=2)
+    text = prompt(PromptKey.VALUES_PHASE1_USER).format(schema=rendered)
     if guidance:
         text += "\n\n" + prompt(PromptKey.VALUES_PHASE1_GUIDANCE).format(guidance=guidance.strip())
     return text
 
 
-def _phase1_tools(values_schema: dict[str, Any], *, chunked: bool) -> list[dict[str, Any]]:
+def _phase1_tools(
+    values_schema: dict[str, Any], *, chunked: bool, single_ref: bool = False
+) -> list[dict[str, Any]]:
     """The phase-1 tool set.
 
     ``chunked`` gates the whole chunked-submission protocol — the ``done``
@@ -1787,14 +1841,20 @@ def _phase1_tools(values_schema: dict[str, Any], *, chunked: bool) -> list[dict[
     escalation, enabled only after an attempt was truncated (see
     :func:`extract_values`), where the prompt carries the matching protocol.
     """
-    tools = [_submit_values_tool(values_schema, with_layout=True, chunked=chunked)]
+    tools = [
+        _submit_values_tool(values_schema, with_layout=True, chunked=chunked, single_ref=single_ref)
+    ]
     if chunked:
         tools.append(_append_entries_tool())
     return tools
 
 
 def _submit_values_tool(
-    values_schema: dict[str, Any], *, with_layout: bool = False, chunked: bool = False
+    values_schema: dict[str, Any],
+    *,
+    with_layout: bool = False,
+    chunked: bool = False,
+    single_ref: bool = False,
 ) -> dict[str, Any]:
     """Build the ``submit_values`` tool spec.
 
@@ -1805,9 +1865,21 @@ def _submit_values_tool(
     ``_page_number`` typo) at the API layer, instead of relying on the
     model to follow the prompt perfectly.
 
+    ``single_ref=True`` instead accepts a :func:`_single_ref_schema` tree,
+    which keeps its ``definitions`` block and ``#/definitions/...`` pointers.
+    Those definitions are **hoisted to the tool's parameter root** here,
+    because a ``#/definitions/...`` JSON Pointer resolves against the root of
+    the schema document the provider validates — the ``parameters`` object,
+    not the nested ``values`` sub-schema. Left in place, every pointer would
+    dangle.
+
     ``with_layout`` adds a sibling ``layout`` parameter for phase 1's
     use only — phase 2 reads it as a hint, phase 3 doesn't need it.
     """
+    definitions: dict[str, Any] | None = None
+    if single_ref and isinstance(values_schema.get("definitions"), dict):
+        definitions = values_schema["definitions"]
+        values_schema = {k: v for k, v in values_schema.items() if k != "definitions"}
     properties: dict[str, Any] = {"values": values_schema}
     if with_layout:
         properties["layout"] = _layout_param_schema()
@@ -1833,16 +1905,19 @@ def _submit_values_tool(
             "Submit the final extracted values. Call exactly once when "
             "extraction is complete; this ends the run."
         )
+    # Key order matches the historical layout (type, properties, required) so
+    # the flag-off request is byte-identical; ``definitions`` only ever appears
+    # on the single-ref path.
+    parameters: dict[str, Any] = {"type": "object", "properties": properties}
+    if definitions is not None:
+        parameters["definitions"] = definitions
+    parameters["required"] = ["values"]
     return {
         "type": "function",
         "function": {
             "name": _TOOL_SUBMIT_VALUES,
             "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": ["values"],
-            },
+            "parameters": parameters,
         },
     }
 
@@ -1998,6 +2073,93 @@ def _specialize_leaf(expanded: dict[str, Any], extras: dict[str, Any]) -> dict[s
         }
     expanded.update(extras)
     return expanded
+
+
+def _single_ref_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Like :func:`_expand_refs`, but keeps a *shared* ``definitions`` block and
+    leaves plain ``#/definitions/...`` pointers in place instead of inlining a
+    copy of the definition body at every leaf.
+
+    For an N-leaf schema, :func:`_expand_refs` copies the leaf definition body
+    N times; this keeps it once and points every eligible leaf at it, so the
+    tool schema transmits ~N times smaller. Only sound for providers that
+    resolve local ``$ref`` reliably — :func:`_expand_refs` exists precisely to
+    work around Gemini's inconsistent ``$ref`` handling — so the call site
+    gates this to Anthropic-routed models.
+
+    **A leaf only stays a pointer when that is semantically free.** A ``$ref``
+    node may carry sidecar keys (``prompt``, ``example``, ``description``,
+    ``datatype``, ``value_enum``); :func:`_expand_refs` merges them onto the
+    expanded body via :func:`_specialize_leaf`, and ``value_enum`` in
+    particular becomes a real ``value.enum`` that the provider's constrained
+    decoder enforces. JSON Schema draft-07 *ignores keys sitting beside a*
+    ``$ref``, so emitting such a leaf as a bare pointer would silently drop
+    that enum constraint — a behavior change, not an encoding change. Leaves
+    carrying sidecars that survive :func:`_strip_annotations` (i.e.
+    ``value_enum``, or any non-annotation key) are therefore expanded and
+    specialized exactly as before; only leaves with nothing to specialize
+    become pointers. The result is that
+    ``_strip_annotations(_single_ref_schema(s))`` and
+    ``_strip_annotations(_expand_refs(s))`` are the *same schema* once the
+    pointers are resolved — see the round-trip test in ``test_grounded.py``.
+
+    Same tightening semantics as :func:`_expand_refs` otherwise: every
+    constrained ``type: object`` node gets ``additionalProperties: false``,
+    including the shared definition bodies, and ``$schema`` is stripped. The
+    ``definitions`` block is retained here and hoisted to the tool's parameter
+    root by :func:`_submit_values_tool`, where ``#/definitions/...`` pointers
+    actually resolve.
+    """
+    defs = schema.get("definitions") or {}
+    used: set[str] = set()
+
+    def expand_node(node: Any) -> Any:
+        """Expand one node exactly as :func:`_expand_refs` would, against this
+        schema's ``definitions``. Routed through a throwaway wrapper because
+        ``_expand_refs`` reads ``definitions`` off the node it is handed — a
+        bare merge would leak the whole ``definitions`` block into the leaf as
+        a sidecar."""
+        wrapper = _expand_refs({"definitions": defs, "properties": {"n": node}})
+        return wrapper["properties"]["n"]
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/definitions/"):
+                if not isinstance(defs.get(ref[len("#/definitions/") :]), dict):
+                    return dict(node)  # unresolved — keep as-is, same as _expand_refs
+                extras = {k: v for k, v in node.items() if k != "$ref"}
+                # Sidecars that _strip_annotations drops anyway cost the leaf
+                # nothing: it can still point at the shared definition.
+                # `value_enum` is the exception — _specialize_leaf turns it
+                # into a `value.enum` that survives stripping, so such a leaf
+                # must be expanded to keep the constraint.
+                if "value_enum" in extras or any(k not in _ANNOTATION_KEYS for k in extras):
+                    return expand_node(node)
+                used.add(ref[len("#/definitions/") :])
+                return {"$ref": ref}
+            out: dict[str, Any] = {
+                k: walk(v) for k, v in node.items() if k not in {"$schema", "definitions"}
+            }
+            if (
+                out.get("type") == "object"
+                and isinstance(out.get("properties"), dict)
+                and "additionalProperties" not in out
+            ):
+                out["additionalProperties"] = False
+            return out
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        return node
+
+    result = walk(schema)
+    assert isinstance(result, dict)
+    if used:
+        # Only the definitions actually pointed at survive, each expanded and
+        # tightened, so resolving a pointer yields exactly what _expand_refs
+        # would have inlined there.
+        result["definitions"] = {key: expand_node(defs[key]) for key in sorted(used)}
+    return result
 
 
 def _expand_refs(schema: dict[str, Any]) -> dict[str, Any]:

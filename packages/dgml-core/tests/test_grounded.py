@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -28,14 +29,21 @@ from dgml_core.errors import (
     SchemaNotFound,
     ValuesExtractionFailed,
 )
-from dgml_core.extraction_schema import parse_rnc
+from dgml_core.extraction_schema import field_tree_to_rnc, parse_rnc, rnc_to_json_schema
 from dgml_core.extraction_xml import dgml_xml_to_values
 from dgml_core.grounded import (
+    _ENV_PHASE1_SCHEMA_COMPACT,
+    _ENV_PHASE1_SINGLE_REF,
     _SCHEMA_TREE_MAX_DEPTH,
     DEFAULT_MAX_TOOL_ITERS,
     GroundedConfig,
+    _drop_bboxes_from_schema,
+    _expand_refs,
     _field_node_schema,
+    _single_ref_schema,
+    _strip_annotations,
     _submit_schema_tool,
+    _values_phase1_user_prompt,
     extract_values,
     generate_schema,
     get_page_words,
@@ -1427,6 +1435,180 @@ def test_extract_values_phase1_submit_tool_strips_bbox(workspace: Workspace) -> 
     location_props = leaf["properties"]["locations"]["items"]["properties"]
     assert "page_number" in location_props
     assert "bounding_box" not in location_props
+
+
+# ---------------------------------------------------------------------------
+# phase-1 schema de-duplication flags (DGML_PHASE1_SCHEMA_COMPACT / _SINGLE_REF)
+
+
+_ENUM_RNC_TREE: list[dict[str, Any]] = [
+    {"name": "policy_number", "kind": "field", "prompt": "The policy number"},
+    {"name": "meter_type", "kind": "field", "enum": ["electric", "water"], "prompt": "Classify"},
+    {"name": "line_items", "kind": "collection", "children": [{"name": "amount", "kind": "field"}]},
+]
+
+
+def _enum_json_schema() -> dict[str, Any]:
+    """A realistic docset schema built through the real RNC bridge: plain
+    `$ref` leaves, an enum leaf carrying a `value_enum` sidecar, and an array
+    of `$ref` leaves."""
+    rnc = field_tree_to_rnc(_ENUM_RNC_TREE, workspace="ws", docset_name="d")
+    return rnc_to_json_schema(rnc)
+
+
+def _resolve_refs(node: Any, definitions: dict[str, Any]) -> Any:
+    """Inline every `#/definitions/...` pointer against *definitions*."""
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/definitions/"):
+            return _resolve_refs(definitions[ref[len("#/definitions/") :]], definitions)
+        return {k: _resolve_refs(v, definitions) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_resolve_refs(x, definitions) for x in node]
+    return node
+
+
+def test_phase1_prose_schema_compact_is_lossless_and_shorter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`DGML_PHASE1_SCHEMA_COMPACT` re-encodes the prose schema copy with
+    compact separators: strictly shorter, and a lossless re-encoding (parses
+    back to the identical object, so no guidance is lost)."""
+    schema = _enum_json_schema()
+
+    monkeypatch.delenv(_ENV_PHASE1_SCHEMA_COMPACT, raising=False)
+    legacy = _values_phase1_user_prompt(schema)
+    monkeypatch.setenv(_ENV_PHASE1_SCHEMA_COMPACT, "1")
+    compact = _values_phase1_user_prompt(schema)
+
+    assert len(compact) < len(legacy)
+    assert json.dumps(schema, indent=2) in legacy
+    assert json.dumps(schema, separators=(",", ":")) in compact
+    # Lossless: same parsed object, only whitespace differs.
+    assert json.loads(json.dumps(schema, separators=(",", ":"))) == schema
+    # And the guidance the prose copy exists to carry survives compaction.
+    assert "The policy number" in compact
+
+
+def test_single_ref_schema_resolves_to_the_expanded_schema() -> None:
+    """The load-bearing invariant: the single-`$ref` tool schema and the
+    legacy expanded one are the SAME schema once pointers are resolved.
+
+    This is what makes the flag an input-*encoding* change rather than a
+    behavior change — including for enum leaves, whose `value_enum` sidecar
+    `_expand_refs` specializes into a real `value.enum` that the provider
+    constrain-decodes."""
+    schema = _drop_bboxes_from_schema(_enum_json_schema())
+
+    expanded = _strip_annotations(_expand_refs(schema))
+    single = _strip_annotations(_single_ref_schema(schema))
+    definitions = single.pop("definitions")
+
+    assert _resolve_refs(single, definitions) == expanded
+
+
+def test_single_ref_schema_keeps_one_definition_body() -> None:
+    """The point of the flag: the leaf body is transmitted once, not once per
+    leaf. Plain leaves become pointers; the enum leaf stays inlined because a
+    key beside a `$ref` is ignored by JSON Schema and the constraint would be
+    silently lost."""
+    schema = _drop_bboxes_from_schema(_enum_json_schema())
+
+    expanded = _strip_annotations(_expand_refs(schema))
+    single = _strip_annotations(_single_ref_schema(schema))
+
+    # `derived_from` appears exactly once per inlined leaf body. Expansion
+    # inlines all three leaves; single-ref inlines only the enum leaf, plus the
+    # one shared definition body.
+    assert json.dumps(expanded).count('"derived_from"') == 3
+    assert json.dumps(single).count('"derived_from"') == 2
+    assert len(json.dumps(single)) < len(json.dumps(expanded))
+
+    # The enum constraint survives on BOTH paths.
+    assert single["properties"]["MeterType"]["properties"]["value"]["enum"] == [
+        "electric",
+        "water",
+    ]
+    assert "$ref" not in json.dumps(single["properties"]["MeterType"])
+    # Plain leaves are bare pointers into the single shared body.
+    assert single["properties"]["PolicyNumber"] == {"$ref": "#/definitions/extracted_value"}
+    assert single["properties"]["LineItems"]["items"] == {"$ref": "#/definitions/extracted_value"}
+    assert list(single["definitions"]) == ["extracted_value"]
+    # Tightening semantics match expansion.
+    assert single["definitions"]["extracted_value"]["additionalProperties"] is False
+
+
+def _phase1_submit_tool(workspace: Workspace, *, values_model: str) -> dict[str, Any]:
+    """Run one extraction (phase 2 matches ⇒ no phase 3) and return the
+    `submit_values` tool spec phase 1 handed to the provider."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "hi", "l": [10, 20, 30, 40]}])
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.add_file(ds.id, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=values_model)
+    phase1_values = {"title": {"text": "hi", "locations": [{"page_number": 1}]}}
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        extract_values(workspace, ds.id, fid, config=config)
+    assert mock_completion.call_count == 1
+    tools = mock_completion.call_args_list[0].kwargs["tools"]
+    tool = next(t for t in tools if t["function"]["name"] == "submit_values")
+    assert isinstance(tool, dict)
+    return tool
+
+
+def test_phase1_single_ref_hoists_definitions_to_parameter_root(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`DGML_PHASE1_SINGLE_REF` + an Anthropic values model ⇒ the tool ships
+    `$ref` leaves with `definitions` at the PARAMETER root, where a
+    `#/definitions/...` pointer actually resolves (it resolves against the
+    document the provider validates, not the nested `values` sub-schema)."""
+    monkeypatch.setenv(_ENV_PHASE1_SINGLE_REF, "1")
+    tool = _phase1_submit_tool(workspace, values_model="anthropic/claude-opus-4-7")
+
+    params = tool["function"]["parameters"]
+    assert "extracted_value" in params["definitions"]
+    values_param = params["properties"]["values"]
+    assert "definitions" not in values_param
+    assert "$ref" in json.dumps(values_param)
+    # Every pointer resolves against the hoisted block — none dangle.
+    for ref in re.findall(r'"\$ref":\s*"#/definitions/([^"]+)"', json.dumps(values_param)):
+        assert ref in params["definitions"]
+
+
+def test_phase1_single_ref_non_anthropic_stays_expanded(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even with the flag on, a non-Anthropic values model keeps the legacy
+    fully-expanded, self-contained tool schema — `_expand_refs` exists to work
+    around exactly those providers' loose `$ref` handling."""
+    monkeypatch.setenv(_ENV_PHASE1_SINGLE_REF, "1")
+    tool = _phase1_submit_tool(workspace, values_model="gemini/gemini-2.5-pro")
+
+    params = tool["function"]["parameters"]
+    assert "definitions" not in params
+    assert "$ref" not in json.dumps(params["properties"]["values"])
+
+
+def test_phase1_flags_off_is_legacy_for_anthropic(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flags OFF is the legacy path even for Anthropic: expanded tool schema,
+    no `$ref`/`definitions`, indent-2 prose copy."""
+    monkeypatch.delenv(_ENV_PHASE1_SINGLE_REF, raising=False)
+    monkeypatch.delenv(_ENV_PHASE1_SCHEMA_COMPACT, raising=False)
+    tool = _phase1_submit_tool(workspace, values_model="anthropic/claude-opus-4-7")
+
+    params = tool["function"]["parameters"]
+    assert "definitions" not in params
+    assert list(params) == ["type", "properties", "required"]
+    assert "$ref" not in json.dumps(params["properties"]["values"])
 
 
 def test_extract_values_propagates_schema_not_found(workspace: Workspace) -> None:
