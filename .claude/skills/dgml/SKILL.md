@@ -287,7 +287,7 @@ uv run dgml workspace create --organization Acme
 cat > "${DGML_HOME:-./dgml-workspace}/config.toml" <<'EOF'
 [generation]
 model = "anthropic/claude-haiku-4-5"
-label_model = "anthropic/claude-sonnet-4-6"
+label_model = "anthropic/claude-sonnet-5"
 api_key_env = "ANTHROPIC_API_KEY"
 EOF
 
@@ -467,11 +467,21 @@ The workflow is generate-schema → extract → get-values:
 #    typed dg:value at extraction, not bare text.
 uv run dgml extraction generate-schema "$ds" --from-file "$fid"
 
-#    …or set one yourself. set-schema accepts RNC *or* a grounded-field JSON
-#    Schema and converts JSON to RNC on the way in (RNC is the only on-disk form).
+#    …or set one yourself. set-schema accepts RNC *or* a JSON Schema and
+#    converts JSON to RNC on the way in (RNC is the only on-disk form).
 #    A hand-written .rnc may carry `## Prompt:` lines telling the LLM where to
-#    find each field.
+#    find each field, and a field's content model may be a value enumeration
+#    (`( "electric" | "water" | … )`) — extraction then returns the verbatim
+#    page text plus the classifying token as a normalized dg:value.
 uv run dgml extraction set-schema "$ds" --schema-file schema.rnc
+
+#    Optional: docset-level guidance — free-form markdown with domain rules
+#    that span fields (classification decision rules, consistency rules).
+#    Stored as extraction-guidance.md and injected into every extract's
+#    phase-1 prompt for this docset. Use `## Prompt:` for one field,
+#    guidance for the document kind.
+uv run dgml extraction set-guidance "$ds" --guidance-file guidance.md
+uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 
 # 2) Extract values for a file → writes a dg:extraction element into the file's
 #    <stem>.dgml.xml. `mode` is full-extraction if a generated tree already
@@ -491,9 +501,10 @@ uv run dgml extraction get-values "$ds" "$fid" --as xml | jq -r .xml
 ```
 
 Inspect or convert the stored schema with `get-schema` (`--schema-format rnc`
-default, or `json` for the engine's grounded-field projection). Typed values
-carry a normalized `dg:value`/`xsi:type` (dates, amounts, integers) and every
-value carries a `dg:origin` box back to `page_images/page_N.png`.
+default, or `json` for the engine's extracted-value projection). Typed values
+carry a normalized `dg:value`/`xsi:type` (dates, amounts, integers), enum
+fields carry the schema token as `dg:value` (no `xsi:type`), and every
+grounded value carries a `dg:origin` box back to `page_images/page_N.png`.
 
 A schema field's `## Prompt:` may describe a **derivation rule** instead of a
 place on the page ("Compute as sum of Quantity × UnitPrice for each LineItem").
@@ -507,9 +518,10 @@ elements, so an un-extracted input leaves the computed value unverifiable
 (unresolvable refs are counted as `matching.dropped_refs` in
 `extraction_stats.json`, and `dgml check` flags source-less computed fields
 as `computed_field_unattributed`). Errors are the
-usual envelope: `SCHEMA_NOT_FOUND` (no schema set), `NO_FILES` (empty docset,
-no `--from-file`), `VALUES_NOT_FOUND` (extract not run yet),
-`GROUNDED_CONFIG_MISSING` (no `grounded` config). See
+usual envelope: `SCHEMA_NOT_FOUND` (no schema set), `GUIDANCE_NOT_FOUND`
+(no guidance set), `NO_FILES` (empty docset, no `--from-file`),
+`VALUES_NOT_FOUND` (extract not run yet), `GROUNDED_CONFIG_MISSING` (no
+`grounded` config). See
 [cli-reference.md](../../../docs/cli-reference.md) for full payloads.
 
 ### Semantic links — built into `generate`

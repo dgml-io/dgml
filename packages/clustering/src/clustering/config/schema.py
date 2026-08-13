@@ -27,6 +27,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 FusionName = Literal["none", "concat_norm", "late_concat", "cross_attention", "gated"]
 ManifoldName = Literal["euclidean", "spherical", "hyperbolic", "product"]
 ScenarioName = Literal["s1", "s2", "s3", "s4", "s5"]
+# How the few-shot / supervised scenarios (S3, S5) pick which support samples
+# build each category prototype when a category has more than ``n_shots``:
+# ``order`` keeps the first ``n_shots`` in dataset order (today's behaviour);
+# ``central`` keeps the ``n_shots`` nearest the category mean (the most typical),
+# a measured win over ``order`` when support is capped, largest at low shot counts.
+SupportSelection = Literal["order", "central"]
 # Text-encoder names that share the SentenceTransformer adapter — the
 # instruction-tuned / Matryoshka / MTEB-frontier crew (E5, BGE, GTE,
 # Stella, Jina v3). Distinct registry names rather than a single
@@ -300,6 +306,15 @@ class ScenarioConfig(_StrictModel):
     k_clusters: int | None = None
     n_shots: int | None = None
     known_categories: list[str] | None = None
+    # ── Support-sample selection (S3 / S5) ────────────────────────────────
+    support_selection: SupportSelection = "order"
+    """Which support samples build each prototype when a category has more than
+    ``n_shots`` of them. ``"order"`` (default) keeps the first ``n_shots`` in
+    dataset order — today's behaviour. ``"central"`` keeps the ``n_shots`` nearest
+    the category's ambient mean (the most typical), which builds a cleaner
+    prototype from the same budget; measured to beat ``"order"`` on all four
+    internal corpora, largest at low shot counts. A no-op when a category has
+    ``<= n_shots`` samples (nothing to choose)."""
     # ── Name+support prototype blend (S5) ─────────────────────────────────
     name_prototype_blend: float | None = None
     """Blend weight ``alpha`` in [0, 1] mixing the encoded category-*name* prototype
@@ -412,6 +427,16 @@ class ScenarioConfig(_StrictModel):
     # - ``leiden_min_cluster_size``: communities smaller than this go to
     #   the noise bucket (label = -1).
     # - ``leiden_n_iterations``: ``-1`` = run to convergence.
+    # - ``leiden_k_selection``: ``"none"`` (default, off) or ``"silhouette"``.
+    #   When ``"silhouette"`` and ``graph_method="knn"``, the graph degree is
+    #   chosen per corpus rather than fixed: leiden runs at the configured
+    #   ``leiden_k_neighbors`` *and* at a sparser ``min(k, max(2, (n-1)//8))``,
+    #   and the partition with the higher silhouette on the clustering space is
+    #   kept — but only when it wins by more than ``leiden_k_selection_margin``,
+    #   so a near-tie keeps the configured k. Measured to recover an under-split
+    #   small corpus with no regression on the others; opt-in, off by default,
+    #   so the shipped fixed-k behaviour is unchanged.
+    # - ``leiden_k_selection_margin``: the silhouette margin above (``>= 0``).
     leiden_graph_method: Literal["knn", "mutual_knn", "radius"] = "knn"
     leiden_k_neighbors: int = 15
     leiden_radius: float | None = None
@@ -420,6 +445,8 @@ class ScenarioConfig(_StrictModel):
     leiden_resolution: float = 1.0
     leiden_min_cluster_size: int = 2
     leiden_n_iterations: int = -1
+    leiden_k_selection: Literal["none", "silhouette"] = "none"
+    leiden_k_selection_margin: float = 0.1
     # DBSCAN hyper-parameters (ignored unless ``cluster_algorithm='dbscan'``).
     # - ``dbscan_eps``: neighbourhood radius. ``None`` → auto via
     #   ``dbscan_r_method`` (``"knee"`` k-NN-distance knee / ``"mst_gap"``).
@@ -520,6 +547,18 @@ class ScenarioConfig(_StrictModel):
     def _check_pooling_pages(self) -> ScenarioConfig:
         if self.pooling_pages < 1:
             raise ValueError(f"pooling_pages must be >= 1; got {self.pooling_pages}.")
+        return self
+
+    @model_validator(mode="after")
+    def _check_leiden_k_selection_margin(self) -> ScenarioConfig:
+        # A negative margin would invert the gate (switch on the *worse*
+        # silhouette); 0 is the plain "keep whichever is higher" selector.
+        if self.leiden_k_selection_margin < 0:
+            raise ValueError(
+                "leiden_k_selection_margin must be >= 0 (0 = keep the higher-silhouette "
+                f"partition; a margin only makes the switch more conservative); got "
+                f"{self.leiden_k_selection_margin}."
+            )
         return self
 
 

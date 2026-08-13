@@ -84,6 +84,14 @@ class Workspace:
         # names so the two never clobber.
         return self.docset_dir(docset_id) / "extraction-schema.rnc"
 
+    def docset_guidance_path(self, docset_id: str) -> Path:
+        # Free-form docset-level extraction guidance (markdown/plain text) —
+        # domain rules that apply to the whole document kind rather than one
+        # field (classification decision rules, cross-field invariants the
+        # extractor should honor). Set via `extraction set-guidance`; injected
+        # into the phase-1 extraction prompt alongside the schema.
+        return self.docset_dir(docset_id) / "extraction-guidance.md"
+
     def docset_generation_schema_path(self, docset_id: str) -> Path:
         # The generation *tag* schema written by `docset generate`
         # (consumed by convert_batch — the machine exchange format that seeds

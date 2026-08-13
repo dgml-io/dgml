@@ -3604,15 +3604,15 @@ def test_extraction_set_and_get_schema_rnc(
     assert payload["schema_format"] == "rnc"
     assert payload["schema"] == _RNC_SCHEMA
 
-    # get-schema json returns the engine's grounded_field JSON Schema projection.
+    # get-schema json returns the engine's extracted_value JSON Schema projection.
     rc = main(_ws_args(ws) + ["extraction", "get-schema", ds_id, "--schema-format", "json"])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["schema_format"] == "json"
-    assert payload["schema"]["properties"]["VendorName"]["anyOf"] == [
-        {"$ref": "#/definitions/grounded_field"},
-        {"$ref": "#/definitions/computed_field"},
-    ]
+    assert payload["schema"]["properties"]["VendorName"] == {
+        "$ref": "#/definitions/extracted_value"
+    }
+    assert "extracted_value" in payload["schema"]["definitions"]
 
 
 def test_extraction_get_schema_missing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -3623,6 +3623,46 @@ def test_extraction_get_schema_missing(tmp_path: Path, capsys: pytest.CaptureFix
     rc = main(_ws_args(ws) + ["extraction", "get-schema", ds_id])
     assert rc == 1
     assert _read_stderr(capsys)["error"]["code"] == "SCHEMA_NOT_FOUND"
+
+
+def test_extraction_set_and_get_guidance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    ds_id = _new_docset(ws, capsys)
+
+    guidance_file = tmp_path / "guidance.md"
+    guidance_file.write_text("# Rules\nClassify by behavior, not name.\n", encoding="utf-8")
+    rc = main(
+        _ws_args(ws) + ["extraction", "set-guidance", ds_id, "--guidance-file", str(guidance_file)]
+    )
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload == {
+        "docset_id": ds_id,
+        "guidance": "# Rules\nClassify by behavior, not name.\n",
+    }
+    # Stored beside the schema as extraction-guidance.md.
+    assert (ws / "docsets" / ds_id / "extraction-guidance.md").exists()
+
+    rc = main(_ws_args(ws) + ["extraction", "get-guidance", ds_id])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["guidance"].startswith("# Rules")
+
+
+def test_extraction_get_guidance_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    ds_id = _new_docset(ws, capsys)
+    rc = main(_ws_args(ws) + ["extraction", "get-guidance", ds_id])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "GUIDANCE_NOT_FOUND"
 
 
 def test_extraction_get_values_json_and_xml(

@@ -1627,6 +1627,26 @@ def _add_extraction_subparsers(
         help="Representation to return: rnc (canonical, default) or json (JSON Schema projection).",
     )
 
+    ex_set_guidance = extraction.add_parser(
+        "set-guidance",
+        parents=[common],
+        help="Set docset-level extraction guidance (free-form text shown to the extraction LLM).",
+    )
+    ex_set_guidance.add_argument("docset_id")
+    ex_set_guidance.add_argument(
+        "--guidance-file",
+        required=True,
+        type=Path,
+        help="Path to a markdown/plain-text file with domain rules for this document kind.",
+    )
+
+    ex_get_guidance = extraction.add_parser(
+        "get-guidance",
+        parents=[common],
+        help="Show a DocSet's extraction guidance.",
+    )
+    ex_get_guidance.add_argument("docset_id")
+
     ex_extract = extraction.add_parser(
         "extract",
         parents=[common],
@@ -1739,6 +1759,18 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             )
         else:
             _emit({"docset_id": args.docset_id, "schema_format": "rnc", "schema": rnc}, fmt)
+        return 0
+
+    if sub == "set-guidance":
+        store.get(args.docset_id)  # raises DocSetNotFound
+        guidance = args.guidance_file.read_text(encoding="utf-8")
+        store.set_guidance(args.docset_id, guidance)
+        _emit({"docset_id": args.docset_id, "guidance": guidance}, fmt)
+        return 0
+
+    if sub == "get-guidance":
+        guidance = store.get_guidance(args.docset_id)  # raises GuidanceNotFound
+        _emit({"docset_id": args.docset_id, "guidance": guidance}, fmt)
         return 0
 
     if sub == "extract":

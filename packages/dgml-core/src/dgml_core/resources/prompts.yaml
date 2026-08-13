@@ -46,6 +46,8 @@ extraction_schema_user_body: |-
       "name": "DueDate",          // required; becomes the tag name
       "kind": "field",            // "field" | "container" | "collection"
       "datatype": "date",         // fields only (see the datatype list)
+      "enum": ["a", "b"],         // fields only: closed classification set
+                                  // (instead of a datatype, never both)
       "description": "...",        // optional, short
       "example": "...",            // optional, a real value seen in a document
       "prompt": "...",             // optional: where to find / how to derive it
@@ -81,6 +83,18 @@ extraction_schema_user_body: |-
      near-duplicate fields.
   3. Keep the schema focused on what someone would actually extract. Skip
      chrome (page numbers, headers/footers) unless it carries meaning.
+  4. When a field classifies into a small closed set of categories that
+     recurs across documents of this kind (a status, a document type, a
+     payment method), give it an ``enum`` of short snake_case tokens
+     instead of a datatype. Extraction keeps the verbatim page text and
+     adds the matching token as the normalized value. Don't force an
+     enum onto open-ended values (names, ids, free text).
+  5. A ``prompt`` phrased as a derivation — "Compute as ...", "Derive
+     from ...", "Count the number of ..." — makes the field a COMPUTED
+     field at extraction time: its value is reasoned from other
+     extracted fields instead of read off the page. Use that only for
+     genuine derivations, and make sure every input the rule mentions
+     is itself a field in the schema.
 
   That ``submit_schema`` call IS the answer — do not also reply with prose.
 
@@ -90,10 +104,48 @@ extraction_schema_user_body: |-
 extraction_values_phase1_system: |-
   You extract structured values from a PDF using the provided schema.
   Each leaf value you return is an object with a ``text`` field (the
-  extracted value) and a ``locations`` array. Each location identifies
-  the ``page_number`` (1-indexed integer) where that value appears.
-  This phase deliberately omits bounding boxes — a later phase will add
-  them.
+  value verbatim as printed), an optional normalized ``value``, and a
+  ``locations`` array. Each location identifies the ``page_number``
+  (1-indexed integer) where that value appears. This phase deliberately
+  omits bounding boxes — a later phase will add them.
+
+  NORMALIZED ``value`` — alongside the verbatim ``text``, return the
+  machine-readable form when one exists:
+
+  1. ENUM fields — schema leaves whose ``value`` carries an ``enum``
+     list (or a ``value_enum`` sidecar) are CLASSIFICATION fields:
+     ``value`` is the one enum token that classifies the thing.
+     Classify by the schema field's guidance and the document's
+     meaning, not by string similarity. If no token applies with
+     confidence, OMIT ``value`` — never guess and never invent a token
+     outside the list. How you report the enum's PROVENANCE depends on
+     whether the page prints the thing being classified:
+
+     a. The page PRINTS a label for this field — a unit of measure, a
+        currency symbol or code, a status stamped on the document, a
+        payment term. Return a grounded value: ``text`` is that printed
+        label, ``locations`` point at it. Ground the SPECIFIC span that
+        names this field's value, not the whole row it sits in.
+     b. The token is your JUDGMENT about other content, with nothing on
+        the page stating it — sorting a line item into a category from
+        its printed name, or reading a document's type from how it is
+        laid out. Return the COMPUTED form instead — ``computed: true``
+        and ``derived_from`` citing the field(s) you judged from — with
+        no ``locations``. The page never printed the category; you
+        concluded it.
+
+     Never copy a sibling field's verbatim text into an enum leaf's
+     ``text``. If your evidence for the classification IS that sibling
+     (the line item's printed name, a section heading), that is case
+     (b): cite it in ``derived_from`` rather than duplicating its
+     text.
+  2. Typed fields — dates as ISO (YYYY-MM-DD), numbers as plain
+     unformatted digits ("1234.50", not "$1,234.50").
+  3. Free-text fields — omit ``value``; the verbatim ``text`` is the
+     value.
+
+  ``text`` stays verbatim in every case — normalization lives in
+  ``value``, never by rewriting ``text``.
 
   ARRAY COMPLETENESS — non-negotiable. Arrays in the schema (transaction
   lists, line items, courses, etc.) must include EVERY entry the
@@ -129,8 +181,8 @@ extraction_values_phase1_system: |-
   COMPUTED (REASONED) FIELDS. Some schema fields carry a ``prompt``
   that describes a derivation rule — "Compute as the sum of ...",
   "Derive from ...", "Count the number of ..." — rather than a place on
-  the page. For those fields, return the computed alternative instead
-  of a grounded value:
+  the page. For those fields, return the computed form instead of a
+  grounded value:
 
     {"text": "<display form>", "value": "<canonical result>",
      "computed": true, "derived_from": ["<dotted path>", ...]}
@@ -150,6 +202,14 @@ extraction_values_phase1_system: |-
      you also verified it against a calculation. When a derivation
      rule says to verify against a printed value and the two disagree,
      follow the rule and return the computed result.
+  5. INFERRED values are computed values too — a value no single spot
+     on the page states, that you conclude from evidence (a currency
+     inferred from the issuer's country, a count of the entries in a
+     list). Cite the extracted values that constitute the evidence in
+     ``derived_from`` (e.g. the currency's evidence is the issuer name
+     you extracted; a count's is each entry it counts).
+     A computed value with an empty ``derived_from`` is an unauditable
+     claim — always name your evidence when it is in the submission.
 
   Submit final results via the ``submit_values`` tool call. Do not
   invent values; if a field is not present in the document, omit it
@@ -183,10 +243,48 @@ extraction_values_phase1_system: |-
   Use dotted notation for nested arrays (e.g. ``"company.contacts"``).
 
 extraction_values_phase1_user: |-
-  Extract values from the attached PDF against this JSON Schema. Each grounded leaf value's locations need only carry the page_number (1-indexed); a later phase will add bounding boxes. Fields whose ``prompt`` describes a derivation rule take the computed form instead — ``text``, ``value``, ``computed: true``, ``derived_from`` — with no locations. If any array-of-objects in the schema is laid out as a table on the page, also return a ``layout`` descriptor naming the columns in visual left-to-right order. Submit results via the submit_values tool call when done.
+  Extract values from the attached PDF against this JSON Schema. Each grounded leaf value carries the verbatim ``text``, the normalized ``value`` where one exists (the classifying enum token for fields with a ``value_enum`` list, ISO dates, plain numbers — omit when the text can't be normalized), and ``locations`` that need only carry the page_number (1-indexed); a later phase will add bounding boxes. Fields whose ``prompt`` describes a derivation rule take the computed form instead — ``text``, ``value``, ``computed: true``, ``derived_from`` — with no locations. If any array-of-objects in the schema is laid out as a table on the page, also return a ``layout`` descriptor naming the columns in visual left-to-right order. Submit results via the submit_values tool call when done.
 
   SCHEMA:
   {schema}
+
+# Appended to the phase-1 user prompt (after the schema) when the docset has
+# extraction guidance set (`dgml extraction set-guidance`). .format()'d with
+# {guidance} — the verbatim text of the docset's extraction-guidance.md.
+extraction_values_phase1_guidance: |-
+  DOCSET GUIDANCE — domain rules for documents of this kind, written by
+  the schema's author. They govern how fields are found, classified, and
+  derived, and take precedence over your own priors about such
+  documents. Cross-field consistency rules stated here (e.g. sums that
+  should reconcile) are guidance for your extraction and derivations —
+  when the document genuinely disagrees with a rule, extract what the
+  document says; never adjust values to force consistency.
+
+  {guidance}
+
+# Appended to the phase-1 user prompt when a previous attempt was truncated
+# (finish_reason='length'); used verbatim.
+extraction_values_phase1_retry_chunked: |-
+  MANDATORY CHUNKED SUBMISSION. A previous extraction attempt on this
+  document exceeded the output token limit and was truncated, losing
+  the whole run. You MUST NOT attempt a single full submission this
+  time. Split the output across several calls instead:
+
+  1. Call ``submit_values`` with ``done: false``, carrying every scalar
+     field plus the FIRST batch of entries for each large array.
+  2. Then call ``append_entries`` repeatedly: ``path`` is the dotted
+     path of the array to extend (e.g. "Transactions" or
+     "Sections[0].LineItems"), ``entries`` the next batch —
+     same item structure, document order, never repeating entries you
+     already submitted. Each call is acknowledged with a tool result.
+  3. Set ``done: true`` on the final call (either tool).
+
+  Keep every individual call small — at most ~40 array entries.
+  Completeness comes from the NUMBER of calls, not their size; array
+  completeness above still applies across the whole sequence.
+  Computed fields that derive from array entries (sums, counts) go in
+  the first ``submit_values`` call — their ``derived_from`` paths may
+  reference entries appended afterwards.
 
 # ── Grounded extraction: value extraction, phase 3 (attach bounding boxes) ────
 # The OCR word listing is rendered as a compact TOON table (see dgml_core.toon):

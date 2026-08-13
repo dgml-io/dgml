@@ -87,6 +87,7 @@ from .errors import TextExtractionFailed
 from .llm import LLMConfig, build_user_content, call
 from .ocr import OcrConfig, _write_page_json, extract_text_ocr
 from .pages import DEFAULT_DPI
+from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
 from .text_extraction import (
@@ -499,7 +500,7 @@ def _merge_system_prompt() -> str:
     core LLM feature), so wording can be tuned without touching this module.
     The loader caches after the first read.
     """
-    return prompt("merge_system_prompt").rstrip()
+    return prompt(PromptKey.MERGE_SYSTEM).rstrip()
 
 
 def _llm_emit_plan(

@@ -75,6 +75,7 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
+    from clustering.config.schema import SupportSelection
     from clustering.manifolds.base import ManifoldHead
 
 CalibrationMethod = Literal["none", "temperature", "platt"]
@@ -335,6 +336,7 @@ def support_loo_logits(
     manifold: ManifoldHead,
     *,
     n_shots: int | None = None,
+    selection: SupportSelection = "order",
     prototype_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Build leave-one-out calibration logits from a labeled support set.
@@ -369,6 +371,12 @@ def support_loo_logits(
         manifold: Active manifold head (``expmap0`` + ``pairwise_dist``).
         n_shots: Same per-category cap ``_build_prototypes`` applies, or
             ``None`` for no cap.
+        selection: Same support-sample selection ``_support_prototypes`` applies
+            (``"order"`` / ``"central"``). Must match inference or the LOO
+            prototypes would be built differently from the ones the run scores
+            against. Under leave-one-out, centrality is recomputed on the
+            post-exclusion member set, mirroring how inference would build the
+            prototype from those same rows.
         prototype_transform: Applied to the ``[K, D]`` leave-one-out prototype
             stack before scoring. Scenarios that post-process their prototypes
             — S5's name/support blend, for one — must pass the same transform
@@ -394,8 +402,16 @@ def support_loo_logits(
 
     def _prototype(cat: str, exclude: int | None) -> torch.Tensor:
         members = [k for k in by_cat[cat] if k != exclude]
-        if n_shots is not None:
-            members = members[:n_shots]
+        if n_shots is not None and len(members) > n_shots:
+            if selection == "central":
+                # Recompute centrality on the post-exclusion set, mirroring how
+                # _support_prototypes would build the prototype from these rows.
+                m_emb = support_embeddings[torch.tensor(members)]
+                dist = torch.linalg.norm(m_emb - m_emb.mean(dim=0, keepdim=True), dim=1)
+                keep = torch.argsort(dist, stable=True)[:n_shots].tolist()
+                members = [members[int(j)] for j in keep]
+            else:  # "order"
+                members = members[:n_shots]
         ambient_mean = support_embeddings[torch.tensor(members)].mean(dim=0)
         proto: torch.Tensor = manifold.expmap0(ambient_mean.unsqueeze(0)).squeeze(0)
         return proto
@@ -432,6 +448,7 @@ def fit_support_calibrator(
     coverage: float | None,
     abstain_threshold: float | None,
     n_shots: int | None = None,
+    selection: SupportSelection = "order",
     prototype_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> Calibrator | None:
     """Fit a calibrator from a labeled support set, or ``None`` if not possible.
@@ -452,6 +469,7 @@ def fit_support_calibrator(
         categories,
         manifold,
         n_shots=n_shots,
+        selection=selection,
         prototype_transform=prototype_transform,
     )
     if loo is None:

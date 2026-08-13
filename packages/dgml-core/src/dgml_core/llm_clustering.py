@@ -53,6 +53,7 @@ from .classification import (
 from .errors import ClassificationFailed
 from .llm import LLMConfig, call_with_tools
 from .models import DocSet
+from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
 from .usage import OPERATION_CLUSTER
@@ -422,13 +423,13 @@ def _build_grouping_prompt(doc_labels: list[str], docsets: list[DocSet]) -> str:
     and joins the pieces with blank lines.
     """
     parts = [
-        prompt("cluster_grouping_intro"),
-        prompt("cluster_grouping_doc_manifest").format(
+        prompt(PromptKey.CLUSTER_GROUPING_INTRO),
+        prompt(PromptKey.CLUSTER_GROUPING_DOC_MANIFEST).format(
             count=len(doc_labels), labels=", ".join(doc_labels)
         ),
     ]
     if docsets:
-        listing = [prompt("cluster_grouping_existing_intro")]
+        listing = [prompt(PromptKey.CLUSTER_GROUPING_EXISTING_INTRO)]
         for ds in docsets:
             listing.append(f"- id={ds.id}")
             listing.append(f"  name: {ds.name}")
@@ -439,7 +440,7 @@ def _build_grouping_prompt(doc_labels: list[str], docsets: list[DocSet]) -> str:
                 for q in ds.key_questions:
                     listing.append(f"    - {q}")
         parts.append("\n".join(listing))
-    parts.append(prompt("cluster_grouping_instructions").format(tool=_TOOL_GROUP))
+    parts.append(prompt(PromptKey.CLUSTER_GROUPING_INSTRUCTIONS).format(tool=_TOOL_GROUP))
     return "\n\n".join(parts)
 
 

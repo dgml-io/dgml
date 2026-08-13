@@ -285,6 +285,38 @@ def test_loo_honours_the_n_shots_cap() -> None:
     assert float(capped[0][2, 0]) == pytest.approx(-7.5, abs=1e-4)
 
 
+def test_loo_honours_central_selection() -> None:
+    # Same invariant as the n_shots-cap test but for the *selection* knob: the
+    # calibrator must build its leave-one-out prototypes the way inference does.
+    # Class A is an OUTLIER first, then a tight typical cluster. With n_shots=2,
+    # "order" keeps the first two remaining (dragging in the outlier), while
+    # "central" keeps the two nearest the post-exclusion mean (dropping it).
+    manifold = _euclidean(dim=2)
+    emb = torch.tensor(
+        [
+            [10.0, 0.0],  # A outlier, first in order
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [50.0, 0.0],  # B
+            [50.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    labels: list[str | None] = ["A", "A", "A", "A", "B", "B"]
+
+    order = support_loo_logits(emb, labels, ["A", "B"], manifold, n_shots=2, selection="order")
+    central = support_loo_logits(emb, labels, ["A", "B"], manifold, n_shots=2, selection="central")
+    assert order is not None and central is not None
+    assert not torch.allclose(order[0], central[0])
+
+    # Row 1 = holding out sample (0,0). "order" builds A's prototype from
+    # {outlier, (0,1)} = (5, 0.5) → own-class logit ≈ -5.02; "central" builds it
+    # from the two typical rows {(1,0),(0,1)} = (0.5, 0.5) → logit ≈ -0.707.
+    assert float(order[0][1, 0]) == pytest.approx(-5.0249, abs=1e-3)
+    assert float(central[0][1, 0]) == pytest.approx(-0.7071, abs=1e-3)
+
+
 def test_loo_applies_the_prototype_transform() -> None:
     # S5 blends a name prototype into the support mean; calibration has to
     # replay that or it measures a different geometry than inference.

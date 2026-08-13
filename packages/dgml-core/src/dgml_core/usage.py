@@ -72,6 +72,12 @@ class UsageEvent:
     outcome: str
     context: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # Anthropic prompt-cache accounting. Default 0 rather than None so rows
+    # written before these fields existed — and any UsageEvent built without
+    # them — stay valid, and so the values sum across calls. Populated by
+    # ``extract_cost_and_tokens``.
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -104,24 +110,52 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
     come off the standard OpenAI-shaped ``response.usage``. Any field we
     can't read returns ``None`` (the JSONL row carries the null forward
     rather than fabricating a zero).
+
+    Anthropic prompt-cache counters are surfaced by litellm on that same
+    normalized ``response.usage`` object as ``cache_read_input_tokens`` and
+    ``cache_creation_input_tokens``; we mirror them as ``cache_read_tokens``
+    and ``cache_creation_tokens``. Unlike the cost/token fields these default
+    to ``0`` rather than ``None``: a provider reporting no cache activity
+    genuinely used zero cache, and the values are summed across calls. A
+    fallback also checks ``_hidden_params`` in case a litellm version
+    relocates them there.
     """
     out: dict[str, Any] = {
         "cost_usd": None,
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
+    # litellm normalizes the Anthropic counters onto ``usage`` under these
+    # names; map each source name to the field we persist.
+    cache_fields = (
+        ("cache_read_input_tokens", "cache_read_tokens"),
+        ("cache_creation_input_tokens", "cache_creation_tokens"),
+    )
     hidden = getattr(response, "_hidden_params", None)
     if isinstance(hidden, dict):
         cost = hidden.get("response_cost")
         if isinstance(cost, int | float) and not isinstance(cost, bool):
             out["cost_usd"] = float(cost)
+        # Fallback: some litellm paths stash the cache counters in
+        # ``_hidden_params``. ``usage`` (read below) takes precedence.
+        for src, dst in cache_fields:
+            val = hidden.get(src)
+            if isinstance(val, int) and not isinstance(val, bool):
+                out[dst] = val
     usage = getattr(response, "usage", None)
     if usage is not None:
         for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
             val = getattr(usage, name, None)
             if isinstance(val, int) and not isinstance(val, bool):
                 out[name] = val
+        # Canonical location for the Anthropic prompt-cache counters.
+        for src, dst in cache_fields:
+            val = getattr(usage, src, None)
+            if isinstance(val, int) and not isinstance(val, bool):
+                out[dst] = val
     return out
 
 
@@ -133,7 +167,14 @@ def add_partial(acc: dict[str, Any], inc: dict[str, Any]) -> None:
     accumulator's value stays ``None`` only if every contribution is
     ``None`` for that field.
     """
-    for k in ("cost_usd", "prompt_tokens", "completion_tokens", "total_tokens"):
+    for k in (
+        "cost_usd",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+    ):
         a = acc.get(k)
         b = inc.get(k)
         if a is None and b is None:

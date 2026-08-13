@@ -18,7 +18,7 @@ artifacts are moved to cache/label_prev/ first.
 
 Usage:
     uv run python scripts/rerender.py <docset_dir> [--workspace-name NAME]
-        [--relabel anthropic/claude-sonnet-4-6]
+        [--relabel anthropic/claude-sonnet-5]
 
     <docset_dir> e.g. evaluation/dgml/workspaces/<workspace>/docsets/<id>
 """
@@ -126,7 +126,7 @@ def main() -> int:
         default=None,
         help=(
             "Re-run Pass B (semantic labeling) LIVE with this model on the cached "
-            "transcription, e.g. anthropic/claude-sonnet-4-6 — a handful of small "
+            "transcription, e.g. anthropic/claude-sonnet-5 — a handful of small "
             "calls instead of a full regeneration. Previous labeling artifacts "
             "move to cache/label_prev/."
         ),

@@ -60,6 +60,7 @@ from __future__ import annotations
 import logging
 import math
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -85,6 +86,7 @@ ClusterAlgorithm = Literal[
 GraphCCRadiusMethod = Literal["knee", "mst_gap"]
 LeidenGraphMethod = Literal["knn", "mutual_knn", "radius"]
 LeidenQuality = Literal["modularity", "cpm"]
+LeidenKSelection = Literal["none", "silhouette"]
 ReduceMethod = Literal[
     "none",
     "pca",
@@ -1343,6 +1345,57 @@ def manifold_meanshift(
     return _labels_and_medoids(raw_labels, d_np, embeddings)
 
 
+def _partition_silhouette(embeddings: torch.Tensor, labels: torch.Tensor) -> float:
+    """Mean silhouette of ``labels`` on ``embeddings`` (Euclidean), or ``-1.0``
+    for a partition too degenerate to score.
+
+    A single community, or one per point, has no silhouette — return the worst
+    possible score so the selector never prefers such a partition over a real
+    one. Noise-labelled points (``-1``) are treated as their own group, matching
+    the measurement the ``silhouette`` selection was tuned against.
+    """
+    from sklearn.metrics import silhouette_score
+
+    lab = labels.detach().cpu().numpy()
+    n_labels = len(set(lab.tolist()))
+    if n_labels < 2 or n_labels >= int(embeddings.shape[0]):
+        return -1.0
+    return float(silhouette_score(embeddings.detach().cpu().numpy(), lab))
+
+
+def _select_leiden_k_by_silhouette(
+    embeddings: torch.Tensor,
+    run: Callable[[int], tuple[torch.Tensor, torch.Tensor]],
+    *,
+    configured_k: int,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Choose the leiden k-NN graph degree per corpus by silhouette.
+
+    Runs leiden at the configured ``k`` and at a sparser candidate
+    ``max(2, (n-1)//8)``, and keeps the partition with the higher silhouette on
+    ``embeddings`` — but only when the sparser one wins by more than ``margin``,
+    so a near-tie keeps the configured ``k``. When the candidate would not
+    actually lower ``k`` (large ``n``), there is no alternative to weigh and the
+    configured run is returned unchanged, making this a no-op on the corpora the
+    sparser graph cannot help. Measured (opt-in, off by default): recovers an
+    under-split small corpus at no regression on the others.
+
+    The ``margin`` matters because silhouette tracks the true partition quality
+    only loosely: on a corpus where the two degrees are near-tied it can prefer
+    the marginally-higher-silhouette one even when that one is slightly worse, so
+    the gate trusts the switch only when the silhouette gap is decisive.
+    """
+    n = int(embeddings.shape[0])
+    candidate_k = max(2, (n - 1) // 8)
+    base = run(configured_k)
+    if candidate_k >= configured_k:
+        return base
+    capped = run(candidate_k)
+    gap = _partition_silhouette(embeddings, capped[0]) - _partition_silhouette(embeddings, base[0])
+    return capped if gap > margin else base
+
+
 def cluster_embeddings(
     embeddings: torch.Tensor,
     manifold: ManifoldHead,
@@ -1371,6 +1424,8 @@ def cluster_embeddings(
     leiden_resolution: float = 1.0,
     leiden_min_cluster_size: int = 2,
     leiden_n_iterations: int = -1,
+    leiden_k_selection: LeidenKSelection = "none",
+    leiden_k_selection_margin: float = 0.1,
     # DBSCAN-only knobs.
     dbscan_eps: float | None = None,
     dbscan_r_method: GraphCCRadiusMethod = "knee",
@@ -1438,19 +1493,30 @@ def cluster_embeddings(
             min_cluster_size=graph_cc_min_cluster_size,
         )
     if algorithm == "leiden":
-        return manifold_leiden(
-            embeddings,
-            manifold=manifold,
-            graph_method=leiden_graph_method,
-            k_neighbors=leiden_k_neighbors,
-            radius=leiden_radius,
-            r_method=leiden_r_method,
-            quality=leiden_quality,
-            resolution=leiden_resolution,
-            min_cluster_size=leiden_min_cluster_size,
-            seed=seed,
-            n_iterations=leiden_n_iterations,
-        )
+
+        def _leiden(k_neighbors: int) -> tuple[torch.Tensor, torch.Tensor]:
+            return manifold_leiden(
+                embeddings,
+                manifold=manifold,
+                graph_method=leiden_graph_method,
+                k_neighbors=k_neighbors,
+                radius=leiden_radius,
+                r_method=leiden_r_method,
+                quality=leiden_quality,
+                resolution=leiden_resolution,
+                min_cluster_size=leiden_min_cluster_size,
+                seed=seed,
+                n_iterations=leiden_n_iterations,
+            )
+
+        if leiden_k_selection == "silhouette" and leiden_graph_method == "knn":
+            return _select_leiden_k_by_silhouette(
+                embeddings,
+                _leiden,
+                configured_k=leiden_k_neighbors,
+                margin=leiden_k_selection_margin,
+            )
+        return _leiden(leiden_k_neighbors)
     if algorithm == "dbscan":
         return manifold_dbscan(
             embeddings,

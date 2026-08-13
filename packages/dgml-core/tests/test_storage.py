@@ -156,6 +156,26 @@ def test_render_config_toml_is_valid_and_complete() -> None:
     assert "# [models]" in placeholder
 
 
+def test_default_models_are_recognized_by_the_provider_router() -> None:
+    """Every shipped default must be an id litellm knows.
+
+    `dgml init --provider X` writes these verbatim, and the LLM layer
+    pre-flights each model through `litellm.get_model_info`
+    (`llm._require_supported_model`). A stale or mistyped default therefore
+    produces a config that only fails on the user's first LLM call, with a
+    ModelNotSupported naming a model they never chose — so pin the check here
+    rather than discovering it downstream.
+    """
+    from dgml_core.llm import model_max_output_tokens
+
+    for provider, tiers in PROVIDER_MODELS.items():
+        for tier, model in tiers.items():
+            assert model_max_output_tokens(model) is not None, (
+                f"default {provider}/{tier} = {model!r} is not a model id litellm "
+                "recognizes; `dgml init` would write a config that fails on first use"
+            )
+
+
 def test_render_config_toml_ships_opt_in_features_disabled() -> None:
     """Both opt-in features are named (so `dgml init` advertises them) but off.
 

@@ -14,28 +14,29 @@
 
 This module powers two CLI surfaces:
 
-- ``dgml extraction generate-schema`` — Claude is given a PDF from the docset
-  and asked to propose a *typed field tree* describing the structured
-  information to extract, choosing an ``xsd`` datatype for each leaf. That tree
-  is rendered straight to the at-rest RELAX NG Compact schema
-  (:func:`dgml_core.extraction_schema.field_tree_to_rnc`) — no grounded_field
-  JSON Schema intermediate. Downstream extraction attributes every value back
-  to a region of the source via the ``grounded_field`` form
-  (``{text, locations: [{page_number, bounding_box}]}``).
+- ``dgml extraction generate-schema`` — the configured ``schema_model`` is
+  given sample PDFs from the docset and asked to propose a *typed field tree*
+  describing the structured information to extract, choosing an ``xsd``
+  datatype (or enum token set) for each leaf. That tree is rendered straight
+  to the at-rest RELAX NG Compact schema
+  (:func:`dgml_core.extraction_schema.field_tree_to_rnc`) — no JSON Schema
+  intermediate. Downstream extraction attributes every value back to a region
+  of the source via the ``extracted_value`` form
+  (``{text, value?, locations: [{page_number, bounding_box}]}``).
 
-- ``dgml file extract`` (and the auto-extract hook on
-  ``dgml docset add-file``) — Gemini is given a PDF plus the docset's
-  schema, and asked to produce values matching that schema. To keep
-  output attributable to the source, the model is granted a ``get_page_words``
-  tool that returns OCR-extracted words and their bounding boxes from
-  the workspace. The model produces final results via a ``submit_values``
-  tool call.
+- ``dgml extraction extract`` (and the auto-extract hook on
+  ``dgml docset add-file``) — the configured ``values_model`` is given a PDF
+  plus the docset's schema, and asked to produce values matching that schema.
+  To keep output attributable to the source, the model is granted a
+  ``get_page_words`` tool that returns OCR-extracted words and their bounding
+  boxes from the workspace. The model produces final results via a
+  ``submit_values`` tool call.
 
 Coordinate space contract:
 - Bounding boxes are integer image pixels ``[left, top, right, bottom]``
   (top-left origin) at 300 dpi, relative to ``page_images/page_N.png`` —
   one convention end-to-end. This is what ``page_text/page_N.json``
-  stores, what the ``grounded_field`` form uses in schemas and values,
+  stores, what the ``extracted_value`` form uses in schemas and values,
   and what the ``get_page_words`` tool hands the model. The model reads
   pixel word boxes and returns pixel bboxes, so every hop speaks one
   language with no conversion.
@@ -65,25 +66,39 @@ from .errors import (
 )
 from .extraction_schema import (
     FIELD_DATATYPES,
+    Tag,
+    Vocabulary,
     field_tree_to_rnc,
     parse_rnc,
     rnc_to_json_schema,
 )
 from .extraction_xml import (
+    check_derivations,
+    check_invariants,
     count_dropped_refs,
+    count_unnormalized_enum_values,
     embed_extraction_into,
     has_document_tree,
     standalone_extraction_doc,
 )
 from .files import FileStore
-from .llm import LLMConfig, call_with_tools
+from .llm import (
+    LLMConfig,
+    _mark_document_cacheable,
+    call_with_tools,
+    is_anthropic_model,
+    model_max_output_tokens,
+)
 from .matching import (
     UnmatchedItem,
+    get_at_path,
+    parse_path,
     path_to_str,
     run_phase2_matching,
     walk_computed_leaves,
 )
 from .models_config import ConfigSection, Tier, resolve_tiered_model
+from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace, read_json, write_json_atomic, write_text_atomic
 from .toon import encode_phase3_words
@@ -101,13 +116,14 @@ from .usage import (
 
 DEFAULT_MAX_TOOL_ITERS = 20
 
-# Per-call output token cap. Set high to avoid silent clipping that
-# would surface as malformed-JSON tool-call arguments. Frontier
-# Gemini/Claude models cap at 64K-65K output tokens; 65000 hits that
-# ceiling while leaving the provider's bookkeeping headroom. Tuned
-# for value extraction which can be large (fully-grounded entries
-# carry text plus several bbox locations apiece).
-_DEFAULT_MAX_COMPLETION_TOKENS = 65000
+# Per-call output token cap — deliberately set to the largest ceiling any
+# current frontier model offers (128K on Claude Opus/Sonnet 5, Sonnet 4.6,
+# Gemini 2.5 Pro). `llm._build_completion_kwargs` clamps this down to each
+# model's documented limit, so a model with a lower ceiling (Haiku 4.5 at
+# 64K) gets its own maximum rather than a 400. Asking for the ceiling matters
+# for value extraction: a long itemized document can genuinely need
+# >65K output tokens, and clipping surfaces as truncated tool-call arguments.
+_DEFAULT_MAX_COMPLETION_TOKENS = 128000
 
 # Temperature for value extraction specifically. Schema generation
 # benefits from a little creativity (it's choosing field names);
@@ -147,6 +163,7 @@ DEFAULT_SCHEMA_SAMPLE_SIZE = 3
 _TOOL_GET_PAGE_WORDS = "get_page_words"
 _TOOL_SUBMIT_SCHEMA = "submit_schema"
 _TOOL_SUBMIT_VALUES = "submit_values"
+_TOOL_APPEND_ENTRIES = "append_entries"
 _TOOL_SUBMIT_LOCATIONS = "submit_locations"
 
 
@@ -367,7 +384,7 @@ def generate_schema(
     ]
     user_content.extend(pdf_blocks)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": prompt("extraction_schema_system")},
+        {"role": "system", "content": prompt(PromptKey.SCHEMA_SYSTEM)},
         {"role": "user", "content": user_content},
     ]
     tools = [_submit_schema_tool()]
@@ -396,6 +413,11 @@ def generate_schema(
             messages=messages,
             tools=tools,
             tool_choice={"type": "function", "function": {"name": _TOOL_SUBMIT_SCHEMA}},
+            # Deliberately NOT cached: the cacheable prefix is tools + system,
+            # and this system prompt is well short of the provider's minimum
+            # cacheable prefix, so a breakpoint would create no entry. Schema
+            # generation also runs once per docset, so there is no reuse to
+            # capture even if it did.
         )
     except Exception as exc:
         raise SchemaGenerationFailed(
@@ -413,10 +435,10 @@ def generate_schema(
 
 def _schema_user_prompt(n_files: int) -> str:
     if n_files == 1:
-        intro = prompt("extraction_schema_user_intro_single")
+        intro = prompt(PromptKey.SCHEMA_USER_INTRO_SINGLE)
     else:
-        intro = prompt("extraction_schema_user_intro_multi").format(n_files=n_files)
-    return intro + "\n\n" + prompt("extraction_schema_user_body")
+        intro = prompt(PromptKey.SCHEMA_USER_INTRO_MULTI).format(n_files=n_files)
+    return intro + "\n\n" + prompt(PromptKey.SCHEMA_USER_BODY)
 
 
 #: Max nesting depth of the *declared* field-tree schema. Only constrains
@@ -578,6 +600,7 @@ def extract_values(
     rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
     vocab = parse_rnc(rnc_schema)
     schema = rnc_to_json_schema(rnc_schema)
+    guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
     pdf_bytes = _pdf_path(workspace, file_id).read_bytes()
     api_key = _resolve_api_key(config.values_api_key, config.values_api_key_env)
     api_base = config.values_api_base
@@ -601,40 +624,125 @@ def extract_values(
     total_locations = 0
     computed_fields = 0
     dropped_refs = 0
+    unnormalized_enums = 0
+    derivations_checked = 0
+    derivations_mismatched = 0
+    invariants_checked = 0
+    invariant_violations: list[str] = []
     phase1_layout: dict[str, Any] | None = None
+    phase1_tool_schema_mode = "inlined"
+    phase1_chunk_calls = 0
+    phase1_truncated_retries = 0
 
     try:
         # --- Phase 1: text + page numbers, no bboxes (LLM) ----------
         phase1_started = time.monotonic()
         phase1_schema = _drop_bboxes_from_schema(schema)
-        phase1_values_schema = _expand_refs(phase1_schema)
-        phase1_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": prompt("extraction_values_phase1_system")},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _values_phase1_user_prompt(phase1_schema)},
-                    _pdf_content_block(pdf_bytes),
-                ],
-            },
-        ]
-        phase1_args, phase1_tool_calls = _run_extract_loop(
-            workspace=workspace,
-            file_id=file_id,
-            messages=phase1_messages,
-            tools=[_submit_values_tool(phase1_values_schema, with_layout=True)],
-            model=config.values_model,
-            api_key=api_key,
-            api_base=api_base,
-            max_tool_iters=config.max_tool_iters,
-            totals=phase1_totals,
-        )
+        # The tool parameter gets the expanded schema with prose annotations
+        # stripped — the identical keys remain in the user-prompt copy
+        # (phase1_schema), so no guidance is lost, and the smaller schema
+        # keeps Gemini's constrained decoder within its state budget.
+        phase1_tool_schema = _strip_annotations(_expand_refs(phase1_schema))
+        # Schema + docset guidance are byte-identical for every file in a
+        # docset, so a breakpoint here covers tools + system + schema + guidance
+        # across files. Keeping the chunking directive OUT of this block is what
+        # lets the retry still read it: the directive goes in its own block
+        # after, so the cached prefix is unchanged between the two attempts.
+        schema_text = _values_phase1_user_prompt(phase1_schema, guidance)
+
+        def _phase1_messages(*, chunked: bool) -> list[dict[str, Any]]:
+            # Rebuilt per attempt — _run_extract_loop mutates its message list.
+            anthropic = is_anthropic_model(config.values_model)
+            schema_block: dict[str, Any] = {"type": "text", "text": schema_text}
+            # ``cache_control`` is Anthropic-specific, so gate on the provider
+            # the same way ``call_with_tools`` gates its own marker — otherwise
+            # a ``gemini/*`` values model gets an Anthropic-only key in user
+            # content.
+            if anthropic:
+                schema_block["cache_control"] = {"type": "ephemeral"}
+            user_content: list[dict[str, Any]] = [schema_block]
+            if chunked:
+                user_content.append(
+                    {"type": "text", "text": prompt(PromptKey.VALUES_PHASE1_RETRY_CHUNKED)}
+                )
+            user_content.append(_pdf_content_block(pdf_bytes))
+            if anthropic and chunked:
+                # The per-file PDF earns a breakpoint only here. Chunked mode
+                # is several turns over one unchanged prefix, so turns after
+                # the first read it back; on the ordinary single-turn path a
+                # breakpoint could only ever pay the write premium, which is
+                # why the document is otherwise left untagged.
+                user_content = _mark_document_cacheable(user_content)
+            return [
+                {"role": "system", "content": prompt(PromptKey.VALUES_PHASE1_SYSTEM)},
+                {"role": "user", "content": user_content},
+            ]
+
+        # Two independent fallbacks compose around phase 1, each a one-way
+        # latch enabled by the failure it answers:
+        # * provider rejects the inlined tool schema ("too many states")
+        #   → permissive object parameter + code-side vocabulary pruning;
+        # * output truncated (finish_reason='length')
+        #   → chunked submission (see _phase1_tools) with a mandatory directive.
+        # Because a latch is only ever flipped from off to on, and each handler
+        # re-raises once its own latch is set, the loop runs at most three
+        # attempts (initial + one per latch) before terminating.
+        chunked = False
+        while True:
+            tool_schema = (
+                _PERMISSIVE_VALUES_PARAM
+                if phase1_tool_schema_mode == "permissive"
+                else phase1_tool_schema
+            )
+            try:
+                phase1_args, phase1_tool_calls, phase1_chunk_calls = _run_extract_loop(
+                    workspace=workspace,
+                    file_id=file_id,
+                    messages=_phase1_messages(chunked=chunked),
+                    tools=_phase1_tools(tool_schema, chunked=chunked),
+                    chunked=chunked,
+                    model=config.values_model,
+                    api_key=api_key,
+                    api_base=api_base,
+                    max_tool_iters=config.max_tool_iters,
+                    totals=phase1_totals,
+                )
+                break
+            except _OutputTruncated as exc:
+                if chunked:
+                    raise ValuesExtractionFailed(
+                        f"{exc} The chunked-submission retry was truncated too; "
+                        "consider a model with a higher output ceiling or "
+                        "splitting the document."
+                    ) from exc
+                chunked = True
+                phase1_truncated_retries += 1
+            except ValuesExtractionFailed as exc:
+                if phase1_tool_schema_mode == "permissive" or not _is_tool_schema_too_large(exc):
+                    raise
+                # Gemini's constrained decoder rejected the inlined schema;
+                # the model still sees the full schema in the user prompt.
+                phase1_tool_schema_mode = "permissive"
+        # Enforce the vocabulary code-side on exactly the paths whose payload
+        # never met a provider-side shape check: permissive mode (the values
+        # parameter was a bare object) and chunked mode (append_entries
+        # batches are validated only as generic objects). The inlined
+        # single-shot path already got additionalProperties:false at the API
+        # layer, and pruning it too would discard off-schema values *before*
+        # phases 2/3 rather than at serialization — a behavior change beyond
+        # what these fallbacks need.
+        if phase1_tool_schema_mode == "permissive" or chunked:
+            phase1_args["values"] = _prune_to_vocabulary(phase1_args["values"], vocab)
         phase1_values = phase1_args["values"]
         phase1_layout = phase1_args.get("layout") or None
         if not isinstance(phase1_layout, dict):
             phase1_layout = None
         tool_calls_total += phase1_tool_calls
         phase1_duration = round(time.monotonic() - phase1_started, 3)
+        # The merged extracted_value leaf shape lets a sloppy model blur the
+        # grounded/computed boundary; normalize before phases 2/3 (and the
+        # serializer) so their invariants hold regardless.
+        _normalize_leaf_provenance(phase1_values)
         # Computed (reasoned) leaves carry no locations — phases 2 and 3
         # never see them; counted here so the stats file can attest they
         # were deliberate, not dropped. dropped_refs counts derived_from
@@ -642,6 +750,16 @@ def extract_values(
         # provenance that would otherwise vanish silently at serialization.
         computed_fields = sum(1 for _ in walk_computed_leaves(phase1_values))
         dropped_refs = count_dropped_refs(phase1_values)
+        # Enum leaves whose normalized value isn't one of the schema's tokens
+        # serialize text-only; count them so misses are visible in stats.
+        unnormalized_enums = count_unnormalized_enum_values(phase1_values, vocab)
+        # Recompute checkable derivations (report-only): a mismatch means a
+        # computed leaf's value agrees with neither the sum, the count, nor
+        # any single one of its derived_from inputs.
+        derivations_checked, derivations_mismatched = check_derivations(phase1_values)
+        # Schema-declared `## Invariant:` relations (count/sum across the
+        # submission). Report-only, like the derivation recompute above.
+        invariants_checked, invariant_violations = check_invariants(phase1_values, vocab)
 
         # --- Phase 2: code-side OCR matching ------------------------
         phase2_result = run_phase2_matching(workspace, file_id, phase1_values, layout=phase1_layout)
@@ -711,6 +829,8 @@ def extract_values(
                     prompt_tokens=merged_totals["prompt_tokens"],
                     completion_tokens=merged_totals["completion_tokens"],
                     total_tokens=merged_totals["total_tokens"],
+                    cache_read_tokens=merged_totals["cache_read_tokens"],
+                    cache_creation_tokens=merged_totals["cache_creation_tokens"],
                     duration_s=round(time.monotonic() - started, 3),
                     outcome=outcome,
                     context={
@@ -746,7 +866,15 @@ def extract_values(
                     total_locations=total_locations,
                     computed_fields=computed_fields,
                     dropped_refs=dropped_refs,
+                    unnormalized_enums=unnormalized_enums,
+                    derivations_checked=derivations_checked,
+                    derivations_mismatched=derivations_mismatched,
+                    invariants_checked=invariants_checked,
+                    invariant_violations=invariant_violations,
                     phase1_layout=phase1_layout,
+                    phase1_tool_schema=phase1_tool_schema_mode,
+                    phase1_chunk_calls=phase1_chunk_calls,
+                    phase1_truncated_retries=phase1_truncated_retries,
                 )
         except Exception:
             pass
@@ -758,6 +886,11 @@ def _empty_totals() -> dict[str, Any]:
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
+        # Anthropic prompt-cache counters (default 0, summable). These flow
+        # into ``extraction_stats.json`` via the ``**phaseN_totals`` spread
+        # and into the ``usage.jsonl`` row via ``_merge_totals``.
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
 
 
@@ -797,7 +930,15 @@ def _write_extraction_stats(
     total_locations: int,
     computed_fields: int,
     dropped_refs: int,
+    unnormalized_enums: int,
+    derivations_checked: int,
+    derivations_mismatched: int,
+    invariants_checked: int,
+    invariant_violations: list[str],
     phase1_layout: dict[str, Any] | None,
+    phase1_tool_schema: str,
+    phase1_chunk_calls: int,
+    phase1_truncated_retries: int,
 ) -> None:
     """Write ``extraction_stats.json`` into the file's marker directory.
 
@@ -812,7 +953,16 @@ def _write_extraction_stats(
         "outcome": outcome,
         "error": error_msg,
         "phases": {
-            "phase1": {"duration_s": phase1_duration, **phase1_totals},
+            "phase1": {
+                "duration_s": phase1_duration,
+                # 1 = ordinary single submit_values; >1 = the chunked
+                # protocol (append_entries / done=false continuations).
+                "chunk_calls": phase1_chunk_calls,
+                # times phase 1 was restarted with the explicit chunking
+                # directive after a finish_reason='length' truncation.
+                "truncated_retries": phase1_truncated_retries,
+                **phase1_totals,
+            },
             "phase2": {"duration_s": phase2_duration},
             "phase3": {
                 "duration_s": phase3_duration,
@@ -827,11 +977,26 @@ def _write_extraction_stats(
             "unmatched": unmatched,
             "computed_fields": computed_fields,
             "dropped_refs": dropped_refs,
+            "unnormalized_enum_values": unnormalized_enums,
+            "derivations_checked": derivations_checked,
+            "derivations_mismatched": derivations_mismatched,
+            # Schema-declared invariants: how many were evaluable, and the
+            # human-readable text of each violation so a failure is
+            # actionable without re-deriving it from the values tree.
+            "invariants_checked": invariants_checked,
+            "invariants_violated": len(invariant_violations),
+            "invariant_violations": invariant_violations,
         },
         # Phase-1's emitted layout hint, persisted so we can audit
         # whether the model produced a useful descriptor for each
         # array (some models drop optional tool-call parameters).
         "phase1_layout": phase1_layout,
+        # "inlined" when the docset schema rode inside the submit_values
+        # tool parameter (provider-enforced shape); "permissive" when the
+        # provider rejected the inlined schema (Gemini "too many states")
+        # and the retry ran with a bare object parameter + code-side
+        # vocabulary pruning.
+        "phase1_tool_schema": phase1_tool_schema,
     }
     write_json_atomic(workspace.docset_file_extraction_stats_path(docset_id, file_id), stats)
 
@@ -930,7 +1095,16 @@ def _phase3_call_for_page(
 ) -> dict[str, list[dict[str, Any]]]:
     """One litellm call: send the page + ids that need locating, return
     ``{id: [{page_number, bounding_box}, ...]}`` parsed from the model's
-    ``submit_locations`` tool call."""
+    ``submit_locations`` tool call.
+
+    Deliberately uncached, for three independent reasons: the cacheable prefix
+    is tools + system and ``_submit_locations_tool`` is built from *this page's*
+    unmatched ids, so the prefix differs on every call and no read can match;
+    page calls run in parallel, and an entry is only readable once the first
+    response has begun streaming; and the phase-3 system prompt alone is under
+    the minimum cacheable prefix. Marking it only risks paying the cache-write
+    premium for a read that cannot arrive — the same reasoning that keeps the
+    PDF and image blocks untagged."""
     image_path = workspace.file_dir(file_id) / "page_images" / f"page_{page_number}.png"
     if not image_path.exists():
         raise ValuesExtractionFailed(
@@ -949,7 +1123,7 @@ def _phase3_call_for_page(
         page_anchors=_collect_page_anchors(values, page_number),
     )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": prompt("extraction_values_phase3_system")},
+        {"role": "system", "content": prompt(PromptKey.VALUES_PHASE3_SYSTEM)},
         {
             "role": "user",
             "content": [
@@ -1128,7 +1302,7 @@ def _phase3_user_prompt(
     # :mod:`dgml_core.toon`, measured at -72.2% input tokens versus the former
     # ``json.dumps(..., indent=2)`` array). Lossless; only the words given TO
     # the model change — the ``submit_locations`` response contract is untouched.
-    return prompt("extraction_values_phase3_user").format(
+    return prompt(PromptKey.VALUES_PHASE3_USER).format(
         page_number=page_number,
         ocr_words=encode_phase3_words(page_words.get("words", [])),
         known_locations="\n".join(anchors_lines),
@@ -1211,6 +1385,111 @@ def _image_content_block(image_bytes: bytes) -> dict[str, Any]:
     }
 
 
+class _OutputTruncated(ValuesExtractionFailed):
+    """A phase-1 turn stopped with ``finish_reason == "length"`` — the tool
+    call was clipped mid-output. Caught by :func:`extract_values`, which
+    retries once with an explicit chunked-submission directive; surfaces as a
+    plain :class:`ValuesExtractionFailed` if the retry truncates too."""
+
+
+def _merge_values(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """Merge a follow-up ``submit_values`` chunk into the accumulated tree.
+
+    In place on *base*: non-leaf dicts merge recursively, lists concatenate
+    (chunks carry only NEW entries, per the prompt contract), and leaves
+    (dicts carrying ``text``) or scalars replace. Returns *base*."""
+    for key, value in extra.items():
+        current = base.get(key)
+        if isinstance(current, dict) and isinstance(value, dict) and "text" not in value:
+            _merge_values(current, value)
+        elif isinstance(current, list) and isinstance(value, list):
+            current.extend(value)
+        else:
+            base[key] = value
+    return base
+
+
+def _apply_append_entries(acc_args: dict[str, Any] | None, args: dict[str, Any]) -> dict[str, Any]:
+    """Apply one ``append_entries`` call to the accumulated values; the
+    returned dict is the tool result (an ``error`` key means the call was
+    rejected — the model sees it and can correct course; the run only fails
+    on protocol-independent problems)."""
+    if acc_args is None:
+        return {
+            "error": (
+                f"no values submitted yet — call {_TOOL_SUBMIT_VALUES} with done=false "
+                f"before {_TOOL_APPEND_ENTRIES}"
+            )
+        }
+    raw_path = args.get("path")
+    entries = args.get("entries")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return {"error": "append_entries requires a dotted 'path' string"}
+    if not isinstance(entries, list):
+        return {"error": "append_entries requires an 'entries' array"}
+    path = parse_path(raw_path.strip())
+    if path is None:
+        return {"error": f"could not parse path {raw_path!r}"}
+    target = get_at_path(acc_args["values"], path)
+    if target is None:
+        return {
+            "error": (
+                f"path {raw_path!r} does not exist in the submitted values; include the "
+                "array (with its first entries) in submit_values before appending to it"
+            )
+        }
+    if not isinstance(target, list):
+        return {"error": f"path {raw_path!r} is not an array"}
+    target.extend(entries)
+    return {"recorded": len(entries), "total_entries": len(target)}
+
+
+def _append_entries_tool() -> dict[str, Any]:
+    """The chunked-submission continuation tool: extend an array submitted by
+    an earlier ``submit_values(done=false)`` call. Entries are validated
+    code-side against the docset vocabulary after the run (the per-path item
+    schema can't be expressed in one static tool spec)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _TOOL_APPEND_ENTRIES,
+            "description": (
+                "Append the next batch of array entries to the values tree "
+                "submitted by an earlier submit_values call with done=false. "
+                "Entries must follow the same item structure as the array in "
+                "the schema, in document order, without repeating entries "
+                "already submitted. Set done=true on the final call of the "
+                "whole extraction."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Dotted path of the array to extend, e.g. "
+                            "'Transactions' or 'Sections[0].LineItems'."
+                        ),
+                    },
+                    "entries": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "The next batch of array entries.",
+                    },
+                    "done": {
+                        "type": "boolean",
+                        "description": (
+                            "True when this call completes the extraction; "
+                            "false/omitted when more calls follow."
+                        ),
+                    },
+                },
+                "required": ["path", "entries"],
+            },
+        },
+    }
+
+
 def _run_extract_loop(
     *,
     workspace: Workspace,
@@ -1222,15 +1501,37 @@ def _run_extract_loop(
     api_base: str | None,
     max_tool_iters: int,
     totals: dict[str, Any],
-) -> tuple[dict[str, Any], int]:
-    """Run a multi-turn extraction loop until the model calls ``submit_values``.
+    chunked: bool = False,
+) -> tuple[dict[str, Any], int, int]:
+    """Run a multi-turn extraction loop until the model finishes submitting.
 
-    Returns ``(submit_args, tool_calls_run)`` — ``submit_args`` is the
-    full args dict the model passed to ``submit_values``, so callers can
-    pluck out optional sibling fields like ``layout`` in addition to
-    ``values``. Mutates ``totals`` by adding cost/token deltas from
-    every litellm call so the surrounding ``extract_values`` records a
-    single usage row across both phases.
+    Returns ``(submit_args, tool_calls_run, chunk_calls)`` — ``submit_args``
+    carries the merged ``values`` tree plus optional sibling fields like
+    ``layout``; ``chunk_calls`` counts the submission calls (1 for the
+    ordinary single ``submit_values``, more when the model used the chunked
+    protocol). Mutates ``totals`` by adding cost/token deltas from every
+    litellm call so the surrounding ``extract_values`` records a single
+    usage row across both phases.
+
+    Two submission protocols:
+
+    * **Single-shot** (ordinary documents): one ``submit_values`` call, its
+      ``done`` flag omitted or true.
+    * **Chunked** (very large outputs): ``submit_values`` with
+      ``done: false`` (scalars + first array batches), then repeated
+      ``append_entries`` calls extending an array at a dotted path, the
+      last one carrying ``done: true``. Each non-terminal call gets an
+      acknowledging tool result so the model continues the same turn loop.
+
+    ``chunked`` must match the tool set the caller built (see
+    :func:`_phase1_tools`): the chunked protocol is honored only when it is
+    set, so an ``append_entries`` call that arrives without it is treated as
+    an unknown tool. That keeps the caller's invariant true by construction —
+    if appends ran, chunked mode was on, so the payload gets pruned.
+
+    A turn that stops with ``finish_reason == "length"`` raises
+    :class:`_OutputTruncated` so the caller can retry with an explicit
+    chunking directive.
     """
     # Phase 1 uses tool_choice="auto" (the default in call_with_tools) so
     # the model can call get_page_words between turns. With auto choice
@@ -1248,15 +1549,48 @@ def _run_extract_loop(
     )
 
     tool_calls_run = 0
+    chunk_calls = 0
+    acc_args: dict[str, Any] | None = None  # accumulated submit_values args
+
+    def _ack(call_id: str, name: str, payload: dict[str, Any]) -> None:
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": json.dumps(payload),
+            }
+        )
+
     for _ in range(max_tool_iters):
         try:
-            result = call_with_tools(llm_config, messages=messages, tools=tools)
+            # Always cached: the system prompt and the schema block ahead of the
+            # per-file PDF are byte-identical for every file in the docset, so
+            # each file after the first reads that prefix instead of re-sending
+            # it. ``call_with_tools`` no-ops the marker for non-Anthropic models.
+            result = call_with_tools(llm_config, messages=messages, tools=tools, cache=True)
         except Exception as exc:
             raise ValuesExtractionFailed(
                 f"extraction call failed: {type(exc).__name__}: {exc}"
             ) from exc
 
         add_partial(totals, result.usage)
+
+        if result.finish_reason == "length":
+            # Without this check a clipped submit_values surfaces as an
+            # opaque malformed-JSON error; name the real cause instead. The
+            # cap reported is the effective one — the request is clamped to
+            # the model's own ceiling when that is lower than what we ask for.
+            effective_cap = min(
+                _DEFAULT_MAX_COMPLETION_TOKENS,
+                model_max_output_tokens(model, api_base) or _DEFAULT_MAX_COMPLETION_TOKENS,
+            )
+            raise _OutputTruncated(
+                "model output hit the completion-token cap "
+                f"(finish_reason='length', max_completion_tokens={effective_cap}, "
+                f"the ceiling for {model!r}) before finishing its tool call — "
+                "the extraction output was truncated."
+            )
 
         if not result.tool_calls:
             raise ValuesExtractionFailed(
@@ -1281,7 +1615,41 @@ def _run_extract_loop(
                     raise ValuesExtractionFailed(
                         f"{_TOOL_SUBMIT_VALUES!r} was called without a 'values' object"
                     )
-                return args, tool_calls_run
+                chunk_calls += 1
+                if acc_args is None:
+                    acc_args = args
+                else:
+                    acc_args["values"] = _merge_values(acc_args["values"], values)
+                    if isinstance(args.get("layout"), dict):
+                        merged_layout = acc_args.get("layout")
+                        if isinstance(merged_layout, dict):
+                            merged_layout.update(args["layout"])
+                        else:
+                            acc_args["layout"] = args["layout"]
+                assert acc_args is not None
+                if args.get("done", True):
+                    return acc_args, tool_calls_run, chunk_calls
+                _ack(
+                    call.id,
+                    name,
+                    {
+                        "recorded": True,
+                        "next": (
+                            f"continue with {_TOOL_APPEND_ENTRIES} (or another "
+                            f"{_TOOL_SUBMIT_VALUES}); set done=true on the last call"
+                        ),
+                    },
+                )
+                continue
+
+            if name == _TOOL_APPEND_ENTRIES and chunked:
+                chunk_calls += 1
+                outcome = _apply_append_entries(acc_args, args)
+                if "error" not in outcome and args.get("done", False):
+                    assert acc_args is not None  # _apply_append_entries verified
+                    return acc_args, tool_calls_run, chunk_calls
+                _ack(call.id, name, outcome)
+                continue
 
             if name == _TOOL_GET_PAGE_WORDS:
                 tool_calls_run += 1
@@ -1302,14 +1670,7 @@ def _run_extract_loop(
                     # Bubble tool errors back to the model as a tool result;
                     # don't fail the whole extraction on a bad lookup.
                     tool_result = {"error": f"{type(exc).__name__}: {exc}"}
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "name": name,
-                        "content": json.dumps(tool_result),
-                    }
-                )
+                _ack(call.id, name, tool_result)
                 continue
 
             raise ValuesExtractionFailed(f"model called unknown tool: {name!r}")
@@ -1320,40 +1681,120 @@ def _run_extract_loop(
     )
 
 
+def _normalize_leaf_provenance(values: Any) -> None:
+    """Enforce the grounded-XOR-computed invariant on phase-1 leaves, in place.
+
+    The merged ``extracted_value`` leaf shape lets a sloppy model return both
+    ``locations`` and ``computed``/``derived_from`` on one leaf, an empty
+    ``locations`` array on a computed value, or an empty-string ``value``.
+    Phases 2/3 and the XML serializer rely on the invariants the old split
+    shapes guaranteed — a grounded leaf has ``locations`` and no computed
+    keys; a computed leaf has ``computed``/``derived_from`` (a list) and no
+    ``locations`` key — so this pass restores them:
+
+    * a leaf with at least one usable location is grounded → computed keys
+      are dropped;
+    * a leaf with computed markers and no usable location is computed →
+      ``computed`` is forced true, ``derived_from`` to a list of strings,
+      and ``locations`` removed;
+    * an unusable ``locations`` array (empty, or no valid page_number) on a
+      plain leaf is removed;
+    * an empty-string ``value`` is removed.
+    """
+    if isinstance(values, list):
+        for entry in values:
+            _normalize_leaf_provenance(entry)
+        return
+    if not isinstance(values, dict):
+        return
+    if isinstance(values.get("text"), str):
+        # A leaf (only leaves carry a lowercase "text" key — tag names are
+        # PascalCase). Normalize in place; never descend further.
+        if values.get("value") == "":
+            del values["value"]
+        locations = values.get("locations")
+        grounded = isinstance(locations, list) and any(
+            isinstance(loc, dict) and isinstance(loc.get("page_number"), int) for loc in locations
+        )
+        if grounded:
+            values.pop("computed", None)
+            values.pop("derived_from", None)
+        elif "computed" in values or "derived_from" in values:
+            values["computed"] = True
+            refs = values.get("derived_from")
+            values["derived_from"] = (
+                [r for r in refs if isinstance(r, str)] if isinstance(refs, list) else []
+            )
+            values.pop("locations", None)
+        else:
+            values.pop("locations", None)
+        return
+    for child in values.values():
+        _normalize_leaf_provenance(child)
+
+
 def _drop_bboxes_from_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of the schema with ``bounding_box`` stripped from
-    ``definitions.grounded_field.locations[]``.
+    """Return a copy of the schema with ``bounding_box`` stripped from the
+    leaf definition's ``locations[]`` (``extracted_value``, plus the legacy
+    ``grounded_field`` for older exported schemas).
 
     Phase-1 extraction shows the model this slimmer shape so it focuses
     on getting the text and page numbers right without the bbox burden.
-    Schemas without the conventional ``$ref: '#/definitions/grounded_field'``
-    pattern are returned unchanged — the convention is what the
-    schema-gen step always produces.
+    Schemas without a conventional leaf definition are returned unchanged.
     """
     out = copy.deepcopy(schema)
     defs = out.get("definitions")
     if not isinstance(defs, dict):
         return out
-    gf = defs.get("grounded_field")
-    if not isinstance(gf, dict):
-        return out
-    locs = gf.get("properties", {}).get("locations", {})
-    items = locs.get("items", {})
-    props = items.get("properties")
-    if isinstance(props, dict) and "bounding_box" in props:
-        del props["bounding_box"]
-    required = items.get("required")
-    if isinstance(required, list):
-        items["required"] = [r for r in required if r != "bounding_box"]
+    for def_name in ("extracted_value", "grounded_field"):
+        leaf_def = defs.get(def_name)
+        if not isinstance(leaf_def, dict):
+            continue
+        locs = leaf_def.get("properties", {}).get("locations", {})
+        items = locs.get("items", {})
+        props = items.get("properties")
+        if isinstance(props, dict) and "bounding_box" in props:
+            del props["bounding_box"]
+        required = items.get("required")
+        if isinstance(required, list):
+            items["required"] = [r for r in required if r != "bounding_box"]
     return out
 
 
-def _values_phase1_user_prompt(schema: dict[str, Any]) -> str:
-    return prompt("extraction_values_phase1_user").format(schema=json.dumps(schema, indent=2))
+def _values_phase1_user_prompt(schema: dict[str, Any], guidance: str | None = None) -> str:
+    """The phase-1 user prompt: instructions + schema, plus the docset's
+    extraction guidance (``extraction-guidance.md``) when one is set.
+
+    Both parts are byte-identical for every file in a docset, which is what
+    makes this block worth a cache breakpoint. The chunked-submission
+    directive is deliberately NOT included: it is appended as its own block by
+    the caller, so that adding it on a retry leaves this prefix — and the
+    cache entry written for it — untouched."""
+    text = prompt(PromptKey.VALUES_PHASE1_USER).format(schema=json.dumps(schema, indent=2))
+    if guidance:
+        text += "\n\n" + prompt(PromptKey.VALUES_PHASE1_GUIDANCE).format(guidance=guidance.strip())
+    return text
+
+
+def _phase1_tools(values_schema: dict[str, Any], *, chunked: bool) -> list[dict[str, Any]]:
+    """The phase-1 tool set.
+
+    ``chunked`` gates the whole chunked-submission protocol — the ``done``
+    flag on ``submit_values`` and the ``append_entries`` continuation tool.
+    Single-shot is the default contract: offering a continuation tool the run
+    has no reason to use invites the model to split output that fits in one
+    call, and costs tool-schema tokens on every request. Chunking is an
+    escalation, enabled only after an attempt was truncated (see
+    :func:`extract_values`), where the prompt carries the matching protocol.
+    """
+    tools = [_submit_values_tool(values_schema, with_layout=True, chunked=chunked)]
+    if chunked:
+        tools.append(_append_entries_tool())
+    return tools
 
 
 def _submit_values_tool(
-    values_schema: dict[str, Any], *, with_layout: bool = False
+    values_schema: dict[str, Any], *, with_layout: bool = False, chunked: bool = False
 ) -> dict[str, Any]:
     """Build the ``submit_values`` tool spec.
 
@@ -1370,14 +1811,33 @@ def _submit_values_tool(
     properties: dict[str, Any] = {"values": values_schema}
     if with_layout:
         properties["layout"] = _layout_param_schema()
+    if chunked:
+        # Only offered in chunked mode — a `done` flag on a single-shot call
+        # is an invitation to split output we have room for, and every unused
+        # parameter is schema the constrained decoder still has to carry.
+        properties["done"] = {
+            "type": "boolean",
+            "description": (
+                "Omit (or true) when this call carries the complete "
+                "extraction; false when more array entries will follow via "
+                "append_entries calls."
+            ),
+        }
+        description = (
+            "Submit the extracted values. Pass done=false when the output is "
+            "too large for one call and continue with append_entries; a call "
+            "with done omitted or true ends the run."
+        )
+    else:
+        description = (
+            "Submit the final extracted values. Call exactly once when "
+            "extraction is complete; this ends the run."
+        )
     return {
         "type": "function",
         "function": {
             "name": _TOOL_SUBMIT_VALUES,
-            "description": (
-                "Submit the final extracted values. Call exactly once when "
-                "extraction is complete; this ends the run."
-            ),
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": properties,
@@ -1422,6 +1882,124 @@ def _layout_param_schema() -> dict[str, Any]:
     }
 
 
+# Prose annotation keys the tool schema doesn't need: they live on in the
+# user-prompt copy of the schema, and for a large docset schema they are most
+# of the bytes — stripping them keeps the provider's constrained decoder
+# (notably Gemini's, which rejects big schemas with "too many states for
+# serving") within budget. `enum` is deliberately NOT here: it is load-bearing
+# for constrained decoding of normalized enum values.
+_ANNOTATION_KEYS = frozenset({"description", "prompt", "example", "datatype", "value_enum"})
+
+
+def _strip_annotations(node: Any) -> Any:
+    """Deep-copy *node* (a tool schema) without prose annotation keys."""
+    if isinstance(node, dict):
+        return {k: _strip_annotations(v) for k, v in node.items() if k not in _ANNOTATION_KEYS}
+    if isinstance(node, list):
+        return [_strip_annotations(x) for x in node]
+    return node
+
+
+# The fallback `values` tool parameter when the provider rejects the inlined
+# docset schema: shape enforcement moves from the API layer to the prompt
+# (which carries the full schema) plus code-side pruning against the
+# vocabulary (_prune_to_vocabulary).
+_PERMISSIVE_VALUES_PARAM: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "The extracted values tree. MUST follow the JSON Schema given in the "
+        "prompt exactly — same nesting, same field names, and the leaf value "
+        "shape it defines."
+    ),
+}
+
+
+def _is_tool_schema_too_large(exc: Exception) -> bool:
+    """True when the provider rejected the request because the inlined tool
+    schema overflows its constrained-decoding budget. Matched on the error
+    text because litellm surfaces it as a provider BadRequest string —
+    Gemini's wording is "too many states for serving"."""
+    return "too many states" in str(exc).lower()
+
+
+def _prune_to_vocabulary(values: dict[str, Any], vocab: Vocabulary) -> dict[str, Any]:
+    """Drop keys and wrong-shape nodes the docset vocabulary doesn't define.
+
+    The code-side stand-in for the ``additionalProperties: false`` the
+    inlined tool schema enforces at the API layer — used when the provider
+    rejected the inlined schema and phase 1 ran with the permissive object
+    parameter. Leaf internals are left untouched (they are normalized by
+    :func:`_normalize_leaf_provenance`)."""
+
+    def prune_children(children: list[Tag], value: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for child in children:
+            pruned = prune_tag(child, value.get(child.name))
+            if pruned is not None:
+                out[child.name] = pruned
+        return out
+
+    def prune_tag(tag: Tag, value: Any) -> Any:
+        if value is None:
+            return None
+        if tag.kind == "field":
+            return value if isinstance(value, dict) else None
+        if tag.kind == "choice":
+            if not isinstance(value, dict):
+                return None
+            if any(c.name in value for c in tag.children):
+                return prune_children(tag.children, value)
+            return value  # the scalar-leaf alternative
+        if tag.kind == "collection":
+            if not isinstance(value, list):
+                return None
+            item = tag.item
+            entries = []
+            for entry in value:
+                if item is not None and item.kind == "field":
+                    pruned = prune_tag(item, entry)
+                elif isinstance(entry, dict):
+                    pruned = prune_children(tag.children, entry)
+                else:
+                    pruned = None
+                if pruned is not None:
+                    entries.append(pruned)
+            return entries
+        # container
+        return prune_children(tag.children, value) if isinstance(value, dict) else None
+
+    return {
+        root.name: pruned
+        for root in vocab.roots
+        if (pruned := prune_tag(root, values.get(root.name))) is not None
+    }
+
+
+def _specialize_leaf(expanded: dict[str, Any], extras: dict[str, Any]) -> dict[str, Any]:
+    """Apply a leaf $ref node's sidecar keys to its expanded definition.
+
+    ``value_enum`` narrows the leaf's ``value`` property to the schema's
+    closed token set (an ``enum``) so the provider's constrained decoder
+    enforces it; every other sidecar key (``prompt``, ``example``,
+    ``description``, ``datatype``) is carried as an annotation. *expanded*
+    is a fresh tree built by ``_expand_refs``' walk, so mutating it here
+    never touches the shared definition."""
+    extras = dict(extras)
+    enum_values = extras.pop("value_enum", None)
+    if (
+        isinstance(enum_values, list)
+        and enum_values
+        and isinstance(expanded.get("properties"), dict)
+        and isinstance(expanded["properties"].get("value"), dict)
+    ):
+        expanded["properties"]["value"] = {
+            **expanded["properties"]["value"],
+            "enum": list(enum_values),
+        }
+    expanded.update(extras)
+    return expanded
+
+
 def _expand_refs(schema: dict[str, Any]) -> dict[str, Any]:
     """Inline-expand local ``#/definitions/...`` $refs in a JSON Schema,
     and tighten every ``type: object`` node by setting
@@ -1449,6 +2027,14 @@ def _expand_refs(schema: dict[str, Any]) -> dict[str, Any]:
     open-ended map in the docset schema (rare, but possible) still
     works.
 
+    A ``$ref`` node may carry sidecar keys next to the ref (``prompt``,
+    ``example``, ``description``, ``datatype``, ``value_enum`` — the
+    per-field annotations the RNC bridge emits). Those are merged onto
+    the expanded definition so per-field guidance survives into the tool
+    schema; ``value_enum`` is *specialized* into the expanded leaf's
+    ``value.enum`` so the provider constrain-decodes the normalized
+    value to the schema's closed token set.
+
     Unknown $ref forms (external URLs, non-``definitions`` JSON Pointers)
     are left untouched; the downstream provider will fail loudly on
     them rather than silently produce a wrong-shape result.
@@ -1462,7 +2048,10 @@ def _expand_refs(schema: dict[str, Any]) -> dict[str, Any]:
                 key = ref[len("#/definitions/") :]
                 target = defs.get(key)
                 if isinstance(target, dict):
-                    return walk(target)
+                    expanded = walk(target)
+                    assert isinstance(expanded, dict)  # walk(dict) is a dict
+                    extras = {k: v for k, v in node.items() if k != "$ref"}
+                    return _specialize_leaf(expanded, extras) if extras else expanded
                 return node  # unresolved — keep as-is so the model error is visible
             out: dict[str, Any] = {
                 k: walk(v) for k, v in node.items() if k not in {"$schema", "definitions"}

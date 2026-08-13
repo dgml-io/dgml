@@ -130,8 +130,8 @@ value-extraction ← `advanced`, classification/style ← `light`, schema-genera
 [models]
 light    = "gemini/gemini-flash-lite-latest"
 standard = "anthropic/claude-haiku-4-5"
-advanced = "anthropic/claude-sonnet-4-6"
-expert   = "anthropic/claude-opus-4-8"
+advanced = "anthropic/claude-sonnet-5"
+expert   = "anthropic/claude-opus-5"
 ```
 
 To pin a specific model for one task, add its per-task section (it overrides the
@@ -141,7 +141,7 @@ them to this workspace only (it deep-merges over the user config):
 ```toml
 [generation]
 model = "anthropic/claude-haiku-4-5"
-label_model = "anthropic/claude-sonnet-4-6"
+label_model = "anthropic/claude-sonnet-5"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [classification]

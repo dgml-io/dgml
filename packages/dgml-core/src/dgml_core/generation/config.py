@@ -180,7 +180,7 @@ def validate_generation_models(
             # typo) — NOT for a valid-provider/bad-model id, which passes here.
             raise GenerationConfigInvalid(
                 f"'{model}' is not a recognized model string "
-                "(expected e.g. 'anthropic/claude-sonnet-4-6'): "
+                "(expected e.g. 'anthropic/claude-sonnet-5'): "
                 f"{short_error_message(exc)}"
             ) from exc
         if api_base is not None:

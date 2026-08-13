@@ -20,6 +20,7 @@ from .errors import (
     CorruptMetadata,
     DocSetNotFound,
     FileNotFound,
+    GuidanceNotFound,
     InvalidArgument,
     SchemaInvalid,
     SchemaNotFound,
@@ -193,6 +194,53 @@ class DocSetStore:
         if not self.ws.docset_dir(docset_id).exists():
             raise DocSetNotFound(f"docset '{docset_id}' not found")
         path = self.ws.docset_schema_path(docset_id)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
+    # ---- extraction guidance (docsets/<id>/extraction-guidance.md) ---------
+
+    def get_guidance(self, docset_id: str) -> str:
+        """Read the docset's extraction guidance text.
+
+        Raises :class:`GuidanceNotFound` if absent. The guidance is free-form
+        markdown/plain text injected into the phase-1 extraction prompt for
+        every file extracted against this docset.
+        """
+        if not docset_id.strip():
+            raise InvalidArgument("docset id must not be empty")
+        if not self.ws.docset_dir(docset_id).exists():
+            raise DocSetNotFound(f"docset '{docset_id}' not found")
+        path = self.ws.docset_guidance_path(docset_id)
+        if not path.exists():
+            raise GuidanceNotFound(f"docset '{docset_id}' has no extraction guidance")
+        return path.read_text(encoding="utf-8")
+
+    def has_guidance(self, docset_id: str) -> bool:
+        if not docset_id.strip():
+            raise InvalidArgument("docset id must not be empty")
+        return self.ws.docset_guidance_path(docset_id).exists()
+
+    def set_guidance(self, docset_id: str, guidance: str) -> str:
+        """Write (replace) the docset's extraction guidance text."""
+        if not docset_id.strip():
+            raise InvalidArgument("docset id must not be empty")
+        if not self.ws.docset_dir(docset_id).exists():
+            raise DocSetNotFound(f"docset '{docset_id}' not found")
+        if not isinstance(guidance, str) or not guidance.strip():
+            raise InvalidArgument("guidance must be non-empty text")
+        write_text_atomic(self.ws.docset_guidance_path(docset_id), guidance)
+        return guidance
+
+    def clear_guidance(self, docset_id: str) -> bool:
+        """Remove the docset's extraction guidance. Returns True if removed,
+        False if there was none to remove."""
+        if not docset_id.strip():
+            raise InvalidArgument("docset id must not be empty")
+        if not self.ws.docset_dir(docset_id).exists():
+            raise DocSetNotFound(f"docset '{docset_id}' not found")
+        path = self.ws.docset_guidance_path(docset_id)
         if not path.exists():
             return False
         path.unlink()

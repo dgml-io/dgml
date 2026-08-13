@@ -308,6 +308,55 @@ def _mark_last_block_cacheable(
     return out
 
 
+def _mark_system_message_cacheable(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a shallow copy of *messages* with the system message tagged
+    ``cache_control: {"type": "ephemeral"}`` for Anthropic (tool-call path).
+
+    Mirrors :func:`_build_system_message` for :func:`call_with_tools`, whose
+    callers pass a fully-built ``messages`` list rather than the
+    ``system_prompt`` + ``user_content`` split the text path uses. Only the
+    first ``role == "system"`` message is tagged (the extraction call sites have
+    exactly one, always first): a string ``content`` is wrapped into a single
+    cacheable text block; a list ``content`` gets the marker on its last block.
+
+    The system prompt is the block callers are most likely to share across
+    requests, but a marker is not a guarantee: the provider caches nothing if
+    the prefix ahead of the breakpoint — tools, then system — is shorter than
+    its minimum cacheable length, and nothing is read back unless a later
+    request repeats that prefix exactly.
+
+    Per-request-volatile user content (per-file PDF, per-page image, per-page
+    OCR words) is deliberately left untouched — a caller that also has a
+    *stable* user block (e.g. the docset schema text in phase-1 extraction) tags
+    it itself before calling. A shallow copy is returned so the caller's list,
+    reused across a tool loop, is never mutated.
+    """
+    out: list[dict[str, Any]] = [dict(m) for m in messages]
+    for i, msg in enumerate(out):
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            out[i] = {
+                **msg,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        elif isinstance(content, list) and content:
+            blocks = [dict(b) for b in content]
+            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            out[i] = {**msg, "content": blocks}
+        break
+    return out
+
+
 def call_with_refinement(
     config: LLMConfig,
     *,
@@ -402,6 +451,40 @@ def _require_supported_model(model: str, api_base: str | None) -> None:
         ) from exc
 
 
+def model_max_output_tokens(model: str, api_base: str | None = None) -> int | None:
+    """The model's documented output-token ceiling, or ``None`` when unknown.
+
+    Read from litellm's model metadata so callers can ask for a model's real
+    ceiling instead of hardcoding one number across a fleet whose limits
+    differ (frontier Claude/Gemini allow 128K; Haiku 4.5 caps at 64K).
+    ``None`` for a custom ``api_base`` (self-hosted/proxy — no metadata) or an
+    id litellm doesn't know, in which case callers keep their own default.
+    """
+    if api_base:
+        return None
+    try:
+        info = litellm.get_model_info(model)
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    raw = info.get("max_output_tokens") or info.get("max_tokens")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        return None
+    return int(raw)
+
+
+def _clamp_output_tokens(requested: int, model: str, api_base: str | None) -> int:
+    """Lower *requested* to the model's ceiling when we know it.
+
+    Only ever lowers: asking a model for more output tokens than it supports
+    is a provider 400, and the caller's intent ("give me as much room as this
+    model allows") is served by the ceiling.
+    """
+    ceiling = model_max_output_tokens(model, api_base)
+    return min(requested, ceiling) if ceiling is not None else requested
+
+
 def _build_completion_kwargs(
     config: LLMConfig,
     *,
@@ -431,10 +514,17 @@ def _build_completion_kwargs(
     # default is the only always-safe value.
     if config.temperature is not None and not is_anthropic_model(config.model):
         kwargs["temperature"] = config.temperature
+    # Both caps are clamped to the model's documented ceiling — a request for
+    # more output than the model allows is a provider 400, and callers ask for
+    # the largest useful value rather than tracking per-model limits.
     if config.max_tokens is not None:
-        kwargs["max_tokens"] = config.max_tokens
+        kwargs["max_tokens"] = _clamp_output_tokens(
+            config.max_tokens, config.model, config.api_base
+        )
     if config.max_completion_tokens is not None:
-        kwargs["max_completion_tokens"] = config.max_completion_tokens
+        kwargs["max_completion_tokens"] = _clamp_output_tokens(
+            config.max_completion_tokens, config.model, config.api_base
+        )
     if config.timeout is not None:
         kwargs["timeout"] = config.timeout
     if config.api_key:
@@ -550,6 +640,8 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
                     prompt_tokens=totals["prompt_tokens"],
                     completion_tokens=totals["completion_tokens"],
                     total_tokens=totals["total_tokens"],
+                    cache_read_tokens=totals["cache_read_tokens"],
+                    cache_creation_tokens=totals["cache_creation_tokens"],
                     duration_s=round(time.monotonic() - started, 3),
                     outcome=outcome,
                     context=config.context or {},
@@ -635,6 +727,7 @@ def call_with_tools(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     tool_choice: str | dict[str, Any] | None = None,
+    cache: bool = False,
 ) -> CallResult:
     """Invoke the configured model with tool definitions; return the full
     message plus parsed usage.
@@ -652,7 +745,24 @@ def call_with_tools(
     ``"required"`` or a ``{"type": "function", ...}`` dict to force a
     tool call; the Anthropic ``reasoning_effort`` drop is keyed off
     that forced choice.
+
+    ``cache=True`` enables provider prompt caching. For Anthropic-routed
+    models it tags the system message with ``cache_control: {"type":
+    "ephemeral"}`` (via :func:`_mark_system_message_cacheable`), so the
+    tools + system prefix — identical across every call in a docset —
+    replays at ~10% token cost within the 5-minute TTL. Callers that also
+    carry a *stable* user-content block (e.g. the docset schema text that is
+    byte-identical across every file) tag that block themselves before
+    calling; per-request-volatile blocks (per-file PDF, per-page image/OCR
+    words) are never tagged. litellm forwards ``cache_control`` on system and
+    message content blocks for Anthropic even on tool-carrying requests, so
+    caching composes with ``tools``. Caching changes only billing and
+    latency — the request the model sees, and hence its output, are
+    unaffected. For non-Anthropic providers caching is implicit and the flag
+    is a no-op.
     """
+    if cache and is_anthropic_model(config.model):
+        messages = _mark_system_message_cacheable(messages)
     kwargs = _build_completion_kwargs(
         config,
         messages=messages,
@@ -692,6 +802,8 @@ def empty_usage_totals() -> dict[str, Any]:
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
 
 
@@ -742,6 +854,8 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
                     prompt_tokens=totals["prompt_tokens"],
                     completion_tokens=totals["completion_tokens"],
                     total_tokens=totals["total_tokens"],
+                    cache_read_tokens=totals["cache_read_tokens"],
+                    cache_creation_tokens=totals["cache_creation_tokens"],
                     duration_s=round(time.monotonic() - started, 3),
                     outcome=outcome,
                     context=config.context or {},

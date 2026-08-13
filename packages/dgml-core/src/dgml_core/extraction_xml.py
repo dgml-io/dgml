@@ -13,7 +13,9 @@
 """Serialize extracted values into a ``dg:extraction`` element and back.
 
 The grounded-extraction engine produces a values tree that mirrors the docset
-schema: a leaf is ``{"text": ..., "locations": [{"page_number", "bounding_box"}]}``,
+schema: a leaf is ``{"text": ..., "value"?: ..., "locations": [{"page_number",
+"bounding_box"}]}`` (``value`` is the model's normalized form — for enum fields
+the schema token, validated against the enum before it becomes ``dg:value``),
 a container is a dict of child fields, and a collection is a list of such dicts.
 
 A leaf may instead be **computed** (spec §7/§13) — derived by the model
@@ -42,11 +44,12 @@ a caller asks for ``--format json``.
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from lxml import etree  # type: ignore[import-untyped]
 
-from .extraction_schema import Tag, Vocabulary
+from .extraction_schema import Tag, Vocabulary, parse_invariant
 from .generation.semantic_transform import _detect_value_type
 from .matching import (
     LeafPath,
@@ -173,6 +176,208 @@ def count_dropped_refs(values: dict[str, Any]) -> int:
     return dropped
 
 
+_DERIVATION_TOLERANCE = Decimal("0.05")
+
+
+def _leaf_number(leaf: Any) -> Decimal | None:
+    """A leaf's numeric reading — its normalized ``value`` if numeric, else its
+    ``text`` with common money formatting stripped. ``None`` when not numeric."""
+    if not isinstance(leaf, dict):
+        return None
+    for raw in (leaf.get("value"), leaf.get("text")):
+        if raw is None:
+            continue
+        cleaned = str(raw).replace(",", "").replace("$", "").strip()
+        try:
+            return Decimal(cleaned)
+        except InvalidOperation:
+            continue
+    return None
+
+
+def check_derivations(values: dict[str, Any]) -> tuple[int, int]:
+    """Recompute checkable computed leaves; return ``(checked, mismatched)``.
+
+    Report-only quality signal (surfaced in ``extraction_stats.json``): for
+    each computed leaf whose ``derived_from`` paths all resolve to leaves
+    with numeric readings, the leaf is *checked*; it counts as *mismatched*
+    when its own numeric value matches neither the SUM of the inputs, the
+    COUNT of the inputs, nor any single input (a passthrough/min/max style
+    derivation) within a $0.05 tolerance. Non-numeric derivations (an
+    inferred currency, a classification) are skipped, not counted.
+    """
+    checked = 0
+    mismatched = 0
+    for _path, leaf in walk_computed_leaves(values):
+        refs = leaf.get("derived_from")
+        if not isinstance(refs, list) or not refs:
+            continue
+        inputs: list[Decimal] = []
+        resolvable = True
+        for raw in refs:
+            path = parse_path(raw) if isinstance(raw, str) else None
+            source = get_at_path(values, path) if path is not None else None
+            number = _leaf_number(source)
+            if number is None:
+                resolvable = False
+                break
+            inputs.append(number)
+        if not resolvable:
+            continue
+        result = _leaf_number(leaf)
+        if result is None:
+            continue
+        checked += 1
+        candidates = [sum(inputs, Decimal(0)), Decimal(len(inputs)), *inputs]
+        if not any(abs(result - c) <= _DERIVATION_TOLERANCE for c in candidates):
+            mismatched += 1
+    return checked, mismatched
+
+
+def _resolve_collection(values: dict[str, Any], path: str) -> list[Any] | None:
+    """Walk a dotted tag path to a collection, or ``None`` if it isn't one.
+
+    Only dict hops are followed: an invariant naming a path that runs through a
+    repeated entry is unresolvable rather than ambiguously "the first one".
+    """
+    node: Any = values
+    for segment in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(segment)
+    return node if isinstance(node, list) else None
+
+
+def check_invariants(values: dict[str, Any], vocab: Vocabulary) -> tuple[int, list[str]]:
+    """Evaluate the schema's ``## Invariant:`` annotations against *values*.
+
+    Returns ``(checked, violations)`` where each violation is a human-readable
+    one-liner naming the field, the expectation and what was found. Report-only
+    by design (spec §13: extraction never adjusts values to force consistency)
+    — the caller surfaces the counts in ``extraction_stats.json`` and
+    ``dgml check``.
+
+    An invariant whose field or collection is absent from *values* is **not**
+    counted: extraction schemas are nullable throughout, so "not extracted" is
+    a legal outcome and must not read as a violation. Only a field that has a
+    value, with a resolvable collection to compare against, is checked.
+
+    The two forms differ on an empty collection, deliberately. ``count`` is
+    about cardinality, which is known as soon as the collection resolves, so
+    an empty one is checked against zero. ``sum`` is about leaf values, so it
+    is skipped unless at least one entry yielded a number — otherwise a total
+    whose per-entry amounts simply weren't extracted would report as a
+    violation.
+    """
+    checked = 0
+    violations: list[str] = []
+
+    def visit(tag: Tag, value: Any) -> None:
+        nonlocal checked
+        if value is None:
+            return
+        if tag.kind == "field":
+            if tag.invariant and isinstance(value, dict):
+                _check_one(tag, value)
+            return
+        if tag.kind == "collection":
+            if not isinstance(value, list):
+                return
+            item = tag.item
+            for entry in value:
+                if item is not None and item.kind == "field":
+                    visit(item, entry)
+                elif isinstance(entry, dict):
+                    for child in tag.children:
+                        visit(child, entry.get(child.name))
+            return
+        if isinstance(value, dict):
+            for child in tag.children:
+                visit(child, value.get(child.name))
+
+    def _check_one(tag: Tag, leaf: dict[str, Any]) -> None:
+        nonlocal checked
+        assert tag.invariant is not None
+        parsed = parse_invariant(tag.invariant)
+        if parsed is None:  # pragma: no cover - schema load rejects these
+            return
+        kind, path, leaf_name = parsed
+        actual = _leaf_number(leaf)
+        if actual is None:
+            return  # field present but not numeric — nothing to compare
+        # Invariants are evaluated against the whole submission, so a path is
+        # resolved from the root regardless of where the annotated field sits.
+        collection = _resolve_collection(values, path)
+        if collection is None:
+            return
+        if kind == "count":
+            checked += 1
+            expected = Decimal(len(collection))
+            if actual != expected:
+                violations.append(f"{tag.name}: expected count({path}) = {expected}, got {actual}")
+            return
+        # sum(<collection>[].<leaf>)
+        assert leaf_name is not None
+        addends = [
+            number
+            for entry in collection
+            if isinstance(entry, dict)
+            for number in (_leaf_number(entry.get(leaf_name)),)
+            if number is not None
+        ]
+        if not addends:
+            return
+        checked += 1
+        expected = sum(addends, Decimal(0))
+        if abs(actual - expected) > _DERIVATION_TOLERANCE:
+            violations.append(
+                f"{tag.name}: expected sum({path}[].{leaf_name}) = {expected}, got {actual}"
+            )
+
+    for root in vocab.roots:
+        visit(root, values.get(root.name))
+    return checked, violations
+
+
+def count_unnormalized_enum_values(values: dict[str, Any], vocab: Vocabulary) -> int:
+    """Number of enum-field leaves whose ``value`` is missing or not one of the
+    schema's enum tokens. Those leaves serialize text-only (no ``dg:value``),
+    so the misses are surfaced in ``extraction_stats.json`` instead of
+    vanishing silently."""
+    count = 0
+
+    def visit(tag: Tag, value: Any) -> None:
+        nonlocal count
+        if value is None:
+            return
+        if tag.kind == "field":
+            if tag.enum_values is not None and isinstance(value, dict):
+                raw = value.get("value")
+                token = str(raw).strip() if raw is not None else None
+                if token not in tag.enum_values:
+                    count += 1
+            return
+        if tag.kind == "collection":
+            if not isinstance(value, list):
+                return
+            item = tag.item
+            for entry in value:
+                if item is not None and item.kind == "field":
+                    visit(item, entry)
+                elif isinstance(entry, dict):
+                    for child in tag.children:
+                        visit(child, entry.get(child.name))
+            return
+        # container / choice-with-children: descend by child name.
+        if isinstance(value, dict):
+            for child in tag.children:
+                visit(child, value.get(child.name))
+
+    for root in vocab.roots:
+        visit(root, values.get(root.name))
+    return count
+
+
 def unattributed_computed_fields(xml: str | bytes) -> list[str]:
     """Local names of ``dg:origin="computed"`` elements that carry no
     ``dg:href`` — a computed value whose sources can't be walked (spec §13
@@ -198,6 +403,7 @@ def _set_computed_attrs(
     value: dict[str, Any],
     value_type: str | None,
     ids: dict[LeafPath, str],
+    enum_values: list[str] | None = None,
 ) -> None:
     """Emit the computed-field attribute set (spec §13): ``dg:origin="computed"``,
     a mandatory ``dg:value`` (the model's canonical ``value``, normalized), and
@@ -207,8 +413,14 @@ def _set_computed_attrs(
     text_str = el.text or ""
     raw_value = value.get("value")
     canonical = str(raw_value).strip() if raw_value is not None else None
-    if value_type is not None:
-        xsi_type: str | None = value_type
+    if enum_values is not None:
+        # Enum fields carry the schema token as dg:value, no xsi:type (the
+        # tokens aren't XSD types). An unnormalizable value falls back to the
+        # display text so the mandatory dg:value is still present.
+        xsi_type: str | None = None
+        dg_value = canonical if canonical in enum_values else None
+    elif value_type is not None:
+        xsi_type = value_type
         dg_value = canonical
         if dg_value is None:
             xsi_type, dg_value = _typed_value(text_str, value_type)
@@ -243,6 +455,7 @@ def _add_field(
     value: dict[str, Any],
     value_type: str | None = None,
     *,
+    enum_values: list[str] | None = None,
     path: LeafPath = (),
     ids: dict[LeafPath, str] | None = None,
 ) -> None:
@@ -254,16 +467,34 @@ def _add_field(
     if text_str:
         el.text = text_str
     if is_computed_leaf(value):
-        _set_computed_attrs(el, value, value_type, ids)
+        _set_computed_attrs(el, value, value_type, ids, enum_values)
         return
-    if text_str:
+    # Grounded leaf: the model-returned normalized `value` wins when it
+    # validates (an enum token from the schema's closed set, or a value the
+    # declared datatype accepts); otherwise fall back to normalizing the
+    # verbatim text. An enum leaf with no valid token stays text-only —
+    # counted upstream as unnormalized, never guessed.
+    raw_value = value.get("value")
+    canonical = str(raw_value).strip() if raw_value is not None else None
+    xsi_type: str | None = None
+    dg_value: str | None = None
+    if enum_values is not None:
+        if canonical in enum_values:
+            dg_value = canonical
+    elif text_str or canonical:
         if value_type is not None:
-            xsi_type, dg_value = _typed_value(text_str, value_type)
+            if canonical:
+                xsi_type, dg_value = _typed_value(canonical, value_type)
+            if dg_value is None and text_str:
+                xsi_type, dg_value = _typed_value(text_str, value_type)
         else:
-            xsi_type, dg_value, _ = _detect_value_type(text_str, extra_formats=False)
-        if xsi_type and dg_value is not None:
+            xsi_type, dg_value, _ = _detect_value_type(canonical or text_str, extra_formats=False)
+            if canonical and dg_value is None:
+                dg_value = canonical
+    if dg_value is not None:
+        if xsi_type:
             el.set(f"{{{XSI_NS}}}type", xsi_type)
-            el.set(f"{{{DG_NS}}}value", dg_value)
+        el.set(f"{{{DG_NS}}}value", dg_value)
     origin = _origin_from_locations(value.get("locations"))
     if origin:
         el.set(f"{{{DG_NS}}}origin", origin)
@@ -282,7 +513,16 @@ def _add_tag(
         return  # field not extracted — omit the element entirely
     if tag.kind == "field":
         if isinstance(value, dict):
-            _add_field(parent, docset_ns, tag.name, value, tag.value_type, path=path, ids=ids)
+            _add_field(
+                parent,
+                docset_ns,
+                tag.name,
+                value,
+                tag.value_type,
+                enum_values=tag.enum_values,
+                path=path,
+                ids=ids,
+            )
         return
     if tag.kind == "container":
         if not isinstance(value, dict):
@@ -313,13 +553,23 @@ def _add_tag(
         item_name = (item.name if item else None) or tag.item_name or tag.name
         item_is_leaf = item is not None and item.kind == "field"
         item_type = item.value_type if item is not None else None
+        item_enum = item.enum_values if item is not None else None
         for i, entry in enumerate(value):
             if not isinstance(entry, dict):
                 continue
             item_path = path + (i,)
             if item_is_leaf:
                 # list of grounded text values — each entry is a leaf field.
-                _add_field(el, docset_ns, item_name, entry, item_type, path=item_path, ids=ids)
+                _add_field(
+                    el,
+                    docset_ns,
+                    item_name,
+                    entry,
+                    item_type,
+                    enum_values=item_enum,
+                    path=item_path,
+                    ids=ids,
+                )
             else:
                 item_el = etree.SubElement(el, f"{{{docset_ns}}}{item_name}")
                 _maybe_set_id(item_el, item_path, ids)

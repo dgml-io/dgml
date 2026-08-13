@@ -174,6 +174,12 @@ class SchemaNotFound(NotFoundError):
     code = "SCHEMA_NOT_FOUND"
 
 
+class GuidanceNotFound(NotFoundError):
+    """The docset has no extraction guidance (``extraction-guidance.md``)."""
+
+    code = "GUIDANCE_NOT_FOUND"
+
+
 class SchemaInvalid(DgmlError):
     code = "SCHEMA_INVALID"
 

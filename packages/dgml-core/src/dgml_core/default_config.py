@@ -38,14 +38,21 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
         # (transcription → labeling/value-extraction → schema generation).
         "light": "gemini/gemini-flash-lite-latest",
         "standard": "anthropic/claude-haiku-4-5",
-        "advanced": "anthropic/claude-sonnet-4-6",
-        "expert": "anthropic/claude-opus-4-8",
+        "advanced": "anthropic/claude-sonnet-5",
+        "expert": "anthropic/claude-opus-5",
     },
     "anthropic": {
+        # `advanced` (labeling, value extraction) and `expert` (schema
+        # generation) carry the reasoning-heavy work, so they track the current
+        # Sonnet/Opus generation. Both allow 128K output tokens — twice the
+        # previous generation's ceiling, which matters for value extraction on
+        # charge-heavy documents (see grounded._DEFAULT_MAX_COMPLETION_TOKENS).
+        # `light`/`standard` stay on Haiku 4.5: there is no Haiku 5, and the
+        # cheap tiers do classification and transcription where it holds up.
         "light": "anthropic/claude-haiku-4-5",
         "standard": "anthropic/claude-haiku-4-5",
-        "advanced": "anthropic/claude-sonnet-4-6",
-        "expert": "anthropic/claude-opus-4-8",
+        "advanced": "anthropic/claude-sonnet-5",
+        "expert": "anthropic/claude-opus-5",
     },
     "google": {
         "light": "gemini/gemini-flash-lite-latest",

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import pytest
 from dgml_core.extraction_schema import json_schema_to_rnc, parse_rnc
 from dgml_core.extraction_xml import (
     carry_extraction_over,
@@ -511,3 +512,391 @@ def test_carry_extraction_over_noop_without_prior_extraction() -> None:
     prior = '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"><a>only a tree</a></dg:chunk>'
     fresh = '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"><b>new tree</b></dg:chunk>'
     assert carry_extraction_over(prior, fresh) == fresh
+
+
+# ── Enum fields and model-returned normalized values ─────────────────────────
+
+_ENUM_RNC = """\
+namespace docset = "http://dgml.io/acme/utility-bills"
+
+MeterType =
+  element docset:MeterType {
+    ( "electric" | "natural_gas" | "water" )
+  }
+
+TotalUsage =
+  element docset:TotalUsage {
+    xsd:decimal
+  }
+
+Notes =
+  element docset:Notes {
+    text
+  }
+"""
+
+
+def _enum_vocab() -> object:
+    return parse_rnc(_ENUM_RNC)
+
+
+def test_enum_field_valid_token_becomes_dg_value() -> None:
+    values = {
+        "MeterType": {
+            "text": "Electric Service",
+            "value": "electric",
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        }
+    }
+    xml = standalone_extraction_doc(values, vocab=_enum_vocab())  # type: ignore[arg-type]
+    assert 'dg:value="electric"' in xml
+    assert ">Electric Service</docset:MeterType>" in xml
+    # Enum tokens aren't XSD types — no xsi:type on the element.
+    assert "xsi:type" not in xml
+
+
+def test_enum_field_invalid_token_stays_text_only() -> None:
+    values = {
+        "MeterType": {
+            "text": "Mystery Commodity",
+            "value": "plasma",  # not in the enum — never guessed into dg:value
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        }
+    }
+    xml = standalone_extraction_doc(values, vocab=_enum_vocab())  # type: ignore[arg-type]
+    assert "dg:value" not in xml
+    assert ">Mystery Commodity</docset:MeterType>" in xml
+
+
+def test_enum_field_missing_value_stays_text_only() -> None:
+    values = {
+        "MeterType": {
+            "text": "Electric Service",
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        }
+    }
+    xml = standalone_extraction_doc(values, vocab=_enum_vocab())  # type: ignore[arg-type]
+    assert "dg:value" not in xml
+
+
+def test_enum_dg_value_round_trips_to_values_json() -> None:
+    vocab = _enum_vocab()
+    values = {
+        "MeterType": {
+            "text": "Electric Service",
+            "value": "electric",
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        }
+    }
+    xml = standalone_extraction_doc(values, vocab=vocab)  # type: ignore[arg-type]
+    assert dgml_xml_to_values(xml, vocab=vocab) == values  # type: ignore[arg-type]
+
+
+def test_typed_field_model_value_wins_when_it_validates() -> None:
+    values = {
+        "TotalUsage": {
+            "text": "18,808.674 kWh",
+            "value": "18808.674",
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        }
+    }
+    xml = standalone_extraction_doc(values, vocab=_enum_vocab())  # type: ignore[arg-type]
+    assert 'xsi:type="decimal"' in xml
+    assert 'dg:value="18808.674"' in xml
+
+
+def test_typed_field_bad_model_value_falls_back_to_text_heuristics() -> None:
+    values = {
+        "TotalUsage": {
+            "text": "18,808.674 kWh",
+            "value": "lots",  # garbage — the verbatim text still normalizes
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        }
+    }
+    xml = standalone_extraction_doc(values, vocab=_enum_vocab())  # type: ignore[arg-type]
+    assert 'dg:value="18808.674"' in xml
+
+
+def test_untyped_field_model_value_kept_without_xsi_type() -> None:
+    values = {
+        "Notes": {
+            "text": "See rider B",
+            "value": "rider-b",
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        }
+    }
+    xml = standalone_extraction_doc(values, vocab=_enum_vocab())  # type: ignore[arg-type]
+    assert 'dg:value="rider-b"' in xml
+    assert "xsi:type" not in xml
+
+
+def test_computed_enum_field_uses_valid_token() -> None:
+    values = {
+        "Notes": {
+            "text": "electric bill",
+            "locations": [{"page_number": 1, "bounding_box": [1, 2, 3, 4]}],
+        },
+        "MeterType": {
+            "text": "Electric",
+            "value": "electric",
+            "computed": True,
+            "derived_from": ["Notes"],
+        },
+    }
+    xml = standalone_extraction_doc(values, vocab=_enum_vocab())  # type: ignore[arg-type]
+    assert 'dg:origin="computed"' in xml
+    assert 'dg:value="electric"' in xml
+
+
+def test_count_unnormalized_enum_values() -> None:
+    from dgml_core.extraction_xml import count_unnormalized_enum_values
+
+    vocab = _enum_vocab()
+    values = {
+        "MeterType": {
+            "text": "Mystery",
+            "value": "plasma",
+            "locations": [{"page_number": 1}],
+        },
+        "TotalUsage": {"text": "5", "locations": [{"page_number": 1}]},
+    }
+    assert count_unnormalized_enum_values(values, vocab) == 1  # type: ignore[arg-type]
+    values["MeterType"]["value"] = "electric"
+    assert count_unnormalized_enum_values(values, vocab) == 0  # type: ignore[arg-type]
+
+
+# ── Derivation recompute (report-only) ────────────────────────────────────────
+
+
+def test_check_derivations_sum_match_and_mismatch() -> None:
+    from dgml_core.extraction_xml import check_derivations
+
+    def bill(total: str) -> dict[str, object]:
+        return {
+            "Items": [
+                {"Amount": {"text": "$2.00", "locations": [{"page_number": 1}]}},
+                {"Amount": {"text": "$3.01", "locations": [{"page_number": 1}]}},
+            ],
+            "Total": {
+                "text": f"${total}",
+                "value": total,
+                "computed": True,
+                "derived_from": ["Items[0].Amount", "Items[1].Amount"],
+            },
+        }
+
+    assert check_derivations(bill("5.01")) == (1, 0)  # exact
+    assert check_derivations(bill("5.05")) == (1, 0)  # within $0.05
+    assert check_derivations(bill("6.50")) == (1, 1)  # off
+
+
+def test_check_derivations_count_and_passthrough_accepted() -> None:
+    from dgml_core.extraction_xml import check_derivations
+
+    values = {
+        "MeterIds": [
+            {"text": "1010016194", "locations": [{"page_number": 1}]},
+            {"text": "2020032388", "locations": [{"page_number": 1}]},
+        ],
+        # A count derivation: value equals len(inputs), not their sum.
+        "NMeters": {
+            "text": "2",
+            "value": "2",
+            "computed": True,
+            "derived_from": ["MeterIds[0]", "MeterIds[1]"],
+        },
+        # A passthrough/max-style derivation: value equals one input.
+        "LargestCharge": {
+            "text": "$9.00",
+            "value": "9.00",
+            "computed": True,
+            "derived_from": ["Charges[0]", "Charges[1]"],
+        },
+        "Charges": [
+            {"text": "$4.00", "locations": [{"page_number": 1}]},
+            {"text": "$9.00", "locations": [{"page_number": 1}]},
+        ],
+    }
+    assert check_derivations(values) == (2, 0)
+
+
+def test_check_derivations_skips_non_numeric_and_dangling() -> None:
+    from dgml_core.extraction_xml import check_derivations
+
+    values = {
+        "UtilityProvider": {"text": "PECO Energy", "locations": [{"page_number": 1}]},
+        # Inferred currency: input not numeric → skipped, not counted.
+        "Currency": {
+            "text": "USD",
+            "value": "USD",
+            "computed": True,
+            "derived_from": ["UtilityProvider"],
+        },
+        # Dangling ref → skipped.
+        "Total": {
+            "text": "$5",
+            "value": "5",
+            "computed": True,
+            "derived_from": ["Missing.Path"],
+        },
+    }
+    assert check_derivations(values) == (0, 0)
+
+
+# ── Schema-declared invariants (## Invariant:) ───────────────────────────────
+
+_INVARIANT_RNC = """\
+namespace docset = "http://dgml.io/acme/bills"
+
+## Number of distinct meters
+## Invariant: count(MeterReadings)
+NMeters =
+  element docset:NMeters {
+    xsd:integer
+  }
+
+## Invariant: sum(MeterReadings[].TotalCost)
+TotalNewCharges =
+  element docset:TotalNewCharges {
+    xsd:decimal
+  }
+
+MeterReadings =
+  element docset:MeterReadings {
+    MeterReading*
+  }
+
+MeterReading =
+  element docset:MeterReading {
+    (text | TotalCost)*
+  }
+
+TotalCost =
+  element docset:TotalCost {
+    xsd:decimal
+  }
+"""
+
+
+def _inv_vocab() -> object:
+    return parse_rnc(_INVARIANT_RNC)
+
+
+def _readings(*costs: str) -> list[dict[str, object]]:
+    return [{"TotalCost": {"text": f"${c}", "value": c}} for c in costs]
+
+
+def test_count_invariant_catches_disagreement() -> None:
+    """The bug this exists for: a count field that disagrees with the
+    collection it counts, where the derivation itself is self-consistent."""
+    from dgml_core.extraction_xml import check_invariants
+
+    vocab = _inv_vocab()
+    ok = {"NMeters": {"text": "2", "value": "2"}, "MeterReadings": _readings("1", "2")}
+    assert check_invariants(ok, vocab) == (1, [])  # type: ignore[arg-type]
+
+    bad = {"NMeters": {"text": "1", "value": "1"}, "MeterReadings": _readings("1", "2")}
+    checked, violations = check_invariants(bad, vocab)  # type: ignore[arg-type]
+    assert checked == 1
+    assert len(violations) == 1
+    assert "NMeters" in violations[0] and "count(MeterReadings)" in violations[0]
+
+
+def test_sum_invariant_uses_money_tolerance() -> None:
+    from dgml_core.extraction_xml import check_invariants
+
+    vocab = _inv_vocab()
+    for total, expect_violation in (("3.00", False), ("3.05", False), ("3.50", True)):
+        values = {
+            "TotalNewCharges": {"text": f"${total}", "value": total},
+            "MeterReadings": _readings("1.00", "2.00"),
+        }
+        _, violations = check_invariants(values, vocab)  # type: ignore[arg-type]
+        assert bool(violations) is expect_violation, (total, violations)
+
+
+def test_invariants_skip_absent_and_non_numeric_fields() -> None:
+    """Every field is nullable, so 'not extracted' must never read as a
+    violation — and a non-numeric value has nothing to compare."""
+    from dgml_core.extraction_xml import check_invariants
+
+    vocab = _inv_vocab()
+    # Field absent entirely.
+    assert check_invariants({"MeterReadings": _readings("1")}, vocab) == (0, [])  # type: ignore[arg-type]
+    # Collection absent.
+    assert check_invariants({"NMeters": {"text": "1", "value": "1"}}, vocab) == (0, [])  # type: ignore[arg-type]
+    # Field present but non-numeric.
+    values = {"NMeters": {"text": "several"}, "MeterReadings": _readings("1")}
+    assert check_invariants(values, vocab) == (0, [])  # type: ignore[arg-type]
+
+
+def test_unsupported_invariant_form_is_a_schema_error() -> None:
+    from dgml_core.errors import SchemaInvalid
+
+    bad = _INVARIANT_RNC.replace("## Invariant: count(MeterReadings)", "## Invariant: nMeters > 0")
+    with pytest.raises(SchemaInvalid, match="Invariant"):
+        parse_rnc(bad)
+
+
+_INVOICE_INVARIANT_RNC = """\
+namespace docset = "http://www.dgml.io/acme/invoices#"
+
+## Total invoice amount
+## Invariant: sum(LineItems[].Amount)
+InvoiceTotal =
+  element docset:InvoiceTotal {
+    xsd:decimal
+  }
+
+LineItems =
+  element docset:LineItems {
+    LineItem*
+  }
+
+LineItem =
+  element docset:LineItem {
+    (text | Amount)*
+  }
+
+Amount =
+  element docset:Amount {
+    xsd:decimal
+  }
+"""
+
+
+def test_sum_invariant_covers_the_spec_invoice_case() -> None:
+    """The DGML spec's own §13 example — an invoice total composed of its line
+    items — is a single root-level collection, which the sum form expresses."""
+    from dgml_core.extraction_xml import check_invariants
+
+    vocab = parse_rnc(_INVOICE_INVARIANT_RNC)
+    items = [
+        {"Amount": {"text": "$149.85", "value": "149.85"}},
+        {"Amount": {"text": "$200.00", "value": "200.00"}},
+    ]
+    ok = {"InvoiceTotal": {"text": "$349.85", "value": "349.85"}, "LineItems": items}
+    assert check_invariants(ok, vocab) == (1, [])
+
+    bad = {"InvoiceTotal": {"text": "$349.85", "value": "500.00"}, "LineItems": items}
+    _, violations = check_invariants(bad, vocab)
+    assert len(violations) == 1 and "sum(LineItems[].Amount)" in violations[0]
+
+
+def test_invariant_cannot_reach_a_sibling_collection_inside_an_entry() -> None:
+    """Documented limit: paths resolve from the root through dict hops, so a
+    field inside a collection entry cannot reference a collection alongside it.
+    Such an invariant is skipped (not counted, not violated) rather than
+    resolving to an arbitrary entry."""
+    from dgml_core.extraction_xml import check_invariants
+
+    rnc = _INVOICE_INVARIANT_RNC.replace(
+        "## Invariant: sum(LineItems[].Amount)",
+        "## Invariant: sum(LineItems.Nested[].Amount)",
+    )
+    vocab = parse_rnc(rnc)
+    values = {
+        "InvoiceTotal": {"text": "$1", "value": "1"},
+        "LineItems": [{"Amount": {"text": "$1", "value": "1"}}],
+    }
+    assert check_invariants(values, vocab) == (0, [])

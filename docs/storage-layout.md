@@ -44,6 +44,7 @@ config merges across layers.
 │   └── <docset_id>/                  # 12-char base-36 ID
 │       ├── docset.json               # { id, name, description, key_questions }
 │       ├── extraction-schema.rnc      # grounded extraction schema, RELAX NG Compact (optional)
+│       ├── extraction-guidance.md     # docset-level extraction guidance shown to the LLM (optional)
 │       ├── schema.json               # generation tag schema, written by `generate` (present after generation)
 │       ├── full-schema.rnc           # schema.json as RELAX NG Compact, written by `generate` (see below)
 │       └── files/
@@ -161,8 +162,8 @@ back the per-task models:
 [models]
 light    = "gemini/gemini-flash-lite-latest"  # classification, style
 standard = "anthropic/claude-haiku-4-5"    # transcription, text extraction
-advanced = "anthropic/claude-sonnet-4-6"   # labeling, value extraction
-expert   = "anthropic/claude-opus-4-8"     # schema generation
+advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
+expert   = "anthropic/claude-opus-5"       # schema generation
 ```
 
 (The tier→task mapping lives in code and may change; it is not written into the
@@ -257,7 +258,7 @@ credentials.
 
 ```toml
 [grounded]
-schema_model = "anthropic/claude-opus-4-8"
+schema_model = "anthropic/claude-opus-5"
 values_model = "gemini/gemini-2.5-pro"
 schema_api_key_env = "ANTHROPIC_API_KEY"
 values_api_key_env = "GEMINI_API_KEY"
@@ -289,7 +290,7 @@ tier resolves a model, generation fails with `GENERATION_CONFIG_MISSING`.
 ```toml
 [generation]
 # Overrides (optional — the tiers cover both by default):
-label_model = "anthropic/claude-opus-4-8"
+label_model = "anthropic/claude-opus-5"
 ```
 
 Field rules:
@@ -480,21 +481,36 @@ the file atomically; clearing it removes the file.
 
 The schema describes the fields to extract as a docset vocabulary — element
 definitions of the form `Name = element docset:Name { content }`
-with `##` doc comments (`## description`, `## Example:`, `## Prompt:`) — within
+with `##` doc comments (`## description`, `## Example:`, `## Prompt:`,
+`## Invariant:`) — within
 the constrained subset the toolkit understands (`dgml_core.extraction_schema`).
 It follows the spec §12/§13 form (a `namespace docset` declaration plus element
 defs; roots are the unreferenced elements — no `start`/`dg:chunk` rule), and a
-`start` rule is also accepted if present. Internally it is converted to the
-engine's `grounded_field` JSON Schema, whose
-leaf values carry `{ "text", "locations": [{ "page_number", "bounding_box":
-[left, top, right, bottom] }] }` in integer image pixels (top-left origin, 300
-dpi, relative to `page_images/page_N.png`), so every extracted value traces
-back to one or more regions of the source PDF.
+`start` rule is also accepted if present. A field's content model is `text`, an
+`xsd:` datatype, or a **value enumeration** (`( "electric" | "water" | … )`)
+constraining the normalized value to a closed token set. Internally it is
+converted to the engine's `extracted_value` JSON Schema, whose leaf values
+carry `{ "text", "value"?, "locations": [{ "page_number", "bounding_box":
+[left, top, right, bottom] }] }` — verbatim text, optional normalized value
+(enum token, ISO date, plain number), and locations in integer image pixels
+(top-left origin, 300 dpi, relative to `page_images/page_N.png`) — so every
+extracted value traces back to one or more regions of the source PDF.
 
 When present, `extraction-schema.rnc` is one of the artifacts captured in a
 file's attestation (its own `extraction_schema` slot, hashed as raw RNC bytes),
 alongside `schema.json` and the file's `<stem>.dgml.xml` — see
 [merkle-attestation.md](merkle-attestation.md).
+
+## `docsets/<id>/extraction-guidance.md` (optional)
+
+Docset-level **extraction guidance** — free-form markdown/plain text holding
+domain rules that apply to the whole document kind rather than any single
+field: classification decision rules, disambiguation conventions, cross-field
+consistency rules the extractor should honor. Written verbatim by
+`dgml extraction set-guidance` (replaced atomically; removed by clearing);
+read by every `dgml extraction extract` against the docset and injected into
+the phase-1 extraction prompt after the schema. Complements the per-field
+`## Prompt:` annotations in `extraction-schema.rnc`.
 
 ## `docsets/<id>/schema.json` (optional)
 

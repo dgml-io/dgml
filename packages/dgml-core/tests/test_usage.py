@@ -137,6 +137,9 @@ def test_extract_cost_from_hidden_params() -> None:
         "prompt_tokens": 12,
         "completion_tokens": 3,
         "total_tokens": 15,
+        # No cache counters on the usage object → the 0 defaults stand.
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
 
 
@@ -157,6 +160,131 @@ def test_extract_cost_handles_missing_usage() -> None:
     assert out["prompt_tokens"] is None
     assert out["completion_tokens"] is None
     assert out["total_tokens"] is None
+
+
+def test_extract_cache_tokens_from_usage() -> None:
+    """Anthropic prompt-cache counters are read off ``response.usage``
+    (litellm's ``cache_read_input_tokens`` / ``cache_creation_input_tokens``)
+    and mirrored to our ``cache_read_tokens`` / ``cache_creation_tokens``."""
+    response = SimpleNamespace(
+        _hidden_params={"response_cost": 0.002},
+        usage=SimpleNamespace(
+            prompt_tokens=1000,
+            completion_tokens=50,
+            total_tokens=1050,
+            cache_read_input_tokens=800,
+            cache_creation_input_tokens=200,
+        ),
+    )
+    out = extract_cost_and_tokens(response)
+    assert out["cache_read_tokens"] == 800
+    assert out["cache_creation_tokens"] == 200
+    # The pre-existing fields are untouched.
+    assert out["prompt_tokens"] == 1000
+    assert out["cost_usd"] == 0.002
+
+
+def test_extract_cache_tokens_from_hidden_params_fallback() -> None:
+    """If a litellm path stashes the counters in ``_hidden_params`` instead
+    of on ``usage``, we still pick them up."""
+    response = SimpleNamespace(
+        _hidden_params={
+            "response_cost": 0.002,
+            "cache_read_input_tokens": 640,
+            "cache_creation_input_tokens": 128,
+        },
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+    )
+    out = extract_cost_and_tokens(response)
+    assert out["cache_read_tokens"] == 640
+    assert out["cache_creation_tokens"] == 128
+
+
+def test_extract_cache_tokens_default_zero_when_absent() -> None:
+    """A provider that reports no cache activity leaves the 0 defaults."""
+    response = SimpleNamespace(
+        _hidden_params={},
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=1, total_tokens=6),
+    )
+    out = extract_cost_and_tokens(response)
+    assert out["cache_read_tokens"] == 0
+    assert out["cache_creation_tokens"] == 0
+
+
+def test_cache_tokens_round_trip_to_usage_jsonl(workspace: Workspace) -> None:
+    """Cache counters recorded on a ``UsageEvent`` land in ``usage.jsonl``
+    and read back verbatim; an event built without them defaults to 0."""
+    record_usage(
+        workspace,
+        UsageEvent(
+            at="2026-08-07T12:00:00Z",
+            operation="extract_values",
+            model="anthropic/claude-opus",
+            cost_usd=0.01,
+            prompt_tokens=2000,
+            completion_tokens=100,
+            total_tokens=2100,
+            duration_s=1.0,
+            outcome="ok",
+            cache_read_tokens=1500,
+            cache_creation_tokens=500,
+        ),
+    )
+    record_usage(
+        workspace,
+        UsageEvent(
+            at="2026-08-07T12:01:00Z",
+            operation="classify",
+            model="gemini/flash",
+            cost_usd=None,
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+            duration_s=0.2,
+            outcome="ok",
+        ),
+    )
+    events = read_events(workspace)
+    assert events[0]["cache_read_tokens"] == 1500
+    assert events[0]["cache_creation_tokens"] == 500
+    # Default keeps rows built without the fields valid.
+    assert events[1]["cache_read_tokens"] == 0
+    assert events[1]["cache_creation_tokens"] == 0
+
+
+def test_add_partial_sums_cache_tokens() -> None:
+    acc = {
+        "cost_usd": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+    }
+    add_partial(
+        acc,
+        {
+            "cost_usd": 0.5,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cache_read_tokens": 100,
+            "cache_creation_tokens": 40,
+        },
+    )
+    add_partial(
+        acc,
+        {
+            "cost_usd": 0.5,
+            "prompt_tokens": 20,
+            "completion_tokens": 5,
+            "total_tokens": 25,
+            "cache_read_tokens": 300,
+            "cache_creation_tokens": 0,
+        },
+    )
+    assert acc["cache_read_tokens"] == 400
+    assert acc["cache_creation_tokens"] == 40
 
 
 def test_extract_cost_rejects_bool_as_int() -> None:

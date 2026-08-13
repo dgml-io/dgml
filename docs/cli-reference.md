@@ -523,7 +523,7 @@ passing arbitrary paths), the pipeline renders to a tempdir via the
 same canonical `pages.render_pages` (ghostscript).
 
 The models are **not** CLI flags — like every other model-consuming command
-(`docset schema generate`, `file extract`, `discover`), `generate` reads them
+(`extraction generate-schema`, `extraction extract`, `discover`), `generate` reads them
 solely from the merged config, so each is one visible, deliberate choice. Each
 model resolves from its per-task field (`generation.model`,
 `generation.label_model`) or, when unset, its `[models]` tier (`standard` for
@@ -671,10 +671,14 @@ generate`, which transcribes the *whole* document.
 Two formats are involved:
 
 - **Schema** — the canonical at-rest form is **RELAX NG Compact**
-  (`extraction-schema.rnc`, per the DGML spec §12/§13). The CLI also *accepts* a
-  grounded-field JSON Schema
-  on input and converts it to RNC before storing. Schemas may carry
-  `## Prompt:` annotations guiding the LLM where to find each field.
+  (`extraction-schema.rnc`, per the DGML spec §12/§13). The CLI also *accepts*
+  a JSON Schema on input and converts it to RNC before storing (see
+  `set-schema` below for the accepted dialects). Schemas may carry
+  `## Prompt:` annotations guiding the LLM where to find each field, and a
+  field's content model may be a **value enumeration**
+  (`( "electric" | "water" | … )`) constraining the normalized value to a
+  closed token set — extraction then returns the verbatim page text plus the
+  classifying token as `dg:value`.
 - **Values** — extraction writes a `dg:extraction` element **inside the file's
   core `<stem>.dgml.xml`** (spec §13), holding the schema's fields as `docset:`
   elements with `dg:value`/`xsi:type` and `dg:origin`. There is no separate
@@ -709,22 +713,65 @@ to a `dg:value`/`xsi:type`. The output shape is unchanged.
   "schema_format": "rnc",
   "schema": "namespace dg = \"http://dgml.io/ns/dg#\"\n...",
   "from_file_ids": ["5kqt9r5fowno"],
-  "model": "anthropic/claude-opus-4-7"
+  "model": "anthropic/claude-opus-5"
 }
 ```
 
 ### `dgml extraction set-schema <docset_id> --schema-file PATH`
 
 Set the DocSet's extraction schema from a file. Accepts a `.rnc` (RELAX NG
-Compact) or `.json` (grounded-field JSON Schema) document — JSON is converted to
-RNC. Anything outside the supported RNC subset is rejected with `SCHEMA_INVALID`.
+Compact) or `.json` (JSON Schema) document — JSON is converted to RNC.
+Anything outside the supported RNC subset is rejected with `SCHEMA_INVALID`.
 RNC is the only on-disk form. Returns `{docset_id, schema_format: "rnc", schema}`.
+
+Accepted JSON dialects (all convert to the same RNC):
+
+- the engine's own projection (`get-schema --schema-format json` output):
+  leaves are `{"$ref": "#/definitions/extracted_value"}` with optional
+  `datatype` / `value_enum` / `prompt` / `example` / `description` /
+  `item_name` sidecar keys on the property node (legacy `grounded_field`
+  refs and the grounded/computed `anyOf` union are still accepted);
+- **standard-dialect schemas** (e.g. draft 2020-12 exports from another
+  system): a root `$ref`, local `$defs`/`definitions` `$ref`s (sibling
+  annotation keys merge over the target), `title` as the DGML element name,
+  and leaves recognized *structurally* — an object whose properties are a
+  subset of `{text, value, locations, derived_from, computed}` with `text`
+  present is a leaf, its `value` subschema mapped to the field type
+  (`enum` list → value enumeration; `format: date` / `type: integer` /
+  `boolean` / `number` / a plain-decimal `pattern` → the XSD datatype).
+
+Same-named tags must share one identical definition; two definitions with the
+same name but different content or annotations are rejected with
+`SCHEMA_INVALID` (rename one, e.g. by qualifying it with its parent). When a top-level
+field's identical definition is also referenced inside a nested structure, the
+rendered RNC carries an explicit `start` rule so the field stays a root.
 
 ### `dgml extraction get-schema <docset_id> [--schema-format rnc|json]`
 
 Return the DocSet's schema as canonical RNC (default) or as the engine's
-grounded-field JSON Schema projection (`--schema-format json`). Errors
-`SCHEMA_NOT_FOUND` if none is set.
+JSON Schema projection (`--schema-format json`), whose leaves are
+`extracted_value` refs (`{text, value?, locations?, computed?, derived_from?}`
+— note: projections exported before the merged leaf shape used a
+`grounded_field`/`computed_field` union; both are still accepted on
+`set-schema` input). Errors `SCHEMA_NOT_FOUND` if none is set.
+
+### `dgml extraction set-guidance <docset_id> --guidance-file PATH`
+
+Set docset-level **extraction guidance** from a markdown/plain-text file —
+free-form domain rules that apply to the whole document kind rather than any
+one field (classification decision rules, disambiguation conventions,
+cross-field consistency rules the extractor should honor). Stored verbatim at
+`docsets/<id>/extraction-guidance.md` beside `extraction-schema.rnc`, and
+injected into the phase-1 extraction prompt (after the schema, before the
+document) on every `extract` against the DocSet. Complements the per-field
+`## Prompt:` annotations in the schema; use guidance for rules that span
+fields, prompts for where to find one value. Returns
+`{docset_id, guidance}`.
+
+### `dgml extraction get-guidance <docset_id>`
+
+Return the DocSet's extraction guidance as `{docset_id, guidance}`. Errors
+`GUIDANCE_NOT_FOUND` if none is set.
 
 ### `dgml extraction extract <docset_id> <file_id> [--values-model M]`
 
@@ -805,9 +852,66 @@ from `dg:href` and counted in `extraction_stats.json` under
 up with no `dg:href` at all is flagged by `dgml check` as
 `computed_field_unattributed`.
 
+Extraction asks each model for its own maximum output (128K on current
+frontier Claude/Gemini, 64K on Haiku 4.5 — read from the provider's model
+metadata and clamped per model, so no request exceeds a model's ceiling).
+A phase-1 turn that still clips that ceiling (`finish_reason='length'`)
+reports the truncation explicitly and is retried once in **chunked** mode:
+the model calls `submit_values` with `done: false` (scalars + first array
+batches) and extends arrays with repeated `append_entries` calls, `done: true`
+on the last — merged and vocabulary-checked code-side, transparent in the CLI
+payloads. Chunking is strictly that escalation: an ordinary run is never
+offered the continuation tool or the `done` flag, so it can't split output
+that fits in one call. `extraction_stats.json` records both under
+`phases.phase1`: `chunk_calls` (1 = ordinary single submission) and
+`truncated_retries`.
+
+**Schema-declared invariants.** A field may carry a `## Invariant:` annotation
+naming a checkable relation against the rest of the submission — the
+machine-checkable counterpart to the prose rules in a docset's
+`extraction-guidance.md`, which a model can silently ignore:
+
+```rnc
+## Number of line items on the invoice
+## Invariant: count(LineItems)
+LineItemCount =
+  element docset:LineItemCount {
+    xsd:integer
+  }
+```
+
+Two forms: `count(Path.To.Collection)` (exact) and
+`sum(Path.To.Collection[].LeafName)` (within $0.05). Both are **report-only** —
+values are never adjusted to satisfy one — and results land in
+`extraction_stats.json` as `invariants_checked` / `invariants_violated`, with
+each violation's text under `invariant_violations`. A field or collection that
+wasn't extracted is skipped rather than counted, since every field is nullable.
+
+Two limits are deliberate and decide whether a rule is expressible: an
+invariant is **one term** (`sum(A[].x) + sum(B[].y)` has no form — a rule
+spanning two collections must not be approximated by one of them, which would
+flag correct output), and paths resolve **from the submission root through
+object hops only** (a field inside a collection entry cannot reference a
+sibling collection within that entry). Anything outside the two forms is
+rejected with `SCHEMA_INVALID` at load, so an unexpressible rule fails loudly
+instead of never running.
+
+`extraction_stats.json`'s `matching` block also reports
+`unnormalized_enum_values` (enum-field leaves whose returned value wasn't one
+of the schema's tokens — those serialize text-only, never guessed) and a
+report-only derivation recompute: `derivations_checked` /
+`derivations_mismatched` (computed leaves whose numeric inputs all resolve
+are recomputed; a leaf mismatches when its value agrees with neither the sum,
+the count, nor any single input within $0.05). The top-level
+`phase1_tool_schema` field records whether the docset schema rode inside the
+`submit_values` tool parameter (`"inlined"`, provider-enforced shape) or
+extraction fell back to a permissive parameter with code-side vocabulary
+pruning (`"permissive"` — the retry path when a provider rejects a very large
+inlined schema, e.g. Gemini's "too many states for serving").
+
 Errors across the group: `DOCSET_NOT_FOUND`, `FILE_NOT_FOUND`,
-`SCHEMA_NOT_FOUND`, `SCHEMA_INVALID`, `NO_FILES`, `VALUES_NOT_FOUND`,
-`GROUNDED_CONFIG_MISSING`, `GROUNDED_CONFIG_INVALID`.
+`SCHEMA_NOT_FOUND`, `SCHEMA_INVALID`, `GUIDANCE_NOT_FOUND`, `NO_FILES`,
+`VALUES_NOT_FOUND`, `GROUNDED_CONFIG_MISSING`, `GROUNDED_CONFIG_INVALID`.
 
 ## File commands
 
@@ -1021,7 +1125,7 @@ section in `<workspace>/config.toml`:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `model` | yes | `<provider>/<model>` in [litellm](https://docs.litellm.ai/docs/providers) form — e.g. `gemini/gemini-flash-lite-latest`, `anthropic/claude-opus-4-7`, `openai/gpt-4o`. |
+| `model` | yes | `<provider>/<model>` in [litellm](https://docs.litellm.ai/docs/providers) form — e.g. `gemini/gemini-flash-lite-latest`, `anthropic/claude-opus-5`, `openai/gpt-4o`. |
 | `max_pages` | no (default `3`) | How many rendered page images (`page_images/page_1.png` …) to send to the LLM. Cap is per-classification cost: 1 is the cheap setting, 4+ is the thorough one. |
 | `naming_attempts` | no (default `1`) | How many independent proposals to request when naming a *newly clustered* DocSet (`dgml cluster`, not per-file `--auto-classify`). At `1` the single proposal is used as-is. At `2`+ the name the plurality of attempts agreed on wins, and that share is reported as the file's `naming_confidence` — a 3-of-3 agreement is safe to accept unreviewed, a 2-1 split is worth a look. Costs tokens linearly, so raise it only for runs where a wrong DocSet name is expensive to undo. |
 | `api_key` | no | Optional literal API key. Use only on per-developer workspaces (config.toml isn't checked in). Mutually exclusive with `api_key_env`. |

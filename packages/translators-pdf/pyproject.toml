@@ -17,7 +17,7 @@ xlsx = ["reportlab>=4.0", "openpyxl>=3.1"]
 dgml-core = { workspace = true }
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling<1.26"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

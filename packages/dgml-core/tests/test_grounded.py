@@ -149,12 +149,16 @@ def _tool_call_response(
     cost_usd: float | None = None,
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
 ) -> SimpleNamespace:
     """A litellm-shaped completion response with one tool call.
 
     Cost/token fields are optional — when set they get plumbed through
     the same attributes :func:`dgml_core.usage.extract_cost_and_tokens` reads
-    in production, so tests can lock telemetry math."""
+    in production, so tests can lock telemetry math. Cache counters use the
+    litellm source names (``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``)."""
     call = SimpleNamespace(
         id=call_id,
         function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
@@ -163,14 +167,34 @@ def _tool_call_response(
     response = SimpleNamespace(choices=[SimpleNamespace(message=msg)])
     if cost_usd is not None:
         response._hidden_params = {"response_cost": cost_usd}
-    if prompt_tokens is not None or completion_tokens is not None:
+    has_cache = cache_read_tokens is not None or cache_creation_tokens is not None
+    if prompt_tokens is not None or completion_tokens is not None or has_cache:
         total = (prompt_tokens or 0) + (completion_tokens or 0)
         response.usage = SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total,
         )
+        if cache_read_tokens is not None:
+            response.usage.cache_read_input_tokens = cache_read_tokens
+        if cache_creation_tokens is not None:
+            response.usage.cache_creation_input_tokens = cache_creation_tokens
     return response
+
+
+def _truncated_response() -> SimpleNamespace:
+    """A turn that stopped with finish_reason='length' mid-tool-call."""
+    call = SimpleNamespace(
+        id="trunc",
+        function=SimpleNamespace(name="submit_values", arguments='{"values": {"Bi'),
+    )
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=[call]), finish_reason="length"
+            )
+        ]
+    )
 
 
 def _no_tool_call_response() -> SimpleNamespace:
@@ -968,7 +992,9 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "phases",
         "matching",
         "phase1_layout",
+        "phase1_tool_schema",
     }
+    assert stats["phase1_tool_schema"] == "inlined"
     assert stats["outcome"] == "ok"
     assert stats["error"] is None
     # Phase 2 matched the only location; phase 3 not needed.
@@ -979,16 +1005,28 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "unmatched": 0,
         "computed_fields": 0,
         "dropped_refs": 0,
+        "unnormalized_enum_values": 0,
+        "derivations_checked": 0,
+        "derivations_mismatched": 0,
+        "invariants_checked": 0,
+        "invariants_violated": 0,
+        "invariant_violations": [],
     }
     # Per-phase shape. Phase 2 has no LLM, so no cost/token fields.
     assert set(stats["phases"].keys()) == {"phase1", "phase2", "phase3"}
     assert set(stats["phases"]["phase1"].keys()) == {
         "duration_s",
+        "chunk_calls",
+        "truncated_retries",
         "cost_usd",
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
     }
+    assert stats["phases"]["phase1"]["chunk_calls"] == 1
+    assert stats["phases"]["phase1"]["truncated_retries"] == 0
     assert set(stats["phases"]["phase2"].keys()) == {"duration_s"}
     assert set(stats["phases"]["phase3"].keys()) == {
         "duration_s",
@@ -997,6 +1035,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
     }
     assert stats["phases"]["phase3"]["page_calls"] == 0
     assert "duration_s" in stats["phases"]["phase2"]
@@ -1348,7 +1388,7 @@ def test_expand_refs_chained_definitions() -> None:
 
 def test_extract_values_phase1_submit_tool_strips_bbox(workspace: Workspace) -> None:
     """Phase 1's ``submit_values`` tool inlines the expanded docset schema
-    with ``bounding_box`` stripped from ``grounded_field.locations`` — the
+    with ``bounding_box`` stripped from ``extracted_value.locations`` — the
     provider validates only ``page_number`` at the tool-call layer, since
     phase 2 (code) is what attaches the bbox."""
     fid = "f1aaaaaaaaaa"
@@ -1377,11 +1417,14 @@ def test_extract_values_phase1_submit_tool_strips_bbox(workspace: Workspace) -> 
     # Schema is expanded and self-contained — no $ref left.
     assert "definitions" not in values_param
     assert "$ref" not in json.dumps(values_param)
-    # The leaf is the grounded/computed union; the grounded branch comes first.
-    grounded_branch, computed_branch = values_param["properties"]["title"]["anyOf"]
-    assert "derived_from" in computed_branch["properties"]
-    # And crucially: bounding_box is gone from the grounded branch's locations[].
-    location_props = grounded_branch["properties"]["locations"]["items"]["properties"]
+    # The leaf is the merged extracted_value shape — grounded and computed
+    # provenance share one object (no anyOf union).
+    leaf = values_param["properties"]["title"]
+    assert "derived_from" in leaf["properties"]
+    assert "computed" in leaf["properties"]
+    assert "value" in leaf["properties"]
+    # And crucially: bounding_box is gone from the leaf's locations[].
+    location_props = leaf["properties"]["locations"]["items"]["properties"]
     assert "page_number" in location_props
     assert "bounding_box" not in location_props
 
@@ -1481,6 +1524,12 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
         "unmatched": 0,
         "computed_fields": 1,
         "dropped_refs": 0,
+        "unnormalized_enum_values": 0,
+        "derivations_checked": 0,
+        "derivations_mismatched": 0,
+        "invariants_checked": 0,
+        "invariants_violated": 0,
+        "invariant_violations": [],
     }
 
 
@@ -1518,3 +1567,738 @@ def test_extract_values_counts_dropped_refs_in_stats(workspace: Workspace) -> No
     )
     assert stats["matching"]["computed_fields"] == 1
     assert stats["matching"]["dropped_refs"] == 2
+
+
+# ── Merged-leaf provenance normalization & enum tool-schema specialization ───
+
+
+def test_normalize_leaf_provenance_grounded_wins_over_computed_markers() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values = {
+        "Title": {
+            "text": "hi",
+            "computed": True,
+            "derived_from": ["Other"],
+            "locations": [{"page_number": 1}],
+        }
+    }
+    _normalize_leaf_provenance(values)
+    assert values["Title"] == {"text": "hi", "locations": [{"page_number": 1}]}
+
+
+def test_normalize_leaf_provenance_computed_drops_empty_locations() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values = {
+        "Total": {"text": "$5", "value": "5", "derived_from": ["Items[0].Amount"], "locations": []}
+    }
+    _normalize_leaf_provenance(values)
+    assert values["Total"] == {
+        "text": "$5",
+        "value": "5",
+        "computed": True,
+        "derived_from": ["Items[0].Amount"],
+    }
+
+
+def test_normalize_leaf_provenance_filters_and_defaults() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "A": {"text": "x", "value": "", "locations": [{"page_number": 1}]},  # empty value dropped
+        "B": {"text": "y", "computed": True, "derived_from": ["ok", 7]},  # non-str ref filtered
+        "C": {"text": "z", "locations": []},  # unusable locations removed
+        "Nested": [{"D": {"text": "w", "locations": [{"page_number": 2}]}}],
+    }
+    _normalize_leaf_provenance(values)
+    assert values["A"] == {"text": "x", "locations": [{"page_number": 1}]}
+    assert values["B"] == {"text": "y", "computed": True, "derived_from": ["ok"]}
+    assert values["C"] == {"text": "z"}
+    assert values["Nested"][0]["D"]["locations"] == [{"page_number": 2}]
+
+
+def test_expand_refs_specializes_value_enum_and_carries_annotations() -> None:
+    from dgml_core.extraction_schema import rnc_to_json_schema
+    from dgml_core.grounded import _expand_refs
+
+    rnc = (
+        'namespace docset = "http://dgml.io/x/y"\n\n'
+        "## Commodity being billed\n"
+        "## Prompt: Classify by the service section heading\n"
+        "MeterType =\n"
+        "  element docset:MeterType {\n"
+        '    ( "electric" | "water" )\n  }\n'
+    )
+    expanded = _expand_refs(rnc_to_json_schema(rnc))
+    leaf = expanded["properties"]["MeterType"]
+    # The enum lands on the leaf's `value` so providers constrain-decode it.
+    assert leaf["properties"]["value"]["enum"] == ["electric", "water"]
+    # Annotation sidecars survive expansion (guidance reaches the tool schema).
+    assert leaf["prompt"] == "Classify by the service section heading"
+    assert "value_enum" not in leaf
+    # And the object is still tightened.
+    assert leaf["additionalProperties"] is False
+
+
+def test_extract_values_injects_docset_guidance(workspace: Workspace) -> None:
+    """When the docset has extraction-guidance.md set, its text is appended to
+    the phase-1 user prompt (after the schema, before the PDF block)."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "hi", "l": [10, 20, 30, 40]}])
+
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.set_guidance(ds.id, "Classify charges by behavior, not by name.")
+    store.add_file(ds.id, fid)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    phase1_values = {"title": {"text": "hi", "locations": [{"page_number": 1}]}}
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        extract_values(workspace, ds.id, fid, config=config)
+
+    messages = mock_completion.call_args_list[0].kwargs["messages"]
+    user_text = messages[1]["content"][0]["text"]
+    assert "DOCSET GUIDANCE" in user_text
+    assert "Classify charges by behavior, not by name." in user_text
+    # Guidance follows the schema (stable prefix for prompt caching).
+    assert user_text.index("SCHEMA:") < user_text.index("DOCSET GUIDANCE")
+    # And not set → not present.
+    store.clear_guidance(ds.id)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        extract_values(workspace, ds.id, fid, config=config)
+    user_text = mock_completion.call_args_list[0].kwargs["messages"][1]["content"][0]["text"]
+    assert "DOCSET GUIDANCE" not in user_text
+
+
+# ── Tier-3 robustness: annotation stripping, permissive fallback, truncation ─
+
+
+def test_strip_annotations_drops_prose_keeps_enum() -> None:
+    from dgml_core.extraction_schema import rnc_to_json_schema
+    from dgml_core.grounded import _expand_refs, _strip_annotations
+
+    rnc = (
+        'namespace docset = "http://dgml.io/x/y"\n\n'
+        "## Commodity being billed\n"
+        "## Example: Electric Service\n"
+        "## Prompt: Classify by the service section heading\n"
+        "MeterType =\n"
+        "  element docset:MeterType {\n"
+        '    ( "electric" | "water" )\n  }\n'
+    )
+    stripped = _strip_annotations(_expand_refs(rnc_to_json_schema(rnc)))
+    leaf = stripped["properties"]["MeterType"]
+    assert "prompt" not in leaf and "example" not in leaf and "description" not in leaf
+    assert "description" not in leaf["properties"]["text"]
+    # Structure and the load-bearing enum survive.
+    assert leaf["properties"]["value"]["enum"] == ["electric", "water"]
+    assert leaf["additionalProperties"] is False
+    assert "required" in leaf
+
+
+def test_prune_to_vocabulary_drops_unknown_keys() -> None:
+    from dgml_core.extraction_schema import parse_rnc
+    from dgml_core.grounded import _prune_to_vocabulary
+
+    rnc = (
+        'namespace docset = "http://dgml.io/x/y"\n\n'
+        "Bill =\n"
+        "  element docset:Bill {\n"
+        "    (text | Total | Items)*\n  }\n\n"
+        "Total =\n"
+        "  element docset:Total {\n"
+        "    xsd:decimal\n  }\n\n"
+        "Items =\n"
+        "  element docset:Items {\n"
+        "    Item*\n  }\n\n"
+        "Item =\n"
+        "  element docset:Item {\n"
+        "    (text | Name)*\n  }\n\n"
+        "Name =\n"
+        "  element docset:Name {\n"
+        "    text\n  }\n"
+    )
+    vocab = parse_rnc(rnc)
+    values = {
+        "Bill": {
+            "Total": {"text": "$5", "locations": [{"page_number": 1}]},
+            "Fabricated": {"text": "x"},  # not in the vocabulary
+            "Items": [
+                {"Name": {"text": "a", "locations": [{"page_number": 1}]}, "Extra": 1},
+                "not-a-dict",  # wrong shape
+            ],
+        },
+        "Unknown": {"text": "y"},
+    }
+    pruned = _prune_to_vocabulary(values, vocab)
+    assert pruned == {
+        "Bill": {
+            "Total": {"text": "$5", "locations": [{"page_number": 1}]},
+            "Items": [{"Name": {"text": "a", "locations": [{"page_number": 1}]}}],
+        }
+    }
+
+
+def test_extract_values_permissive_fallback_on_too_many_states(workspace: Workspace) -> None:
+    """A Gemini 'too many states for serving' rejection retries phase 1 once
+    with a permissive object parameter, prunes the result against the
+    vocabulary, and records the mode in extraction_stats.json."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "hi", "l": [10, 20, 30, 40]}])
+
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.add_file(ds.id, fid)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    phase1_values = {
+        "title": {"text": "hi", "locations": [{"page_number": 1}]},
+        "bogus_key": {"text": "fabricated"},
+    }
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            Exception("BadRequestError: The specified schema produces too many states for serving"),
+            _tool_call_response("submit_values", {"values": phase1_values}),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds.id, fid, config=config)
+
+    assert mock_completion.call_count == 2
+    # Retry used the permissive values parameter (no inlined properties).
+    retry_tools = mock_completion.call_args_list[1].kwargs["tools"]
+    submit_tool = next(t for t in retry_tools if t["function"]["name"] == "submit_values")
+    values_param = submit_tool["function"]["parameters"]["properties"]["values"]
+    assert "properties" not in values_param
+    # Fabricated key pruned code-side.
+    assert "bogus_key" not in result.values
+    assert result.values["title"]["text"] == "hi"
+
+    stats_path = workspace.docset_file_extraction_stats_path(ds.id, fid)
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    assert stats["phase1_tool_schema"] == "permissive"
+
+
+def test_extract_values_other_provider_errors_do_not_fall_back(workspace: Workspace) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.add_file(ds.id, fid)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=Exception("BadRequestError: something unrelated"),
+    ) as mock_completion:
+        with pytest.raises(ValuesExtractionFailed, match="something unrelated"):
+            extract_values(workspace, ds.id, fid, config=config)
+    assert mock_completion.call_count == 1
+
+
+def test_extract_values_truncated_output_reports_length(workspace: Workspace) -> None:
+    """finish_reason == 'length' surfaces as an explicit truncation error, not
+    an opaque malformed-JSON one."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.add_file(ds.id, fid)
+
+    call = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(name="submit_values", arguments='{"values": {"tr'),
+    )
+    msg = SimpleNamespace(content=None, tool_calls=[call])
+    truncated = SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="length")])
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", return_value=truncated):
+        with pytest.raises(ValuesExtractionFailed, match="truncated"):
+            extract_values(workspace, ds.id, fid, config=config)
+
+
+def test_pdf_cached_only_in_chunked_mode(workspace: Workspace) -> None:
+    """The per-file PDF earns a cache breakpoint only where a read can happen.
+
+    Chunked mode is several turns over one unchanged prefix, so turns after the
+    first read the document back. On the ordinary single-turn path a breakpoint
+    could only ever pay the write premium, so the document stays untagged and
+    the only markers are the transport's system message and the cross-file
+    schema block.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "hi", "l": [10, 20, 30, 40]}])
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.add_file(ds.id, fid)
+
+    values = {"title": {"text": "hi", "locations": [{"page_number": 1}]}}
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="anthropic/claude-sonnet-5"
+    )
+
+    def pdf_cached(call: Any) -> bool:
+        blocks = call.kwargs["messages"][1]["content"]
+        pdf = next(b for b in blocks if b.get("type") == "file")
+        return "cache_control" in pdf
+
+    # Single shot: schema block + system only.
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": values}),
+    ) as m:
+        extract_values(workspace, ds.id, fid, config=config)
+    assert pdf_cached(m.call_args_list[0]) is False
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == [
+        "[0].content[0]",
+        "[1].content[0]",
+    ]
+
+    # After a truncation, the chunked retry tags the document too.
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _truncated_response(),
+            _tool_call_response("submit_values", {"values": values}),
+        ],
+    ) as m:
+        extract_values(workspace, ds.id, fid, config=config)
+    assert pdf_cached(m.call_args_list[0]) is False
+    assert pdf_cached(m.call_args_list[1]) is True
+
+
+def test_merge_values_semantics() -> None:
+    from dgml_core.grounded import _merge_values
+
+    base = {
+        "Title": {"text": "old", "locations": [{"page_number": 1}]},
+        "Items": [{"A": {"text": "1"}}],
+        "Group": {"X": {"text": "x"}},
+    }
+    extra = {
+        "Title": {"text": "new", "locations": [{"page_number": 2}]},  # leaf replaces
+        "Items": [{"A": {"text": "2"}}],  # lists concatenate
+        "Group": {"Y": {"text": "y"}},  # non-leaf dicts merge
+    }
+    merged = _merge_values(base, extra)
+    assert merged["Title"]["text"] == "new"
+    assert [e["A"]["text"] for e in merged["Items"]] == ["1", "2"]
+    assert set(merged["Group"]) == {"X", "Y"}
+
+
+def test_apply_append_entries_paths_and_errors() -> None:
+    from dgml_core.grounded import _apply_append_entries
+
+    assert "error" in _apply_append_entries(None, {"path": "Items", "entries": []})
+    acc = {"values": {"Items": [{"A": {"text": "1"}}], "Scalar": {"text": "s"}}}
+    assert "error" in _apply_append_entries(acc, {"entries": []})  # no path
+    assert "error" in _apply_append_entries(acc, {"path": "Items"})  # no entries
+    assert "error" in _apply_append_entries(acc, {"path": "Nope", "entries": []})
+    assert "error" in _apply_append_entries(acc, {"path": "Scalar", "entries": []})
+    ok = _apply_append_entries(acc, {"path": "Items", "entries": [{"A": {"text": "2"}}]})
+    assert ok == {"recorded": 1, "total_entries": 2}
+    assert len(acc["values"]["Items"]) == 2
+
+
+_CHUNK_RNC = """\
+namespace docset = "http://dgml.io/x/chunky"
+
+Bill =
+  element docset:Bill {
+    (text | Total | Items)*
+  }
+
+Total =
+  element docset:Total {
+    xsd:decimal
+  }
+
+Items =
+  element docset:Items {
+    Item*
+  }
+
+Item =
+  element docset:Item {
+    (text | Name)*
+  }
+
+Name =
+  element docset:Name {
+    text
+  }
+"""
+
+
+def test_extract_values_chunked_submission_merges_and_prunes(workspace: Workspace) -> None:
+    """submit_values(done=false) + append_entries(...) + append_entries(done=true)
+    merge into one values tree; fabricated keys in appended entries are pruned
+    (appends bypass provider-side validation); stats record the chunk calls."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(
+        workspace,
+        fid,
+        page=1,
+        words=[
+            {"t": "a", "l": [10, 20, 30, 40]},
+            {"t": "b", "l": [50, 20, 70, 40]},
+            {"t": "$3", "l": [90, 20, 120, 40]},
+        ],
+    )
+    store = DocSetStore(workspace)
+    ds = store.create(name="Chunky")
+    store.set_schema(ds.id, _CHUNK_RNC)
+    store.add_file(ds.id, fid)
+
+    first = {
+        "Bill": {
+            "Total": {"text": "$3", "value": "3", "locations": [{"page_number": 1}]},
+            "Items": [{"Name": {"text": "a", "locations": [{"page_number": 1}]}}],
+        }
+    }
+    responses = [
+        # Chunked mode is reachable only after a truncated attempt — that is
+        # what puts append_entries on the tool list in the first place.
+        _truncated_response(),
+        _tool_call_response("submit_values", {"values": first, "done": False}, call_id="c1"),
+        _tool_call_response(
+            "append_entries",
+            {
+                "path": "Bill.Items",
+                "entries": [
+                    {
+                        "Name": {"text": "b", "locations": [{"page_number": 1}]},
+                        "Bogus": {"text": "x"},
+                    }
+                ],
+            },
+            call_id="c2",
+        ),
+        _tool_call_response(
+            "append_entries", {"path": "Bill.Items", "entries": [], "done": True}, call_id="c3"
+        ),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        result = extract_values(workspace, ds.id, fid, config=config)
+
+    assert mock_completion.call_count == 4  # truncated attempt + 3 chunked calls
+    items = result.values["Bill"]["Items"]
+    assert [e["Name"]["text"] for e in items] == ["a", "b"]
+    assert "Bogus" not in items[1]  # pruned — appends bypass API-layer validation
+    # Non-terminal calls were acknowledged with tool results.
+    final_messages = mock_completion.call_args_list[3].kwargs["messages"]
+    tool_msgs = [m for m in final_messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+    assert "recorded" in tool_msgs[0]["content"]
+
+    stats = json.loads(
+        workspace.docset_file_extraction_stats_path(ds.id, fid).read_text(encoding="utf-8")
+    )
+    assert stats["phases"]["phase1"]["chunk_calls"] == 3
+    assert stats["phases"]["phase1"]["truncated_retries"] == 1
+
+
+def test_extract_values_append_error_lets_model_correct(workspace: Workspace) -> None:
+    """A bad append path is answered with an error tool result (not a run
+    failure); the model corrects and completes."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "a", "l": [10, 20, 30, 40]}])
+    store = DocSetStore(workspace)
+    ds = store.create(name="Chunky")
+    store.set_schema(ds.id, _CHUNK_RNC)
+    store.add_file(ds.id, fid)
+
+    first = {"Bill": {"Items": [{"Name": {"text": "a", "locations": [{"page_number": 1}]}}]}}
+    responses = [
+        _truncated_response(),  # enables chunked mode
+        _tool_call_response("submit_values", {"values": first, "done": False}, call_id="c1"),
+        _tool_call_response(
+            "append_entries", {"path": "Wrong.Path", "entries": [], "done": True}, call_id="c2"
+        ),
+        _tool_call_response(
+            "append_entries", {"path": "Bill.Items", "entries": [], "done": True}, call_id="c3"
+        ),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        result = extract_values(workspace, ds.id, fid, config=config)
+    assert mock_completion.call_count == 4
+    # The bad-path call got an error tool result and did NOT end the run.
+    final_messages = mock_completion.call_args_list[3].kwargs["messages"]
+    errs = [m for m in final_messages if m.get("role") == "tool" and "error" in m["content"]]
+    assert len(errs) == 1
+    assert result.values["Bill"]["Items"][0]["Name"]["text"] == "a"
+
+
+def test_extract_values_truncation_retries_with_chunk_directive(workspace: Workspace) -> None:
+    """First attempt truncates (finish_reason='length'); the retry carries the
+    mandatory chunking directive and succeeds chunked."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "a", "l": [10, 20, 30, 40]}])
+    store = DocSetStore(workspace)
+    ds = store.create(name="Chunky")
+    store.set_schema(ds.id, _CHUNK_RNC)
+    store.add_file(ds.id, fid)
+
+    call = SimpleNamespace(
+        id="t1", function=SimpleNamespace(name="submit_values", arguments='{"values": {"Bi')
+    )
+    truncated = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=[call]), finish_reason="length"
+            )
+        ]
+    )
+    first = {"Bill": {"Items": [{"Name": {"text": "a", "locations": [{"page_number": 1}]}}]}}
+    responses = [
+        truncated,
+        _tool_call_response("submit_values", {"values": first, "done": False}, call_id="c1"),
+        _tool_call_response(
+            "append_entries", {"path": "Bill.Items", "entries": [], "done": True}, call_id="c2"
+        ),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        result = extract_values(workspace, ds.id, fid, config=config)
+
+    assert mock_completion.call_count == 3
+
+    # First attempt: no directive. Retry: directive present in the user text.
+    def user_text(call: Any) -> str:
+        blocks = call.kwargs["messages"][1]["content"]
+        return "\n".join(b["text"] for b in blocks if b.get("type") == "text")
+
+    assert "MANDATORY CHUNKED SUBMISSION" not in user_text(mock_completion.call_args_list[0])
+    assert "MANDATORY CHUNKED SUBMISSION" in user_text(mock_completion.call_args_list[1])
+    # The directive rides its own block so the cached schema block is unchanged
+    # between the two attempts — the retry can still read the entry the first
+    # attempt wrote.
+    first_blocks = mock_completion.call_args_list[0].kwargs["messages"][1]["content"]
+    retry_blocks = mock_completion.call_args_list[1].kwargs["messages"][1]["content"]
+    assert first_blocks[0]["text"] == retry_blocks[0]["text"]
+    assert result.values["Bill"]["Items"][0]["Name"]["text"] == "a"
+
+    stats = json.loads(
+        workspace.docset_file_extraction_stats_path(ds.id, fid).read_text(encoding="utf-8")
+    )
+    assert stats["phases"]["phase1"]["truncated_retries"] == 1
+    assert stats["phases"]["phase1"]["chunk_calls"] == 2
+
+
+def test_chunking_tools_are_offered_only_after_truncation(workspace: Workspace) -> None:
+    """The chunked protocol is an escalation, not a standing option: a normal
+    run must not be offered append_entries or a `done` flag it has no reason
+    to use, and the retry must be offered both."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "hi", "l": [10, 20, 30, 40]}])
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.add_file(ds.id, fid)
+
+    values = {"title": {"text": "hi", "locations": [{"page_number": 1}]}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+
+    def tool_names(call: Any) -> set[str]:
+        return {t["function"]["name"] for t in call.kwargs["tools"]}
+
+    def submit_params(call: Any) -> set[str]:
+        tools = call.kwargs["tools"]
+        submit = next(t for t in tools if t["function"]["name"] == "submit_values")
+        return set(submit["function"]["parameters"]["properties"])
+
+    # Ordinary run: single-shot tool set only.
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": values}),
+    ) as mock_completion:
+        extract_values(workspace, ds.id, fid, config=config)
+    call = mock_completion.call_args_list[0]
+    # NOTE: get_page_words is never offered — see the dead-dispatch finding in
+    # _run_extract_loop; phase 1 currently exposes submit_values alone.
+    assert tool_names(call) == {"submit_values"}
+    assert submit_params(call) == {"values", "layout"}  # no `done`
+
+    # After a truncation, the retry carries the chunked protocol.
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _truncated_response(),
+            _tool_call_response("submit_values", {"values": values}),
+        ],
+    ) as mock_completion:
+        extract_values(workspace, ds.id, fid, config=config)
+    first, retry = mock_completion.call_args_list[0], mock_completion.call_args_list[1]
+    assert "append_entries" not in tool_names(first)
+    assert "append_entries" in tool_names(retry)
+    assert "done" in submit_params(retry)
+
+
+def test_append_entries_rejected_when_chunking_is_off(workspace: Workspace) -> None:
+    """Gating the tool is the primary defense; the loop also refuses the call
+    outright, so 'appends ran' always implies chunked mode (and therefore
+    code-side pruning of the unvalidated batches)."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_RNC)
+    store.add_file(ds.id, fid)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response(
+            "append_entries", {"path": "title", "entries": [], "done": True}
+        ),
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="unknown tool"):
+            extract_values(workspace, ds.id, fid, config=config)
+
+
+def _cache_control_paths(obj: Any, path: str = "") -> list[str]:
+    """Every location a ``cache_control`` key appears at, for assertions."""
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "cache_control":
+                found.append(path)
+            else:
+                found.extend(_cache_control_paths(v, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            found.extend(_cache_control_paths(v, f"{path}[{i}]"))
+    return found
+
+
+def test_phase1_caches_by_default(workspace: Workspace) -> None:
+    """Phase 1 marks its stable prefix with no configuration required.
+
+    The system prompt and the schema block ahead of the per-file PDF are
+    byte-identical for every file in a docset, so each file after the first
+    reads that prefix. This is on unconditionally for Anthropic values models —
+    the test pins that so a refactor cannot silently drop the marker.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": values})
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="anthropic/claude-sonnet-4-6"
+    )
+    with patch("litellm.completion", return_value=response) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    # System message (tagged by the transport) plus the schema-text block.
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == [
+        "[0].content[0]",
+        "[1].content[0]",
+    ]
+
+
+def test_phase1_schema_block_not_cached_off_anthropic(workspace: Workspace) -> None:
+    """The phase-1 schema block is Anthropic-gated, like the transport's marker.
+
+    ``cache_control`` is Anthropic-specific. ``call_with_tools`` guards its own
+    system-message marker with ``is_anthropic_model``; the schema-text block in
+    ``extract_values`` must do the same, or a Gemini values model would get an
+    Anthropic-only key injected into its user content.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": values})
+
+    gemini_cfg = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="gemini/gemini-2.5-pro"
+    )
+    with patch("litellm.completion", return_value=response) as m:
+        extract_values(workspace, ds_id, fid, config=gemini_cfg)
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == []
+
+    anthropic_cfg = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="anthropic/claude-sonnet-4-6"
+    )
+    with patch("litellm.completion", return_value=response) as m:
+        extract_values(workspace, ds_id, fid, config=anthropic_cfg)
+    # System message (tagged by the transport) plus the schema-text block.
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == [
+        "[0].content[0]",
+        "[1].content[0]",
+    ]
+
+
+def test_schema_gen_never_cached(workspace: Workspace) -> None:
+    """Schema generation carries no cache marker.
+
+    Its cacheable prefix (tools + a short system prompt) is below the provider's
+    minimum cacheable length, so a breakpoint creates no entry — and schema-gen
+    runs once per docset, so there is no reuse to capture regardless.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    response = _tool_call_response("submit_schema", {"fields": _MIN_FIELDS})
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", return_value=response) as m:
+        generate_schema(workspace, [fid], config=config, docset_name="D")
+    assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == []
+
+
+def test_phase3_never_cached(workspace: Workspace) -> None:
+    """Phase-3 page calls carry no cache marker.
+
+    ``_submit_locations_tool`` is built from the page's own unmatched ids, so the
+    tools+system prefix differs on every call and no read can ever match; the
+    calls also run in parallel, and the system prompt alone is under the minimum
+    cacheable prefix. A marker could only cost the write premium.
+    """
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=1)
+    _seed_page_text(workspace, fid, page=1, words=[{"t": "Hello", "l": [0, 0, 10, 10]}])
+    _seed_page_image(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    # A phase-1 value whose text will not match page_text, forcing phase 3.
+    phase1_values = {"title": {"text": "Unmatchable zzzz", "locations": [{"page_number": 1}]}}
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="anthropic/claude-sonnet-4-6"
+    )
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response(
+                "submit_locations",
+                {"locations": [{"id": "a", "bounding_boxes": [[1.0, 2.0, 3.0, 4.0]]}]},
+                call_id="p3",
+            ),
+        ],
+    ) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert len(m.call_args_list) >= 2, "phase 3 did not run; test would be vacuous"
+    for call in m.call_args_list[1:]:
+        assert _cache_control_paths(call.kwargs["messages"]) == []
