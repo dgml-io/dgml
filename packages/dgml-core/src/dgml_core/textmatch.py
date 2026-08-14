@@ -38,7 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .errors import FileNotFound
-from .storage import Workspace, read_json
+from .storage import Workspace
 
 # ---- Data shapes -----------------------------------------------------------
 
@@ -162,12 +162,9 @@ def load_page_words(
     same way it finds single-line text. Word ``.idx`` is preserved so
     callers that care about OCR identity still see the original
     index."""
-    text_path = workspace.file_text_dir(file_id) / f"page_{page_number}.json"
-    if not text_path.exists():
-        raise FileNotFound(
-            f"no page_text for file '{file_id}' page {page_number} (expected at {text_path})"
-        )
-    payload = read_json(text_path)
+    payload = workspace.read_page_text(file_id, page_number)
+    if payload is None:
+        raise FileNotFound(f"no page_text for file '{file_id}' page {page_number}")
     dims = PageDims(int(payload["width"]), int(payload["height"]))
     raw_words = payload.get("words", [])
     loaded: list[Word] = []

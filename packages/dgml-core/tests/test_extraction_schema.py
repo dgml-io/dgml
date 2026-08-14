@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 from dgml_core.errors import SchemaInvalid
 from dgml_core.extraction_schema import (
@@ -195,6 +197,111 @@ def test_prompt_carried_into_json_schema() -> None:
     js = rnc_to_json_schema(_SPEC_RNC)
     vendor = js["properties"]["Invoice"]["properties"]["VendorName"]
     assert vendor["prompt"] == "Look for the company name at the top of the invoice"
+
+
+def test_multiline_example_stays_on_one_doc_comment_line() -> None:
+    """A newline in `example` used to emit raw, unprefixed lines that no longer
+    parsed as RNC — the model proposing a multi-line postal address broke schema
+    generation outright."""
+    tree = [
+        {
+            "name": "remittance_payer_address",
+            "kind": "field",
+            "datatype": "text",
+            "description": "The customer's mailing address on the remittance stub.",
+            "example": "TIDEWATER FREIGHT CO\nC/O NORTHGATE TRUST\nPO BOX 4417",
+        }
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+
+    validate_rnc(rnc)  # used to raise SchemaInvalid: unexpected RNC line
+    assert "## Example: TIDEWATER FREIGHT CO C/O NORTHGATE TRUST PO BOX 4417" in rnc
+    # No content line escaped the `##` prefix.
+    assert "\nC/O NORTHGATE TRUST" not in rnc
+    assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
+
+
+def test_multiline_prompt_and_invariant_are_folded() -> None:
+    """`prompt` and `invariant` share the one-line-each constraint with `example`."""
+    tree = [
+        {
+            "name": "line_items",
+            "kind": "collection",
+            "fields": [{"name": "amount", "kind": "field", "datatype": "decimal"}],
+        },
+        {
+            "name": "line_item_count",
+            "kind": "field",
+            "datatype": "integer",
+            "prompt": "Look near the top.\nThen check the appendix.",
+            # A stray trailing newline would otherwise reach _validate_invariant.
+            "invariant": "count(LineItems)\n",
+        },
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+
+    validate_rnc(rnc)
+    assert "## Prompt: Look near the top. Then check the appendix." in rnc
+    assert "## Invariant: count(LineItems)\n" in rnc
+    count = next(t for t in parse_rnc(rnc).roots if t.name == "LineItemCount")
+    assert count.prompt == "Look near the top. Then check the appendix."
+    assert count.invariant == "count(LineItems)"
+    assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
+
+
+def test_multiline_description_still_spans_doc_comment_lines() -> None:
+    """`description` is the one annotation the emitter line-splits and the parser
+    rejoins, so it must keep round-tripping multi-line rather than being folded."""
+    tree = [
+        {
+            "name": "clause",
+            "kind": "field",
+            "datatype": "text",
+            "description": "First line.\nSecond line.\nThird line.",
+        }
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+
+    validate_rnc(rnc)
+    assert "## First line.\n## Second line.\n## Third line.\n" in rnc
+    assert parse_rnc(rnc).roots[0].description == "First line.\nSecond line.\nThird line."
+    assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
+
+
+def test_multiline_example_folded_on_the_json_schema_path_too() -> None:
+    """The CLI's `set-schema` JSON import builds Tags through `_node_to_tag`, so it
+    needs the same fold."""
+    schema = {
+        "type": "object",
+        "definitions": {"grounded_field": {"type": "object"}},
+        "properties": {
+            "payee_address": {
+                "$ref": "#/definitions/grounded_field",
+                "example": "City of Elmbrook\n812 Kestrel Avenue",
+            }
+        },
+    }
+    rnc = json_schema_to_rnc(schema, workspace="ws", docset_name="d")
+
+    validate_rnc(rnc)
+    assert "## Example: City of Elmbrook 812 Kestrel Avenue" in rnc
+
+
+def test_single_line_annotations_are_untouched() -> None:
+    """The fold must be a no-op for values already on one line, so existing
+    schemas render byte-for-byte as before."""
+    tree = [
+        {
+            "name": "vendor_name",
+            "kind": "field",
+            "datatype": "text",
+            "example": "Larkspur Systems,  LLC",  # doubled space preserved
+            "prompt": "Top of the invoice",
+        }
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+    assert "## Example: Larkspur Systems,  LLC" in rnc
+    assert "## Prompt: Top of the invoice" in rnc
 
 
 _CHOICE_RNC = """\
@@ -521,9 +628,10 @@ def test_identical_shared_definition_is_reused() -> None:
     assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
 
 
-def test_same_name_different_content_is_an_error() -> None:
-    """Two same-named fields with different guidance/content must not silently
-    collapse into one definition (first-wins used to drop one side's prompt)."""
+def test_same_name_different_content_is_disambiguated() -> None:
+    """Two same-named fields with different guidance must not collapse into one
+    definition (first-wins used to drop one side's prompt). RNC has no per-parent
+    name scope, so the later one is qualified with its parent instead."""
     tree = [
         {
             "name": "document",
@@ -538,7 +646,107 @@ def test_same_name_different_content_is_an_error() -> None:
             "fields": [{"name": "currency", "kind": "field", "prompt": "ISO code for this meter"}],
         },
     ]
-    with pytest.raises(SchemaInvalid, match="'Currency'"):
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+
+    # The outermost claimant keeps the plain name; the nested one is qualified.
+    assert "Currency =" in rnc
+    assert "MeterCurrency =" in rnc
+    # Both sides' guidance survives — neither was dropped by a silent collapse.
+    assert "## Prompt: ISO code for the whole bill" in rnc
+    assert "## Prompt: ISO code for this meter" in rnc
+    # Each parent references its own definition.
+    assert "(text | Currency)*" in rnc
+    assert "(text | MeterCurrency)*" in rnc
+    assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
+
+
+def test_collision_inside_a_collection_is_qualified_by_the_item() -> None:
+    """The reported failure mode: a document-level field and a per-item field of
+    the same name. The item's singular name is the qualifier, not the plural."""
+    tree = [
+        {"name": "amount_due", "kind": "field", "datatype": "decimal", "description": "Bill total"},
+        {
+            "name": "line_items",
+            "kind": "collection",
+            "fields": [
+                {
+                    "name": "amount_due",
+                    "kind": "field",
+                    "datatype": "decimal",
+                    "description": "Amount for this line",
+                }
+            ],
+        },
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+
+    assert "LineItemAmountDue =" in rnc
+    assert "LineItemsAmountDue =" not in rnc
+    assert rnc.count("element docset:AmountDue {") == 1
+    assert "## Bill total" in rnc
+    assert "## Amount for this line" in rnc
+    assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
+
+
+def test_implicit_collection_item_name_competes_for_names() -> None:
+    """A collection with no explicit ``item`` still claims the singular of its
+    own name, so it has to yield when a different field already holds it."""
+    tree = [
+        {"name": "line_item", "kind": "field", "datatype": "text", "description": "A note"},
+        {
+            "name": "line_items",
+            "kind": "collection",
+            "fields": [{"name": "amount", "kind": "field", "datatype": "decimal"}],
+        },
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+
+    # The pre-existing field keeps `LineItem`; the implied item takes another name.
+    assert "## A note\nLineItem =" in rnc
+    assert rnc.count("element docset:LineItem {") == 1
+    assert "LineItemsLineItem*" in rnc
+    assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
+
+
+def test_identical_subtrees_still_share_one_definition() -> None:
+    """Disambiguation must not break intentional reuse: a byte-identical subtree
+    under two parents stays a single shared definition."""
+    address = {
+        "name": "address",
+        "kind": "container",
+        "description": "A postal address",
+        "fields": [
+            {"name": "street", "kind": "field", "datatype": "text"},
+            {"name": "post_code", "kind": "field", "datatype": "text"},
+        ],
+    }
+    tree = [
+        {"name": "supplier", "kind": "container", "fields": [copy.deepcopy(address)]},
+        {"name": "customer", "kind": "container", "fields": [copy.deepcopy(address)]},
+    ]
+    rnc = field_tree_to_rnc(tree, workspace="ws", docset_name="d")
+
+    assert rnc.count("element docset:Address {") == 1
+    assert rnc.count("element docset:Street {") == 1
+    assert "SupplierAddress" not in rnc
+    assert "CustomerAddress" not in rnc
+    assert vocabulary_to_rnc(parse_rnc(rnc)) == rnc
+
+
+def test_duplicate_sibling_names_remain_an_error() -> None:
+    """Two children of one parent sharing a name is an ambiguous model, not a
+    name-scoping mismatch — disambiguation must not paper over it."""
+    tree = [
+        {
+            "name": "meter",
+            "kind": "container",
+            "fields": [
+                {"name": "usage", "kind": "field", "datatype": "decimal"},
+                {"name": "usage", "kind": "field", "datatype": "text"},
+            ],
+        }
+    ]
+    with pytest.raises(SchemaInvalid, match="duplicate tag name 'Usage'"):
         field_tree_to_rnc(tree, workspace="ws", docset_name="d")
 
 

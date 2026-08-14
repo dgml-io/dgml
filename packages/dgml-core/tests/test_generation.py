@@ -2297,3 +2297,103 @@ def test_parse_block_choice_group() -> None:
         block_id="b2",
     )
     assert empty is not None and empty.checked == [] and empty.value == ""
+
+
+def test_chunks_bounds_by_size_block_count_and_never_drops() -> None:
+    from dgml_core.generation.label import _MAX_BLOCKS_PER_CALL, _MAX_CHUNK_CHARS, _chunks
+
+    # Dense blocks (~1/3 of the char budget each) split into multi-block chunks
+    # that each stay within the budget — not one oversized call.
+    big = "x" * (_MAX_CHUNK_CHARS // 3)
+    dense = [_b("p", f"d{i}", text=big) for i in range(10)]
+    groups = _chunks(dense)
+    assert len(groups) > 1
+    for g in groups:
+        if len(g) > 1:
+            assert sum(len(b.flat_text()) for b in g) <= _MAX_CHUNK_CHARS
+    assert sum(len(g) for g in groups) == len(dense)  # no block lost
+
+    # A single block bigger than the whole budget still forms its own chunk.
+    huge = [_b("p", "h1", text="y" * (_MAX_CHUNK_CHARS * 2))]
+    assert _chunks(huge) == [huge]
+
+    # A small doc is a single chunk.
+    small = [_b("p", f"s{i}", text="short") for i in range(5)]
+    assert _chunks(small) == [small]
+
+    # The block-count cap still splits many tiny blocks the char budget misses.
+    tiny = [_b("p", f"t{i}", text="a") for i in range(_MAX_BLOCKS_PER_CALL + 5)]
+    caps = _chunks(tiny)
+    assert len(caps) == 2
+    assert all(len(g) <= _MAX_BLOCKS_PER_CALL for g in caps)
+
+
+def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chunk whose JSON reply is unparseable is bisected until each block is
+    labeled, instead of dropping the whole chunk."""
+    from dgml_core.generation.label import _label_chunk
+
+    chunk = [_b("p", f"p{i}", text=f"clause number {i}") for i in range(4)]
+    calls = {"n": 0}
+
+    def fake_call(config: llm.LLMConfig, **kw: Any) -> str:
+        calls["n"] += 1
+        listing = kw["user_content"][-1]["text"]
+        ids = re.findall(r"(?m)^(\w+) ", listing)
+        if len(ids) != 1:  # "too large" -> comes back as malformed JSON
+            return "{ not valid json ,,,"
+        return json.dumps({"labels": {ids[0]: {"concept": "Revenue"}}})
+
+    monkeypatch.setattr(llm, "call", fake_call)
+    warnings: list[str] = []
+    err = _label_chunk(
+        "doc.pdf",
+        chunk,
+        {},
+        [],
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=None,
+        debug=False,
+        log=lambda *_: None,
+        stem="doc",
+        label_tag="c01",
+        warnings=warnings,
+    )
+    assert err is None
+    assert all(b.concept == "Revenue" for b in chunk)  # every block recovered
+    assert calls["n"] > 4  # proves it split past the single top-level call
+    assert not warnings  # clean recovery emits no failure warnings
+
+
+def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call-level error must not split (it fails at any size) — retry once and
+    warn, bounding calls to 2."""
+    from dgml_core.generation.label import _label_chunk
+
+    chunk = [_b("p", f"p{i}", text=f"clause {i}") for i in range(8)]
+    calls = {"n": 0}
+
+    def boom(config: llm.LLMConfig, **kw: Any) -> str:
+        calls["n"] += 1
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(llm, "call", boom)
+    warnings: list[str] = []
+    err = _label_chunk(
+        "doc.pdf",
+        chunk,
+        {},
+        [],
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=None,
+        debug=False,
+        log=lambda *_: None,
+        stem="doc",
+        label_tag="c01",
+        warnings=warnings,
+    )
+    assert err is None  # RuntimeError is soft, not a reachability error
+    assert calls["n"] == 2  # retried once, never split
+    assert sum("labeling failed" in w for w in warnings) == 1

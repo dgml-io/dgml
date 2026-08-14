@@ -14,18 +14,24 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from . import layout
+
+if TYPE_CHECKING:
+    from .storage_service import BlobStore, DocStore
 
 from .default_config import PROVIDER_MODELS
 
 ENV_VAR = "DGML_HOME"
 DEFAULT_DIR_NAME = "dgml-workspace"
-CONFIG_NAME = "config.toml"
+CONFIG_NAME = layout.CONFIG_FILE
 USER_CONFIG_DIR = "dgml"
 WORKSPACE_META_NAME = "workspace.json"
 
@@ -43,7 +49,20 @@ class Workspace:
 
     @classmethod
     def resolve(cls, override: Path | str | None = None) -> Workspace:
+        """Resolve a workspace from ``override`` (the ``--workspace`` value), then
+        ``$DGML_HOME``, then ``./dgml-workspace``.
+
+        ``override`` may be a **path** or a **workspace id**: if it exactly matches
+        a registered id, the workspace opens at that entry's recorded root;
+        otherwise it is treated as a path (unchanged behaviour). Ids are opaque
+        ``ws_…`` slugs, so they never collide with a real path a user would type.
+        """
         if override is not None:
+            from . import registry  # lazy: registry imports storage helpers
+
+            entry = registry.get(str(override))
+            if entry is not None and entry.root is not None:
+                return cls(root=Path(entry.root).resolve())
             root = Path(override).expanduser().resolve()
         elif ENV_VAR in os.environ and os.environ[ENV_VAR].strip():
             root = Path(os.environ[ENV_VAR]).expanduser().resolve()
@@ -51,112 +70,77 @@ class Workspace:
             root = (Path.cwd() / DEFAULT_DIR_NAME).resolve()
         return cls(root=root)
 
+    def local_path(self, key: str) -> Path:
+        """The on-disk location a store key would occupy under this root.
+
+        The single filesystem escape hatch: pair it with a
+        :mod:`dgml_core.layout` key builder so a real path and the key naming the
+        same data cannot drift apart. Domain code addresses data by **key**
+        through ``store`` and does not need this; it exists for the few things
+        that genuinely require a path (reading the user's source file, test
+        fixtures that build a tree directly). Meaningful only for a local store."""
+        return self.root / key.rstrip("/")
+
     @property
     def docsets_dir(self) -> Path:
-        return self.root / "docsets"
+        return self.root / layout.DOCSETS_DIR
 
     @property
     def files_dir(self) -> Path:
-        return self.root / "files"
+        return self.root / layout.FILES_DIR
 
     @property
     def embedding_cache_dir(self) -> Path:
         """Where clustering encoders cache content-hashed embeddings so
         re-embedding unchanged files across runs is cheap. Per-workspace and
         safe to delete."""
-        return self.root / ".cache" / "embeddings"
+        return self.root / layout.CACHE_DIR / layout.EMBEDDINGS_DIR
 
-    def docset_dir(self, docset_id: str) -> Path:
-        return self.docsets_dir / docset_id
+    def blob_key(self, path: Path) -> str:
+        """The store key naming ``path``, the inverse of :meth:`local_path`.
 
-    def docset_files_dir(self, docset_id: str) -> Path:
-        return self.docset_dir(docset_id) / "files"
+        Pure path arithmetic (relative to this root, as POSIX) — it holds no
+        knowledge of the layout itself, so it stays correct as
+        :mod:`dgml_core.layout` evolves. For the filesystem-bound cases that
+        have a real path in hand and need the key for it."""
+        return path.resolve().relative_to(self.root).as_posix()
 
-    def docset_json_path(self, docset_id: str) -> Path:
-        return self.docset_dir(docset_id) / "docset.json"
+    # Naming workspace artifacts is :mod:`dgml_core.layout`'s job, not this
+    # class's: a key is root-relative, so it does not need a workspace to exist.
+    # Callers build one with a ``layout`` builder and hand it straight to
+    # ``store`` (``list_blobs`` / ``get_blob`` / …); the filesystem-bound few
+    # compose it with ``local_path``. Prefer the ``layout.*_prefix`` spelling for
+    # anything prefix-matched — the trailing slash is what keeps ``files/ab``
+    # from also selecting ``files/abc``.
 
-    def docset_schema_path(self, docset_id: str) -> Path:
-        # The grounded *extraction* schema, stored in RELAX NG Compact (the
-        # spec's canonical schema form). Set via `extraction set-schema` /
-        # `extraction generate-schema`, consumed by extract_values (converted to
-        # the engine's grounded_field JSON Schema on read). Distinct from the
-        # *generation tag* schema at docset_generation_schema_path — separate
-        # names so the two never clobber.
-        return self.docset_dir(docset_id) / "extraction-schema.rnc"
+    def read_page_text(self, file_id: str, page: int) -> dict[str, Any] | None:
+        """The per-page word-box JSON for ``page`` of ``file_id`` (a blob),
+        read through the store, or ``None`` if it was never extracted.
 
-    def docset_guidance_path(self, docset_id: str) -> Path:
-        # Free-form docset-level extraction guidance (markdown/plain text) —
-        # domain rules that apply to the whole document kind rather than one
-        # field (classification decision rules, cross-field invariants the
-        # extractor should honor). Set via `extraction set-guidance`; injected
-        # into the phase-1 extraction prompt alongside the schema.
-        return self.docset_dir(docset_id) / "extraction-guidance.md"
+        Parsed with the same duplicate-key rejection as every workspace JSON, so
+        malformed content raises :class:`~dgml_core.errors.CorruptMetadata`."""
+        from .errors import CorruptMetadata
 
-    def docset_generation_schema_path(self, docset_id: str) -> Path:
-        # The generation *tag* schema written by `docset generate`
-        # (consumed by convert_batch — the machine exchange format that seeds
-        # later runs via --schema-path).
-        return self.docset_dir(docset_id) / "schema.json"
-
-    def docset_full_schema_path(self, docset_id: str) -> Path:
-        # schema.json rendered as RELAX NG Compact at the end of `docset
-        # generate` — the *full* (whole-document) schema, named in the same
-        # style as extraction-schema.rnc. Lossless: every schema.json field
-        # survives as `# Field: value` comments, so this is the artifact that
-        # ships in DGMLX bundles and is hashed into the file attestation
-        # (slot "full_schema").
-        return self.docset_dir(docset_id) / "full-schema.rnc"
-
-    def docset_file_dir(self, docset_id: str, file_id: str) -> Path:
-        """Per-(docset, file) directory. The marker dir for the assignment; the
-        file's core ``<stem>.dgml.xml`` (generated tree and/or dg:extraction)
-        and its extraction_stats.json sidecar land here."""
-        return self.docset_files_dir(docset_id) / file_id
-
-    def docset_file_extraction_stats_path(self, docset_id: str, file_id: str) -> Path:
-        """Per-extraction phase timings, costs, and match %, written on every
-        successful extract_values run so the UX can render a Stats tab without
-        re-deriving anything from usage.jsonl. Lives in the file's marker dir."""
-        return self.docset_file_dir(docset_id, file_id) / "extraction_stats.json"
-
-    def file_dgml_xml_path(self, docset_id: str, file_id: str, file_stem: str) -> Path:
-        """Canonical location of the DGML XML output for one file in a
-        docset:
-        ``<workspace>/docsets/<docset_id>/files/<file_id>/<stem>.dgml.xml``.
-
-        This is the deterministic, per-(docset, file) slot that ``dgml
-        docset generate`` writes to and that file attestation reads as the
-        DGML artifact for the pair. It lives in the file's marker directory so
-        placement never depends on the original filename being unique within
-        the docset. Pass
-        ``Path(original_filename).stem`` as ``file_stem``."""
-        return self.docset_file_dir(docset_id, file_id) / f"{file_stem}.dgml.xml"
-
-    def file_dir(self, file_id: str) -> Path:
-        return self.files_dir / file_id
-
-    def file_json_path(self, file_id: str) -> Path:
-        return self.file_dir(file_id) / "file.json"
-
-    def file_errors_path(self, file_id: str) -> Path:
-        return self.file_dir(file_id) / "errors.json"
-
-    def file_pages_dir(self, file_id: str) -> Path:
-        return self.file_dir(file_id) / "page_images"
-
-    def file_text_dir(self, file_id: str) -> Path:
-        return self.file_dir(file_id) / "page_text"
+        key = layout.file_page_text_key(file_id, page)
+        try:
+            data = self.blobs.get_blob(key)
+        except FileNotFoundError:
+            return None
+        try:
+            return json.loads(data, object_pairs_hook=_reject_duplicate_keys)  # type: ignore[no-any-return]
+        except ValueError as exc:
+            raise CorruptMetadata(f"page_text {key} is not valid JSON: {exc}") from exc
 
     @property
     def config_path(self) -> Path:
         """Optional per-workspace ``config.toml`` (resolution layer 3). Overrides
         keys from the user-level ``~/.config/dgml/config.toml``; absent in the
         common case where the user config suffices."""
-        return self.root / CONFIG_NAME
+        return self.root / layout.CONFIG_FILE
 
     @property
     def usage_log_path(self) -> Path:
-        return self.root / "usage.jsonl"
+        return self.root / layout.USAGE_FILE
 
     @property
     def meta_path(self) -> Path:
@@ -164,22 +148,67 @@ class Workspace:
         ``organization``. Written by ``dgml workspace create``. The
         organization is what docset namespace URIs embed
         (``http://dgml.io/<organization>/<DocSetSlug>``)."""
-        return self.root / WORKSPACE_META_NAME
+        return self.root / layout.WORKSPACE_FILE
+
+    @functools.cached_property
+    def blobs(self) -> BlobStore:
+        """The workspace's **blob** backend (page images, PDFs, XML, schemas).
+
+        For a **registered** workspace the non-secret identity comes from its
+        registry entry's snapshot (authoritative and self-contained), with secrets
+        merged from the named ``config.toml`` template; an **unregistered**
+        workspace falls back to the bundled local-disk store (zero config). See
+        :func:`dgml_core.registry.resolve_store_configs`. All blob data flows through
+        this rather than the filesystem directly, so it can live on any pluggable
+        backend.
+
+        **Cached for the lifetime of this ``Workspace``.** Caching works on this
+        frozen dataclass because ``cached_property`` writes straight into
+        ``__dict__`` rather than through ``__setattr__``, and it is a *non-data*
+        descriptor, so a test that replaces the class attribute still takes
+        precedence."""
+        from . import registry
+        from .storage_resolve import make_blob_store
+
+        return make_blob_store(registry.resolve_store_configs(self)[0])
+
+    @functools.cached_property
+    def docs(self) -> DocStore:
+        """The workspace's **document** backend (manifests, page text, assignments,
+        usage). Resolved independently of :attr:`blobs` — see it for the
+        registered/unregistered resolution and caching notes."""
+        from . import registry
+        from .storage_resolve import make_doc_store
+
+        return make_doc_store(registry.resolve_store_configs(self)[1])
 
     def read_meta(self) -> dict[str, Any]:
         """Return the parsed ``workspace.json`` mapping, or ``{}`` when the file
         is absent (workspaces created before ``workspace.json`` existed)."""
-        path = self.meta_path
-        if not path.exists():
-            return {}
-        data = read_json(path)
+        data = self.docs.get_doc(layout.Collection.WORKSPACE, layout.Collection.WORKSPACE)
         return data if isinstance(data, dict) else {}
 
-    def write_meta(self, *, name: str, organization: str) -> None:
-        """Persist the workspace identity (``name`` + ``organization``) to
-        ``workspace.json``. The organization is embedded in docset namespace
-        URIs. Backs ``dgml workspace create``."""
-        write_json_atomic(self.meta_path, {"name": name, "organization": organization})
+    def write_meta(self, *, name: str, organization: str, workspace_id: str | None = None) -> None:
+        """Persist the workspace identity to ``workspace.json``: ``name`` +
+        ``organization`` (embedded in docset namespace URIs), and a stable
+        ``workspace_id`` when given. Backs ``dgml workspace create``.
+
+        Merge-preserving: reads the existing meta and updates only these fields, so
+        it never drops ``schema_version`` (stamped by migrations) or an existing
+        ``workspace_id`` — pass ``workspace_id`` only when setting/minting one."""
+        meta = dict(self.read_meta())
+        meta["name"] = name
+        meta["organization"] = organization
+        if workspace_id is not None:
+            meta["workspace_id"] = workspace_id
+        self.docs.put_doc(layout.Collection.WORKSPACE, layout.Collection.WORKSPACE, meta)
+
+    @property
+    def workspace_id(self) -> str | None:
+        """The workspace's stable id from ``workspace.json`` (``None`` for a
+        workspace created before ids existed, until backfilled on first open)."""
+        v = self.read_meta().get("workspace_id")
+        return v if isinstance(v, str) and v else None
 
     @property
     def organization(self) -> str:

@@ -93,7 +93,7 @@ def test_azure_missing_env_var_raises_auth_error(
     with pytest.raises(AuthError, match="TEST_AZURE_KEY"):
         extract_text_ocr(
             text_pdf,
-            workspace.file_text_dir("does-not-matter"),
+            workspace.root / "page_text",
             file_id="does-not-matter",
             page_images_dir=pages_dir,
             config=cfg,
@@ -132,10 +132,10 @@ def test_azure_missing_sdk_raises_ocr_failed(
     with pytest.raises(OcrFailed, match="pip install dgml\\[azure\\]"):
         extract_text_ocr(
             text_pdf,
-            workspace.file_text_dir("does-not-matter"),
+            workspace.root / "page_text",
             file_id="does-not-matter",
             # page_images_dir is irrelevant — SDK import fails first.
-            page_images_dir=workspace.file_pages_dir("does-not-matter"),
+            page_images_dir=workspace.root / "page_images",
             config=cfg,
         )
 

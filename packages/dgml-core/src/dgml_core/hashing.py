@@ -21,7 +21,12 @@ CHUNK_SIZE = 1 << 16
 
 
 def sha256_file(path: Path) -> str:
-    """Return the lowercase hex SHA-256 digest of the file at ``path``."""
+    """Return the lowercase hex SHA-256 digest of the file at ``path``.
+
+    Chunked, so the file is never held whole in memory. To hash a *stored*
+    artifact, prefer ``StorageService.sha256_blob``, which reaches a path
+    through the store and then defers to this.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(CHUNK_SIZE), b""):

@@ -99,6 +99,7 @@ from pathlib import Path
 
 from lxml import etree  # type: ignore[import-untyped]
 
+from . import layout
 from .errors import (
     AttestationInvalid,
     DocSetNotFound,
@@ -121,7 +122,7 @@ from .opc import (
     zip_package,
 )
 from .pages import PAGE_GLOB
-from .storage import Workspace, read_json
+from .storage import Workspace
 
 _ATTESTATION_VERSION = "1"
 
@@ -173,7 +174,7 @@ class ArtifactRef:
     """
 
     slot_id: str
-    path: Path
+    key: str
     kind: ArtifactKind
     leaf_hash: str
     number: int | None = None
@@ -268,32 +269,41 @@ def collect_file_version(
         raise InvalidArgument("file id must not be empty")
     if docset_id is not None and not docset_id.strip():
         raise InvalidArgument("docset id must not be empty when provided")
-    if not ws.file_dir(file_id).exists():
-        raise FileNotFound(f"file '{file_id}' not found in workspace")
-    if docset_id is not None and not ws.docset_dir(docset_id).exists():
-        raise DocSetNotFound(f"docset '{docset_id}' not found in workspace")
 
-    # file.json is consulted even though it's not itself a leaf — the
-    # PDF's on-disk name (and therefore the DGML XML's expected stem) live
-    # there. A workspace without a parseable file.json is structurally
-    # broken; let the read_json call's CorruptMetadata propagate.
-    record = FileRecord.from_json(read_json(ws.file_json_path(file_id)))
+    # file.json is consulted even though it's not itself a leaf — the source's
+    # on-disk name (and therefore the DGML XML's expected stem) live there. Its
+    # absence means the file doesn't exist; a corrupt one is structurally broken
+    # (get_doc lets that CorruptMetadata propagate). Existence is defined by the
+    # manifest, not a directory, so this works on any store.
+    blobs, docs = ws.blobs, ws.docs  # both bound once; each re-resolves lazily
+    record_data = docs.get_doc(layout.Collection.FILES, file_id)
+    if record_data is None:
+        raise FileNotFound(f"file '{file_id}' not found in workspace")
+    if docset_id is not None and docs.get_doc(layout.Collection.DOCSETS, docset_id) is None:
+        raise DocSetNotFound(f"docset '{docset_id}' not found in workspace")
+    record = FileRecord.from_json(record_data)
 
     refs: list[ArtifactRef] = []
 
+    # Every BINARY slot below hashes via sha256_blob rather than get_blob: the
+    # bytes are never looked at, only digested, so there is no reason to hold an
+    # artifact whole — least of all the source document, the one leaf with no
+    # size bound (it is whatever the user added).
+
     # Slot 1: the original source document (a .pdf, or the .docx/.xls/… that
     # was converted). Named "source" — the role, not the file format.
-    source_path = ws.file_dir(file_id) / record.original_filename
-    if source_path.exists():
-        refs.append(_binary_ref("source", source_path))
+    source_key = layout.file_source_key(file_id, record.original_filename)
+    if blobs.blob_exists(source_key):
+        refs.append(_binary_ref("source", source_key, blobs.sha256_blob(source_key)))
 
     # Slot 2: page images, ordered by page number (not lexicographic —
     # 'page_10.png' sorts before 'page_2.png' alphabetically).
-    pages_dir = ws.file_pages_dir(file_id)
-    if pages_dir.exists():
-        for img_path in sorted(pages_dir.glob(PAGE_GLOB), key=_page_num):
-            n = _page_num(img_path)
-            refs.append(_binary_ref(f"page_image[{n}]", img_path, number=n))
+    for img_key in sorted(
+        blobs.list_blobs(layout.file_pages_prefix(file_id)),
+        key=lambda k: _page_num(Path(k)),
+    ):
+        n = _page_num(Path(img_key))
+        refs.append(_binary_ref(f"page_image[{n}]", img_key, blobs.sha256_blob(img_key), number=n))
 
     # Per-page text JSONs (`page_text/`) are deliberately *not* attested: the
     # token files are an intermediate text-extraction artifact, not part of the
@@ -305,24 +315,32 @@ def collect_file_version(
         # `docset generate`). Hashed as raw bytes, like the extraction schema.
         # schema.json is deliberately not a leaf — the RNC carries every one
         # of its fields as `# Field: value` comments.
-        full_schema_path = ws.docset_full_schema_path(docset_id)
-        if full_schema_path.exists():
-            refs.append(_binary_ref("full_schema", full_schema_path))
+        full_schema_key = layout.docset_full_schema_key(docset_id)
+        if blobs.blob_exists(full_schema_key):
+            refs.append(
+                _binary_ref("full_schema", full_schema_key, blobs.sha256_blob(full_schema_key))
+            )
 
         # Slot 4: the grounded extraction schema (`extraction-schema.rnc`,
         # RELAX NG Compact) that governs this file's `dg:extraction`. Hashed as
         # raw bytes — RNC is plain text, neither JSON nor XML. Present only once
         # `extraction set-schema` / `generate-schema` has run for the docset.
-        extraction_schema_path = ws.docset_schema_path(docset_id)
-        if extraction_schema_path.exists():
-            refs.append(_binary_ref("extraction_schema", extraction_schema_path))
+        extraction_schema_key = layout.docset_extraction_schema_key(docset_id)
+        if blobs.blob_exists(extraction_schema_key):
+            refs.append(
+                _binary_ref(
+                    "extraction_schema",
+                    extraction_schema_key,
+                    blobs.sha256_blob(extraction_schema_key),
+                )
+            )
 
         # Slot 5: DGML XML output for this file.
-        dgml_xml_path = ws.file_dgml_xml_path(
-            docset_id, file_id, Path(record.original_filename).stem
-        )
-        if dgml_xml_path.exists():
-            refs.append(_xml_ref("dgml_xml", dgml_xml_path))
+        dgml_xml_key = layout.dgml_xml_key(docset_id, file_id, Path(record.original_filename).stem)
+        # The one leaf that genuinely needs the bytes: an XML leaf hash is the
+        # merkle_root of the parsed tree, not a digest of the file.
+        if blobs.blob_exists(dgml_xml_key):
+            refs.append(_xml_ref("dgml_xml", dgml_xml_key, blobs.get_blob(dgml_xml_key)))
 
     if not refs:
         scope = f" in docset '{docset_id}'" if docset_id else ""
@@ -471,7 +489,13 @@ def export_attestation(
     not ``unpacked``) — exactly one of the latter two is non-``None``.
     """
     attestation = attest_file(ws, file_id, docset_id)
-    record = FileRecord.from_json(read_json(ws.file_json_path(file_id)))
+    blobs, docs = ws.blobs, ws.docs  # both bound once; each re-resolves lazily
+    # attest_file already validated the file exists (via collect_file_version);
+    # re-read its manifest through the store for the source stem.
+    record_data = docs.get_doc(layout.Collection.FILES, file_id)
+    if record_data is None:
+        raise FileNotFound(f"file '{file_id}' not found in workspace")
+    record = FileRecord.from_json(record_data)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(record.original_filename).stem
 
@@ -484,8 +508,14 @@ def export_attestation(
         for ref in attestation.leaves:
             rel = _export_rel_path(ref)
             dest = staging / rel
+            # mkdir stays explicit: LocalStore.download_blob happens to create
+            # parents, but the BlobStore contract doesn't promise it.
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ref.path, dest)
+            # download_blob, not get_blob + write_bytes: the store's own
+            # local-file transfer, so no artifact crosses the Python boundary
+            # whole (locally a kernel-side copy; on a remote store a managed,
+            # ranged, retried download).
+            blobs.download_blob(ref.key, dest)
             rel_paths[ref.slot_id] = rel
 
         attestation_path = write_attestation(staging, attestation, record, rel_paths)
@@ -508,7 +538,7 @@ def _write_opc_parts(staging: Path, rel_paths: dict[str, str]) -> list[str]:
     the attestation. Returns the bundle's part list (every part except the
     special ``[Content_Types].xml``), ready to be handed to :func:`zip_package`.
     """
-    attestation_rel = f"{METADATA_DIRNAME}/{METADATA_FILENAME}"
+    attestation_rel = layout.pair_id(METADATA_DIRNAME, METADATA_FILENAME)
     parts = [*rel_paths.values(), attestation_rel, PACKAGE_RELS_PATH]
 
     # Package relationships, in declaration order; rIds are assigned
@@ -609,7 +639,7 @@ def read_attestation(directory: Path) -> AttestationInventory:
     """
     q = _attestation_qname
     path = directory / METADATA_DIRNAME / METADATA_FILENAME
-    rel = f"{METADATA_DIRNAME}/{METADATA_FILENAME}"
+    rel = layout.pair_id(METADATA_DIRNAME, METADATA_FILENAME)
     if not path.exists():
         raise AttestationInvalid(f"no {rel} found in {directory}")
     try:
@@ -755,12 +785,13 @@ def _attestation_qname(local: str) -> str:
 
 def _export_rel_path(ref: ArtifactRef) -> str:
     """POSIX-style bundle path for ``ref``. Ordering never depends on it."""
+    name = ref.key.rsplit("/", 1)[-1]
     if ref.slot_id == "source":
-        return f"source/{ref.path.name}"
+        return f"source/{name}"
     if ref.slot_id.startswith("page_image["):
-        return f"page_images/{ref.path.name}"
+        return f"page_images/{name}"
     # full-schema.rnc, extraction-schema.rnc, and <stem>.dgml.xml sit at the bundle root.
-    return ref.path.name
+    return name
 
 
 def _rel_text(el: etree._Element) -> str:
@@ -814,10 +845,19 @@ def _collect_from_attestation(directory: Path, inventory: AttestationInventory) 
             raise AttestationInvalid(
                 f"attestation file references missing artifact: {entry.rel_path}"
             )
+        # Read bytes only for the XML leaf, which has to be parsed; a binary leaf
+        # is hashed chunk-wise off the path. This side runs against a bundle from
+        # an untrusted third party, so its size is not ours to assume.
         if entry.kind is ArtifactKind.BINARY:
-            refs.append(_binary_ref(entry.slot_id, abs_path, number=entry.number))
+            refs.append(
+                _binary_ref(
+                    entry.slot_id, entry.rel_path, sha256_file(abs_path), number=entry.number
+                )
+            )
         else:
-            refs.append(_xml_ref(entry.slot_id, abs_path, number=entry.number))
+            refs.append(
+                _xml_ref(entry.slot_id, entry.rel_path, abs_path.read_bytes(), number=entry.number)
+            )
     return FileVersion(
         file_id=inventory.file_id,
         docset_id=inventory.docset_id,
@@ -825,18 +865,28 @@ def _collect_from_attestation(directory: Path, inventory: AttestationInventory) 
     )
 
 
-def _binary_ref(slot_id: str, path: Path, *, number: int | None = None) -> ArtifactRef:
-    return ArtifactRef(slot_id, path, ArtifactKind.BINARY, sha256_file(path), number)
+def _binary_ref(
+    slot_id: str, key: str, leaf_hash: str, *, number: int | None = None
+) -> ArtifactRef:
+    """Leaf for a BINARY artifact, whose hash is the plain SHA-256 of its bytes.
+
+    ``leaf_hash`` is supplied by the caller rather than computed here because the
+    two sides reach the bytes differently and neither should load them whole: the
+    collect side hashes through ``BlobStore.sha256_blob`` (chunked, and
+    zero-copy on ``LocalStore``), the verify side through
+    :func:`~dgml_core.hashing.sha256_file` on the bundle path it already holds.
+    """
+    return ArtifactRef(slot_id, key, ArtifactKind.BINARY, leaf_hash, number)
 
 
-def _xml_ref(slot_id: str, path: Path, *, number: int | None = None) -> ArtifactRef:
-    return ArtifactRef(slot_id, path, ArtifactKind.XML, _hash_xml_file(path), number)
+def _xml_ref(slot_id: str, key: str, data: bytes, *, number: int | None = None) -> ArtifactRef:
+    return ArtifactRef(slot_id, key, ArtifactKind.XML, _hash_xml_bytes(data, key), number)
 
 
-def _hash_xml_file(path: Path) -> str:
-    """Parse ``path`` as XML and return :func:`dgml.merkle.merkle_root`."""
+def _hash_xml_bytes(data: bytes, key: str) -> str:
+    """Parse ``data`` as XML and return :func:`dgml.merkle.merkle_root`."""
     try:
-        tree = etree.parse(str(path))
+        root = etree.fromstring(data)
     except etree.XMLSyntaxError as exc:
-        raise ValueError(f"{path} is not well-formed XML: {exc}") from exc
-    return merkle_root(tree.getroot())
+        raise ValueError(f"{key} is not well-formed XML: {exc}") from exc
+    return merkle_root(root)

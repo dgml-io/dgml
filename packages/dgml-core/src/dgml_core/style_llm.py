@@ -33,15 +33,14 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Any
 
-from . import llm
+from . import layout, llm
 from .concurrency import map_concurrent
 from .errors import short_error_message
 from .generation.transcribe import strip_fences
-from .pages import PAGE_FILENAME_TEMPLATE
 from .storage import Workspace
+from .storage_service import BlobStore
 from .style import ALLOWED, merge_styles, validate_style
 from .usage import OPERATION_STYLE_ANNOTATE
 
@@ -66,13 +65,15 @@ class _PageJob:
     ``snippets`` are already-extracted strings and ``config`` already carries
     this page's recording context. ``elements`` rides along only so the calling
     thread can line results back up with their targets — the worker must not
-    read it.
+    read it. The page image is read lazily in the worker via ``blobs`` +
+    ``image_key`` (not prefetched), capping resident image bytes at the pool size.
     """
 
     page: int
     elements: list[Any]
     snippets: list[str]
-    image_path: Path
+    image_key: str
+    blobs: BlobStore
     config: llm.LLMConfig
 
 
@@ -97,7 +98,7 @@ def _styles_for_page(job: _PageJob) -> _PageResult:
     aborts.
     """
     try:
-        styles = _request_styles(job.config, job.image_path.read_bytes(), job.snippets)
+        styles = _request_styles(job.config, job.blobs.get_blob(job.image_key), job.snippets)
     except Exception as exc:
         return _PageResult(None, exc, llm.is_model_reachability_error(exc))
     return _PageResult(styles, None, False)
@@ -125,12 +126,13 @@ def annotate_style_from_image(
     to ``max_concurrency`` threads (litellm's HTTP call releases the GIL). No
     page's failure ever affects another: :func:`_styles_for_page` returns its
     error rather than raising, so nothing is ever cancelled and every page runs.
-    The thread split is strict — workers see only ``str``/``Path``/``LLMConfig``
-    and return plain data; **every read of and write to the XML tree happens on
-    this thread**, in ``by_page`` order, so output is byte-identical whatever
-    the worker count and whatever order the calls complete in. Page images are
-    read inside the workers rather than prefetched, capping resident image bytes
-    at ``max_concurrency`` pages instead of the whole document.
+    The thread split is strict — workers see only a ``str`` image key, the
+    ``BlobStore`` to read it from, and an ``LLMConfig``, and return plain
+    data; **every read of and write to the XML tree happens on this thread**, in
+    ``by_page`` order, so output is byte-identical whatever the worker count and
+    whatever order the calls complete in. Page images are read inside the workers
+    rather than prefetched, capping resident image bytes at ``max_concurrency``
+    pages instead of the whole document.
 
     Failed pages are reported to stderr under ``debug``; a model-unreachability
     failure (bad key, bad model id, dead endpoint) is reported once rather than
@@ -157,11 +159,10 @@ def annotate_style_from_image(
     # Prepare every request up front, on this thread: snippet text comes out of
     # the tree here, and pages with no rendered image drop out here, so the
     # fan-out below is over nothing but self-contained work items.
-    pages_dir = workspace.file_pages_dir(file_id)
     jobs: list[_PageJob] = []
     for page, pairs in by_page.items():
-        image_path = pages_dir / (PAGE_FILENAME_TEMPLATE % page)
-        if not image_path.exists():
+        image_key = layout.file_page_image_key(file_id, page)
+        if not workspace.blobs.blob_exists(image_key):
             continue
         capped = pairs[:_MAX_SNIPPETS_PER_PAGE]
         jobs.append(
@@ -169,7 +170,8 @@ def annotate_style_from_image(
                 page=page,
                 elements=[el for el, _ in capped],
                 snippets=[text for _, text in capped],
-                image_path=image_path,
+                image_key=image_key,
+                blobs=workspace.blobs,
                 # One call per page → one usage row per page, via the recording
                 # context on this page's own config (gated on --debug in the
                 # call layer). The per-page copy also keeps that recording state

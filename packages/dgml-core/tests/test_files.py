@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from dgml_core import layout
 from dgml_core.conversion import ConverterConfig, DocConverter
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
@@ -84,11 +85,17 @@ def test_convertible_source_persists_converted_pdf(
     src.write_bytes(b"original docx bytes")
     result = store.add(src)
 
-    fdir = store.ws.file_dir(result.record.id)
     assert result.conversion_error is None
     assert result.record.original_filename == "foo.docx"
-    assert (fdir / "foo.docx").read_bytes() == b"original docx bytes"  # original preserved
-    assert (fdir / "foo.pdf").read_bytes() == b"%PDF-stub:foo.docx"  # converted persisted
+    # original preserved + converted PDF persisted, both as blobs under the file
+    assert (
+        store.ws.blobs.get_blob(layout.file_source_key(result.record.id, "foo.docx"))
+        == b"original docx bytes"
+    )
+    assert (
+        store.ws.blobs.get_blob(layout.file_source_key(result.record.id, "foo.pdf"))
+        == b"%PDF-stub:foo.docx"
+    )
     assert result.record.pdf_converter == "stub-docx"  # converter named on the record
 
 
@@ -104,7 +111,7 @@ def test_add_pdf(store: FileStore, sample_pdf: Path) -> None:
     assert result.record.page_image_dpi == 300
     assert result.record.page_image_renderer == "ghostscript"
     assert result.record.pdf_converter is None
-    pages = list(store.ws.file_pages_dir(result.record.id).glob("page_*.png"))
+    pages = _page_pngs(store.ws, result.record.id)
     assert len(pages) == 2
 
 
@@ -113,20 +120,28 @@ def test_add_pdf_custom_dpi_is_rendered_and_recorded(store: FileStore, sample_pd
     result = store.add(sample_pdf, dpi=150)
     assert result.page_render_error is None
     assert result.record.page_image_dpi == 150
-    pages = sorted(store.ws.file_pages_dir(result.record.id).glob("page_*.png"))
+    pages = _page_pngs(store.ws, result.record.id)
     assert len(pages) == 2
     # The record has to describe the pixels actually on disk, since `dgml check`
     # reproduces this geometry when it repairs the file later.
-    width, height = _png_size(pages[0])
+    width, height = _png_size(store.ws.blobs.get_blob(pages[0]))
     at_300 = store.add(sample_pdf, on_conflict=ConflictPolicy.DUPLICATE)
-    w300, h300 = _png_size(sorted(store.ws.file_pages_dir(at_300.record.id).glob("page_*.png"))[0])
+    w300, h300 = _png_size(store.ws.blobs.get_blob(_page_pngs(store.ws, at_300.record.id)[0]))
     assert width < w300 and height < h300
 
 
-def _png_size(png: Path) -> tuple[int, int]:
+def _png_size(data: bytes) -> tuple[int, int]:
     """Width/height from a PNG's IHDR — avoids depending on an image library."""
-    header = png.read_bytes()[16:24]
+    header = data[16:24]
     return int.from_bytes(header[:4], "big"), int.from_bytes(header[4:], "big")
+
+
+def _page_pngs(ws: Workspace, file_id: str) -> list[str]:
+    """Sorted page-image blob keys for ``file_id`` (store analogue of globbing
+    page_*.png in the page-images dir)."""
+    return sorted(
+        k for k in ws.blobs.list_blobs(layout.file_pages_prefix(file_id)) if k.endswith(".png")
+    )
 
 
 def test_add_rejects_nonpositive_dpi(store: FileStore, sample_pdf: Path) -> None:
@@ -254,8 +269,8 @@ def test_delete_rejects_empty_file_id_preserves_other_files(
     """
     keep_a = "aaaaaaaaaaaa"
     keep_b = "bbbbbbbbbbbb"
-    workspace.file_dir(keep_a).mkdir(parents=True)
-    workspace.file_dir(keep_b).mkdir(parents=True)
+    workspace.docs.put_doc("files", keep_a, {"id": keep_a})
+    workspace.docs.put_doc("files", keep_b, {"id": keep_b})
     docsets = DocSetStore(workspace)
     ds = docsets.create(name="X")
     docsets.add_file(ds.id, keep_a)
@@ -265,8 +280,8 @@ def test_delete_rejects_empty_file_id_preserves_other_files(
     with pytest.raises(InvalidArgument):
         store.delete("   ")
 
-    assert workspace.file_dir(keep_a).is_dir()
-    assert workspace.file_dir(keep_b).is_dir()
+    assert workspace.docs.get_doc("files", keep_a) is not None
+    assert workspace.docs.get_doc("files", keep_b) is not None
     assert workspace.files_dir.is_dir()
     assert docsets.list_files(ds.id) == [keep_a]
 
@@ -307,9 +322,9 @@ def test_page_count_failure_soft_fails(
     assert result.record.page_count is None
     assert result.page_count_error is not None
     # file.json must exist — the partial-failure recovery is the whole point.
-    assert workspace.file_json_path(result.record.id).exists()
+    assert workspace.docs.get_doc("files", result.record.id) is not None
     # The recorded error is permanent so consistency check won't loop.
     from dgml_core.errors import load_recorded_errors
 
-    recorded = load_recorded_errors(workspace.file_errors_path(result.record.id))
+    recorded = load_recorded_errors(workspace, result.record.id)
     assert any(e.operation == "pdf_page_count" and e.permanent for e in recorded)

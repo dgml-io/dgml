@@ -52,6 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import layout
 from .config import load_merged_config
 from .docsets import DocSetStore
 from .errors import (
@@ -100,7 +101,7 @@ from .matching import (
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .prompts import PromptKey
 from .prompts import get as prompt
-from .storage import Workspace, read_json, write_json_atomic, write_text_atomic
+from .storage import Workspace
 from .toon import encode_phase3_words
 from .usage import (
     OPERATION_EXTRACT_VALUES,
@@ -277,13 +278,12 @@ def get_page_words(
     """
     if page < 1:
         raise ValueError("page must be 1-indexed (≥ 1)")
-    text_path = workspace.file_text_dir(file_id) / f"page_{page}.json"
-    if not text_path.exists():
+    payload = workspace.read_page_text(file_id, page)
+    if payload is None:
         raise FileNotFound(
-            f"no page_text for file '{file_id}' page {page} "
-            f"(expected at {text_path}); was the file added with --text-mode digital or ocr?"
+            f"no page_text for file '{file_id}' page {page}; "
+            "was the file added with --text-mode digital or ocr?"
         )
-    payload = read_json(text_path)
     words: list[dict[str, Any]] = payload.get("words", [])
 
     s = 0 if start_idx is None else max(0, start_idx)
@@ -312,15 +312,13 @@ def get_page_words(
 # ---- PDF input helpers -----------------------------------------------------
 
 
-def _pdf_path(workspace: Workspace, file_id: str) -> Path:
-    """Find the single ``*.pdf`` under ``files/<file_id>/``."""
-    file_dir = workspace.file_dir(file_id)
-    if not file_dir.exists():
-        raise FileNotFound(f"file '{file_id}' not found at {file_dir}")
-    pdfs = list(file_dir.glob("*.pdf"))
+def _pdf_bytes(workspace: Workspace, file_id: str) -> bytes:
+    """Return the bytes of the single ``*.pdf`` stored for ``file_id``."""
+    keys = workspace.blobs.list_blobs(layout.file_prefix(file_id))
+    pdfs = [k for k in keys if k.endswith(".pdf")]
     if not pdfs:
-        raise FileNotFound(f"file '{file_id}' has no source PDF in {file_dir}")
-    return pdfs[0]
+        raise FileNotFound(f"file '{file_id}' has no source PDF")
+    return workspace.blobs.get_blob(pdfs[0])
 
 
 def _pdf_content_block(pdf_bytes: bytes) -> dict[str, Any]:
@@ -375,7 +373,7 @@ def generate_schema(
     # the call before we burn an LLM API request.
     pdf_blocks: list[dict[str, Any]] = []
     for fid in file_ids:
-        pdf_bytes = _pdf_path(workspace, fid).read_bytes()
+        pdf_bytes = _pdf_bytes(workspace, fid)
         pdf_blocks.append(_pdf_content_block(pdf_bytes))
 
     api_key = _resolve_api_key(config.schema_api_key, config.schema_api_key_env)
@@ -551,7 +549,7 @@ class ExtractionResult:
 
     values: dict[str, Any]
     tool_calls: int
-    xml_path: Path
+    xml_key: str
     mode: str
 
 
@@ -601,7 +599,7 @@ def extract_values(
     vocab = parse_rnc(rnc_schema)
     schema = rnc_to_json_schema(rnc_schema)
     guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
-    pdf_bytes = _pdf_path(workspace, file_id).read_bytes()
+    pdf_bytes = _pdf_bytes(workspace, file_id)
     api_key = _resolve_api_key(config.values_api_key, config.values_api_key_env)
     api_base = config.values_api_base
 
@@ -790,8 +788,12 @@ def extract_values(
         # tree (full-extraction), or written as a standalone dg:chunk when no
         # tree exists yet (extraction).
         stem = Path(FileStore(workspace).get(file_id).original_filename).stem
-        xml_path = workspace.file_dgml_xml_path(docset_id, file_id, stem)
-        existing = xml_path.read_text(encoding="utf-8") if xml_path.exists() else None
+        xml_key = layout.dgml_xml_key(docset_id, file_id, stem)
+        existing = (
+            workspace.blobs.get_blob(xml_key).decode("utf-8")
+            if workspace.blobs.blob_exists(xml_key)
+            else None
+        )
         if existing is not None and has_document_tree(existing):
             # A generated document tree is present — add extraction alongside it.
             mode = "full-extraction"
@@ -800,10 +802,10 @@ def extract_values(
             # No tree (fresh, or a prior extraction-only file) — (re)write standalone.
             mode = "extraction"
             doc = standalone_extraction_doc(final_values, vocab=vocab)
-        write_text_atomic(xml_path, doc)
+        workspace.blobs.put_blob(xml_key, doc.encode("utf-8"))
         outcome = OUTCOME_OK
         return ExtractionResult(
-            values=final_values, tool_calls=tool_calls_total, xml_path=xml_path, mode=mode
+            values=final_values, tool_calls=tool_calls_total, xml_key=xml_key, mode=mode
         )
     except ValuesExtractionFailed as exc:
         error_msg = str(exc)
@@ -998,7 +1000,9 @@ def _write_extraction_stats(
         # vocabulary pruning.
         "phase1_tool_schema": phase1_tool_schema,
     }
-    write_json_atomic(workspace.docset_file_extraction_stats_path(docset_id, file_id), stats)
+    workspace.docs.put_doc(
+        layout.Collection.EXTRACTION_STATS, layout.pair_id(docset_id, file_id), stats
+    )
 
 
 # ---- Phase 3: per-page LLM for unmatched items ----------------------------
@@ -1105,10 +1109,10 @@ def _phase3_call_for_page(
     the minimum cacheable prefix. Marking it only risks paying the cache-write
     premium for a read that cannot arrive — the same reasoning that keeps the
     PDF and image blocks untagged."""
-    image_path = workspace.file_dir(file_id) / "page_images" / f"page_{page_number}.png"
-    if not image_path.exists():
+    image_key = layout.file_page_image_key(file_id, page_number)
+    if not workspace.blobs.blob_exists(image_key):
         raise ValuesExtractionFailed(
-            f"phase 3: no page image at {image_path} for page {page_number}"
+            f"phase 3: no page image for file '{file_id}' page {page_number}"
         )
 
     try:
@@ -1128,7 +1132,7 @@ def _phase3_call_for_page(
             "role": "user",
             "content": [
                 {"type": "text", "text": user_text},
-                _image_content_block(image_path.read_bytes()),
+                _image_content_block(workspace.blobs.get_blob(image_key)),
             ],
         },
     ]

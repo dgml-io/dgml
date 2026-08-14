@@ -264,13 +264,18 @@ def merge_coverage_documents(
     return list(by_source.values())
 
 
-def save_coverage_report(results: list[dict[str, Any]], path: Path) -> None:
+def dump_coverage_report(results: list[dict[str, Any]]) -> str:
+    """Serialize a coverage report (``generated_at`` + ``documents``) to JSON."""
     report = {
         "generated_at": datetime.now(UTC).isoformat(),
         "documents": results,
     }
+    return json.dumps(report, indent=2, ensure_ascii=False)
+
+
+def save_coverage_report(results: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(dump_coverage_report(results), encoding="utf-8")
 
 
 def coverage_summary_line(result: dict[str, Any]) -> str:

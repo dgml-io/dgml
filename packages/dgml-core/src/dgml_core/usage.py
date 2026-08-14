@@ -31,10 +31,10 @@ file.
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from . import layout
 from .storage import Workspace
 
 # Operation identifiers — keep these stable; the UX filters by them.
@@ -84,18 +84,16 @@ class UsageEvent:
 
 
 def record_usage(workspace: Workspace, event: UsageEvent) -> None:
-    """Append a single usage event to ``<workspace>/usage.jsonl``.
+    """Append a single usage event to the workspace's ``usage`` log.
 
-    A write failure here is swallowed: cost telemetry must never break
-    the operation it's reporting on. Worst case the row is missing from
-    the log; the user's PDF is still ingested / classified / extracted.
+    Routed through the storage backend's append-only ``usage`` collection (the
+    local store keeps it as ``<workspace>/usage.jsonl``, one JSON object per
+    line). A write failure here is swallowed: cost telemetry must never break
+    the operation it's reporting on. Worst case the row is missing from the log;
+    the user's PDF is still ingested / classified / extracted.
     """
     try:
-        path = workspace.usage_log_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event.to_json(), separators=(",", ":"))
-        with path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        workspace.docs.append_doc(layout.Collection.USAGE, event.to_json())
     except Exception:
         # Intentional broad catch: never let logging take down the
         # caller. The usage log is best-effort telemetry.
@@ -183,22 +181,6 @@ def add_partial(acc: dict[str, Any], inc: dict[str, Any]) -> None:
 
 
 def read_events(workspace: Workspace) -> list[dict[str, Any]]:
-    """Read all events from ``usage.jsonl``. Tolerates corrupt lines
-    (skips them silently) and a missing file (returns ``[]``)."""
-    path = workspace.usage_log_path
-    if not path.exists():
-        return []
-    out: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError:
-                # Tail line from a crashed-mid-write append — skip it.
-                continue
-            if isinstance(obj, dict):
-                out.append(obj)
-    return out
+    """Read all events from the workspace's ``usage`` log. Tolerates corrupt
+    lines (skips them silently) and a missing log (returns ``[]``)."""
+    return workspace.docs.find_docs(layout.Collection.USAGE, {})

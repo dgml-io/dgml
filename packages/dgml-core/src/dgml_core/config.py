@@ -90,6 +90,7 @@ def _build_settings_class(user_path: Path, ws_path: Path) -> type[BaseSettings]:
         text_extraction: dict[str, Any] = {}
         conversion: dict[str, Any] = {}
         clustering: dict[str, Any] = {}
+        storage: dict[str, Any] = {}
 
         @classmethod
         def settings_customise_sources(

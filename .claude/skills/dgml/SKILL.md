@@ -22,14 +22,18 @@ From inside this repo, use `uv run dgml …` (the venv is managed by `uv sync`).
 
 The workspace root is picked in this order:
 
-1. `--workspace <path>` flag
+1. `--workspace <path-or-id>` flag — a filesystem path **or** a `ws_…` workspace id
+   from `dgml workspace list` (a registered id opens at its recorded root; anything
+   else is a path)
 2. `$DGML_HOME`
 3. `./dgml-workspace` (default, relative to cwd)
 
 Setup — the minimum is a **single** command:
 
 1. `dgml init [--provider <anthropic|google|mixed>]` — **run once per machine.** Writes the user-level `~/.config/dgml/config.toml` with a `[models]` block. Omit `--provider` to auto-detect from the API-key env vars that are set (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY`); pass `--force` to overwrite an existing file (backs it up first). There are **no** default models — an unconfigured model is a hard error, never a silent paid call.
-2. `dgml workspace create [path] --organization <org>` — creates the workspace (`docsets/` + `files/`), records its identity in `workspace.json`. It does **not** touch the user config; if the config is missing it still creates the workspace and warns on stderr to run `dgml init`. The optional positional `path` is where to create it (`dgml workspace create ./ws …`); omit it to use the resolved root (global `--workspace` → `$DGML_HOME` → `./dgml-workspace`). `--organization` is **required** and is embedded in this workspace's docset namespace URIs (`http://dgml.io/<org>/<DocSetSlug>`); pass an optional `--name` for a human-readable label.
+2. `dgml workspace create [path] --organization <org>` — creates the workspace (`docsets/` + `files/`), records its identity in `workspace.json`, and mints a stable `workspace_id` (echoed in the payload). It does **not** touch the user config; if the config is missing it still creates the workspace and warns on stderr to run `dgml init`. The optional positional `path` is where to create it (`dgml workspace create ./ws …`); omit it to use the resolved root (global `--workspace` → `$DGML_HOME` → `./dgml-workspace`). `--organization` is **required** and is embedded in this workspace's docset namespace URIs (`http://dgml.io/<org>/<DocSetSlug>`); pass an optional `--name` for a human-readable label. Use `--storage <name>` to put the workspace on a named storage service defined as `[storage.<name>]` in `config.toml` (omit for the bundled local-disk default; a non-secret snapshot of the service is recorded in the registry).
+
+Managing multiple workspaces: `dgml workspace list` prints every workspace registered on this machine (`{workspace_id, name, organization, root, storage_service, created_at}`), and any `workspace_id` can be passed as `--workspace <id>` to open it without knowing its path — e.g. `id=$(dgml workspace create ./ws --organization Acme | jq -r .workspace_id)` then `dgml --workspace "$id" file list`. New workspaces register automatically, as does the first open of any existing one; `dgml workspace register [path] [--storage <name>]` is the explicit fix for a **moved** directory (re-points its recorded root, keeping the id), for switching a workspace's storage service, or for repairing a `STORAGE_BACKEND_MISMATCH` (a hand-edited registry entry).
 
 Configure once per machine: every workspace inherits `~/.config/dgml/config.toml`. Models are set via the `[models]` tiers (`light`/`standard`/`advanced`/`expert`); per-task sections override a tier. A workspace can override per key via its own `<workspace>/config.toml`, and env vars (`DGML_MODELS__ADVANCED=…`) override on top. Any command other than `init` / `workspace create` on an uninitialized workspace fails with `WORKSPACE_NOT_INITIALIZED`.
 
@@ -491,7 +495,7 @@ uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 #    --auto-classify / cluster into an existing docset) auto-extracts it —
 #    check the payload's `extraction` block; run `extract` manually only for
 #    files assigned before the schema existed or to re-extract.
-uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_path}'
+uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_key}'
 
 # 3) Read them back. Default is values-shape JSON (projected from dg:extraction);
 #    --as xml returns the whole core DGML document.

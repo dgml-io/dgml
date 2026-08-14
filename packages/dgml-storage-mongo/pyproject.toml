@@ -1,0 +1,21 @@
+[project]
+name = "dgml-storage-mongo"
+version = "0.1.0"
+description = "Sample DGML DocStore backed by MongoDB."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Docugami" }]
+readme = "README.md"
+# pymongo (Apache-2.0) is allow-list clean; see the licence note in README.md for
+# the *server* side (MongoDB Community / FerretDB).
+dependencies = ["dgml-core>=0.1.0", "pymongo>=4.6"]
+
+[tool.uv.sources]
+dgml-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dgml_storage_mongo"]

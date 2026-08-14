@@ -1,0 +1,15 @@
+# Local MongoDB for the dgml-storage-mongo integration tests.
+#
+#   docker compose -f packages/dgml-storage-mongo/docker-compose.yml up -d
+#   DGML_TEST_MONGO_URI=mongodb://localhost:27017 uv run pytest packages/dgml-storage-mongo
+#
+# Without DGML_TEST_MONGO_URI the suite runs against in-process mongomock instead.
+services:
+  mongo:
+    image: mongo:7
+    ports: ["27017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ping:1})"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

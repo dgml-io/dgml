@@ -67,10 +67,11 @@ from pathlib import Path
 from lxml import etree  # type: ignore[import-untyped]
 from lxml.etree import _Element  # type: ignore[import-untyped]
 
+from . import layout
 from .errors import DocSetNotFound, FileNotFound, InvalidArgument, NotFoundError
 from .merkle import MerkleProof, canonical_hash, merkle_proof, merkle_root, verify_proof
 from .models import FileRecord
-from .storage import Workspace, read_json
+from .storage import Workspace
 
 
 @dataclass(frozen=True)
@@ -135,23 +136,23 @@ def load_dgml_root(ws: Workspace, file_id: str, docset_id: str) -> _Element:
         raise InvalidArgument("file id must not be empty")
     if not docset_id.strip():
         raise InvalidArgument("docset id must not be empty")
-    if not ws.file_dir(file_id).exists():
+    record_data = ws.docs.get_doc(layout.Collection.FILES, file_id)
+    if record_data is None:
         raise FileNotFound(f"file '{file_id}' not found in workspace")
-    if not ws.docset_dir(docset_id).exists():
+    if ws.docs.get_doc(layout.Collection.DOCSETS, docset_id) is None:
         raise DocSetNotFound(f"docset '{docset_id}' not found in workspace")
 
-    record = FileRecord.from_json(read_json(ws.file_json_path(file_id)))
-    xml_path = ws.file_dgml_xml_path(docset_id, file_id, Path(record.original_filename).stem)
-    if not xml_path.exists():
+    record = FileRecord.from_json(record_data)
+    xml_key = layout.dgml_xml_key(docset_id, file_id, Path(record.original_filename).stem)
+    if not ws.blobs.blob_exists(xml_key):
         raise NotFoundError(
             f"no generated DGML XML for file '{file_id}' in docset '{docset_id}' "
-            f"(expected {xml_path})"
+            f"(expected {xml_key})"
         )
     try:
-        tree = etree.parse(str(xml_path))
+        root: _Element = etree.fromstring(ws.blobs.get_blob(xml_key))
     except etree.XMLSyntaxError as exc:
-        raise ValueError(f"{xml_path} is not well-formed XML: {exc}") from exc
-    root: _Element = tree.getroot()
+        raise ValueError(f"{xml_key} is not well-formed XML: {exc}") from exc
     return root
 
 

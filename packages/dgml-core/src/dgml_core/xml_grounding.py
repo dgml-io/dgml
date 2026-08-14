@@ -106,6 +106,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import layout
+
 if TYPE_CHECKING:
     from .style_config import StyleConfig
 
@@ -286,15 +288,15 @@ def _collect_segments(root: Any) -> list[_TextSeg]:
 
 
 def _list_pages(workspace: Workspace, file_id: str) -> list[int]:
-    text_dir = workspace.file_text_dir(file_id)
+    prefix = layout.file_text_prefix(file_id)
     pages = sorted(
         int(m.group(1))
-        for p in text_dir.glob("page_*.json")
-        if (m := re.fullmatch(r"page_(\d+)", p.stem)) is not None
+        for key in workspace.blobs.list_blobs(prefix)
+        if (m := re.fullmatch(r"page_(\d+)", Path(key).stem)) is not None
     )
     if not pages:
         raise FileNotFound(
-            f"no page_text for file '{file_id}' (expected page_*.json under {text_dir}); "
+            f"no page_text for file '{file_id}' (expected page_*.json under {prefix}); "
             "was the file added with --text-mode digital, ocr, or hybrid?"
         )
     return pages

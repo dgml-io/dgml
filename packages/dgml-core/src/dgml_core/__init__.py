@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from . import layout
 from .consistency import CheckReport, Issue, check_workspace
 from .conversion import (
     ConverterConfig,
@@ -35,6 +36,7 @@ from .errors import (
     InvalidPDF,
     PageRenderFailed,
     UnsupportedFileType,
+    WorkspaceMigrationFailed,
     WorkspaceNotInitialized,
 )
 from .file_attestation import (
@@ -57,18 +59,48 @@ from .file_attestation import (
     write_attestation,
 )
 from .files import AddFileResult, ConflictPolicy, FileStore
+from .layout import Collection
+from .migrations import (
+    WORKSPACE_SCHEMA_VERSION,
+    Migration,
+    MigrationResult,
+    migrate_workspace,
+    pending_migrations,
+    stamp_schema_version,
+    workspace_schema_version,
+)
 from .models import DocSet, FileRecord
 from .storage import Workspace
+from .storage_local import LocalStore
+from .storage_resolve import (
+    DEFAULT_STORAGE_PROVIDER,
+    DEFAULT_STORAGE_SERVICE,
+    load_store_configs,
+    make_blob_store,
+    make_doc_store,
+    storage_fingerprint,
+)
+from .storage_service import (
+    BlobStore,
+    DocStore,
+    StorageConfig,
+)
+from .workspace_ops import WorkspaceOps
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "DEFAULT_STORAGE_PROVIDER",
+    "DEFAULT_STORAGE_SERVICE",
+    "WORKSPACE_SCHEMA_VERSION",
     "AddFileResult",
     "ArtifactKind",
     "ArtifactRef",
     "AttestationEntry",
     "AttestationInventory",
+    "BlobStore",
     "CheckReport",
+    "Collection",
     "ConflictError",
     "ConflictPolicy",
     "ConversionConfigInvalid",
@@ -80,6 +112,7 @@ __all__ = [
     "DocSet",
     "DocSetNotFound",
     "DocSetStore",
+    "DocStore",
     "FileAttestation",
     "FileNotFound",
     "FileRecord",
@@ -89,11 +122,17 @@ __all__ = [
     "InvalidArgument",
     "InvalidPDF",
     "Issue",
+    "LocalStore",
+    "Migration",
+    "MigrationResult",
     "PageRenderFailed",
+    "StorageConfig",
     "UnsupportedFileType",
     "VerifyResult",
     "Workspace",
+    "WorkspaceMigrationFailed",
     "WorkspaceNotInitialized",
+    "WorkspaceOps",
     "__version__",
     "attest_file",
     "attest_file_version",
@@ -101,11 +140,20 @@ __all__ = [
     "collect_file_version",
     "collect_from_attestation",
     "export_attestation",
+    "layout",
     "load_conversion_config",
+    "load_store_configs",
+    "make_blob_store",
     "make_converter",
+    "make_doc_store",
+    "migrate_workspace",
+    "pending_migrations",
     "read_attestation",
+    "stamp_schema_version",
+    "storage_fingerprint",
     "verify_attestation_dir",
     "verify_bundle",
     "verify_file_version",
+    "workspace_schema_version",
     "write_attestation",
 ]

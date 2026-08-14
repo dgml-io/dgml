@@ -19,11 +19,39 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from dgml_core import DEFAULT_STORAGE_PROVIDER, BlobStore, LocalStore, StorageConfig
 from dgml_core.pages import GS_BINARIES
 from dgml_core.storage import Workspace
 
 PAGE_WIDTH_PTS = 612
 PAGE_HEIGHT_PTS = 792
+
+
+# --- store construction (shared by the storage and attestation suites) -------
+
+
+def local_store(root: Path) -> LocalStore:
+    cfg = StorageConfig(provider=DEFAULT_STORAGE_PROVIDER, root=root)
+    return LocalStore(LocalStore.parse_config(cfg))
+
+
+class DefaultBridgeStore(LocalStore):
+    """A store with LocalStore's blob primitives but the *base* path bridge —
+    exercises the default download-to-temp / upload-on-exit implementations that
+    every third-party store inherits (LocalStore itself overrides them).
+
+    Attestation hashes through the path bridge, so this is also what proves the
+    remote-store code path produces identical leaf hashes and roots."""
+
+    materialize = BlobStore.materialize
+    staged_write = BlobStore.staged_write
+    materialize_dir = BlobStore.materialize_dir
+    working_dir = BlobStore.working_dir
+
+
+def default_bridge_store(root: Path) -> DefaultBridgeStore:
+    cfg = LocalStore.parse_config(StorageConfig(DEFAULT_STORAGE_PROVIDER, root))
+    return DefaultBridgeStore(cfg)
 
 
 def _toml_scalar(value: Any) -> str:

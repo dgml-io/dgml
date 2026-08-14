@@ -14,10 +14,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
+from . import layout
 from .errors import (
     AuthError,
     CorruptMetadata,
@@ -32,13 +33,11 @@ from .errors import (
     load_recorded_errors,
     now_iso,
 )
-from .hashing import sha256_file
 from .hybrid import extract_text_hybrid
 from .ocr import extract_text_ocr, load_ocr_config
-from .pages import DEFAULT_DPI, PAGE_GLOB, render_pages
-from .storage import Workspace, read_json
+from .pages import DEFAULT_DPI, render_pages
+from .storage import Workspace
 from .text_extraction import (
-    PAGE_TEXT_GLOB,
     ExtractDigitalResult,
     TextMode,
     classify_extraction_outcome,
@@ -84,10 +83,28 @@ class CheckReport:
         return not self.issues
 
 
+def _entity_ids(ws: Workspace, collection: str, blob_prefix: str) -> list[str]:
+    """Every entity id in the workspace, store-natively.
+
+    The union of two sources: ids with a readable manifest (``find_docs``), and
+    *blob-orphans* — ids that have blobs under ``blob_prefix`` but whose manifest
+    is missing or unreadable (so ``find_docs`` skipped them). The per-entity
+    check then resolves each id's manifest and flags a missing/corrupt one. This
+    is the store analogue of the old ``iterdir`` scan: an entity "exists" when it
+    has a manifest *or* artifacts, not when a bare directory is present (a
+    concept no remote store has)."""
+    ids = {str(doc["id"]) for doc in ws.docs.find_docs(collection, {})}
+    for key in ws.blobs.list_blobs(blob_prefix):
+        segment = key[len(blob_prefix) :].split("/", 1)[0]
+        if segment:
+            ids.add(segment)
+    return sorted(ids)
+
+
 def check_workspace(
     ws: Workspace, *, retry_errors: bool = False, verbose: bool = False, debug: bool = False
 ) -> CheckReport:
-    """Validate the on-disk workspace; repair fixable issues where safe.
+    """Validate the workspace; repair fixable issues where safe.
 
     With ``retry_errors=True``, recorded permanent errors are cleared before
     checking so that previously-failed operations are re-attempted.
@@ -98,26 +115,20 @@ def check_workspace(
     """
     report = CheckReport()
 
-    if ws.files_dir.exists():
-        for entry in sorted(ws.files_dir.iterdir()):
-            if not entry.is_dir():
-                continue
-            report.files_checked += 1
-            _check_file(
-                ws,
-                entry.name,
-                retry_errors=retry_errors,
-                verbose=verbose,
-                debug=debug,
-                report=report,
-            )
+    for file_id in _entity_ids(ws, "files", "files/"):
+        report.files_checked += 1
+        _check_file(
+            ws,
+            file_id,
+            retry_errors=retry_errors,
+            verbose=verbose,
+            debug=debug,
+            report=report,
+        )
 
-    if ws.docsets_dir.exists():
-        for entry in sorted(ws.docsets_dir.iterdir()):
-            if not entry.is_dir():
-                continue
-            report.docsets_checked += 1
-            _check_docset(ws, entry.name, report=report)
+    for docset_id in _entity_ids(ws, "docsets", "docsets/"):
+        report.docsets_checked += 1
+        _check_docset(ws, docset_id, report=report)
 
     return report
 
@@ -131,26 +142,11 @@ def _check_file(
     debug: bool,
     report: CheckReport,
 ) -> None:
-    file_dir = ws.file_dir(file_id)
-    json_path = ws.file_json_path(file_id)
-    errors_path = ws.file_errors_path(file_id)
-
     if retry_errors:
-        clear_recorded_errors(errors_path)
-
-    if not json_path.exists():
-        report.issues.append(
-            Issue(
-                kind="missing_metadata",
-                target_type="file",
-                target_id=file_id,
-                message="file.json missing",
-            )
-        )
-        return
+        clear_recorded_errors(ws, file_id)
 
     try:
-        record_data = read_json(json_path)
+        record_data = ws.docs.get_doc(layout.Collection.FILES, file_id)
     except CorruptMetadata as exc:
         report.issues.append(
             Issue(
@@ -158,6 +154,17 @@ def _check_file(
                 target_type="file",
                 target_id=file_id,
                 message=str(exc),
+            )
+        )
+        return
+
+    if record_data is None:
+        report.issues.append(
+            Issue(
+                kind="missing_metadata",
+                target_type="file",
+                target_id=file_id,
+                message="file.json missing",
             )
         )
         return
@@ -178,8 +185,8 @@ def _check_file(
         )
         return
 
-    pdf_path = file_dir / original_filename
-    if not pdf_path.exists():
+    source_key = layout.file_source_key(file_id, original_filename)
+    if not ws.blobs.blob_exists(source_key):
         report.issues.append(
             Issue(
                 kind="missing_pdf",
@@ -191,7 +198,7 @@ def _check_file(
         return
 
     if sha:
-        actual_sha = sha256_file(pdf_path)
+        actual_sha = ws.blobs.sha256_blob(source_key)
         if actual_sha != sha:
             report.issues.append(
                 Issue(
@@ -202,11 +209,11 @@ def _check_file(
                 )
             )
 
-    recorded = load_recorded_errors(errors_path)
+    recorded = load_recorded_errors(ws, file_id)
     permanent_ops = {e.operation for e in recorded if e.permanent}
 
-    pages_dir = ws.file_pages_dir(file_id)
-    rendered_pages = sorted(pages_dir.glob(PAGE_GLOB)) if pages_dir.exists() else []
+    pages_prefix = layout.file_pages_prefix(file_id)
+    rendered = len(ws.blobs.list_blobs(pages_prefix))
 
     expected: int | None
     # A stored ``page_count`` of 0 is never legitimate — every PDF has at
@@ -230,17 +237,17 @@ def _check_file(
     else:
         # No reliable stored page count (the original add couldn't parse one,
         # or stored a bogus 0, though page rendering may still have succeeded).
-        # Recover the count from the page images already on disk — ghostscript
+        # Recover the count from the page images already stored — ghostscript
         # renders one image per page, so the rendered set is authoritative —
-        # rather than re-parsing the PDF. If nothing is on disk yet, attempt a
+        # rather than re-parsing the PDF. If nothing is stored yet, attempt a
         # render to recover it: the count may have failed while rendering would
         # still succeed.
-        expected = len(rendered_pages)
+        expected = rendered
         if not expected:
             recovered = _recover_missing_pages(
-                pdf_path=pdf_path,
-                pages_dir=pages_dir,
-                errors_path=errors_path,
+                ws=ws,
+                source_key=source_key,
+                pages_prefix=pages_prefix,
                 permanent_ops=permanent_ops,
                 file_id=file_id,
                 dpi=dpi,
@@ -249,14 +256,14 @@ def _check_file(
             if not recovered:
                 return  # issue already recorded by the helper
             expected = recovered
-            rendered_pages = sorted(pages_dir.glob(PAGE_GLOB))
+            rendered = len(ws.blobs.list_blobs(pages_prefix))
 
     _check_page_rendering(
-        pdf_path=pdf_path,
-        pages_dir=pages_dir,
-        rendered_pages=rendered_pages,
+        ws=ws,
+        source_key=source_key,
+        pages_prefix=pages_prefix,
+        rendered=rendered,
         expected=expected,
-        errors_path=errors_path,
         permanent_ops=permanent_ops,
         file_id=file_id,
         dpi=dpi,
@@ -269,13 +276,11 @@ def _check_file(
         # a render_pages permanent error this run; that's fine — text
         # extraction is independent of page rendering and we want to refresh
         # the set for the text-extraction check.
-        permanent_ops = {e.operation for e in load_recorded_errors(errors_path) if e.permanent}
+        permanent_ops = {e.operation for e in load_recorded_errors(ws, file_id) if e.permanent}
         _check_text_extraction(
             ws=ws,
-            pdf_path=pdf_path,
-            text_dir=ws.file_text_dir(file_id),
+            source_key=source_key,
             expected=expected,
-            errors_path=errors_path,
             permanent_ops=permanent_ops,
             file_id=file_id,
             text_mode=text_mode,
@@ -284,6 +289,18 @@ def _check_file(
             debug=debug,
             report=report,
         )
+
+
+def _render(ws: Workspace, source_key: str, pages_prefix: str, dpi: int) -> int:
+    """Render the source PDF's page images through the store.
+
+    Materialize the source to a real path (ghostscript needs one) and render
+    into a store-backed staging directory; ``render_pages`` clears stale images
+    itself. ``dpi`` reproduces the file's existing render resolution so repaired
+    pages stay aligned with the ``page_text/`` boxes already stored. Returns the
+    page count."""
+    with ws.blobs.materialize(source_key) as pdf_path, ws.blobs.staged_write(pages_prefix) as tmp:
+        return render_pages(pdf_path, tmp, dpi=dpi)
 
 
 def _recorded_dpi(record_data: dict[str, Any]) -> int:
@@ -304,16 +321,16 @@ def _recorded_dpi(record_data: dict[str, Any]) -> int:
 
 def _recover_missing_pages(
     *,
-    pdf_path: Path,
-    pages_dir: Path,
-    errors_path: Path,
+    ws: Workspace,
+    source_key: str,
+    pages_prefix: str,
     permanent_ops: set[str],
     file_id: str,
     dpi: int,
     report: CheckReport,
 ) -> int:
     """Recover a file whose stored page count is unknown/bogus and which has
-    no rendered pages on disk, by attempting a fresh render.
+    no rendered pages stored, by attempting a fresh render.
 
     Ghostscript is the authority on how many pages a PDF has, so a successful
     render establishes the true count. Returns the number of pages rendered,
@@ -332,10 +349,11 @@ def _recover_missing_pages(
         return 0
 
     try:
-        actual = render_pages(pdf_path, pages_dir, dpi=dpi)
+        actual = _render(ws, source_key, pages_prefix, dpi)
     except (GhostscriptNotFound, PageRenderFailed) as exc:
         append_recorded_error(
-            errors_path,
+            ws,
+            file_id,
             RecordedError(
                 operation="render_pages",
                 message=str(exc),
@@ -378,17 +396,17 @@ def _recover_missing_pages(
 
 def _check_page_rendering(
     *,
-    pdf_path: Path,
-    pages_dir: Path,
-    rendered_pages: list[Path],
+    ws: Workspace,
+    source_key: str,
+    pages_prefix: str,
+    rendered: int,
     expected: int,
-    errors_path: Path,
     permanent_ops: set[str],
     file_id: str,
     dpi: int,
     report: CheckReport,
 ) -> None:
-    if len(rendered_pages) == expected:
+    if rendered == expected:
         return
 
     if "render_pages" in permanent_ops:
@@ -399,17 +417,18 @@ def _check_page_rendering(
                 target_id=file_id,
                 message=(
                     f"page rendering previously failed permanently; have "
-                    f"{len(rendered_pages)}/{expected} pages"
+                    f"{rendered}/{expected} pages"
                 ),
             )
         )
         return
 
     try:
-        actual = render_pages(pdf_path, pages_dir, dpi=dpi)
+        actual = _render(ws, source_key, pages_prefix, dpi)
     except (GhostscriptNotFound, PageRenderFailed) as exc:
         append_recorded_error(
-            errors_path,
+            ws,
+            file_id,
             RecordedError(
                 operation="render_pages",
                 message=str(exc),
@@ -429,7 +448,8 @@ def _check_page_rendering(
 
     if actual != expected:
         append_recorded_error(
-            errors_path,
+            ws,
+            file_id,
             RecordedError(
                 operation="render_pages",
                 message=f"rendered {actual}, expected {expected}",
@@ -460,10 +480,8 @@ def _check_page_rendering(
 def _check_text_extraction(
     *,
     ws: Workspace,
-    pdf_path: Path,
-    text_dir: Path,
+    source_key: str,
     expected: int,
-    errors_path: Path,
     permanent_ops: set[str],
     file_id: str,
     text_mode: str,
@@ -472,16 +490,15 @@ def _check_text_extraction(
     debug: bool,
     report: CheckReport,
 ) -> None:
-    text_files = sorted(text_dir.glob(PAGE_TEXT_GLOB)) if text_dir.exists() else []
-
-    corrupt = [p for p in text_files if not _is_valid_text_json(p)]
-    for p in corrupt:
+    text_keys = ws.blobs.list_blobs(layout.file_text_prefix(file_id))
+    corrupt = [k for k in text_keys if not _is_valid_text_json(ws, k)]
+    for k in corrupt:
         report.issues.append(
             Issue(
                 kind="page_text_corrupt",
                 target_type="file",
                 target_id=file_id,
-                message=f"{p.name} is not valid JSON",
+                message=f"{k.rsplit('/', 1)[-1]} is not valid JSON",
             )
         )
 
@@ -497,22 +514,23 @@ def _check_text_extraction(
                 target_id=file_id,
                 message=(
                     f"text extraction previously failed permanently; have "
-                    f"{len(text_files) - len(corrupt)}/{expected} valid page_text files"
+                    f"{len(text_keys) - len(corrupt)}/{expected} valid page_text files"
                 ),
             )
         )
         return
 
-    if not corrupt and len(text_files) == expected:
+    if not corrupt and len(text_keys) == expected:
         return
 
     try:
         result = _reextract(
-            ws, pdf_path, text_dir, file_id, text_mode, dpi=dpi, verbose=verbose, debug=debug
+            ws, source_key, file_id, text_mode, dpi=dpi, verbose=verbose, debug=debug
         )
     except (TextExtractionFailed, OcrFailed, AuthError, DgmlError) as exc:
         append_recorded_error(
-            errors_path,
+            ws,
+            file_id,
             RecordedError(
                 operation="text_extraction",
                 message=str(exc),
@@ -544,7 +562,8 @@ def _check_text_extraction(
         return
 
     append_recorded_error(
-        errors_path,
+        ws,
+        file_id,
         RecordedError(
             operation="text_extraction",
             message=outcome.message,
@@ -566,8 +585,7 @@ def _check_text_extraction(
 
 def _reextract(
     ws: Workspace,
-    pdf_path: Path,
-    text_dir: Path,
+    source_key: str,
     file_id: str,
     text_mode: str,
     *,
@@ -577,62 +595,74 @@ def _reextract(
 ) -> ExtractDigitalResult:
     """Re-extract text for ``file_id`` using whichever mode it was added with.
 
+    The source PDF is materialized for the extractors, page_text is written into
+    a store-backed staging dir, and OCR/hybrid read the file's page images from a
+    materialized copy — the same store bridges the file-add path uses.
+
     ``dpi`` is the file's *own* render resolution, not today's default: digital
     word boxes are written in page-image pixel space, so re-extracting at a
     different value would leave ``page_text/`` disagreeing with the
     ``page_images/`` already on disk. The pure-OCR path reads those images
-    directly and so needs no dpi.
-    """
-    if text_mode == TextMode.OCR.value:
-        config = load_ocr_config(ws)
-        return extract_text_ocr(
-            pdf_path,
-            text_dir,
-            file_id=file_id,
-            page_images_dir=ws.file_pages_dir(file_id),
-            config=config,
-        )
-    if text_mode == TextMode.HYBRID.value:
-        config = load_ocr_config(ws)
-        text_extraction_config = load_text_extraction_config(ws)
-        return extract_text_hybrid(
-            pdf_path,
-            text_dir,
-            file_id=file_id,
-            page_images_dir=ws.file_pages_dir(file_id),
-            config=config,
-            text_extraction_config=text_extraction_config,
-            workspace=ws,
-            dpi=dpi,
-            verbose=verbose,
-            debug=debug,
-        )
-    return extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
+    directly and so needs no dpi."""
+    text_prefix = layout.file_text_prefix(file_id)
+    pages_prefix = layout.file_pages_prefix(file_id)
+    with (
+        ws.blobs.materialize(source_key) as pdf_path,
+        ws.blobs.staged_write(text_prefix) as text_dir,
+    ):
+        if text_mode == TextMode.OCR.value:
+            config = load_ocr_config(ws)
+            with ws.blobs.materialize_dir(pages_prefix) as pages_dir:
+                return extract_text_ocr(
+                    pdf_path,
+                    text_dir,
+                    file_id=file_id,
+                    page_images_dir=pages_dir,
+                    config=config,
+                )
+        if text_mode == TextMode.HYBRID.value:
+            config = load_ocr_config(ws)
+            text_extraction_config = load_text_extraction_config(ws)
+            with ws.blobs.materialize_dir(pages_prefix) as pages_dir:
+                return extract_text_hybrid(
+                    pdf_path,
+                    text_dir,
+                    file_id=file_id,
+                    page_images_dir=pages_dir,
+                    config=config,
+                    text_extraction_config=text_extraction_config,
+                    workspace=ws,
+                    dpi=dpi,
+                    verbose=verbose,
+                    debug=debug,
+                )
+        return extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
 
 
-def _is_valid_text_json(path: Path) -> bool:
+def _is_valid_text_json(ws: Workspace, key: str) -> bool:
     try:
-        data = read_json(path)
-    except CorruptMetadata:
+        data = json.loads(ws.blobs.get_blob(key))
+    except (ValueError, FileNotFoundError):
         return False
     return isinstance(data, dict) and "words" in data and "page" in data
 
 
-def _check_docset(ws: Workspace, docset_id: str, *, report: CheckReport) -> None:
-    json_path = ws.docset_json_path(docset_id)
-    if not json_path.exists():
-        report.issues.append(
-            Issue(
-                kind="missing_metadata",
-                target_type="docset",
-                target_id=docset_id,
-                message="docset.json missing",
-            )
-        )
-        return
-
+def _file_present(ws: Workspace, file_id: str) -> bool:
+    """Whether ``file_id`` is a real entity — a readable/corrupt manifest, or any
+    artifacts. Used by the dangling-reference check so an assignment to a file
+    that has a manifest (even a broken one) or stored blobs is not "dangling"
+    (its own corruption is reported by :func:`_check_file`)."""
     try:
-        read_json(json_path)
+        if ws.docs.get_doc(layout.Collection.FILES, file_id) is not None:
+            return True
+    except CorruptMetadata:
+        return True
+    return bool(ws.blobs.list_blobs(layout.file_prefix(file_id)))
+
+
+def _check_docset(ws: Workspace, docset_id: str, *, report: CheckReport) -> None:
+    try:
+        record_data = ws.docs.get_doc(layout.Collection.DOCSETS, docset_id)
     except CorruptMetadata as exc:
         report.issues.append(
             Issue(
@@ -644,27 +674,34 @@ def _check_docset(ws: Workspace, docset_id: str, *, report: CheckReport) -> None
         )
         return
 
-    files_dir = ws.docset_files_dir(docset_id)
-    if not files_dir.exists():
+    if record_data is None:
+        report.issues.append(
+            Issue(
+                kind="missing_metadata",
+                target_type="docset",
+                target_id=docset_id,
+                message="docset.json missing",
+            )
+        )
         return
-    for ref in sorted(files_dir.iterdir()):
-        if not ref.is_dir():
-            continue
-        if not ws.file_dir(ref.name).exists():
+
+    for assignment in ws.docs.find_docs(layout.Collection.ASSIGNMENTS, {"docset_id": docset_id}):
+        file_id = str(assignment["file_id"])
+        if not _file_present(ws, file_id):
             report.issues.append(
                 Issue(
                     kind="dangling_file_reference",
                     target_type="docset",
                     target_id=docset_id,
-                    message=f"references missing file '{ref.name}'",
+                    message=f"references missing file '{file_id}'",
                 )
             )
             continue
-        _check_computed_attribution(ref, docset_id=docset_id, file_id=ref.name, report=report)
+        _check_computed_attribution(ws, docset_id=docset_id, file_id=file_id, report=report)
 
 
 def _check_computed_attribution(
-    ref_dir: Path, *, docset_id: str, file_id: str, report: CheckReport
+    ws: Workspace, *, docset_id: str, file_id: str, report: CheckReport
 ) -> None:
     """Flag ``dg:origin="computed"`` elements with no ``dg:href`` in the
     file's DGML XML.
@@ -676,9 +713,11 @@ def _check_computed_attribution(
     is owned by the generation/extraction writers, not this check."""
     from .extraction_xml import unattributed_computed_fields
 
-    for xml_path in sorted(ref_dir.glob("*.dgml.xml")):
+    for key in sorted(ws.blobs.list_blobs(layout.docset_pair_prefix(docset_id, file_id))):
+        if not key.endswith(".dgml.xml"):
+            continue
         try:
-            tags = unattributed_computed_fields(xml_path.read_bytes())
+            tags = unattributed_computed_fields(ws.blobs.get_blob(key))
         except Exception:
             continue
         if tags:
@@ -688,7 +727,7 @@ def _check_computed_attribution(
                     target_type="docset",
                     target_id=docset_id,
                     message=(
-                        f"file '{file_id}' {xml_path.name}: computed element(s) with no "
+                        f"file '{file_id}' {key.rsplit('/', 1)[-1]}: computed element(s) with no "
                         f"dg:href sources: {', '.join(sorted(set(tags)))}"
                     ),
                 )

@@ -95,6 +95,18 @@ extraction_schema_user_body: |-
      extracted fields instead of read off the page. Use that only for
      genuine derivations, and make sure every input the rule mentions
      is itself a field in the schema.
+  6. Every ``name`` in the tree must be UNIQUE, at every level — a name is
+     one schema definition shared by all its occurrences, not a label
+     scoped to its parent. Two nodes may share a name only when they are
+     genuinely the same thing with the same ``kind``, ``datatype``/``enum``,
+     children, AND identical ``description``/``example``/``prompt``; any
+     difference at all is an error. When the same word describes different
+     things at different levels, qualify each with its context — an
+     invoice-level total and a per-line amount become ``InvoiceAmountDue``
+     and ``LineItemAmountDue``, never two ``AmountDue`` nodes. A collection
+     whose ``item`` you omit also claims the singular of its own name
+     (``LineItems`` claims ``LineItem``), so don't use that singular for a
+     different field elsewhere.
 
   That ``submit_schema`` call IS the answer — do not also reply with prose.
 

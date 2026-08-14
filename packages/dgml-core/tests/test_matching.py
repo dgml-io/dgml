@@ -16,6 +16,7 @@ import json
 from typing import Any
 
 import pytest
+from dgml_core import layout
 from dgml_core.matching import (
     _array_layout_key,
     _walk_leaves,
@@ -25,7 +26,7 @@ from dgml_core.matching import (
     walk_computed_leaves,
 )
 from dgml_core.models import FileRecord
-from dgml_core.storage import Workspace, write_json_atomic
+from dgml_core.storage import Workspace
 
 
 def _seed_file_and_text(
@@ -39,7 +40,6 @@ def _seed_file_and_text(
 ) -> None:
     """Set up the minimum on-disk state the matcher reads: file.json
     (so storage helpers resolve a path) + a page_text/page_N.json."""
-    workspace.file_dir(file_id).mkdir(parents=True, exist_ok=True)
     record = FileRecord(
         id=file_id,
         original_path="/fake/x.pdf",
@@ -49,11 +49,12 @@ def _seed_file_and_text(
         page_count=page,
         text_mode="digital",
     )
-    write_json_atomic(workspace.file_json_path(file_id), record.to_json())
-    workspace.file_text_dir(file_id).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        workspace.file_text_dir(file_id) / f"page_{page}.json",
-        {"file_id": file_id, "page": page, "width": width, "height": height, "words": words},
+    workspace.docs.put_doc("files", file_id, record.to_json())
+    workspace.blobs.put_blob(
+        layout.file_page_text_key(file_id, page),
+        json.dumps(
+            {"file_id": file_id, "page": page, "width": width, "height": height, "words": words}
+        ).encode(),
     )
 
 
@@ -195,7 +196,6 @@ def test_no_page_text_falls_through_to_unmatched(workspace: Workspace) -> None:
     can't be matched in code — every leaf becomes unmatched and waits
     for phase 3 to look at the page image."""
     # Seed file but no page_text.
-    workspace.file_dir("f1aaaaaaaaaa").mkdir(parents=True, exist_ok=True)
     record = FileRecord(
         id="f1aaaaaaaaaa",
         original_path="/fake/x.pdf",
@@ -205,7 +205,7 @@ def test_no_page_text_falls_through_to_unmatched(workspace: Workspace) -> None:
         page_count=1,
         text_mode="digital",
     )
-    write_json_atomic(workspace.file_json_path("f1aaaaaaaaaa"), record.to_json())
+    workspace.docs.put_doc("files", "f1aaaaaaaaaa", record.to_json())
 
     phase1 = {"title": {"text": "Hello", "locations": [{"page_number": 1}]}}
     result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)

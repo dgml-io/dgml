@@ -21,9 +21,9 @@ from __future__ import annotations
 import base64
 import io
 
+from . import layout
 from .docsets import DocSetStore
 from .files import FileStore
-from .pages import PAGE_GLOB
 from .storage import Workspace
 
 
@@ -34,11 +34,9 @@ def gather_file_pages(workspace: Workspace, file_id: str, max_pages: int) -> lis
     Callers decide what that means in their context (e.g. classification
     soft-fails; a future OCR helper may treat it as a precondition).
     """
-    pages_dir = workspace.file_pages_dir(file_id)
-    if not pages_dir.exists():
-        return []
-    paths = sorted(pages_dir.glob(PAGE_GLOB))[:max_pages]
-    return [p.read_bytes() for p in paths]
+    prefix = layout.file_pages_prefix(file_id)
+    keys = workspace.blobs.list_blobs(prefix)[:max_pages]
+    return [workspace.blobs.get_blob(k) for k in keys]
 
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"

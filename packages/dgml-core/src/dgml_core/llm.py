@@ -67,6 +67,15 @@ from .usage import (
 # belt-and-suspenders guard for anything else a dependency writes to stdout.
 litellm.suppress_debug_info = True
 
+# Providers disagree about which sampling knobs they accept: OpenAI's reasoning
+# families (gpt-5, o-series) reject any explicit ``temperature`` but 1, Anthropic
+# rejects it as deprecated on newer models, and litellm turns each mismatch into
+# a local ``UnsupportedParamsError`` instead of a call. Callers here state the
+# decoding they want (extraction asks for 0.0 so the source-text → schema-slot
+# mapping is deterministic) and let litellm drop what the target model can't take,
+# rather than every call site tracking per-provider parameter support.
+litellm.drop_params = True
+
 PDF_NATIVE_MODEL_PATTERNS = [
     r"claude",
     r"gemini",

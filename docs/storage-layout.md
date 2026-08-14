@@ -19,7 +19,11 @@ element can span pages.
 
 The root is determined in this order:
 
-1. `--workspace <path>` CLI flag (or `Workspace.resolve(<path>)` in code).
+1. `--workspace <path-or-id>` CLI flag (or `Workspace.resolve(<path-or-id>)` in
+   code). The argument is a filesystem path **or** a `ws_…` workspace id: when it
+   exactly matches an id in the [per-machine registry](#per-machine-workspace-registry),
+   the workspace opens at that entry's recorded root; otherwise it is treated as a
+   path (the `ws_` prefix + base32 charset means an id can't be mistaken for one).
 2. The `DGML_HOME` environment variable.
 3. Default: `./dgml-workspace` (relative to the current working directory).
 
@@ -37,7 +41,7 @@ config merges across layers.
 
 ```
 <workspace_root>/
-├── workspace.json                    # { name, organization } — written by `workspace create`
+├── workspace.json                    # { name, organization, workspace_id, schema_version } — written by `workspace create`
 ├── config.toml                       # OCR / LLM / clustering settings (optional)
 ├── usage.jsonl                       # LLM call event log (optional)
 ├── docsets/
@@ -48,9 +52,13 @@ config merges across layers.
 │       ├── schema.json               # generation tag schema, written by `generate` (present after generation)
 │       ├── full-schema.rnc           # schema.json as RELAX NG Compact, written by `generate` (see below)
 │       └── files/
-│           └── <file_id>/            # marker dir; <stem>.dgml.xml lands here
-│                                     # (generated tree and/or dg:extraction),
-│                                     # plus its grounded/stats siblings (below)
+│           └── <file_id>/            # one assigned (DocSet, File) pair
+│               ├── assignment.json   # { docset_id, file_id, assigned_at } — the assignment record
+│               └── <stem>.dgml.xml   # generated tree and/or dg:extraction,
+│                                     #   plus its grounded/stats siblings (below)
+├── .cache/                           # workspace-internal scratch; never workspace data,
+│   ├── embeddings/                   #   excluded from the blob namespace and safe to delete
+│   └── staging/                      #   in-flight batch writes (page renders, text extraction)
 └── files/
     └── <file_id>/                    # 12-char base-36 ID
         ├── <original_filename>       # source copied in (a .pdf, or a
@@ -100,10 +108,24 @@ The workspace identity, written by `dgml workspace create`:
 ```json
 {
   "name": "Acme Contracts",
-  "organization": "Acme"
+  "organization": "Acme",
+  "workspace_id": "ws_7f3k9q2m4b8xr5wa",
+  "schema_version": 1
 }
 ```
 
+- `workspace_id` — the workspace's **stable handle** (`ws_` + 16 lowercase
+  base32 chars, 80 bits from `secrets`). Opaque and non-semantic, so it survives a
+  directory rename. Minted at `workspace create` and carried here so the directory
+  self-describes; it also keys the [per-machine registry](#per-machine-workspace-registry).
+  A workspace created before this field existed is given one automatically the
+  first time any command opens it (a schema migration). `dgml --workspace <workspace_id>`
+  opens the workspace by this id.
+- `schema_version` — the on-disk layout revision this workspace was last written
+  against. `dgml` migrates an older workspace up to the current revision in place
+  the first time a command touches it (see
+  [migrations](../packages/dgml-core/src/dgml_core/migrations.py)); a workspace
+  with no `workspace.json` at all reads as version 0.
 - `organization` — embedded in every docset namespace URI this workspace
   generates (`http://dgml.io/<organization>/<DocSetSlug>`), across both the
   generated document tree (`dgml docset generate`) and the extraction schema
@@ -117,6 +139,62 @@ The workspace identity, written by `dgml workspace create`:
   `workspace.json` existed (e.g. `dgml-workspace`), preserving their namespaces.
 - `name` — human-readable label (`--name`, optional; defaults to the workspace
   directory name). Surfaced by `dgml status`; not used in URIs.
+
+## Per-machine workspace registry
+
+A single **per-machine** index maps each `workspace_id` to where that workspace
+lives, so workspaces can be listed (`dgml workspace list`) and opened by id
+(`dgml --workspace <workspace_id>`). It sits next to the user config —
+`$XDG_CONFIG_HOME/dgml/workspaces.json` if set, else `%APPDATA%\dgml\workspaces.json`
+on Windows, else `~/.config/dgml/workspaces.json` — and is machine-managed **JSON**
+(not hand-edited, unlike `config.toml`), an object keyed by `workspace_id`:
+
+```json
+{
+  "ws_7f3k9q2m4b8xr5wa": {
+    "name": "Acme Contracts",
+    "organization": "Acme",
+    "root": "/Users/me/acme-ws",
+    "storage_service": "default",
+    "storage": {
+      "blobs": { "provider": "dgml_core.storage_local:LocalStore" },
+      "docs": { "provider": "dgml_core.storage_local:LocalStore" }
+    },
+    "storage_fingerprint": "sha256:…",
+    "created_at": "2026-08-05T12:00:00Z",
+    "schema_version": 1
+  }
+}
+```
+
+- The registry is **per-machine**, deliberately separate from `workspace.json`
+  (which travels with the directory): the same workspace opened on two machines has
+  one `workspace_id` but two registry entries, each with that machine's `root`.
+- `root` is the local store location (used for open-by-id and the reverse lookup).
+  Only `LocalStore` ships today, so every entry has a `root`.
+- **The entry is self-describing about the workspace's stores.** `storage_service`
+  names the [`config.toml` storage template](#storage-services-storage) the
+  workspace was created from (where its secrets live, and the target of a re-seal).
+  `storage` is a **non-secret snapshot pair** of that template — one snapshot each
+  for the `blobs` and `docs` roles (provider + non-secret options — never
+  credentials), since a workspace configures its blob store and document store
+  independently. It is *authoritative* for opening the workspace: it opens from this
+  snapshot even if the template is later edited or removed, so the registry alone
+  records where a workspace's data lives. Editing the `config.toml` template does
+  **not** change an existing workspace's stores — `dgml workspace register --storage
+  <name>` is the explicit "adopt new config" (re-seal).
+- `storage_fingerprint` is a credential-free hash of the snapshot. On open it is
+  recomputed from the entry and compared: a mismatch means the machine-managed JSON
+  was **hand-edited**, and the command hard-fails with `STORAGE_BACKEND_MISMATCH`
+  (repair with `dgml workspace register … --storage <name>`). It is *not* compared
+  against `config.toml`.
+- Entries are added automatically: `workspace create` records a new workspace
+  (including its storage snapshot), and the first time any command opens a workspace
+  on a machine it is auto-registered there (additive — it never overwrites an
+  existing entry). `dgml workspace register` is the explicit override that re-seals
+  a moved directory's `root` or switches its storage service.
+- Each write is atomic (write-temp-rename); registration is an idempotent upsert by
+  id, so a lost update from a concurrent write self-heals on the next open.
 
 ## Configuration (`config.toml`)
 
@@ -152,6 +230,52 @@ and never treated as config.
 There are **no in-code model defaults**: a loader raises its `*_CONFIG_MISSING`
 code when a model can't be resolved from any layer, so DGML never makes a paid
 LLM call you didn't set up.
+
+### Storage services (`[storage]`)
+
+Where a workspace's data physically lives. A workspace has **two independently
+configured backends** — a **blob** store (page images, PDFs, XML, schemas) and a
+**document** store (manifests, page text, assignments, the usage log) — so it can
+mix them (e.g. S3 blobs + Mongo docs, or S3 blobs + local docs). By default there
+is nothing to configure — both run on the bundled local-disk store. To use a
+pluggable backend, define one or more **named storage services**; each is selected
+at `dgml workspace create --storage <name>` and snapshotted into that workspace's
+[registry entry](#per-machine-workspace-registry).
+
+```toml
+# A named service with a backend per role. Each provider is a dotted "module:Class"
+# path; the remaining keys are that provider's own options.
+[storage.acme.blobs]
+provider     = "dgml_storage_s3:S3BlobStore"
+bucket       = "acme-contracts"
+region       = "us-east-1"
+
+[storage.acme.docs]
+provider       = "dgml_storage_mongo:MongoDocStore"
+mongo_database = "dgml"
+```
+
+- **Per-role form** — `[storage.<name>.blobs]` / `[storage.<name>.docs]` subtables,
+  each with its own `provider` + options. A role you omit falls back to the bundled
+  local store, so `[storage.<name>.blobs]` alone puts blobs on the backend and keeps
+  documents on local disk.
+- **Flat form** — a `[storage.<name>]` with a single top-level `provider` (and no
+  `blobs`/`docs` subtables) uses that one class for **both** roles; it must implement
+  both `BlobStore` and `DocStore` (the bundled `LocalStore` does). A table may not
+  set both a top-level `provider` and role subtables.
+- **`default` and back-compat** — the reserved name **`default`** is what a workspace
+  uses when `--storage` is omitted; a bare `[storage]` (flat or with `blobs`/`docs`)
+  *is* the `default` service, and no `[storage]` at all is the zero-config local
+  store for both roles.
+- **Secrets vs. identity.** Each backend's non-secret identity (provider + options
+  like `bucket`/`region`) is snapshotted into the registry entry and is authoritative
+  for opening the workspace. Secret-hinted options (keys containing `key`, `secret`,
+  `token`, `password`, `credential`) are **never** written to the registry; they are
+  read from this template (or the provider SDK's own credential chain) at open and
+  are excluded from the seal fingerprint, so rotating a credential never trips it.
+- **Pinned semantics.** Editing a `[storage.<name>]` template does not change an
+  existing workspace's stores — the workspace stays on its recorded snapshot. Use
+  `dgml workspace register --storage <name>` to re-seal it to the current template.
 
 ### The `[models]` tiers
 
@@ -622,7 +746,7 @@ When `generate` ran first, `extract` adds the `dg:extraction` element alongside
 the tree (`full-extraction`); otherwise it writes a minimal `dg:chunk` holding
 only the `dg:extraction` element (`extraction`). `dgml extraction get-values`
 projects the `dg:extraction` element back to values-shape JSON
-(`{tag: {text, value?, locations}}`). Placing this file in the marker dir
+(`{tag: {text, value?, locations}}`). Placing this file in the pair directory
 (rather than at the docset root) makes the artifact path deterministic
 and unique per file, which is what file attestation
 ([packages/dgml/src/dgml/file_attestation.py](../packages/dgml/src/dgml/file_attestation.py))
@@ -758,13 +882,20 @@ when something goes wrong.
 
 ## DocSet ↔ File assignments
 
-When a File is assigned to a DocSet, an empty directory named after the
-file's ID is created under `<workspace>/docsets/<docset_id>/files/`.
-Future revisions may put per-(DocSet, File) data inside, but for now those
-directories exist only as cross-reference markers.
+When a File is assigned to a DocSet, an `assignment.json` is written to
+`<workspace>/docsets/<docset_id>/files/<file_id>/`, holding
+`{ docset_id, file_id, assigned_at }`. The pair directory also holds that
+pair's generated artifacts (`<stem>.dgml.xml`, `extraction_stats.json`).
+
+Earlier revisions recorded the assignment as the *bare existence* of that
+directory, with no file inside. That could not survive its own deletion —
+removing the record meant removing the directory, and therefore the generated
+artifacts with it — so the record is now a document like any other. A workspace
+written before this change is upgraded automatically on first use — see
+`schema_version` under [`workspace.json`](#workspacejson).
 
 - Removing a **File** deletes its directory under `files/` AND every
-  marker directory under `docsets/*/files/<file_id>/`.
+  pair directory under `docsets/*/files/<file_id>/`.
 - Removing a **DocSet** leaves the underlying Files untouched.
 - The `replace` conflict policy on `dgml file add` deletes the existing
   File entirely, which means its DocSet assignments are also dropped. Use

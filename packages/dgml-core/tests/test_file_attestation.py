@@ -34,6 +34,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from dgml_core import DEFAULT_STORAGE_PROVIDER, LocalStore, StorageConfig, layout
 from dgml_core.errors import (
     AttestationInvalid,
     CorruptMetadata,
@@ -59,8 +60,10 @@ from dgml_core.file_attestation import (
     verify_file_version,
 )
 from dgml_core.merkle import merkle_root, merkle_root_from_hashes
-from dgml_core.storage import Workspace, write_json_atomic
+from dgml_core.storage import Workspace
 from lxml import etree  # type: ignore[import-untyped]
+
+from .conftest import default_bridge_store
 
 # --- minimal on-disk fixture helpers ----------------------------------------
 
@@ -76,11 +79,10 @@ def _seed_file(
     """Drop a fake file directory: file.json, a source placeholder, page
     images and page text. Bytes are arbitrary — attestation hashes the
     bytes, it doesn't validate they're a real PDF/JPEG."""
-    file_dir = ws.file_dir(file_id)
-    file_dir.mkdir(parents=True)
-    (file_dir / pdf_name).write_bytes(b"%PDF-1.4\n%fake-pdf-bytes\n")
-    write_json_atomic(
-        ws.file_json_path(file_id),
+    ws.blobs.put_blob(layout.file_source_key(file_id, pdf_name), b"%PDF-1.4\n%fake-pdf-bytes\n")
+    ws.docs.put_doc(
+        "files",
+        file_id,
         {
             "id": file_id,
             "original_path": f"/src/{pdf_name}",
@@ -94,18 +96,14 @@ def _seed_file(
             "pdf_converter": pdf_converter,
         },
     )
-    pages_dir = ws.file_pages_dir(file_id)
-    pages_dir.mkdir(parents=True)
-    text_dir = ws.file_text_dir(file_id)
-    text_dir.mkdir(parents=True)
     for n in range(1, pages + 1):
-        (pages_dir / f"page_{n}.png").write_bytes(f"fake-png-page-{n}".encode())
+        ws.blobs.put_blob(layout.file_page_image_key(file_id, n), f"fake-png-page-{n}".encode())
         page_text = {
             "file_id": file_id,
             "page": n,
             "words": [{"t": f"w{n}", "l": [0, 0, 1, 1]}],
         }
-        (text_dir / f"page_{n}.json").write_text(json.dumps(page_text), encoding="utf-8")
+        ws.blobs.put_blob(layout.file_page_text_key(file_id, n), json.dumps(page_text).encode())
 
 
 _FULL_SCHEMA_RNC = "# Role: root\nstart = element dg:chunk { text }\n"
@@ -118,28 +116,27 @@ def _seed_docset(
     full_schema: str | None = None,
     extraction_schema: str | None = None,
 ) -> None:
-    ws.docset_dir(docset_id).mkdir(parents=True)
-    write_json_atomic(
-        ws.docset_dir(docset_id) / "docset.json",
+    ws.docs.put_doc(
+        "docsets",
+        docset_id,
         {"id": docset_id, "name": "Test", "description": "", "key_questions": []},
     )
     if full_schema is not None:
         # The attestation "full_schema" slot is the generation tag schema
         # (full-schema.rnc, RELAX NG Compact), hashed as raw bytes.
-        ws.docset_full_schema_path(docset_id).write_text(full_schema, encoding="utf-8")
+        ws.blobs.put_blob(layout.docset_full_schema_key(docset_id), full_schema.encode())
     if extraction_schema is not None:
         # The attestation "extraction_schema" slot is the grounded extraction
         # schema (RELAX NG Compact), hashed as raw bytes.
-        ws.docset_schema_path(docset_id).write_text(extraction_schema, encoding="utf-8")
+        ws.blobs.put_blob(
+            layout.docset_extraction_schema_key(docset_id), extraction_schema.encode()
+        )
 
 
 def _seed_dgml_xml(
     ws: Workspace, docset_id: str, pdf_stem: str, xml: bytes, file_id: str = "f001"
-) -> Path:
-    path = ws.file_dgml_xml_path(docset_id, file_id, pdf_stem)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(xml)
-    return path
+) -> None:
+    ws.blobs.put_blob(layout.dgml_xml_key(docset_id, file_id, pdf_stem), xml)
 
 
 _ATTESTATION_REL = f"{METADATA_DIRNAME}/{METADATA_FILENAME}"
@@ -192,7 +189,7 @@ def test_page_text_files_are_never_attested(workspace: Workspace) -> None:
     """The token files under `page_text/` exist on disk but are intentionally
     excluded from the file version — no `page_text[...]` slot ever appears."""
     _seed_file(workspace, "f001", pages=2)
-    assert workspace.file_text_dir("f001").exists()  # token files are on disk
+    assert workspace.blobs.list_blobs(layout.file_text_prefix("f001"))  # token files exist
     version = collect_file_version(workspace, "f001")
     assert not any(a.slot_id.startswith("page_text[") for a in version.artifacts)
 
@@ -228,6 +225,36 @@ def test_docset_adds_schema_and_dgml_xml_in_slot_order(workspace: Workspace) -> 
     )
 
 
+def test_assignment_representation_does_not_affect_attestation(workspace: Workspace) -> None:
+    """How an assignment is stored must not perturb the attestation.
+
+    The Merkle root is DGML's proof-of-origin contract, so it has to depend only
+    on the attested artifacts. This pins that: a pair directory carrying an
+    ``assignment.json`` document, a legacy bare marker directory, and no
+    assignment at all must all produce the same slots and the same root — which
+    is also what keeps previously anchored records valid across this change."""
+    _seed_file(workspace, "f001", pages=1, pdf_name="contract.pdf")
+    _seed_docset(workspace, "ds01", full_schema=_FULL_SCHEMA_RNC)
+    _seed_dgml_xml(workspace, "ds01", "contract", b"<dg:chunk xmlns:dg='http://x'><a/></dg:chunk>")
+
+    def snapshot() -> tuple[list[str], str]:
+        version = collect_file_version(workspace, "f001", "ds01")
+        return [a.slot_id for a in version.artifacts], attest_file_version(version).root
+
+    # (1) no assignment recorded — the pair dir holds only the generated XML
+    baseline = snapshot()
+    assert baseline[0] == ["source", "page_image[1]", "full_schema", "dgml_xml"]
+
+    # (2) assignment as a real document, written into that same directory
+    workspace.docs.put_doc("assignments", "ds01/f001", {"docset_id": "ds01", "file_id": "f001"})
+    assert workspace.docs.get_doc("assignments", "ds01/f001") is not None
+    assert snapshot() == baseline
+
+    # (3) assignment removed — still no effect on the file version
+    workspace.docs.delete_doc("assignments", "ds01/f001")
+    assert snapshot() == baseline
+
+
 def test_extraction_schema_slot_present_without_generation_schema(workspace: Workspace) -> None:
     """The extraction schema is an independent slot — it appears even when the
     generation full-schema.rnc is absent, still ordered ahead of the DGML XML."""
@@ -248,9 +275,7 @@ def test_missing_artifacts_silently_excluded(workspace: Workspace) -> None:
     slots and nothing else; not an error."""
     _seed_file(workspace, "f001", pages=2)
     # Remove the page-images dir to simulate rendering not having run yet.
-    import shutil
-
-    shutil.rmtree(workspace.file_pages_dir("f001"))
+    workspace.blobs.delete_blobs(layout.file_pages_prefix("f001"))
     version = collect_file_version(workspace, "f001")
     slot_ids = [a.slot_id for a in version.artifacts]
     assert slot_ids == ["source"]
@@ -290,9 +315,9 @@ def test_missing_docset_raises_docset_not_found(workspace: Workspace) -> None:
 
 def test_empty_version_raises_value_error(workspace: Workspace) -> None:
     """File dir exists but completely empty (no PDF, no pages, no text)."""
-    workspace.file_dir("f001").mkdir(parents=True)
-    write_json_atomic(
-        workspace.file_json_path("f001"),
+    workspace.docs.put_doc(
+        "files",
+        "f001",
         {
             "id": "f001",
             "original_path": "/src/doc.pdf",
@@ -309,8 +334,11 @@ def test_empty_version_raises_value_error(workspace: Workspace) -> None:
 
 
 def test_corrupt_file_json_raises_corrupt_metadata(workspace: Workspace) -> None:
-    workspace.file_dir("f001").mkdir(parents=True)
-    workspace.file_json_path("f001").write_text("{not json", encoding="utf-8")
+    # Corrupt manifest on disk (LocalStore-specific): put_doc can't write invalid
+    # JSON and put_blob refuses a document key, so write via the local_path escape.
+    manifest = workspace.local_path(f"{layout.file_prefix('f001')}file.json")
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text("{not json", encoding="utf-8")
     with pytest.raises(CorruptMetadata):
         collect_file_version(workspace, "f001")
 
@@ -320,7 +348,7 @@ def test_schema_json_is_not_attested(workspace: Workspace) -> None:
     slot, and even a corrupt one is never read during collection."""
     _seed_file(workspace, "f001", pages=1)
     _seed_docset(workspace, "ds01", full_schema=_FULL_SCHEMA_RNC)
-    workspace.docset_generation_schema_path("ds01").write_text("not json", encoding="utf-8")
+    workspace.blobs.put_blob(layout.docset_generation_schema_key("ds01"), b"not json")
     slot_ids = [a.slot_id for a in collect_file_version(workspace, "f001", "ds01").artifacts]
     assert "schema" not in slot_ids
     assert "full_schema" in slot_ids
@@ -330,7 +358,7 @@ def test_unexpected_page_filename_raises(workspace: Workspace) -> None:
     _seed_file(workspace, "f001", pages=1)
     # Stray file matching the ``page_*.png`` glob but not the strict
     # ``page_<digits>.png`` shape the attestation requires for ordering.
-    (workspace.file_pages_dir("f001") / "page_thumb.png").write_bytes(b"x")
+    workspace.blobs.put_blob(f"{layout.file_pages_prefix('f001')}page_thumb.png", b"x")
     with pytest.raises(ValueError, match="unexpected file name"):
         collect_file_version(workspace, "f001")
 
@@ -358,7 +386,7 @@ def test_binary_leaf_hash_is_sha256_of_file_bytes(workspace: Workspace) -> None:
     _seed_file(workspace, "f001", pages=1)
     version = collect_file_version(workspace, "f001")
     source_ref = next(a for a in version.artifacts if a.slot_id == "source")
-    expected = hashlib.sha256(source_ref.path.read_bytes()).hexdigest()
+    expected = hashlib.sha256(workspace.blobs.get_blob(source_ref.key)).hexdigest()
     assert source_ref.leaf_hash == expected
 
 
@@ -405,10 +433,10 @@ def test_root_matches_manual_merkle_over_leaf_hashes(workspace: Workspace) -> No
 def test_single_artifact_root_equals_leaf_hash(workspace: Workspace) -> None:
     """RFC 6962: a 1-leaf tree has root == leaf (no pairing). Matches the
     merkle.py contract."""
-    workspace.file_dir("f001").mkdir(parents=True)
-    (workspace.file_dir("f001") / "doc.pdf").write_bytes(b"only-pdf")
-    write_json_atomic(
-        workspace.file_json_path("f001"),
+    workspace.blobs.put_blob(layout.file_source_key("f001", "doc.pdf"), b"only-pdf")
+    workspace.docs.put_doc(
+        "files",
+        "f001",
         {
             "id": "f001",
             "original_path": "/src/doc.pdf",
@@ -435,7 +463,7 @@ def test_verify_roundtrip_returns_true_when_unchanged(workspace: Workspace) -> N
 def test_verify_returns_false_on_pdf_tamper(workspace: Workspace) -> None:
     _seed_file(workspace, "f001", pages=1)
     att = attest_file(workspace, "f001")
-    (workspace.file_dir("f001") / "doc.pdf").write_bytes(b"%PDF-1.4\n%TAMPERED\n")
+    workspace.blobs.put_blob(layout.file_source_key("f001", "doc.pdf"), b"%PDF-1.4\n%TAMPERED\n")
     assert verify_file_version(workspace, att) is False
 
 
@@ -444,10 +472,10 @@ def test_page_text_tamper_does_not_affect_verification(workspace: Workspace) -> 
     unchanged — verification still passes."""
     _seed_file(workspace, "f001", pages=1)
     att = attest_file(workspace, "f001")
-    text_path = workspace.file_text_dir("f001") / "page_1.json"
-    parsed = json.loads(text_path.read_text())
+    text_key = layout.file_page_text_key("f001", 1)
+    parsed = json.loads(workspace.blobs.get_blob(text_key))
     parsed["words"][0]["t"] = "TAMPERED"
-    text_path.write_text(json.dumps(parsed), encoding="utf-8")
+    workspace.blobs.put_blob(text_key, json.dumps(parsed).encode())
     assert verify_file_version(workspace, att) is True
 
 
@@ -455,8 +483,8 @@ def test_verify_returns_false_on_schema_tamper(workspace: Workspace) -> None:
     _seed_file(workspace, "f001", pages=1)
     _seed_docset(workspace, "ds01", full_schema=_FULL_SCHEMA_RNC)
     att = attest_file(workspace, "f001", "ds01")
-    workspace.docset_full_schema_path("ds01").write_text(
-        _FULL_SCHEMA_RNC + "# tampered\n", encoding="utf-8"
+    workspace.blobs.put_blob(
+        layout.docset_full_schema_key("ds01"), (_FULL_SCHEMA_RNC + "# tampered\n").encode()
     )
     assert verify_file_version(workspace, att) is False
 
@@ -471,8 +499,9 @@ def test_verify_returns_false_on_extraction_schema_tamper(workspace: Workspace) 
         extraction_schema='namespace docset = "http://www.dgml.io/acme/x#"\n',
     )
     att = attest_file(workspace, "f001", "ds01")
-    workspace.docset_schema_path("ds01").write_text(
-        'namespace docset = "http://www.dgml.io/acme/y#"\n', encoding="utf-8"
+    workspace.blobs.put_blob(
+        layout.docset_extraction_schema_key("ds01"),
+        b'namespace docset = "http://www.dgml.io/acme/y#"\n',
     )
     assert verify_file_version(workspace, att) is False
 
@@ -483,7 +512,7 @@ def test_verify_raises_on_slot_inventory_mismatch(workspace: Workspace) -> None:
     _seed_file(workspace, "f001", pages=2)
     att = attest_file(workspace, "f001")
     # Delete one page image — slot count drops by 1.
-    (workspace.file_pages_dir("f001") / "page_2.png").unlink()
+    workspace.blobs.delete_blob(layout.file_page_image_key("f001", 2))
     with pytest.raises(ValueError, match="slot inventory differs"):
         verify_file_version(workspace, att)
 
@@ -491,9 +520,8 @@ def test_verify_raises_on_slot_inventory_mismatch(workspace: Workspace) -> None:
 def test_verify_raises_when_file_was_deleted(workspace: Workspace) -> None:
     _seed_file(workspace, "f001", pages=1)
     att = attest_file(workspace, "f001")
-    import shutil
-
-    shutil.rmtree(workspace.file_dir("f001"))
+    workspace.docs.delete_doc("files", "f001")
+    workspace.blobs.delete_blobs(layout.file_prefix("f001"))
     with pytest.raises(FileNotFound):
         verify_file_version(workspace, att)
 
@@ -503,8 +531,8 @@ def test_two_independent_file_versions_have_distinct_roots(workspace: Workspace)
     _seed_file(workspace, "f002", pages=1, pdf_name="b.pdf")
     # The fixture writes identical placeholder bytes; give the two sources
     # distinct content so their (source-only + page-image) roots must differ.
-    (workspace.file_dir("f001") / "a.pdf").write_bytes(b"%PDF-1.4\n%aaa\n")
-    (workspace.file_dir("f002") / "b.pdf").write_bytes(b"%PDF-1.4\n%bbb\n")
+    workspace.blobs.put_blob(layout.file_source_key("f001", "a.pdf"), b"%PDF-1.4\n%aaa\n")
+    workspace.blobs.put_blob(layout.file_source_key("f002", "b.pdf"), b"%PDF-1.4\n%bbb\n")
     assert attest_file(workspace, "f001").root != attest_file(workspace, "f002").root
 
 
@@ -539,7 +567,7 @@ def test_artifact_ref_is_frozen_and_hashable() -> None:
     callers building 'changed-slot' diffs across two attestations."""
     from dataclasses import FrozenInstanceError
 
-    ref = ArtifactRef("source", Path("/tmp/x.pdf"), ArtifactKind.BINARY, "0" * 64)
+    ref = ArtifactRef("source", "files/x/x.pdf", ArtifactKind.BINARY, "0" * 64)
     with pytest.raises(FrozenInstanceError):
         ref.leaf_hash = "ff" * 32  # type: ignore[misc]
     assert hash(ref) == hash(ref)
@@ -1065,3 +1093,226 @@ def test_collect_from_attestation_missing_artifact_raises(workspace: Workspace) 
     (out_dir / "page_images" / "page_1.png").unlink()
     with pytest.raises(AttestationInvalid, match="missing artifact"):
         verify_attestation_dir(out_dir)
+
+
+# --- bounded-memory reads + hash stability ----------------------------------
+#
+# Attestation hashes artifacts it never otherwise reads, so no leaf may load a
+# blob whole: the source document is the one leaf with no size bound (it is
+# whatever PDF the user added). The tests below pin both halves of that — that
+# the whole-blob API is not reached, and that avoiding it did not change a
+# single hash.
+
+# Deterministic, and larger than CHUNK_SIZE where it matters, so a chunk
+# boundary is genuinely crossed on the way to the golden root below.
+_GOLDEN_SOURCE = b"%PDF-1.4\n" + b"golden-source-bytes\n" * 10_000  # 200_009 bytes
+_GOLDEN_PAGE_1 = b"golden-png-page-1"  # single chunk
+_GOLDEN_PAGE_2 = b"golden-png-page-2\n" * 8_000  # 144_000 bytes: multi-chunk
+_GOLDEN_FULL_SCHEMA = "# Role: root\nstart = element dg:chunk { text }\n"
+_GOLDEN_EXTRACTION_SCHEMA = 'namespace docset = "http://www.dgml.io/acme/golden#"\n'
+_GOLDEN_DGML_XML = b"<dg:chunk xmlns:dg='http://dgml.io/golden'><a>x</a></dg:chunk>"
+
+# Frozen literals, deliberately not recomputed — their value is being
+# independent of whatever the hashing code currently does. These digests are
+# what `dgml stake` anchors on chain, so if this test fails, the format changed:
+# treat it as a breaking change and find out why, rather than pasting in the new
+# values.
+_GOLDEN_FILE_ONLY_ROOT = "4eaf62cb4fd851d84460302b178c8c4b3305e39ca22a89338ac78bb9153a71ee"
+_GOLDEN_DOCSET_ROOT = "cc89736b9055c57c04a6970f0637651bbcf0ff80fd43afccbc3bd41ab3f728db"
+_GOLDEN_LEAVES = {
+    "source": "fa4e141fdb9b3ded91fbe19c2fab0468108afedafdbbd2e988908086452c884d",
+    "page_image[1]": "87deef5e03609886b29e883ca1469fd843cd1eb1e29e4962ea8c385f4ab3eb5f",
+    "page_image[2]": "e2e74f0eb72ab58e7954f37fb61c3a02018ae10c459c55309f4d8840c4b59483",
+    "full_schema": "6c9e4f9b6b690dd58a551a0c6a3c078b8dd09f0931a8e53876e116cc00a56779",
+    "extraction_schema": "b93069efd02d43c5c536660c470a684321f2808fa4fa719415ff34431360259f",
+    "dgml_xml": "25f693ccc9f3fcb5445b5e5ae0c778de70bc3580fcdc950e5021d652002154a1",
+}
+
+
+def _seed_golden(ws: Workspace) -> None:
+    """Seed the fixture the golden root above was captured from."""
+    ws.blobs.put_blob(layout.file_source_key("f001", "contract.pdf"), _GOLDEN_SOURCE)
+    ws.docs.put_doc(
+        "files",
+        "f001",
+        {
+            "id": "f001",
+            "original_path": "/src/contract.pdf",
+            "original_filename": "contract.pdf",
+            "sha256": "0" * 64,
+            "added_at": "2026-06-05T00:00:00Z",
+            "page_count": 2,
+            "text_mode": "digital",
+            "page_image_dpi": 300,
+            "page_image_renderer": "ghostscript",
+            "pdf_converter": None,
+        },
+    )
+    ws.blobs.put_blob(layout.file_page_image_key("f001", 1), _GOLDEN_PAGE_1)
+    ws.blobs.put_blob(layout.file_page_image_key("f001", 2), _GOLDEN_PAGE_2)
+    _seed_docset(
+        ws, "ds01", full_schema=_GOLDEN_FULL_SCHEMA, extraction_schema=_GOLDEN_EXTRACTION_SCHEMA
+    )
+    _seed_dgml_xml(ws, "ds01", "contract", _GOLDEN_DGML_XML)
+
+
+def test_attestation_root_golden_vector(workspace: Workspace) -> None:
+    """Frozen leaf hashes and Merkle roots over multi-chunk artifacts.
+
+    Without this the suite could not tell whether a hashing refactor changed a
+    root, because every other test either recomputes the expectation the same
+    way the code does or asserts only on structure.
+    """
+    _seed_golden(workspace)
+
+    file_only = attest_file(workspace, "f001")
+    assert file_only.root == _GOLDEN_FILE_ONLY_ROOT
+
+    with_docset = attest_file(workspace, "f001", "ds01")
+    assert with_docset.root == _GOLDEN_DOCSET_ROOT
+    assert {leaf.slot_id: leaf.leaf_hash for leaf in with_docset.leaves} == _GOLDEN_LEAVES
+
+
+def test_binary_leaf_hash_is_chunked_sha256_of_stored_bytes(workspace: Workspace) -> None:
+    """A binary leaf is the plain SHA-256 of the blob, crossing chunk boundaries
+    — i.e. sha256_blob agrees with a one-shot hash of the same bytes."""
+    _seed_golden(workspace)
+    leaves = {leaf.slot_id: leaf for leaf in collect_file_version(workspace, "f001").artifacts}
+    for slot_id, payload in (
+        ("source", _GOLDEN_SOURCE),
+        ("page_image[2]", _GOLDEN_PAGE_2),
+    ):
+        assert leaves[slot_id].leaf_hash == hashlib.sha256(payload).hexdigest()
+
+
+class _NoWholeBlobStore(LocalStore):
+    """Fails if any artifact is read whole into memory.
+
+    ``allow`` names the keys for which ``get_blob`` is legitimate — only the
+    DGML XML leaf, whose hash is the merkle_root of the parsed tree rather than
+    a digest of the file, plus the JSON documents that go through get_doc.
+    """
+
+    allow_suffixes: tuple[str, ...] = (".dgml.xml",)
+
+    def get_blob(self, key: str) -> bytes:
+        if not key.endswith(self.allow_suffixes):
+            raise AssertionError(f"whole-blob read of {key!r} during attestation")
+        return super().get_blob(key)
+
+
+@pytest.fixture
+def no_whole_blob_workspace(workspace: Workspace, monkeypatch: pytest.MonkeyPatch) -> Workspace:
+    store = _NoWholeBlobStore(
+        LocalStore.parse_config(StorageConfig(DEFAULT_STORAGE_PROVIDER, workspace.root))
+    )
+    monkeypatch.setattr(Workspace, "blobs", property(lambda self: store))
+    monkeypatch.setattr(Workspace, "docs", property(lambda self: store))
+    return workspace
+
+
+def test_collect_never_reads_a_binary_artifact_whole(no_whole_blob_workspace: Workspace) -> None:
+    ws = no_whole_blob_workspace
+    _seed_golden(ws)
+    # Fails on the pre-change implementation at the source slot.
+    version = collect_file_version(ws, "f001", "ds01")
+    assert [a.slot_id for a in version.artifacts] == list(_GOLDEN_LEAVES)
+
+
+def test_export_never_reads_a_binary_artifact_whole(no_whole_blob_workspace: Workspace) -> None:
+    ws = no_whole_blob_workspace
+    _seed_golden(ws)
+    out_dir = ws.root.parent / "bundle"
+    attestation, _, _ = _export(ws, "f001", out_dir, "ds01")
+    assert attestation.root == _GOLDEN_DOCSET_ROOT
+    # the bundle is complete and self-verifying despite never buffering a blob
+    assert (out_dir / "source" / "contract.pdf").read_bytes() == _GOLDEN_SOURCE
+    assert verify_attestation_dir(out_dir).valid is True
+
+
+def test_verify_never_reads_a_binary_artifact_whole(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verify side holds bundle paths, not blobs, so it must hash off the
+    path — this is the side a third party runs on an untrusted bundle."""
+    _seed_golden(workspace)
+    out_dir = workspace.root.parent / "bundle"
+    _export(workspace, "f001", out_dir, "ds01")
+
+    real_read_bytes = Path.read_bytes
+
+    def guarded(self: Path) -> bytes:
+        if self.suffix not in (".xml",):
+            raise AssertionError(f"whole-file read of {self.name!r} during verify")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded)
+    assert verify_attestation_dir(out_dir).valid is True
+
+
+def test_roots_identical_across_path_bridge_implementations(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hashing now runs through the path bridge, so a store using the *base*
+    download-to-temp bridge (what every third-party store inherits) must produce
+    byte-identical leaves and roots to LocalStore's zero-copy override."""
+    _seed_golden(workspace)
+    local = attest_file(workspace, "f001", "ds01")
+
+    monkeypatch.setattr(Workspace, "blobs", property(lambda self: default_bridge_store(self.root)))
+    monkeypatch.setattr(Workspace, "docs", property(lambda self: default_bridge_store(self.root)))
+    bridged = attest_file(workspace, "f001", "ds01")
+
+    assert bridged.root == local.root == _GOLDEN_DOCSET_ROOT
+    assert [(a.slot_id, a.leaf_hash) for a in bridged.leaves] == [
+        (a.slot_id, a.leaf_hash) for a in local.leaves
+    ]
+
+
+def test_export_and_verify_through_default_path_bridge(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_golden(workspace)
+    monkeypatch.setattr(Workspace, "blobs", property(lambda self: default_bridge_store(self.root)))
+    monkeypatch.setattr(Workspace, "docs", property(lambda self: default_bridge_store(self.root)))
+    out_dir = workspace.root.parent / "bundle"
+    attestation, _, _ = _export(workspace, "f001", out_dir, "ds01")
+    assert attestation.root == _GOLDEN_DOCSET_ROOT
+    assert (out_dir / "source" / "contract.pdf").read_bytes() == _GOLDEN_SOURCE
+    assert verify_attestation_dir(out_dir).valid is True
+
+
+def test_shrinking_re_render_yields_the_same_root_on_both_backends(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The concrete attestation bug behind the staged_write replace contract.
+
+    Render a file's pages, then re-render it with fewer (a corrected page count,
+    a re-converted source). An upload-only staged_write leaves the surplus
+    images behind on a store that stages through temp files, while a store that
+    writes in place drops them — and since ``collect_file_version`` hashes
+    ``list_blobs(page_images)``, the two backends would then publish different
+    Merkle roots for identical content. Proof of origin cannot depend on where
+    the workspace is hosted."""
+    _seed_file(workspace, "f001", pages=5, pdf_name="contract.pdf")
+
+    def re_render_to_two_pages() -> str:
+        prefix = layout.file_pages_prefix("f001")
+        with workspace.blobs.staged_write(prefix) as pages_dir:
+            for n in (1, 2):
+                (pages_dir / f"page_{n}.png").write_bytes(f"fake-png-page-{n}".encode())
+        return attest_file(workspace, "f001").root
+
+    local_root = re_render_to_two_pages()
+    slots = [a.slot_id for a in collect_file_version(workspace, "f001").artifacts]
+    assert slots == ["source", "page_image[1]", "page_image[2]"]  # 3..5 are gone
+
+    # Put the surplus pages back, then repeat the whole thing through the base
+    # bridge — the implementation every third-party store inherits.
+    for n in range(3, 6):
+        workspace.blobs.put_blob(
+            layout.file_page_image_key("f001", n), f"fake-png-page-{n}".encode()
+        )
+    monkeypatch.setattr(Workspace, "blobs", property(lambda self: default_bridge_store(self.root)))
+    monkeypatch.setattr(Workspace, "docs", property(lambda self: default_bridge_store(self.root)))
+    assert re_render_to_two_pages() == local_root

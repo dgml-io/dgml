@@ -14,20 +14,20 @@
 
 from __future__ import annotations
 
-import shutil
-
+from . import layout
 from .errors import (
-    CorruptMetadata,
     DocSetNotFound,
     FileNotFound,
     GuidanceNotFound,
     InvalidArgument,
     SchemaInvalid,
     SchemaNotFound,
+    now_iso,
 )
 from .ids import new_id
 from .models import DocSet
-from .storage import Workspace, read_json, write_json_atomic, write_text_atomic
+from .storage import Workspace
+from .workspace_ops import WorkspaceOps
 
 
 class DocSetStore:
@@ -36,30 +36,35 @@ class DocSetStore:
     def __init__(self, workspace: Workspace) -> None:
         self.ws = workspace
 
+    def _require_docset(self, docset_id: str) -> None:
+        """Raise :class:`DocSetNotFound` unless the docset's manifest exists.
+
+        Existence is defined by the ``docset.json`` document, not a directory —
+        so the check works on any store (a remote backend has no ``docsets/<id>/``
+        directory to stat)."""
+        if self.ws.docs.get_doc(layout.Collection.DOCSETS, docset_id) is None:
+            raise DocSetNotFound(f"docset '{docset_id}' not found")
+
     def list_all(self) -> list[DocSet]:
-        if not self.ws.docsets_dir.exists():
-            return []
-        out: list[DocSet] = []
-        for entry in sorted(self.ws.docsets_dir.iterdir()):
-            if not entry.is_dir():
-                continue
-            json_path = entry / "docset.json"
-            if not json_path.exists():
-                continue
-            try:
-                data = read_json(json_path)
-            except CorruptMetadata:
-                continue
-            out.append(DocSet.from_json(data))
-        return out
+        # Sorted here, not by the store: ``find_docs`` has no defined ordering
+        # (LocalStore returns path order, a document database returns insertion
+        # order), and this list is user-visible CLI output that must not depend
+        # on which backend the workspace happens to live on.
+        return sorted(
+            (
+                DocSet.from_json(data)
+                for data in self.ws.docs.find_docs(layout.Collection.DOCSETS, {})
+            ),
+            key=lambda ds: ds.id,
+        )
 
     def get(self, docset_id: str) -> DocSet:
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        json_path = self.ws.docset_json_path(docset_id)
-        if not json_path.exists():
+        data = self.ws.docs.get_doc(layout.Collection.DOCSETS, docset_id)
+        if data is None:
             raise DocSetNotFound(f"docset '{docset_id}' not found")
-        return DocSet.from_json(read_json(json_path))
+        return DocSet.from_json(data)
 
     def create(
         self,
@@ -77,9 +82,9 @@ class DocSetStore:
             description=description,
             key_questions=list(key_questions or []),
         )
-        self.ws.docset_dir(docset_id).mkdir(parents=True, exist_ok=False)
-        self.ws.docset_files_dir(docset_id).mkdir(parents=True, exist_ok=True)
-        write_json_atomic(self.ws.docset_json_path(docset_id), ds.to_json())
+        # No directory is created up front — the store owns container creation
+        # (put_doc writes the manifest). A fresh new_id never collides.
+        self.ws.docs.put_doc(layout.Collection.DOCSETS, docset_id, ds.to_json())
         return ds
 
     def update(
@@ -99,49 +104,51 @@ class DocSetStore:
             ds.description = description
         if key_questions is not None:
             ds.key_questions = list(key_questions)
-        write_json_atomic(self.ws.docset_json_path(docset_id), ds.to_json())
+        self.ws.docs.put_doc(layout.Collection.DOCSETS, docset_id, ds.to_json())
         return ds
 
     def delete(self, docset_id: str) -> None:
-        if not docset_id.strip():
-            raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        shutil.rmtree(self.ws.docset_dir(docset_id))
+        """Delete the docset and every assignment to it. The underlying files
+        are untouched. The cascade itself lives in :class:`WorkspaceOps`."""
+        WorkspaceOps(self.ws).delete_docset(docset_id)
 
     def list_files(self, docset_id: str) -> list[str]:
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        files_dir = self.ws.docset_files_dir(docset_id)
-        if not files_dir.exists():
-            return []
-        return sorted(p.name for p in files_dir.iterdir() if p.is_dir())
+        self._require_docset(docset_id)
+        assignments = self.ws.docs.find_docs(
+            layout.Collection.ASSIGNMENTS, {"docset_id": docset_id}
+        )
+        return sorted(str(a["file_id"]) for a in assignments)
 
     def add_file(self, docset_id: str, file_id: str) -> None:
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
         if not file_id.strip():
             raise InvalidArgument("file id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        if not self.ws.file_dir(file_id).exists():
+        self._require_docset(docset_id)
+        if self.ws.docs.get_doc(layout.Collection.FILES, file_id) is None:
             raise FileNotFound(f"file '{file_id}' not found")
-        ref = self.ws.docset_files_dir(docset_id) / file_id
-        ref.mkdir(parents=True, exist_ok=True)
+        # An assignment is a document keyed by the (docset, file) pair. Re-adding
+        # is idempotent — it replaces the same document, refreshing assigned_at.
+        self.ws.docs.put_doc(
+            layout.Collection.ASSIGNMENTS,
+            layout.pair_id(docset_id, file_id),
+            {"docset_id": docset_id, "file_id": file_id, "assigned_at": now_iso()},
+        )
 
     def remove_file(self, docset_id: str, file_id: str) -> None:
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
         if not file_id.strip():
             raise InvalidArgument("file id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        ref = self.ws.docset_files_dir(docset_id) / file_id
-        if not ref.exists():
+        self._require_docset(docset_id)
+        if (
+            self.ws.docs.get_doc(layout.Collection.ASSIGNMENTS, layout.pair_id(docset_id, file_id))
+            is None
+        ):
             raise FileNotFound(f"file '{file_id}' is not assigned to docset '{docset_id}'")
-        shutil.rmtree(ref)
+        WorkspaceOps(self.ws).unassign(docset_id, file_id)
 
     # ---- extraction schema (docsets/<id>/extraction-schema.rnc, RELAX NG Compact) --
 
@@ -154,17 +161,17 @@ class DocSetStore:
         """
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        path = self.ws.docset_schema_path(docset_id)
-        if not path.exists():
-            raise SchemaNotFound(f"docset '{docset_id}' has no schema")
-        return path.read_text(encoding="utf-8")
+        self._require_docset(docset_id)
+        key = layout.docset_extraction_schema_key(docset_id)
+        try:
+            return self.ws.blobs.get_blob(key).decode("utf-8")
+        except FileNotFoundError:
+            raise SchemaNotFound(f"docset '{docset_id}' has no schema") from None
 
     def has_schema(self, docset_id: str) -> bool:
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        return self.ws.docset_schema_path(docset_id).exists()
+        return self.ws.blobs.blob_exists(layout.docset_extraction_schema_key(docset_id))
 
     def set_schema(self, docset_id: str, schema: str) -> str:
         """Write (replace) the docset's extraction schema from RNC text.
@@ -178,12 +185,14 @@ class DocSetStore:
 
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
+        self._require_docset(docset_id)
         if not isinstance(schema, str):
             raise SchemaInvalid("schema must be RNC text")
         validate_rnc(schema)  # raises SchemaInvalid on anything outside the subset
-        write_text_atomic(self.ws.docset_schema_path(docset_id), schema)
+        self.ws.blobs.put_blob(
+            layout.docset_extraction_schema_key(docset_id),
+            schema.encode("utf-8"),
+        )
         return schema
 
     def clear_schema(self, docset_id: str) -> bool:
@@ -191,12 +200,11 @@ class DocSetStore:
         False if there was none to remove."""
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        path = self.ws.docset_schema_path(docset_id)
-        if not path.exists():
+        self._require_docset(docset_id)
+        key = layout.docset_extraction_schema_key(docset_id)
+        if not self.ws.blobs.blob_exists(key):
             return False
-        path.unlink()
+        self.ws.blobs.delete_blob(key)
         return True
 
     # ---- extraction guidance (docsets/<id>/extraction-guidance.md) ---------
@@ -210,27 +218,29 @@ class DocSetStore:
         """
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        path = self.ws.docset_guidance_path(docset_id)
-        if not path.exists():
-            raise GuidanceNotFound(f"docset '{docset_id}' has no extraction guidance")
-        return path.read_text(encoding="utf-8")
+        self._require_docset(docset_id)
+        key = layout.docset_guidance_key(docset_id)
+        try:
+            return self.ws.blobs.get_blob(key).decode("utf-8")
+        except FileNotFoundError:
+            raise GuidanceNotFound(f"docset '{docset_id}' has no extraction guidance") from None
 
     def has_guidance(self, docset_id: str) -> bool:
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        return self.ws.docset_guidance_path(docset_id).exists()
+        return self.ws.blobs.blob_exists(layout.docset_guidance_key(docset_id))
 
     def set_guidance(self, docset_id: str, guidance: str) -> str:
         """Write (replace) the docset's extraction guidance text."""
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
+        self._require_docset(docset_id)
         if not isinstance(guidance, str) or not guidance.strip():
             raise InvalidArgument("guidance must be non-empty text")
-        write_text_atomic(self.ws.docset_guidance_path(docset_id), guidance)
+        self.ws.blobs.put_blob(
+            layout.docset_guidance_key(docset_id),
+            guidance.encode("utf-8"),
+        )
         return guidance
 
     def clear_guidance(self, docset_id: str) -> bool:
@@ -238,10 +248,9 @@ class DocSetStore:
         False if there was none to remove."""
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
-        if not self.ws.docset_dir(docset_id).exists():
-            raise DocSetNotFound(f"docset '{docset_id}' not found")
-        path = self.ws.docset_guidance_path(docset_id)
-        if not path.exists():
+        self._require_docset(docset_id)
+        key = layout.docset_guidance_key(docset_id)
+        if not self.ws.blobs.blob_exists(key):
             return False
-        path.unlink()
+        self.ws.blobs.delete_blob(key)
         return True

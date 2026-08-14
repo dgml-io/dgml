@@ -29,6 +29,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from dgml_core import layout
 from dgml_core.classification import ClassificationConfig
 from dgml_core.clustering import (
     _resolve_method,
@@ -44,7 +45,7 @@ from dgml_core.llm_clustering import (
     llm_cluster_files,
 )
 from dgml_core.models import DocSet, FileRecord
-from dgml_core.storage import Workspace, write_json_atomic
+from dgml_core.storage import Workspace
 
 from .conftest import make_fake_png, write_classification_config
 
@@ -67,15 +68,12 @@ def _seed_file(workspace: Workspace, file_id: str) -> None:
         page_count=1,
         text_mode="digital",
     )
-    workspace.file_dir(file_id).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(workspace.file_json_path(file_id), record.to_json())
+    workspace.docs.put_doc("files", file_id, record.to_json())
 
 
 def _seed_page_image(workspace: Workspace, file_id: str) -> None:
     """Write a valid single-page PNG so ``gather_file_pages`` finds one page."""
-    pages_dir = workspace.file_pages_dir(file_id)
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    (pages_dir / "page_1.png").write_bytes(make_fake_png(8, 8))
+    workspace.blobs.put_blob(layout.file_page_image_key(file_id, 1), make_fake_png(8, 8))
 
 
 def _seed(workspace: Workspace, file_id: str, *, with_page: bool = True) -> None:

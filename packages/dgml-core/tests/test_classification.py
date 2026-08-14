@@ -18,6 +18,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from dgml_core import layout
 from dgml_core.classification import (
     DEFAULT_MAX_PAGES,
     ClassificationConfig,
@@ -34,7 +35,7 @@ from dgml_core.errors import (
     ClassificationFailed,
 )
 from dgml_core.models import FileRecord
-from dgml_core.storage import Workspace, write_json_atomic
+from dgml_core.storage import Workspace
 from dgml_core.utils import gather_file_pages
 
 from .conftest import write_classification_config
@@ -63,13 +64,11 @@ def _seed_file(workspace: Workspace, file_id: str, *, filename: str = "doc.pdf")
         page_count=1,
         text_mode="digital",
     )
-    workspace.file_dir(file_id).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(workspace.file_json_path(file_id), record.to_json())
+    workspace.docs.put_doc("files", file_id, record.to_json())
 
 
 def _seed_page_image(workspace: Workspace, file_id: str, page: int, content: bytes) -> None:
-    workspace.file_pages_dir(file_id).mkdir(parents=True, exist_ok=True)
-    (workspace.file_pages_dir(file_id) / f"page_{page}.png").write_bytes(content)
+    workspace.blobs.put_blob(layout.file_page_image_key(file_id, page), content)
 
 
 def _tool_call_response(name: str, arguments: dict[str, Any]) -> SimpleNamespace:

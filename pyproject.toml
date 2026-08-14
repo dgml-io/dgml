@@ -38,6 +38,8 @@ dev-dependencies = [
     "umap-learn>=0.5.6",
     "numba>=0.61",
     "networkx>=3.6.1",
+    "moto>=5.2.2",
+    "mongomock>=4.3.0",
 ]
 
 # Evaluation-only dependencies (evaluation/dgml/evaluate.py). Not part of the
@@ -77,7 +79,13 @@ warn_redundant_casts = true
 # makes mypy derive a distinct, path-qualified module name per file.
 explicit_package_bases = true
 namespace_packages = true
-mypy_path = "packages/dgml/src:packages/dgml-core/src:packages/dgml-chain/src:packages/translators-pdf/src:packages/clustering/src"
+# The two sample-store packages both carry a `tests/conftest.py`, which mypy's
+# flat resolution can't disambiguate from each other (they resolve to the same
+# bare `conftest` module). Their `src/` is still strictly type-checked; the
+# integration tests lean on untyped `moto`/`mongomock` fakes, so excluding them
+# from mypy loses little. (pytest still runs them.)
+exclude = "packages/dgml-storage-(s3|mongo)/tests/"
+mypy_path = "packages/dgml/src:packages/dgml-core/src:packages/dgml-chain/src:packages/translators-pdf/src:packages/clustering/src:packages/dgml-storage-s3/src:packages/dgml-storage-mongo/src"
 
 [[tool.mypy.overrides]]
 module = [

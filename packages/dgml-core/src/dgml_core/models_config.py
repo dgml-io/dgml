@@ -71,6 +71,7 @@ class ConfigSection(StrEnum):
     TEXT_EXTRACTION = "text_extraction"
     CONVERSION = "conversion"
     CLUSTERING = "clustering"
+    STORAGE = "storage"
 
 
 # Cheapest → strongest. Fallback searches lower (cheaper) neighbours first.

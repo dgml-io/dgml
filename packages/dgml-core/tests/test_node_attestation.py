@@ -22,6 +22,7 @@ import hashlib
 import json
 
 import pytest
+from dgml_core import layout
 from dgml_core.errors import DocSetNotFound, FileNotFound, InvalidArgument, NotFoundError
 from dgml_core.merkle import merkle_root, proof_from_json, proof_to_json
 from dgml_core.node_attestation import (
@@ -33,7 +34,7 @@ from dgml_core.node_attestation import (
     resolve_child_path,
     resolve_xpath,
 )
-from dgml_core.storage import Workspace, write_json_atomic
+from dgml_core.storage import Workspace
 from lxml import etree  # type: ignore[import-untyped]
 
 DGML_XML = b"""\
@@ -55,10 +56,9 @@ xmlns:docset="http://dgml.io/ns/dgml/test">
 
 
 def _seed(ws: Workspace, file_id: str = "f001", docset_id: str = "ds01") -> None:
-    file_dir = ws.file_dir(file_id)
-    file_dir.mkdir(parents=True)
-    write_json_atomic(
-        ws.file_json_path(file_id),
+    ws.docs.put_doc(
+        "files",
+        file_id,
         {
             "id": file_id,
             "original_path": "/src/ledger.pdf",
@@ -69,14 +69,12 @@ def _seed(ws: Workspace, file_id: str = "f001", docset_id: str = "ds01") -> None
             "text_mode": "digital",
         },
     )
-    ws.docset_dir(docset_id).mkdir(parents=True)
-    write_json_atomic(
-        ws.docset_dir(docset_id) / "docset.json",
+    ws.docs.put_doc(
+        "docsets",
+        docset_id,
         {"id": docset_id, "name": "Test", "description": "", "key_questions": []},
     )
-    xml_path = ws.file_dgml_xml_path(docset_id, file_id, "ledger")
-    xml_path.parent.mkdir(parents=True, exist_ok=True)
-    xml_path.write_bytes(DGML_XML)
+    ws.blobs.put_blob(layout.dgml_xml_key(docset_id, file_id, "ledger"), DGML_XML)
 
 
 # --- export -------------------------------------------------------------------
@@ -155,7 +153,7 @@ def test_export_missing_file_docset_or_xml(workspace: Workspace) -> None:
     with pytest.raises(DocSetNotFound):
         export_node(workspace, "f001", "nope", leaf_index=0)
     # Docset exists but the pair has no generated XML.
-    workspace.docset_dir("ds02").mkdir(parents=True)
+    workspace.docs.put_doc("docsets", "ds02", {"id": "ds02"})
     with pytest.raises(NotFoundError, match="no generated DGML XML"):
         export_node(workspace, "f001", "ds02", leaf_index=0)
 
@@ -214,8 +212,10 @@ def test_prove_detects_node_tamper(workspace: Workspace) -> None:
     _seed(workspace)
     att = export_node(workspace, "f001", "ds01", xpath="/dg:chunk/docset:Header")
 
-    xml_path = workspace.file_dgml_xml_path("ds01", "f001", "ledger")
-    xml_path.write_bytes(DGML_XML.replace(b"Resident Ledger", b"TAMPERED"))
+    workspace.blobs.put_blob(
+        layout.dgml_xml_key("ds01", "f001", "ledger"),
+        DGML_XML.replace(b"Resident Ledger", b"TAMPERED"),
+    )
 
     result = prove_node(workspace, "f001", "ds01", att.root_hash, att.proof)
     assert result.valid is False
@@ -234,7 +234,9 @@ def test_prove_detects_wrong_root(workspace: Workspace) -> None:
 def test_prove_raises_when_document_restructured(workspace: Workspace) -> None:
     _seed(workspace)
     att = export_node(workspace, "f001", "ds01", leaf_index=8)
-    xml_path = workspace.file_dgml_xml_path("ds01", "f001", "ledger")
-    xml_path.write_bytes(b"<dg:chunk xmlns:dg='http://dgml.io/ns/dg#'/>")
+    workspace.blobs.put_blob(
+        layout.dgml_xml_key("ds01", "f001", "ledger"),
+        b"<dg:chunk xmlns:dg='http://dgml.io/ns/dg#'/>",
+    )
     with pytest.raises(ValueError, match="out of range"):
         prove_node(workspace, "f001", "ds01", att.root_hash, att.proof)

@@ -15,12 +15,12 @@
 from __future__ import annotations
 
 import os
-import shutil
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from . import layout
 from .conversion import (
     convert_to_pdf_bytes,
     converter_name_for_path,
@@ -30,7 +30,6 @@ from .conversion import (
 from .errors import (
     AuthError,
     ConflictError,
-    CorruptMetadata,
     DgmlError,
     FileNotFound,
     InvalidArgument,
@@ -49,9 +48,10 @@ from .ids import new_id
 from .models import FileRecord
 from .ocr import extract_text_ocr, load_ocr_config
 from .pages import DEFAULT_DPI, RENDERER_NAME, pdf_page_count, render_pages
-from .storage import Workspace, read_json, write_json_atomic
+from .storage import Workspace
 from .text_extraction import TextMode, classify_extraction_outcome, extract_text_digital
 from .text_extraction_config import load_text_extraction_config
+from .workspace_ops import WorkspaceOps
 
 PDF_MAGIC = b"%PDF-"
 
@@ -98,29 +98,26 @@ class FileStore:
         self.ws = workspace
 
     def list_all(self) -> list[FileRecord]:
-        if not self.ws.files_dir.exists():
-            return []
-        records: list[FileRecord] = []
-        for entry in sorted(self.ws.files_dir.iterdir()):
-            if not entry.is_dir():
-                continue
-            json_path = entry / "file.json"
-            if not json_path.exists():
-                continue
-            try:
-                data = read_json(json_path)
-            except CorruptMetadata:
-                continue
-            records.append(FileRecord.from_json(data))
-        return records
+        # Sorted here, not by the store: ``find_docs`` has no defined ordering
+        # (LocalStore returns path order, a document database returns insertion
+        # order). Beyond the user-visible listing, ``_find_conflicts`` scans this
+        # and returns the *first* match, so an unstable order would let the same
+        # duplicate report a different existing id per backend.
+        return sorted(
+            (
+                FileRecord.from_json(data)
+                for data in self.ws.docs.find_docs(layout.Collection.FILES, {})
+            ),
+            key=lambda record: record.id,
+        )
 
     def get(self, file_id: str) -> FileRecord:
         if not file_id.strip():
             raise InvalidArgument("file id must not be empty")
-        json_path = self.ws.file_json_path(file_id)
-        if not json_path.exists():
+        data = self.ws.docs.get_doc(layout.Collection.FILES, file_id)
+        if data is None:
             raise FileNotFound(f"file '{file_id}' not found")
-        return FileRecord.from_json(read_json(json_path))
+        return FileRecord.from_json(data)
 
     def _find_conflicts(
         self, sha256: str, original_path: str
@@ -272,17 +269,17 @@ class FileStore:
         debug: bool = False,
     ) -> AddFileResult:
         file_id = new_id()
-        file_dir = self.ws.file_dir(file_id)
-        file_dir.mkdir(parents=True, exist_ok=False)
-        # The original source is stored under its own name. A convertible
+        # The store owns container creation (upload_blob writes the source blob);
+        # a fresh new_id never collides, so no directory is created up front.
+        # The original source is stored under its own name (a blob). A convertible
         # source is converted to a PDF here (persisted alongside it as
         # `<stem>.pdf` by _ensure_pdf) to drive page rendering / count / text
         # extraction; generation later reuses that same persisted PDF.
-        dest_source = file_dir / source_path.name
-        shutil.copy2(source_path, dest_source)
+        source_key = layout.file_source_key(file_id, source_path.name)
+        self.ws.blobs.upload_blob(source_key, source_path)
 
-        pdf_path, conversion_error, pdf_converter = self._ensure_pdf(dest_source, file_id)
-        if pdf_path is None:
+        pdf_key, conversion_error, pdf_converter = self._ensure_pdf(source_key, file_id)
+        if pdf_key is None:
             record = FileRecord(
                 id=file_id,
                 original_path=original_path,
@@ -293,7 +290,7 @@ class FileStore:
                 text_mode=text_mode.value,
                 pdf_converter=pdf_converter,
             )
-            write_json_atomic(self.ws.file_json_path(file_id), record.to_json())
+            self.ws.docs.put_doc(layout.Collection.FILES, file_id, record.to_json())
             return AddFileResult(
                 record=record,
                 created=True,
@@ -301,17 +298,21 @@ class FileStore:
                 conversion_error=conversion_error,
             )
 
-        page_count, page_count_error = self._safe_page_count(pdf_path, file_id)
-        page_render_error = self._render_pages(pdf_path, file_id, expected=page_count, dpi=dpi)
-        text_extraction_error, text_summary = self._extract_text(
-            pdf_path,
-            file_id,
-            text_mode=text_mode,
-            page_count=page_count,
-            dpi=dpi,
-            verbose=verbose,
-            debug=debug,
-        )
+        # Page count, render, and text extraction all need a real PDF path; one
+        # materialize yields it (zero-copy on LocalStore, a temp download on a
+        # remote store) and all three share it.
+        with self.ws.blobs.materialize(pdf_key) as pdf_path:
+            page_count, page_count_error = self._safe_page_count(pdf_path, file_id)
+            page_render_error = self._render_pages(pdf_path, file_id, expected=page_count, dpi=dpi)
+            text_extraction_error, text_summary = self._extract_text(
+                pdf_path,
+                file_id,
+                text_mode=text_mode,
+                page_count=page_count,
+                dpi=dpi,
+                verbose=verbose,
+                debug=debug,
+            )
 
         record = FileRecord(
             id=file_id,
@@ -325,7 +326,7 @@ class FileStore:
             page_image_renderer=RENDERER_NAME,
             pdf_converter=pdf_converter,
         )
-        write_json_atomic(self.ws.file_json_path(file_id), record.to_json())
+        self.ws.docs.put_doc(layout.Collection.FILES, file_id, record.to_json())
         return AddFileResult(
             record=record,
             created=True,
@@ -337,50 +338,54 @@ class FileStore:
         )
 
     def _ensure_pdf(
-        self, stored_source: Path, file_id: str
-    ) -> tuple[Path | None, str | None, str | None]:
-        """Return ``(pdf_path, error, converter_name)`` for the stored source.
+        self, source_key: str, file_id: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return ``(pdf_key, error, converter_name)`` for the stored source.
 
-        For a ``.pdf`` source this is the stored file itself. For a convertible
+        For a ``.pdf`` source this is the source blob itself. For a convertible
         source it runs the configured converter and **persists** the resulting
-        PDF alongside the original at ``<stem>.pdf`` in the file directory. That
-        persisted PDF is what page rendering / count / text extraction run on
-        here, and what generation later reuses (see
+        PDF alongside the original at ``<stem>.pdf`` (a blob). That persisted PDF
+        is what page rendering / count / text extraction run on here, and what
+        generation later reuses (see
         :func:`dgml_core.generation.document.load_document_as_pdf`) — so the document
         is converted exactly once, and the bytes the page images were rendered
         from are byte-identical to those generation slices.
 
-        The third element is the converter's name (``None`` for a ``.pdf``
-        source), recorded on the file regardless of whether the conversion
-        ultimately succeeded so a failed convert still names what was tried.
+        The converter needs a real filesystem path, so the source blob is
+        materialized for the call (zero-copy on LocalStore). The third element is
+        the converter's name (``None`` for a ``.pdf`` source), recorded on the
+        file regardless of whether the conversion ultimately succeeded so a
+        failed convert still names what was tried.
 
         On conversion failure a permanent error is recorded and
         ``(None, message, converter_name)`` is returned so the file record is
         still created (consistent with the page-render / text soft-fail pattern).
         """
-        if stored_source.suffix.lower() == ".pdf":
-            return stored_source, None, None
+        if source_key.lower().endswith(".pdf"):
+            return source_key, None, None
 
         converters = load_conversion_config(self.ws)
-        converter_name = converter_name_for_path(stored_source, converters)
-        try:
-            pdf_bytes = convert_to_pdf_bytes(stored_source, converters)
-        except DgmlError as exc:
-            message = str(exc)
-            append_recorded_error(
-                self.ws.file_errors_path(file_id),
-                RecordedError(
-                    operation="convert_to_pdf",
-                    message=message,
-                    occurred_at=now_iso(),
-                    permanent=True,
-                ),
-            )
-            return None, message, converter_name
+        with self.ws.blobs.materialize(source_key) as src:
+            converter_name = converter_name_for_path(src, converters)
+            try:
+                pdf_bytes = convert_to_pdf_bytes(src, converters)
+            except DgmlError as exc:
+                message = str(exc)
+                append_recorded_error(
+                    self.ws,
+                    file_id,
+                    RecordedError(
+                        operation="convert_to_pdf",
+                        message=message,
+                        occurred_at=now_iso(),
+                        permanent=True,
+                    ),
+                )
+                return None, message, converter_name
 
-        pdf_path = stored_source.with_suffix(".pdf")
-        pdf_path.write_bytes(pdf_bytes)
-        return pdf_path, None, converter_name
+        pdf_key = Path(source_key).with_suffix(".pdf").as_posix()
+        self.ws.blobs.put_blob(pdf_key, pdf_bytes)
+        return pdf_key, None, converter_name
 
     def _safe_page_count(self, pdf_path: Path, file_id: str) -> tuple[int | None, str | None]:
         """Read the PDF's page count. On failure, record a permanent error
@@ -390,7 +395,8 @@ class FileStore:
         except Exception as exc:  # pdfminer can raise a variety of errors.
             message = f"could not read PDF page count: {type(exc).__name__}: {exc}"
             append_recorded_error(
-                self.ws.file_errors_path(file_id),
+                self.ws,
+                file_id,
                 RecordedError(
                     operation="pdf_page_count",
                     message=message,
@@ -406,10 +412,13 @@ class FileStore:
         """Render pages, recording errors. Returns a human-readable error
         message on failure or partial success, or ``None`` on full success."""
         try:
-            rendered = render_pages(pdf_path, self.ws.file_pages_dir(file_id), dpi=dpi)
+            pages_prefix = layout.file_pages_prefix(file_id)
+            with self.ws.blobs.staged_write(pages_prefix) as pages_dir:
+                rendered = render_pages(pdf_path, pages_dir, dpi=dpi)
         except PageRenderFailed as exc:
             append_recorded_error(
-                self.ws.file_errors_path(file_id),
+                self.ws,
+                file_id,
                 RecordedError(
                     operation="render_pages",
                     message=str(exc),
@@ -422,7 +431,8 @@ class FileStore:
         if expected is not None and rendered != expected:
             message = f"rendered {rendered} pages, PDF reports {expected}"
             append_recorded_error(
-                self.ws.file_errors_path(file_id),
+                self.ws,
+                file_id,
                 RecordedError(
                     operation="render_pages",
                     message=message,
@@ -474,10 +484,10 @@ class FileStore:
         page_count: int | None,
         dpi: int = DEFAULT_DPI,
     ) -> tuple[str | None, dict[str, Any] | None]:
+        text_prefix = layout.file_text_prefix(file_id)
         try:
-            result = extract_text_digital(
-                pdf_path, self.ws.file_text_dir(file_id), file_id=file_id, dpi=dpi
-            )
+            with self.ws.blobs.staged_write(text_prefix) as text_dir:
+                result = extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
         except TextExtractionFailed as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
         return self._classify_and_record(result, file_id, page_count, mode_label="digital")
@@ -496,14 +506,20 @@ class FileStore:
             # config has to be fixed before retrying.
             return self._record_text_failure(file_id, str(exc), permanent=True), None
 
+        text_prefix = layout.file_text_prefix(file_id)
+        pages_prefix = layout.file_pages_prefix(file_id)
         try:
-            result = extract_text_ocr(
-                pdf_path,
-                self.ws.file_text_dir(file_id),
-                file_id=file_id,
-                page_images_dir=self.ws.file_pages_dir(file_id),
-                config=config,
-            )
+            with (
+                self.ws.blobs.materialize_dir(pages_prefix) as pages_dir,
+                self.ws.blobs.staged_write(text_prefix) as text_dir,
+            ):
+                result = extract_text_ocr(
+                    pdf_path,
+                    text_dir,
+                    file_id=file_id,
+                    page_images_dir=pages_dir,
+                    config=config,
+                )
         except (OcrFailed, AuthError) as exc:
             # Provider/auth failures are recorded as permanent — re-running
             # without changing config or credentials won't help. `dgml check
@@ -528,19 +544,25 @@ class FileStore:
         except DgmlError as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
 
+        text_prefix = layout.file_text_prefix(file_id)
+        pages_prefix = layout.file_pages_prefix(file_id)
         try:
-            result = extract_text_hybrid(
-                pdf_path,
-                self.ws.file_text_dir(file_id),
-                file_id=file_id,
-                page_images_dir=self.ws.file_pages_dir(file_id),
-                config=config,
-                text_extraction_config=text_extraction_config,
-                workspace=self.ws,
-                dpi=dpi,
-                verbose=verbose,
-                debug=debug,
-            )
+            with (
+                self.ws.blobs.materialize_dir(pages_prefix) as pages_dir,
+                self.ws.blobs.staged_write(text_prefix) as text_dir,
+            ):
+                result = extract_text_hybrid(
+                    pdf_path,
+                    text_dir,
+                    file_id=file_id,
+                    page_images_dir=pages_dir,
+                    config=config,
+                    text_extraction_config=text_extraction_config,
+                    workspace=self.ws,
+                    dpi=dpi,
+                    verbose=verbose,
+                    debug=debug,
+                )
         except (OcrFailed, AuthError) as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
 
@@ -568,7 +590,8 @@ class FileStore:
 
     def _record_text_failure(self, file_id: str, message: str, *, permanent: bool) -> str:
         append_recorded_error(
-            self.ws.file_errors_path(file_id),
+            self.ws,
+            file_id,
             RecordedError(
                 operation="text_extraction",
                 message=message,
@@ -579,13 +602,6 @@ class FileStore:
         return message
 
     def delete(self, file_id: str) -> None:
-        if not file_id.strip():
-            raise InvalidArgument("file id must not be empty")
-        if not self.ws.file_dir(file_id).exists():
-            raise FileNotFound(f"file '{file_id}' not found")
-        if self.ws.docsets_dir.exists():
-            for docset_dir in self.ws.docsets_dir.iterdir():
-                ref = docset_dir / "files" / file_id
-                if ref.exists():
-                    shutil.rmtree(ref)
-        shutil.rmtree(self.ws.file_dir(file_id))
+        """Delete the file, unassigning it from every docset first. The cascade
+        itself lives in :class:`WorkspaceOps`."""
+        WorkspaceOps(self.ws).delete_file(file_id)

@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 import pytest
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL
+from dgml_core import layout
 from dgml_core.classification import ClassificationDecision
 from dgml_core.clustering import (
     DEFAULT_INCREMENTAL_NOVELTY_QUANTILE,
@@ -55,7 +56,6 @@ def _dp(cluster_name: str, confidence: float | None = None) -> DocPrediction:
 def _seed_file(workspace: Workspace, file_id: str) -> None:
     """Materialize a minimal File record on disk so list_all() finds it."""
     from dgml_core.models import FileRecord
-    from dgml_core.storage import write_json_atomic
 
     record = FileRecord(
         id=file_id,
@@ -66,19 +66,18 @@ def _seed_file(workspace: Workspace, file_id: str) -> None:
         page_count=1,
         text_mode="digital",
     )
-    workspace.file_dir(file_id).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(workspace.file_json_path(file_id), record.to_json())
+    workspace.docs.put_doc("files", file_id, record.to_json())
 
 
-def _seed_page_image(workspace: Workspace, file_id: str) -> Path:
+def _seed_page_image(workspace: Workspace, file_id: str) -> None:
     """Write a tiny but valid PNG to ``page_1.png`` for ``file_id``."""
+    from io import BytesIO
+
     from PIL import Image
 
-    page_dir = workspace.file_pages_dir(file_id)
-    page_dir.mkdir(parents=True, exist_ok=True)
-    path = page_dir / "page_1.png"
-    Image.new("RGB", (8, 8), color=(123, 200, 50)).save(path, "PNG")
-    return path
+    buf = BytesIO()
+    Image.new("RGB", (8, 8), color=(123, 200, 50)).save(buf, "PNG")
+    workspace.blobs.put_blob(layout.file_page_image_key(file_id, 1), buf.getvalue())
 
 
 @pytest.fixture

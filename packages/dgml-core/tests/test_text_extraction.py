@@ -16,18 +16,24 @@ import json
 from pathlib import Path
 
 import pytest
+from dgml_core import layout
 from dgml_core.consistency import check_workspace
 from dgml_core.errors import load_recorded_errors
 from dgml_core.files import FileStore
 from dgml_core.pages import DEFAULT_DPI
 from dgml_core.storage import Workspace
 from dgml_core.text_extraction import (
-    PAGE_TEXT_GLOB,
     TextMode,
     extract_text_digital,
 )
 
 from .conftest import PAGE_HEIGHT_PTS, PAGE_WIDTH_PTS
+
+
+def _page_texts(ws: Workspace, file_id: str) -> list[str]:
+    """page_text blob keys for ``file_id`` — the store analogue of globbing
+    ``page_*.json`` in the workspace's page-text dir."""
+    return [k for k in ws.blobs.list_blobs(layout.file_text_prefix(file_id)) if k.endswith(".json")]
 
 
 def test_extract_text_digital_writes_per_page_json(tmp_path: Path, text_pdf: Path) -> None:
@@ -126,8 +132,7 @@ def test_file_add_digital_default_extracts_text(workspace: Workspace, text_pdf: 
     assert result.text_extraction["mode"] == TextMode.DIGITAL.value
     assert result.text_extraction["pages_with_words"] == 2
 
-    text_dir = workspace.file_text_dir(result.record.id)
-    assert len(list(text_dir.glob(PAGE_TEXT_GLOB))) == 2
+    assert len(_page_texts(workspace, result.record.id)) == 2
 
 
 def test_file_add_partial_empty_pdf_soft_fails_non_permanent(
@@ -144,7 +149,7 @@ def test_file_add_partial_empty_pdf_soft_fails_non_permanent(
     assert result.text_extraction["pages_with_words"] == 1
     assert result.text_extraction["pages_written"] == 2
 
-    errors = load_recorded_errors(workspace.file_errors_path(result.record.id))
+    errors = load_recorded_errors(workspace, result.record.id)
     text_errs = [e for e in errors if e.operation == "text_extraction"]
     assert text_errs and all(not e.permanent for e in text_errs)
 
@@ -156,8 +161,7 @@ def test_check_partial_empty_re_extract_records_non_permanent(
     signal must be re-recorded (not silently reported as 'repaired')."""
     f = FileStore(workspace).add(mixed_pdf)
     # Drop the page_text JSONs so check is forced to re-extract.
-    for p in workspace.file_text_dir(f.record.id).glob(PAGE_TEXT_GLOB):
-        p.unlink()
+    workspace.blobs.delete_blobs(layout.file_text_prefix(f.record.id))
 
     report = check_workspace(workspace)
     issues = [i for i in report.issues if i.kind == "page_text_count_mismatch"]
@@ -167,7 +171,7 @@ def test_check_partial_empty_re_extract_records_non_permanent(
     assert not any(i.repaired for i in issues)
     assert any("had no extractable digital text" in i.message for i in issues)
 
-    errors = load_recorded_errors(workspace.file_errors_path(f.record.id))
+    errors = load_recorded_errors(workspace, f.record.id)
     text_errs = [e for e in errors if e.operation == "text_extraction"]
     assert text_errs and any(not e.permanent for e in text_errs)
 
@@ -180,7 +184,7 @@ def test_file_add_blank_pdf_soft_fails_text_extraction(
     assert result.text_extraction_error is not None
     assert "no digital text" in result.text_extraction_error.lower()
 
-    errors = load_recorded_errors(workspace.file_errors_path(result.record.id))
+    errors = load_recorded_errors(workspace, result.record.id)
     text_errs = [e for e in errors if e.operation == "text_extraction"]
     assert text_errs
     assert any(e.permanent for e in text_errs)
@@ -189,7 +193,7 @@ def test_file_add_blank_pdf_soft_fails_text_extraction(
 def test_check_retry_errors_re_runs_text_extraction(workspace: Workspace, sample_pdf: Path) -> None:
     f = FileStore(workspace).add(sample_pdf)
     # Confirm permanent text-extraction error was recorded.
-    errs = load_recorded_errors(workspace.file_errors_path(f.record.id))
+    errs = load_recorded_errors(workspace, f.record.id)
     assert any(e.operation == "text_extraction" and e.permanent for e in errs)
 
     # Without --retry-errors: the permanent marker blocks re-attempts.
@@ -199,8 +203,7 @@ def test_check_retry_errors_re_runs_text_extraction(workspace: Workspace, sample
 
     # Delete the page_text JSONs to simulate missing extraction output and
     # force the consistency check to attempt re-extraction.
-    for p in workspace.file_text_dir(f.record.id).glob(PAGE_TEXT_GLOB):
-        p.unlink()
+    workspace.blobs.delete_blobs(layout.file_text_prefix(f.record.id))
 
     # With --retry-errors: the marker is cleared; re-extraction runs and (for
     # a blank PDF) re-records the same permanent failure.
@@ -216,13 +219,12 @@ def test_check_repairs_missing_page_text_for_digital_pdf(
     --retry-errors should re-extract and mark the issue repaired."""
     f = FileStore(workspace).add(text_pdf)
     assert f.text_extraction_error is None
-    for p in workspace.file_text_dir(f.record.id).glob(PAGE_TEXT_GLOB):
-        p.unlink()
+    workspace.blobs.delete_blobs(layout.file_text_prefix(f.record.id))
 
     report = check_workspace(workspace)
     repaired = [i for i in report.issues if i.kind == "page_text_count_mismatch" and i.repaired]
     assert repaired, report.to_json()
-    assert len(list(workspace.file_text_dir(f.record.id).glob(PAGE_TEXT_GLOB))) == 2
+    assert len(_page_texts(workspace, f.record.id)) == 2
 
 
 def test_check_re_extracts_at_the_files_own_dpi(workspace: Workspace, text_pdf: Path) -> None:
@@ -234,15 +236,15 @@ def test_check_re_extracts_at_the_files_own_dpi(workspace: Workspace, text_pdf: 
     """
     f = FileStore(workspace).add(text_pdf, dpi=150)
     assert f.record.page_image_dpi == 150
-    text_dir = workspace.file_text_dir(f.record.id)
-    before = json.loads((text_dir / "page_1.json").read_text())
+    before = workspace.read_page_text(f.record.id, 1)
+    assert before is not None
     assert before["width"] == round(PAGE_WIDTH_PTS * 150 / 72)
 
-    for p in text_dir.glob(PAGE_TEXT_GLOB):
-        p.unlink()
+    workspace.blobs.delete_blobs(layout.file_text_prefix(f.record.id))
     check_workspace(workspace)
 
-    after = json.loads((text_dir / "page_1.json").read_text())
+    after = workspace.read_page_text(f.record.id, 1)
+    assert after is not None
     assert after["width"] == before["width"]
     assert after["height"] == before["height"]
     assert after["words"] == before["words"]
@@ -253,15 +255,14 @@ def test_check_falls_back_to_the_default_dpi_for_legacy_records(
 ) -> None:
     """Records written before page_image_dpi existed mean "the default was in force"."""
     f = FileStore(workspace).add(text_pdf)
-    record_path = workspace.file_json_path(f.record.id)
-    data = json.loads(record_path.read_text())
+    data = workspace.docs.get_doc("files", f.record.id)
+    assert data is not None
     del data["page_image_dpi"]
-    record_path.write_text(json.dumps(data))
+    workspace.docs.put_doc("files", f.record.id, data)
 
-    text_dir = workspace.file_text_dir(f.record.id)
-    for p in text_dir.glob(PAGE_TEXT_GLOB):
-        p.unlink()
+    workspace.blobs.delete_blobs(layout.file_text_prefix(f.record.id))
     check_workspace(workspace)
 
-    page = json.loads((text_dir / "page_1.json").read_text())
+    page = workspace.read_page_text(f.record.id, 1)
+    assert page is not None
     assert page["width"] == round(PAGE_WIDTH_PTS * DEFAULT_DPI / 72)

@@ -39,9 +39,10 @@ from typing import Any
 from lxml import etree  # type: ignore[import-untyped]
 from lxml.etree import _Element  # type: ignore[import-untyped]
 
+from . import layout
 from .errors import DocSetNotFound, FileNotFound, InvalidArgument, NotFoundError
 from .models import FileRecord
-from .storage import Workspace, read_json
+from .storage import Workspace
 
 # Regex to strip xmlns declarations from serialized XML snippets.
 _XMLNS_RE = re.compile(r'\s+xmlns(?::\w+)?="[^"]*"')
@@ -144,33 +145,29 @@ def load_subtree_root(ws: Workspace, file_id: str, docset_id: str) -> _Element:
         raise InvalidArgument("file id must not be empty")
     if not docset_id.strip():
         raise InvalidArgument("docset id must not be empty")
-    if not ws.file_dir(file_id).exists():
+    record_data = ws.docs.get_doc(layout.Collection.FILES, file_id)
+    if record_data is None:
         raise FileNotFound(f"file '{file_id}' not found in workspace")
-    if not ws.docset_dir(docset_id).exists():
+    if ws.docs.get_doc(layout.Collection.DOCSETS, docset_id) is None:
         raise DocSetNotFound(f"docset '{docset_id}' not found in workspace")
 
-    record = FileRecord.from_json(read_json(ws.file_json_path(file_id)))
+    record = FileRecord.from_json(record_data)
     stem = Path(record.original_filename).stem
-    xml_path = ws.file_dgml_xml_path(docset_id, file_id, stem)
-    if not xml_path.exists():
+    xml_key = layout.dgml_xml_key(docset_id, file_id, stem)
+    if not ws.blobs.blob_exists(xml_key):
         raise NotFoundError(
             f"no generated DGML XML for file '{file_id}' in docset '{docset_id}' "
-            f"(expected {xml_path})"
+            f"(expected {xml_key})"
         )
 
-    # Prefer grounded variant if present.
-    name = xml_path.name
-    if name.endswith(".xml"):
-        grounded_path = xml_path.with_name(name[: -len(".xml")] + ".grounded.xml")
-    else:
-        grounded_path = xml_path.with_name(name + ".grounded.xml")
-    preferred = grounded_path if grounded_path.exists() else xml_path
+    # Prefer the grounded variant (``<stem>.dgml.grounded.xml``) if present.
+    grounded_key = layout.dgml_grounded_xml_key(docset_id, file_id, stem)
+    preferred = grounded_key if ws.blobs.blob_exists(grounded_key) else xml_key
 
     try:
-        tree = etree.parse(str(preferred))
+        root: _Element = etree.fromstring(ws.blobs.get_blob(preferred))
     except etree.XMLSyntaxError as exc:
         raise ValueError(f"{preferred} is not well-formed XML: {exc}") from exc
-    root: _Element = tree.getroot()
     return root
 
 

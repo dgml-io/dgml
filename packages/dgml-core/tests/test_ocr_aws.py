@@ -67,9 +67,9 @@ def test_aws_missing_sdk_raises_ocr_failed(
     with pytest.raises(OcrFailed, match="pip install dgml\\[aws\\]"):
         extract_text_ocr(
             text_pdf,
-            workspace.file_text_dir("does-not-matter"),
+            workspace.root / "page_text",
             file_id="does-not-matter",
-            page_images_dir=workspace.file_pages_dir("does-not-matter"),
+            page_images_dir=workspace.root / "page_images",
             config=cfg,
         )
 

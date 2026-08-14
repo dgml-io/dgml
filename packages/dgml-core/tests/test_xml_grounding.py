@@ -21,13 +21,15 @@ Pages are 1000x1000 px here, so a word at x=100 reads back as left=100.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
+from dgml_core import layout
 from dgml_core.errors import FileNotFound, GroundingFailed
 from dgml_core.models import FileRecord
-from dgml_core.storage import Workspace, write_json_atomic
+from dgml_core.storage import Workspace
 from dgml_core.xml_grounding import (
     _lis_pairs,
     ground_dgml_xml,
@@ -54,7 +56,6 @@ def _line(words: str, top: int) -> list[dict[str, Any]]:
 
 
 def _seed_pages(workspace: Workspace, pages: dict[int, list[dict[str, Any]]]) -> None:
-    workspace.file_dir(FILE_ID).mkdir(parents=True, exist_ok=True)
     record = FileRecord(
         id=FILE_ID,
         original_path="/fake/contract.pdf",
@@ -64,12 +65,13 @@ def _seed_pages(workspace: Workspace, pages: dict[int, list[dict[str, Any]]]) ->
         page_count=len(pages),
         text_mode="digital",
     )
-    write_json_atomic(workspace.file_json_path(FILE_ID), record.to_json())
-    workspace.file_text_dir(FILE_ID).mkdir(parents=True, exist_ok=True)
+    workspace.docs.put_doc("files", FILE_ID, record.to_json())
     for page, words in pages.items():
-        write_json_atomic(
-            workspace.file_text_dir(FILE_ID) / f"page_{page}.json",
-            {"file_id": FILE_ID, "page": page, "width": 1000, "height": 1000, "words": words},
+        workspace.blobs.put_blob(
+            layout.file_page_text_key(FILE_ID, page),
+            json.dumps(
+                {"file_id": FILE_ID, "page": page, "width": 1000, "height": 1000, "words": words}
+            ).encode(),
         )
 
 
@@ -276,7 +278,6 @@ def test_existing_output_requires_force(workspace: Workspace, tmp_path: Path) ->
 
 
 def test_missing_page_text_raises(workspace: Workspace, tmp_path: Path) -> None:
-    workspace.file_dir(FILE_ID).mkdir(parents=True, exist_ok=True)
     with pytest.raises(FileNotFound):
         _ground(workspace, tmp_path, _STANDARD_XML)
 

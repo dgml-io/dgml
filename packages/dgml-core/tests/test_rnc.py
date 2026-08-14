@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from dgml_core import layout
 from dgml_core.generation.rnc import build_rnc, rnc_to_schema_dict, write_docset_rnc
+from dgml_core.storage import Workspace
 
 _SCHEMA = {
     "tags": {
@@ -100,16 +102,17 @@ def test_rnc_reverse_defaults_without_comments() -> None:
     assert data["notes"] == ""
 
 
-def test_write_docset_rnc(tmp_path: Path) -> None:
-    """Writes <docset>/full-schema.rnc from schema.json + XML; None without one."""
-    assert write_docset_rnc(tmp_path) is None  # no schema.json yet
+def test_write_docset_rnc(workspace: Workspace) -> None:
+    """Writes the docset's full-schema.rnc from schema.json + XML; None without one."""
+    ws = workspace
+    did = "d1"
+    assert write_docset_rnc(ws, did) is None  # no schema.json yet
 
-    (tmp_path / "schema.json").write_text(json.dumps(_SCHEMA), encoding="utf-8")
-    (tmp_path / "docset.json").write_text(json.dumps({"name": "synthetic"}), encoding="utf-8")
-    xml_dir = tmp_path / "files" / "f1"
-    xml_dir.mkdir(parents=True)
-    (xml_dir / "doc.dgml.xml").write_text(_XML, encoding="utf-8")
+    # The generation schema is a blob (exact Schema.save bytes), not a document.
+    ws.blobs.put_blob(layout.docset_generation_schema_key(did), json.dumps(_SCHEMA).encode("utf-8"))
+    ws.docs.put_doc("docsets", did, {"id": did, "name": "synthetic"})
+    ws.blobs.put_blob("docsets/d1/files/f1/doc.dgml.xml", _XML.encode("utf-8"))
 
-    out = write_docset_rnc(tmp_path)
-    assert out == tmp_path / "full-schema.rnc" and out.exists()
-    assert rnc_to_schema_dict(out.read_text(encoding="utf-8")) == _SCHEMA
+    key = write_docset_rnc(ws, did)
+    assert key == "docsets/d1/full-schema.rnc"
+    assert rnc_to_schema_dict(ws.blobs.get_blob(key).decode("utf-8")) == _SCHEMA

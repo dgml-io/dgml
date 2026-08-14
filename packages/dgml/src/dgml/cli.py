@@ -20,12 +20,15 @@ non-interactive flag-driven commands.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
+from dgml_core import layout
+from dgml_core import registry as ws_registry
 from dgml_core.classification import (
     ClassificationConfig,
     classify_file,
@@ -37,6 +40,11 @@ from dgml_core.default_config import PROVIDER_MODELS
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import DgmlError, WorkspaceNotInitialized, short_error_message
 from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
+from dgml_core.migrations import (
+    MigrationResult,
+    migrate_workspace,
+    stamp_schema_version,
+)
 from dgml_core.models import DocSet
 from dgml_core.pages import DEFAULT_DPI
 from dgml_core.storage import (
@@ -48,6 +56,7 @@ from dgml_core.storage import (
     user_config_path,
     write_user_config,
 )
+from dgml_core.storage_resolve import DEFAULT_STORAGE_SERVICE
 from dgml_core.text_extraction import TextMode
 
 if TYPE_CHECKING:
@@ -274,6 +283,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Human-readable workspace name (identity metadata, stored in workspace.json). "
             "Defaults to the workspace directory name."
+        ),
+    )
+    ws_create.add_argument(
+        "--storage",
+        default=None,
+        help=(
+            "Name of the storage service to create this workspace on — a "
+            "[storage.<name>] table in your config.toml. Its non-secret config is "
+            "snapshotted into the workspace's registry entry. Omit for the bundled "
+            "local-disk default."
+        ),
+    )
+    workspace_sub.add_parser(
+        "list",
+        parents=[common],
+        help="List the workspaces registered on this machine (id, name, root).",
+    )
+    ws_register = workspace_sub.add_parser(
+        "register",
+        parents=[common],
+        help=(
+            "Index an existing workspace in this machine's registry so it can be opened "
+            "by id. Mints a workspace_id if the workspace lacks one; updates the recorded "
+            "root for a moved workspace."
+        ),
+    )
+    ws_register.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Workspace directory. Optional; defaults to the globally-resolved workspace.",
+    )
+    ws_register.add_argument(
+        "--storage",
+        default=None,
+        help=(
+            "Re-seal the workspace to this storage service (a [storage.<name>] table in "
+            "config.toml), re-snapshotting its config into the registry. Omit to keep the "
+            "workspace's current service."
         ),
     )
     sub.add_parser("status", parents=[common], help="Show workspace summary.")
@@ -984,6 +1033,28 @@ def _add_chain_subparsers(
         _chain_config_arg(pv)
 
 
+def _report_migrations(
+    results: list[MigrationResult], ws: Workspace, args: argparse.Namespace
+) -> None:
+    """Announce an applied workspace migration on stderr, under ``--verbose``.
+
+    Verbose-gated on purpose. Migrations are automatic, additive and
+    idempotent, so the default-quiet cost is low — whereas stderr carries the
+    structured error envelope this CLI promises its callers, and a notice
+    printed ahead of a failing command would leave stderr holding a plain-text
+    line *and* a JSON object, breaking every agent that parses it. Under
+    ``--verbose`` stderr is already non-JSON (that is where the traceback
+    goes), so the notice is free there.
+
+    A migration that changed nothing says nothing either way: bumping the
+    version stamp on a workspace that had no work to do is bookkeeping, not an
+    upgrade."""
+    if not (getattr(args, "verbose", False) or os.environ.get("DGML_DEBUG")):
+        return
+    for result in (r for r in results if r.changed):
+        sys.stderr.write(f"[dgml] upgraded workspace at {ws.root} — {result.summary()}\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -994,10 +1065,25 @@ def main(argv: list[str] | None = None) -> int:
         # `init` manages only the user-level config; `workspace create`
         # is what actually builds the workspace — so both run before the
         # workspace exists.
-        if args.command not in ("init", "workspace") and not ws.is_initialized():
-            raise WorkspaceNotInitialized(
-                f"workspace at {ws.root} is not initialized — run 'dgml workspace create'"
-            )
+        if args.command not in ("init", "workspace"):
+            # Integrity-check the workspace's registry entry BEFORE its storage
+            # config is trusted to build the store — a hand-edited workspaces.json
+            # entry raises here (store-free), rather than silently opening a
+            # tampered backend. `workspace register` (exempt above) is how it is
+            # re-sealed, so it is never blocked by this.
+            ws_registry.verify_storage_seal(ws)
+            if not ws.is_initialized():
+                raise WorkspaceNotInitialized(
+                    f"workspace at {ws.root} is not initialized — run 'dgml workspace create'"
+                )
+            # Upgrade an older workspace in place before anything reads it. This
+            # is the one point every command passes through, so there is no
+            # separate migrate step to remember. No-op (one document read) when
+            # the workspace is already current. Migration mints a workspace_id
+            # (store-agnostic); then index it in this machine's registry so it is
+            # openable by id / listed — additive and idempotent.
+            _report_migrations(migrate_workspace(ws), ws, args)
+            ws_registry.ensure_registered(ws)
         return _dispatch(args, ws, fmt)
     except DgmlError as exc:
         return _emit_error(exc.code, str(exc), fmt)
@@ -1138,16 +1224,30 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         if args.path is not None:
             ws = Workspace.resolve(args.path)
 
-        ws.init()
         name = args.name or ws.root.name
-        ws.write_meta(name=name, organization=args.organization)
+        service = args.storage or DEFAULT_STORAGE_SERVICE
+        # Register FIRST — this mints the id and seals the entry store-free, so it
+        # validates the named storage service (a bad --storage raises here before
+        # anything is created) and the entry exists for ws.store below to resolve
+        # the chosen backend.
+        workspace_id = ws_registry.register_workspace(
+            ws, name=name, organization=args.organization, service=service
+        )
+        # Now build the workspace through the selected backend.
+        ws.init()
+        ws.write_meta(name=name, organization=args.organization, workspace_id=workspace_id)
+        # Stamp the current layout revision so a brand-new workspace is never
+        # mistaken for an old one and re-scanned by the migration on first use.
+        stamp_schema_version(ws)
 
         upath = user_config_path()
         config_present = upath.exists()
         payload: dict[str, Any] = {
             "workspace": str(ws.root),
+            "workspace_id": workspace_id,
             "name": name,
             "organization": args.organization,
+            "storage_service": service,
             "initialized": True,
             "config_path": str(upath),
             "config_present": config_present,
@@ -1162,6 +1262,52 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 "Run `dgml init` and set ANTHROPIC_API_KEY / GEMINI_API_KEY.\n"
             )
         _emit(payload, fmt)
+        return 0
+
+    if sub == "list":
+        _emit(
+            {
+                "workspaces": [
+                    {
+                        "workspace_id": e.workspace_id,
+                        "name": e.name,
+                        "organization": e.organization,
+                        "root": e.root,
+                        "storage_service": e.storage_service,
+                        "created_at": e.created_at,
+                    }
+                    for e in ws_registry.list_entries()
+                ]
+            },
+            fmt,
+        )
+        return 0
+
+    if sub == "register":
+        if args.path is not None:
+            ws = Workspace.resolve(args.path)
+        if not ws.is_initialized():
+            raise WorkspaceNotInitialized(
+                f"workspace at {ws.root} is not initialized — run 'dgml workspace create'"
+            )
+        # Reuses the workspace's own id if it has one (a moved dir keeps its id),
+        # else mints and writes one back. Overwrites (re-seals) the entry — the
+        # adopt-new-config / repair-a-hand-edited-entry fix — unlike the additive
+        # auto-registration on open. --storage switches the storage service; omitted
+        # keeps the entry's current one.
+        wid = ws_registry.reregister_workspace(ws, service=args.storage)
+        entry = ws_registry.get(wid)
+        _emit(
+            {
+                "workspace": str(ws.root),
+                "workspace_id": wid,
+                "name": ws.display_name,
+                "organization": ws.organization,
+                "storage_service": entry.storage_service if entry else DEFAULT_STORAGE_SERVICE,
+                "registered": True,
+            },
+            fmt,
+        )
         return 0
 
     raise AssertionError(f"unhandled workspace subcommand: {sub}")  # unreachable (required=True)
@@ -1793,7 +1939,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 "mode": result.mode,
                 "tool_calls": result.tool_calls,
                 "field_count": len(result.values),
-                "xml_path": str(result.xml_path),
+                "xml_key": result.xml_key,
             },
             fmt,
         )
@@ -1803,9 +1949,13 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         from dgml_core.extraction_xml import has_extraction
 
         # Extracted values live as a dg:extraction element inside the file's
-        # core <stem>.dgml.xml — the single *.dgml.xml in the marker dir.
-        candidates = sorted(ws.docset_file_dir(args.docset_id, args.file_id).glob("*.dgml.xml"))
-        xml = candidates[0].read_text(encoding="utf-8") if candidates else ""
+        # core <stem>.dgml.xml — the single *.dgml.xml blob in the pair's prefix.
+        dgml_keys = sorted(
+            k
+            for k in ws.blobs.list_blobs(layout.docset_pair_prefix(args.docset_id, args.file_id))
+            if k.endswith(".dgml.xml")
+        )
+        xml = ws.blobs.get_blob(dgml_keys[0]).decode("utf-8") if dgml_keys else ""
         if not xml or not has_extraction(xml):
             return _emit_error(
                 "VALUES_NOT_FOUND",
@@ -2007,7 +2157,7 @@ def _file_result(status: str, file_id: str, source: str, **extra: Any) -> dict[s
     return {"status": status, "file_id": file_id, "source": source, **extra}
 
 
-def _has_generated_tree(xml_path: Path) -> bool:
+def _has_generated_tree(xml_text: str) -> bool:
     """True when a ``<stem>.dgml.xml`` holds a generated document tree — the
     `docset generate` skip test. An extraction-only file (whose root has just a
     ``dg:extraction`` child) or an unparseable one returns False so generation
@@ -2015,7 +2165,7 @@ def _has_generated_tree(xml_path: Path) -> bool:
     from dgml_core.extraction_xml import has_document_tree
 
     try:
-        return has_document_tree(xml_path.read_text(encoding="utf-8"))
+        return has_document_tree(xml_text)
     except Exception:
         return False
 
@@ -2026,11 +2176,16 @@ def _generate_payload(
     skipped: list[dict[str, Any]],
     failed: list[dict[str, Any]],
     converted: list[dict[str, Any]],
-    output_dir: Path,
-    coverage_report: Path | None,
+    output_key: str,
+    coverage_report: str | None,
 ) -> dict[str, Any]:
     """The single `docset generate` envelope, built the same way whether or not
-    any file actually needed converting (so the two paths can't drift)."""
+    any file actually needed converting (so the two paths can't drift).
+
+    ``output_key`` is the docset's store key (``docsets/<id>``) — the prefix the
+    per-file DGML lives under — and ``coverage_report`` its report key or None.
+    Both are store-native keys, not local paths, so the envelope is meaningful on
+    any backend."""
     return {
         "docset_id": ds.id,
         "docset_name": ds.name,
@@ -2040,8 +2195,8 @@ def _generate_payload(
             "skipped": len(skipped),
             "failed": len(failed),
         },
-        "output_dir": str(output_dir),
-        "coverage_report": str(coverage_report) if coverage_report is not None else None,
+        "output_key": output_key,
+        "coverage_report": coverage_report,
         "results": skipped + failed + converted,
     }
 
@@ -2146,12 +2301,17 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         operation=OPERATION_LINKS,
     )
 
-    # The docset directory is always the output base — schema.json,
-    # coverage_report.json, cache/, and semantic/ live here. Each file's
-    # final .dgml.xml lands in its per-(docset, file) directory (see
-    # ws.file_dgml_xml_path) so placement is deterministic and stable.
-    output_dir = ws.docset_dir(args.docset_id)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # The docset prefix is always the output base — schema.json,
+    # coverage_report.json, cache/, and semantic/ live under it. Each file's
+    # final .dgml.xml lands at its per-(docset, file) key (see
+    # layout.dgml_xml_key) so placement is deterministic and stable.
+    # The docset's store key (``docsets/<id>``) — the prefix the cache, coverage
+    # report, and per-file DGML live under. Reported to the user and used to
+    # build child keys; no directory is created here (the store owns that).
+    # Slash-stripped because it is echoed as ``output_key`` in the JSON result,
+    # where the trailing-slash form would be a breaking change; nothing
+    # prefix-matches on it.
+    output_key = layout.docset_prefix(args.docset_id).rstrip("/")
 
     # Resolve each assigned file into exactly one bucket so the summary counts
     # always sum to `total`: skipped (already converted), failed (source
@@ -2160,13 +2320,13 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # and the run continues (exit 0), matching `dgml cluster`.
     skipped_results: list[dict[str, Any]] = []
     failed_results: list[dict[str, Any]] = []
-    # original_filename → list of (file_id, pdf_path, out_xml, page_text_dir).
+    # original_filename → list of (file_id, out_xml_key, page_text_prefix).
     # Grouped by filename to detect collisions: convert_batch keys documents by
     # filename, so two files sharing a basename can't both convert in one run.
-    candidates: dict[str, list[tuple[str, Path, Path, Path | None]]] = {}
+    candidates: dict[str, list[tuple[str, str, str | None]]] = {}
     # Already-generated docs, for whole-docset roster reuse + namespacing recompute.
     prior_stems: dict[str, str] = {}  # cache stem → original_filename
-    prior_out_paths: dict[str, Path] = {}  # original_filename → existing .dgml.xml
+    prior_out_paths: dict[str, str] = {}  # original_filename → existing .dgml.xml key
     # original_filename → file id for grounding (resolves the file's page OCR).
     # Spans candidates *and* re-rendered prior docs; kept separate from
     # filename_to_fid so the failure-reconciliation loop stays candidate-only.
@@ -2174,8 +2334,15 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     for fid in file_ids:
         record = file_store.get(fid)
         name = record.original_filename
-        pdf_path = ws.file_dir(fid) / name
-        if not pdf_path.exists():
+        stem = Path(name).stem
+        # Generation slices the persisted <stem>.pdf, or — for a file added before
+        # conversions were persisted — the original source, converted on demand.
+        # Both are store blobs under the file's prefix; materialized to a real
+        # path for transcription just before convert_batch (below).
+        if not (
+            ws.blobs.blob_exists(layout.file_source_key(fid, f"{stem}.pdf"))
+            or ws.blobs.blob_exists(layout.file_source_key(fid, name))
+        ):
             failed_results.append(
                 _file_result(
                     "failed",
@@ -2183,39 +2350,42 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     name,
                     error={
                         "code": "FILE_NOT_FOUND",
-                        "message": f"source not found at {pdf_path} for file '{fid}'",
+                        "message": f"no source PDF for file '{fid}'",
                     },
                 )
             )
             _diag(f"Source missing for {name} (file '{fid}') — reported as failed")
             continue
-        out_xml = ws.file_dgml_xml_path(args.docset_id, fid, pdf_path.stem)
-        if out_xml.exists() and _has_generated_tree(out_xml):
+        out_xml_key = layout.dgml_xml_key(args.docset_id, fid, stem)
+        if ws.blobs.blob_exists(out_xml_key) and _has_generated_tree(
+            ws.blobs.get_blob(out_xml_key).decode("utf-8")
+        ):
             # Skip only when a generated document tree is present. An
             # extraction-only file (`extraction extract` ran before
             # `generate`) falls through and gets its tree built; _on_output
             # carries the existing dg:extraction over into the fresh render.
-            skipped_results.append(_file_result("skipped", fid, name, output=str(out_xml)))
-            prior_stems[pdf_path.stem] = name
-            prior_out_paths[name] = out_xml
+            skipped_results.append(_file_result("skipped", fid, name, output=out_xml_key))
+            prior_stems[stem] = name
+            prior_out_paths[name] = out_xml_key
             name_to_fid[name] = fid  # in case it re-renders below and needs re-grounding
             _diag(f"Skipping {name} (already converted)")
             continue
-        ptd = ws.file_text_dir(fid)
+        pt_prefix = layout.file_text_prefix(fid)
         candidates.setdefault(name, []).append(
-            (fid, pdf_path, out_xml, ptd if ptd.is_dir() else None)
+            (fid, out_xml_key, pt_prefix if ws.blobs.list_blobs(pt_prefix) else None)
         )
 
     # Same-basename collision: the typed-block pipeline keys documents by
     # filename, so it can't tell two same-named files apart in one batch.
     # Fail them explicitly instead of silently dropping/misattributing output.
-    pdf_paths: list[Path | str] = []
-    dgml_xml_paths: dict[str, Path] = {}
+    convert_names: list[str] = []
+    dgml_xml_keys: dict[str, str] = {}
     filename_to_fid: dict[str, str] = {}
     page_text_dirs: dict[str, Path] = {}
+    page_text_prefixes: dict[str, str] = {}
     for name, group in candidates.items():
         if len(group) > 1:
-            for fid, _pdf, _out, _ptd in group:
+            for fid, _out, _pref in group:
                 failed_results.append(
                     _file_result(
                         "failed",
@@ -2233,19 +2403,21 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 )
             _diag(f"Duplicate filename '{name}' across {len(group)} files — reported as failed")
             continue
-        fid, pdf_path, out_xml, pt_dir = group[0]
-        pdf_paths.append(pdf_path)
-        dgml_xml_paths[name] = out_xml
+        fid, out_xml_key, pt_pfx = group[0]
+        convert_names.append(name)
+        dgml_xml_keys[name] = out_xml_key
         filename_to_fid[name] = fid
         name_to_fid[name] = fid
-        if pt_dir is not None:
-            page_text_dirs[name] = pt_dir
+        if pt_pfx is not None:
+            page_text_prefixes[name] = pt_pfx
 
     # Coverage is computed (and its per-file summary printed) whenever the user
     # didn't pass --no-coverage, but the coverage_report.json *file* is an
     # intermediate artifact persisted only under --debug.
     compute_cov = not args.no_coverage
-    cov_path = output_dir / "coverage_report.json" if (compute_cov and args.debug) else None
+    cov_report_key = (
+        layout.docset_coverage_report_key(args.docset_id) if (compute_cov and args.debug) else None
+    )
     written: list[dict[str, Any]] = []
     rerendered: list[str] = []
     cov_results: list[dict[str, Any]] = []
@@ -2275,37 +2447,47 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
 
     def _on_output(name: str, xml: str) -> None:
-        out_xml = dgml_xml_paths[name]
-        out_xml.parent.mkdir(parents=True, exist_ok=True)
-        # A file already at this path may carry extracted values — an
+        xml_key = dgml_xml_keys[name]
+        # A blob already at this key may carry extracted values — an
         # extraction-only file getting its tree now, or a full-extraction
         # file being re-rendered. Capture its dg:extraction before the fresh
         # render overwrites it; re-embedded below after grounding + semlinks.
         prior_with_extraction: str | None = None
-        if out_xml.exists():
+        if ws.blobs.blob_exists(xml_key):
             try:
-                prior_text = out_xml.read_text(encoding="utf-8")
+                prior_text = ws.blobs.get_blob(xml_key).decode("utf-8")
                 if has_extraction(prior_text):
                     prior_with_extraction = prior_text
             except Exception:
                 prior_with_extraction = None  # unparseable prior — nothing to carry
-        out_xml.write_text(xml, encoding="utf-8")
+        ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
         # Ground in place: re-parse the just-written tree, align it against the
         # file's page OCR, and rewrite <stem>.dgml.xml with dg:origin boxes.
         # Deterministic and free; a file with no page_text is left ungrounded.
         # Runs for re-rendered prior docs too — their fresh XML would otherwise
-        # lose the boxes a previous run grounded in.
+        # lose the boxes a previous run grounded in. Grounding needs a real path
+        # (lxml); materialize the blob to a working copy, ground in place, then
+        # persist the result (and its stats sidecar) back through the store.
         grounding: dict[str, Any]
         try:
-            res = ground_dgml_xml(
-                ws,
-                name_to_fid[name],
-                out_xml,
-                output_path=out_xml,
-                force=True,
-                write_stats=args.debug,
-                debug=args.debug,
-            )
+            with ws.blobs.materialize(xml_key) as gpath:
+                res = ground_dgml_xml(
+                    ws,
+                    name_to_fid[name],
+                    gpath,
+                    output_path=gpath,
+                    force=True,
+                    write_stats=args.debug,
+                    debug=args.debug,
+                )
+                ws.blobs.put_blob(xml_key, gpath.read_bytes())
+                if res.stats_path is not None and res.stats_path.exists():
+                    ws.blobs.put_blob(
+                        layout.pair_artifact_key(
+                            args.docset_id, name_to_fid[name], res.stats_path.name
+                        ),
+                        res.stats_path.read_bytes(),
+                    )
         except DgmlError as exc:
             grounding = {
                 "grounded": False,
@@ -2327,8 +2509,8 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         links_added = 0
         if not args.no_semlinks:
             try:
-                linked, applied = add_links(out_xml.read_text(encoding="utf-8"), link_config)
-                out_xml.write_text(linked, encoding="utf-8")
+                linked, applied = add_links(ws.blobs.get_blob(xml_key).decode("utf-8"), link_config)
+                ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
                 links_added = len(applied)
                 _diag(f"[semlinks] {name}: {links_added} link(s)")
             except Exception as exc:  # a link-pass failure must not lose the DGML
@@ -2339,9 +2521,9 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         if prior_with_extraction is not None:
             try:
                 merged = carry_extraction_over(
-                    prior_with_extraction, out_xml.read_text(encoding="utf-8")
+                    prior_with_extraction, ws.blobs.get_blob(xml_key).decode("utf-8")
                 )
-                out_xml.write_text(merged, encoding="utf-8")
+                ws.blobs.put_blob(xml_key, merged.encode("utf-8"))
                 _diag(f"[extraction] {name}: carried dg:extraction over into the fresh render")
             except Exception as exc:  # never lose the fresh DGML over the merge
                 _diag(f"[extraction] {name}: dg:extraction NOT carried over ({exc})")
@@ -2362,123 +2544,165 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 "converted",
                 filename_to_fid[name],
                 name,
-                output=str(out_xml),
+                output=xml_key,
                 links=links_added,
                 **grounding,
                 **label_extra,
             )
         )
 
-    if pdf_paths:
+    if convert_names:
         # The cache always exists — it holds functional files the next run
         # reloads (blocks, per-chunk labels, concept_roster.json). --debug only
         # controls whether the extra debug-only artifacts are also written
         # (threaded via ConvertOptions.debug below).
-        cache_dir = args.cache_dir or output_dir / "cache"
-        roster_path = Path(cache_dir) / "concept_roster.json"
-        schema_seed = None
-        roster_seed: dict[str, str] | None = None
-        parent_map_seed: dict[str, str] = {}
-        if args.schema_path:
-            schema_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
-            _diag(
-                f"Loaded schema: {len(schema_seed.tags)} concept(s), "
-                f"{len(parent_map_seed)} container link(s) from {args.schema_path}"
-            )
-        elif not args.no_roster:
-            # Incremental reuse prefers the docset's own schema.json — full
-            # fidelity (role descriptions, observed examples, kind, hierarchy)
-            # — over the flat cache/concept_roster.json fallback. Unlike
-            # --schema-path, no parent_map is derived here: entity-container
-            # grouping stays an explicit opt-in.
-            from dgml_core.generation.schema import Schema
-
-            schema_json_path = Path(cache_dir).parent / "schema.json"
-            if schema_json_path.exists():
-                try:
-                    schema_seed = Schema.load(schema_json_path)
-                    _diag(f"Reusing docset schema: {len(schema_seed.tags)} tag(s)")
-                except (json.JSONDecodeError, TypeError, ValueError, OSError):
-                    schema_seed = None
-            if schema_seed is None and roster_path.exists():
-                try:
-                    roster_seed = _load_schema_roster(roster_path)
-                    _diag(f"Reusing docset roster: {len(roster_seed)} concept(s)")
-                except InvalidArgument:
-                    roster_seed = None
-
-        # Reload already-generated docs from cache so the whole docset stays
-        # consistent as its schema/roster grows; changed originals re-render
-        # (no re-LLM).
-        for stem, blocks in load_labeled_docs_from_cache(cache_dir, list(prior_stems)).items():
-            nm = prior_stems[stem]
-            prior_docs[nm] = blocks
-            prior_outputs[nm] = prior_out_paths[nm].read_text(encoding="utf-8")
-            dgml_xml_paths[nm] = prior_out_paths[nm]
-
-        options = ConvertOptions(
-            model=gen_model,
-            label_model=label_model,
-            api_key=gen_api_key,
-            api_base=gen_api_base,
-            label_api_key=label_api_key,
-            label_api_base=label_api_base,
-            window_size=args.window_size,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            max_parallel_docs=args.max_parallel_calls,
-            cache_dir=cache_dir,
-            debug=args.debug,
-            page_text_dirs=page_text_dirs,
-            workspace=ws,
-            dgml_header=build_header(ws.organization, ds.name),
-            converters=load_conversion_config(ws),
-            roster_seed=roster_seed,
-            schema_seed=schema_seed,
-            parent_map=parent_map_seed or None,
-            progress=_diag,
-        )
-        convert_batch(
-            pdf_paths,
-            options=options,
-            on_output=_on_output,
-            on_error=_on_error,
-            on_label_error=_on_label_error,
-            prior_docs=prior_docs,
-            prior_outputs=prior_outputs,
-        )
-        # convert_batch silently drops documents whose transcription failed, so
-        # `_on_output` never fires for them. Reconcile: any queued file with no
-        # output is a per-file failure, not a vanished row (keeps counts summing
-        # to `total`).
-        produced = {entry["source"] for entry in written}
-        for name, fid in filename_to_fid.items():
-            if name not in produced:
-                message = gen_errors.get(
-                    name, "the generation pipeline produced no output for this file"
+        # The cache is a store-backed working directory: its blobs are pulled in
+        # before the run and pushed back after (LocalStore works in place, no
+        # copy). A --cache-dir override stays a plain local directory (explicit
+        # scratch, not store-backed). schema.json — written by labeling next to
+        # the cache — rides along, persisted as the docset's generation-schema
+        # blob (exact bytes, so no reserialization drift).
+        with contextlib.ExitStack() as _cache_stack:
+            if args.cache_dir:
+                cache_dir = Path(args.cache_dir)
+            else:
+                cache_dir = _cache_stack.enter_context(
+                    ws.blobs.working_dir(layout.generation_cache_prefix(args.docset_id))
                 )
-                failed_results.append(
-                    _file_result(
-                        "failed",
-                        fid,
-                        name,
-                        error={"code": "GENERATION_FAILED", "message": message},
-                    )
+            schema_key = layout.docset_generation_schema_key(args.docset_id)
+            schema_json_local = cache_dir.parent / "schema.json"
+            if (
+                not args.cache_dir
+                and not schema_json_local.exists()
+                and ws.blobs.blob_exists(schema_key)
+            ):
+                ws.blobs.download_blob(schema_key, schema_json_local)
+            roster_path = Path(cache_dir) / "concept_roster.json"
+            schema_seed = None
+            roster_seed: dict[str, str] | None = None
+            parent_map_seed: dict[str, str] = {}
+            if args.schema_path:
+                schema_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
+                _diag(
+                    f"Loaded schema: {len(schema_seed.tags)} concept(s), "
+                    f"{len(parent_map_seed)} container link(s) from {args.schema_path}"
                 )
-        if cov_path is not None and cov_results:
-            # Merge into any existing report so an incremental run keeps the
-            # already-generated docs' coverage instead of overwriting it.
-            existing_docs: list[dict[str, Any]] = []
-            if cov_path.exists():
-                try:
-                    existing_docs = json.loads(cov_path.read_text(encoding="utf-8")).get(
-                        "documents", []
+            elif not args.no_roster:
+                # Incremental reuse prefers the docset's own schema.json — full
+                # fidelity (role descriptions, observed examples, kind, hierarchy)
+                # — over the flat cache/concept_roster.json fallback. Unlike
+                # --schema-path, no parent_map is derived here: entity-container
+                # grouping stays an explicit opt-in.
+                from dgml_core.generation.schema import Schema
+
+                schema_json_path = Path(cache_dir).parent / "schema.json"
+                if schema_json_path.exists():
+                    try:
+                        schema_seed = Schema.load(schema_json_path)
+                        _diag(f"Reusing docset schema: {len(schema_seed.tags)} tag(s)")
+                    except (json.JSONDecodeError, TypeError, ValueError, OSError):
+                        schema_seed = None
+                if schema_seed is None and roster_path.exists():
+                    try:
+                        roster_seed = _load_schema_roster(roster_path)
+                        _diag(f"Reusing docset roster: {len(roster_seed)} concept(s)")
+                    except InvalidArgument:
+                        roster_seed = None
+
+            # Reload already-generated docs from cache so the whole docset stays
+            # consistent as its schema/roster grows; changed originals re-render
+            # (no re-LLM).
+            for stem, blocks in load_labeled_docs_from_cache(cache_dir, list(prior_stems)).items():
+                nm = prior_stems[stem]
+                prior_docs[nm] = blocks
+                prior_outputs[nm] = ws.blobs.get_blob(prior_out_paths[nm]).decode("utf-8")
+                dgml_xml_keys[nm] = prior_out_paths[nm]
+
+            # Materialize each file's page_text/ into a local dir the pipeline
+            # (transcribe gate + coverage) reads. LocalStore yields the real dir
+            # zero-copy; a remote store downloads it to a temp dir held open for
+            # the whole batch. Populate the same dict `_on_output` closes over.
+            with contextlib.ExitStack() as pt_stack:
+                for nm, pref in page_text_prefixes.items():
+                    page_text_dirs[nm] = pt_stack.enter_context(ws.blobs.materialize_dir(pref))
+                # Materialize each file's source dir so transcription's path tools
+                # (load_document_as_pdf → ghostscript) get the original + its
+                # persisted sibling <stem>.pdf on disk. LocalStore yields the real
+                # dir (zero-copy); a remote store downloads it for the batch.
+                pdf_paths: list[Path | str] = [
+                    pt_stack.enter_context(
+                        ws.blobs.materialize_dir(layout.file_prefix(filename_to_fid[nm]))
                     )
-                except (OSError, json.JSONDecodeError):
-                    existing_docs = []
-            cov_mod.save_coverage_report(
-                cov_mod.merge_coverage_documents(existing_docs, cov_results), cov_path
-            )
+                    / nm
+                    for nm in convert_names
+                ]
+                options = ConvertOptions(
+                    model=gen_model,
+                    label_model=label_model,
+                    api_key=gen_api_key,
+                    api_base=gen_api_base,
+                    window_size=args.window_size,
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                    max_parallel_docs=args.max_parallel_calls,
+                    cache_dir=cache_dir,
+                    debug=args.debug,
+                    page_text_dirs=page_text_dirs,
+                    workspace=ws,
+                    dgml_header=build_header(ws.organization, ds.name),
+                    converters=load_conversion_config(ws),
+                    roster_seed=roster_seed,
+                    schema_seed=schema_seed,
+                    parent_map=parent_map_seed or None,
+                    progress=_diag,
+                )
+                convert_batch(
+                    pdf_paths,
+                    options=options,
+                    on_output=_on_output,
+                    on_error=_on_error,
+                    on_label_error=_on_label_error,
+                    prior_docs=prior_docs,
+                    prior_outputs=prior_outputs,
+                )
+            # convert_batch silently drops documents whose transcription failed, so
+            # `_on_output` never fires for them. Reconcile: any queued file with no
+            # output is a per-file failure, not a vanished row (keeps counts summing
+            # to `total`).
+            produced = {entry["source"] for entry in written}
+            for name, fid in filename_to_fid.items():
+                if name not in produced:
+                    message = gen_errors.get(
+                        name, "the generation pipeline produced no output for this file"
+                    )
+                    failed_results.append(
+                        _file_result(
+                            "failed",
+                            fid,
+                            name,
+                            error={"code": "GENERATION_FAILED", "message": message},
+                        )
+                    )
+            if cov_report_key is not None and cov_results:
+                # Merge into any existing report so an incremental run keeps the
+                # already-generated docs' coverage instead of overwriting it.
+                existing_docs: list[dict[str, Any]] = []
+                if ws.blobs.blob_exists(cov_report_key):
+                    try:
+                        existing_docs = json.loads(ws.blobs.get_blob(cov_report_key)).get(
+                            "documents", []
+                        )
+                    except json.JSONDecodeError:
+                        existing_docs = []
+                merged = cov_mod.merge_coverage_documents(existing_docs, cov_results)
+                ws.blobs.put_blob(
+                    cov_report_key, cov_mod.dump_coverage_report(merged).encode("utf-8")
+                )
+            # Persist schema.json (labeling wrote it next to the cache) as the
+            # docset's generation-schema blob — exact bytes, before write_docset_rnc
+            # reads it back — then flush the cache working dir to the store.
+            if not args.cache_dir and schema_json_local.exists():
+                ws.blobs.put_blob(schema_key, schema_json_local.read_bytes())
     else:
         _diag("Nothing to convert — every file is already converted, missing, or a duplicate name.")
 
@@ -2487,16 +2711,16 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # Compact, with data types observed in the final XML). Best-effort — a
     # schema render failure must not fail the generate.
     try:
-        rnc_path = write_docset_rnc(output_dir)
-        if rnc_path is not None:
-            _diag(f"[schema] wrote {rnc_path.name}")
+        rnc_key = write_docset_rnc(ws, args.docset_id)
+        if rnc_key is not None:
+            _diag(f"[schema] wrote {rnc_key.rsplit('/', 1)[-1]}")
     except Exception as exc:
         _diag(f"[schema] full-schema.rnc skipped ({exc})")
 
-    # Report the coverage path only if a report was actually written.
-    coverage_report = cov_path if cov_results else None
+    # Report the coverage report key only if a report was actually written.
+    coverage_report = cov_report_key if cov_results else None
     payload = _generate_payload(
-        ds, len(file_ids), skipped_results, failed_results, written, output_dir, coverage_report
+        ds, len(file_ids), skipped_results, failed_results, written, output_key, coverage_report
     )
     payload["rerendered"] = rerendered
     _emit(payload, fmt)

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from dgml_core import layout
 from dgml_core.style import (
     build_style,
     fontname_is_bold,
@@ -265,9 +266,7 @@ def test_annotate_style_from_image(tmp_path: Path, monkeypatch) -> None:  # type
     ws = Workspace(root=tmp_path / "ws")
     ws.init()
     file_id = "ocrfile12345"
-    pages_dir = ws.file_pages_dir(file_id)
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    (pages_dir / "page_1.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    ws.blobs.put_blob(layout.file_page_image_key(file_id, 1), b"\x89PNG\r\n\x1a\n fake")
 
     root = etree.fromstring(
         '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#">'
@@ -426,15 +425,15 @@ def test_ground_honors_style_config_for_ocr(tmp_path: Path, monkeypatch) -> None
     image-based dg:style pass through grounding; the LLM call is stubbed."""
     from dgml_core import style_llm
     from dgml_core.models import FileRecord
-    from dgml_core.storage import Workspace, write_json_atomic
+    from dgml_core.storage import Workspace
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ws = Workspace(root=tmp_path / "ws")
     ws.init()
     fid = "ocrwire12345"
-    ws.file_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_json_path(fid),
+    ws.docs.put_doc(
+        "files",
+        fid,
         FileRecord(
             id=fid,
             original_path="/f.pdf",
@@ -445,24 +444,23 @@ def test_ground_honors_style_config_for_ocr(tmp_path: Path, monkeypatch) -> None
             text_mode="ocr",  # the gate
         ).to_json(),
     )
-    ws.file_text_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_text_dir(fid) / "page_1.json",
-        {
-            "file_id": fid,
-            "page": 1,
-            "width": 1000,
-            "height": 1000,
-            # OCR words carry no "s" style facts.
-            "words": [
-                {"t": "TITLE", "l": [100, 100, 150, 120]},
-                {"t": "HERE", "l": [160, 100, 210, 120]},
-            ],
-        },
+    ws.blobs.put_blob(
+        layout.file_page_text_key(fid, 1),
+        json.dumps(
+            {
+                "file_id": fid,
+                "page": 1,
+                "width": 1000,
+                "height": 1000,
+                # OCR words carry no "s" style facts.
+                "words": [
+                    {"t": "TITLE", "l": [100, 100, 150, 120]},
+                    {"t": "HERE", "l": [160, 100, 210, 120]},
+                ],
+            }
+        ).encode(),
     )
-    pages_dir = ws.file_pages_dir(fid)
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    (pages_dir / "page_1.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    ws.blobs.put_blob(layout.file_page_image_key(fid, 1), b"\x89PNG\r\n\x1a\n fake")
     ws.config_path.write_text(
         dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"}}),
         encoding="utf-8",
@@ -499,14 +497,14 @@ def _seed_ocr_style_workspace(tmp_path: Path):  # type: ignore[no-untyped-def]
     """An OCR file + enabling `style` config + one page image/text. Returns
     ``(ws, fid, src_xml_path)`` ready to ground."""
     from dgml_core.models import FileRecord
-    from dgml_core.storage import Workspace, write_json_atomic
+    from dgml_core.storage import Workspace
 
     ws = Workspace(root=tmp_path / "ws")
     ws.init()
     fid = "ocrwireusage"
-    ws.file_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_json_path(fid),
+    ws.docs.put_doc(
+        "files",
+        fid,
         FileRecord(
             id=fid,
             original_path="/f.pdf",
@@ -517,20 +515,19 @@ def _seed_ocr_style_workspace(tmp_path: Path):  # type: ignore[no-untyped-def]
             text_mode="ocr",
         ).to_json(),
     )
-    ws.file_text_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_text_dir(fid) / "page_1.json",
-        {
-            "file_id": fid,
-            "page": 1,
-            "width": 1000,
-            "height": 1000,
-            "words": [{"t": "TITLE", "l": [100, 100, 150, 120]}],
-        },
+    ws.blobs.put_blob(
+        layout.file_page_text_key(fid, 1),
+        json.dumps(
+            {
+                "file_id": fid,
+                "page": 1,
+                "width": 1000,
+                "height": 1000,
+                "words": [{"t": "TITLE", "l": [100, 100, 150, 120]}],
+            }
+        ).encode(),
     )
-    pages_dir = ws.file_pages_dir(fid)
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    (pages_dir / "page_1.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    ws.blobs.put_blob(layout.file_page_image_key(fid, 1), b"\x89PNG\r\n\x1a\n fake")
     ws.config_path.write_text(
         dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"}}),
         encoding="utf-8",
@@ -589,15 +586,15 @@ def test_ground_skips_style_config_when_disabled(tmp_path: Path, monkeypatch) ->
     """With no `style` section, the LLM path must not run even for OCR files."""
     from dgml_core import style_llm
     from dgml_core.models import FileRecord
-    from dgml_core.storage import Workspace, write_json_atomic
+    from dgml_core.storage import Workspace
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ws = Workspace(root=tmp_path / "ws")
     ws.init()
     fid = "ocrwire67890"
-    ws.file_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_json_path(fid),
+    ws.docs.put_doc(
+        "files",
+        fid,
         FileRecord(
             id=fid,
             original_path="/f.pdf",
@@ -608,16 +605,17 @@ def test_ground_skips_style_config_when_disabled(tmp_path: Path, monkeypatch) ->
             text_mode="ocr",
         ).to_json(),
     )
-    ws.file_text_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_text_dir(fid) / "page_1.json",
-        {
-            "file_id": fid,
-            "page": 1,
-            "width": 1000,
-            "height": 1000,
-            "words": [{"t": "TITLE", "l": [100, 100, 150, 120]}],
-        },
+    ws.blobs.put_blob(
+        layout.file_page_text_key(fid, 1),
+        json.dumps(
+            {
+                "file_id": fid,
+                "page": 1,
+                "width": 1000,
+                "height": 1000,
+                "words": [{"t": "TITLE", "l": [100, 100, 150, 120]}],
+            }
+        ).encode(),
     )
 
     def _boom(*args: object, **kwargs: object) -> dict[int, str]:
@@ -643,15 +641,15 @@ def test_style_credential_failure_preserves_grounding(tmp_path: Path, monkeypatc
     grounding: `dg:origin` still lands and the file is written, even though the
     image-based style pass can't run (its `api_key_env` is unset)."""
     from dgml_core.models import FileRecord
-    from dgml_core.storage import Workspace, write_json_atomic
+    from dgml_core.storage import Workspace
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ws = Workspace(root=tmp_path / "ws")
     ws.init()
     fid = "ocrwireauth1"
-    ws.file_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_json_path(fid),
+    ws.docs.put_doc(
+        "files",
+        fid,
         FileRecord(
             id=fid,
             original_path="/f.pdf",
@@ -662,23 +660,22 @@ def test_style_credential_failure_preserves_grounding(tmp_path: Path, monkeypatc
             text_mode="ocr",  # the gate
         ).to_json(),
     )
-    ws.file_text_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_text_dir(fid) / "page_1.json",
-        {
-            "file_id": fid,
-            "page": 1,
-            "width": 1000,
-            "height": 1000,
-            "words": [
-                {"t": "TITLE", "l": [100, 100, 150, 120]},
-                {"t": "HERE", "l": [160, 100, 210, 120]},
-            ],
-        },
+    ws.blobs.put_blob(
+        layout.file_page_text_key(fid, 1),
+        json.dumps(
+            {
+                "file_id": fid,
+                "page": 1,
+                "width": 1000,
+                "height": 1000,
+                "words": [
+                    {"t": "TITLE", "l": [100, 100, 150, 120]},
+                    {"t": "HERE", "l": [160, 100, 210, 120]},
+                ],
+            }
+        ).encode(),
     )
-    pages_dir = ws.file_pages_dir(fid)
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    (pages_dir / "page_1.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    ws.blobs.put_blob(layout.file_page_image_key(fid, 1), b"\x89PNG\r\n\x1a\n fake")
     # `api_key_env` points at an env var we make sure is unset -> resolve_api_key
     # raises AuthError inside the style pass at grounding time.
     monkeypatch.delenv("DGML_STYLE_KEY_MISSING", raising=False)
@@ -726,11 +723,9 @@ def _multipage_style_tree(
     ws = Workspace(root=tmp_path / "ws")
     ws.init()
     file_id = "multipagestyl"
-    pages_dir = ws.file_pages_dir(file_id)
-    pages_dir.mkdir(parents=True, exist_ok=True)
     pages = range(1, n_pages + 1)
     for page in images_for if images_for is not None else pages:
-        (pages_dir / f"page_{page}.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+        ws.blobs.put_blob(layout.file_page_image_key(file_id, page), b"\x89PNG\r\n\x1a\n fake")
 
     headings = "".join(f'<Heading dg:origin="{p} 10 20 30 40">TITLE {p}</Heading>' for p in pages)
     root = etree.fromstring(f'<dg:chunk xmlns:dg="http://dgml.io/ns/dg#">{headings}</dg:chunk>')
@@ -909,7 +904,7 @@ def test_ground_records_one_style_usage_row_per_page(tmp_path: Path, monkeypatch
     append order in usage.jsonl is completion order, not page order.
     """
     from dgml_core.models import FileRecord
-    from dgml_core.storage import Workspace, write_json_atomic
+    from dgml_core.storage import Workspace
     from dgml_core.usage import read_events
     from dgml_core.xml_grounding import ground_dgml_xml
 
@@ -917,9 +912,9 @@ def test_ground_records_one_style_usage_row_per_page(tmp_path: Path, monkeypatch
     ws.init()
     fid = "ocrmultipage1"
     n_pages = 3
-    ws.file_dir(fid).mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        ws.file_json_path(fid),
+    ws.docs.put_doc(
+        "files",
+        fid,
         FileRecord(
             id=fid,
             original_path="/f.pdf",
@@ -930,21 +925,20 @@ def test_ground_records_one_style_usage_row_per_page(tmp_path: Path, monkeypatch
             text_mode="ocr",
         ).to_json(),
     )
-    ws.file_text_dir(fid).mkdir(parents=True, exist_ok=True)
-    pages_dir = ws.file_pages_dir(fid)
-    pages_dir.mkdir(parents=True, exist_ok=True)
     for page in range(1, n_pages + 1):
-        write_json_atomic(
-            ws.file_text_dir(fid) / f"page_{page}.json",
-            {
-                "file_id": fid,
-                "page": page,
-                "width": 1000,
-                "height": 1000,
-                "words": [{"t": f"TITLE{page}", "l": [100, 100 * page, 200, 120 * page]}],
-            },
+        ws.blobs.put_blob(
+            layout.file_page_text_key(fid, page),
+            json.dumps(
+                {
+                    "file_id": fid,
+                    "page": page,
+                    "width": 1000,
+                    "height": 1000,
+                    "words": [{"t": f"TITLE{page}", "l": [100, 100 * page, 200, 120 * page]}],
+                }
+            ).encode(),
         )
-        (pages_dir / f"page_{page}.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+        ws.blobs.put_blob(layout.file_page_image_key(fid, page), b"\x89PNG\r\n\x1a\n fake")
     ws.config_path.write_text(
         dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"}}),
         encoding="utf-8",

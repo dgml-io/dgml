@@ -1,0 +1,31 @@
+# Local backing services for the sample store.
+#
+#   docker compose up -d
+#   uv run pytest packages/dgml-storage-s3
+#
+# Neither image is redistributed by DGML; both are dev/CI services invoked over
+# the network, like ghostscript is invoked as a subprocess. MinIO server is
+# AGPL-3.0 and MongoDB Community is SSPL — see README.md. FerretDB (Apache-2.0)
+# is a drop-in for the mongo service if that ever matters; pymongo talks to both.
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: dgmltest
+      MINIO_ROOT_PASSWORD: dgmltest123
+    ports: ["9000:9000"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:7
+    ports: ["27017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import pytest
+from dgml_core import layout
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     DocSetNotFound,
@@ -22,6 +23,7 @@ from dgml_core.errors import (
     SchemaNotFound,
 )
 from dgml_core.storage import Workspace
+from dgml_core.workspace_ops import WorkspaceOps
 
 # A minimal valid extraction schema in the supported RNC subset (RNC is the
 # canonical at-rest form since the extraction rework).
@@ -77,13 +79,11 @@ def test_update_key_questions(workspace: Workspace) -> None:
 
 def test_from_json_tolerates_missing_key_questions(workspace: Workspace) -> None:
     """A docset.json without `key_questions` must round-trip as an empty list."""
-    from dgml_core.storage import write_json_atomic
-
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     # A docset.json that omits the optional key_questions field.
     minimal = {"id": ds.id, "name": "Minimal", "description": "no key_questions"}
-    write_json_atomic(workspace.docset_json_path(ds.id), minimal)
+    workspace.docs.put_doc("docsets", ds.id, minimal)
     loaded = store.get(ds.id)
     assert loaded.key_questions == []
     assert loaded.name == "Minimal"
@@ -137,7 +137,7 @@ def test_add_remove_file_reference(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     fid = "abcdefghijkl"
-    workspace.file_dir(fid).mkdir(parents=True)
+    workspace.docs.put_doc("files", fid, {"id": fid})
     store.add_file(ds.id, fid)
     assert store.list_files(ds.id) == [fid]
     store.remove_file(ds.id, fid)
@@ -147,7 +147,6 @@ def test_add_remove_file_reference(workspace: Workspace) -> None:
 def test_add_file_to_missing_docset(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     fid = "abcdefghijkl"
-    workspace.file_dir(fid).mkdir(parents=True)
     with pytest.raises(DocSetNotFound):
         store.add_file("nosuchdocset", fid)
 
@@ -163,7 +162,6 @@ def test_remove_file_not_assigned(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     fid = "abcdefghijkl"
-    workspace.file_dir(fid).mkdir(parents=True)
     with pytest.raises(FileNotFound):
         store.remove_file(ds.id, fid)
 
@@ -242,9 +240,9 @@ def test_schema_set_and_roundtrip(workspace: Workspace) -> None:
     assert store.has_schema(ds.id) is True
     assert store.get_schema(ds.id) == _RNC
     # Persisted on disk as extraction-schema.rnc in the docset directory.
-    on_disk = workspace.docset_schema_path(ds.id)
-    assert on_disk.name == "extraction-schema.rnc"
-    assert on_disk.read_text(encoding="utf-8") == _RNC
+    schema_key = layout.docset_extraction_schema_key(ds.id)
+    assert schema_key.endswith("extraction-schema.rnc")
+    assert workspace.blobs.get_blob(schema_key).decode("utf-8") == _RNC
 
 
 def test_schema_set_replaces_previous(workspace: Workspace) -> None:
@@ -316,7 +314,6 @@ def test_list_files_rejects_empty_docset_id(workspace: Workspace) -> None:
 def test_add_file_rejects_empty_docset_id(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     fid = "abcdefghijkl"
-    workspace.file_dir(fid).mkdir(parents=True)
     with pytest.raises(InvalidArgument):
         store.add_file("", fid)
 
@@ -325,6 +322,77 @@ def test_remove_file_rejects_empty_docset_id(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     with pytest.raises(InvalidArgument):
         store.remove_file("", "abcdefghijkl")
+
+
+# ------------------------------------------------- assignment cascade semantics
+
+
+def _assigned_pair(workspace: Workspace) -> tuple[DocSetStore, str, str]:
+    """A docset with one assigned file that has generated artifacts."""
+    store = DocSetStore(workspace)
+    ds = store.create(name="X")
+    fid = "abcdefghijkl"
+    workspace.docs.put_doc("files", fid, {"id": fid})
+    store.add_file(ds.id, fid)
+    workspace.blobs.put_blob(f"docsets/{ds.id}/files/{fid}/report.dgml.xml", b"<x/>")
+    workspace.docs.put_doc("extraction_stats", f"{ds.id}/{fid}", {"matched": 3})
+    return store, ds.id, fid
+
+
+def test_add_file_records_an_assignment_document(workspace: Workspace) -> None:
+    store = DocSetStore(workspace)
+    ds = store.create(name="X")
+    fid = "abcdefghijkl"
+    workspace.docs.put_doc("files", fid, {"id": fid})
+    store.add_file(ds.id, fid)
+
+    doc = workspace.docs.get_doc("assignments", f"{ds.id}/{fid}")
+    assert doc is not None
+    assert doc["docset_id"] == ds.id
+    assert doc["file_id"] == fid
+    assert doc["assigned_at"]  # the relationship can carry metadata now
+
+
+def test_unassign_removes_record_and_pair_artifacts(workspace: Workspace) -> None:
+    """The cascade must delete the assignment *and* the pair's artifacts.
+
+    Each is a separate store object, so this only passes if `unassign` deletes
+    all three explicitly — the behavior a remote backend depends on. It used to
+    also pass on local disk when the assignment delete alone did an rmtree."""
+    store, did, fid = _assigned_pair(workspace)
+    WorkspaceOps(workspace).unassign(did, fid)
+
+    assert workspace.docs.get_doc("assignments", f"{did}/{fid}") is None
+    assert not workspace.blobs.blob_exists(f"docsets/{did}/files/{fid}/report.dgml.xml")
+    assert workspace.docs.get_doc("extraction_stats", f"{did}/{fid}") is None
+    assert store.list_files(did) == []
+
+
+def test_remove_file_removes_pair_artifacts(workspace: Workspace) -> None:
+    store, did, fid = _assigned_pair(workspace)
+    store.remove_file(did, fid)
+    assert store.list_files(did) == []
+    assert not workspace.blobs.blob_exists(f"docsets/{did}/files/{fid}/report.dgml.xml")
+    assert workspace.docs.get_doc("extraction_stats", f"{did}/{fid}") is None
+
+
+def test_docset_delete_removes_every_assignment_and_artifact(workspace: Workspace) -> None:
+    store, did, fid = _assigned_pair(workspace)
+    store.delete(did)
+    assert workspace.docs.get_doc("assignments", f"{did}/{fid}") is None
+    assert workspace.docs.find_docs("assignments", {"docset_id": did}) == []
+    assert workspace.blobs.list_blobs(f"docsets/{did}/") == []
+    # the underlying file is untouched
+    assert workspace.docs.get_doc("files", fid) is not None
+
+
+def test_reassign_is_idempotent(workspace: Workspace) -> None:
+    store, did, fid = _assigned_pair(workspace)
+    store.add_file(did, fid)  # re-adding replaces the same document
+    assert store.list_files(did) == [fid]
+    assert len(workspace.docs.find_docs("assignments", {"docset_id": did})) == 1
+    # and it must not disturb the pair's generated artifacts
+    assert workspace.blobs.blob_exists(f"docsets/{did}/files/{fid}/report.dgml.xml")
 
 
 # ---- extraction guidance ---------------------------------------------------
@@ -347,9 +415,9 @@ def test_guidance_set_and_roundtrip(workspace: Workspace) -> None:
     store.set_guidance(ds.id, text)
     assert store.has_guidance(ds.id) is True
     assert store.get_guidance(ds.id) == text
-    on_disk = workspace.docset_guidance_path(ds.id)
-    assert on_disk.name == "extraction-guidance.md"
-    assert on_disk.read_text(encoding="utf-8") == text
+    key = f"docsets/{ds.id}/extraction-guidance.md"
+    assert workspace.blobs.blob_exists(key)
+    assert workspace.blobs.get_blob(key).decode("utf-8") == text
 
 
 def test_guidance_set_replaces_and_clear(workspace: Workspace) -> None:

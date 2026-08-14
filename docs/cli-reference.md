@@ -37,7 +37,7 @@ or after a command group (`dgml docset --format text list`).
 
 | Flag             | Description |
 |------------------|-------------|
-| `--workspace`    | Override the workspace root. Default: `$DGML_HOME` then `./dgml-workspace`. |
+| `--workspace`    | Override the workspace to open — a filesystem path **or** a `ws_…` id from `dgml workspace list`. A registered id resolves through the per-machine registry to its root; anything else is treated as a path. Default: `$DGML_HOME` then `./dgml-workspace`. |
 | `--format`       | `json` (default) or `text`. |
 | `--verbose`      | Emit informational diagnostics to stderr. Controls hybrid text-mode warnings (digital/OCR conflicts, OCR misses) and the per-page merge summary, plus the `docset generate` pipeline's progress lines. Off by default — stderr stays reserved for error envelopes. |
 | `--debug`        | Keep intermediate debug files in the workspace **and** record LLM cost/token telemetry to `<workspace>/usage.jsonl`. Off by default, so only final files (and the small functional cache the next run reloads) are kept. With `--debug` off: no `usage.jsonl` rows are written for **any** operation (classify, cluster, transcribe, label, links, schema/value extraction, hybrid merge); `docset generate` skips the debug-only `cache/` artifacts (raw LLM dumps, `*.concept.xml`/`*.semantic.xml`, prompt listings) and `coverage_report.json`; and the in-place grounding pass skips the `<stem>.dgml.grounding_stats.json` sidecar. The functional `cache/` files (`*_blocks.json`, `label_*_cNN_raw.json`, `concept_roster.json`) are **always** written — incremental generation reloads them. Pass `--debug` to retain the debug artifacts and log usage. (Coverage summaries still print on stderr under `--verbose` either way.) |
@@ -90,16 +90,20 @@ The human-readable report (detected keys, the `[models]` block with inline
 tier→capability comments, next steps) goes to **stderr**; stdout stays the JSON
 contract. `provider` is `null` when no keys were detected.
 
-### `dgml workspace create [PATH] --organization ORG [--name NAME]`
+### `dgml workspace create [PATH] --organization ORG [--name NAME] [--storage NAME]`
 `PATH` is the optional directory to create the workspace in — pass it to avoid
 the redundant global `--workspace` (`dgml workspace create ./ws …`). When
 omitted, the root resolves in the usual order (global `--workspace` → `$DGML_HOME`
 → `./dgml-workspace`); a `PATH` given here overrides that.
 
 Steps:
-1. Creates `docsets/` and `files/`.
-2. Writes the workspace identity (`name` + `organization`) to
-   `<workspace>/workspace.json`.
+1. Indexes the workspace in this machine's registry
+   (`~/.config/dgml/workspaces.json`) so it can be listed by
+   `dgml workspace list` and opened by id (`dgml --workspace <workspace_id>`),
+   recording which **storage service** it lives on (below).
+2. Creates `docsets/` and `files/` on that storage service.
+3. Writes the workspace identity (`name` + `organization` + a freshly-minted
+   stable `workspace_id`) to `<workspace>/workspace.json`.
 
 Config is owned by `dgml init` and lives at the user level — `workspace create`
 does **not** create or touch it (nor does it write a per-workspace
@@ -115,22 +119,95 @@ identifier for your org (changing it later shifts the namespaces of newly
 generated XML). `--name` is optional human-readable identity metadata and
 defaults to the workspace directory name.
 
+`--storage NAME` selects the **storage service** the workspace is created on — a
+`[storage.<name>]` template in your `config.toml` (see
+[storage-layout.md](storage-layout.md)). A **non-secret snapshot** of that
+service (provider + non-secret options; never credentials) is recorded in the
+registry entry, which becomes the authoritative record of where the workspace's
+data lives. Omit `--storage` for the bundled local-disk default. A `--storage
+NAME` that names no configured service fails with `STORAGE_CONFIG_INVALID` before
+anything is created.
+
 Output (JSON):
 
 ```json
 {
   "workspace": "…/dgml-workspace",
+  "workspace_id": "ws_7f3k9q2m4b8xr5wa",
   "name": "dgml-workspace",
   "organization": "Acme",
+  "storage_service": "default",
   "initialized": true,
   "config_path": "~/.config/dgml/config.toml",
   "config_present": true
 }
 ```
 
-`config_present` reports whether the user-level config exists. When it is
-`false`, an extra `next_action` field is present and the stderr warning above is
-emitted — but the workspace is created regardless (exit `0`).
+`workspace_id` is the stable handle (`ws_` + 16 base32 chars) minted for this
+workspace; pass it to any command as `--workspace <workspace_id>`. It survives a
+directory rename, is written to `workspace.json`, and keys the per-machine
+registry. `config_present` reports whether the user-level config exists. When it
+is `false`, an extra `next_action` field is present and the stderr warning above
+is emitted — but the workspace is created regardless (exit `0`).
+
+### `dgml workspace list`
+List the workspaces registered on **this machine** (the registry is per-machine,
+so a workspace opened on two machines appears once on each). Reads only
+`~/.config/dgml/workspaces.json` — no workspace needs to be resolved, and it
+never touches the workspaces themselves.
+
+Output (JSON), sorted by id:
+
+```json
+{
+  "workspaces": [
+    {
+      "workspace_id": "ws_7f3k9q2m4b8xr5wa",
+      "name": "Acme Contracts",
+      "organization": "Acme",
+      "root": "/Users/me/acme-ws",
+      "storage_service": "default",
+      "created_at": "2026-08-05T12:00:00Z"
+    }
+  ]
+}
+```
+
+`storage_service` is the storage template each workspace was created on (see
+[storage-layout.md](storage-layout.md)).
+
+### `dgml workspace register [PATH] [--storage NAME]`
+Index an existing workspace in this machine's registry — the recovery path when a
+workspace was created elsewhere, its directory **moved**, or you want to change or
+repair its storage service. `PATH` is optional and defaults to the
+globally-resolved workspace. The workspace must already be initialized (run
+`dgml workspace create` otherwise → `WORKSPACE_NOT_INITIALIZED`).
+
+- If the workspace is already indexed here, its entry is **re-sealed** in place
+  (identity taken from the existing entry, so this works even when the entry's
+  storage snapshot was hand-edited into an unopenable state — the repair for a
+  `STORAGE_BACKEND_MISMATCH`). `--storage NAME` switches the workspace to a
+  different `[storage.<name>]` service and re-snapshots it; omit it to keep the
+  current service.
+- Otherwise (e.g. a moved directory) its `workspace_id` is read from
+  `workspace.json` (minted and written back if absent) and a fresh entry is
+  recorded, re-pointing `root` to `PATH`.
+
+Normal use never needs this: `workspace create` registers new workspaces, and the
+first time any command opens a workspace it is auto-registered on that machine.
+
+Output (JSON):
+
+```json
+{
+  "workspace": "/Users/me/acme-ws",
+  "workspace_id": "ws_7f3k9q2m4b8xr5wa",
+  "name": "Acme Contracts",
+  "organization": "Acme",
+  "storage_service": "default",
+  "registered": true
+}
+```
 
 ### `dgml status`
 Summary: workspace path, count of docsets, count of files.
@@ -577,11 +654,11 @@ per-item `results`, each carrying a `status`), matching the bulk `file add`:
   "docset_name": "Q2 contracts",
   "summary": { "total": 3, "converted": 2, "skipped": 1, "failed": 0 },
   "rerendered": [],
-  "output_dir": "/ws/docsets/p9pjusnwg50l",
-  "coverage_report": "/ws/docsets/p9pjusnwg50l/coverage_report.json",
+  "output_key": "docsets/p9pjusnwg50l",
+  "coverage_report": "docsets/p9pjusnwg50l/coverage_report.json",
   "results": [
-    {"status": "skipped", "file_id": "ab55kdjs93kk", "source": "already-done.pdf", "output": "/ws/docsets/p9pjusnwg50l/files/ab55kdjs93kk/already-done.dgml.xml"},
-    {"status": "converted", "file_id": "k7q3xb91pmrf", "source": "contract-a.pdf", "output": "/ws/docsets/p9pjusnwg50l/files/k7q3xb91pmrf/contract-a.dgml.xml", "grounded": true, "matched_token_pct": 99.6, "elements_annotated": 445}
+    {"status": "skipped", "file_id": "ab55kdjs93kk", "source": "already-done.pdf", "output": "docsets/p9pjusnwg50l/files/ab55kdjs93kk/already-done.dgml.xml"},
+    {"status": "converted", "file_id": "k7q3xb91pmrf", "source": "contract-a.pdf", "output": "docsets/p9pjusnwg50l/files/k7q3xb91pmrf/contract-a.dgml.xml", "grounded": true, "matched_token_pct": 99.6, "elements_annotated": 445}
   ]
 }
 ```
@@ -603,9 +680,11 @@ Three things produce a `failed` entry:
   available without `--verbose`. The full, untruncated error still goes to
   stderr under `--verbose`.
 
-`output_dir` is the docset directory; per-file DGML lands under its
-`files/<file-id>/` subdirectory (see each `results` entry's `output`).
-`coverage_report` is the report path only when a report was actually written;
+`output_key` is the docset's storage key (`docsets/<docset-id>`); per-file DGML
+lands under its `files/<file-id>/` subdirectory (see each `results` entry's
+`output`). Both `output_key` and `coverage_report` are store-native keys, not
+local paths, so the envelope is meaningful whatever backend the workspace uses.
+`coverage_report` is the report key only when a report was actually written;
 it is `null` when `--no-coverage` is set, no file had `page_text/`, or
 `--debug` was not passed (coverage is still computed and its per-file summary
 printed under `--verbose`, but the `coverage_report.json` file is written only
@@ -791,7 +870,7 @@ a generated document tree the extraction is added alongside it
   "mode": "full-extraction",
   "tool_calls": 2,
   "field_count": 7,
-  "xml_path": ".../docsets/o8vr8rs488vg/files/5kqt9r5fowno/Invoice 2025.dgml.xml"
+  "xml_key": "docsets/o8vr8rs488vg/files/5kqt9r5fowno/Invoice 2025.dgml.xml"
 }
 ```
 
@@ -1803,6 +1882,9 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `PDF_SLICE_FAILED` | soft | A PDF page-slice operation failed during generation. |
 | `TEXT_EXTRACTION_FAILED` | soft | pdfminer.six extracted no digital text; recorded (`text_extraction_error`). |
 | `CORRUPT_METADATA` | hard / soft | A `file.json`/`docset.json` is not valid JSON (also reported by `dgml check`). |
+| `STORAGE_CONFIG_INVALID` | hard | A `[storage]` / `[storage.<name>]` table is malformed, or `--storage NAME` names a service that isn't configured. |
+| `STORAGE_PROVIDER_UNRESOLVABLE` | hard | A storage `provider` dotted path (`module:Class`) can't be imported/resolved. |
+| `STORAGE_BACKEND_MISMATCH` | hard | The storage snapshot recorded for a workspace in `~/.config/dgml/workspaces.json` was hand-edited and no longer matches its sealed fingerprint. The registry is machine-managed; re-seal with `dgml workspace register <root> --storage <name>` (or restore the entry). |
 | `NOT_IMPLEMENTED` | hard | A requested mode/path is not implemented. |
 | `DGML_ERROR` | hard | Generic base code; specific codes above are preferred. |
 
