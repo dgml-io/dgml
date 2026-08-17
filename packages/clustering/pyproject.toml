@@ -49,6 +49,12 @@ umap = [
 gemini = [
     "litellm>=1.51.0",
 ]
+# The `openai` text encoder calls OpenAI embeddings through the same litellm
+# (provider-agnostic, MIT). Only needed for a bare `dgml-clustering` install;
+# `dgml[clustering]` already pulls litellm via dgml-core.
+openai = [
+    "litellm>=1.51.0",
+]
 
 [build-system]
 requires = ["hatchling<1.26"]

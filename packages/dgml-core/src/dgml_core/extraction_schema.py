@@ -35,7 +35,8 @@ the Apache-2.0 license clean).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .errors import SchemaInvalid
@@ -201,6 +202,135 @@ class Vocabulary:
     roots: list[Tag]
 
 
+# ── Tag-name disambiguation ──────────────────────────────────────────────────
+#
+# RNC has a flat pattern namespace: one ``Name = element docset:Name { … }`` def
+# per tag name, with no scoping by parent. A vocabulary built from an untrusted
+# source — an LLM-submitted field tree, an imported JSON Schema — routinely uses
+# one name for two different things (a document-level ``AmountDue`` and a
+# per-line-item one), which has no representation in RNC at all and would reach
+# :func:`_emit_tag_defs` as a hard error, failing the whole schema over a naming
+# collision.
+#
+# The vocabulary builders below run the tree through :func:`_disambiguate_names`
+# instead: the first claimant keeps the plain name and every genuinely different
+# later occurrence gets a parent-qualified one (``LineItemAmountDue``) — the same
+# rename the error message asks a human to make. Occurrences whose entire
+# definition subtree is identical are real reuse and keep the shared name, so a
+# vocabulary that was already collision-free comes back untouched and the RNC
+# round-trip stays byte-for-byte. The check in :func:`_emit_tag_defs` remains as
+# the backstop that proves this ran.
+
+# Numbered fallback bound, for the pathological case where the name and every
+# ancestor-qualified form is already claimed by a different definition.
+_MAX_NAME_SUFFIX = 99
+
+
+def _identity_key(tag: Tag) -> tuple[Any, ...]:
+    """A hashable identity for *tag*'s whole definition subtree.
+
+    Two tags may share one RNC pattern name exactly when this matches: not just
+    their own def, but every def their content model transitively reaches, since
+    :func:`_emit_tag_defs` walks into the children of a reused name as well.
+    Annotations are part of it — they render into the ``##`` doc comments, so a
+    differing description alone is a differing definition.
+    """
+    return (
+        tag.name,
+        tag.kind,
+        tag.description,
+        tag.example,
+        tag.prompt,
+        tag.invariant,
+        tag.value_type,
+        tuple(tag.enum_values or ()),
+        tag.item_name,
+        _identity_key(tag.item) if tag.item is not None else None,
+        tuple(_identity_key(child) for child in tag.children),
+    )
+
+
+def _name_candidates(desired: str, ancestors: list[str]) -> Iterator[str]:
+    """Names to try for a tag, best first: its own, then qualified by each
+    ancestor (nearest first), then numbered."""
+    seen = {desired}
+    yield desired
+    for ancestor in reversed(ancestors):
+        candidate = f"{ancestor}{desired}"
+        if candidate not in seen:
+            seen.add(candidate)
+            yield candidate
+    for suffix in range(2, _MAX_NAME_SUFFIX + 1):
+        candidate = f"{desired}{suffix}"
+        if candidate not in seen:
+            yield candidate
+
+
+def _claim_name(
+    desired: str,
+    key: tuple[Any, ...],
+    taken: dict[str, tuple[Any, ...]],
+    ancestors: list[str],
+) -> str:
+    for candidate in _name_candidates(desired, ancestors):
+        claimed = taken.get(candidate)
+        if claimed is None:
+            taken[candidate] = key
+            return candidate
+        if claimed == key:
+            return candidate  # the identical definition — intentional reuse
+    raise SchemaInvalid(
+        f"could not find a free tag name for '{desired}': it and every "
+        f"qualified or numbered variant is already bound to a different definition"
+    )
+
+
+def _rename_tag(
+    tag: Tag,
+    taken: dict[str, tuple[Any, ...]],
+    ancestors: list[str],
+    memo: dict[tuple[Any, ...], Tag],
+) -> Tag:
+    key = _identity_key(tag)
+    cached = memo.get(key)
+    if cached is not None:
+        # Same definition seen before, so it resolved to the same name and the
+        # same renamed subtree; reusing it also keeps deep reuse from blowing up.
+        return cached
+    name = _claim_name(tag.name, key, taken, ancestors)
+    inner = [*ancestors, name]
+
+    if tag.kind == "collection":
+        # The singular item gets a def of its own, so it competes for names like
+        # any other tag — including when it was only implied by the collection's
+        # name. Materializing it records that decision in the vocabulary.
+        if tag.item is None and not tag.item_name:
+            base_item = Tag(name=_singularize(name), kind="container", children=tag.children)
+        else:
+            base_item = _collection_item_tag(tag)
+        item = _rename_tag(base_item, taken, inner, memo)
+        # `children` mirrors the item's fields (empty for a collection of bare
+        # typed values, whose item is itself a leaf field).
+        renamed = replace(tag, name=name, item=item, item_name=item.name, children=item.children)
+    else:
+        children = [_rename_tag(child, taken, inner, memo) for child in tag.children]
+        renamed = replace(tag, name=name, children=children)
+
+    memo[key] = renamed
+    return renamed
+
+
+def _disambiguate_names(roots: list[Tag]) -> list[Tag]:
+    """Return *roots* rewritten so each tag name maps onto exactly one definition.
+
+    Walks in document order (roots first, then depth-first), so the outermost
+    occurrence of a contested name keeps it and nested ones are qualified.
+    """
+    taken: dict[str, tuple[Any, ...]] = {}
+    memo: dict[tuple[Any, ...], Tag] = {}
+    return [_rename_tag(root, taken, [], memo) for root in roots]
+
+
 # ── JSON Schema → Vocabulary ─────────────────────────────────────────────────
 
 
@@ -231,6 +361,27 @@ def _pascal_case(raw: str) -> str:
     return pascal
 
 
+def _one_line(value: Any) -> Any:
+    """Fold a doc-comment annotation onto a single line.
+
+    ``example``, ``prompt``, and ``invariant`` each occupy exactly one ``##``
+    line, and :func:`_parse_doc_comments` reads each from one line — every other
+    ``##`` line becomes part of ``description``. A newline inside one of them
+    would emit raw, unprefixed text that no longer parses as RNC at all (an
+    LLM-proposed multi-line postal-address ``example`` is the case seen in
+    practice), and spreading it over several ``##`` lines is not an option
+    either: the continuation lines would come back appended to the description.
+
+    So newlines fold to spaces as the value enters the vocabulary. ``description``
+    is exempt — it is the one annotation :func:`_doc_comment` line-splits and the
+    parser rejoins, so it round-trips multi-line as-is. A value already on one
+    line is returned untouched, keeping the RNC round-trip byte-for-byte.
+    """
+    if not isinstance(value, str) or ("\n" not in value and "\r" not in value):
+        return value
+    return " ".join(value.split())
+
+
 def _node_to_tag(name: str, node: dict[str, Any]) -> Tag:
     # A `title` names the element directly (standard JSON Schema dialects put
     # the target DGML element name there); the property key is the fallback.
@@ -238,9 +389,9 @@ def _node_to_tag(name: str, node: dict[str, Any]) -> Tag:
     raw_name = title if isinstance(title, str) and title.strip() else name
     tag_name = _pascal_case(raw_name) or "Field"
     description = node.get("description")
-    example = node.get("example")
-    prompt = node.get("prompt")
-    raw_invariant = node.get("invariant")
+    example = _one_line(node.get("example"))
+    prompt = _one_line(node.get("prompt"))
+    raw_invariant = _one_line(node.get("invariant"))
     invariant = _validate_invariant(raw_invariant) if isinstance(raw_invariant, str) else None
 
     if _grounded_leaf(node):
@@ -492,7 +643,7 @@ def json_schema_to_vocabulary(schema: dict[str, Any], *, namespace_uri: str) -> 
     roots = _properties_to_tags(resolved.get("properties"))
     if not roots:
         raise SchemaInvalid("schema has no 'properties' — nothing to extract")
-    return Vocabulary(namespace_uri=namespace_uri, roots=roots)
+    return Vocabulary(namespace_uri=namespace_uri, roots=_disambiguate_names(roots))
 
 
 # ── Typed field tree → Vocabulary ────────────────────────────────────────────
@@ -644,8 +795,8 @@ def _field_node_to_tag(node: Any) -> Tag:
     kind = kind.strip().lower()
 
     description = node.get("description")
-    example = node.get("example")
-    prompt = node.get("prompt")
+    example = _one_line(node.get("example"))
+    prompt = _one_line(node.get("prompt"))
 
     if kind == "field":
         enum_values = _normalize_enum_values(node.get("enum"), tag_name=name)
@@ -659,7 +810,7 @@ def _field_node_to_tag(node: Any) -> Tag:
             example=example,
             prompt=prompt,
             invariant=(
-                _validate_invariant(node["invariant"])
+                _validate_invariant(_one_line(node["invariant"]))
                 if isinstance(node.get("invariant"), str)
                 else None
             ),
@@ -729,11 +880,16 @@ def field_tree_to_vocabulary(fields: Any, *, namespace_uri: str) -> Vocabulary:
 
     *fields* is the list of top-level nodes (see the module comment above).
     Raises :class:`SchemaInvalid` for a malformed tree.
+
+    A name the model reused for two different things across levels is repaired
+    by :func:`_disambiguate_names` rather than rejected — see its section
+    comment. Two *siblings* sharing a name stay a hard error: that is an
+    ambiguous model, not a naming-scope mismatch.
     """
     roots = _field_nodes_to_tags(fields, context="<root>")
     if not roots:
         raise SchemaInvalid("field tree is empty — nothing to extract")
-    return Vocabulary(namespace_uri=namespace_uri, roots=roots)
+    return Vocabulary(namespace_uri=namespace_uri, roots=_disambiguate_names(roots))
 
 
 # ── Vocabulary → JSON Schema ─────────────────────────────────────────────────
@@ -818,16 +974,23 @@ def vocabulary_to_json_schema(vocab: Vocabulary) -> dict[str, Any]:
 
 
 def _doc_comment(tag: Tag) -> str:
+    """The ``##`` doc-comment block for *tag*.
+
+    ``description`` spreads over as many ``##`` lines as it has; the other three
+    each get exactly one, so they are folded onto a single line here as well as
+    at Tag-construction time (see :func:`_one_line`) — a directly-constructed
+    :class:`Tag` must not be able to emit RNC that no longer parses.
+    """
     lines: list[str] = []
     if tag.description:
         for line in tag.description.splitlines():
             lines.append(f"## {line}".rstrip())
     if tag.example:
-        lines.append(f"## Example: {tag.example}")
+        lines.append(f"## Example: {_one_line(tag.example)}")
     if tag.prompt:
-        lines.append(f"## Prompt: {tag.prompt}")
+        lines.append(f"## Prompt: {_one_line(tag.prompt)}")
     if tag.invariant:
-        lines.append(f"## Invariant: {tag.invariant}")
+        lines.append(f"## Invariant: {_one_line(tag.invariant)}")
     return "".join(f"{line}\n" for line in lines)
 
 

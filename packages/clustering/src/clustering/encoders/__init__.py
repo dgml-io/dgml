@@ -29,6 +29,7 @@ from clustering.encoders import (
     gemini,  # noqa: F401  (registers "gemini")
     image,  # noqa: F401  (registers "dit", "vit", "donut")
     lexical,  # noqa: F401  (registers "tfidf")
+    openai_embeddings,  # noqa: F401  (registers "openai")
     qwen3_vl_embedding,  # noqa: F401  (registers "qwen3_vl_embedding")
     qwen_vl,  # noqa: F401  (registers "qwen_vl")
     text,  # noqa: F401

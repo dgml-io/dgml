@@ -1072,6 +1072,9 @@ logging = [
     { name = "clearml" },
     { name = "wandb" },
 ]
+openai = [
+    { name = "litellm" },
+]
 umap = [
     { name = "numba" },
     { name = "umap-learn" },
@@ -1083,6 +1086,7 @@ requires-dist = [
     { name = "clearml", marker = "extra == 'logging'", specifier = ">=1.16" },
     { name = "geoopt", specifier = ">=0.5" },
     { name = "litellm", marker = "extra == 'gemini'", specifier = ">=1.51.0" },
+    { name = "litellm", marker = "extra == 'openai'", specifier = ">=1.51.0" },
     { name = "networkx", specifier = ">=3.2" },
     { name = "numba", marker = "extra == 'umap'", specifier = ">=0.61" },
     { name = "numpy", specifier = ">=2.0" },
@@ -1100,7 +1104,7 @@ requires-dist = [
     { name = "umap-learn", marker = "extra == 'umap'", specifier = ">=0.5.6" },
     { name = "wandb", marker = "extra == 'logging'", specifier = ">=0.17" },
 ]
-provides-extras = ["logging", "umap", "gemini"]
+provides-extras = ["logging", "umap", "gemini", "openai"]
 
 [[package]]
 name = "dgml-core"
