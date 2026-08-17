@@ -146,6 +146,22 @@ _DEFAULT_VALUES_TEMPERATURE = 0.0
 # UI defaults, which is the trap we just hit).
 _DEFAULT_REASONING_EFFORT = "high"
 
+# Value extraction is the exception: it runs at "medium". Thinking tokens bill as
+# output tokens and output is the bulk of extraction spend, which makes the
+# reasoning budget the largest cost and latency dial on this path. Measured
+# against reference labels, "medium" cost about a quarter less and finished about
+# twice as fast, with extraction quality equivalent to "high" and no document
+# losing entries from a repeating field — including the long, table-heavy
+# documents the "high" default was originally chosen to protect.
+#
+# This is deliberately a separate constant rather than a change to
+# _DEFAULT_REASONING_EFFORT. Schema generation and location grounding force
+# ``tool_choice``, so the LLM wrapper drops ``reasoning_effort`` for
+# Anthropic-routed models and the value would be inert there on Claude — but it
+# is NOT dropped for other providers, and lowering their budget was not
+# measured. Only phase 1 uses auto tool choice, so only phase 1 changes.
+_VALUES_REASONING_EFFORT = "medium"
+
 
 # HTTP timeout for a single litellm call. The default in litellm is
 # in the few-minutes range and isn't long enough for high-reasoning
@@ -1540,7 +1556,10 @@ def _run_extract_loop(
     # Phase 1 uses tool_choice="auto" (the default in call_with_tools) so
     # the model can call get_page_words between turns. With auto choice
     # the wrapper keeps reasoning_effort for every provider, including
-    # Anthropic — only forced tool_choice triggers the Anthropic drop.
+    # Anthropic — only forced tool_choice triggers the Anthropic drop. That
+    # also makes this the only call site where the reasoning budget has any
+    # effect on Claude, which is why :data:`_VALUES_REASONING_EFFORT` applies
+    # here and nowhere else.
     llm_config = LLMConfig(
         model=model,
         api_key=api_key,
@@ -1549,7 +1568,7 @@ def _run_extract_loop(
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
         timeout=_DEFAULT_TIMEOUT_SECONDS,
-        reasoning_effort=_DEFAULT_REASONING_EFFORT,
+        reasoning_effort=_VALUES_REASONING_EFFORT,
     )
 
     tool_calls_run = 0

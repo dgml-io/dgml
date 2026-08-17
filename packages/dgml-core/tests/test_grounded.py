@@ -616,7 +616,7 @@ def test_extract_values_drops_temperature_for_anthropic(
     with patch("litellm.completion", return_value=response) as m:
         extract_values(workspace, ds_id, fid, config=anthropic_cfg)
     phase1_kwargs = m.call_args_list[0].kwargs
-    assert phase1_kwargs["reasoning_effort"] == "high"
+    assert phase1_kwargs["reasoning_effort"] == "medium"
     assert "temperature" not in phase1_kwargs
 
     gemini_cfg = GroundedConfig(
@@ -625,8 +625,40 @@ def test_extract_values_drops_temperature_for_anthropic(
     with patch("litellm.completion", return_value=response) as m:
         extract_values(workspace, ds_id, fid, config=gemini_cfg)
     phase1_kwargs = m.call_args_list[0].kwargs
-    assert phase1_kwargs["reasoning_effort"] == "high"
+    assert phase1_kwargs["reasoning_effort"] == "medium"
     assert phase1_kwargs["temperature"] == 0.0
+
+
+def test_lower_values_budget_does_not_reach_location_grounding(workspace: Workspace) -> None:
+    """Value extraction runs at a lower reasoning budget than the rest of the
+    pipeline; location grounding must keep the module default.
+
+    Location grounding forces ``tool_choice``, so Anthropic drops the setting
+    either way — but other providers keep it, and lowering their budget was never
+    measured. A Gemini values model makes the value observable on both calls, so
+    this pins the boundary instead of trusting it. Needs text phase 2 cannot
+    match, which is what sends grounding to the LLM at all."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # only contains "Hello", "world"
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+
+    assert m.call_count == 2
+    assert m.call_args_list[0].kwargs["reasoning_effort"] == "medium"
+    assert m.call_args_list[1].kwargs["reasoning_effort"] == "high"
 
 
 def test_generate_schema_rejects_empty_file_list(workspace: Workspace) -> None:
