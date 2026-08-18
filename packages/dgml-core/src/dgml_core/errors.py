@@ -174,6 +174,16 @@ class ModelNotSupported(DgmlError):
     code = "MODEL_NOT_SUPPORTED"
 
 
+class EmptyModelResponse(DgmlError):
+    """A litellm.completion call returned successfully but carried no choices
+    (zero candidates / zero completion tokens). Observed intermittently with
+    Gemini and normally transient — the caller retries first and only raises
+    this once an empty response persists across every attempt, so it surfaces
+    clearly instead of as a downstream ``choices[0]`` IndexError."""
+
+    code = "EMPTY_MODEL_RESPONSE"
+
+
 class OcrFailed(DgmlError):
     code = "OCR_FAILED"
 

@@ -48,7 +48,7 @@ from typing import Any, cast
 
 import litellm
 
-from .errors import ModelNotSupported, now_iso, short_error_message
+from .errors import EmptyModelResponse, ModelNotSupported, now_iso, short_error_message
 from .storage import Workspace
 from .usage import (
     OUTCOME_ERROR,
@@ -394,12 +394,13 @@ def call_with_refinement(
     )
     user_msg = {"role": "user", "content": user_blocks}
 
-    # Both requests fold into one aggregated row.
+    # Both requests fold into one aggregated row. Route through
+    # _completion_with_retry so an empty/transient response is retried rather
+    # than crashing on choices[0] (same guard as every other call site).
     with _record_call(config) as totals:
-        with _quiet_stdout():
-            draft_resp = litellm.completion(
-                **_build_completion_kwargs(config, messages=[sys_msg, user_msg])
-            )
+        draft_resp = _completion_with_retry(
+            _build_completion_kwargs(config, messages=[sys_msg, user_msg])
+        )
         add_partial(totals, extract_cost_and_tokens(draft_resp))
         draft = cast(str, draft_resp["choices"][0]["message"]["content"])
 
@@ -409,10 +410,9 @@ def call_with_refinement(
             {"role": "assistant", "content": draft},
             {"role": "user", "content": refine_instruction},
         ]
-        with _quiet_stdout():
-            refined_resp = litellm.completion(
-                **_build_completion_kwargs(config, messages=refine_msgs)
-            )
+        refined_resp = _completion_with_retry(
+            _build_completion_kwargs(config, messages=refine_msgs)
+        )
         add_partial(totals, extract_cost_and_tokens(refined_resp))
         refined = cast(str, refined_resp["choices"][0]["message"]["content"])
     return draft, refined
@@ -569,7 +569,17 @@ def _quiet_stdout() -> Iterator[None]:
 
 
 def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
-    """Call litellm.completion with exponential-backoff retries for transient errors."""
+    """Call litellm.completion with exponential-backoff retries for transient
+    failures — both raised errors and *empty* responses.
+
+    A successful call can still come back with an empty ``choices`` list (zero
+    candidates, zero completion tokens): observed intermittently with Gemini via
+    litellm, and transient — an immediate retry clears it. Left unhandled it
+    surfaces downstream as ``response.choices[0]`` → ``IndexError`` and aborts
+    the whole request (e.g. a document's extraction). So an empty response is
+    retried like any other transient failure, and only raises
+    :class:`EmptyModelResponse` once it persists across every attempt.
+    """
     import litellm
 
     delay = 2.0
@@ -577,7 +587,7 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
     for attempt in range(max_retries):
         try:
             with _quiet_stdout():
-                return litellm.completion(**kwargs)
+                response = litellm.completion(**kwargs)
         except Exception as exc:
             msg = str(exc).lower()
             # Retry on transient network/server errors only.
@@ -599,6 +609,21 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
             last_exc = exc
             time.sleep(delay)
             delay *= 2
+            continue
+        # A successful call can still carry an empty choices list (transient
+        # provider glitch); retry it rather than let choices[0] IndexError.
+        choices = getattr(response, "choices", None)
+        if choices is None and isinstance(response, dict):
+            choices = response.get("choices")
+        if choices:
+            return response
+        if attempt == max_retries - 1:
+            raise EmptyModelResponse(
+                f"model returned no choices after {max_retries} attempts "
+                f"(model={kwargs.get('model')!r})"
+            )
+        time.sleep(delay)
+        delay *= 2
     raise last_exc  # type: ignore[misc]
 
 

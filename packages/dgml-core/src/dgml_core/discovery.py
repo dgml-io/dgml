@@ -478,7 +478,7 @@ def classify_tags_with_llm(tag_names: list[str], llm_config: Any) -> dict[str, s
     """
     import json as _json
 
-    import litellm
+    from .llm import _completion_with_retry
 
     if not tag_names:
         return {}
@@ -495,12 +495,16 @@ def classify_tags_with_llm(tag_names: list[str], llm_config: Any) -> dict[str, s
         'category string ("Who", "When", "Amounts", "Definitions", "Rules") or null.'
     )
 
-    resp = litellm.completion(
-        model=llm_config.model,
-        api_key=llm_config.api_key,
-        api_base=llm_config.api_base,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
+    # Route through the shared retry/guard so an empty or transient response is
+    # retried instead of crashing on choices[0].
+    resp = _completion_with_retry(
+        {
+            "model": llm_config.model,
+            "api_key": llm_config.api_key,
+            "api_base": llm_config.api_base,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1024,
+        }
     )
     text = str(resp.choices[0].message.content or "").strip()
     # Strip markdown code fences if present.

@@ -67,6 +67,100 @@ def test_completion_with_retry_redirects_only_during_call(
     assert sys.stdout is original
 
 
+def test_completion_with_retry_retries_empty_choices_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful response with an empty `choices` list (an intermittent
+    Gemini glitch) is retried rather than passed through to a downstream
+    `choices[0]` IndexError; the first non-empty response is returned."""
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    def flaky_completion(**kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return SimpleNamespace(choices=[])  # empty candidate — transient
+        return SimpleNamespace(choices=[SimpleNamespace(message="ok")])
+
+    monkeypatch.setattr("litellm.completion", flaky_completion)
+    monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)  # no backoff wait
+
+    result = llm._completion_with_retry({"model": "gemini/gemini-2.5-pro", "messages": []})
+
+    assert calls["n"] == 3
+    assert result.choices[0].message == "ok"
+
+
+def test_completion_with_retry_raises_on_persistent_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every attempt comes back empty, a clear EmptyModelResponse is raised
+    (carrying the model id) instead of a bare IndexError."""
+    from types import SimpleNamespace
+
+    from dgml_core.errors import EmptyModelResponse
+
+    calls = {"n": 0}
+
+    def always_empty(**kwargs: Any) -> Any:
+        calls["n"] += 1
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr("litellm.completion", always_empty)
+    monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+
+    with pytest.raises(EmptyModelResponse, match="no choices"):
+        llm._completion_with_retry(
+            {"model": "gemini/gemini-2.5-pro", "messages": []}, max_retries=3
+        )
+
+    assert calls["n"] == 3  # exhausted every attempt before raising
+
+
+def test_completion_with_retry_retries_dict_shaped_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The empty-choices guard also fires for dict-shaped responses ({"choices": []}),
+    not just objects — exercises the isinstance(response, dict) fallback on the empty path."""
+    calls = {"n": 0}
+
+    def flaky(**kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        return {"choices": []} if calls["n"] < 2 else _resp("OK")
+
+    monkeypatch.setattr("litellm.completion", flaky)
+    monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+
+    result = llm._completion_with_retry({"model": "gemini/gemini-2.5-pro", "messages": []})
+
+    assert calls["n"] == 2
+    assert result == _resp("OK")
+
+
+def test_completion_with_retry_retries_transient_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient network error is retried and then succeeds — guards the
+    `continue` in the except branch (without it, `response` is unbound and the
+    empty-choices guard would raise UnboundLocalError)."""
+    calls = {"n": 0}
+
+    def flaky(**kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("503 Service Unavailable: overloaded")
+        return _resp("OK")
+
+    monkeypatch.setattr("litellm.completion", flaky)
+    monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+
+    result = llm._completion_with_retry({"model": "gpt-4o", "messages": []})
+
+    assert calls["n"] == 2
+    assert result == _resp("OK")
+
+
 def test_call_with_refinement_replays_draft_in_second_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
