@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -2062,6 +2063,16 @@ def _add_generate_subparser(
             "dates, derived values) added in place, using the labeling model."
         ),
     )
+    gen.add_argument(
+        "--no-semlink-cache",
+        action="store_true",
+        help=(
+            "Always call the model for the semantic-link pass. By default the pass "
+            "is content-addressed on (grounded XML, labeling model, link prompts) "
+            "and a repeat run replays the cached result instead of paying for it "
+            "again; a hit writes the same bytes the model call would have."
+        ),
+    )
 
 
 def _load_schema_roster(path: Path) -> dict[str, str]:
@@ -2227,6 +2238,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         validate_generation_models,
     )
     from dgml_core.generation import coverage as cov_mod
+    from dgml_core.generation import links as links_mod
     from dgml_core.generation.blocks import Block
     from dgml_core.generation.links import add_links
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
@@ -2421,6 +2433,14 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     written: list[dict[str, Any]] = []
     rerendered: list[str] = []
     cov_results: list[dict[str, Any]] = []
+    # `_on_output` runs on convert_batch's document pool, so it records its
+    # per-document results here — each document owns one key, so no two threads
+    # write the same entry — and the three lists above are extended in a fixed
+    # order once the batch has drained. Appending straight from the workers
+    # would make the JSON payload depend on completion order.
+    converted_by_name: dict[str, dict[str, Any]] = {}
+    cov_by_name: dict[str, dict[str, Any]] = {}
+    rerendered_by_name: dict[str, None] = {}
     # Already-generated docs reloaded from cache (populated below when there is
     # new work) so namespacing spans the whole docset and flipped originals
     # re-render. _on_output reads prior_outputs to route/flag them.
@@ -2445,6 +2465,26 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     def _on_label_error(name: str, err: dict[str, str]) -> None:
         label_errors[name] = err
         _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
+
+    def _semlink_cache_key(xml_bytes: bytes) -> str:
+        """Content address for one document's semantic-link result.
+
+        Keyed on everything that determines the output — the grounded XML, the
+        labeling model, and both link prompts — so editing a prompt or switching
+        models misses rather than replaying a stale result. Parts are
+        length-prefixed so no concatenation of two different inputs can collide.
+        """
+        digest = hashlib.sha256()
+        for part in (
+            xml_bytes,
+            label_model.encode("utf-8"),
+            links_mod.SYSTEM_PROMPT.encode("utf-8"),
+            links_mod.VERIFY_SYSTEM_PROMPT.encode("utf-8"),
+        ):
+            digest.update(len(part).to_bytes(8, "big"))
+            digest.update(part)
+        prefix = layout.generation_cache_prefix(args.docset_id)
+        return f"{prefix}semlinks/{digest.hexdigest()}"
 
     def _on_output(name: str, xml: str) -> None:
         xml_key = dgml_xml_keys[name]
@@ -2506,13 +2546,30 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             )
         # Final step: add semantic links in place (dg:itemprop/dg:href). Runs on
         # re-rendered priors too — their fresh XML would otherwise lose the links.
+        # The pass is a pure function of (grounded XML, labeling model, link
+        # prompts), so it is content-addressed: a hit replays the exact bytes the
+        # model call would have written, making a repeat run free rather than
+        # merely cheaper. The applied-link count is cached alongside so the
+        # reported `links` is identical on both paths.
         links_added = 0
         if not args.no_semlinks:
+            source = ws.blobs.get_blob(xml_key)
+            cache_key = _semlink_cache_key(source)
+            cached_xml, cached_meta = f"{cache_key}.xml", f"{cache_key}.json"
             try:
-                linked, applied = add_links(ws.blobs.get_blob(xml_key).decode("utf-8"), link_config)
-                ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
-                links_added = len(applied)
-                _diag(f"[semlinks] {name}: {links_added} link(s)")
+                if not args.no_semlink_cache and ws.blobs.blob_exists(cached_xml):
+                    ws.blobs.put_blob(xml_key, ws.blobs.get_blob(cached_xml))
+                    links_added = int(json.loads(ws.blobs.get_blob(cached_meta))["links"])
+                    _diag(f"[semlinks] {name}: {links_added} link(s) (cached)")
+                else:
+                    linked, applied = add_links(source.decode("utf-8"), link_config)
+                    ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
+                    links_added = len(applied)
+                    ws.blobs.put_blob(cached_xml, linked.encode("utf-8"))
+                    ws.blobs.put_blob(
+                        cached_meta, json.dumps({"links": links_added}).encode("utf-8")
+                    )
+                    _diag(f"[semlinks] {name}: {links_added} link(s)")
             except Exception as exc:  # a link-pass failure must not lose the DGML
                 _diag(f"[semlinks] {name}: skipped ({exc})")
         # Re-embed the prior dg:extraction last, after grounding + semlinks
@@ -2528,27 +2585,26 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             except Exception as exc:  # never lose the fresh DGML over the merge
                 _diag(f"[extraction] {name}: dg:extraction NOT carried over ({exc})")
         if name in prior_outputs:
-            rerendered.append(name)  # an already-generated doc whose namespacing flipped
+            # an already-generated doc whose namespacing flipped
+            rerendered_by_name[name] = None
             return
         pt_dir = page_text_dirs.get(name)
         if compute_cov and pt_dir is not None:
             result = cov_mod.compute_coverage(xml, name, page_text_dir=pt_dir)
             _diag(cov_mod.coverage_summary_line(result))
-            cov_results.append(result)
+            cov_by_name[name] = result
         # Present only on files whose labeling couldn't reach the model — like
         # grounding_error, which appears only when grounded is False.
         label_error = label_errors.get(name)
         label_extra = {"label_error": label_error} if label_error is not None else {}
-        written.append(
-            _file_result(
-                "converted",
-                filename_to_fid[name],
-                name,
-                output=xml_key,
-                links=links_added,
-                **grounding,
-                **label_extra,
-            )
+        converted_by_name[name] = _file_result(
+            "converted",
+            filename_to_fid[name],
+            name,
+            output=xml_key,
+            links=links_added,
+            **grounding,
+            **label_extra,
         )
 
     if convert_names:
@@ -2665,6 +2721,15 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     prior_docs=prior_docs,
                     prior_outputs=prior_outputs,
                 )
+            # Documents were converted on a pool, so fold the per-document
+            # results back in a fixed order — queued order for converted files,
+            # docset order for re-rendered priors — and the payload stays
+            # byte-identical to the serial run it replaced.
+            written.extend(
+                converted_by_name[name] for name in convert_names if name in converted_by_name
+            )
+            cov_results.extend(cov_by_name[name] for name in convert_names if name in cov_by_name)
+            rerendered.extend(name for name in prior_docs if name in rerendered_by_name)
             # convert_batch silently drops documents whose transcription failed, so
             # `_on_output` never fires for them. Reconcile: any queued file with no
             # output is a per-file failure, not a vanished row (keeps counts summing

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dgml_core import llm
+from dgml_core.concurrency import map_concurrent
 from dgml_core.conversion import ConverterConfig
 from dgml_core.errors import short_error_message
 from dgml_core.generation import document
@@ -282,13 +283,13 @@ def convert_batch(
             on_label_error=on_label_error,
         )
 
-    outputs: dict[str, str] = {}
-    for name, blocks in docs.items():
+    def _emit(item: tuple[str, list[Block]]) -> tuple[str, str]:
         # With dgml_header set, the product output is the final dg:chunk dgml
         # (concept tags where labeled, dg:chunk scaffolding otherwise, value
         # typing). Without it, the plain structure-attribute form is returned
         # (library/test shape). The compact concept render and the
         # structure-attribute XML are kept as debug artifacts in the cache.
+        name, blocks = item
         if opts.dgml_header:
             xml = render_dgml(blocks, header=opts.dgml_header, parent_map=opts.parent_map)
         else:
@@ -296,8 +297,6 @@ def convert_batch(
         # Stream to the sink (freed immediately) or accumulate for the return.
         if on_output is not None:
             on_output(name, xml)
-        else:
-            outputs[name] = xml
         # Debug-only intermediate renders — never read back, so gated on
         # --debug (the functional blocks/roster caches are written elsewhere).
         if opts.debug and opts.cache_dir is not None:
@@ -309,6 +308,18 @@ def convert_batch(
             (cache / f"{Path(name).stem}.semantic.xml").write_text(
                 render_semantic_xml(blocks), encoding="utf-8"
             )
+        return name, xml
+
+    # The per-document sink is the expensive half of a run — grounding plus the
+    # semantic-link model calls — and documents are independent, so it runs on
+    # the same bounded pool transcription uses. Only when there is no sink is
+    # this pure rendering, which is cheap enough to stay inline.
+    # `map_concurrent` returns results in input order, so a caller folding them
+    # into shared state still sees a deterministic sequence; sinks that mutate
+    # caller state must key by document and order the fold themselves.
+    emit_workers = opts.max_parallel_docs if on_output is not None else 1
+    emitted = map_concurrent(_emit, list(docs.items()), max_workers=emit_workers)
+    outputs: dict[str, str] = {} if on_output is not None else dict(emitted)
 
     # Re-render prior docs whose rendered XML changed and emit only those. All
     # concepts are docset:-namespaced, so sharing does not shift prefixes; a
@@ -316,10 +327,15 @@ def convert_batch(
     # docset's schema/roster grows (or when migrating legacy dg:-namespaced
     # concepts to docset:).
     if prior_docs and opts.dgml_header and on_output is not None:
+        # Rendering is cheap and decides *which* priors changed, so it stays
+        # inline and in order; only the sink — grounding plus the link model
+        # calls — goes on the pool.
+        changed: list[tuple[str, str]] = []
         for name, blocks in prior_docs.items():
             xml = render_dgml(blocks, header=opts.dgml_header, parent_map=opts.parent_map)
             if prior_outputs is not None and prior_outputs.get(name) == xml:
                 continue
             log(f"re-rendering {name} (docset render changed)")
-            on_output(name, xml)
+            changed.append((name, xml))
+        map_concurrent(lambda item: on_output(*item), changed, max_workers=opts.max_parallel_docs)
     return outputs

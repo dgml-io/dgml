@@ -540,9 +540,14 @@ with an ISO-8601 offset in `dg:value`), and derived values (`greaterOf`/
 labeling model (`generation.label_model`), then a skeptical pass verifies them.
 Each converted file's `results` entry carries a `links` count.
 
+The link pass is content-addressed on (grounded XML, labeling model, link
+prompts), so re-running a docset replays cached results instead of paying for
+the model again; `--no-semlink-cache` forces a fresh call.
+
 ```bash
 uv run dgml docset generate "$ds" | jq '.results[] | {source, links}'
-uv run dgml docset generate "$ds" --no-semlinks   # skip the link step
+uv run dgml docset generate "$ds" --no-semlinks       # skip the link step
+uv run dgml docset generate "$ds" --no-semlink-cache  # re-link, ignoring the cache
 ```
 
 ### Cluster the unassigned files

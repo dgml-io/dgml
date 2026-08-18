@@ -4247,6 +4247,141 @@ def test_docset_generate_builds_tree_for_extraction_only_file(
     assert 'dg:origin="1 10 20 30 40"' in final  # grounding survived verbatim
 
 
+def _two_files_in_docset(
+    ws: Path, tmp_path: Path, did: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Add two documents to *did*. They must differ in both name and content:
+    generate reports same-named files as a duplicate-filename failure, and
+    `file add` dedupes on content hash. The tree each one yields is supplied by
+    the fake convert_batch, so the PDFs themselves need only be distinct."""
+    for name, text in (("one.pdf", "First Document"), ("two.pdf", "Second Document")):
+        pdf = tmp_path / name
+        _write_text_pdf(pdf, pages_text=[text])
+        main(_ws_args(ws) + ["file", "add", str(pdf)])
+        fid = _read_stdout(capsys)["file"]["id"]
+        main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+        capsys.readouterr()  # drain, so the next iteration reads only its own JSON
+
+
+_SAME_TREE = '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"><a>same tree</a></dg:chunk>'
+
+
+def _fake_convert_emitting(tree: str, *, reverse: bool = False) -> Any:
+    """Stand in for convert_batch: hand *tree* to the sink for every input."""
+
+    def fake_convert(paths: Any, *, options: Any, on_output: Any, **_kw: Any) -> dict[str, str]:
+        names = [Path(p).name for p in paths]
+        for name in reversed(names) if reverse else names:
+            on_output(name, tree)
+        return {}
+
+    return fake_convert
+
+
+def _counting_linker(calls: list[str]) -> Any:
+    """Stand in for add_links, recording every XML it was actually called with."""
+    from dgml_core.generation.links import Link
+
+    def fake_add_links(xml: str, config: Any, *, verify: bool = True) -> tuple[str, list[Link]]:
+        calls.append(xml)
+        linked = xml.replace("<a>", '<a dg:itemprop="references" dg:href="#x">')
+        return linked, [Link("a", ["x"], "references")]
+
+    return fake_add_links
+
+
+@needs_gs
+def test_semlink_cache_replays_result_for_an_identical_tree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The link pass is a pure function of (grounded XML, model, prompts), so a
+    second document with an identical tree replays the cached bytes instead of
+    paying for a second model call — and reports the same `links` count."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    _two_files_in_docset(ws, tmp_path, did, capsys)
+
+    calls: list[str] = []
+    with (
+        patch("dgml_core.generation.convert_batch", side_effect=_fake_convert_emitting(_SAME_TREE)),
+        patch("dgml_core.generation.links.add_links", side_effect=_counting_linker(calls)),
+    ):
+        rc = main(
+            _ws_args(ws) + ["docset", "generate", did, "--no-coverage", "--max-parallel-calls", "1"]
+        )
+    assert rc == 0
+    payload = _read_generate_stdout(capsys)
+    converted = [r for r in payload["results"] if r["status"] == "converted"]
+    assert len(converted) == 2
+    # One model call for two identical trees; both documents report its result.
+    assert len(calls) == 1
+    assert {r["links"] for r in converted} == {1}
+    stored = {Workspace(root=ws).blobs.get_blob(r["output"]).decode("utf-8") for r in converted}
+    assert len(stored) == 1  # cache hit wrote the same bytes, not a re-derivation
+    assert 'dg:itemprop="references"' in stored.pop()
+
+
+@needs_gs
+def test_no_semlink_cache_always_calls_the_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--no-semlink-cache` opts out: identical trees each pay for their own call."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    _two_files_in_docset(ws, tmp_path, did, capsys)
+
+    calls: list[str] = []
+    with (
+        patch("dgml_core.generation.convert_batch", side_effect=_fake_convert_emitting(_SAME_TREE)),
+        patch("dgml_core.generation.links.add_links", side_effect=_counting_linker(calls)),
+    ):
+        rc = main(
+            _ws_args(ws)
+            + [
+                "docset",
+                "generate",
+                did,
+                "--no-coverage",
+                "--no-semlink-cache",
+                "--max-parallel-calls",
+                "1",
+            ]
+        )
+    assert rc == 0
+    _read_generate_stdout(capsys)
+    assert len(calls) == 2
+
+
+@needs_gs
+def test_generate_results_order_is_independent_of_completion_order(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Documents are converted on a pool, so the sink can fire in any order. The
+    `results` array is part of the CLI contract and must stay in queued order."""
+
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    _two_files_in_docset(ws, tmp_path, did, capsys)
+
+    main(_ws_args(ws) + ["docset", "list-files", did])
+    queued = _read_stdout(capsys)["file_ids"]
+    assert len(queued) == 2
+
+    # The sink fires in reverse; the payload must still follow the queue.
+    with (
+        patch(
+            "dgml_core.generation.convert_batch",
+            side_effect=_fake_convert_emitting(_SAME_TREE, reverse=True),
+        ),
+        patch("dgml_core.generation.links.add_links", side_effect=_counting_linker([])),
+    ):
+        rc = main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"])
+    assert rc == 0
+    payload = _read_generate_stdout(capsys)
+    converted = [r["file_id"] for r in payload["results"] if r["status"] == "converted"]
+    assert converted == queued
+
+
 # ------------------------------------------------------- workspace migration
 
 
