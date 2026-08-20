@@ -27,6 +27,7 @@ This pass covers three families:
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -169,11 +170,24 @@ def _verify(
     return [c for i, c in enumerate(cands) if i in kept]
 
 
-def add_links(xml: str, config: llm.LLMConfig, *, verify: bool = True) -> tuple[str, list[Link]]:
-    """Add semantic links to *xml*; return (linked xml, applied links).
+def listing_digest(xml: str) -> str:
+    """Hash of exactly what the link model is shown for *xml*.
 
-    Proposes links, verifies them with a skeptical second pass (unless
-    *verify* is False), then applies the survivors.
+    The prompt carries tag local names and text, never attributes. So two
+    versions of a document that read the same to the model hash the same, and
+    adding ``dg:origin`` boxes or moving concepts to a different namespace
+    prefix does not make the pass run again.
+    """
+    root = etree.fromstring(xml.encode())
+    return hashlib.sha256(_listing(_elements(root)).encode("utf-8")).hexdigest()
+
+
+def plan_links(xml: str, config: llm.LLMConfig, *, verify: bool = True) -> list[dict[str, Any]]:
+    """Ask the model which links *xml* should carry.
+
+    Every model call for the pass happens here. The answer comes back as plain
+    data, with both ends of a link given as positions in document order, so a
+    caller can store it and apply it later with :func:`apply_plan`.
     """
     root = etree.fromstring(xml.encode())
     elements = _elements(root)
@@ -182,24 +196,61 @@ def add_links(xml: str, config: llm.LLMConfig, *, verify: bool = True) -> tuple[
         cands = _propose(elements, config)
         if verify and cands:
             cands = _verify(elements, cands, config)
+    return [
+        {
+            "subject": c.subject,
+            "objects": list(c.objects),
+            "predicate": c.predicate,
+            "value": c.value,
+        }
+        for c in cands
+    ]
 
+
+def apply_plan(xml: str, plan: list[dict[str, Any]]) -> tuple[str, list[Link]]:
+    """Write a plan from :func:`plan_links` into *xml*. Makes no model call.
+
+    Entries pointing outside the tree are skipped, so a plan applied to a
+    document it was not built for produces fewer links instead of raising.
+    """
+    root = etree.fromstring(xml.encode())
+    elements = _elements(root)
     used: set[str] = {i for el in elements if (i := el.get(f"{{{_XML}}}id"))}
     applied: list[Link] = []
-    for c in cands:
-        obj_ids = [_ensure_id(elements[o], used) for o in c.objects]
-        subj_id = _ensure_id(elements[c.subject], used)
+    count = len(elements)
+    for item in plan:
+        subject_idx = item.get("subject")
+        obj_idxs = [
+            o
+            for o in (item.get("objects") or [])
+            if isinstance(o, int) and 0 <= o < count and o != subject_idx
+        ]
+        if not isinstance(subject_idx, int) or not 0 <= subject_idx < count or not obj_idxs:
+            continue
+        predicate = str(item.get("predicate") or "references")
+        obj_ids = [_ensure_id(elements[o], used) for o in obj_idxs]
+        subj_id = _ensure_id(elements[subject_idx], used)
         href = " ".join(f"#{oid}" for oid in obj_ids)
-        subject = elements[c.subject]
-        subject.set(f"{{{_DG}}}itemprop", c.predicate)
+        subject = elements[subject_idx]
+        subject.set(f"{{{_DG}}}itemprop", predicate)
         subject.set(f"{{{_DG}}}href", href)
         # On a TYPED element (xsi:type present) dg:value already holds the
         # normalized typed value — writing the link payload over it would make
         # the xsi:type/dg:value pair inconsistent (e.g. decimal + "$2,500,000").
         # The typed value wins; the link keeps itemprop + href.
-        value = "" if subject.get(f"{{{_XSI}}}type") else c.value
+        value = "" if subject.get(f"{{{_XSI}}}type") else str(item.get("value") or "")
         if value:
             subject.set(f"{{{_DG}}}value", value)
-        applied.append(Link(subj_id, obj_ids, c.predicate, value, href))
+        applied.append(Link(subj_id, obj_ids, predicate, value, href))
 
     body = etree.tostring(root, encoding="unicode")
     return f"<?xml version='1.0' encoding='utf-8'?>\n{body}\n", applied
+
+
+def add_links(xml: str, config: llm.LLMConfig, *, verify: bool = True) -> tuple[str, list[Link]]:
+    """Add semantic links to *xml*; return (linked xml, applied links).
+
+    Proposes links, verifies them with a skeptical second pass (unless
+    *verify* is False), then applies the survivors.
+    """
+    return apply_plan(xml, plan_links(xml, config, verify=verify))

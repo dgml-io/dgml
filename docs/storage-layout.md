@@ -653,9 +653,12 @@ governs the generated full-document tree; the extraction schema governs the
 (`full-extraction`). The body is the planner's `Schema` document
 (canonical tag names plus per-tag metadata). Generation also writes a
 `cache/` at the docset root. It holds **functional** files the next
-`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`, and
+`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`,
 `concept_roster.json` (the flat legacy vocabulary; incremental reuse prefers
-the docset's `schema.json` and falls back to this file) —
+the docset's `schema.json` and falls back to this file), and
+`semlinks/<hash>.json` (one document's semantic links, keyed on what the link
+model reads — tag names and text — so re-rendering or grounding a document
+replays them instead of paying for the pass again) —
 which are always written. Its **debug-only** artifacts (raw LLM dumps,
 `*.concept.xml`/`*.semantic.xml`, prompt listings) and the separate
 `coverage_report.json` are written only when `dgml --debug docset generate`

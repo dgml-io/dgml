@@ -127,3 +127,82 @@ def test_link_value_never_clobbers_a_typed_value(monkeypatch: pytest.MonkeyPatch
     due = by["DueDate"]  # untyped: link payload lands in dg:value
     assert due.get(f"{{{_DG}}}value") == "P7D"
     assert [ln.value for ln in applied] == ["", "P7D"]  # reported value mirrors the XML
+
+
+def test_listing_digest_ignores_attributes() -> None:
+    """The prompt shows tag names and text, never attributes — so grounding a
+    document or moving concepts to another namespace prefix must not change its
+    cache key, or every re-render would pay for the pass again."""
+    from dgml_core.generation.links import listing_digest
+
+    grounded = _XML.replace("<dg:BaseRent>", '<dg:BaseRent dg:origin="1,2,3,4" dg:style="bold">')
+    assert listing_digest(_XML) == listing_digest(grounded)
+
+    renamed = _XML.replace("dg:BaseRent", "docset:BaseRent").replace(
+        'xmlns:dg="http://dgml.io/ns/dg#"',
+        'xmlns:dg="http://dgml.io/ns/dg#" xmlns:docset="http://dgml.io/ns/docset#"',
+    )
+    assert listing_digest(_XML) == listing_digest(renamed)
+
+    # Changing text the model DOES see must change the key.
+    assert listing_digest(_XML) != listing_digest(_XML.replace("100", "250"))
+
+
+def test_apply_plan_is_deterministic_and_needs_no_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached plan replays without a model call, and lands the same links on a
+    re-grounded copy of the same tree."""
+    from dgml_core.generation.links import apply_plan
+
+    def explode(*_a: object, **_k: object) -> str:
+        raise AssertionError("apply_plan must not call the model")
+
+    monkeypatch.setattr(llm, "call", explode)
+
+    plan = [{"subject": 2, "objects": [1], "predicate": "relativeTo", "value": "P1Y"}]
+    first, applied = apply_plan(_XML, plan)
+    grounded = _XML.replace("<dg:BaseRent>", '<dg:BaseRent dg:origin="1,2,3,4">')
+    second, applied_again = apply_plan(grounded, plan)
+
+    assert [(ln.subject, ln.predicate, ln.href) for ln in applied] == [
+        (ln.subject, ln.predicate, ln.href) for ln in applied_again
+    ]
+    assert 'dg:itemprop="relativeTo"' in first and 'dg:itemprop="relativeTo"' in second
+
+
+def test_apply_plan_skips_entries_outside_the_tree() -> None:
+    """A plan applied to a document it wasn't built for loses links rather than
+    raising, so a stale cache entry can never sink a file."""
+    from dgml_core.generation.links import apply_plan
+
+    _, applied = apply_plan(
+        _XML,
+        [
+            {"subject": 999, "objects": [1], "predicate": "references", "value": ""},
+            {"subject": 2, "objects": [999], "predicate": "references", "value": ""},
+            {"subject": 2, "objects": [1], "predicate": "relativeTo", "value": "P1Y"},
+        ],
+    )
+    assert [ln.predicate for ln in applied] == ["relativeTo"]
+
+
+def test_verify_false_keeps_every_proposal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--no-semlink-verify path: one model call, nothing filtered."""
+    calls: list[str] = []
+
+    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
+        calls.append(str(kwargs["system_prompt"]))
+        return json.dumps(
+            {
+                "links": [
+                    {"subject": "e0002", "object": "e0001", "predicate": "relativeTo"},
+                    {"subject": "e0004", "object": "e0003", "predicate": "greaterOf"},
+                ]
+            }
+        )
+
+    monkeypatch.setattr(llm, "call", fake_call)
+    _, applied = add_links(_XML, llm.LLMConfig(model="x"), verify=False)
+    assert len(applied) == 2
+    assert len(calls) == 1 and "reviewer" not in calls[0]

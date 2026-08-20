@@ -4279,24 +4279,27 @@ def _fake_convert_emitting(tree: str, *, reverse: bool = False) -> Any:
 
 
 def _counting_linker(calls: list[str]) -> Any:
-    """Stand in for add_links, recording every XML it was actually called with."""
-    from dgml_core.generation.links import Link
+    """Stand in for plan_links, recording every XML the model was asked about.
 
-    def fake_add_links(xml: str, config: Any, *, verify: bool = True) -> tuple[str, list[Link]]:
+    Only the model call is faked; the real apply_plan writes the links, so these
+    tests cover the path that actually runs.
+    """
+
+    def fake_plan_links(xml: str, config: Any, *, verify: bool = True) -> list[dict[str, Any]]:
         calls.append(xml)
-        linked = xml.replace("<a>", '<a dg:itemprop="references" dg:href="#x">')
-        return linked, [Link("a", ["x"], "references")]
+        # element 1 is <a>, element 0 is the enclosing dg:chunk
+        return [{"subject": 1, "objects": [0], "predicate": "references", "value": ""}]
 
-    return fake_add_links
+    return fake_plan_links
 
 
 @needs_gs
 def test_semlink_cache_replays_result_for_an_identical_tree(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The link pass is a pure function of (grounded XML, model, prompts), so a
-    second document with an identical tree replays the cached bytes instead of
-    paying for a second model call — and reports the same `links` count."""
+    """Two documents that read the same to the model share one cache entry, so
+    the second replays the stored links instead of paying for a second call —
+    and reports the same `links` count."""
     ws = tmp_path / "ws"
     did = _init_with_docset(ws, capsys)
     _two_files_in_docset(ws, tmp_path, did, capsys)
@@ -4304,7 +4307,7 @@ def test_semlink_cache_replays_result_for_an_identical_tree(
     calls: list[str] = []
     with (
         patch("dgml_core.generation.convert_batch", side_effect=_fake_convert_emitting(_SAME_TREE)),
-        patch("dgml_core.generation.links.add_links", side_effect=_counting_linker(calls)),
+        patch("dgml_core.generation.links.plan_links", side_effect=_counting_linker(calls)),
     ):
         rc = main(
             _ws_args(ws) + ["docset", "generate", did, "--no-coverage", "--max-parallel-calls", "1"]
@@ -4333,7 +4336,7 @@ def test_no_semlink_cache_always_calls_the_model(
     calls: list[str] = []
     with (
         patch("dgml_core.generation.convert_batch", side_effect=_fake_convert_emitting(_SAME_TREE)),
-        patch("dgml_core.generation.links.add_links", side_effect=_counting_linker(calls)),
+        patch("dgml_core.generation.links.plan_links", side_effect=_counting_linker(calls)),
     ):
         rc = main(
             _ws_args(ws)
@@ -4373,7 +4376,7 @@ def test_generate_results_order_is_independent_of_completion_order(
             "dgml_core.generation.convert_batch",
             side_effect=_fake_convert_emitting(_SAME_TREE, reverse=True),
         ),
-        patch("dgml_core.generation.links.add_links", side_effect=_counting_linker([])),
+        patch("dgml_core.generation.links.plan_links", side_effect=_counting_linker([])),
     ):
         rc = main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"])
     assert rc == 0
@@ -4456,3 +4459,68 @@ def test_workspace_create_stamps_schema_version(
     # identity survives the stamp
     assert workspace.organization == "acme"
     assert workspace.display_name == "W"
+
+
+@needs_gs
+def test_no_semlink_verify_skips_the_review_pass(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--no-semlink-verify` reaches the library as verify=False, and its result
+    is cached separately from a reviewed one (the two are different answers)."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    _two_files_in_docset(ws, tmp_path, did, capsys)
+
+    seen: list[bool] = []
+
+    def spy(xml: str, config: Any, *, verify: bool = True) -> list[dict[str, Any]]:
+        seen.append(verify)
+        return [{"subject": 1, "objects": [0], "predicate": "references", "value": ""}]
+
+    with (
+        patch("dgml_core.generation.convert_batch", side_effect=_fake_convert_emitting(_SAME_TREE)),
+        patch("dgml_core.generation.links.plan_links", side_effect=spy),
+    ):
+        rc = main(
+            _ws_args(ws)
+            + [
+                "docset",
+                "generate",
+                did,
+                "--no-coverage",
+                "--no-semlink-verify",
+                "--max-parallel-calls",
+                "1",
+            ]
+        )
+    assert rc == 0
+    assert seen == [False]  # one call for two identical trees, review skipped
+
+
+@needs_gs
+def test_link_failure_is_reported_and_keeps_the_dgml(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A link-pass failure must not look like "this document has no links": the
+    document keeps its unlinked DGML and the entry carries `link_error`."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    _two_files_in_docset(ws, tmp_path, did, capsys)
+
+    def boom(xml: str, config: Any, *, verify: bool = True) -> list[dict[str, Any]]:
+        raise RuntimeError("429 rate limit exceeded")
+
+    with (
+        patch("dgml_core.generation.convert_batch", side_effect=_fake_convert_emitting(_SAME_TREE)),
+        patch("dgml_core.generation.links.plan_links", side_effect=boom),
+    ):
+        rc = main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"])
+    assert rc == 0
+    converted = [r for r in _read_generate_stdout(capsys)["results"] if r["status"] == "converted"]
+    assert converted
+    for entry in converted:
+        assert "rate limit" in entry["link_error"]
+        assert entry["links"] == 0
+        # the tree survived, just unlinked
+        stored = Workspace(root=ws).blobs.get_blob(entry["output"]).decode("utf-8")
+        assert "same tree" in stored and "dg:itemprop" not in stored

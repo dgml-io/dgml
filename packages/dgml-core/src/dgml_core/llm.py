@@ -590,7 +590,9 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
                 response = litellm.completion(**kwargs)
         except Exception as exc:
             msg = str(exc).lower()
-            # Retry on transient network/server errors only.
+            # Retry on transient network/server errors only. Rate limits count:
+            # they say "not now", not "never", and the pipeline runs documents
+            # concurrently, so hitting one is expected rather than exceptional.
             transient = any(
                 t in msg
                 for t in (
@@ -602,6 +604,11 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
                     "overloaded",
                     "529",
                     "503",
+                    "429",
+                    "rate limit",
+                    "rate_limit",
+                    "ratelimit",
+                    "too many requests",
                 )
             )
             if not transient or attempt == max_retries - 1:

@@ -592,3 +592,38 @@ def test_output_tokens_clamped_to_model_ceiling() -> None:
         llm.LLMConfig(model="anthropic/claude-haiku-4-5", max_tokens=128000), messages=msgs
     )
     assert kwargs["max_tokens"] == 64000
+
+
+def test_rate_limits_are_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 429 says "not now", not "never". The pipeline runs documents
+    concurrently, so hitting one is expected; before this it raised on the first
+    try and the caller silently lost that document's links."""
+    attempts: list[int] = []
+
+    def flaky(**_kwargs: Any) -> Any:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise Exception("litellm.RateLimitError: 429 Too Many Requests")
+        return type("R", (), {"choices": [object()]})()
+
+    monkeypatch.setattr(litellm, "completion", flaky)
+    monkeypatch.setattr("dgml_core.llm.time.sleep", lambda _s: None)
+    llm._completion_with_retry({"model": "claude-sonnet-4-5"})
+    assert len(attempts) == 3
+
+
+def test_non_transient_errors_still_raise_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adding rate limits to the retry set must not turn a bad API key into
+    three slow attempts."""
+    attempts: list[int] = []
+
+    def bad_key(**_kwargs: Any) -> Any:
+        attempts.append(1)
+        raise Exception("AuthenticationError: invalid x-api-key")
+
+    monkeypatch.setattr(litellm, "completion", bad_key)
+    with pytest.raises(Exception, match="AuthenticationError"):
+        llm._completion_with_retry({"model": "claude-sonnet-4-5"})
+    assert len(attempts) == 1

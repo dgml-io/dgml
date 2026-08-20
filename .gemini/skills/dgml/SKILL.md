@@ -548,6 +548,7 @@ the model again; `--no-semlink-cache` forces a fresh call.
 uv run dgml docset generate "$ds" | jq '.results[] | {source, links}'
 uv run dgml docset generate "$ds" --no-semlinks       # skip the link step
 uv run dgml docset generate "$ds" --no-semlink-cache  # re-link, ignoring the cache
+uv run dgml docset generate "$ds" --no-semlink-verify # one call instead of two; more links, less filtered
 ```
 
 ### Cluster the unassigned files

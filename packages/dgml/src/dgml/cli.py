@@ -2068,9 +2068,19 @@ def _add_generate_subparser(
         action="store_true",
         help=(
             "Always call the model for the semantic-link pass. By default the pass "
-            "is content-addressed on (grounded XML, labeling model, link prompts) "
-            "and a repeat run replays the cached result instead of paying for it "
-            "again; a hit writes the same bytes the model call would have."
+            "is cached on what the model actually reads (tag names and text, plus "
+            "the labeling model and the link prompts), so a repeat run replays the "
+            "cached links instead of paying for them again."
+        ),
+    )
+    gen.add_argument(
+        "--no-semlink-verify",
+        action="store_true",
+        help=(
+            "Skip the second, skeptical pass that reviews each proposed link. "
+            "Halves the model calls the link pass makes and cuts its wall-clock "
+            "time by about 60%%, and keeps roughly twice as many links — including "
+            "the weaker ones the review would have dropped."
         ),
     )
 
@@ -2240,7 +2250,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     from dgml_core.generation import coverage as cov_mod
     from dgml_core.generation import links as links_mod
     from dgml_core.generation.blocks import Block
-    from dgml_core.generation.links import add_links
+    from dgml_core.generation.links import apply_plan, plan_links
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
     from dgml_core.generation.rnc import write_docset_rnc
     from dgml_core.generation.to_semantic import build_header
@@ -2458,6 +2468,10 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # --verbose; the document still renders (unlabeled). Labeling completes
     # before any _on_output fires, so the entry below can read this.
     label_errors: dict[str, dict[str, str]] = {}
+    # name -> short reason when the semantic-link pass could not complete. The
+    # document keeps its (unlinked) DGML, so without this a rate limit or a bad
+    # model id looked exactly like "this document has no links".
+    link_errors: dict[str, str] = {}
 
     def _on_error(name: str, message: str) -> None:
         gen_errors[name] = message
@@ -2466,20 +2480,23 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         label_errors[name] = err
         _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
 
-    def _semlink_cache_key(xml_bytes: bytes) -> str:
-        """Content address for one document's semantic-link result.
+    def _semlink_cache_key(xml_text: str) -> str:
+        """Cache address for one document's semantic links.
 
-        Keyed on everything that determines the output — the grounded XML, the
-        labeling model, and both link prompts — so editing a prompt or switching
-        models misses rather than replaying a stale result. Parts are
-        length-prefixed so no concatenation of two different inputs can collide.
+        Keyed on what the model actually reads — tag names and text, via
+        links.listing_digest — plus the labeling model, both link prompts, and
+        whether the review pass runs. Attributes are deliberately not part of
+        it: the prompt never shows them, so grounding a document or renaming a
+        namespace prefix leaves the links unchanged and should hit rather than
+        pay again. Parts are length-prefixed so two different inputs cannot
+        concatenate to the same key.
         """
         digest = hashlib.sha256()
         for part in (
-            xml_bytes,
+            links_mod.listing_digest(xml_text).encode("utf-8"),
             label_model.encode("utf-8"),
             links_mod.SYSTEM_PROMPT.encode("utf-8"),
-            links_mod.VERIFY_SYSTEM_PROMPT.encode("utf-8"),
+            b"" if args.no_semlink_verify else links_mod.VERIFY_SYSTEM_PROMPT.encode("utf-8"),
         ):
             digest.update(len(part).to_bytes(8, "big"))
             digest.update(part)
@@ -2553,24 +2570,30 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         # reported `links` is identical on both paths.
         links_added = 0
         if not args.no_semlinks:
-            source = ws.blobs.get_blob(xml_key)
-            cache_key = _semlink_cache_key(source)
-            cached_xml, cached_meta = f"{cache_key}.xml", f"{cache_key}.json"
+            source = ws.blobs.get_blob(xml_key).decode("utf-8")
+            plan_key = f"{_semlink_cache_key(source)}.json"
             try:
-                if not args.no_semlink_cache and ws.blobs.blob_exists(cached_xml):
-                    ws.blobs.put_blob(xml_key, ws.blobs.get_blob(cached_xml))
-                    links_added = int(json.loads(ws.blobs.get_blob(cached_meta))["links"])
-                    _diag(f"[semlinks] {name}: {links_added} link(s) (cached)")
+                cached = (
+                    ws.blobs.get_blob(plan_key)
+                    if not args.no_semlink_cache and ws.blobs.blob_exists(plan_key)
+                    else None
+                )
+                if cached is not None:
+                    plan = json.loads(cached)
+                    hit = " (cached)"
                 else:
-                    linked, applied = add_links(source.decode("utf-8"), link_config)
-                    ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
-                    links_added = len(applied)
-                    ws.blobs.put_blob(cached_xml, linked.encode("utf-8"))
-                    ws.blobs.put_blob(
-                        cached_meta, json.dumps({"links": links_added}).encode("utf-8")
-                    )
-                    _diag(f"[semlinks] {name}: {links_added} link(s)")
+                    plan = plan_links(source, link_config, verify=not args.no_semlink_verify)
+                    ws.blobs.put_blob(plan_key, json.dumps(plan).encode("utf-8"))
+                    hit = ""
+                # The plan is applied to the CURRENT tree either way, so a cache
+                # hit and a fresh call write the same links onto whatever the
+                # render and grounding just produced.
+                linked, applied = apply_plan(source, plan)
+                ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
+                links_added = len(applied)
+                _diag(f"[semlinks] {name}: {links_added} link(s){hit}")
             except Exception as exc:  # a link-pass failure must not lose the DGML
+                link_errors[name] = short_error_message(exc)
                 _diag(f"[semlinks] {name}: skipped ({exc})")
         # Re-embed the prior dg:extraction last, after grounding + semlinks
         # have finished rewriting the tree, so the extraction subtree is
@@ -2593,10 +2616,15 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             result = cov_mod.compute_coverage(xml, name, page_text_dir=pt_dir)
             _diag(cov_mod.coverage_summary_line(result))
             cov_by_name[name] = result
-        # Present only on files whose labeling couldn't reach the model — like
-        # grounding_error, which appears only when grounded is False.
+        # Each present only when that step failed, like grounding_error, which
+        # appears only when grounded is False.
+        extra: dict[str, Any] = {}
         label_error = label_errors.get(name)
-        label_extra = {"label_error": label_error} if label_error is not None else {}
+        if label_error is not None:
+            extra["label_error"] = label_error
+        link_error = link_errors.get(name)
+        if link_error is not None:
+            extra["link_error"] = link_error
         converted_by_name[name] = _file_result(
             "converted",
             filename_to_fid[name],
@@ -2604,7 +2632,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             output=xml_key,
             links=links_added,
             **grounding,
-            **label_extra,
+            **extra,
         )
 
     if convert_names:
