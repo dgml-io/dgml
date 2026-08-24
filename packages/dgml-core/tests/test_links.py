@@ -206,3 +206,71 @@ def test_verify_false_keeps_every_proposal(monkeypatch: pytest.MonkeyPatch) -> N
     _, applied = add_links(_XML, llm.LLMConfig(model="x"), verify=False)
     assert len(applied) == 2
     assert len(calls) == 1 and "reviewer" not in calls[0]
+
+
+_NESTED = (
+    "<?xml version='1.0' encoding='utf-8'?>\n"
+    '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#">'
+    "<dg:Section>TERMS"
+    "<dg:Clause>Company shall provide<dg:Item>widgets</dg:Item>monthly</dg:Clause>"
+    "</dg:Section>"
+    "</dg:chunk>"
+)
+
+
+def _lines(xml: str) -> list[str]:
+    from dgml_core.generation.links import _elements, _listing
+
+    root = etree.fromstring(xml.encode())
+    return _listing(_elements(root)).splitlines()
+
+
+def test_listing_does_not_repeat_descendant_text() -> None:
+    """A clause's words must appear on the clause, not again on its section and
+    the root. Repeating them bills the same characters once per nesting level."""
+    lines = _lines(_NESTED)
+    section = next(ln for ln in lines if "<Section>" in ln)
+    clause = next(ln for ln in lines if "<Clause>" in ln)
+
+    assert section.split(": ", 1)[1] == "TERMS"  # its own text only
+    assert "Company" not in section and "widgets" not in section
+    assert "widgets" not in clause  # the Item's text lives on the Item's line
+
+
+def test_listing_keeps_every_element_addressable() -> None:
+    """Both ends of a link are named by id, so an element with no text of its
+    own still needs a line — otherwise it could never be a subject or object."""
+    from dgml_core.generation.links import _elements
+
+    root = etree.fromstring(_NESTED.encode())
+    lines = _lines(_NESTED)
+    assert len(lines) == len(_elements(root))
+    chunk = next(ln for ln in lines if "<chunk>" in ln)
+    assert chunk.startswith("e0000") and chunk.endswith(": ")
+
+
+def test_listing_indent_shows_nesting() -> None:
+    """With descendant text gone, the indent is what tells the model a clause
+    sits inside a section."""
+    lines = _lines(_NESTED)
+    indents = [len(ln.split("<")[0]) - len("e0000 ") for ln in lines]
+    assert indents == [0, 2, 4, 6]  # chunk, Section, Clause, Item
+
+
+def test_listing_does_not_run_words_together_across_a_child() -> None:
+    """In mixed content the child's text sits on its own line. Joining the text
+    either side of it without a space would invent a word ("providemonthly")."""
+    clause = next(ln for ln in _lines(_NESTED) if "<Clause>" in ln)
+    assert clause.split(": ", 1)[1] == "Company shall provide monthly"
+
+
+def test_listing_carries_every_word_once() -> None:
+    """Nothing is dropped and nothing is duplicated: each word of the document
+    appears in the listing exactly once."""
+    import collections
+
+    lines = _lines(_NESTED)
+    listed = collections.Counter(w for ln in lines for w in ln.split(": ", 1)[1].split())
+    assert listed == collections.Counter(
+        ["TERMS", "Company", "shall", "provide", "monthly", "widgets"]
+    )

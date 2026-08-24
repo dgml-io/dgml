@@ -71,12 +71,53 @@ def _elements(root: etree._Element) -> list[etree._Element]:
     return [el for el in root.iter() if isinstance(el.tag, str)]
 
 
+# Indentation is capped so a deeply nested tree cannot spend most of a line on
+# leading spaces.
+_MAX_INDENT = 8
+
+
+def _own_text(el: etree._Element) -> str:
+    """The text belonging to *el* itself — never a descendant's.
+
+    That is ``el.text`` plus the tail of each child, which together are the
+    character data directly under this element.
+    """
+    parts = [el.text or ""]
+    for child in el:
+        parts.append(child.tail or "")
+    # Joined with a space, not concatenated: the child's own text sits on its
+    # own line, so running the words either side of it together would invent a
+    # word that is not in the document ("provide" + "monthly").
+    return " ".join(" ".join(parts).split())
+
+
+def _depth(el: etree._Element) -> int:
+    """How many ancestors *el* has; 0 for the root."""
+    return sum(1 for _ in el.iterancestors())
+
+
 def _listing(elements: list[etree._Element]) -> str:
+    """One line per element: id, nesting depth, tag name, and its own text.
+
+    Each element contributes only the text directly under it. Using the whole
+    subtree instead would repeat a clause's opening words on the clause, on its
+    section, and on the root — the same characters billed once per level of
+    nesting, which on a deep document is most of the prompt.
+
+    Every element still gets a line, including one with no text of its own, so
+    both ends of a link stay addressable by id. Elements are listed in document
+    order and the indent shows nesting, so the model can still read a clause
+    across the lines it is split over.
+
+    (``_snip``, which labels an already-chosen candidate for the review pass,
+    deliberately keeps using the full subtree: there the point is to identify
+    one element in a short phrase, not to lay out the whole document.)
+    """
     lines = []
     for i, el in enumerate(elements):
         name = etree.QName(el).localname
-        text = " ".join("".join(el.itertext()).split())[:220]
-        lines.append(f"e{i:04d} <{name}>: {text}")
+        pad = "  " * min(_depth(el), _MAX_INDENT)
+        lines.append(f"e{i:04d} {pad}<{name}>: {_own_text(el)[:220]}")
     return "\n".join(lines)
 
 
