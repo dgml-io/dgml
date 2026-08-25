@@ -18,7 +18,8 @@ import json
 
 import pytest
 from dgml_core import llm
-from dgml_core.generation.links import _parse_json, add_links
+from dgml_core.errors import LinkPlanFailed
+from dgml_core.generation.links import _parse_items, add_links
 from lxml import etree  # type: ignore[import-untyped]
 
 _DG = "http://dgml.io/ns/dg#"
@@ -44,7 +45,7 @@ def _fake_llm(
             return json.dumps({"verdicts": [{"i": i, "keep": k} for i, k in enumerate(keep)]})
         return json.dumps({"links": links})
 
-    monkeypatch.setattr(llm, "call", fake_call)
+    monkeypatch.setattr(llm, "call_continued", fake_call)
 
 
 def test_add_links_applies_relative_and_multi_target_formula(
@@ -90,10 +91,15 @@ def test_verify_drops_rejected_links(monkeypatch: pytest.MonkeyPatch) -> None:
     assert esc.get(f"{{{_DG}}}itemprop") is None  # dropped link left unlinked
 
 
-def test_parse_json_tolerates_fences_and_prose() -> None:
-    assert _parse_json('```json\n{"links": []}\n```') == {"links": []}
-    assert _parse_json('sure: {"links": [{"predicate": "x"}]} done')["links"][0]["predicate"] == "x"
-    assert _parse_json("not json at all") == {}
+def test_parse_items_tolerates_fences_and_prose() -> None:
+    assert _parse_items('```json\n{"links": []}\n```', "links") == []
+    assert _parse_items('sure: {"links": [{"predicate": "x"}]} done', "links") == [
+        {"predicate": "x"}
+    ]
+    # Nothing recoverable is an error, not an empty answer: returning [] here
+    # would be cached as "this document has no links" and never retried.
+    with pytest.raises(LinkPlanFailed):
+        _parse_items("not json at all", "links")
 
 
 def test_link_value_never_clobbers_a_typed_value(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -148,6 +154,70 @@ def test_listing_digest_ignores_attributes() -> None:
     assert listing_digest(_XML) != listing_digest(_XML.replace("100", "250"))
 
 
+def _renamed(xml: str) -> str:
+    """Every concept tag in the fixture renamed — what a roster revision does."""
+    for old, new in (
+        ("CommencementDate", "StartDate"),
+        ("AdjustmentDate", "ReviewDate"),
+        ("BaseRent", "AnnualRent"),
+        ("Escalation", "RentIncrease"),
+    ):
+        xml = xml.replace(f"dg:{old}", f"dg:{new}")
+    return xml
+
+
+def _linked_positions(xml: str, plan: list[dict[str, object]]) -> list[tuple[int, str, list[int]]]:
+    """Every applied link as (subject position, predicate, object positions).
+
+    Positions, not ids: `_ensure_id` mints an id from the tag name, so a renamed
+    tree correctly gets different id strings for the same elements.
+    """
+    from dgml_core.generation.links import _elements, apply_plan
+
+    linked, _ = apply_plan(xml, plan)
+    elements = _elements(etree.fromstring(linked.encode()))
+    at = {el.get(_XMLID): i for i, el in enumerate(elements)}
+    out = []
+    for i, el in enumerate(elements):
+        predicate = el.get(f"{{{_DG}}}itemprop")
+        if predicate:
+            href = el.get(f"{{{_DG}}}href") or ""
+            out.append((i, predicate, [at[h.lstrip("#")] for h in href.split()]))
+    return out
+
+
+def test_listing_digest_ignores_tag_names() -> None:
+    """Renaming concepts must not re-link the document. A plan addresses both
+    ends of a link by position in document order, so the plan the old names
+    produced still lands on exactly the same elements — and keying on tag names
+    made every roster revision re-link each document it re-rendered."""
+    from dgml_core.generation.links import listing_digest
+
+    renamed = _renamed(_XML)
+    assert renamed != _XML  # the fixture really did change
+    assert listing_digest(_XML) == listing_digest(renamed)
+
+    plan = [
+        {"subject": 2, "objects": [1], "predicate": "relativeTo", "value": "P1Y"},
+        {"subject": 4, "objects": [1, 3], "predicate": "greaterOf", "value": ""},
+    ]
+    assert _linked_positions(_XML, plan) == _linked_positions(renamed, plan)
+
+
+def test_listing_digest_still_tracks_nesting() -> None:
+    """Shape is half of what the key covers: moving an element under another
+    changes the plan the model would give, so it must change the key."""
+    from dgml_core.generation.links import listing_digest
+
+    flat = (
+        '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"><dg:A>alpha</dg:A><dg:B>beta</dg:B></dg:chunk>'
+    )
+    nested = (
+        '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"><dg:A>alpha<dg:B>beta</dg:B></dg:A></dg:chunk>'
+    )
+    assert listing_digest(flat) != listing_digest(nested)
+
+
 def test_apply_plan_is_deterministic_and_needs_no_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -158,7 +228,7 @@ def test_apply_plan_is_deterministic_and_needs_no_model(
     def explode(*_a: object, **_k: object) -> str:
         raise AssertionError("apply_plan must not call the model")
 
-    monkeypatch.setattr(llm, "call", explode)
+    monkeypatch.setattr(llm, "call_continued", explode)
 
     plan = [{"subject": 2, "objects": [1], "predicate": "relativeTo", "value": "P1Y"}]
     first, applied = apply_plan(_XML, plan)
@@ -202,7 +272,7 @@ def test_verify_false_keeps_every_proposal(monkeypatch: pytest.MonkeyPatch) -> N
             }
         )
 
-    monkeypatch.setattr(llm, "call", fake_call)
+    monkeypatch.setattr(llm, "call_continued", fake_call)
     _, applied = add_links(_XML, llm.LLMConfig(model="x"), verify=False)
     assert len(applied) == 2
     assert len(calls) == 1 and "reviewer" not in calls[0]
@@ -274,3 +344,91 @@ def test_listing_carries_every_word_once() -> None:
     assert listed == collections.Counter(
         ["TERMS", "Company", "shall", "provide", "monthly", "widgets"]
     )
+
+
+# A well-formed proposal, and the two ways the model has been seen to damage
+# one: a bare (unquoted) element id inside an object list, observed in
+# production; and a length truncation, which loses the tail of the array.
+_GOOD_REPLY = json.dumps(
+    {
+        "links": [
+            {"subject": "e0002", "object": "e0001", "predicate": "relativeTo", "value": "P1Y"},
+            {"subject": "e0004", "object": ["e0001", "e0003"], "predicate": "greaterOf"},
+            {"subject": "e0003", "object": "e0001", "predicate": "valueFrom"},
+        ]
+    }
+)
+
+
+def test_salvage_keeps_the_links_before_a_malformed_one() -> None:
+    """One bad entry used to cost the whole document's links: the reply would
+    not decode, so the pass planned zero links and that empty plan was cached."""
+    damaged = _GOOD_REPLY.replace('["e0001", "e0003"]', '[e0001, "e0003"]')
+    with pytest.raises(ValueError):
+        json.loads(damaged)  # the whole reply really is unparseable
+
+    items = _parse_items(damaged, "links")
+    assert [i["predicate"] for i in items] == ["relativeTo"]
+
+
+def test_salvage_keeps_the_complete_prefix_of_a_truncated_reply() -> None:
+    """Cut the reply at every offset: never raise, never invent an entry, and
+    always recover exactly the entries that survived the cut whole."""
+    complete = json.loads(_GOOD_REPLY)["links"]
+    seen_counts = set()
+    for cut in range(len(_GOOD_REPLY)):
+        head = _GOOD_REPLY[:cut]
+        try:
+            items = _parse_items(head, "links")
+        except LinkPlanFailed:
+            continue  # nothing recoverable yet — the array has not opened
+        assert items == complete[: len(items)], f"invented an entry at cut {cut}"
+        seen_counts.add(len(items))
+    # Every non-empty prefix is reachable, so the walk really did stop
+    # entry-wise rather than all-or-nothing. Zero is never a *result* here: a
+    # cut that leaves nothing intact is a failed call, not an empty answer.
+    assert seen_counts == {1, 2, 3}
+
+
+def test_clean_reply_parses_exactly_as_before() -> None:
+    """The regression half: salvage is a fallback, never a re-interpretation."""
+    assert _parse_items(_GOOD_REPLY, "links") == json.loads(_GOOD_REPLY)["links"]
+    assert _parse_items(f"```json\n{_GOOD_REPLY}\n```", "links") == json.loads(_GOOD_REPLY)["links"]
+
+
+def test_unparseable_proposal_raises_rather_than_planning_no_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plan is content-addressed by its document, so "no links" from a
+    garbled reply would be cached under that key and never asked again. The
+    pass has to fail loudly instead."""
+    monkeypatch.setattr(llm, "call_continued", lambda *_a, **_k: "I could not do that.")
+    with pytest.raises(LinkPlanFailed):
+        add_links(_XML, llm.LLMConfig(model="x"))
+
+
+def test_reviewer_returning_no_verdicts_raises_rather_than_dropping_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review that never happened is not a review that rejected everything.
+    Unparsed verdicts drop every candidate, which used to be indistinguishable
+    from a document with nothing to link — and got cached as one."""
+
+    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
+        if "reviewer" in str(kwargs["system_prompt"]):
+            return "The candidates look mostly fine to me."
+        return _GOOD_REPLY
+
+    monkeypatch.setattr(llm, "call_continued", fake_call)
+    with pytest.raises(LinkPlanFailed):
+        add_links(_XML, llm.LLMConfig(model="x"))
+
+    # An explicit rejection of every candidate is a real answer, and stands.
+    def reject_all(config: llm.LLMConfig, **kwargs: object) -> str:
+        if "reviewer" in str(kwargs["system_prompt"]):
+            return json.dumps({"verdicts": [{"i": i, "keep": False} for i in range(3)]})
+        return _GOOD_REPLY
+
+    monkeypatch.setattr(llm, "call_continued", reject_all)
+    _, applied = add_links(_XML, llm.LLMConfig(model="x"))
+    assert applied == []

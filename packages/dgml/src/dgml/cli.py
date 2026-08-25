@@ -2483,13 +2483,13 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     def _semlink_cache_key(xml_text: str) -> str:
         """Cache address for one document's semantic links.
 
-        Keyed on what the model actually reads — tag names and text, via
+        Keyed on what the plan depends on — the document's text and shape, via
         links.listing_digest — plus the labeling model, both link prompts, and
-        whether the review pass runs. Attributes are deliberately not part of
-        it: the prompt never shows them, so grounding a document or renaming a
-        namespace prefix leaves the links unchanged and should hit rather than
-        pay again. Parts are length-prefixed so two different inputs cannot
-        concatenate to the same key.
+        whether the review pass runs. Attributes and tag names are deliberately
+        not part of it (see links.listing_digest), so grounding a document or
+        renaming its concepts hits rather than paying for the pass again. Parts
+        are length-prefixed so two different inputs cannot concatenate to the
+        same key.
         """
         digest = hashlib.sha256()
         for part in (

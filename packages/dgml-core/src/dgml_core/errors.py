@@ -260,6 +260,17 @@ class GroundingFailed(DgmlError):
     code = "GROUNDING_FAILED"
 
 
+class LinkPlanFailed(DgmlError):
+    """The semantic-link model answered, but the answer could not be used —
+    undecodable even item-wise, or a reviewer reply carrying no verdict for any
+    candidate. Raised rather than returned as an empty plan: the caller
+    content-addresses what it gets back, so a transport-level accident returned
+    as "this document has no links" would be cached under the document's key and
+    never retried."""
+
+    code = "LINK_PLAN_FAILED"
+
+
 class LabelModelUnreachable(DgmlError):
     # Never raised — labeling must never propagate, or it would discard a good
     # transcription. Exists so the per-file `label_error` payload surfaced by
