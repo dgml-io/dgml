@@ -10,9 +10,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sample DGML document storage backend: documents in MongoDB.
-See :mod:`dgml_storage_mongo.store`."""
+"""Sample DGML storage backends on MongoDB.
 
-from .store import MONGO_URI_ENV, MongoDocStore
+- :class:`~dgml_storage_mongo.store.MongoDocStore` — documents, one collection
+  per :class:`~dgml_core.layout.Collection` member.
+- :class:`~dgml_storage_mongo.gridfs_store.MongoGridFSBlobStore` — blobs in a
+  GridFS bucket.
+- :class:`~dgml_storage_mongo.combined.MongoGridFSStore` — both roles on one
+  database.
+"""
 
-__all__ = ["MONGO_URI_ENV", "MongoDocStore"]
+from ._client import MONGO_URI_ENV
+from .combined import MongoGridFSStore
+from .gridfs_store import CHUNK_BYTES, DEFAULT_BUCKET, MongoGridFSBlobStore
+from .store import MongoDocStore
+
+__all__ = [
+    "CHUNK_BYTES",
+    "DEFAULT_BUCKET",
+    "MONGO_URI_ENV",
+    "MongoDocStore",
+    "MongoGridFSBlobStore",
+    "MongoGridFSStore",
+]

@@ -12,11 +12,17 @@
 
 """A sample :class:`~dgml_core.storage_service.DocStore`: documents in MongoDB.
 
-DGML documents (manifests, page text, assignments, the usage log) live in MongoDB
-collections — the collection API ``DocStore`` was modelled on, so nearly every
-method is a one-line delegation. A reference to copy, not a tuned production
-store. Pair it with a :class:`~dgml_core.storage_service.BlobStore` (e.g.
-``dgml-storage-s3``, or the bundled local store) for the blob half.
+DGML documents (file and docset manifests, assignments, extraction stats, the
+usage log) live in MongoDB collections — the collection API ``DocStore`` was
+modelled on, so nearly every method is a one-line delegation. A reference to
+copy, not a tuned production store. Pair it with a
+:class:`~dgml_core.storage_service.BlobStore`: ``dgml-storage-s3``, the bundled
+local store, or this package's own
+:class:`~dgml_storage_mongo.gridfs_store.MongoGridFSBlobStore` (see
+:class:`~dgml_storage_mongo.MongoGridFSStore` for both roles at once).
+
+Note that per-page text is a **blob**, not a document — it lives under
+``files/<id>/page_text/`` and is read through the blob store.
 
 **Sample, not supported.** Resolved by dotted path like any third party's own::
 
@@ -43,64 +49,54 @@ matches none of them.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from typing import Any
 
-from dgml_core.errors import DgmlError, InvalidArgument, StorageConfigInvalid
+from dgml_core.errors import InvalidArgument
 from dgml_core.layout import Collection
 from dgml_core.storage_service import DocStore, StorageConfig
 
-#: Environment variable holding the full MongoDB connection string, including
-#: any credentials. Deliberately not a config key — see the module docstring.
-MONGO_URI_ENV = "DGML_MONGO_URI"
+from ._client import (
+    IDENTITY_FIELDS,
+    MONGO_URI_ENV,
+    connect,
+    validate_identity,
+)
+
+__all__ = ["MONGO_URI_ENV", "MongoDocStore"]
 
 
 class MongoDocStore(DocStore):
     """DGML documents in MongoDB collections."""
 
     name = "mongo"
-    config_fields = frozenset({"mongo_host", "mongo_port", "mongo_database"})
+    config_fields = IDENTITY_FIELDS
 
     # ---- configuration ----
 
     @classmethod
     def parse_config(cls, config: StorageConfig) -> StorageConfig:
         cls._check_no_extra_fields(config.options)
-        database = config.options.get("mongo_database")
-        if not isinstance(database, str) or not database.strip():
-            raise StorageConfigInvalid(
-                f"[storage] provider {cls.name!r} requires a 'mongo_database'"
-            )
-        host = config.options.get("mongo_host")
-        if host is not None and not isinstance(host, str):
-            raise StorageConfigInvalid("'mongo_host' must be a string")
-        port = config.options.get("mongo_port")
-        if port is not None and not isinstance(port, int):
-            raise StorageConfigInvalid("'mongo_port' must be an integer")
+        validate_identity(cls.name, config.options)
         return config
 
     def __init__(self, config: StorageConfig) -> None:
-        # Lazy SDK import with an actionable message, per the ABC's contract:
-        # a workspace that never opens this store must not need pymongo.
-        try:
-            from pymongo import MongoClient
-        except ImportError as exc:  # pragma: no cover - depends on install extras
-            raise DgmlError(
-                "the mongo sample store needs pymongo: pip install dgml-storage-mongo"
-            ) from exc
+        # Authentication is all-or-nothing via the environment (see
+        # ``_client.connect``). There is deliberately no username/password
+        # config key: a half-credential in config builds a URI pymongo rejects,
+        # and adding the password key is exactly the plaintext-registry leak
+        # this design avoids.
+        self._bind_docs(connect(config.options))
 
-        opts = config.options
-        # Authentication is all-or-nothing via the environment. There is
-        # deliberately no username/password config key: a half-credential in
-        # config builds a URI pymongo rejects, and adding the password key is
-        # exactly the plaintext-registry leak this design avoids.
-        uri = os.environ.get(MONGO_URI_ENV)
-        if not uri:
-            host = str(opts.get("mongo_host") or "localhost")
-            port = int(opts.get("mongo_port") or 27017)
-            uri = f"mongodb://{host}:{port}"
-        self._db: Any = MongoClient(uri)[str(opts["mongo_database"])]
+    def _bind_docs(self, db: Any) -> None:
+        """Attach the document collections to an open database.
+
+        Split out of ``__init__`` so the combined stores can bind both roles to
+        one client instead of calling each parent's ``__init__`` and opening a
+        second. That is a *class*-level concern: a workspace whose roles resolve
+        to the same config also shares one instance between them, so the flat
+        form holds a single client either way."""
+        self._db: Any = db
 
     # ---- Documents (MongoDB) ----
     #

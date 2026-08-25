@@ -261,8 +261,16 @@ mongo_database = "dgml"
   documents on local disk.
 - **Flat form** — a `[storage.<name>]` with a single top-level `provider` (and no
   `blobs`/`docs` subtables) uses that one class for **both** roles; it must implement
-  both `BlobStore` and `DocStore` (the bundled `LocalStore` does). A table may not
-  set both a top-level `provider` and role subtables.
+  both `BlobStore` and `DocStore` (the bundled `LocalStore` does, as does the sample
+  `dgml_storage_mongo:MongoGridFSStore`). A table may not set both a top-level `provider`
+  and role subtables.
+- **One backend means one instance.** When both roles resolve to the same backend, a
+  workspace constructs it **once** and serves both roles from that single instance —
+  so `MongoGridFSStore` in the flat form holds one `MongoClient`, not one per role.
+  This keys off the resolved config, not the syntax, so it covers the flat form *and*
+  two per-role subtables that happen to be identical. Roles that resolve differently
+  are still built independently, and lazily: a command that only reads documents never
+  constructs the blob store.
 - **`default` and back-compat** — the reserved name **`default`** is what a workspace
   uses when `--storage` is omitted; a bare `[storage]` (flat or with `blobs`/`docs`)
   *is* the `default` service, and no `[storage]` at all is the zero-config local

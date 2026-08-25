@@ -10,13 +10,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fixtures for the sample Mongo **document** store.
+"""Fixtures for the sample Mongo stores — documents, blobs, and both at once.
 
 Two modes, same tests: real MongoDB when ``DGML_TEST_MONGO_URI`` is set (the
 ``docker compose`` stack), else in-process ``mongomock``. The default
 ``uv run pytest`` always runs the whole thing; CI additionally runs it against a
-real Mongo. Every test gets its own database. The blob half of a workspace uses
-the bundled local store here, so these tests need no S3.
+real Mongo. Every test gets its own database.
+
+``mongo_docs_workspace`` keeps blobs on local disk (so those tests need no S3);
+``mongo_gridfs_workspace`` puts *both* roles in Mongo via ``MongoGridFSStore``.
 """
 
 from __future__ import annotations
@@ -25,15 +27,19 @@ import os
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from dgml_core.storage import Workspace
 from dgml_core.storage_service import StorageConfig
-from dgml_storage_mongo import MongoDocStore
+from dgml_storage_mongo import MongoDocStore, MongoGridFSBlobStore
 
 MONGO_URI_ENV = "DGML_TEST_MONGO_URI"
 USING_REAL_MONGO = bool(os.environ.get(MONGO_URI_ENV))
 PROVIDER = "dgml_storage_mongo:MongoDocStore"
+GRIDFS_PROVIDER = "dgml_storage_mongo:MongoGridFSBlobStore"
+BOTH_GRIDFS_PROVIDER = "dgml_storage_mongo:MongoGridFSStore"
 
 
 @pytest.fixture(autouse=True)
@@ -90,4 +96,63 @@ def mongo_docs_workspace(tmp_path: Path) -> Workspace:
     )
     ws = Workspace(root=root)
     ws.init()  # docs → Mongo, blobs → local disk
+    return ws
+
+
+@pytest.fixture(autouse=True)
+def _mongomock_gridfs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``mongomock`` drive ``GridFSBucket``.
+
+    Two gaps to close. ``gridfs`` type-checks its arguments with ``isinstance``
+    against pymongo classes, which ``enable_gridfs_integration`` widens to accept
+    mongomock's. And ``mongomock.MongoClient`` has no ``.options`` property, so
+    GridFSBucket's ``db.client.options.timeout`` falls through mongomock's
+    attribute-style database accessor and ``_timeout`` becomes a ``Collection``,
+    tripping pymongo's timeout wrapper on first upload.
+
+    Note the shape of that failure if you ever debug it: ``_TimeoutContext``
+    sets its context variable *before* raising, so the first GridFS call fails
+    and every later one silently passes. A batch run can look green off one
+    poisoned test — check GridFS tests individually.
+    """
+    if USING_REAL_MONGO:
+        return
+    import mongomock
+    from mongomock.gridfs import enable_gridfs_integration
+
+    enable_gridfs_integration()
+    monkeypatch.setattr(
+        mongomock.MongoClient,
+        "options",
+        property(lambda self: SimpleNamespace(timeout=None)),
+        raising=False,
+    )
+
+
+@pytest.fixture
+def blobs(mongo_config: StorageConfig) -> MongoGridFSBlobStore:
+    return MongoGridFSBlobStore(MongoGridFSBlobStore.parse_config(mongo_config))
+
+
+def chunk_collection(store: MongoGridFSBlobStore) -> Any:
+    """The GridFS bucket's chunk collection.
+
+    Reaches inside the store because the properties it backs — an overwrite
+    leaving no orphaned chunks, a torn read being detected — are only observable
+    from there."""
+    return store._files.database[f"{store._files.name.rsplit('.', 1)[0]}.chunks"]
+
+
+@pytest.fixture
+def mongo_gridfs_workspace(tmp_path: Path) -> Workspace:
+    """Both roles in Mongo, with blobs in GridFS."""
+    root = tmp_path / "ws"
+    root.mkdir(parents=True, exist_ok=True)
+    db = f"dgml_test_{uuid.uuid4().hex[:12]}"
+    (root / "config.toml").write_text(
+        f'[storage.default]\nprovider = "{BOTH_GRIDFS_PROVIDER}"\nmongo_database = "{db}"\n',
+        encoding="utf-8",
+    )
+    ws = Workspace(root=root)
+    ws.init()
     return ws

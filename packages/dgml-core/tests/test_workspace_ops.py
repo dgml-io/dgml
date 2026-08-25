@@ -205,4 +205,7 @@ def test_a_cascade_resolves_the_backend_once(
 
     cold = Workspace(root=workspace.root)  # nothing cached yet
     WorkspaceOps(cold).delete_docset("d1")
-    assert built == {"blobs": 1, "docs": 1}  # each store resolved once, not per call
+    # Resolved once, not per call. ``docs`` is zero rather than one because this
+    # fixture is zero-config: both roles are ``LocalStore``, so the two configs
+    # compare equal and ``ws.docs`` shares the instance ``make_blob_store`` built.
+    assert built == {"blobs": 1, "docs": 0}

@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 from . import layout
 
 if TYPE_CHECKING:
-    from .storage_service import BlobStore, DocStore
+    from .storage_service import BlobStore, DocStore, StorageConfig
 
 from .default_config import PROVIDER_MODELS
 
@@ -151,6 +151,21 @@ class Workspace:
         return self.root / layout.WORKSPACE_FILE
 
     @functools.cached_property
+    def _store_configs(self) -> tuple[StorageConfig, StorageConfig]:
+        """The effective ``(blob_cfg, doc_cfg)`` pair this workspace opens with.
+
+        Cached so registry + config resolution happens **once per workspace**
+        rather than once per role. That work is not cheap and is identical for
+        both roles: ``resolve_store_configs`` re-reads ``workspaces.json`` once
+        per registry entry, and ``load_merged_config`` rebuilds a fresh
+        ``BaseSettings`` subclass and re-reads both ``config.toml`` layers on
+        every call. Resolving the pair together halves it for every workspace,
+        local or remote."""
+        from . import registry
+
+        return registry.resolve_store_configs(self)
+
+    @functools.cached_property
     def blobs(self) -> BlobStore:
         """The workspace's **blob** backend (page images, PDFs, XML, schemas).
 
@@ -167,20 +182,36 @@ class Workspace:
         ``__dict__`` rather than through ``__setattr__``, and it is a *non-data*
         descriptor, so a test that replaces the class attribute still takes
         precedence."""
-        from . import registry
         from .storage_resolve import make_blob_store
 
-        return make_blob_store(registry.resolve_store_configs(self)[0])
+        return make_blob_store(self._store_configs[0])
 
     @functools.cached_property
     def docs(self) -> DocStore:
         """The workspace's **document** backend (manifests, page text, assignments,
-        usage). Resolved independently of :attr:`blobs` — see it for the
-        registered/unregistered resolution and caching notes."""
-        from . import registry
-        from .storage_resolve import make_doc_store
+        usage). See :attr:`blobs` for the registered/unregistered resolution and
+        caching notes.
 
-        return make_doc_store(registry.resolve_store_configs(self)[1])
+        When both roles resolve to the **same backend** this *is* :attr:`blobs` —
+        one instance, constructed once, so a provider serving both roles holds a
+        single connection rather than one per role. "Same backend" is decided by
+        config equality, so it covers a service written as one top-level
+        ``provider`` *and* one written as two identical per-role tables; identical
+        config means an identical backend either way.
+
+        Construction stays lazy per role: when the two configs differ, touching
+        this never builds a blob store."""
+        from .storage_resolve import make_doc_store
+        from .storage_service import DocStore
+
+        blob_cfg, doc_cfg = self._store_configs
+        if blob_cfg == doc_cfg:
+            store = self.blobs
+            if isinstance(store, DocStore):
+                return store
+            # Equal configs naming a blob-only provider: fall through so
+            # ``make_doc_store`` raises the usual error rather than a new one.
+        return make_doc_store(doc_cfg)
 
     def read_meta(self) -> dict[str, Any]:
         """Return the parsed ``workspace.json`` mapping, or ``{}`` when the file

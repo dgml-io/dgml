@@ -497,6 +497,109 @@ def test_resolve_store_configs_unregistered_is_local(tmp_path: Path) -> None:
     assert blob_cfg.root == doc_cfg.root == ws.root
 
 
+def _same_instance(blobs: object, docs: object) -> bool:
+    """Whether the two roles are the same object. Takes ``object`` because
+    ``BlobStore`` and ``DocStore`` are unrelated ABCs, so a direct ``is`` reads to
+    mypy as a non-overlapping identity check — sharing is exactly the case where
+    one object satisfies both."""
+    return blobs is docs
+
+
+def test_same_backend_for_both_roles_is_one_instance(tmp_path: Path) -> None:
+    """A provider serving both roles is constructed once, so it holds one
+    connection per workspace rather than one per role.
+
+    Sharing keys off config *equality*, so it covers the two ways a config can
+    name one backend: the zero-config default, and two per-role tables that are
+    identical. Identical config means an identical backend either way."""
+    from .conftest import write_config
+
+    flat = Workspace.resolve(tmp_path / "flat")
+    flat.root.mkdir()
+    assert _same_instance(flat.blobs, flat.docs)  # zero-config: both roles are LocalStore
+
+    per_role = Workspace.resolve(tmp_path / "per-role")
+    per_role.root.mkdir()
+    write_config(
+        per_role,
+        {
+            "storage": {
+                "default": {
+                    "blobs": {"provider": DEFAULT_STORAGE_PROVIDER},
+                    "docs": {"provider": DEFAULT_STORAGE_PROVIDER},
+                }
+            }
+        },
+    )
+    assert _same_instance(per_role.blobs, per_role.docs)
+
+
+def test_split_backends_stay_distinct_and_lazy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sharing must not cost laziness. When the two roles resolve to *different*
+    backends, touching one role never constructs the other — otherwise a
+    docs-only command on a split-provider workspace would open the blob store's
+    SDK client and credentials for nothing."""
+    import dgml_core.storage_resolve as storage_resolve
+
+    from .conftest import write_config
+
+    ws = Workspace.resolve(tmp_path)
+    write_config(
+        ws,
+        {
+            "storage": {
+                "default": {
+                    "blobs": {"provider": f"{DefaultBridgeStore.__module__}:DefaultBridgeStore"},
+                    "docs": {"provider": DEFAULT_STORAGE_PROVIDER},
+                }
+            }
+        },
+    )
+
+    built = 0
+    real_make = storage_resolve.make_blob_store
+
+    def counting_make(config: object) -> object:
+        nonlocal built
+        built += 1
+        return real_make(config)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(storage_resolve, "make_blob_store", counting_make)
+
+    docs = ws.docs
+    assert isinstance(docs, LocalStore) and not isinstance(docs, DefaultBridgeStore)
+    assert built == 0  # the blob role was never resolved
+
+    assert isinstance(ws.blobs, DefaultBridgeStore)
+    assert built == 1
+    assert ws.blobs is not ws.docs
+
+
+def test_store_configs_resolve_once_for_both_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Registry + config resolution is per workspace, not per role. It re-reads
+    ``workspaces.json`` once per registry entry and rebuilds a settings class on
+    every call, so doing it twice was pure duplicated parsing."""
+    import dgml_core.registry as registry
+
+    calls = 0
+    real_resolve = registry.resolve_store_configs
+
+    def counting_resolve(ws: Workspace) -> object:
+        nonlocal calls
+        calls += 1
+        return real_resolve(ws)
+
+    monkeypatch.setattr(registry, "resolve_store_configs", counting_resolve)
+
+    ws = Workspace.resolve(tmp_path)
+    assert (ws.blobs, ws.docs) == (ws.blobs, ws.docs)
+    assert calls == 1
+
+
 # --------------------------------------------------------------------- fingerprint
 
 
