@@ -141,6 +141,45 @@ def _depth(el: etree._Element) -> int:
     return sum(1 for _ in el.iterancestors())
 
 
+def _parent_positions(elements: list[etree._Element]) -> list[int]:
+    """Each element's parent, as a position in *elements* (-1 for the root).
+
+    Derived from nesting depth in one pass rather than from element identity:
+    document order is DFS pre-order, so the parent of the element at depth *d*
+    is the most recent element seen at depth *d-1*. Positions are also the
+    coordinate a plan speaks in, which keeps the whole module on one of them.
+    """
+    parents = [-1] * len(elements)
+    open_at_depth: list[int] = []
+    for i, el in enumerate(elements):
+        depth = _depth(el)
+        del open_at_depth[depth:]  # close everything the new element is not under
+        parents[i] = open_at_depth[depth - 1] if depth else -1
+        open_at_depth.append(i)
+    return parents
+
+
+def _is_ancestor(parents: list[int], ancestor: int, node: int) -> bool:
+    at = parents[node]
+    while at != -1:
+        if at == ancestor:
+            return True
+        at = parents[at]
+    return False
+
+
+def _shares_a_path(parents: list[int], a: int, b: int) -> bool:
+    """True when one of *a*, *b* is an ancestor of the other.
+
+    A link between two elements on the same root-to-leaf path states a
+    relationship the nesting already states. ``link_system`` opens by defining
+    a link as a relationship "that the tree's nesting does not capture", so this
+    is not a judgement about link quality — it is the one case the format
+    excludes by definition.
+    """
+    return _is_ancestor(parents, a, b) or _is_ancestor(parents, b, a)
+
+
 def _listing(elements: list[etree._Element]) -> str:
     """One line per element: id, nesting depth, tag name, and its own text.
 
@@ -265,6 +304,92 @@ def _verify(
     return [c for i, c in enumerate(cands) if i in kept]
 
 
+# Two elements within this many positions of each other in document order are
+# neighbours: close enough that a reader meets them together, so a link between
+# them is unlikely to be carrying information the layout does not.
+_NEIGHBOUR_WITHIN = 3
+
+
+@dataclass(frozen=True)
+class LinkAudit:
+    """What a document's own XML says about the links it carries.
+
+    No reference output and no annotation: these are absolute properties of a
+    single document, so run-to-run churn — which makes semantic-link output hard
+    to score against itself — does not enter.
+
+    Counts are over subject→object *pairs*, not links: a value derived from
+    three elements is one link and three pairs, and each pair is judged
+    separately.
+
+    Two of the four are defects. ``dangling`` is a broken document: a
+    ``dg:href`` that resolves to nothing. ``nested`` contradicts the format
+    outright — ``link_system`` defines a link as a relationship the nesting does
+    not capture, and a link to one's own ancestor is nothing else.
+
+    The other two are measurements, not verdicts. ``sibling`` and ``neighbour``
+    count links between elements a reader meets together, which the prompt asks
+    the model to skip as "recoverable from layout alone" — but a document of
+    short consecutive clauses can legitimately link neighbours, so a high count
+    is a question, not a finding. ``mean_distance`` is context for both.
+    """
+
+    links: int
+    pairs: int
+    nested: int
+    sibling: int
+    neighbour: int
+    dangling: int
+    mean_distance: float
+    nested_subjects: list[str]
+    dangling_hrefs: list[str]
+
+
+def audit_links(xml: str | bytes) -> LinkAudit:
+    """Audit the semantic links in *xml* structurally. Makes no model call."""
+    root = etree.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+    elements = _elements(root)
+    parents = _parent_positions(elements)
+    position_of = {xid: i for i, el in enumerate(elements) if (xid := el.get(f"{{{_XML}}}id"))}
+    links = pairs = nested = sibling = neighbour = dangling = 0
+    distance_total = 0
+    nested_subjects: list[str] = []
+    dangling_hrefs: list[str] = []
+    for subject_idx, subject in enumerate(elements):
+        href = subject.get(f"{{{_DG}}}href")
+        if not href:
+            continue
+        links += 1
+        for token in href.split():
+            pairs += 1
+            object_idx = position_of.get(token.lstrip("#"))
+            if object_idx is None:
+                dangling += 1
+                dangling_hrefs.append(token)
+                continue
+            if _shares_a_path(parents, subject_idx, object_idx):
+                nested += 1
+                nested_subjects.append(subject.get(f"{{{_XML}}}id") or f"e{subject_idx:04d}")
+            if parents[subject_idx] == parents[object_idx]:
+                sibling += 1
+            distance = abs(subject_idx - object_idx)
+            if distance <= _NEIGHBOUR_WITHIN:
+                neighbour += 1
+            distance_total += distance
+    resolved = pairs - dangling
+    return LinkAudit(
+        links=links,
+        pairs=pairs,
+        nested=nested,
+        sibling=sibling,
+        neighbour=neighbour,
+        dangling=dangling,
+        mean_distance=distance_total / resolved if resolved else 0.0,
+        nested_subjects=nested_subjects,
+        dangling_hrefs=dangling_hrefs,
+    )
+
+
 def listing_digest(xml: str) -> str:
     """Hash of what a link plan for *xml* actually depends on: its text and shape.
 
@@ -318,27 +443,104 @@ def plan_links(xml: str, config: llm.LLMConfig, *, verify: bool = True) -> list[
     ]
 
 
+@dataclass(frozen=True)
+class PlanLosses:
+    """The plan entries that do not become links, by cause.
+
+    - ``nested`` — every object is on the subject's own root-to-leaf path, so
+      the link would state what the nesting states (:func:`_shares_a_path`). An
+      entry naming three objects that loses only one to nesting still lands, and
+      is not counted here.
+    - ``overwritten`` — ``dg:itemprop``/``dg:href`` are attributes *on the
+      subject element*, so a second link on one subject displaces the first.
+      That is a limit of the format rather than a decision made here, which is
+      exactly why it is worth surfacing: without it, a pass silently discards
+      about a tenth of what it accepted.
+    - ``off_tree`` — the subject, or every object, is not an element of this
+      document. Expected when a cached plan meets a re-rendered tree.
+
+    Every entry either becomes a link or lands in one of these, so
+    ``len(plan) == len(applied) + total``.
+    """
+
+    nested: int
+    overwritten: int
+    off_tree: int
+
+    @property
+    def total(self) -> int:
+        return self.nested + self.overwritten + self.off_tree
+
+
+def _resolve_plan(
+    elements: list[etree._Element], plan: list[dict[str, Any]]
+) -> tuple[list[tuple[int, list[int], str, str]], PlanLosses]:
+    """The plan entries that will reach the XML, in write order, and what did not.
+
+    One walk, shared by :func:`apply_plan` and :func:`plan_losses`, so what gets
+    written and what gets counted cannot disagree.
+    """
+    count = len(elements)
+    parents = _parent_positions(elements)
+    resolved: list[tuple[int, list[int], str, str]] = []
+    at_subject: dict[int, int] = {}
+    off_tree = nested = overwritten = 0
+    for item in plan:
+        subject_idx = item.get("subject")
+        objects = [o for o in (item.get("objects") or []) if isinstance(o, int)]
+        if not isinstance(subject_idx, int) or not 0 <= subject_idx < count:
+            off_tree += 1
+            continue
+        on_tree = [o for o in objects if 0 <= o < count and o != subject_idx]
+        if not on_tree:
+            off_tree += 1
+            continue
+        # A nested object is dropped on its own: a lesser-of formula naming
+        # three elements, one of them an ancestor, keeps the other two rather
+        # than losing the whole link.
+        keep = [o for o in on_tree if not _shares_a_path(parents, subject_idx, o)]
+        if not keep:
+            nested += 1
+            continue
+        entry = (
+            subject_idx,
+            keep,
+            str(item.get("predicate") or "references"),
+            str(item.get("value") or ""),
+        )
+        previous = at_subject.get(subject_idx)
+        if previous is None:
+            at_subject[subject_idx] = len(resolved)
+            resolved.append(entry)
+        else:
+            resolved[previous] = entry  # the XML keeps only the last one
+            overwritten += 1
+    return resolved, PlanLosses(nested=nested, overwritten=overwritten, off_tree=off_tree)
+
+
+def plan_losses(xml: str, plan: list[dict[str, Any]]) -> PlanLosses:
+    """Which of *plan*'s entries applying it to *xml* would not land. Writes nothing."""
+    return _resolve_plan(_elements(etree.fromstring(xml.encode())), plan)[1]
+
+
 def apply_plan(xml: str, plan: list[dict[str, Any]]) -> tuple[str, list[Link]]:
     """Write a plan from :func:`plan_links` into *xml*. Makes no model call.
 
     Entries pointing outside the tree are skipped, so a plan applied to a
-    document it was not built for produces fewer links instead of raising.
+    document it was not built for produces fewer links instead of raising. So
+    are links between an element and its own ancestor or descendant, which the
+    format excludes by definition (:func:`_shares_a_path`).
+
+    The returned links are the ones a reader will find in the XML — a link a
+    later entry on the same subject overwrote is not among them. Use
+    :func:`plan_losses` for what did not make it, and why.
     """
     root = etree.fromstring(xml.encode())
     elements = _elements(root)
     used: set[str] = {i for el in elements if (i := el.get(f"{{{_XML}}}id"))}
+    resolved, _ = _resolve_plan(elements, plan)
     applied: list[Link] = []
-    count = len(elements)
-    for item in plan:
-        subject_idx = item.get("subject")
-        obj_idxs = [
-            o
-            for o in (item.get("objects") or [])
-            if isinstance(o, int) and 0 <= o < count and o != subject_idx
-        ]
-        if not isinstance(subject_idx, int) or not 0 <= subject_idx < count or not obj_idxs:
-            continue
-        predicate = str(item.get("predicate") or "references")
+    for subject_idx, obj_idxs, predicate, raw_value in resolved:
         obj_ids = [_ensure_id(elements[o], used) for o in obj_idxs]
         subj_id = _ensure_id(elements[subject_idx], used)
         href = " ".join(f"#{oid}" for oid in obj_ids)
@@ -349,7 +551,7 @@ def apply_plan(xml: str, plan: list[dict[str, Any]]) -> tuple[str, list[Link]]:
         # normalized typed value — writing the link payload over it would make
         # the xsi:type/dg:value pair inconsistent (e.g. decimal + "$2,500,000").
         # The typed value wins; the link keeps itemprop + href.
-        value = "" if subject.get(f"{{{_XSI}}}type") else str(item.get("value") or "")
+        value = "" if subject.get(f"{{{_XSI}}}type") else raw_value
         if value:
             subject.set(f"{{{_DG}}}value", value)
         applied.append(Link(subj_id, obj_ids, predicate, value, href))

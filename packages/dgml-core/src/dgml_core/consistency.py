@@ -697,38 +697,103 @@ def _check_docset(ws: Workspace, docset_id: str, *, report: CheckReport) -> None
                 )
             )
             continue
-        _check_computed_attribution(ws, docset_id=docset_id, file_id=file_id, report=report)
+        _check_dgml_xml(ws, docset_id=docset_id, file_id=file_id, report=report)
 
 
-def _check_computed_attribution(
-    ws: Workspace, *, docset_id: str, file_id: str, report: CheckReport
-) -> None:
-    """Flag ``dg:origin="computed"`` elements with no ``dg:href`` in the
-    file's DGML XML.
+def _check_dgml_xml(ws: Workspace, *, docset_id: str, file_id: str, report: CheckReport) -> None:
+    """Run every XML-level check over the file's DGML, reading each blob once.
 
-    A computed field's value is verifiable only by walking its ``dg:href``
-    sources and recomputing the derivation (spec §13); one with no sources is
-    an unauditable claim — usually the model derived it from document content
-    the schema never extracted. Malformed XML is skipped here: XML validity
-    is owned by the generation/extraction writers, not this check."""
-    from .extraction_xml import unattributed_computed_fields
-
+    Malformed XML is skipped throughout: XML validity is owned by the
+    generation/extraction writers, not this check.
+    """
     for key in sorted(ws.blobs.list_blobs(layout.docset_pair_prefix(docset_id, file_id))):
         if not key.endswith(".dgml.xml"):
             continue
         try:
-            tags = unattributed_computed_fields(ws.blobs.get_blob(key))
+            xml = ws.blobs.get_blob(key)
         except Exception:
             continue
-        if tags:
-            report.issues.append(
-                Issue(
-                    kind="computed_field_unattributed",
-                    target_type="docset",
-                    target_id=docset_id,
-                    message=(
-                        f"file '{file_id}' {key.rsplit('/', 1)[-1]}: computed element(s) with no "
-                        f"dg:href sources: {', '.join(sorted(set(tags)))}"
-                    ),
-                )
+        name = key.rsplit("/", 1)[-1]
+        _check_computed_attribution(
+            xml, docset_id=docset_id, file_id=file_id, name=name, report=report
+        )
+        _check_semantic_links(xml, docset_id=docset_id, file_id=file_id, name=name, report=report)
+
+
+def _check_computed_attribution(
+    xml: bytes, *, docset_id: str, file_id: str, name: str, report: CheckReport
+) -> None:
+    """Flag ``dg:origin="computed"`` elements with no ``dg:href``.
+
+    A computed field's value is verifiable only by walking its ``dg:href``
+    sources and recomputing the derivation (spec §13); one with no sources is
+    an unauditable claim — usually the model derived it from document content
+    the schema never extracted."""
+    from .extraction_xml import unattributed_computed_fields
+
+    try:
+        tags = unattributed_computed_fields(xml)
+    except Exception:
+        return
+    if tags:
+        report.issues.append(
+            Issue(
+                kind="computed_field_unattributed",
+                target_type="docset",
+                target_id=docset_id,
+                message=(
+                    f"file '{file_id}' {name}: computed element(s) with no "
+                    f"dg:href sources: {', '.join(sorted(set(tags)))}"
+                ),
             )
+        )
+
+
+def _check_semantic_links(
+    xml: bytes, *, docset_id: str, file_id: str, name: str, report: CheckReport
+) -> None:
+    """Flag semantic links that contradict what a semantic link is.
+
+    Only the two structural defects are reported. A ``dg:href`` resolving to no
+    element is a broken document. A link between an element and its own
+    ancestor or descendant states a relationship the tree's nesting already
+    states, which is the one case ``link_system`` excludes by definition — new
+    documents cannot carry one (``apply_plan`` drops them), so a hit here means
+    the file predates that filter and re-generating will clear it.
+
+    The audit's other counts — links between siblings or near neighbours — are
+    deliberately *not* raised as issues. They measure how much of a document's
+    linking is local, which is worth watching across a corpus, but a document of
+    short consecutive clauses can legitimately link its neighbours and flagging
+    that would be noise."""
+    from .generation.links import audit_links
+
+    try:
+        audit = audit_links(xml)
+    except Exception:
+        return
+    if audit.dangling:
+        report.issues.append(
+            Issue(
+                kind="semlink_dangling_href",
+                target_type="docset",
+                target_id=docset_id,
+                message=(
+                    f"file '{file_id}' {name}: {audit.dangling} dg:href target(s) resolve to no "
+                    f"element: {', '.join(sorted(set(audit.dangling_hrefs))[:10])}"
+                ),
+            )
+        )
+    if audit.nested:
+        report.issues.append(
+            Issue(
+                kind="semlink_nested",
+                target_type="docset",
+                target_id=docset_id,
+                message=(
+                    f"file '{file_id}' {name}: {audit.nested} link(s) point at the subject's own "
+                    f"ancestor or descendant, which the tree's nesting already states; "
+                    f"subject(s): {', '.join(sorted(set(audit.nested_subjects))[:10])}"
+                ),
+            )
+        )

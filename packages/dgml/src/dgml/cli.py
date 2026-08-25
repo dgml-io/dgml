@@ -2590,8 +2590,16 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 # render and grounding just produced.
                 linked, applied = apply_plan(source, plan)
                 ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
+                # `applied` is what the XML actually carries, so the reported
+                # count matches the document. What the plan asked for and did
+                # not get is diagnosed separately — chiefly links discarded
+                # because dg:itemprop/dg:href are attributes on the subject, so
+                # a second link on one subject overwrites the first.
                 links_added = len(applied)
-                _diag(f"[semlinks] {name}: {links_added} link(s){hit}")
+                losses = links_mod.plan_losses(source, plan)
+                lost = f", {losses.overwritten} lost to overwrite" if losses.overwritten else ""
+                nested = f", {losses.nested} nested dropped" if losses.nested else ""
+                _diag(f"[semlinks] {name}: {links_added} link(s){lost}{nested}{hit}")
             except Exception as exc:  # a link-pass failure must not lose the DGML
                 link_errors[name] = short_error_message(exc)
                 _diag(f"[semlinks] {name}: skipped ({exc})")

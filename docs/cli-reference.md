@@ -232,6 +232,8 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `text_extraction_failed_permanent` | file | A previous extraction recorded a permanent failure; not retried without `--retry-errors` |
 | `dangling_file_reference` | docset | DocSet references a File ID that doesn't exist |
 | `computed_field_unattributed` | docset | A `dg:origin="computed"` element in a file's DGML XML has no `dg:href` sources — the derivation can't be audited (spec §13 requires computed fields to name their sources) |
+| `semlink_dangling_href` | docset | A semantic link's `dg:href` names an `xml:id` no element in the document carries |
+| `semlink_nested` | docset | A semantic link points at the subject's own ancestor or descendant, stating a relationship the tree's nesting already states. Newly generated files can't carry one — re-generating clears it |
 
 `--retry-errors` clears recorded permanent errors and re-attempts the
 failed operations.
