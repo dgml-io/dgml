@@ -2249,7 +2249,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     )
     from dgml_core.generation import coverage as cov_mod
     from dgml_core.generation import links as links_mod
-    from dgml_core.generation.blocks import Block
+    from dgml_core.generation.blocks import Block, block_concept_labels
     from dgml_core.generation.links import apply_plan, plan_links
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
     from dgml_core.generation.rnc import write_docset_rnc
@@ -2615,6 +2615,25 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         if compute_cov and pt_dir is not None:
             result = cov_mod.compute_coverage(xml, name, page_text_dir=pt_dir)
             _diag(cov_mod.coverage_summary_line(result))
+            # --debug: how many concept labels the labeling pass assigned
+            # actually propagated into the rendered DGML (e.g. "180 labels
+            # exported over 200 total"). Reloads the doc's labeled blocks from
+            # cache to get the assigned-label multiset; best-effort, never fails
+            # a conversion. Recorded under `label_propagation` in the report.
+            if args.debug:
+                try:
+                    stem = Path(name).stem
+                    labeled = load_labeled_docs_from_cache(cache_dir, [stem]).get(stem)
+                    if labeled is not None:
+                        prop = cov_mod.compute_label_propagation(
+                            block_concept_labels(labeled), xml, source_name=name
+                        )
+                        result["label_propagation"] = {
+                            k: v for k, v in prop.items() if k != "source"
+                        }
+                        _diag(cov_mod.label_propagation_summary_line(prop))
+                except Exception as exc:  # debug-only diagnostic — never fatal
+                    _diag(f"[labels] {name}: propagation check skipped ({exc})")
             cov_by_name[name] = result
         # Each present only when that step failed, like grounding_error, which
         # appears only when grounded is False.
