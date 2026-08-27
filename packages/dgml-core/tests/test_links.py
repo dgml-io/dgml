@@ -432,3 +432,180 @@ def test_reviewer_returning_no_verdicts_raises_rather_than_dropping_everything(
     monkeypatch.setattr(llm, "call_continued", reject_all)
     _, applied = add_links(_XML, llm.LLMConfig(model="x"))
     assert applied == []
+
+
+# ── structural audit and the nested-link filter ──────────────────────────────
+
+# A three-level tree with a pair of leaves under each of two sections, so every
+# relationship the audit distinguishes is expressible against one fixture.
+# Positions: 0 chunk, 1 SectionA, 2 Rent, 3 Term, 4 SectionB, 5 Cap, 6 Notice.
+_TREE = (
+    "<?xml version='1.0' encoding='utf-8'?>\n"
+    '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#">'
+    '<dg:SectionA xml:id="a">RENT'
+    '<dg:Rent xml:id="rent">$2,500</dg:Rent>'
+    '<dg:Term xml:id="term">five years</dg:Term>'
+    "</dg:SectionA>"
+    '<dg:SectionB xml:id="b">LIABILITY'
+    '<dg:Cap xml:id="cap">$1,000,000</dg:Cap>'
+    '<dg:Notice xml:id="notice">30 days</dg:Notice>'
+    "</dg:SectionB>"
+    "</dg:chunk>"
+)
+
+
+def _one(subject: int, objects: list[int], predicate: str = "references") -> dict[str, object]:
+    return {"subject": subject, "objects": objects, "predicate": predicate, "value": ""}
+
+
+def test_a_link_to_an_ancestor_or_descendant_is_dropped() -> None:
+    """The nesting already states it. `link_system` opens by defining a link as
+    a relationship the tree's nesting does NOT capture, so this is the one case
+    the format excludes outright rather than a judgement about quality."""
+    from dgml_core.generation.links import apply_plan
+
+    for label, plan in (
+        ("descendant", [_one(1, [2])]),  # section -> its own child
+        ("ancestor", [_one(2, [1])]),  # child -> its own section
+        ("grandparent", [_one(2, [0])]),  # leaf -> the chunk root
+    ):
+        _, applied = apply_plan(_TREE, plan)
+        assert applied == [], f"{label} link survived"
+
+
+def test_links_across_the_tree_survive() -> None:
+    """The filter is ancestry, not distance: siblings, cousins and far-apart
+    elements are all kept. Only self-referential nesting goes."""
+    from dgml_core.generation.links import apply_plan
+
+    plan = [
+        _one(2, [3]),  # sibling
+        _one(5, [2]),  # cousin, across sections
+        _one(6, [1]),  # leaf -> the OTHER section (not its own ancestor)
+    ]
+    _, applied = apply_plan(_TREE, plan)
+    assert [ln.subject for ln in applied] == ["rent", "cap", "notice"]
+
+
+def test_a_nested_object_is_dropped_without_losing_the_link() -> None:
+    """A lesser-of formula naming three elements, one of them an ancestor, keeps
+    the other two — the entry is not thrown away whole."""
+    from dgml_core.generation.links import apply_plan
+
+    _, applied = apply_plan(_TREE, [_one(2, [1, 3, 5], "lesserOf")])
+    assert len(applied) == 1
+    assert applied[0].objects == ["term", "cap"]  # "a", the ancestor, is gone
+
+
+def test_self_reference_is_dropped() -> None:
+    from dgml_core.generation.links import apply_plan
+
+    _, applied = apply_plan(_TREE, [_one(2, [2])])
+    assert applied == []
+
+
+def test_audit_counts_pairs_and_separates_defects_from_measurements() -> None:
+    """Counts are over subject->object pairs, not links: a value derived from
+    three elements is one link and three pairs, judged separately."""
+    from dgml_core.generation.links import apply_plan, audit_links
+
+    linked, _ = apply_plan(
+        _TREE,
+        [
+            _one(2, [3]),  # sibling, 1 position apart
+            _one(5, [2, 3], "lesserOf"),  # two pairs, both far and non-sibling
+        ],
+    )
+    audit = audit_links(linked)
+    assert (audit.links, audit.pairs) == (2, 3)
+    assert audit.nested == 0 and audit.dangling == 0
+    assert audit.sibling == 1  # rent -> term only
+    # Distances |2-3|=1, |5-2|=3, |5-3|=2 — all three within the 3-position
+    # neighbour window, which is what makes this fixture's linking local.
+    assert audit.neighbour == 3
+    assert audit.mean_distance == pytest.approx((1 + 3 + 2) / 3)
+
+
+def test_audit_flags_a_nested_link_that_predates_the_filter() -> None:
+    """The audit reads documents `apply_plan` can no longer produce — the point
+    of shipping it is to see the defect in files already on disk."""
+    from dgml_core.generation.links import audit_links
+
+    legacy = _TREE.replace(
+        '<dg:Rent xml:id="rent">',
+        '<dg:Rent xml:id="rent" dg:itemprop="references" dg:href="#a">',
+    )
+    audit = audit_links(legacy)
+    assert audit.nested == 1 and audit.nested_subjects == ["rent"]
+
+
+def test_audit_flags_a_dangling_href() -> None:
+    from dgml_core.generation.links import audit_links
+
+    broken = _TREE.replace(
+        '<dg:Rent xml:id="rent">',
+        '<dg:Rent xml:id="rent" dg:itemprop="references" dg:href="#gone">',
+    )
+    audit = audit_links(broken)
+    assert audit.dangling == 1 and audit.dangling_hrefs == ["#gone"]
+    assert audit.mean_distance == 0.0  # nothing resolved, so no distance to average
+
+
+def test_every_plan_entry_either_lands_or_is_accounted_for() -> None:
+    """Nothing disappears quietly — including the links the format itself
+    discards, because dg:itemprop/dg:href are attributes on the subject and a
+    second link on one subject displaces the first."""
+    from dgml_core.generation.links import apply_plan, audit_links, plan_losses
+
+    plan = [
+        _one(2, [3]),  # lands
+        _one(2, [5]),  # same subject, same predicate: merges into the one above
+        _one(2, [6], "amends"),  # same subject, DIFFERENT predicate: displaces it
+        _one(2, [1]),  # nested (its own section)
+        _one(99, [1]),  # subject off the tree
+        _one(3, [99]),  # every object off the tree
+    ]
+    losses = plan_losses(_TREE, plan)
+    assert (losses.merged, losses.displaced, losses.nested, losses.off_tree) == (1, 1, 1, 2)
+
+    linked, applied = apply_plan(_TREE, plan)
+    assert len(applied) == 1 and applied[0].predicate == "amends"
+    assert audit_links(linked).pairs == 1
+    assert len(plan) == len(applied) + losses.total
+
+
+def test_two_links_stating_the_same_relationship_become_one_with_both_objects() -> None:
+    """A subject carries one dg:itemprop/dg:href pair, but dg:href holds a LIST
+    of objects — that is how a lesser-of formula names its operands. Two entries
+    saying the same thing about one subject are therefore one link with two
+    objects, and folding them keeps a link the format would otherwise discard."""
+    from dgml_core.generation.links import apply_plan, plan_losses
+
+    plan = [_one(2, [3], "references"), _one(2, [5], "references")]
+    _, applied = apply_plan(_TREE, plan)
+    assert len(applied) == 1
+    assert applied[0].objects == ["term", "cap"]  # both survive
+    assert applied[0].href == "#term #cap"
+    assert plan_losses(_TREE, plan).displaced == 0
+
+
+def test_merging_stops_at_a_real_disagreement_about_the_value() -> None:
+    """A subject carries a single dg:value, so two entries that state the same
+    relationship with different values are a genuine conflict and must not be
+    folded — folding would silently drop one of the two values."""
+    from dgml_core.generation.links import apply_plan, plan_losses
+
+    plan = [
+        {"subject": 2, "objects": [3], "predicate": "relativeTo", "value": "P1Y"},
+        {"subject": 2, "objects": [5], "predicate": "relativeTo", "value": "P30D"},
+    ]
+    losses = plan_losses(_TREE, plan)
+    assert (losses.merged, losses.displaced) == (0, 1)
+    _, applied = apply_plan(_TREE, plan)
+    assert len(applied) == 1 and applied[0].value == "P30D"  # the last one wins
+
+    # One value stated and one left blank is not a disagreement: fold them.
+    plan[1]["value"] = ""
+    assert plan_losses(_TREE, plan).merged == 1
+    _, applied = apply_plan(_TREE, plan)
+    assert applied[0].objects == ["term", "cap"] and applied[0].value == "P1Y"

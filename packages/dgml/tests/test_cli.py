@@ -4263,7 +4263,11 @@ def _two_files_in_docset(
         capsys.readouterr()  # drain, so the next iteration reads only its own JSON
 
 
-_SAME_TREE = '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"><a>same tree</a></dg:chunk>'
+# Two sibling leaves, so a link between them is one apply_plan will keep — a
+# leaf linked to its enclosing chunk is its own ancestor and gets dropped.
+_SAME_TREE = (
+    '<dg:chunk xmlns:dg="http://dgml.io/ns/dg#"><a>same tree</a><b>and again</b></dg:chunk>'
+)
 
 
 def _fake_convert_emitting(tree: str, *, reverse: bool = False) -> Any:
@@ -4287,8 +4291,8 @@ def _counting_linker(calls: list[str]) -> Any:
 
     def fake_plan_links(xml: str, config: Any, *, verify: bool = True) -> list[dict[str, Any]]:
         calls.append(xml)
-        # element 1 is <a>, element 0 is the enclosing dg:chunk
-        return [{"subject": 1, "objects": [0], "predicate": "references", "value": ""}]
+        # element 0 is the enclosing dg:chunk, 1 is <a>, 2 is <b>
+        return [{"subject": 1, "objects": [2], "predicate": "references", "value": ""}]
 
     return fake_plan_links
 
