@@ -289,6 +289,52 @@ def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Pat
     assert not [i for i in report.issues if i.kind == "computed_field_unattributed"]
 
 
+@needs_gs
+def test_semantic_link_defects_flagged(workspace: Workspace, text_pdf: Path) -> None:
+    """`check` reports the two structural link defects: an href resolving to no
+    element, and a link to the subject's own ancestor. Both are readable from
+    the XML alone — no gold annotation, no reference run. Links that are merely
+    local (siblings, neighbours) are measured by the audit but must NOT be
+    raised as issues, or every densely linked document would look broken."""
+    f = FileStore(workspace).add(text_pdf)
+    store = DocSetStore(workspace)
+    ds = store.create(name="X")
+    store.add_file(ds.id, f.record.id)
+    xml_key = layout.dgml_xml_key(ds.id, f.record.id, "doc")
+
+    def check(body: bytes) -> dict[str, list[str]]:
+        workspace.blobs.put_blob(
+            xml_key,
+            b'<dg:chunk xmlns:dg="http://dgml.io/ns/dg#" xmlns:docset="http://x/ns">'
+            + body
+            + b"</dg:chunk>",
+        )
+        found: dict[str, list[str]] = {}
+        for issue in check_workspace(workspace).issues:
+            found.setdefault(issue.kind, []).append(issue.message)
+        return found
+
+    nested = check(
+        b'<docset:Section xml:id="s1">TERMS'
+        b'<docset:Rent xml:id="r1" dg:itemprop="references" dg:href="#s1">$100</docset:Rent>'
+        b"</docset:Section>"
+    )
+    assert "semlink_nested" in nested and "r1" in nested["semlink_nested"][0]
+
+    dangling = check(
+        b'<docset:Rent xml:id="r1" dg:itemprop="references" dg:href="#nope">$100</docset:Rent>'
+    )
+    assert "semlink_dangling_href" in dangling and "#nope" in dangling["semlink_dangling_href"][0]
+
+    local = check(
+        b'<docset:Section xml:id="s1">TERMS'
+        b'<docset:Rent xml:id="r1" dg:itemprop="relativeTo" dg:href="#t1">$100</docset:Rent>'
+        b'<docset:Term xml:id="t1">5 years</docset:Term>'
+        b"</docset:Section>"
+    )
+    assert "semlink_nested" not in local and "semlink_dangling_href" not in local
+
+
 @pytest.mark.parametrize("debug", [True, False])
 def test_reextract_hybrid_threads_debug(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch, debug: bool
