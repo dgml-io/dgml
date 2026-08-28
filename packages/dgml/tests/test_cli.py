@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -4326,6 +4328,54 @@ def test_semlink_cache_replays_result_for_an_identical_tree(
     stored = {Workspace(root=ws).blobs.get_blob(r["output"]).decode("utf-8") for r in converted}
     assert len(stored) == 1  # cache hit wrote the same bytes, not a re-derivation
     assert 'dg:itemprop="references"' in stored.pop()
+
+
+@needs_gs
+def test_link_usage_is_recorded_per_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two documents linked at the same time get one usage row EACH, named.
+
+    `record_usage_for` marks its open aggregation scope on the LLMConfig object,
+    so one config shared across the emit pool meant the second document to start
+    saw a scope already open, folded its tokens into the first document's row,
+    and wrote no row of its own — leaving the pass readable only in aggregate,
+    and misattributed even then. The barrier holds both documents inside
+    `plan_links` at once, which is the only state in which that could happen.
+    """
+    from dgml_core.usage import read_events
+
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    _two_files_in_docset(ws, tmp_path, did, capsys)
+
+    both_proposing = threading.Barrier(2, timeout=10)
+
+    def fake_call(config: Any, **kwargs: Any) -> str:
+        if "reviewer" in str(kwargs["system_prompt"]):
+            return json.dumps({"verdicts": [{"i": 0, "keep": True}]})
+        both_proposing.wait()  # exactly one propose call per document
+        return json.dumps(
+            {"links": [{"subject": "e0001", "object": "e0002", "predicate": "references"}]}
+        )
+
+    def fake_convert(paths: Any, *, options: Any, on_output: Any, **_kw: Any) -> dict[str, str]:
+        # Mirror convert_batch's emit pool: the sink runs concurrently per doc.
+        names = [Path(p).name for p in paths]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda n: on_output(n, _SAME_TREE), names))
+        return {}
+
+    with (
+        patch("dgml_core.generation.convert_batch", side_effect=fake_convert),
+        patch("dgml_core.llm.call_continued", side_effect=fake_call),
+    ):
+        rc = main(_ws_args(ws) + ["--debug", "docset", "generate", did, "--no-coverage"])
+    assert rc == 0
+
+    rows = [e for e in read_events(Workspace(root=ws)) if e["operation"] == "links"]
+    assert len(rows) == 2  # one per document, not one covering both
+    assert {r["context"]["doc"] for r in rows} == {"one.pdf", "two.pdf"}
 
 
 @needs_gs

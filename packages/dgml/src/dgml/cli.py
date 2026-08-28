@@ -2314,14 +2314,24 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         return _emit_error(exc.code, str(exc), fmt)
 
     # The semantic-link pass runs on the labeling model (and its credentials).
-    link_config = llm.LLMConfig(
-        model=label_model,
-        api_key=label_api_key,
-        api_base=label_api_base,
-        workspace=ws,
-        debug=args.debug,
-        operation=OPERATION_LINKS,
-    )
+    # One config per DOCUMENT, never one shared by all of them. Documents are
+    # linked concurrently on the emit pool, and `llm.record_usage_for` marks the
+    # open aggregation scope on the config object itself — so a shared config
+    # means the second document to start folds its tokens into whichever scope
+    # opened first, and the row that lands names one document while covering
+    # several. Per-document configs also give each row a `doc` context, so the
+    # pass can be read per file rather than only in aggregate.
+    def _link_config(doc_name: str) -> llm.LLMConfig:
+        config = llm.LLMConfig(
+            model=label_model,
+            api_key=label_api_key,
+            api_base=label_api_base,
+            workspace=ws,
+            debug=args.debug,
+            operation=OPERATION_LINKS,
+        )
+        config.context = {"doc": doc_name}
+        return config
 
     # The docset prefix is always the output base — schema.json,
     # coverage_report.json, cache/, and semantic/ live under it. Each file's
@@ -2582,7 +2592,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     plan = json.loads(cached)
                     hit = " (cached)"
                 else:
-                    plan = plan_links(source, link_config, verify=not args.no_semlink_verify)
+                    plan = plan_links(source, _link_config(name), verify=not args.no_semlink_verify)
                     ws.blobs.put_blob(plan_key, json.dumps(plan).encode("utf-8"))
                     hit = ""
                 # The plan is applied to the CURRENT tree either way, so a cache
