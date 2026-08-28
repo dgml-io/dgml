@@ -42,6 +42,9 @@ from __future__ import annotations
 
 import copy
 import json
+import tempfile
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -66,9 +69,10 @@ from .errors import (
     DgmlError,
     IncrementalWithoutClusters,
 )
+from .files import FileStore
 from .llm_clustering import llm_cluster_files
 from .models_config import ConfigSection
-from .run_clustering import resolve_text_settings, run_clustering_detailed
+from .run_clustering import resolve_text_settings, resolve_text_view, run_clustering_detailed
 from .storage import Workspace, read_json
 from .utils import unassigned_file_ids
 
@@ -658,66 +662,80 @@ def clustering_internal(
     # clusters from scratch (S1, no prototypes) and needs no gate.
     if effective_mode == "incremental":
         overrides = _with_incremental_novelty_default(overrides)
-    # Point corpus-fitted text encoders at the workspace files/ dir and
-    # learn the text view the configured encoder expects, so the dataset
-    # assembles record.text under that same view.
-    text_view, overrides = resolve_text_settings(workspace.files_dir, overrides)
+    # Point corpus-fitted text encoders at a directory of page text and learn
+    # the text view the configured encoder expects, so the dataset assembles
+    # record.text under that same view. The corpus directory is only guaranteed
+    # to exist for the duration of this block — see ``_corpus_dir``.
+    # Every file in the workspace, not just the ones being clustered: the encoder
+    # fits document frequencies over the *whole* corpus, and the local walk it
+    # replaces reads every ``files/<id>/`` directory. Narrowing this to ``usable``
+    # would make IDF — and therefore the clustering — depend on the backend.
+    corpus_ids = [record.id for record in FileStore(workspace).list_all()]
+    # The view is resolved first because it decides which pages are worth
+    # materializing — the default ``page1`` needs only the first of each file.
+    with _corpus_dir(workspace, corpus_ids, resolve_text_view(overrides)) as corpus_root:
+        text_view, overrides = resolve_text_settings(corpus_root, overrides)
 
-    # Load enough page renders for the scenario's image pooling. ``pooling_pages``
-    # defaults to 1 (page-1 only), so this is a no-op unless the caller opted in;
-    # threading it here is what makes the knob actually take effect end-to-end.
-    pooling_pages = int((overrides.get("scenario") or {}).get("pooling_pages") or 1)
+        # Load enough page renders for the scenario's image pooling.
+        # ``pooling_pages`` defaults to 1 (page-1 only), so this is a no-op
+        # unless the caller opted in; threading it here is what makes the knob
+        # actually take effect end-to-end.
+        pooling_pages = int((overrides.get("scenario") or {}).get("pooling_pages") or 1)
 
-    dataset = WorkspaceFileDataset(workspace, usable, text_view=text_view, max_pages=pooling_pages)
-
-    # Build a labeled support set from existing DocSet members: for the
-    # incremental path, reconstruct each category's prototype from *all*
-    # of its members with a rendered page image (bounded by
-    # MAX_SUPPORT_SAMPLES_PER_DOCSET). Embeddings are cached by content
-    # hash, so re-embedding already-seen members is cheap. With samples in
-    # hand, run_clustering escalates from name-only (S2) to few-shot (S3)
-    # prototypes; ``max_shots`` tells S3 how many per category to average.
-    support_file_ids: list[str] = []
-    support_labels: dict[str, str] = {}
-    max_shots = 0
-    for docset in proto_docsets:
-        picked = 0
-        for fid in docset_store.list_files(docset.id):
-            if picked >= MAX_SUPPORT_SAMPLES_PER_DOCSET:
-                break
-            if workspace.blobs.list_blobs(layout.file_pages_prefix(fid)):
-                support_file_ids.append(fid)
-                support_labels[fid] = docset.name
-                picked += 1
-        max_shots = max(max_shots, picked)
-
-    if support_file_ids:
-        support_dataset = WorkspaceFileDataset(
-            workspace,
-            support_file_ids,
-            labels=support_labels,
-            text_view=text_view,
-            max_pages=pooling_pages,
+        dataset = WorkspaceFileDataset(
+            workspace, usable, text_view=text_view, max_pages=pooling_pages
         )
-        detailed = run_clustering_detailed(
-            dataset,
-            known_categories=known_categories,
-            n_samples_per_category=max_shots,
-            support_dataset=support_dataset,
-            overrides=overrides,
-            cache_dir=workspace.embedding_cache_dir,
-            classification_config=_adjudication_config(workspace),
-            debug=debug,
-        )
-    else:
-        detailed = run_clustering_detailed(
-            dataset,
-            known_categories=known_categories,
-            overrides=overrides,
-            cache_dir=workspace.embedding_cache_dir,
-            classification_config=_adjudication_config(workspace),
-            debug=debug,
-        )
+
+        # Build a labeled support set from existing DocSet members: for the
+        # incremental path, reconstruct each category's prototype from *all*
+        # of its members with a rendered page image (bounded by
+        # MAX_SUPPORT_SAMPLES_PER_DOCSET). Embeddings are cached by content
+        # hash, so re-embedding already-seen members is cheap. With samples in
+        # hand, run_clustering escalates from name-only (S2) to few-shot (S3)
+        # prototypes; ``max_shots`` tells S3 how many per category to average.
+        support_file_ids: list[str] = []
+        support_labels: dict[str, str] = {}
+        max_shots = 0
+        for docset in proto_docsets:
+            picked = 0
+            for fid in docset_store.list_files(docset.id):
+                if picked >= MAX_SUPPORT_SAMPLES_PER_DOCSET:
+                    break
+                if workspace.blobs.list_blobs(layout.file_pages_prefix(fid)):
+                    support_file_ids.append(fid)
+                    support_labels[fid] = docset.name
+                    picked += 1
+            max_shots = max(max_shots, picked)
+
+        # Inside the ``with``: the text encoder is constructed here, and that is
+        # the point at which it reads ``corpus_dir`` off disk.
+        if support_file_ids:
+            support_dataset = WorkspaceFileDataset(
+                workspace,
+                support_file_ids,
+                labels=support_labels,
+                text_view=text_view,
+                max_pages=pooling_pages,
+            )
+            detailed = run_clustering_detailed(
+                dataset,
+                known_categories=known_categories,
+                n_samples_per_category=max_shots,
+                support_dataset=support_dataset,
+                overrides=overrides,
+                cache_dir=workspace.embedding_cache_dir,
+                classification_config=_adjudication_config(workspace),
+                debug=debug,
+            )
+        else:
+            detailed = run_clustering_detailed(
+                dataset,
+                known_categories=known_categories,
+                overrides=overrides,
+                cache_dir=workspace.embedding_cache_dir,
+                classification_config=_adjudication_config(workspace),
+                debug=debug,
+            )
 
     # Split off the noise bucket before it can pass for a cluster name. The
     # density-based algorithms (the default `leiden` among them) return it
@@ -744,6 +762,71 @@ def clustering_internal(
         method="embedding",
         known_categories=known_categories,
     )
+
+
+@contextmanager
+def _corpus_dir(workspace: Workspace, file_ids: Sequence[str], text_view: str) -> Iterator[Path]:
+    """A local directory of page text for the corpus-fitted text encoder.
+
+    ``TfidfEncoder`` — the *default* text encoder — fits document frequencies by
+    walking a directory of ``<file_id>/page_text/*.json``
+    (``clustering.encoders.lexical._read_corpus``), so it needs real paths. On
+    ``LocalStore`` the workspace ``files/`` dir already is that directory and is
+    yielded unchanged. On any other backend nothing is on local disk, and the
+    encoder would otherwise raise "found no page_text under …" naming a directory
+    that is empty by design — while pointing the user at OCR, which is not the
+    problem.
+
+    Only ``page_text`` is materialized. ``files/<id>/`` also holds the source
+    document and every rendered page image — the bulk of a workspace, and nothing
+    the corpus reader opens.
+
+    ``text_view`` narrows it further. The default view — ``page1`` — reads only
+    the first page (``_text_from_pages`` takes ``pages[0]`` and discards the
+    rest), so only ``page_1.json`` is fetched: one blob per file instead of one
+    per page. Every other view (``full``, ``headers``, ``salient_boost``, or any
+    multi-view spec naming them) reads all pages, so all are fetched.
+
+    A directory is created for **every** id, including ones with no page text, so
+    the corpus has one entry per file exactly as the local walk does. That keeps
+    the encoder's document-frequency thresholds (``min_df``/``max_df``) and its
+    "N files but none contain extracted text" message identical across backends.
+
+    The directory lives only for the duration of the ``with`` block; the encoder
+    reads it while being constructed inside ``run_clustering_detailed``, so the
+    block has to span that call.
+    """
+    from .storage_local import LocalStore
+
+    # Exact type, not ``isinstance``: the passthrough is only valid because
+    # ``LocalStore``'s keys *are* paths under the workspace root. A subclass has
+    # changed something — ``DefaultBridgeStore`` in the test suite subclasses it
+    # precisely to keep the primitives but take the base path bridge — so the
+    # assumption no longer holds. Materializing for an unknown subclass is slower
+    # and correct; short-circuiting it would be fast and wrong.
+    if type(workspace.blobs) is LocalStore:
+        yield workspace.files_dir
+        return
+
+    from clustering.example import split_view_spec
+
+    first_page_only = all(name == "page1" for name in split_view_spec(text_view))
+
+    with tempfile.TemporaryDirectory(prefix="dgml-corpus-") as tmp:
+        root = Path(tmp)
+        for file_id in file_ids:
+            (root / file_id).mkdir(parents=True, exist_ok=True)
+            prefix = layout.file_text_prefix(file_id)
+            keys = workspace.blobs.list_blobs(prefix)
+            if first_page_only:
+                # Filtered from the listing rather than probed with blob_exists,
+                # so a file with no page text still costs one round trip.
+                wanted = layout.file_page_text_key(file_id, 1)
+                keys = [key for key in keys if key == wanted]
+            for key in keys:
+                dest = root / file_id / layout.PAGE_TEXT_DIR / key[len(prefix) :]
+                workspace.blobs.download_blob(key, dest)
+        yield root
 
 
 def _adjudication_config(workspace: Workspace) -> ClassificationConfig | None:

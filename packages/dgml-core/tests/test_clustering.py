@@ -309,6 +309,217 @@ def test_clustering_internal_passes_empty_overrides_when_no_config(workspace: Wo
     }
 
 
+def _seed_page_text(workspace: Workspace, file_id: str, words: list[str]) -> None:
+    """Write a minimal word-box page_text JSON, the shape ``_build_text`` reads."""
+    page = {
+        "page_number": 1,
+        "words": [{"t": w, "l": [10 * i, 100, 10 * i + 8, 112]} for i, w in enumerate(words)],
+    }
+    workspace.blobs.put_blob(
+        layout.file_page_text_key(file_id, 1), json.dumps(page).encode("utf-8")
+    )
+
+
+def test_corpus_dir_is_materialized_for_a_non_local_blob_store(tmp_path: Path) -> None:
+    """The tfidf encoder reads ``corpus_dir`` off the filesystem, so a workspace
+    whose blobs are not on local disk needs its page text materialized first.
+
+    Without this the encoder raises "found no page_text under <ws>/files" — naming
+    a directory that is empty by design, while pointing the user at OCR.
+
+    ``DefaultBridgeStore`` has ``LocalStore``'s blob primitives but the *base*
+    path bridge, which is the code path every third-party (S3, Mongo) store takes.
+    """
+    from .conftest import DefaultBridgeStore, default_bridge_store
+
+    root = tmp_path / "ws"
+    root.mkdir(parents=True)
+    store = default_bridge_store(root)
+    ws = Workspace(root=root)
+    # Both roles on the bridge store, so nothing resolves to a plain LocalStore.
+    ws.__dict__["blobs"] = store
+    ws.__dict__["docs"] = store
+    ws.init()
+
+    for fid, words in (("f1", ["invoice", "total", "due"]), ("f2", ["lease", "tenant", "rent"])):
+        _seed_file(ws, fid)
+        _seed_page_image(ws, fid)
+        _seed_page_text(ws, fid, words)
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"f1": _dp("unknown_0"), "f2": _dp("unknown_1")},
+    ) as mock_run:
+        clustering_internal(ws)
+
+    corpus_dir = Path(mock_run.call_args.kwargs["overrides"]["encoder_text"]["extra"]["corpus_dir"])
+    # Not the (empty) local files/ dir — a materialized tree that actually has the text.
+    assert corpus_dir != ws.files_dir
+    assert isinstance(store, DefaultBridgeStore)
+
+
+def test_corpus_dir_materialization_mirrors_the_local_walk(tmp_path: Path) -> None:
+    """The materialized tree must look to ``_read_corpus`` exactly like the local
+    one: a directory per file id (**including** ids with no page text, so the
+    corpus length and the encoder's min_df/max_df thresholds match), with page
+    text under ``page_text/``."""
+    from dgml_core.clustering import _corpus_dir
+
+    ws = _bridge_workspace(tmp_path)
+    _seed_page_text(ws, "withtext", ["alpha", "beta"])
+    # "notext" gets no page_text at all — the scanned-PDF case.
+
+    with _corpus_dir(ws, ["withtext", "notext"], "full") as corpus_root:
+        assert sorted(p.name for p in corpus_root.iterdir()) == ["notext", "withtext"]
+        page = corpus_root / "withtext" / layout.PAGE_TEXT_DIR / "page_1.json"
+        assert page.is_file()
+        assert "alpha" in page.read_text(encoding="utf-8")
+        # The empty one is present but carries no text, exactly as on local disk.
+        assert not (corpus_root / "notext" / layout.PAGE_TEXT_DIR).exists()
+        held = corpus_root
+    # Cleaned up on exit — it is a temp tree, not workspace state.
+    assert not held.exists()
+
+
+def test_corpus_dir_passes_through_for_a_local_store(workspace: Workspace) -> None:
+    """LocalStore already *is* the corpus directory, so no copy is made."""
+    from dgml_core.clustering import _corpus_dir
+
+    with _corpus_dir(workspace, ["f1"], "full") as corpus_root:
+        assert corpus_root == workspace.files_dir
+
+
+def _bridge_workspace(tmp_path: Path) -> Workspace:
+    """A workspace whose blobs take the *base* path bridge — the code path every
+    non-local store (S3, Mongo) uses."""
+    from .conftest import default_bridge_store
+
+    root = tmp_path / "ws"
+    root.mkdir(parents=True)
+    store = default_bridge_store(root)
+    ws = Workspace(root=root)
+    ws.__dict__["blobs"] = store
+    ws.__dict__["docs"] = store
+    ws.init()
+    return ws
+
+
+@pytest.mark.parametrize(
+    ("text_view", "expected_pages"),
+    [
+        ("page1", ["page_1.json"]),  # the default: only the first page is read
+        ("full", ["page_1.json", "page_2.json", "page_3.json"]),
+        ("salient_boost", ["page_1.json", "page_2.json", "page_3.json"]),
+        # A multi-view spec naming anything but page1 still needs every page.
+        ("page1+full", ["page_1.json", "page_2.json", "page_3.json"]),
+    ],
+)
+def test_corpus_fetches_only_the_pages_the_view_reads(
+    tmp_path: Path, text_view: str, expected_pages: list[str]
+) -> None:
+    """``page1`` discards every page but the first, so fetching the rest is pure
+    waste on a remote backend — one blob per file instead of one per page."""
+    from dgml_core.clustering import _corpus_dir
+
+    ws = _bridge_workspace(tmp_path)
+    for page in (1, 2, 3):
+        ws.blobs.put_blob(
+            layout.file_page_text_key("f1", page),
+            json.dumps({"page_number": page, "words": [{"t": "x", "l": [0, 0, 8, 12]}]}).encode(),
+        )
+
+    with _corpus_dir(ws, ["f1"], text_view) as corpus_root:
+        got = sorted(p.name for p in (corpus_root / "f1" / layout.PAGE_TEXT_DIR).iterdir())
+    assert got == expected_pages
+
+
+def test_page1_narrowing_matches_what_build_text_actually_reads(tmp_path: Path) -> None:
+    """Pin the assumption ``_corpus_dir``'s page-1 narrowing rests on.
+
+    Fetching only ``page_1.json`` for the ``page1`` view is sound only while
+    ``clustering.example._text_from_pages`` keeps discarding everything after
+    ``pages[0]`` — and that lives in a *different package*. If it ever changed to
+    read more, the narrowing would silently truncate the corpus and the
+    materializer's own tests would not notice, because they assert what it
+    fetches rather than what the reader needs.
+
+    So assert the invariant end-to-end: for ``page1``, a page-1-only tree must
+    produce identical text to the full one — and for a view that reads every
+    page, it must not.
+    """
+    from clustering.example import _build_text
+
+    def _page(words: list[str]) -> str:
+        return json.dumps(
+            {"words": [{"t": w, "l": [10 * i, 100, 10 * i + 8, 112]} for i, w in enumerate(words)]}
+        )
+
+    full_dir = tmp_path / "full" / "f1"
+    first_dir = tmp_path / "first" / "f1"
+    (full_dir / layout.PAGE_TEXT_DIR).mkdir(parents=True)
+    (first_dir / layout.PAGE_TEXT_DIR).mkdir(parents=True)
+    for page, words in ((1, ["alpha"]), (2, ["beta"]), (3, ["gamma"])):
+        payload = _page(words)
+        (full_dir / layout.PAGE_TEXT_DIR / f"page_{page}.json").write_text(payload)
+        if page == 1:
+            (first_dir / layout.PAGE_TEXT_DIR / f"page_{page}.json").write_text(payload)
+
+    # The narrowing is lossless for the view it is applied to...
+    assert _build_text(full_dir, view="page1") == _build_text(first_dir, view="page1")
+    # ...and would be lossy for one it is not applied to, which is why the
+    # narrowing is gated on the view rather than always on.
+    assert _build_text(full_dir, view="full") != _build_text(first_dir, view="full")
+
+
+def test_corpus_covers_every_file_not_just_the_ones_being_clustered(tmp_path: Path) -> None:
+    """The encoder fits document frequencies over the *whole* corpus.
+
+    The local walk it replaces reads every ``files/<id>/`` directory — assigned
+    files included. Materializing only the clustering candidates would fit IDF
+    over a strictly smaller document set, so the same workspace would cluster
+    differently depending on its storage backend.
+    """
+    from .conftest import default_bridge_store
+
+    root = tmp_path / "ws"
+    root.mkdir(parents=True)
+    store = default_bridge_store(root)
+    ws = Workspace(root=root)
+    ws.__dict__["blobs"] = store
+    ws.__dict__["docs"] = store
+    ws.init()
+
+    # "assigned" belongs to a docset, so it is never a clustering candidate —
+    # but it is part of the corpus.
+    for fid in ("candidate", "assigned"):
+        _seed_file(ws, fid)
+        _seed_page_image(ws, fid)
+        _seed_page_text(ws, fid, ["lease", "tenant"])
+    from dgml_core.utils import unassigned_file_ids
+
+    docsets = DocSetStore(ws)
+    ds = docsets.create("Leases")
+    docsets.add_file(ds.id, "assigned")
+    assert unassigned_file_ids(ws) == ["candidate"]
+
+    # The temp tree only exists inside the ``with``, which is exactly when the real
+    # encoder reads it — so snapshot it from the stand-in rather than afterwards.
+    seen: list[str] = []
+    captured: list[Path] = []
+
+    def _capture(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        corpus_dir = Path(kwargs["overrides"]["encoder_text"]["extra"]["corpus_dir"])
+        captured.append(corpus_dir)
+        seen.extend(sorted(p.name for p in corpus_dir.iterdir()))
+        return {"candidate": _dp("unknown_0")}
+
+    with patch("dgml_core.clustering.run_clustering_detailed", side_effect=_capture):
+        clustering_internal(ws)
+
+    assert seen == ["assigned", "candidate"]  # the assigned file is in the corpus
+    assert not captured[0].exists()  # and the tree is cleaned up on exit
+
+
 # ---------------------------------------------------------------------------
 # incremental novelty-gate default — _with_incremental_novelty_default
 # ---------------------------------------------------------------------------

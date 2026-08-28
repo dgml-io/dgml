@@ -76,21 +76,42 @@ _CONFIG_RESOURCE = "clustering_config.json"
 
 
 def resolve_text_settings(
-    files_dir: Path, overrides: dict[str, Any] | None
+    corpus_dir: Path, overrides: dict[str, Any] | None
 ) -> tuple[str, dict[str, Any]]:
     """Resolve the effective text view and inject the corpus directory.
 
     Corpus-fitted text encoders (``tfidf``) need
-    ``encoder_text.extra.corpus_dir`` pointed at the workspace ``files/``
-    dir to fit document frequencies over the whole corpus, and the dataset
-    must assemble ``record.text`` under the *same* ``text_view`` the encoder
-    fits on. Both are derived here from the merged bundled-default +
-    ``overrides`` config so the dataset and the encoder always agree.
+    ``encoder_text.extra.corpus_dir`` pointed at a directory of
+    ``<file_id>/page_text/*.json`` to fit document frequencies over the whole
+    corpus, and the dataset must assemble ``record.text`` under the *same*
+    ``text_view`` the encoder fits on. Both are derived here from the merged
+    bundled-default + ``overrides`` config so the dataset and the encoder always
+    agree.
+
+    ``corpus_dir`` is the workspace ``files/`` dir on a local-disk workspace, and
+    a temporary materialization of the page-text blobs on any other backend — see
+    ``dgml_core.clustering._corpus_dir``. It may therefore be valid only for the
+    duration of the caller's ``with`` block.
 
     Returns ``(text_view, overrides')`` where ``overrides'`` is ``overrides``
     with ``corpus_dir`` merged into ``encoder_text.extra``. Injecting
     ``corpus_dir`` is harmless for encoders that don't read it (dense
     encoders ignore unknown ``extra`` keys).
+    """
+    injected = _deep_merge(
+        overrides or {},
+        {"encoder_text": {"extra": {"corpus_dir": str(corpus_dir)}}},
+    )
+    return resolve_text_view(overrides), injected
+
+
+def resolve_text_view(overrides: dict[str, Any] | None) -> str:
+    """The effective ``text_view`` for ``overrides``, over the bundled defaults.
+
+    Split out of :func:`resolve_text_settings` because the view has to be known
+    *before* the corpus directory exists: which pages a caller needs to
+    materialize depends on it (``page1`` reads only the first page, every other
+    view reads all of them).
     """
     base: dict[str, Any] = json.loads(
         (resources.files("dgml_core") / _CONFIG_RESOURCE).read_text(encoding="utf-8")
@@ -98,12 +119,7 @@ def resolve_text_settings(
     merged = _deep_merge(base, overrides or {})
     encoder_text = merged.get("encoder_text")
     extra = encoder_text.get("extra") if isinstance(encoder_text, dict) else None
-    text_view = str(extra.get("text_view", "full")) if isinstance(extra, dict) else "full"
-    injected = _deep_merge(
-        overrides or {},
-        {"encoder_text": {"extra": {"corpus_dir": str(files_dir)}}},
-    )
-    return text_view, injected
+    return str(extra.get("text_view", "full")) if isinstance(extra, dict) else "full"
 
 
 @dataclass(frozen=True)
