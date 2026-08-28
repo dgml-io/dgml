@@ -107,8 +107,7 @@ def _xml_words(xml_text: str) -> list[str]:
     return _tokenize(text)
 
 
-# Namespaces that carry DGML scaffolding rather than domain concepts. Every
-# other namespaced element is a docset concept tag (``docset:<Concept>``).
+# DGML scaffolding namespaces; every other namespaced element is a concept tag.
 _INFRA_NS = frozenset(
     {
         "http://dgml.io/ns/dg#",
@@ -120,12 +119,8 @@ _INFRA_NS = frozenset(
 
 
 def _xml_concept_counts(xml_text: str) -> Counter[str]:
-    """Multiset of concept-tag localnames in the DGML.
-
-    A concept tag is any element in the docset namespace — i.e. namespaced but
-    not one of the ``_INFRA_NS`` scaffolding namespaces. Returns an empty
-    Counter if the XML can't be parsed.
-    """
+    """Multiset of concept-tag localnames (namespaced but not ``_INFRA_NS``);
+    empty if the XML can't be parsed."""
     try:
         from lxml import etree
 
@@ -142,7 +137,7 @@ def _xml_concept_counts(xml_text: str) -> Counter[str]:
         if not isinstance(el.tag, str):
             continue  # comments / processing instructions
         qname = etree.QName(el)
-        if qname.namespace and qname.namespace not in _INFRA_NS:
+        if qname.namespace and qname.namespace not in _INFRA_NS:  # a concept tag
             counts[qname.localname] += 1
     return counts
 
@@ -334,14 +329,12 @@ def coverage_summary_line(result: dict[str, Any]) -> str:
 def compute_label_propagation(
     assigned_labels: Iterable[str], xml_text: str, *, source_name: str
 ) -> dict[str, Any]:
-    """How many concept labels the labeling pass assigned survive into the DGML.
+    """How many assigned concept labels survive into the rendered DGML.
 
-    *assigned_labels* is the multiset (with repeats) of concept names carried by
-    the labeled blocks before rendering — see
-    ``dgml_core.generation.blocks.block_concept_labels``. A label is *exported*
-    when a concept tag of the same name appears in the rendered *xml_text*; the
-    shortfall (``labels_missing``) is what a block carried but the renderer
-    dropped or merged away — a useful debug signal, not a hard invariant.
+    *assigned_labels* is the multiset from ``blocks.block_concept_labels``; a
+    label is exported when a concept tag of the same name appears in *xml_text*.
+    ``labels_missing`` is the per-concept shortfall — a debug signal, not an
+    invariant.
     """
     assigned: Counter[str] = Counter(c for c in assigned_labels if c)
     in_xml = _xml_concept_counts(xml_text)

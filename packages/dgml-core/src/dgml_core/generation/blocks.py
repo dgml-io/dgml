@@ -413,13 +413,11 @@ def build_tree(blocks: list[Block], parent_map: Mapping[str, str] | None = None)
 
 
 def block_concept_labels(blocks: Iterable[Block]) -> list[str]:
-    """Every concept name the labeling pass assigned across *blocks*.
+    """Multiset of concept names the labeling pass assigned across *blocks*.
 
-    A multiset (concepts kept with their repeats): the block / value / lim /
-    group concepts, the per-column cell concepts, and every inline entity span
-    concept (in text, labels, and cells). Compare this against the concept tags
-    in the rendered DGML to see how many assigned labels actually propagated —
-    see ``dgml_core.generation.coverage.compute_label_propagation``.
+    Block/value/lim concepts, per-column cell concepts, and inline entity spans;
+    ``group_concept`` once per table (see below). Fed to
+    ``coverage.compute_label_propagation`` to check propagation into the DGML.
     """
     out: list[str] = []
     prev_group = ""
@@ -434,9 +432,8 @@ def block_concept_labels(blocks: Iterable[Block]) -> list[str]:
                 out.append(span.concept)
         for cell in b.cell_entities:
             out.extend(span.concept for span in cell if span.concept)
-        # group_concept is the table-level tag every row of a table carries, but
-        # the renderer emits it once per table — count it once per contiguous
-        # table run, not per row, so a fully-propagated doc reads ~100%.
+        # Every row carries group_concept but it renders once per table — count
+        # it once per contiguous run of rows, not per row.
         is_row = b.structure == "row"
         if b.group_concept and not (prev_was_row and b.group_concept == prev_group):
             out.append(b.group_concept)

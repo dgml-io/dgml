@@ -2615,11 +2615,9 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         if compute_cov and pt_dir is not None:
             result = cov_mod.compute_coverage(xml, name, page_text_dir=pt_dir)
             _diag(cov_mod.coverage_summary_line(result))
-            # --debug: how many concept labels the labeling pass assigned
-            # actually propagated into the rendered DGML (e.g. "180 labels
-            # exported over 200 total"). Reloads the doc's labeled blocks from
-            # cache to get the assigned-label multiset; best-effort, never fails
-            # a conversion. Recorded under `label_propagation` in the report.
+            # --debug: how many assigned labels reached the DGML (e.g. "180
+            # labels exported over 200 total"). Reloads labeled blocks from
+            # cache; best-effort, recorded under `label_propagation`.
             if args.debug:
                 try:
                     stem = Path(name).stem
