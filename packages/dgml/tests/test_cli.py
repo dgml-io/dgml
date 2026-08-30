@@ -856,13 +856,15 @@ def test_cluster_assigns_unassigned_files_to_docsets(
         patch("litellm.completion") as mock_completion,
         patch("dgml_core.clustering.run_clustering_detailed") as mock_cluster,
     ):
-        rc = main(_ws_args(ws) + ["cluster"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding"])
         assert rc == 0
         payload = _read_stdout(capsys)
         assert payload["clusters"] == {}
         assert payload["failed_file_ids"] == []
         assert payload["skipped"] is False
         assert payload["mode"] == "fresh"
+        # No unassigned files, so no engine ran.
+        assert payload["method"] is None
         assert payload["n_new_clusters"] == 0
         mock_completion.assert_not_called()
         mock_cluster.assert_not_called()
@@ -888,7 +890,7 @@ def test_cluster_assigns_unassigned_files_to_docsets(
             return_value={fid: _dp("unknown_0")},
         ),
     ):
-        rc = main(_ws_args(ws) + ["cluster"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding"])
     assert rc == 0
     payload = _read_stdout(capsys)
     # Placeholder "unknown_0" from the clusterer is rewritten to the
@@ -896,6 +898,7 @@ def test_cluster_assigns_unassigned_files_to_docsets(
     assert payload["clusters"] == {fid: "Sample Documents"}
     assert payload["failed_file_ids"] == []
     assert payload["mode"] == "fresh"
+    assert payload["method"] == "embedding"
     assert payload["n_new_clusters"] == 1
     assert payload["assignments"][fid] == {
         "docset": "Sample Documents",
@@ -924,7 +927,7 @@ def test_cluster_assigns_unassigned_files_to_docsets(
         patch("litellm.completion") as mock_completion,
         patch("dgml_core.clustering.run_clustering_detailed") as mock_cluster,
     ):
-        rc = main(_ws_args(ws) + ["cluster"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding"])
         assert rc == 0
         payload = _read_stdout(capsys)
         assert payload["clusters"] == {}
@@ -933,6 +936,53 @@ def test_cluster_assigns_unassigned_files_to_docsets(
         assert payload["mode"] == "incremental"
         mock_completion.assert_not_called()
         mock_cluster.assert_not_called()
+
+
+@needs_gs
+def test_cluster_defaults_to_auto_and_routes_a_small_workspace_to_the_llm(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Plain `dgml cluster` on a couple of files must not reach the embedding path.
+
+    Reported from the field: two files, and the run died inside sklearn with
+    "max_df corresponds to < documents than min_df" — the tf-idf fit has no
+    document-frequency signal to work with at that size. The routing that
+    avoids it existed already; it just was not the default.
+    """
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(
+        Workspace(root=ws), {"model": "gemini/gemini-3.1-flash-lite", "max_pages": 1}
+    )
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    response = _tool_response(
+        "group_documents",
+        {
+            "groups": [
+                {
+                    "name": "Sample Documents",
+                    "description": "test docs",
+                    "key_questions": ["What is this?"],
+                    "members": ["doc_1"],
+                }
+            ]
+        },
+    )
+    with (
+        patch("litellm.completion", return_value=response),
+        patch("dgml_core.clustering.run_clustering_detailed") as mock_cluster,
+    ):
+        rc = main(_ws_args(ws) + ["cluster"])
+
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["method"] == "llm"
+    # The statistical pipeline — the one that used to raise here — never ran.
+    mock_cluster.assert_not_called()
+    assert payload["clusters"] == {fid: "Sample Documents"}
 
 
 @needs_gs
@@ -963,7 +1013,7 @@ def test_cluster_reports_confidence_for_a_new_docset(
             return_value={fid: _dp("unknown_0", 0.42)},
         ),
     ):
-        rc = main(_ws_args(ws) + ["cluster"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding"])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["assignments"][fid] == {
@@ -1008,7 +1058,7 @@ def test_cluster_flags_a_low_confidence_assignment_for_review(
             return_value={fid: _dp("unknown_0", 0.11, review=True)},
         ),
     ):
-        rc = main(_ws_args(ws) + ["cluster"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding"])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["assignments"][fid]["review"] is True
@@ -1075,7 +1125,7 @@ def test_cluster_config_flag_passes_overrides_to_run_clustering(
             return_value={fid: _dp("unknown_0")},
         ) as mock_cluster,
     ):
-        rc = main(_ws_args(ws) + ["cluster", "--config", str(cfg)])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding", "--config", str(cfg)])
     assert rc == 0
     # The file's overrides reached the clusterer. corpus_dir is injected
     # alongside, but our custom scenario value survives the deep merge.
@@ -1097,6 +1147,9 @@ def test_cluster_config_flag_missing_file_errors(
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     capsys.readouterr()
 
+    # No --method: the default must reject a bad --config too. It used to route
+    # small corpora to the LLM before the config was ever resolved, so a mistyped
+    # path succeeded on the default path and errored only under `--method embedding`.
     rc = main(_ws_args(ws) + ["cluster", "--config", str(tmp_path / "nope.json")])
     assert rc != 0
     assert _read_stderr(capsys)["error"]["code"] == "CLUSTERING_CONFIG_INVALID"
@@ -1142,7 +1195,7 @@ def test_cluster_config_preset_name_passes_preset_overrides(
             return_value={fid: _dp("unknown_0")},
         ) as mock_cluster,
     ):
-        rc = main(_ws_args(ws) + ["cluster", "--config", "medium"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding", "--config", "medium"])
     assert rc == 0
     overrides = mock_cluster.call_args.kwargs["overrides"]
     # The medium preset fuses a dense image encoder into the text signal —
@@ -1271,7 +1324,7 @@ def test_cluster_partial_success_when_llm_fails(
             return_value=cluster_assignments,
         ),
     ):
-        rc = main(_ws_args(ws) + ["cluster"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding"])
     assert rc == 0
     payload = _read_stdout(capsys)
 
@@ -1302,7 +1355,7 @@ def test_cluster_without_classification_config_soft_fails(
             return_value={fid: _dp("unknown_0")},
         ),
     ):
-        rc = main(_ws_args(ws) + ["cluster"])
+        rc = main(_ws_args(ws) + ["cluster", "--method", "embedding"])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["failed_file_ids"] == [fid]

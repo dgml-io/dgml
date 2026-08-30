@@ -43,6 +43,7 @@ from __future__ import annotations
 import copy
 import json
 import tempfile
+import warnings
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -56,6 +57,7 @@ from . import layout
 from .classification import (
     ClassificationConfig,
     ClassificationDecision,
+    _resolve_api_key,
     load_classification_config,
     propose_new_docset_for_files,
 )
@@ -63,6 +65,7 @@ from .config import load_merged_config
 from .dataset import WorkspaceFileDataset
 from .docsets import DocSetStore
 from .errors import (
+    ClassificationConfigMissing,
     ClassificationFailed,
     ClusteringConfigInvalid,
     CorruptMetadata,
@@ -98,16 +101,21 @@ CLUSTER_MODES: tuple[str, ...] = get_args(ClusterMode)
 # Clustering *method* — how documents are grouped, orthogonal to the
 # fresh/incremental mode above.
 #
-# - ``embedding`` (default): the encode → project → statistical-cluster
-#   pipeline in :mod:`dgml_core.run_clustering`. The right choice once a
-#   corpus is large enough for tf-idf / neighbor-graph statistics to be
-#   meaningful.
+# - ``embedding``: the encode → project → statistical-cluster pipeline in
+#   :mod:`dgml_core.run_clustering`. The right choice once a corpus is
+#   large enough for tf-idf / neighbor-graph statistics to be meaningful.
 # - ``llm``: send every document's page images to the vision LLM in one
 #   call and let it partition them (:func:`dgml_core.llm_clustering.llm_cluster_files`).
 #   Built for *very small* corpora, where the embedding pipeline has too
 #   little signal to cluster reliably.
-# - ``auto``: pick ``llm`` when the number of clusterable files is at or
-#   below :data:`SMALL_CORPUS_MAX_FILES`, else ``embedding``.
+# - ``auto`` (default): on a *fresh* run, pick ``llm`` when the number of
+#   clusterable files is at or below :data:`SMALL_CORPUS_MAX_FILES`, else
+#   ``embedding``; an incremental run always takes ``embedding`` (see
+#   :func:`_resolve_method` for why the batch size does not speak for it).
+#   ``embedding`` is not a safe default on its own: on a small fresh corpus
+#   it is the path the two bullets above say it cannot serve, and the
+#   tf-idf fit has no document-frequency signal to work with at all. So the
+#   routing, not the caller, picks the engine unless the caller insists.
 ClusterMethod = Literal["auto", "embedding", "llm"]
 CLUSTER_METHODS: tuple[str, ...] = get_args(ClusterMethod)
 
@@ -238,7 +246,10 @@ class _InternalResult:
     # than one ``False`` per file. Empty unless ``scenario.calibration`` is set.
     review: dict[str, bool] = field(default_factory=dict)
     mode: str = "fresh"
-    method: str = "embedding"
+    # The engine that grouped the files, or None when none ran (empty
+    # workspace, nothing clusterable, `skip_existing` short-circuit). Never
+    # "auto": that is a request, not an outcome.
+    method: str | None = None
     known_categories: list[str] = field(default_factory=list)
     # LLM-method only: proposed DocSet metadata for each emergent
     # ``"unknown_N"`` cluster, keyed by cluster name. When present,
@@ -295,7 +306,7 @@ def clustering(
     skip_existing: bool = False,
     config: str | None = None,
     mode: str = "auto",
-    method: str = "embedding",
+    method: str = "auto",
     small_corpus_threshold: int = SMALL_CORPUS_MAX_FILES,
     debug: bool = False,
 ) -> dict[str, Any]:
@@ -341,6 +352,10 @@ def clustering(
       ``failed_file_ids``) — except files that were never in a cluster to
       begin with (no page image, or the clusterer's noise bucket), which
       are absent from ``clusters`` entirely.
+    - ``method``: the engine that grouped the files after ``auto`` was
+      resolved — ``"embedding"`` or ``"llm"`` — or ``None`` when no engine ran
+      (nothing unassigned, nothing clusterable, or ``skip_existing``
+      short-circuited). Never ``"auto"``: that is a request, not an outcome.
     - ``failed_file_ids``: file IDs that were not assigned to any
       DocSet — because their first-page image was missing, because the
       clusterer placed them in no cluster (they resemble neither an
@@ -403,6 +418,10 @@ def clustering(
             "failed_file_ids": [],
             "skipped": True,
             "mode": "incremental" if DocSetStore(workspace).list_all() else "fresh",
+            # No engine ran, so there is nothing to report. Echoing the request
+            # would put "auto" — the default — in a field documented as the
+            # engine that grouped the files.
+            "method": None,
             "n_assigned_existing": 0,
             "n_new_clusters": 0,
             "assignments": {},
@@ -547,6 +566,11 @@ def clustering(
         "failed_file_ids": failed_file_ids,
         "skipped": False,
         "mode": internal.mode,
+        # Which engine actually grouped the files, or null when none ran.
+        # Under the default ``method="auto"`` the caller does not choose it,
+        # and an ``auto`` run that fell back off the LLM partitioner would
+        # otherwise be indistinguishable from one that never routed there.
+        "method": internal.method,
         "n_assigned_existing": n_assigned_existing,
         "n_new_clusters": n_new_clusters,
         "assignments": assignments,
@@ -558,7 +582,7 @@ def clustering_internal(
     workspace: Workspace,
     config: str | None = None,
     mode: str = "auto",
-    method: str = "embedding",
+    method: str = "auto",
     small_corpus_threshold: int = SMALL_CORPUS_MAX_FILES,
     debug: bool = False,
 ) -> _InternalResult:
@@ -572,14 +596,17 @@ def clustering_internal(
 
     ``method`` selects the clustering engine (orthogonal to ``mode``):
 
-    - **embedding** (default) ⇒ the statistical pipeline via
+    - **embedding** ⇒ the statistical pipeline via
       :func:`dgml.run_clustering.run_clustering_detailed`.
     - **llm** ⇒ the vision-LLM partitioner
       (:func:`dgml_core.llm_clustering.llm_cluster_files`), for very small
       corpora. Emergent clusters carry a naming proposal on
       :attr:`_InternalResult.proposals`.
-    - **auto** ⇒ ``llm`` when at most ``small_corpus_threshold`` files are
-      clusterable, else ``embedding``.
+    - **auto** (the default) ⇒ ``llm`` when a *fresh* run has at most
+      ``small_corpus_threshold`` clusterable files, else ``embedding``; an
+      incremental run always takes ``embedding`` (see :func:`_resolve_method`),
+      and so does an ``auto`` run whose classification config cannot be used
+      (see :func:`_llm_partitioner_usable`).
 
     ``mode`` selects fresh vs incremental (see the module docstring):
 
@@ -633,13 +660,32 @@ def clustering_internal(
         known_categories = []
         proto_docsets = []
 
+    # Resolve `--config` before routing, not after. The LLM path ignores the
+    # embedding configuration, but "ignored" must not become "unvalidated": a
+    # mistyped preset name or config path has to be an error on every method,
+    # or `--method llm` silently accepts a path that `--method embedding`
+    # rejects. A malformed file/section/preset raises ClusteringConfigInvalid,
+    # which the CLI surfaces as an error envelope.
+    overrides = resolve_clustering_overrides(workspace, config=config)
+
     # Route to the LLM partitioner for small corpora before doing any of the
     # embedding-pipeline setup below (which the LLM path doesn't need).
     effective_method = _resolve_method(
-        method, n_usable=len(usable), threshold=small_corpus_threshold
+        method,
+        n_usable=len(usable),
+        threshold=small_corpus_threshold,
+        mode=effective_mode,
     )
+    # Under ``auto`` the routing chose the engine, so it also owns the case
+    # where that engine cannot run: a workspace that never configured a
+    # classification model, wrote a malformed one, or names a credential that
+    # is not in the environment. Deciding it here, before the call, keeps
+    # :func:`clustering`'s documented "does not raise" contract intact and
+    # costs nothing — a caller who *named* ``llm`` still gets the error.
+    if effective_method == "llm" and method == "auto" and not _llm_partitioner_usable(workspace):
+        effective_method = "embedding"
     if effective_method == "llm":
-        return _llm_cluster_internal(
+        llm_result = _llm_cluster_internal(
             workspace,
             usable,
             skipped,
@@ -647,13 +693,16 @@ def clustering_internal(
             known_categories=known_categories,
             effective_mode=effective_mode,
             debug=debug,
+            retry_on_embedding=method == "auto",
         )
+        # ``None`` only under ``auto``, and only for a call that failed after it
+        # started. Some of those failures belong to the partitioner rather than
+        # to the model, and the embedding pipeline can still name the corpus, so
+        # fall through rather than lose a run the old default would have
+        # completed.
+        if llm_result is not None:
+            return llm_result
 
-    # Clustering overrides. ``config`` may be a preset name, a path, or None
-    # (workspace config.toml section). Missing config/section → empty dict
-    # and the bundled defaults stand. A malformed file/section/preset raises
-    # ClusteringConfigInvalid, which the CLI surfaces as an error envelope.
-    overrides = resolve_clustering_overrides(workspace, config=config)
     # Incremental runs assign into existing DocSets via S2/S3's nearest-
     # prototype gate. With the framework's all-``None`` gate defaults that gate
     # never fires, so every new document is forced into its closest DocSet and
@@ -847,16 +896,71 @@ def _adjudication_config(workspace: Workspace) -> ClassificationConfig | None:
         return None
 
 
-def _resolve_method(method: str, *, n_usable: int, threshold: int) -> str:
-    """Resolve ``auto`` to ``llm`` / ``embedding`` from the corpus size.
+def _llm_partitioner_usable(workspace: Workspace) -> bool:
+    """Can the vision-LLM partitioner run against this workspace at all?
 
-    A corpus at or below ``threshold`` clusterable files is "small" — too
-    small for the embedding statistics to be reliable — so it goes to the
-    LLM partitioner. ``embedding`` / ``llm`` are returned unchanged.
+    True when a classification model resolves, and when a credential the config
+    *names* is present. It cannot see further than the config: a workspace that
+    leaves the key to litellm's own per-provider environment variable, which is
+    what ``dgml init`` produces, looks usable here whether or not that variable
+    is set. An absent key of that shape surfaces as a failed call instead, which
+    is why :func:`_llm_cluster_internal` still needs its own answer for a call
+    that fails once started.
+
+    Both checks are pure config reads, so asking costs nothing next to the call
+    they guard, and asking here rather than catching later is what lets ``auto``
+    route around a *setup* problem without raising out of :func:`clustering`.
+
+    Every :class:`DgmlError` is a "no", but not every "no" is silent. A
+    workspace that never configured a model is simply not LLM-enabled, and
+    announcing that on each small run would be noise. A workspace that
+    configured one and got it wrong is a different thing: routing around it
+    keeps the run working, and saying nothing would hide the mistake and leave
+    the config permanently inert. So the second case warns.
     """
-    if method == "auto":
-        return "llm" if n_usable <= threshold else "embedding"
-    return method
+    try:
+        _resolve_api_key(load_classification_config(workspace))
+    except ClassificationConfigMissing:
+        return False
+    except DgmlError as exc:
+        warnings.warn(
+            "clustering: the configured classification model cannot be used "
+            f"({exc}). This run grouped the files with the embedding pipeline "
+            "instead. Fix the 'classification' config, or pass --method llm to "
+            "make this an error rather than a fallback.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
+
+
+def _resolve_method(method: str, *, n_usable: int, threshold: int, mode: str) -> str:
+    """Resolve ``auto`` to ``llm`` / ``embedding``. Others pass through.
+
+    Only a **fresh** run is at the mercy of how many files it was handed. It
+    builds a neighbour graph over them and cuts it into communities, and below
+    a handful of documents there is no graph worth cutting: at the shipped
+    ``leiden_k_neighbors=25`` every document is a neighbour of every other, so
+    the whole batch comes back as one community. Measured on an internal
+    corpus: 3 to 6 files yield exactly one cluster, whatever they contain.
+    A corpus at or below ``threshold`` files therefore goes to the LLM
+    partitioner, which reads the pages instead of counting neighbours.
+
+    An **incremental** run does not cluster at all. It scores each document
+    against prototypes rebuilt from DocSet members that already exist, so a
+    batch of two arrives as reliably as a batch of two hundred and its size
+    says nothing about whether the statistics hold. Routing on it would swap
+    the assignment engine — nearest prototype, novelty gate, calibration and
+    the review queue included — for a one-shot partition, on the runs where
+    the embedding path is at its strongest. So it stays on the statistical
+    path regardless of batch size.
+    """
+    if method != "auto":
+        return method
+    if mode != "fresh":
+        return "embedding"
+    return "llm" if n_usable <= threshold else "embedding"
 
 
 def _llm_cluster_internal(
@@ -868,7 +972,8 @@ def _llm_cluster_internal(
     known_categories: list[str],
     effective_mode: str,
     debug: bool,
-) -> _InternalResult:
+    retry_on_embedding: bool = False,
+) -> _InternalResult | None:
     """Cluster ``usable`` files with the vision-LLM partitioner.
 
     ``proto_docsets`` (empty in fresh mode) are offered to the model as
@@ -881,6 +986,21 @@ def _llm_cluster_internal(
     batch — every usable file is routed into ``render_skipped`` so the outer
     :func:`clustering` reports them in ``failed_file_ids`` rather than
     crashing, mirroring the embedding path's per-cluster soft-fail.
+
+    Setup problems never reach here under ``auto``: the routing checks for them
+    first (:func:`_llm_partitioner_usable`). What it cannot check for is a call
+    that fails once started, and ``retry_on_embedding`` says what to do then.
+    Set only under ``auto``, it returns ``None`` instead of soft-failing, and
+    the caller groups the corpus with the embedding pipeline.
+
+    That is worth doing because some of these failures are the partitioner's
+    alone, not the model's. It sends every file's pages in one request under a
+    bespoke grouping tool, so it can exceed a provider's per-request image cap,
+    or get back members named by filename instead of the ``doc_N`` labels the
+    tool defines. The naming pass the embedding path uses has neither problem:
+    one small request per cluster, a different tool. So the second engine can
+    name a corpus the first one just failed on, and a caller who did not choose
+    the first engine should not lose the run to it.
     """
     ccfg = load_classification_config(workspace)
     try:
@@ -888,6 +1008,8 @@ def _llm_cluster_internal(
             workspace, usable, config=ccfg, docsets=proto_docsets, debug=debug
         )
     except ClassificationFailed:
+        if retry_on_embedding:
+            return None
         return _InternalResult(
             clusters={},
             render_skipped=[*skipped, *usable],

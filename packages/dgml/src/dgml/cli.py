@@ -376,16 +376,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--method",
         dest="method",
         choices=("auto", "embedding", "llm"),
-        default="embedding",
-        help="How documents are grouped, orthogonal to --mode. 'embedding' "
-        "(default) uses the statistical encode → project → cluster pipeline — "
-        "the right choice once a corpus is large enough for tf-idf / neighbor "
-        "statistics to be meaningful. 'llm' sends every document's page images "
-        "to the vision LLM in one call and lets it partition them — built for "
-        "very small corpora where the embedding pipeline has too little signal. "
-        "'auto' picks 'llm' when at most --small-corpus-threshold files are "
-        "clusterable, else 'embedding'. Both 'llm' and 'auto' (when it routes "
-        "to the LLM) need the same `classification` config as --auto-classify.",
+        default="auto",
+        help="How documents are grouped, orthogonal to --mode. 'auto' (default) "
+        "picks 'llm' for a FRESH run of at most --small-corpus-threshold "
+        "clusterable files, and 'embedding' for everything else, incremental "
+        "runs included whatever their batch size. 'embedding' forces the "
+        "statistical encode → project → cluster pipeline: the right choice once "
+        "a corpus is large enough for tf-idf / neighbor statistics to be "
+        "meaningful, and too little signal below that. 'llm' forces sending "
+        "every document's page images to the vision LLM in one call and letting "
+        "it partition them. Both 'llm' and 'auto' (when it routes to the LLM) "
+        "need the same `classification` config as --auto-classify. When that "
+        "config is absent or unusable, 'auto' groups with 'embedding' instead "
+        "and 'llm' reports the failure. The method that ran is echoed as "
+        "`method` in the JSON result, null if none did.",
     )
     cluster_p.add_argument(
         "--small-corpus-threshold",
@@ -394,9 +398,10 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         # Keep in sync with dgml_core.clustering.SMALL_CORPUS_MAX_FILES (8).
         default=8,
-        help="With --method auto, route corpora of at most N clusterable files "
-        "to the LLM partitioner, and larger ones to the embedding pipeline "
-        "(default 8). Ignored for --method embedding / llm.",
+        help="With --method auto, route a fresh run of at most N clusterable "
+        "files to the LLM partitioner, and larger ones to the embedding "
+        "pipeline (default 8). Ignored for --method embedding / llm, and for "
+        "incremental runs.",
     )
 
     docset = sub.add_parser("docset", parents=[common], help="DocSet management.").add_subparsers(
@@ -1363,7 +1368,7 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 skip_existing=getattr(args, "skip_existing", False),
                 config=getattr(args, "config", None),
                 mode=getattr(args, "mode", "auto"),
-                method=getattr(args, "method", "embedding"),
+                method=getattr(args, "method", "auto"),
                 small_corpus_threshold=getattr(args, "small_corpus_threshold", 8),
                 debug=args.debug,
             ),

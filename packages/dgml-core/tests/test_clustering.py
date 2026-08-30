@@ -150,7 +150,7 @@ def test_workspace_file_dataset_iterates(workspace: Workspace) -> None:
 
 
 def test_clustering_internal_empty_workspace(workspace: Workspace) -> None:
-    result = clustering_internal(workspace)
+    result = clustering_internal(workspace, method="embedding")
     assert result.clusters == {}
     assert result.render_skipped == []
     # No DocSets ⇒ auto resolves to fresh.
@@ -168,7 +168,7 @@ def test_clustering_internal_skips_files_without_page_image(workspace: Workspace
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"with_image": _dp("unknown_0")},
     ) as mock_run:
-        result = clustering_internal(workspace)
+        result = clustering_internal(workspace, method="embedding")
 
     assert result.clusters == {"with_image": "unknown_0"}
     assert result.render_skipped == ["no_image"]
@@ -189,7 +189,7 @@ def test_clustering_internal_threads_existing_docset_names(workspace: Workspace)
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("Contracts", 0.8)},
     ) as mock_run:
-        result = clustering_internal(workspace)
+        result = clustering_internal(workspace, method="embedding")
 
     assert sorted(mock_run.call_args.kwargs["known_categories"]) == ["Contracts", "Receipts"]
     # DocSets exist ⇒ auto resolves to incremental, and confidence is threaded.
@@ -225,7 +225,7 @@ def test_clustering_internal_builds_support_set_from_docset_members(workspace: W
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("Contracts", 0.7)},
     ) as mock_run:
-        clustering_internal(workspace)
+        clustering_internal(workspace, method="embedding")
 
     kwargs = mock_run.call_args.kwargs
     # Incremental reconstructs prototypes from all usable members; here the
@@ -252,7 +252,7 @@ def test_clustering_internal_skips_support_when_docsets_have_no_usable_files(
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace)
+        clustering_internal(workspace, method="embedding")
 
     kwargs = mock_run.call_args.kwargs
     assert "n_samples_per_category" not in kwargs
@@ -263,7 +263,7 @@ def test_clustering_internal_all_unusable_skips_clusterer(workspace: Workspace) 
     _seed_file(workspace, "no_image")
 
     with patch("dgml_core.clustering.run_clustering_detailed") as mock_run:
-        result = clustering_internal(workspace)
+        result = clustering_internal(workspace, method="embedding")
 
     assert result.clusters == {}
     assert result.render_skipped == ["no_image"]
@@ -284,7 +284,7 @@ def test_clustering_internal_forwards_workspace_overrides(workspace: Workspace) 
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace)
+        clustering_internal(workspace, method="embedding")
 
     forwarded = mock_run.call_args.kwargs["overrides"]
     assert forwarded["training"] == {"epochs": 7}
@@ -302,7 +302,7 @@ def test_clustering_internal_passes_empty_overrides_when_no_config(workspace: Wo
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace)
+        clustering_internal(workspace, method="embedding")
 
     assert mock_run.call_args.kwargs["overrides"] == {
         "encoder_text": {"extra": {"corpus_dir": str(workspace.files_dir)}}
@@ -350,7 +350,7 @@ def test_corpus_dir_is_materialized_for_a_non_local_blob_store(tmp_path: Path) -
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0"), "f2": _dp("unknown_1")},
     ) as mock_run:
-        clustering_internal(ws)
+        clustering_internal(ws, method="embedding")
 
     corpus_dir = Path(mock_run.call_args.kwargs["overrides"]["encoder_text"]["extra"]["corpus_dir"])
     # Not the (empty) local files/ dir — a materialized tree that actually has the text.
@@ -514,7 +514,7 @@ def test_corpus_covers_every_file_not_just_the_ones_being_clustered(tmp_path: Pa
         return {"candidate": _dp("unknown_0")}
 
     with patch("dgml_core.clustering.run_clustering_detailed", side_effect=_capture):
-        clustering_internal(ws)
+        clustering_internal(ws, method="embedding")
 
     assert seen == ["assigned", "candidate"]  # the assigned file is in the corpus
     assert not captured[0].exists()  # and the tree is cleaned up on exit
@@ -571,7 +571,7 @@ def test_clustering_internal_incremental_injects_novelty_default(workspace: Work
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("Contracts", 0.7)},
     ) as mock_run:
-        result = clustering_internal(workspace)
+        result = clustering_internal(workspace, method="embedding")
 
     assert result.mode == "incremental"
     scenario = mock_run.call_args.kwargs["overrides"]["scenario"]
@@ -588,7 +588,7 @@ def test_clustering_internal_fresh_does_not_inject_novelty_default(workspace: Wo
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace, mode="fresh")
+        clustering_internal(workspace, mode="fresh", method="embedding")
 
     scenario = mock_run.call_args.kwargs["overrides"].get("scenario", {})
     assert "threshold_quantile" not in scenario
@@ -605,7 +605,7 @@ def test_clustering_internal_incremental_respects_user_gate(workspace: Workspace
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("Contracts", 0.7)},
     ) as mock_run:
-        clustering_internal(workspace)
+        clustering_internal(workspace, method="embedding")
 
     scenario = mock_run.call_args.kwargs["overrides"]["scenario"]
     assert scenario["threshold_confidence"] == 0.5
@@ -693,7 +693,7 @@ def test_clustering_internal_fresh_mode_ignores_existing_docsets(workspace: Work
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("unknown_0")},
     ) as mock_run:
-        result = clustering_internal(workspace, mode="fresh")
+        result = clustering_internal(workspace, mode="fresh", method="embedding")
 
     assert result.mode == "fresh"
     kwargs = mock_run.call_args.kwargs
@@ -705,7 +705,7 @@ def test_clustering_internal_incremental_without_docsets_raises(workspace: Works
     _seed_file(workspace, "u1")
     _seed_page_image(workspace, "u1")
     with pytest.raises(IncrementalWithoutClusters):
-        clustering_internal(workspace, mode="incremental")
+        clustering_internal(workspace, mode="incremental", method="embedding")
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +775,7 @@ def test_clustering_internal_threads_pooling_pages_to_dataset(
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0")},
     ):
-        clustering_internal(workspace)
+        clustering_internal(workspace, method="embedding")
 
     assert captured["max_pages"] == expected
 
@@ -801,7 +801,7 @@ def test_clustering_internal_splits_noise_out_of_clusters(workspace: Workspace) 
             "noise2": _dp(UNKNOWN_NOISE_LABEL),
         },
     ):
-        result = clustering_internal(workspace)
+        result = clustering_internal(workspace, method="embedding")
 
     assert result.clusters == {"real": "unknown_0"}
     assert sorted(result.unclustered) == ["noise1", "noise2"]
@@ -832,7 +832,7 @@ def test_clustering_does_not_name_the_noise_bucket_into_a_docset(workspace: Work
             "dgml_core.clustering.propose_new_docset_for_files", return_value=decision
         ) as mock_propose,
     ):
-        result = clustering(workspace)
+        result = clustering(workspace, method="embedding")
 
     # The noise documents are reported as unassigned — a partial success, the
     # same channel a failed page render uses — and are absent from `clusters`.

@@ -294,30 +294,61 @@ run.
   else `fresh`.
 
 `--method auto|embedding|llm` selects *how* documents are grouped, orthogonal
-to `--mode` (default `embedding`):
+to `--mode` (default `auto`):
 
-- `embedding` — the statistical pipeline (encode → project → cluster) described
-  below. The right choice once a corpus is large enough for tf-idf / neighbor
-  statistics to be meaningful.
-- `llm` — send **every** document's rendered first pages to the vision LLM in a
-  single call and let it partition them by document type. Built for **very small
-  corpora**, where the embedding pipeline has too little signal to cluster
-  reliably (tf-idf has almost nothing to weight, k-NN graphs are dominated by
-  noise). The model partitions *and* names emergent groups in the one call, so
-  no second per-cluster naming round-trip is needed. `--config` is ignored on
-  this path (there is no embedding pipeline to configure).
-- `auto` — route to `llm` when at most `--small-corpus-threshold` files are
-  clusterable, else `embedding`.
+- `auto` — on a **fresh** run, route to `llm` when at most
+  `--small-corpus-threshold` files are clusterable, else `embedding`. An
+  **incremental** run always takes `embedding`, whatever the batch size: it
+  scores each document against prototypes rebuilt from DocSet members that
+  already exist, so two new files are assigned as reliably as two hundred and
+  the size of the batch says nothing about whether the statistics hold. The
+  default, because neither engine covers every fresh corpus size on its own:
+  below the threshold the neighbor graph connects every document to every
+  other and the batch comes back as one group, and a corpus of one or two
+  files gives the tf-idf fit no document-frequency signal at all.
+- `embedding` — force the statistical pipeline (encode → project → cluster)
+  described below. The right choice once a corpus is large enough for tf-idf /
+  neighbor statistics to be meaningful. On a very small corpus it still runs,
+  but tends to return a single group: measured on an internal corpus, 3 to 6
+  files come back as one cluster whatever they contain.
+- `llm` — force sending **every** document's rendered first pages to the vision
+  LLM in a single call and letting it partition them by document type. Built for
+  **very small corpora**, where the embedding pipeline has too little signal to
+  cluster reliably (tf-idf has almost nothing to weight, k-NN graphs are
+  dominated by noise). The model partitions *and* names emergent groups in the
+  one call, so no second per-cluster naming round-trip is needed. `--config` is
+  ignored on this path (there is no embedding pipeline to configure).
 
-`--small-corpus-threshold N` (default `8`) is the cutoff `--method auto` uses:
-corpora of at most `N` clusterable files go to the LLM partitioner, larger ones
-to the embedding pipeline. Ignored for `--method embedding` / `--method llm`.
+`--small-corpus-threshold N` (default `8`) is the cutoff `--method auto` uses on
+a fresh run: corpora of at most `N` clusterable files go to the LLM partitioner,
+larger ones to the embedding pipeline. Ignored for `--method embedding` /
+`--method llm`, and for incremental runs.
 
 Both `--method llm` and `--method auto` (when it routes to the LLM) require the
 same `classification` config as `--auto-classify` (see "Auto-classification"
-above) — the LLM partitioner *is* the classifier's vision machinery. A missing
-`classification` section makes the LLM path soft-fail: every clusterable file
-lands in `failed_file_ids`. The LLM path caps a single call at 24 files; any
+above) — the LLM partitioner *is* the classifier's vision machinery. With
+`--method llm` a missing or malformed `classification` section is an error
+(`CLASSIFICATION_CONFIG_MISSING` / `CLASSIFICATION_CONFIG_INVALID`), and a
+*runtime* failure — provider down, model rejected — soft-fails instead: every
+clusterable file lands in `failed_file_ids`. Under `--method auto` the routing, not the caller,
+picked that engine, so a partitioner it cannot use does not fail the run. A
+missing `classification` section, a malformed one, or a credential the config
+names but the environment does not hold, all group the corpus with the embedding
+pipeline instead. The last two also warn, since a config that was written and
+cannot be used is a mistake worth reporting. A call that fails once started does
+the same, because some of those failures are the partitioner's own and the
+embedding pipeline can still name the corpus. The `method` field of the result
+says which engine ran.
+
+One case is out of reach of that check: a workspace that leaves its API key to
+the provider's own environment variable, as `dgml init` sets up, looks usable
+until the call is made. There the run reports `method` as `llm` with every file
+in `failed_file_ids`, the same as a pinned `--method llm` run.
+
+`--config` is ignored on the LLM path but still validated there, so a mistyped
+preset name or config path is an error under every method — on any run that
+reaches the clusterer at all. A run with nothing to cluster returns before the
+config is read. The LLM path caps a single call at 24 files; any
 beyond that are reported in `failed_file_ids` so you can fall back to the
 embedding pipeline for larger corpora.
 
@@ -373,6 +404,7 @@ the incremental workflow:
 | `failed_file_ids` | Files that ended up in no DocSet: their cluster needed LLM naming and that naming failed (missing config, no page images, provider error, …), their first page never rendered, or the clusterer put them in no cluster at all. Re-run after fixing the underlying cause; assignments are idempotent. |
 | `skipped` | `true` only when `--skip-existing` was passed and there were no unassigned files (the clusterer never ran); `false` on every actual clustering run. Always present. |
 | `mode` | The effective run mode after resolving `auto` — `"fresh"` or `"incremental"`. |
+| `method` | The engine that actually grouped the files after resolving `auto` — `"embedding"` or `"llm"`, or `null` when no engine ran (a `skipped` run, an empty workspace, or nothing clusterable). Never `"auto"`: that is a request, not an outcome. Under the default `--method auto` the caller does not pick the engine, and an `auto` run that fell back off an unusable LLM partitioner is otherwise indistinguishable from one that never routed there. |
 | `n_assigned_existing` | Number of files assigned to a DocSet that already existed before this run (the incremental "fit an existing cluster" case). |
 | `n_new_clusters` | Number of new DocSets created this run (emergent clusters that were LLM-named). |
 | `assignments` | Per-file detail: `docset` (final DocSet name), `confidence` (in `[0, 1]`, or `null`), `naming_confidence` (see below), `is_new` (whether the DocSet was created this run), and `review`. `confidence` means different things per `method`. Under `embedding` it is the nearest-prototype softmax peak when the file was matched against an existing DocSet, and the clustering-geometry peak (`0.0` for files the algorithm called noise) for files placed by a fresh clustering run. Under `llm` it is the model's self-reported confidence in the group the file was placed in — shared by every file in that group, `null` when the model declined to report one. Neither is a calibrated probability: both are *ordinal* scores, comparable within one run and not across runs, so use them to rank which assignments to review first rather than as a threshold. `review` is `true` when the run wants a human to confirm that assignment; the file is assigned either way, so `review` never changes `docset`. |

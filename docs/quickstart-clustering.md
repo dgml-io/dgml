@@ -174,8 +174,9 @@ Response (truncated):
 The embedding pipeline above needs a corpus large enough for its statistics to
 mean something — tf-idf has almost nothing to weight on a few documents, k-NN
 graphs are dominated by noise, and clusters collapse into one bucket (or all
-noise). For very small corpora, skip embeddings entirely and let the vision LLM
-partition the documents directly:
+noise). For very small corpora the default routing skips embeddings entirely and
+lets the vision LLM partition the documents directly — which you can also ask
+for by name:
 
 ```bash
 dgml cluster --method llm
@@ -185,21 +186,31 @@ dgml cluster --method llm
 single call and asks it to group them by document type, then names each
 emergent group — the same vision machinery `dgml file add --auto-classify`
 uses, so it needs the same `classification` section in `<workspace>/config.toml`
-(without it, every file lands in `failed_file_ids`). It partitions *and* names
+(pinned this way, a missing section is an error). It partitions *and* names
 in one round-trip, and a single call covers up to 24 files.
 
-Prefer `--method auto` to let DGML choose: it routes corpora of at most
+You rarely need to ask for it, though: `--method auto` is the default, so a
+plain `dgml cluster` on a fresh workspace already routes corpora of at most
 `--small-corpus-threshold` files (default 8) to the LLM and larger ones to the
-embedding pipeline — the right default for a folder whose size you don't know
-up front.
+embedding pipeline. Move the cutoff, or pin one engine, when you know better
+than the routing does:
 
 ```bash
-dgml cluster --method auto                          # LLM for ≤8 files, else embedding
-dgml cluster --method auto --small-corpus-threshold 12   # raise the cutoff
+dgml cluster --small-corpus-threshold 12   # raise the cutoff
+dgml cluster --method embedding            # pin the statistical pipeline
 ```
 
-The `--method embedding` default (used by the plain `dgml cluster` above) is
-unchanged, so existing large-corpus runs behave exactly as before.
+Fresh corpora above the threshold take the embedding pipeline exactly as
+before, and so does every incremental run whatever its batch size — a batch
+assigned against existing DocSet prototypes needs no neighbor graph, so its
+size is not evidence about anything. If the routing would pick the LLM but the
+workspace has no usable `classification` config, the run groups with the
+embedding pipeline instead of failing, and warns when a config was present but
+unusable. Naming a cluster needs the same model, so on such a workspace the
+files are grouped but land in `failed_file_ids` unnamed. The same fallback
+covers a partitioner call that fails once started, where the embedding path can
+often still name the corpus. The `method` field in the result says which engine
+ran.
 
 ## 5. Tune the clustering (optional)
 

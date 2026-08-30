@@ -23,6 +23,7 @@ its integration through :func:`dgml_core.clustering.clustering_internal` /
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,7 +38,13 @@ from dgml_core.clustering import (
     clustering_internal,
 )
 from dgml_core.docsets import DocSetStore
-from dgml_core.errors import ClassificationConfigMissing, ClassificationFailed
+from dgml_core.errors import (
+    AuthError,
+    ClassificationConfigInvalid,
+    ClassificationConfigMissing,
+    ClassificationFailed,
+    ClusteringConfigInvalid,
+)
 from dgml_core.llm_clustering import (
     DEFAULT_MAX_FILES,
     LLMClusteringResult,
@@ -538,17 +545,23 @@ def test_clustering_llm_assignment_carries_confidence(workspace: Workspace) -> N
 
 
 @pytest.mark.parametrize(
-    ("method", "n", "threshold", "expected"),
+    ("method", "n", "threshold", "mode", "expected"),
     [
-        ("auto", 3, 8, "llm"),
-        ("auto", 8, 8, "llm"),  # boundary: <= threshold
-        ("auto", 9, 8, "embedding"),
-        ("llm", 100, 8, "llm"),  # explicit wins regardless of size
-        ("embedding", 1, 8, "embedding"),
+        ("auto", 3, 8, "fresh", "llm"),
+        ("auto", 8, 8, "fresh", "llm"),  # boundary: <= threshold
+        ("auto", 9, 8, "fresh", "embedding"),
+        # An incremental batch is scored against prototypes that already exist,
+        # so its size says nothing about whether the statistics hold — it stays
+        # on the embedding path however small it is.
+        ("auto", 1, 8, "incremental", "embedding"),
+        ("auto", 8, 8, "incremental", "embedding"),
+        ("llm", 100, 8, "fresh", "llm"),  # explicit wins regardless of size
+        ("llm", 2, 8, "incremental", "llm"),  # ... and regardless of mode
+        ("embedding", 1, 8, "fresh", "embedding"),
     ],
 )
-def test_resolve_method(method: str, n: int, threshold: int, expected: str) -> None:
-    assert _resolve_method(method, n_usable=n, threshold=threshold) == expected
+def test_resolve_method(method: str, n: int, threshold: int, mode: str, expected: str) -> None:
+    assert _resolve_method(method, n_usable=n, threshold=threshold, mode=mode) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -668,3 +681,302 @@ def test_unknown_method_rejected(workspace: Workspace) -> None:
 
 def test_default_max_files_is_reasonable() -> None:
     assert DEFAULT_MAX_FILES >= 8
+
+
+# ---------------------------------------------------------------------------
+# The default method, and what `auto` does when the LLM partitioner can't run
+# ---------------------------------------------------------------------------
+
+
+def test_default_method_routes_a_small_corpus_to_the_llm(workspace: Workspace) -> None:
+    """`dgml cluster` with no --method must not hand a tiny corpus to embeddings.
+
+    Reported from the field: two files, and the run died inside sklearn with
+    "max_df corresponds to < documents than min_df". The routing that avoids
+    that already existed — it was just never the default, so it never fired.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL})
+
+    groups = [_new_group("Invoice", ["doc_1", "doc_2"])]
+    with patch("litellm.completion", return_value=_group_response(groups)) as completion:
+        out = clustering(workspace)
+
+    assert completion.call_count == 1
+    assert out["method"] == "llm"
+    assert out["n_new_clusters"] == 1
+
+
+def test_default_method_leaves_a_large_corpus_on_the_embedding_path(
+    workspace: Workspace,
+) -> None:
+    """The other side of the same default: above the threshold nothing moves.
+
+    This is what keeps the change off every existing large-corpus run.
+    """
+    for i in range(9):
+        _seed(workspace, f"f{i}")
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL})
+
+    with (
+        patch("litellm.completion") as completion,
+        patch(
+            "dgml_core.clustering.run_clustering_detailed",
+            return_value={f"f{i}": _prediction("unknown_0") for i in range(9)},
+        ) as run_embedding,
+    ):
+        internal = clustering_internal(workspace)
+
+    assert internal.method == "embedding"
+    assert run_embedding.call_count == 1
+    assert completion.call_count == 0
+
+
+def test_auto_falls_back_to_embedding_without_classification_config(
+    workspace: Workspace,
+) -> None:
+    """A workspace with no `classification` section must still cluster.
+
+    Under `auto` the *routing* chose the LLM, not the caller, so a partitioner
+    that cannot run is the routing's problem to solve — the statistical path is
+    a weaker answer on a corpus this small, but it is an answer. Contrast
+    ``test_clustering_llm_missing_classification_config_raises``: someone who
+    typed --method llm named the engine and gets the error.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    # No classification config written.
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
+    ) as run_embedding:
+        # Silent on purpose: a workspace that never configured a model is not
+        # LLM-enabled, and saying so on every small run would be noise.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            internal = clustering_internal(workspace, method="auto")
+
+    assert internal.method == "embedding"
+    assert run_embedding.call_count == 1
+
+
+def test_auto_retries_a_failed_partitioner_call_on_the_embedding_engine(
+    workspace: Workspace,
+) -> None:
+    """A partitioner call that fails once started must not lose the run.
+
+    Some of these failures belong to the partitioner and not to the model. It
+    sends every file's pages in one request under its own grouping tool, so it
+    can exceed a provider's per-request image cap, or get back members named by
+    filename instead of the ``doc_N`` labels the tool defines. The naming pass
+    the embedding path uses has neither problem: one small request per cluster,
+    a different tool. Measured on a workspace where the model answers with
+    filenames, ``--method embedding`` names the corpus and creates a DocSet
+    while the partitioner produces nothing, so under ``auto`` — where the
+    caller did not choose the partitioner — the run continues on the other
+    engine. Pinned ``llm`` still soft-fails; see
+    ``test_clustering_llm_runtime_failure_soft_fails``.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL})
+
+    # Members given as filenames, which `_assemble_result` rejects. This is the
+    # partitioner's own tool contract failing, not the model being unreachable.
+    groups = [_new_group("Invoice", ["a.pdf", "b.pdf"])]
+    with (
+        patch("litellm.completion", return_value=_group_response(groups)),
+        patch(
+            "dgml_core.clustering.run_clustering_detailed",
+            return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
+        ) as run_embedding,
+    ):
+        internal = clustering_internal(workspace, method="auto")
+
+    assert internal.method == "embedding"
+    assert run_embedding.call_count == 1
+
+
+def test_pinned_llm_never_falls_back(workspace: Workspace) -> None:
+    """The pin has to be a pin, or --method llm cannot be used to test the LLM."""
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+
+    with pytest.raises(ClassificationConfigMissing):
+        clustering(workspace, method="llm")
+
+
+def test_result_reports_the_method_that_ran(workspace: Workspace) -> None:
+    """`method` is the only way a caller can tell which engine produced a result.
+
+    Under the default the caller does not choose it, and an `auto` run that fell
+    back off the LLM is otherwise indistinguishable from one that never routed
+    there.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL})
+
+    groups = [_new_group("Invoice", ["doc_1", "doc_2"])]
+    with patch("litellm.completion", return_value=_group_response(groups)):
+        assert clustering(workspace, method="llm")["method"] == "llm"
+
+    # A resolved embedding run reports embedding — through the public payload,
+    # and on a run that actually reached the engine rather than short-circuiting.
+    for fid in ("c", "d"):
+        _seed(workspace, fid)
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"c": _prediction("unknown_0"), "d": _prediction("unknown_0")},
+    ):
+        assert clustering(workspace, method="embedding")["method"] == "embedding"
+
+
+def test_no_engine_ran_reports_a_null_method(workspace: Workspace) -> None:
+    """An empty workspace resolves no engine, so the field must not claim one.
+
+    Echoing the request would put ``"auto"`` — the default — into a field
+    documented as the engine that grouped the files.
+    """
+    assert clustering(workspace, skip_existing=True)["method"] is None
+    assert clustering(workspace)["method"] is None
+
+
+def _prediction(cluster_name: str) -> Any:
+    """A stub ``run_clustering_detailed`` outcome, so the fallback tests can
+    assert *which engine ran* without also depending on a fittable corpus."""
+    from dgml_core.run_clustering import DocPrediction
+
+    return DocPrediction(cluster_name=cluster_name, confidence=None)
+
+
+def test_auto_routes_around_a_malformed_classification_section_but_says_so(
+    workspace: Workspace,
+) -> None:
+    """ "Configured wrong" must neither break the run nor pass unmentioned.
+
+    ``clustering()`` documents that it does not raise and the CLI that it exits
+    0, and the caller who typed nothing did not ask for the LLM, so a bad
+    section cannot be allowed to fail the run. But quietly clustering by
+    another engine would hide the mistake and leave the config inert forever,
+    so it warns. Pinned ``llm`` still raises — see the test below.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL, "max_pages": 0})
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
+    ) as run_embedding:
+        with pytest.warns(RuntimeWarning, match="cannot be used"):
+            internal = clustering_internal(workspace, method="auto")
+
+    assert internal.method == "embedding"
+    assert run_embedding.call_count == 1
+
+
+def test_pinned_llm_still_raises_on_a_malformed_section(workspace: Workspace) -> None:
+    """The pin is what turns the fallback back into an error."""
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL, "max_pages": 0})
+
+    with pytest.raises(ClassificationConfigInvalid):
+        clustering_internal(workspace, method="llm")
+
+
+def test_pinned_llm_still_raises_on_an_absent_credential(workspace: Workspace) -> None:
+    """Ditto for a credential the environment does not hold.
+
+    Under ``auto`` this is routed around; naming the engine has to keep meaning
+    "tell me when it cannot run", or --method llm is untestable.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(
+        workspace, {"model": DEFAULT_TEST_MODEL, "api_key_env": "DGML_TEST_ABSENT_KEY"}
+    )
+
+    with pytest.raises(AuthError):
+        clustering_internal(workspace, method="llm")
+
+
+def test_incremental_batch_stays_on_the_embedding_path(workspace: Workspace) -> None:
+    """A small *incremental* batch must not be routed away from the prototypes.
+
+    This is the regression that made the `auto` default unsafe on its first
+    cut: the routing counted the unassigned batch, so a mature workspace plus
+    two freshly added files — the ordinary `file add` -> `cluster` loop — took
+    the one-shot partitioner and skipped the nearest-prototype assignment, the
+    novelty gate and the review queue entirely. Verified by hand on a 40-file
+    workspace before the fix: `method` came back `llm` and
+    `n_assigned_existing` was 0.
+    """
+    store = DocSetStore(workspace)
+    existing = store.create("Invoice", key_questions=["total?"])
+    for fid in ("m1", "m2", "m3"):
+        _seed(workspace, fid)
+        store.add_file(existing.id, fid)
+    # Two new arrivals — under SMALL_CORPUS_MAX_FILES, so the batch-size rule
+    # would have sent them to the LLM.
+    for fid in ("new1", "new2"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL})
+
+    with (
+        patch("litellm.completion") as completion,
+        patch(
+            "dgml_core.clustering.run_clustering_detailed",
+            return_value={"new1": _prediction("Invoice"), "new2": _prediction("Invoice")},
+        ) as run_embedding,
+    ):
+        internal = clustering_internal(workspace)
+
+    assert internal.mode == "incremental"
+    assert internal.method == "embedding"
+    assert run_embedding.call_count == 1
+    assert completion.call_count == 0
+
+
+def test_auto_validates_the_config_before_routing(workspace: Workspace) -> None:
+    """`--config` is ignored on the LLM path, but it must still be *validated*.
+
+    Otherwise a mistyped preset name or config path is an error under
+    `--method embedding` and silently accepted under the default, on exactly
+    the small corpora where the default routes away from the config.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL})
+
+    with patch("litellm.completion") as completion:
+        with pytest.raises(ClusteringConfigInvalid):
+            clustering_internal(workspace, method="auto", config="no-such-preset")
+    assert completion.call_count == 0
+
+
+def test_auto_falls_back_when_the_credential_is_missing(workspace: Workspace) -> None:
+    """A configured model with no key behind it must not break the no-raise contract.
+
+    `classification.api_key_env` naming an unset variable raises `AuthError`
+    from inside the partitioner's setup, before any call. Under `auto` that is
+    the routing's problem, and `clustering()` documents that it does not raise.
+    """
+    for fid in ("a", "b"):
+        _seed(workspace, fid)
+    write_classification_config(
+        workspace, {"model": DEFAULT_TEST_MODEL, "api_key_env": "DGML_TEST_ABSENT_KEY"}
+    )
+
+    with patch(
+        "dgml_core.clustering.run_clustering_detailed",
+        return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
+    ) as run_embedding:
+        with pytest.warns(RuntimeWarning, match="cannot be used"):
+            internal = clustering_internal(workspace, method="auto")
+
+    assert internal.method == "embedding"
+    assert run_embedding.call_count == 1

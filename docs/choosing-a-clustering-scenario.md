@@ -226,9 +226,10 @@ every document — pick it for routing/triage, not for exploring an unknown corp
 - **Incremental novelty gate:** `--mode incremental` ships a conservative gate so
   genuinely new document types open a new DocSet instead of being forced into the
   nearest existing one. See [incremental-clustering.md](incremental-clustering.md).
-- **Very small corpora (≤ 8 files):** embeddings have too little signal — `--method
-  auto` routes to a one-shot vision-LLM partitioner instead. See the "Only a handful
-  of documents?" section of the quickstart.
+- **Very small fresh corpora (≤ 8 files):** embeddings have too little signal — the
+  default `--method auto` routes to a one-shot vision-LLM partitioner instead. Incremental
+  runs keep the embedding path at any batch size. See the "Only a handful of documents?"
+  section of the quickstart.
 - **Building a `DocumentDataset` / `support_dataset`:** for documents already in a
   DGML workspace, `dgml_core.dataset.WorkspaceFileDataset` is the one to use — it
   reads the page renders and page text `dgml file add` produced. Only write your

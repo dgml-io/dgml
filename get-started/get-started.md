@@ -294,7 +294,7 @@ Now, execute the clustering command over the unassigned files. Because Phase 1 a
 uv run dgml cluster --mode fresh
 ```
 
-Under the hood, the clusterer:
+Under the hood, the clusterer picks an engine first: `--method auto`, the default, sends a fresh run of at most eight clusterable files straight to the vision LLM, which partitions and names them in one call. The 30 PDFs here are well above that, so the statistical pipeline runs:
 1. Embeds each unassigned document from its first-page text (the default is a corpus-fitted TF-IDF text encoder; a file also needs a rendered first-page image to be eligible).
 2. Reduces the embeddings with UMAP and runs the **Leiden community detection algorithm** to identify distinct clusters.
 3. Assigns any cluster whose name matches an existing DocSet to that DocSet.

@@ -60,10 +60,13 @@ dgml cluster --workspace ./ws --mode fresh
 # Pick a compute tier by preset name (default is light).
 dgml cluster --workspace ./ws --config medium
 
-# Small incoming batch? Partition it with the vision LLM instead of embeddings.
-# --method is orthogonal to --mode: existing DocSets are still offered to the
-# model as categories to assign into, so incremental growth works the same way.
-dgml cluster --workspace ./ws --method auto
+# Incremental runs stay on the embedding pipeline whatever the batch size — the
+# default --method auto only routes small *fresh* corpora to the vision LLM,
+# because a batch scored against existing prototypes needs no neighbor graph.
+# Pin --method llm to partition an incoming batch with the LLM anyway: existing
+# DocSets are still offered to the model as categories to assign into, so
+# incremental growth works the same way.
+dgml cluster --workspace ./ws --method llm
 ```
 
 See [`dgml cluster`](cli-reference.md) for the full flag reference and the
