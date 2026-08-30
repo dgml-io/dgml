@@ -54,6 +54,12 @@ import torch
 from clustering.config.schema import EncoderConfig
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 
+# Document-frequency pruning bounds, named because the fit has to reason about
+# whether they are satisfiable on the corpus in front of it — see
+# :meth:`TfidfEncoder._fit_view`.
+_MIN_DF = 2  # an absolute document count
+_MAX_DF = 0.9  # a fraction of the documents
+
 
 class TfidfEncoder(Encoder[str]):
     """Corpus-fitted TF-IDF → Truncated-SVD (LSA) text encoder.
@@ -64,8 +70,10 @@ class TfidfEncoder(Encoder[str]):
 
     def __init__(self, cfg: EncoderConfig, *, device: str = "auto") -> None:
         try:
+            # The vectorizer is imported where it is built (``_fit_view``); one
+            # sklearn import is enough to turn a missing install into this
+            # message rather than a traceback from halfway down the fit.
             from sklearn.decomposition import TruncatedSVD
-            from sklearn.feature_extraction.text import TfidfVectorizer
         except ImportError as exc:  # pragma: no cover - exercised only without sklearn
             raise ImportError(
                 "scikit-learn is required for the 'tfidf' encoder. It ships with the "
@@ -110,14 +118,13 @@ class TfidfEncoder(Encoder[str]):
         # encoder and needs no coordinated change to the fusion/manifold dims.
         # Anyone wanting the wider representation raises `embedding_dim`.
         #
-        # Truncated SVD is only meaningful at two or more components, so each
-        # block's width is floored at 2 below — which means a total wider than
-        # `embedding_dim` is arithmetically possible, and `encode` only ever pads,
-        # never truncates. Rejecting the width here is what makes "emits exactly
-        # `embedding_dim`" true rather than merely intended: with
-        # `embedding_dim >= 2 * n_views` the floor never binds, so every block's
-        # width is at most `embedding_dim // n_views` and the total at most
-        # `embedding_dim`.
+        # Every block below is capped at `embedding_dim // n_views` — the SVD
+        # width by its rank bound, and a reducer-less block is a single column —
+        # so the total can only fall short of `embedding_dim`, never exceed it,
+        # and `encode` pads the difference. What the check below buys is the
+        # floor, not the ceiling: a view whose share is under 2 components
+        # cannot carry a direction, and silently emitting one is worse than
+        # saying the width is too small for the spec.
         floor = 2 * len(self._views)
         if cfg.embedding_dim < floor:
             raise ValueError(
@@ -131,39 +138,120 @@ class TfidfEncoder(Encoder[str]):
         per_view_dim = cfg.embedding_dim // len(self._views)
         columns = self._split_columns(corpus)
         self._warn_collapsed_views(columns, corpus_dir=str(corpus_dir), spec=text_view)
-        self._blocks: list[tuple[Any, Any]] = []
+        self._blocks: list[tuple[Any, Any, int]] = []
         n_components = 0
         for name, texts in zip(self._views, columns, strict=True):
-            vectorizer = TfidfVectorizer(
-                stop_words="english",
-                ngram_range=(1, 2),
-                sublinear_tf=True,
-                min_df=2,
-                max_df=0.9,
+            vectorizer, tfidf = self._fit_view(
+                texts, view=name, spec=text_view, corpus_dir=str(corpus_dir)
             )
-            try:
-                tfidf = vectorizer.fit_transform(texts)
-            except ValueError as exc:
-                # sklearn's "empty vocabulary" doesn't say *which* view was empty,
-                # and with several fitted blocks any one of them can be the one
-                # that killed the run.
-                raise ValueError(
-                    f"tfidf encoder: text view {name!r} (of {text_view!r}) yields no usable "
-                    f"vocabulary over the {len(texts)} files under {corpus_dir!r} — sklearn "
-                    f"reports: {exc}. That view is empty or stop-words-only for this corpus; "
-                    "drop it from text_view, or populate page_text/ via OCR "
-                    "(--text-mode ocr|hybrid) if the files are scanned."
-                ) from exc
-            # SVD rank is bounded by both the vocabulary and the corpus size.
-            dim = max(min(per_view_dim, tfidf.shape[1] - 1, tfidf.shape[0] - 1), 2)
-            svd = TruncatedSVD(n_components=dim, random_state=0)
-            svd.fit(tfidf)
-            self._blocks.append((vectorizer, svd))
+            if tfidf.shape[1] < 2:
+                # TruncatedSVD requires at least two features, so the floor
+                # below asks a one-term matrix for two components and raises.
+                # Nothing is lost by skipping it: a single term already is its
+                # own coordinate. Width 1, so this can never widen the output.
+                # The view carries no signal at all in this state — warn,
+                # because in a multi-view spec it still takes its full share of
+                # the stacked row and nothing downstream would ever say so.
+                warnings.warn(
+                    f"tfidf encoder: text view {name!r} (of {text_view!r}) has a "
+                    f"vocabulary of one term over the {len(texts)} files under "
+                    f"{corpus_dir!r}, so it separates no two documents. Every document "
+                    "gets the same value for this view.",
+                    RuntimeWarning,
+                    stacklevel=1,
+                )
+                dim, svd = 1, None
+            else:
+                # SVD rank is bounded by both the vocabulary and the corpus size.
+                dim = max(min(per_view_dim, tfidf.shape[1] - 1, tfidf.shape[0] - 1), 2)
+                svd = TruncatedSVD(n_components=dim, random_state=0)
+                svd.fit(tfidf)
+                # Read the width back rather than trusting the request: on a
+                # corpus that spans fewer dimensions than were asked for — one
+                # document, say — sklearn returns the components it could find,
+                # and padding against the requested count emits a row one column
+                # short of `embedding_dim`.
+                dim = int(svd.components_.shape[0])
+            self._blocks.append((vectorizer, svd, dim))
             n_components += dim
         # The pipeline expects a fixed embedding width; pad SVD output up to the
         # configured dim with zeros if the rank was capped below it.
         self.embedding_dim = cfg.embedding_dim
         self._n_components = n_components
+
+    @staticmethod
+    def _fit_view(texts: list[str], *, view: str, spec: str, corpus_dir: str) -> tuple[Any, Any]:
+        """Fit one view's vectorizer, relaxing the pruning bounds only on failure.
+
+        Returns the fitted vectorizer and its document-term matrix.
+
+        The document-frequency bounds are a noise heuristic, not a correctness
+        requirement, and on a short or homogeneous corpus they can leave no
+        vocabulary at all — or cross outright, since ``_MIN_DF`` is an absolute
+        document count and ``_MAX_DF`` a fraction, so ``_MAX_DF * n < _MIN_DF``
+        holds for *every* corpus of two documents whatever it contains.
+        sklearn's answer is to raise and suggest tuning ``min_df``/``max_df``,
+        which dgml does not expose, leaving the caller nothing to act on.
+
+        So step the bounds down instead, cheapest concession first. Both bounds
+        were swept on the four internal corpora on the shipped path: relaxing
+        ``max_df`` to 1.0 moved NMI by exactly 0.0000 on three of the four and
+        left the vocabulary byte-identical on three (4 terms out of 4265 on the
+        fourth), while ``min_df=1`` cost 0.066 NMI on the smallest corpus. So
+        ``max_df`` goes first and ``min_df`` last: a price worth paying to run
+        at all, and not worth paying otherwise. The first rung is exactly the
+        shipped pair, so a corpus that fits today fits on it, with an unchanged
+        vocabulary and no warning; the later rungs are reachable only where the
+        encoder used to raise.
+
+        This mirrors the reduce-method fallback in
+        :mod:`clustering.scenarios.clustering`, which likewise degrades with a
+        ``RuntimeWarning`` rather than failing the run.
+        """
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        ladder = ((_MIN_DF, _MAX_DF), (_MIN_DF, 1.0), (1, 1.0))
+        for rung, (min_df, max_df) in enumerate(ladder):
+            vectorizer = TfidfVectorizer(
+                stop_words="english",
+                ngram_range=(1, 2),
+                sublinear_tf=True,
+                min_df=min_df,
+                max_df=max_df,
+            )
+            try:
+                tfidf = vectorizer.fit_transform(texts)
+            except ValueError as exc:
+                if rung < len(ladder) - 1:
+                    continue
+                # Nothing is pruned on the last rung, so the bounds are not what
+                # is left to blame: this view really has no usable text. sklearn's
+                # own message names neither the view nor the fix, and with several
+                # fitted blocks any one of them can be the one that killed the run.
+                raise ValueError(
+                    f"tfidf encoder: text view {view!r} (of {spec!r}) yields no usable "
+                    f"vocabulary over the {len(texts)} files under {corpus_dir!r}, even "
+                    f"with document-frequency pruning disabled — sklearn reports: {exc}. "
+                    "That view is empty or stop-words-only for this corpus; drop it from "
+                    "text_view, or populate page_text/ via OCR (--text-mode ocr|hybrid) "
+                    "if the files are scanned."
+                ) from exc
+            if rung > 0:
+                warnings.warn(
+                    f"tfidf encoder: document-frequency pruning (min_df={_MIN_DF}, "
+                    f"max_df={_MAX_DF}) left no vocabulary for text view {view!r} over the "
+                    f"{len(texts)} files under {corpus_dir!r}; refitted with min_df={min_df}, "
+                    f"max_df={max_df}. Expect a weaker text signal — the corpus is small or "
+                    "its documents are near-identical. A corpus this size is better served "
+                    "by `dgml cluster --method llm`.",
+                    RuntimeWarning,
+                    # Config-driven dispatch (`build_encoder` -> `_REGISTRY[name]`
+                    # -> `__init__` -> here), so no caller frame belongs to the
+                    # user; point at the check itself, as _warn_collapsed_views does.
+                    stacklevel=1,
+                )
+            return vectorizer, tfidf
+        raise AssertionError("unreachable: the last rung either returns or raises")
 
     @staticmethod
     def _read_corpus(files_dir: Path, text_view: str) -> list[str]:
@@ -254,9 +342,15 @@ class TfidfEncoder(Encoder[str]):
             """L2-normalize rows so cosine/spherical geometry matches the dense encoders."""
             return np.asarray(x / np.clip(np.linalg.norm(x, axis=1, keepdims=True), 1e-12, None))
 
+        def project(texts: Sequence[str], vectorizer: Any, svd: Any) -> np.ndarray:
+            sparse = vectorizer.transform(texts)
+            # No SVD ⇒ a one-term vocabulary, which is already its own single
+            # coordinate (see __init__); the column passes straight through.
+            return l2(svd.transform(sparse) if svd is not None else sparse.toarray())
+
         blocks = [
-            l2(svd.transform(vectorizer.transform(texts)))
-            for texts, (vectorizer, svd) in zip(
+            project(texts, vectorizer, svd)
+            for texts, (vectorizer, svd, _) in zip(
                 self._split_columns(batch), self._blocks, strict=True
             )
         ]

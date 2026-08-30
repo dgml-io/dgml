@@ -339,7 +339,7 @@ def test_tfidf_multi_view_blocks_are_independently_fitted(tmp_path: Path) -> Non
     enc = _encoder(files, "page1+full")
     # One fitted (vectorizer, SVD) per view, and they saw different text: page 1
     # alone never contains the page-2 boilerplate term.
-    vocabs = [v.vocabulary_ for v, _ in enc._blocks]  # type: ignore[attr-defined]
+    vocabs = [v.vocabulary_ for v, _, _ in enc._blocks]  # type: ignore[attr-defined]
     assert len(vocabs) == 2
     assert "boilerplate" not in vocabs[0]
     assert "boilerplate" in vocabs[1]
