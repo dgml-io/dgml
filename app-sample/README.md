@@ -24,7 +24,7 @@ Open [`dgml-app-sample.html`](dgml-app-sample.html) directly in a browser — `f
 python app-sample/dgml-app-sample-server.py [--workspace /path/to/workspace] [--port 5173]
 ```
 
-Then open `http://localhost:5173`. Workspace root resolution: `--workspace` flag → `DGML_HOME` env var → `./dgml-workspace`.
+Then open `http://localhost:5173`. Workspace root resolution: `--workspace` flag → `DGML_HOME` env var → `./dgml-workspace`. The server resolves that root itself and always passes `--workspace` to the CLI, so it always creates a workspace *at a path*; launched with neither flag nor env var it uses `./dgml-workspace` relative to its own working directory, which `dgml workspace list` will not show. Pass `--workspace` explicitly if you want a workspace you can also address by id.
 
 From the UI you can:
 

@@ -342,8 +342,9 @@ def _run_pipeline(body: dict[str, Any]) -> None:
     try:
         _broadcast({"type": "step", "name": "init", "status": "running"})
         # `dgml init` writes the user-level ~/.config/dgml/config.toml (idempotent,
-        # provider auto-detected); `workspace create` builds the workspace. The
-        # required --organization is embedded in docset namespace URIs.
+        # provider auto-detected); `workspace create` builds the workspace and its
+        # config.toml. --organization is embedded in docset namespace URIs; it is passed
+        # explicitly here so a first run has it, and re-runs inherit it from the config.
         _run_dgml([*ws, "init"], env)
         _run_dgml([*ws, "workspace", "create", "--organization", "dgml-app-sample"], env)
         _broadcast({"type": "step", "name": "init", "status": "done"})

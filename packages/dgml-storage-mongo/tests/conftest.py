@@ -33,7 +33,9 @@ from typing import Any
 import pytest
 from dgml_core.storage import Workspace
 from dgml_core.storage_service import StorageConfig
-from dgml_storage_mongo import MongoDocStore, MongoGridFSBlobStore
+from dgml_core.workspaces_resolve import default_workspaces_store
+from dgml_core.workspaces_store import WORKSPACES_ENV_VAR, WorkspacesConfig
+from dgml_storage_mongo import MongoDocStore, MongoGridFSBlobStore, MongoWorkspacesStore
 
 MONGO_URI_ENV = "DGML_TEST_MONGO_URI"
 USING_REAL_MONGO = bool(os.environ.get(MONGO_URI_ENV))
@@ -46,9 +48,13 @@ BOTH_GRIDFS_PROVIDER = "dgml_storage_mongo:MongoGridFSStore"
 def _isolate_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Sandbox the user-level config + per-machine registry into a temp dir."""
+    """Sandbox the user-level config and the machine's store of workspaces into temp
+    dirs, so neither the developer's real config nor their ``~/dgml-workspaces`` is
+    touched. The memoized store is cleared for the same reason as in the other suites."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path_factory.mktemp("xdg")))
+    monkeypatch.setenv(WORKSPACES_ENV_VAR, str(tmp_path_factory.mktemp("dgml-workspaces")))
     monkeypatch.delenv("DGML_HOME", raising=False)
+    default_workspaces_store.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -62,9 +68,23 @@ def _fake_mongo(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     import pymongo
 
     monkeypatch.delenv("DGML_MONGO_URI", raising=False)
+    monkeypatch.delenv("DGML_WORKSPACES_MONGO_URI", raising=False)
+
+    # A URI-memoizing factory, NOT `mongomock.MongoClient` directly. Two mongomock
+    # clients built from the same URI are separate in-memory universes, so two store
+    # instances that should be looking at one database would silently see different
+    # data — and a concurrency test written against them would pass while asserting
+    # nothing. Same shape of silent green the README warns about for GridFS.
+    universes: dict[str, Any] = {}
+
+    def _client(uri: str = "mongodb://localhost:27017", *args: Any, **kwargs: Any) -> Any:
+        if uri not in universes:
+            universes[uri] = mongomock.MongoClient(uri, *args, **kwargs)
+        return universes[uri]
+
     # store.py imports MongoClient inside __init__, so patching the attribute
     # before construction is enough.
-    monkeypatch.setattr(pymongo, "MongoClient", mongomock.MongoClient)
+    monkeypatch.setattr(pymongo, "MongoClient", _client)
     yield
 
 
@@ -156,3 +176,27 @@ def mongo_gridfs_workspace(tmp_path: Path) -> Workspace:
     ws = Workspace(root=root)
     ws.init()
     return ws
+
+
+@pytest.fixture
+def workspaces_config(tmp_path: Path) -> WorkspacesConfig:
+    """A per-test database for the store of workspaces."""
+    return WorkspacesConfig(
+        provider="dgml_storage_mongo:MongoWorkspacesStore",
+        options={"mongo_database": f"dgml_ws_test_{uuid.uuid4().hex[:12]}"},
+    )
+
+
+@pytest.fixture
+def workspaces_store(workspaces_config: WorkspacesConfig) -> MongoWorkspacesStore:
+    return MongoWorkspacesStore(MongoWorkspacesStore.parse_config(workspaces_config))
+
+
+@pytest.fixture
+def workspaces_store_b(workspaces_config: WorkspacesConfig) -> MongoWorkspacesStore:
+    """A *second* instance over the same database, for the lost-update tests.
+
+    Two instances rather than two calls on one, because the conflict being tested is
+    between two processes that each read, then each write.
+    """
+    return MongoWorkspacesStore(MongoWorkspacesStore.parse_config(workspaces_config))

@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 from pydantic_settings import (
     BaseSettings,
+    InitSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
@@ -67,10 +68,18 @@ ENV_PREFIX = "DGML_"
 ENV_NESTED_DELIMITER = "__"
 
 
-def _build_settings_class(user_path: Path, ws_path: Path) -> type[BaseSettings]:
-    """A ``BaseSettings`` subclass whose TOML sources point at *user_path* and
-    *ws_path*. Defined per call so the classmethod source hook closes over the
-    (runtime) paths — no module-level state, so it stays thread-safe."""
+def _build_settings_class(user_path: Path, ws_config: dict[str, Any] | None) -> type[BaseSettings]:
+    """A ``BaseSettings`` subclass sourcing layer 2 from the TOML file at *user_path*
+    and layer 3 from *ws_config*, the workspace's already-parsed config (``None`` when
+    it has none). Defined per call so the classmethod source hook closes over the
+    runtime values — no module-level state, so it stays thread-safe.
+
+    Layer 3 arrives **parsed** rather than as a path because a workspace's config is not
+    necessarily a file: one held in the machine's store of workspaces may be a row in a
+    shared database. ``TomlConfigSettingsSource`` only reads paths, but it is itself an
+    ``InitSettingsSource`` subclass, so handing the parsed mapping to that base gives an
+    identical result — sources are combined by ``deep_update`` over what each returns,
+    so precedence and the deep merge are unchanged."""
 
     class _DgmlSettings(BaseSettings):
         model_config = SettingsConfigDict(
@@ -102,12 +111,13 @@ def _build_settings_class(user_path: Path, ws_path: Path) -> type[BaseSettings]:
             file_secret_settings: PydanticBaseSettingsSource,
         ) -> tuple[PydanticBaseSettingsSource, ...]:
             # Highest precedence first: CLI-flag overlay (init) > env vars >
-            # workspace file > user file. (TomlConfigSettingsSource returns an
-            # empty mapping for a missing file.)
+            # workspace config > user file. (TomlConfigSettingsSource returns an
+            # empty mapping for a missing file; the workspace layer gets an empty
+            # mapping when the workspace has no config, which is the same thing.)
             return (
                 init_settings,
                 env_settings,
-                TomlConfigSettingsSource(settings_cls, toml_file=ws_path),
+                InitSettingsSource(settings_cls, ws_config or {}),
                 TomlConfigSettingsSource(settings_cls, toml_file=user_path),
             )
 
@@ -135,8 +145,13 @@ def load_merged_config(
             f"{user_path}, then migrate any settings from the old file."
         )
 
-    settings_cls = _build_settings_class(user_path, workspace.config_path)
     try:
+        # Parsed here rather than inside the settings class so an unparseable workspace
+        # config raises the same CorruptMetadata as an unparseable user config, whichever
+        # backing it came from.
+        ws_text = workspace.config_text
+        ws_config = tomllib.loads(ws_text) if ws_text else None
+        settings_cls = _build_settings_class(user_path, ws_config)
         settings = settings_cls(**(cli_overrides or {}))
     except tomllib.TOMLDecodeError as exc:
         raise CorruptMetadata(f"invalid TOML in a config file: {exc}") from exc

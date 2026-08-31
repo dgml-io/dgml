@@ -41,9 +41,10 @@ auth. Config carries *identity only* — host, port, database.
 
 There is deliberately no username/password config key: a half-credential in
 config (a username with no way to supply the password) builds a URI pymongo
-rejects, and an inline password would be written to the plaintext registry —
-``dgml_core.storage_resolve`` only keeps out option names matching
-``("key", "secret", "token", "password", "credential")``, and ``mongo_uri``
+rejects, and an inline password would sit in the workspace's plaintext
+``config.toml`` — which now lives beside the workspace and is likely to be committed
+or synced. ``dgml_core.storage_resolve`` only treats option names matching
+``("key", "secret", "token", "password", "credential")`` as secrets, and ``mongo_uri``
 matches none of them.
 """
 

@@ -457,41 +457,43 @@ def test_load_store_configs_missing_named_service_raises(tmp_path: Path) -> None
 # ---------------------------------------------------------- snapshot / resolution
 
 
-def test_storage_snapshot_drops_secrets_and_round_trips_fingerprint() -> None:
-    from dgml_core.storage_resolve import fingerprint_of_snapshot, storage_snapshot
-
-    cfg = StorageConfig(
+def test_fingerprint_drops_secrets() -> None:
+    """Secret-hinted options are outside the identity hash, so rotating a credential
+    never reads as "the store moved"."""
+    base = {"bucket": "b", "region": "us-east-1"}
+    plain = StorageConfig(provider="p:C", root=Path("/tmp/ws"), options=base)
+    with_secrets = StorageConfig(
         provider="p:C",
         root=Path("/tmp/ws"),
-        options={"bucket": "b", "region": "us-east-1", "secret_key": "SHH", "api_token": "T"},
+        options={**base, "secret_key": "SHH", "api_token": "T"},
     )
-    snap = storage_snapshot(cfg)
-    assert snap == {"provider": "p:C", "bucket": "b", "region": "us-east-1"}  # secrets dropped
-    # The snapshot's fingerprint reproduces the config's fingerprint (integrity seal).
-    assert fingerprint_of_snapshot(snap) == storage_fingerprint(cfg)
+    assert storage_fingerprint(plain) == storage_fingerprint(with_secrets)
 
 
-def test_fingerprint_pair_over_two_snapshots() -> None:
-    from dgml_core.storage_resolve import fingerprint_pair, snapshot_pair
+def test_storage_fingerprint_pair_is_order_sensitive() -> None:
+    from dgml_core.storage_resolve import storage_fingerprint_pair
 
     blob = StorageConfig(provider="pkg:S3", root=Path("/w"), options={"bucket": "b"})
     doc = StorageConfig(provider="pkg:Mongo", root=Path("/w"), options={"mongo_database": "d"})
-    pair = snapshot_pair(blob, doc)
-    assert pair == {
-        "blobs": {"provider": "pkg:S3", "bucket": "b"},
-        "docs": {"provider": "pkg:Mongo", "mongo_database": "d"},
-    }
-    assert fingerprint_pair(pair).startswith("sha256:")
-    # Empty pair reads as unsealed (trust-on-first-use).
-    assert fingerprint_pair({}) == ""
-    # Swapping the two backends changes the fingerprint (order matters).
-    assert fingerprint_pair(pair) != fingerprint_pair(snapshot_pair(doc, blob))
+    assert storage_fingerprint_pair(blob, doc).startswith("sha256:")
+    # Which backend holds which role is part of the identity.
+    assert storage_fingerprint_pair(blob, doc) != storage_fingerprint_pair(doc, blob)
 
 
-def test_resolve_store_configs_unregistered_is_local(tmp_path: Path) -> None:
-    from dgml_core.registry import resolve_store_configs
+def test_storage_fingerprint_pair_ignores_root() -> None:
+    """A workspace copied or moved keeps its seal: where the config lives is not where
+    the data lives."""
+    from dgml_core.storage_resolve import storage_fingerprint_pair
 
-    ws = Workspace.resolve(tmp_path)  # not in the registry
+    here = StorageConfig(provider="pkg:S3", root=Path("/a"), options={"bucket": "b"})
+    there = StorageConfig(provider="pkg:S3", root=Path("/b"), options={"bucket": "b"})
+    assert storage_fingerprint_pair(here, here) == storage_fingerprint_pair(there, there)
+
+
+def test_store_configs_default_to_local_with_no_config(tmp_path: Path) -> None:
+    from dgml_core.storage_resolve import resolve_store_configs
+
+    ws = Workspace.resolve(tmp_path)  # no config.toml at all
     blob_cfg, doc_cfg = resolve_store_configs(ws)
     assert blob_cfg.provider == doc_cfg.provider == DEFAULT_STORAGE_PROVIDER
     assert blob_cfg.root == doc_cfg.root == ws.root
@@ -580,20 +582,20 @@ def test_split_backends_stay_distinct_and_lazy(
 def test_store_configs_resolve_once_for_both_roles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Registry + config resolution is per workspace, not per role. It re-reads
-    ``workspaces.json`` once per registry entry and rebuilds a settings class on
-    every call, so doing it twice was pure duplicated parsing."""
-    import dgml_core.registry as registry
+    """Config resolution is per workspace, not per role. It re-reads ``config.toml``
+    and rebuilds a settings class on every call, so doing it twice was pure duplicated
+    parsing. The seal check shares this cache too."""
+    import dgml_core.storage_resolve as storage_resolve
 
     calls = 0
-    real_resolve = registry.resolve_store_configs
+    real_resolve = storage_resolve.resolve_store_configs
 
     def counting_resolve(ws: Workspace) -> object:
         nonlocal calls
         calls += 1
         return real_resolve(ws)
 
-    monkeypatch.setattr(registry, "resolve_store_configs", counting_resolve)
+    monkeypatch.setattr(storage_resolve, "resolve_store_configs", counting_resolve)
 
     ws = Workspace.resolve(tmp_path)
     assert (ws.blobs, ws.docs) == (ws.blobs, ws.docs)

@@ -78,6 +78,7 @@ from .storage_resolve import (
     load_store_configs,
     make_blob_store,
     make_doc_store,
+    resolve_store_configs,
     storage_fingerprint,
 )
 from .storage_service import (
@@ -85,13 +86,24 @@ from .storage_service import (
     DocStore,
     StorageConfig,
 )
+from .workspace_config import WorkspaceIdentity
+from .workspace_id import is_workspace_id, mint_workspace_id, new_workspace_id
 from .workspace_ops import WorkspaceOps
+from .workspaces_local import LocalDirWorkspacesStore
+from .workspaces_resolve import (
+    DEFAULT_WORKSPACES_PROVIDER,
+    default_workspaces_store,
+    load_workspaces_config,
+    make_workspaces_store,
+)
+from .workspaces_store import WorkspacesConfig, WorkspacesStore, default_workspaces_root
 
 __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_STORAGE_PROVIDER",
     "DEFAULT_STORAGE_SERVICE",
+    "DEFAULT_WORKSPACES_PROVIDER",
     "WORKSPACE_SCHEMA_VERSION",
     "AddFileResult",
     "ArtifactKind",
@@ -122,6 +134,7 @@ __all__ = [
     "InvalidArgument",
     "InvalidPDF",
     "Issue",
+    "LocalDirWorkspacesStore",
     "LocalStore",
     "Migration",
     "MigrationResult",
@@ -130,25 +143,36 @@ __all__ = [
     "UnsupportedFileType",
     "VerifyResult",
     "Workspace",
+    "WorkspaceIdentity",
     "WorkspaceMigrationFailed",
     "WorkspaceNotInitialized",
     "WorkspaceOps",
+    "WorkspacesConfig",
+    "WorkspacesStore",
     "__version__",
     "attest_file",
     "attest_file_version",
     "check_workspace",
     "collect_file_version",
     "collect_from_attestation",
+    "default_workspaces_root",
+    "default_workspaces_store",
     "export_attestation",
+    "is_workspace_id",
     "layout",
     "load_conversion_config",
     "load_store_configs",
+    "load_workspaces_config",
     "make_blob_store",
     "make_converter",
     "make_doc_store",
+    "make_workspaces_store",
     "migrate_workspace",
+    "mint_workspace_id",
+    "new_workspace_id",
     "pending_migrations",
     "read_attestation",
+    "resolve_store_configs",
     "stamp_schema_version",
     "storage_fingerprint",
     "verify_attestation_dir",

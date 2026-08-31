@@ -170,3 +170,162 @@ def test_unwritable_workspace_fails_loudly(workspace: Workspace, monkeypatch) ->
     monkeypatch.setattr(storage_local, "_write_text_atomic", _boom)
     with pytest.raises(WorkspaceMigrationFailed, match="writable"):
         migrate_workspace(workspace)
+
+
+# ------------------------------------- moving the storage binding into config.toml
+
+
+_LOCAL = "dgml_core.storage_local:LocalStore"
+
+
+def _legacy_row(ws: Workspace, *, service: str, snapshot: dict[str, object]) -> str:
+    """Write a pre-upgrade index row — the shape an older dgml wrote, carrying the
+    binding inline."""
+    import json
+
+    from dgml_core import registry
+
+    wid = "ws_legacyxxxxxxxxxx"
+    registry.registry_path().parent.mkdir(parents=True, exist_ok=True)
+    registry.registry_path().write_text(
+        json.dumps(
+            {
+                wid: {
+                    "name": "W",
+                    "organization": "Acme",
+                    "root": str(ws.root),
+                    "storage_service": service,
+                    "storage": snapshot,
+                    "storage_fingerprint": "sha256:deadbeef",
+                    "created_at": "2026-08-05T12:00:00Z",
+                    "schema_version": 1,
+                }
+            }
+        )
+    )
+    return wid
+
+
+def test_seeds_storage_from_the_legacy_snapshot_not_the_template(tmp_path: Path) -> None:
+    """**The highest-risk case in this change.** The old resolver pinned a workspace to
+    its registry snapshot, so a later edit to the ``[storage.<name>]`` template was
+    never in effect. Seeding from the template instead would silently relocate the
+    workspace to a different backend and orphan every file already stored."""
+    from dgml_core import workspace_config
+    from dgml_core.migrations import migrate_workspace_config
+    from dgml_core.storage_resolve import resolve_store_configs
+
+    ws = Workspace(root=tmp_path / "ws")
+    ws.root.mkdir()
+    # The template says one thing...
+    ws.config_path.write_text(f'[storage.svcA]\nprovider = "{_LOCAL}"\nprefix = "EDITED-AWAY"\n')
+    # ...the snapshot (what the workspace actually ran on) says another.
+    _legacy_row(
+        ws, service="svcA", snapshot={"blobs": {"provider": _LOCAL}, "docs": {"provider": _LOCAL}}
+    )
+
+    assert migrate_workspace_config(ws) == 1
+
+    table = workspace_config.read_storage_table(ws, "svcA")
+    assert table is not None
+    assert "prefix" not in table["blobs"], "template leaked into the migrated binding"
+    blob_cfg, _ = resolve_store_configs(ws)
+    assert "prefix" not in blob_cfg.options
+
+
+def test_migration_seals_and_records_identity(tmp_path: Path) -> None:
+    from dgml_core import workspace_config
+    from dgml_core.migrations import migrate_workspace_config
+    from dgml_core.storage_resolve import resolve_store_configs, storage_fingerprint_pair
+
+    ws = Workspace(root=tmp_path / "ws")
+    ws.root.mkdir()
+    wid = _legacy_row(ws, service="default", snapshot={"blobs": {"provider": _LOCAL}})
+    migrate_workspace_config(ws)
+
+    identity = workspace_config.read_identity(ws)
+    assert identity.workspace_id == wid
+    assert identity.organization == "Acme"
+    assert identity.storage_service == "default"
+    assert identity.storage_fingerprint == storage_fingerprint_pair(*resolve_store_configs(ws))
+
+
+def test_config_migration_is_idempotent(tmp_path: Path) -> None:
+    from dgml_core.migrations import migrate_workspace_config
+
+    ws = Workspace(root=tmp_path / "ws")
+    ws.root.mkdir()
+    _legacy_row(ws, service="default", snapshot={"blobs": {"provider": _LOCAL}})
+
+    assert migrate_workspace_config(ws) == 1
+    first = ws.config_path.read_text()
+    assert migrate_workspace_config(ws) == 0
+    assert ws.config_path.read_text() == first
+
+
+def test_migration_leaves_the_legacy_index_untouched(tmp_path: Path) -> None:
+    """The migration copies *out* of the legacy index and never writes to it.
+
+    It used to rewrite the row to strip the now-powerless `storage` keys. That is no
+    longer worth doing: nothing resolves through the file any more, rewriting it would
+    make a dead file look maintained, and `dgml workspace import` needs to read it
+    exactly as the older dgml left it."""
+    import json
+
+    from dgml_core import registry
+    from dgml_core.migrations import migrate_workspace_config
+
+    ws = Workspace(root=tmp_path / "ws")
+    ws.root.mkdir()
+    wid = _legacy_row(ws, service="default", snapshot={"blobs": {"provider": _LOCAL}})
+    before = registry.registry_path().read_bytes()
+
+    assert migrate_workspace_config(ws) == 1
+
+    assert registry.registry_path().read_bytes() == before
+    row = json.loads(registry.registry_path().read_text())[wid]
+    assert row["storage"] == {"blobs": {"provider": _LOCAL}}
+    # ...and the binding it described now lives in the workspace's own config.
+    assert "[storage.default.blobs]" in (ws.config_text or "")
+
+
+def test_migration_never_invents_a_config(tmp_path: Path) -> None:
+    """No legacy row *and* no config file: creating one would be a guess, and the
+    wrong one for a workspace whose remote config was deleted — it would be re-sealed
+    onto the local default while its data sits elsewhere."""
+    from dgml_core.migrations import migrate_workspace_config
+
+    ws = Workspace(root=tmp_path / "ws")
+    ws.root.mkdir()
+    assert migrate_workspace_config(ws) == 0
+    assert not ws.config_path.exists()
+
+
+def test_migration_seals_a_pre_existing_config_with_no_legacy_row(tmp_path: Path) -> None:
+    """A workspace already resolving from its own config has nothing to move, but is
+    still sealed — otherwise it would stay permanently unguarded."""
+    from dgml_core import workspace_config
+    from dgml_core.migrations import migrate_workspace_config
+
+    ws = Workspace(root=tmp_path / "ws")
+    ws.root.mkdir()
+    ws.config_path.write_text(f'[storage]\nprovider = "{_LOCAL}"\n')
+    assert migrate_workspace_config(ws) == 1
+    assert workspace_config.read_identity(ws).storage_fingerprint is not None
+
+
+def test_migration_folds_a_flat_pre_split_snapshot(tmp_path: Path) -> None:
+    """Entries written before the blob/doc split carried one flat snapshot serving
+    both roles."""
+    from dgml_core import workspace_config
+    from dgml_core.migrations import migrate_workspace_config
+
+    ws = Workspace(root=tmp_path / "ws")
+    ws.root.mkdir()
+    _legacy_row(ws, service="default", snapshot={"provider": _LOCAL, "prefix": "p"})
+    migrate_workspace_config(ws)
+
+    table = workspace_config.read_storage_table(ws, "default")
+    assert table is not None
+    assert table["blobs"]["provider"] == table["docs"]["provider"] == _LOCAL
+    assert table["blobs"]["prefix"] == "p"

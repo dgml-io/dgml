@@ -161,20 +161,17 @@ def test_traversal_still_raises_value_error(tmp_path: Path) -> None:
 # --------------------------------------------- paths agree with keys
 
 
-def test_local_path_agrees_with_keys(tmp_path: Path) -> None:
-    """``local_path`` must resolve a key to its location under the root, and
-    ``blob_key`` must invert it — the drift the shared layout exists to prevent.
-    ``Workspace`` names nothing itself: every key comes from a ``layout``
-    builder, and the filesystem escape is ``local_path`` composed with one."""
-    ws = Workspace(root=tmp_path)
+def test_local_store_lays_keys_out_under_the_root(tmp_path: Path) -> None:
+    """A ``LocalStore`` must place a key at ``<root>/<key>`` — the drift the shared
+    layout exists to prevent.
+
+    Asserted against the store rather than a ``Workspace`` path helper: ``local_path``
+    and ``blob_key`` are gone (see issue #129 — no production code addressed data that
+    way), and the store is where the key→path mapping actually lives, so this now tests
+    the thing instead of a description of it."""
+    store = local_store(tmp_path)
     keys = [
-        layout.file_prefix("f1"),
-        layout.file_pages_prefix("f1"),
-        layout.file_text_prefix("f1"),
         layout.file_source_key("f1", "doc.pdf"),
-        layout.docset_prefix("d1"),
-        layout.docset_files_prefix("d1"),
-        layout.docset_pair_prefix("d1", "f1"),
         layout.docset_extraction_schema_key("d1"),
         layout.docset_full_schema_key("d1"),
         layout.docset_generation_schema_key("d1"),
@@ -183,8 +180,29 @@ def test_local_path_agrees_with_keys(tmp_path: Path) -> None:
         layout.file_page_text_key("f1", 1),
     ]
     for key in keys:
-        assert ws.local_path(key) == tmp_path / key.rstrip("/"), key
-        assert ws.blob_key(ws.local_path(key)) == key.rstrip("/"), key
+        store.put_blob(key, b"x")
+        assert (tmp_path / key).is_file(), key
+        assert store.get_blob(key) == b"x", key
+
+
+def test_prefix_keys_select_what_lives_under_them(tmp_path: Path) -> None:
+    """Every ``*_prefix`` builder must actually select the keys built beneath it. The
+    trailing slash is load-bearing — without it ``files/ab`` would also match
+    ``files/abc`` — so this pins the pairing rather than the string."""
+    store = local_store(tmp_path)
+    under = {
+        layout.file_prefix("f1"): layout.file_source_key("f1", "doc.pdf"),
+        layout.file_pages_prefix("f1"): layout.file_page_image_key("f1", 1),
+        layout.file_text_prefix("f1"): layout.file_page_text_key("f1", 1),
+        layout.docset_prefix("d1"): layout.docset_extraction_schema_key("d1"),
+        layout.docset_files_prefix("d1"): layout.dgml_xml_key("d1", "f1", "r"),
+        layout.docset_pair_prefix("d1", "f1"): layout.dgml_xml_key("d1", "f1", "r"),
+    }
+    for key in set(under.values()):
+        store.put_blob(key, b"x")
+    for prefix, key in under.items():
+        assert prefix.endswith("/"), prefix
+        assert key in store.list_blobs(prefix), prefix
 
 
 # ------------------------------------------------------- the store is cached

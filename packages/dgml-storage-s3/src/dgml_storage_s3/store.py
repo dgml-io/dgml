@@ -40,11 +40,13 @@ boto3's default chain (``AWS_ACCESS_KEY_ID`` / ``~/.aws/credentials`` / an IAM
 role). Config carries *identity only* — bucket, endpoint, prefix — which is also
 exactly what should define the store fingerprint.
 
-This is not merely stylistic. ``dgml_core.storage_resolve`` splits config into a
-non-secret snapshot (persisted to the plaintext registry) and secret options
-(kept out of it), and the split is a **substring match on the option name**
-against ``("key", "secret", "token", "password", "credential")``. If you ever add
-an inline-credential option, its name must contain one of those substrings.
+This is not merely stylistic. ``dgml_core.storage_resolve`` excludes secret-hinted
+options from a store's identity fingerprint by a **substring match on the option
+name** against ``("key", "secret", "token", "password", "credential")``. If you ever
+add an inline-credential option, its name must contain one of those substrings — both
+so rotating it does not read as "the store moved", and because this config now lives
+in the workspace's own plaintext ``config.toml``, which sits beside the workspace and
+is likely to be committed or synced.
 """
 
 from __future__ import annotations

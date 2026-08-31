@@ -45,6 +45,7 @@ atomic rename.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import shutil
 import tempfile
@@ -52,7 +53,7 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from .errors import CorruptMetadata, InvalidArgument
+from .errors import CorruptMetadata, InvalidArgument, StorageConfigInvalid
 from .layout import (
     CACHE_DIR,
     DOC_LAYOUTS,
@@ -117,16 +118,52 @@ def _matches(doc: Mapping[str, Any], query: Mapping[str, Any]) -> bool:
 
 
 class LocalStore(BlobStore, DocStore):
-    """Local-disk store over today's workspace layout. Takes no options; its
-    location is the workspace root."""
+    """Local-disk store over today's workspace layout.
+
+    Its location is the workspace root, unless ``workspace_path`` says otherwise::
+
+        [storage.default]
+        provider = "dgml_core.storage_local:LocalStore"
+        workspace_path = "/Volumes/big/acme-corpus"
+
+    That option exists so a workspace can be *listed* in one place and keep its data in
+    another — a workspace adopted from an existing directory, or a corpus that belongs on
+    a different disk. It lives in this class's ``config_fields`` rather than as a general
+    ``[storage]`` key on purpose: where files sit is a local-disk concern, so a
+    ``workspace_path`` under an S3 or Mongo table is rejected automatically by
+    :meth:`~dgml_core.provider.ProviderConfigFields._check_no_extra_fields`, with no
+    "only applies when the provider is local" special case anywhere. See issue #129 for
+    where this is heading — ``StorageConfig.root`` is required of every provider and read
+    only by this one.
+    """
 
     name = "local"
-    config_fields = frozenset()
+    config_fields = frozenset({"workspace_path"})
 
     @classmethod
     def parse_config(cls, config: StorageConfig) -> StorageConfig:
+        """Validate and, when ``workspace_path`` is set, fold it into ``config.root``.
+
+        Normalizing here rather than in ``__init__`` is what keeps this the store's only
+        notion of location: ``__init__`` still reads nothing but ``config.root``, so
+        there is no second code path in which the two could disagree."""
         cls._check_no_extra_fields(config.options)
-        return config
+        declared = config.options.get("workspace_path")
+        if declared is None:
+            return config
+        if not isinstance(declared, str) or not declared.strip():
+            raise StorageConfigInvalid(
+                f"'storage.workspace_path' must be a non-empty string (provider {cls.name!r})"
+            )
+        path = Path(declared).expanduser()
+        if not path.is_absolute():
+            raise StorageConfigInvalid(
+                f"'storage.workspace_path' must be an absolute path (got {declared!r}); a "
+                f"relative one would depend on the working directory, and a workspace "
+                f"listed in a store of workspaces has no config directory to resolve it "
+                f"against"
+            )
+        return dataclasses.replace(config, root=path)
 
     def __init__(self, config: StorageConfig) -> None:
         self._root = Path(config.root)

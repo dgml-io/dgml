@@ -47,7 +47,9 @@ def test_check_surfaces_text_extraction_failed_permanent(
     tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     ws = tmp_path / "ws"
-    Workspace(root=ws).init()
+    # Build it the way `dgml workspace create` does: the CLI rejects an initialized
+    # workspace with no config.toml, because that file names its storage backend.
+    main(["workspace", "create", str(ws), "--organization", "Acme"])
     capsys.readouterr()
 
     rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf)])

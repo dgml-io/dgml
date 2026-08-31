@@ -63,7 +63,7 @@ from dgml_core.merkle import merkle_root, merkle_root_from_hashes
 from dgml_core.storage import Workspace
 from lxml import etree  # type: ignore[import-untyped]
 
-from .conftest import default_bridge_store
+from .conftest import default_bridge_store, local_tree_path
 
 # --- minimal on-disk fixture helpers ----------------------------------------
 
@@ -336,7 +336,7 @@ def test_empty_version_raises_value_error(workspace: Workspace) -> None:
 def test_corrupt_file_json_raises_corrupt_metadata(workspace: Workspace) -> None:
     # Corrupt manifest on disk (LocalStore-specific): put_doc can't write invalid
     # JSON and put_blob refuses a document key, so write via the local_path escape.
-    manifest = workspace.local_path(f"{layout.file_prefix('f001')}file.json")
+    manifest = local_tree_path(workspace, f"{layout.file_prefix('f001')}file.json")
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text("{not json", encoding="utf-8")
     with pytest.raises(CorruptMetadata):

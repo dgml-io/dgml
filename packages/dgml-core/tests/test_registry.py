@@ -10,193 +10,194 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the per-machine workspace registry + id-or-path addressing.
+"""The legacy per-machine index: reading what an older dgml left behind.
 
-The autouse ``_isolate_user_config`` fixture (conftest) points
-``XDG_CONFIG_HOME`` at a per-test tmp dir, so ``registry_path()`` is sandboxed and
-the developer's real ``~/.config/dgml/workspaces.json`` is never touched.
+``workspaces.json`` is no longer written and nothing resolves through it — the list of
+workspaces now lives in a :class:`~dgml_core.workspaces_store.WorkspacesStore`, whose
+own tests are in ``test_workspaces_store.py``. What remains here is one job: read a
+file this machine may already have, well enough for ``dgml workspace import`` and for
+the migration that lifts a pre-upgrade ``storage`` snapshot into a workspace's own
+config.
+
+So these tests are about **tolerance**, not behaviour: every shape an older dgml (or a
+hand edit) could have left must be readable without raising, because the file is
+someone's only record of workspaces they still want.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from dgml_core import registry
 from dgml_core.errors import CorruptMetadata
 from dgml_core.registry import RegistryEntry
-from dgml_core.storage import Workspace
 
 
-def _entry(workspace_id: str, root: Path, *, name: str = "W", org: str = "acme") -> RegistryEntry:
-    return RegistryEntry(
-        workspace_id=workspace_id,
-        name=name,
-        organization=org,
-        root=str(root),
-        storage_service="default",
-        storage={
-            "blobs": {"provider": "dgml_core.storage_local:LocalStore"},
-            "docs": {"provider": "dgml_core.storage_local:LocalStore"},
-        },
-        storage_fingerprint="sha256:deadbeef",
-        created_at="2026-08-05T12:00:00Z",
-        schema_version=1,
-    )
+def _write_index(rows: dict[str, dict[str, object]]) -> Path:
+    """Write a legacy ``workspaces.json`` directly — the only way one comes into
+    existence now, since nothing in dgml writes this file any more."""
+    path = registry.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    return path
 
 
-# ---------------------------------------------------------------- new_workspace_id
+# --------------------------------------------------------------------- reading
 
 
-def test_new_workspace_id_shape_and_uniqueness() -> None:
-    ids = {registry.new_workspace_id() for _ in range(50)}
-    assert len(ids) == 50  # no collisions in a small sample
-    for i in ids:
-        assert i.startswith("ws_")
-        assert len(i) == 19  # "ws_" + 16 base32 chars
-        assert i[3:].isalnum() and i[3:].islower()
-
-
-def test_mint_workspace_id_skips_a_registered_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """mint re-rolls when the freshly-generated id already exists in the registry."""
-    taken = "ws_takentakentaken1"
-    registry.register(_entry(taken, tmp_path / "a"))
-
-    # First roll collides with the registered id, second is free.
-    rolls = iter([taken, "ws_freefreefreefre1"])
-    monkeypatch.setattr(registry, "new_workspace_id", lambda: next(rolls))
-    assert registry.mint_workspace_id() == "ws_freefreefreefre1"
-
-
-# ---------------------------------------------------------------- registry I/O
-
-
-def test_read_registry_absent_is_empty(tmp_path: Path) -> None:
-    assert not registry.registry_path().exists()
+def test_absent_index_reads_as_empty(tmp_path: Path) -> None:
+    """The overwhelmingly common case now: a machine that never had one, or deleted it
+    after importing. Not an error."""
     assert registry.read_registry() == {}
     assert registry.list_entries() == []
-    assert registry.get("ws_nope") is None
+    assert registry.raw_entry_by_root(tmp_path / "ws") is None
 
 
-def test_register_get_list_remove_roundtrip(tmp_path: Path) -> None:
-    a = _entry("ws_aaaaaaaaaaaaaaaa", tmp_path / "a", name="A")
-    b = _entry("ws_bbbbbbbbbbbbbbbb", tmp_path / "b", name="B")
-    registry.register(a)
-    registry.register(b)
-
-    assert registry.get("ws_aaaaaaaaaaaaaaaa") == a
-    assert {e.workspace_id for e in registry.list_entries()} == {a.workspace_id, b.workspace_id}
-    # list is id-sorted (stable output)
-    assert [e.workspace_id for e in registry.list_entries()] == [a.workspace_id, b.workspace_id]
-
-    assert registry.remove("ws_aaaaaaaaaaaaaaaa") is True
-    assert registry.get("ws_aaaaaaaaaaaaaaaa") is None
-    assert registry.remove("ws_aaaaaaaaaaaaaaaa") is False  # already gone
-
-
-def test_register_is_idempotent_upsert(tmp_path: Path) -> None:
-    registry.register(_entry("ws_cccccccccccccccc", tmp_path / "c", name="Old"))
-    registry.register(_entry("ws_cccccccccccccccc", tmp_path / "c", name="New"))
-    entries = registry.list_entries()
-    assert len(entries) == 1
-    assert entries[0].name == "New"
-
-
-def test_get_by_root_reverse_lookup(tmp_path: Path) -> None:
-    registry.register(_entry("ws_dddddddddddddddd", tmp_path / "d"))
-    hit = registry.get_by_root(tmp_path / "d")
-    assert hit is not None and hit.workspace_id == "ws_dddddddddddddddd"
-    assert registry.get_by_root(tmp_path / "nowhere") is None
-
-
-def test_corrupt_registry_raises(tmp_path: Path) -> None:
-    p = registry.registry_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("{not valid json", encoding="utf-8")
-    with pytest.raises(CorruptMetadata):
-        registry.read_registry()
-
-
-def test_non_object_registry_raises(tmp_path: Path) -> None:
-    p = registry.registry_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("[]", encoding="utf-8")
-    with pytest.raises(CorruptMetadata):
-        registry.read_registry()
-
-
-# ---------------------------------------------------------------- id-or-path resolution
-
-
-def test_resolve_by_id_uses_registered_root(tmp_path: Path) -> None:
-    root = (tmp_path / "acme-ws").resolve()
-    wid = registry.new_workspace_id()
-    registry.register(_entry(wid, root))
-    assert Workspace.resolve(wid).root == root
-
-
-def test_resolve_unregistered_token_is_a_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A bare token that is NOT a registered id resolves as a (relative) path.
-    monkeypatch.chdir(tmp_path)
-    assert Workspace.resolve("some_dir").root == (tmp_path / "some_dir").resolve()
-
-
-def test_resolve_absolute_path_is_never_an_id(tmp_path: Path) -> None:
-    p = tmp_path / "ws"
-    assert Workspace.resolve(p).root == p.resolve()
-    assert Workspace.resolve(str(p)).root == p.resolve()
-
-
-def test_resolve_path_typed_id_round_trips(tmp_path: Path) -> None:
-    # --workspace is argparse type=Path, so an id arrives as Path("ws_...").
-    root = (tmp_path / "ws").resolve()
-    wid = registry.new_workspace_id()
-    registry.register(_entry(wid, root))
-    assert Workspace.resolve(Path(wid)).root == root
-
-
-def test_workspace_constructed_by_root_has_no_id(tmp_path: Path) -> None:
-    ws = Workspace(root=tmp_path / "ws")
-    assert ws.workspace_id is None  # no registry / no workspace.json required
-
-
-# ---------------------------------------------------------------- integrity seal
-
-
-def test_verify_storage_seal_passes_and_no_ops(tmp_path: Path) -> None:
-    from dgml_core.errors import StorageBackendMismatch
-
-    ws = Workspace(root=tmp_path / "ws")
-    # Unregistered → trust-on-first-use no-op.
-    registry.verify_storage_seal(ws)
-    # A consistent snapshot/fingerprint pair passes.
-    registry.seal_entry(
-        ws,
-        workspace_id=registry.mint_workspace_id(),
-        name="W",
-        organization="acme",
-        service="default",
-    )
-    registry.verify_storage_seal(ws)  # does not raise
-
-    # An entry with an empty fingerprint is treated as unsealed (no raise).
-    stub = _entry("ws_unsealedxxxxxxxx", tmp_path / "u")
-    registry.register(RegistryEntry(**{**stub.__dict__, "storage_fingerprint": ""}))
-    registry.verify_storage_seal(Workspace(root=tmp_path / "u"))
-
-    # Hand-edit the sealed snapshot without fixing the fingerprint → mismatch.
-    entry = registry.get_by_root(ws.root)
-    assert entry is not None
-    tampered = RegistryEntry(
-        **{
-            **entry.__dict__,
-            "storage": {"blobs": {"provider": "other:Store"}, "docs": entry.storage["docs"]},
+def test_rows_are_read_and_sorted_by_id(tmp_path: Path) -> None:
+    _write_index(
+        {
+            "ws_bbbbbbbbbbbbbbbb": {
+                "name": "B",
+                "organization": "beta",
+                "root": str(tmp_path / "b"),
+            },
+            "ws_aaaaaaaaaaaaaaaa": {
+                "name": "A",
+                "organization": "acme",
+                "root": str(tmp_path / "a"),
+            },
         }
     )
-    registry.register(tampered)
-    with pytest.raises(StorageBackendMismatch):
-        registry.verify_storage_seal(ws)
+    entries = registry.list_entries()
+    assert [e.workspace_id for e in entries] == ["ws_aaaaaaaaaaaaaaaa", "ws_bbbbbbbbbbbbbbbb"]
+    assert entries[0].name == "A"
+    assert entries[1].organization == "beta"
+
+
+def test_raw_entry_by_root_finds_the_row_and_names_its_id(tmp_path: Path) -> None:
+    """``raw`` on purpose: the migration needs the pre-upgrade ``storage`` snapshot,
+    which the dataclass deliberately drops."""
+    root = tmp_path / "ws"
+    _write_index(
+        {
+            "ws_aaaaaaaaaaaaaaaa": {
+                "name": "W",
+                "root": str(root),
+                "storage": {"blobs": {"provider": "x:Y", "bucket": "b"}},
+            }
+        }
+    )
+    row = registry.raw_entry_by_root(root)
+    assert row is not None
+    assert row["workspace_id"] == "ws_aaaaaaaaaaaaaaaa"
+    assert row["storage"] == {"blobs": {"provider": "x:Y", "bucket": "b"}}
+
+
+def test_raw_entry_by_root_resolves_both_sides(tmp_path: Path) -> None:
+    """A recorded root and the root being looked up may spell the same directory
+    differently (a symlinked temp dir, a trailing ``/.``)."""
+    root = tmp_path / "ws"
+    root.mkdir()
+    _write_index({"ws_aaaaaaaaaaaaaaaa": {"root": str(root) + "/."}})
+    assert registry.raw_entry_by_root(root) is not None
+
+
+# ------------------------------------------------------------------- tolerance
+
+
+def test_legacy_storage_keys_are_read_as_noise(tmp_path: Path) -> None:
+    """A pre-upgrade row carried the storage binding inline. Reading one must not raise
+    — those keys are simply not this dataclass's business, and the binding they describe
+    now lives in the workspace's own config."""
+    entry = RegistryEntry.from_dict(
+        "ws_legacyaaaaaaaaaa",
+        {
+            "name": "W",
+            "organization": "acme",
+            "root": str(tmp_path / "ws"),
+            "storage_service": "acme",
+            "storage": {"blobs": {"provider": "x:Y"}},
+            "storage_fingerprint": "sha256:dead",
+            "created_at": "2026-01-01T00:00:00Z",
+            "schema_version": 1,
+        },
+    )
+    assert entry.workspace_id == "ws_legacyaaaaaaaaaa"
+    assert entry.name == "W"
+    assert entry.root == str(tmp_path / "ws")
+    assert not hasattr(entry, "storage")
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {},  # nothing at all
+        {"name": 17, "organization": None},  # wrong types
+        {"root": None},  # a row with no local root
+        {"schema_version": "one"},  # unparseable version
+        {"unknown_future_key": {"nested": True}},
+    ],
+)
+def test_a_malformed_row_is_readable(row: dict[str, object]) -> None:
+    """Refusing to parse would take the import command down with it, stranding every
+    other workspace in the file. A row is best-effort, not validated."""
+    entry = RegistryEntry.from_dict("ws_aaaaaaaaaaaaaaaa", row)
+    assert entry.workspace_id == "ws_aaaaaaaaaaaaaaaa"
+
+
+def test_a_non_dict_row_is_skipped_rather_than_fatal(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    _write_index(
+        {
+            "ws_aaaaaaaaaaaaaaaa": "not-a-row",  # type: ignore[dict-item]
+            "ws_bbbbbbbbbbbbbbbb": {"root": str(root)},
+        }
+    )
+    assert registry.raw_entry_by_root(root) is not None
+
+
+def test_unparseable_json_raises_corrupt_metadata(tmp_path: Path) -> None:
+    """The one thing that *is* fatal, because there is nothing to salvage and silently
+    reporting "no workspaces" would look like the file was already imported."""
+    path = registry.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(CorruptMetadata):
+        registry.read_registry()
+
+
+def test_a_non_object_top_level_raises(tmp_path: Path) -> None:
+    path = registry.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[]", encoding="utf-8")
+    with pytest.raises(CorruptMetadata):
+        registry.read_registry()
+
+
+# ------------------------------------------------------------------- read-only
+
+
+def test_nothing_here_writes_the_index(tmp_path: Path) -> None:
+    """The module is read-only now. This pins that: an index written by hand is
+    byte-identical after every read path has run over it, and a machine with no index
+    never grows one."""
+    root = tmp_path / "ws"
+    rows: dict[str, dict[str, object]] = {"ws_aaaaaaaaaaaaaaaa": {"name": "W", "root": str(root)}}
+    path = _write_index(rows)
+    before = path.read_bytes()
+
+    registry.read_registry()
+    registry.list_entries()
+    registry.raw_entry_by_root(root)
+
+    assert path.read_bytes() == before
+    assert not [name for name in dir(registry) if name in {"register", "remove", "index_workspace"}]
+
+
+def test_the_index_path_follows_the_user_config(tmp_path: Path) -> None:
+    """It sits beside the user ``config.toml``, so the test isolation that redirects
+    ``XDG_CONFIG_HOME`` covers this file too."""
+    assert registry.registry_path().parent == (tmp_path / "xdg-home" / "dgml")
+    assert registry.registry_path().name == "workspaces.json"

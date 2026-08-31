@@ -232,7 +232,6 @@ def test_workspace_meta_roundtrip_and_org_fallback(tmp_path: Path) -> None:
     assert ws.display_name == "dgml-workspace"
 
     ws.write_meta(name="My Workspace", organization="Acme")
-    assert ws.meta_path == ws.root / "workspace.json"
     assert ws.read_meta() == {"name": "My Workspace", "organization": "Acme"}
     assert ws.organization == "Acme"
     assert ws.display_name == "My Workspace"

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from dgml_core import layout
 from dgml_core.storage import Workspace
 from dgml_core.usage import (
     UsageEvent,
@@ -23,6 +24,8 @@ from dgml_core.usage import (
     read_events,
     record_usage,
 )
+
+from .conftest import local_tree_path
 
 # ---------------------------------------------------------------------------
 # record_usage + read_events
@@ -77,7 +80,7 @@ def test_read_events_returns_empty_when_missing(workspace: Workspace) -> None:
 def test_read_events_tolerates_corrupt_lines(workspace: Workspace) -> None:
     """A truncated tail from a crash-mid-append must not break readers
     for the entire file."""
-    path = workspace.usage_log_path
+    path = local_tree_path(workspace, layout.USAGE_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(

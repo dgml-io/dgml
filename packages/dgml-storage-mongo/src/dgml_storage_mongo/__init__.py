@@ -18,18 +18,26 @@
   GridFS bucket.
 - :class:`~dgml_storage_mongo.combined.MongoGridFSStore` — both roles on one
   database.
+- :class:`~dgml_storage_mongo.workspaces.MongoWorkspacesStore` — the *list of
+  workspaces* and each one's ``config.toml``. A different kind of thing from the three
+  above: those hold one workspace's data, this holds the set of workspaces a machine
+  can open, so two machines pointed at it share one list.
 """
 
-from ._client import MONGO_URI_ENV
+from ._client import MONGO_URI_ENV, WORKSPACES_URI_ENV
 from .combined import MongoGridFSStore
 from .gridfs_store import CHUNK_BYTES, DEFAULT_BUCKET, MongoGridFSBlobStore
 from .store import MongoDocStore
+from .workspaces import DEFAULT_COLLECTION, MongoWorkspacesStore
 
 __all__ = [
     "CHUNK_BYTES",
     "DEFAULT_BUCKET",
+    "DEFAULT_COLLECTION",
     "MONGO_URI_ENV",
+    "WORKSPACES_URI_ENV",
     "MongoDocStore",
     "MongoGridFSBlobStore",
     "MongoGridFSStore",
+    "MongoWorkspacesStore",
 ]

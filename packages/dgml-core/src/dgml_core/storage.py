@@ -43,43 +43,107 @@ class Workspace:
     Resolve a workspace with :meth:`Workspace.resolve`. Use the path
     properties (``docset_dir``, ``file_dir``, …) instead of building paths
     by hand so the on-disk layout stays in one place.
+
+    ``root`` and ``config_override`` are independent axes: ``root`` is where the
+    workspace's data lives (for a local store) and the anchor everything else hangs
+    off; ``config_override`` points :attr:`config_path` at a ``config.toml`` kept
+    somewhere other than inside ``root``.
+
+    ``workspaces_id`` set means this workspace is **held in the machine's store of
+    workspaces** (:mod:`dgml_core.workspaces_store`) rather than addressed by path, so
+    its ``config.toml`` is read from and written to that store. It is stored as an
+    **id, not a live store object**, deliberately: this is a frozen dataclass with
+    ``eq=True``, and a networked store holds a client that must not end up inside
+    ``__eq__`` — nor be constructed once per ``Workspace``.
     """
 
     root: Path
+    config_override: Path | None = None
+    workspaces_id: str | None = None
 
     @classmethod
-    def resolve(cls, override: Path | str | None = None) -> Workspace:
+    def resolve(
+        cls, override: Path | str | None = None, *, config: Path | None = None
+    ) -> Workspace:
         """Resolve a workspace from ``override`` (the ``--workspace`` value), then
         ``$DGML_HOME``, then ``./dgml-workspace``.
 
-        ``override`` may be a **path** or a **workspace id**: if it exactly matches
-        a registered id, the workspace opens at that entry's recorded root;
-        otherwise it is treated as a path (unchanged behaviour). Ids are opaque
-        ``ws_…`` slugs, so they never collide with a real path a user would type.
+        ``override`` may be a **path** or a **workspace id**. An id (``ws_`` + 16
+        base32 chars — no separator, no dot, no uppercase) is looked up in the machine's
+        store of workspaces; anything else is a path. ``$DGML_HOME`` takes either too,
+        so a container can name a workspace rather than a directory. A directory whose
+        name happens to be id-shaped is still addressable as ``./ws_…``, which fails the
+        id test on the ``./``.
+
+        ``config`` (the ``--workspace-config`` value) points at a ``config.toml``
+        outside the workspace directory. It applies only to a workspace addressed by
+        path — a workspace listed in the store has its config *in* that store, so
+        pointing elsewhere could only be a mistake, and is refused.
         """
         if override is not None:
-            from . import registry  # lazy: registry imports storage helpers
-
-            entry = registry.get(str(override))
-            if entry is not None and entry.root is not None:
-                return cls(root=Path(entry.root).resolve())
+            resolved = cls._from_workspaces_store(str(override), config)
+            if resolved is not None:
+                return resolved
             root = Path(override).expanduser().resolve()
         elif ENV_VAR in os.environ and os.environ[ENV_VAR].strip():
-            root = Path(os.environ[ENV_VAR]).expanduser().resolve()
+            env_value = os.environ[ENV_VAR].strip()
+            resolved = cls._from_workspaces_store(env_value, config)
+            if resolved is not None:
+                return resolved
+            root = Path(env_value).expanduser().resolve()
         else:
             root = (Path.cwd() / DEFAULT_DIR_NAME).resolve()
-        return cls(root=root)
+        return cls(root=root, config_override=config)
 
-    def local_path(self, key: str) -> Path:
-        """The on-disk location a store key would occupy under this root.
+    @classmethod
+    def _from_workspaces_store(cls, value: str, config: Path | None) -> Workspace | None:
+        """``value`` resolved through the machine's store of workspaces, or ``None`` when
+        it is not an id at all and should be treated as a path.
 
-        The single filesystem escape hatch: pair it with a
-        :mod:`dgml_core.layout` key builder so a real path and the key naming the
-        same data cannot drift apart. Domain code addresses data by **key**
-        through ``store`` and does not need this; it exists for the few things
-        that genuinely require a path (reading the user's source file, test
-        fixtures that build a tree directly). Meaningful only for a local store."""
-        return self.root / key.rstrip("/")
+        The id test is on **shape** (:func:`dgml_core.workspace_id.is_workspace_id`), not
+        on what the store happens to hold. That matters: the old test asked "is this
+        string in the index", so the same argument could mean a workspace on one machine
+        and a directory to create on another. With a shape test, an id-shaped argument
+        the store does not know is an error — which is almost always what the caller
+        wants to hear, rather than having a ``ws_…`` directory appear in the current
+        working directory.
+
+        Raises :class:`~dgml_core.errors.WorkspaceNotFound` for an unknown id, and
+        :class:`~dgml_core.errors.InvalidArgument` if a config override is combined with
+        one."""
+        from .workspace_id import is_workspace_id
+
+        if not is_workspace_id(value):
+            return None
+
+        from .errors import InvalidArgument, WorkspaceNotFound
+        from .workspaces_resolve import default_workspaces_store
+
+        if config is not None:
+            raise InvalidArgument(
+                f"a workspace config cannot be supplied for {value}: its config lives in "
+                f"the machine's store of workspaces, which is where that workspace was "
+                f"found. Address the workspace by path to use your own config file."
+            )
+        store = default_workspaces_store()
+        if not store.exists(value):
+            raise WorkspaceNotFound(f"no workspace {value} in {store.label()}")
+
+        # The store answers where the workspace's files are, including honouring a
+        # `workspace_path` its config declares. Asking it — rather than parsing the
+        # config here — is what keeps one answer: `root` anchors every path property, so
+        # if it disagreed with the store then `is_initialized()` and the store would be
+        # looking in two different places.
+        return cls(root=store.workspace_root(value).resolve(), workspaces_id=value)
+
+    # There is deliberately no key→path or path→key helper here any more.
+    # ``local_path`` and ``blob_key`` were the "filesystem escape hatch", and by the
+    # time every caller went through ``blobs``/``docs`` they had no production callers
+    # at all — only tests reaching into ``LocalStore``'s tree. Keeping them would have
+    # made ``root`` look load-bearing when it is not, and each is one edit away from
+    # being wrong for a workspace whose data is not on this machine. A caller with a
+    # genuine need for a real path uses ``blobs.materialize`` / ``blobs.working_dir``,
+    # which work on every backend. See issue #129.
 
     @property
     def docsets_dir(self) -> Path:
@@ -96,22 +160,12 @@ class Workspace:
         safe to delete."""
         return self.root / layout.CACHE_DIR / layout.EMBEDDINGS_DIR
 
-    def blob_key(self, path: Path) -> str:
-        """The store key naming ``path``, the inverse of :meth:`local_path`.
-
-        Pure path arithmetic (relative to this root, as POSIX) — it holds no
-        knowledge of the layout itself, so it stays correct as
-        :mod:`dgml_core.layout` evolves. For the filesystem-bound cases that
-        have a real path in hand and need the key for it."""
-        return path.resolve().relative_to(self.root).as_posix()
-
     # Naming workspace artifacts is :mod:`dgml_core.layout`'s job, not this
     # class's: a key is root-relative, so it does not need a workspace to exist.
     # Callers build one with a ``layout`` builder and hand it straight to
-    # ``store`` (``list_blobs`` / ``get_blob`` / …); the filesystem-bound few
-    # compose it with ``local_path``. Prefer the ``layout.*_prefix`` spelling for
-    # anything prefix-matched — the trailing slash is what keeps ``files/ab``
-    # from also selecting ``files/abc``.
+    # ``store`` (``list_blobs`` / ``get_blob`` / …). Prefer the ``layout.*_prefix``
+    # spelling for anything prefix-matched — the trailing slash is what keeps
+    # ``files/ab`` from also selecting ``files/abc``.
 
     def read_page_text(self, file_id: str, page: int) -> dict[str, Any] | None:
         """The per-page word-box JSON for ``page`` of ``file_id`` (a blob),
@@ -133,49 +187,124 @@ class Workspace:
 
     @property
     def config_path(self) -> Path:
-        """Optional per-workspace ``config.toml`` (resolution layer 3). Overrides
-        keys from the user-level ``~/.config/dgml/config.toml``; absent in the
-        common case where the user config suffices."""
-        return self.root / layout.CONFIG_FILE
+        """Where this workspace's ``config.toml`` sits **on the filesystem** —
+        ``config_override`` when set, else ``<root>/config.toml``.
+
+        Only meaningful for a workspace addressed by path. One held in the machine's
+        store of workspaces has its config *in that store*, which for a networked
+        backend is not a file at all — use :attr:`config_text` to read it and
+        :attr:`config_location` to name it in a message.
+
+        The config carries the workspace's ``[workspace]`` identity block and its
+        ``[storage]`` binding (see :mod:`dgml_core.workspace_config`), and overrides
+        keys from the user-level ``~/.config/dgml/config.toml`` for every other
+        section. It is the bootstrap artifact — never read through :attr:`docs`,
+        because it names the store."""
+        return self.config_override or self.root / layout.CONFIG_FILE
+
+    #: Where :attr:`_config_state` keeps its memo, for the store-backed case only.
+    _CONFIG_CACHE_KEY = "_config_state_cache"
 
     @property
-    def usage_log_path(self) -> Path:
-        return self.root / layout.USAGE_FILE
+    def _config_state(self) -> tuple[str | None, int | None]:
+        """This workspace's ``config.toml`` text and its revision token, or
+        ``(None, None)`` when it has no config yet.
+
+        **Memoized only when the config is held in the machine's store of workspaces**,
+        where reading it may be a network round trip and a single command asks several
+        times over (``read_identity``, ``read_storage_table``,
+        ``verify_storage_fingerprint``, and two migrations). A config that is a local
+        file is re-read each time instead: the read is cheap, always-fresh is what every
+        caller has always had, and it means there is no staleness rule to remember for
+        the common case.
+
+        The memo is an optimization, never semantics — reading fresh is always correct.
+        Where it does apply, a write through
+        :func:`dgml_core.workspace_config.write_config_text` refreshes it in place, so a
+        write-then-read inside one command stays coherent; code that writes the config
+        by some other route must re-open the ``Workspace``, the same rule that already
+        applies to ``store_configs``."""
+        from . import workspace_config
+
+        if self.workspaces_id is None:
+            return workspace_config.read_config_state(self)
+        # `is None` rather than a falsy test: a cached "(None, None)" — a workspace the
+        # store has no config for — must not be re-fetched on every access.
+        cached: tuple[str | None, int | None] | None = self.__dict__.get(self._CONFIG_CACHE_KEY)
+        if cached is None:
+            cached = workspace_config.read_config_state(self)
+            self.__dict__[self._CONFIG_CACHE_KEY] = cached
+        return cached
 
     @property
-    def meta_path(self) -> Path:
-        """The workspace identity file (``workspace.json``): its ``name`` and
-        ``organization``. Written by ``dgml workspace create``. The
-        organization is what docset namespace URIs embed
-        (``http://dgml.io/<organization>/<DocSetSlug>``)."""
-        return self.root / layout.WORKSPACE_FILE
+    def config_text(self) -> str | None:
+        """This workspace's ``config.toml`` as text, or ``None`` if it has none."""
+        return self._config_state[0]
+
+    @property
+    def config_revision(self) -> int | None:
+        """The revision token that came with :attr:`config_text`, to be handed back on
+        write so a shared backend can reject a lost update. ``None`` from a backend that
+        issues none."""
+        return self._config_state[1]
+
+    @property
+    def config_present(self) -> bool:
+        """Whether this workspace has a ``config.toml`` at all.
+
+        Replaces ``config_path.exists()``: for a workspace held in a store of
+        workspaces there is no path to stat, and an initialized workspace with no config
+        is a hard error either way (the file names its storage backend and cannot be
+        reconstructed)."""
+        return self.config_text is not None
+
+    @property
+    def config_location(self) -> str:
+        """Where this workspace's config lives, for error messages and payloads.
+
+        A filesystem path when the workspace is addressed by path, or when the store of
+        workspaces keeps its configs as files; otherwise the store plus the id. Never a
+        synthetic path — telling a user to restore a file that does not exist from backup
+        is worse than telling them nothing."""
+        if self.workspaces_id is None:
+            return str(self.config_path)
+        from .workspaces_resolve import default_workspaces_store
+
+        return default_workspaces_store().config_location(self.workspaces_id)
+
+    # ``usage_log_path`` and ``meta_path`` are gone too. The usage log is appended
+    # through ``docs.append_doc(Collection.USAGE, …)`` and ``workspace.json`` is read
+    # and written through ``docs`` (see :meth:`read_meta` / :meth:`write_meta`), so
+    # both were paths to files that only exist when the backend happens to be local
+    # disk. Neither had a production caller.
 
     @functools.cached_property
-    def _store_configs(self) -> tuple[StorageConfig, StorageConfig]:
+    def store_configs(self) -> tuple[StorageConfig, StorageConfig]:
         """The effective ``(blob_cfg, doc_cfg)`` pair this workspace opens with.
 
-        Cached so registry + config resolution happens **once per workspace**
-        rather than once per role. That work is not cheap and is identical for
-        both roles: ``resolve_store_configs`` re-reads ``workspaces.json`` once
-        per registry entry, and ``load_merged_config`` rebuilds a fresh
-        ``BaseSettings`` subclass and re-reads both ``config.toml`` layers on
-        every call. Resolving the pair together halves it for every workspace,
-        local or remote."""
-        from . import registry
+        Cached so config resolution happens **once per workspace** rather than once
+        per caller. That work is not cheap and is identical for both roles:
+        ``load_merged_config`` rebuilds a fresh ``BaseSettings`` subclass and re-reads
+        both ``config.toml`` layers on every call. The seal check
+        (:func:`~dgml_core.storage_resolve.verify_storage_fingerprint`) shares this
+        cache, so verifying costs nothing a store build would not have paid anyway.
 
-        return registry.resolve_store_configs(self)
+        **Memoized on first access.** Code that writes a workspace's ``[storage]``
+        binding must do so before touching this (or :attr:`blobs` / :attr:`docs`), or
+        it pins the pre-write pair for the life of the object."""
+        from .storage_resolve import resolve_store_configs
+
+        return resolve_store_configs(self)
 
     @functools.cached_property
     def blobs(self) -> BlobStore:
         """The workspace's **blob** backend (page images, PDFs, XML, schemas).
 
-        For a **registered** workspace the non-secret identity comes from its
-        registry entry's snapshot (authoritative and self-contained), with secrets
-        merged from the named ``config.toml`` template; an **unregistered**
-        workspace falls back to the bundled local-disk store (zero config). See
-        :func:`dgml_core.registry.resolve_store_configs`. All blob data flows through
-        this rather than the filesystem directly, so it can live on any pluggable
-        backend.
+        The backend comes from the workspace's own ``config.toml`` — see
+        :func:`dgml_core.storage_resolve.resolve_store_configs` — falling back to the
+        bundled local-disk store when it configures none (zero config). All blob data
+        flows through this rather than the filesystem directly, so it can live on any
+        pluggable backend.
 
         **Cached for the lifetime of this ``Workspace``.** Caching works on this
         frozen dataclass because ``cached_property`` writes straight into
@@ -184,13 +313,12 @@ class Workspace:
         precedence."""
         from .storage_resolve import make_blob_store
 
-        return make_blob_store(self._store_configs[0])
+        return make_blob_store(self.store_configs[0])
 
     @functools.cached_property
     def docs(self) -> DocStore:
         """The workspace's **document** backend (manifests, page text, assignments,
-        usage). See :attr:`blobs` for the registered/unregistered resolution and
-        caching notes.
+        usage). See :attr:`blobs` for the resolution and caching notes.
 
         When both roles resolve to the **same backend** this *is* :attr:`blobs` —
         one instance, constructed once, so a provider serving both roles holds a
@@ -204,7 +332,7 @@ class Workspace:
         from .storage_resolve import make_doc_store
         from .storage_service import DocStore
 
-        blob_cfg, doc_cfg = self._store_configs
+        blob_cfg, doc_cfg = self.store_configs
         if blob_cfg == doc_cfg:
             store = self.blobs
             if isinstance(store, DocStore):
@@ -267,7 +395,13 @@ class Workspace:
 
     def has_legacy_json_config(self) -> bool:
         """True when a pre-migration ``config.json`` is present but the new
-        ``config.toml`` is not — used to surface a clear upgrade error."""
+        ``config.toml`` is not — used to surface a clear upgrade error.
+
+        Deliberately two filesystem stats rather than :attr:`config_present`: this asks
+        "is this *directory* a pre-TOML workspace", which is inherently a question about
+        a directory, and it runs precisely when the config machinery may not be
+        trustworthy yet. A memoized answer would also make it order-dependent for the
+        one caller that writes a config and asks again."""
         return (self.root / "config.json").exists() and not self.config_path.exists()
 
 

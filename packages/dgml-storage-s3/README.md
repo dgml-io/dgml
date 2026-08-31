@@ -35,7 +35,7 @@ blobs in S3.
 
 This is not stylistic. `dgml_core.storage_resolve` decides what is a secret by
 **substring match on the option name** (`key`, `secret`, `token`, `password`,
-`credential`); anything else is persisted to the plaintext workspace registry. If
+`credential`); anything else is persisted to the workspace's plaintext `config.toml`. If
 you add an inline-credential option, its name must contain one of those
 substrings.
 

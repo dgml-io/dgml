@@ -21,6 +21,8 @@ from typing import Any
 import pytest
 from dgml_core.pages import GS_BINARIES
 from dgml_core.storage import Workspace
+from dgml_core.workspaces_resolve import default_workspaces_store
+from dgml_core.workspaces_store import WORKSPACES_ENV_VAR
 
 
 def _toml_scalar(value: Any) -> str:
@@ -130,8 +132,24 @@ def _write_text_pdf(path: Path, pages_text: list[str]) -> None:
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> Workspace:
+    """An initialized workspace shaped like one ``dgml workspace create`` produced.
+
+    The identity block matters: the CLI treats a missing ``config.toml`` on an
+    initialized workspace as a hard error, because an absent config is
+    indistinguishable from "this was a remote workspace whose config was deleted".
+    A fixture without one would exercise a state the CLI never creates."""
+    from dgml_core import workspace_config
+
     ws = Workspace(root=tmp_path / "ws")
     ws.init()
+    workspace_config.write_identity(
+        ws,
+        workspace_id="ws_fixturexxxxxxxxx",
+        name=ws.root.name,
+        organization=ws.root.name,
+        storage_service="default",
+    )
+    ws.write_meta(name=ws.root.name, organization=ws.root.name, workspace_id="ws_fixturexxxxxxxxx")
     return ws
 
 
@@ -256,11 +274,30 @@ def _stub_add_links(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every CLI test from an empty directory.
+
+    ``Workspace.resolve``'s last fallback is ``./dgml-workspace`` relative to the
+    *current* directory, and pytest runs from the repo root — where a gitignored
+    ``dgml-workspace/`` exists. So a test that forgets ``--workspace`` silently operated
+    on the developer's own workspace and passed for the wrong reason. That is exactly how
+    the bare-``create``-then-bare-command gap shipped unnoticed.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the user-level config (``~/.config/dgml``) at an empty tmp dir so the
-    merged-config loader never reads the developer's real config. Tests that
-    exercise ``dgml init`` write into this isolated location."""
+    """Point the user-level config (``~/.config/dgml``) and the machine's store of
+    workspaces (``~/dgml-workspaces``) at empty tmp dirs.
+
+    Tests that exercise ``dgml init`` write into the isolated config location. The
+    workspaces half is what keeps ``dgml workspace create`` — which now lands in that
+    store by default — out of the developer's home directory. ``cache_clear()`` is
+    required because the resolved store is memoized per process."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-home"))
+    monkeypatch.setenv(WORKSPACES_ENV_VAR, str(tmp_path / "dgml-workspaces"))
+    default_workspaces_store.cache_clear()
 
 
 @pytest.fixture(autouse=True)

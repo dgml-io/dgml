@@ -28,7 +28,7 @@ from dgml_core.errors import (
 from dgml_core.files import FileStore
 from dgml_core.storage import Workspace
 
-from .conftest import needs_gs
+from .conftest import local_tree_path, needs_gs
 
 
 def _page_pngs(ws: Workspace, file_id: str) -> list[str]:
@@ -182,7 +182,7 @@ def test_corrupt_file_metadata_does_not_crash(workspace: Workspace) -> None:
     # dict (can't write invalid JSON) and put_blob refuses a document key. This is
     # a LocalStore-specific failure mode (the manifest is a JSON file that get_doc
     # parses); local_path is the sanctioned filesystem escape for such fixtures.
-    workspace.local_path(f"{layout.file_prefix(fid)}file.json").write_text(
+    local_tree_path(workspace, f"{layout.file_prefix(fid)}file.json").write_text(
         "{not valid json", encoding="utf-8"
     )
     report = check_workspace(workspace)
@@ -197,7 +197,7 @@ def test_corrupt_docset_metadata_does_not_crash(workspace: Workspace) -> None:
     workspace.blobs.put_blob(f"docsets/{did}/extraction-schema.rnc", b"start = text\n")
     # Corrupt manifest on disk — LocalStore-specific; see
     # test_corrupt_file_metadata_does_not_crash for the rationale.
-    workspace.local_path(f"{layout.docset_prefix(did)}docset.json").write_text(
+    local_tree_path(workspace, f"{layout.docset_prefix(did)}docset.json").write_text(
         "{not valid json", encoding="utf-8"
     )
     report = check_workspace(workspace)
@@ -217,7 +217,7 @@ def test_corrupt_metadata_alongside_clean_continues_walk(
     workspace.blobs.put_blob(f"files/{bad}/report.pdf", b"%PDF-1.4\n")
     # Corrupt manifest on disk — LocalStore-specific; see
     # test_corrupt_file_metadata_does_not_crash for the rationale.
-    workspace.local_path(f"{layout.file_prefix(bad)}file.json").write_text(
+    local_tree_path(workspace, f"{layout.file_prefix(bad)}file.json").write_text(
         "{not json", encoding="utf-8"
     )
     workspace.blobs.put_blob(f"files/{good}/report.pdf", b"%PDF-1.4\n")  # blob-orphan: no manifest

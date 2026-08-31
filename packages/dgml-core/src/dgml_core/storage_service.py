@@ -62,11 +62,11 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 from . import layout
-from .errors import StorageConfigInvalid
 from .hashing import sha256_file
+from .provider import ProviderConfigFields
 
 
 @dataclass(frozen=True)
@@ -86,30 +86,20 @@ class StorageConfig:
     options: Mapping[str, Any] = field(default_factory=dict)
 
 
-class _StoreBase(ABC):
+class _StoreBase(ProviderConfigFields, ABC):
     """Config machinery shared by :class:`BlobStore` and :class:`DocStore`.
 
     Subclasses declare ``config_fields`` — the JSON keys they accept under a
     ``storage`` sub-table besides the universal ``provider`` — and are rejected for
-    any other key by :meth:`_check_no_extra_fields` (catches typos and stale
-    fields). A concrete class may implement one interface (an S3 blob store) or
-    both (``LocalStore``); it provides one ``parse_config`` / ``__init__`` either
-    way.
+    any other key by :meth:`~dgml_core.provider.ProviderConfigFields._check_no_extra_fields`
+    (catches typos and stale fields). A concrete class may implement one interface (an
+    S3 blob store) or both (``LocalStore``); it provides one ``parse_config`` /
+    ``__init__`` either way.
+
+    The field machinery itself lives in :class:`~dgml_core.provider.ProviderConfigFields`,
+    shared with the ``[workspaces]`` providers; the defaults there already name this
+    section, so nothing needs restating.
     """
-
-    name: ClassVar[str]
-    config_fields: ClassVar[frozenset[str]] = frozenset()
-
-    @classmethod
-    def _check_no_extra_fields(cls, options: Mapping[str, Any]) -> None:
-        """Raise :class:`StorageConfigInvalid` for any option key not in
-        ``cls.config_fields``."""
-        unknown = set(options) - cls.config_fields
-        if unknown:
-            raise StorageConfigInvalid(
-                f"unknown fields in 'storage' for provider {cls.name!r}: "
-                f"{sorted(unknown)}. Allowed: {sorted(cls.config_fields)}"
-            )
 
     @classmethod
     @abstractmethod

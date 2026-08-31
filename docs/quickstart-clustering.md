@@ -49,9 +49,17 @@ dgml init --provider anthropic             # write ~/.config/dgml/config.toml
 dgml workspace create --organization Acme  # create the workspace
 ```
 
-`DGML_HOME` is optional — without it, pass `--workspace ./dgml-workspace`
-to every command, or `dgml` will fall back to a `./dgml-workspace`
-folder relative to the current directory.
+`DGML_HOME` is what makes the bare commands below work: with it set,
+`workspace create` builds the workspace at that path, and every later
+command resolves the same path. It is not optional in *this* recipe —
+drop it and `workspace create` puts the workspace in the machine's store
+of workspaces instead (`dgml workspace list` shows it), which the bare
+commands below would not find.
+
+Two other ways to get the same result: give `create` the path explicitly
+(`dgml workspace create ./dgml-workspace …`), after which the
+`./dgml-workspace` fallback finds it; or work by id, passing
+`--workspace <ws_id>` to each command.
 
 ## 3. Ingest a folder of PDFs
 

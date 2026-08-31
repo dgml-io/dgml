@@ -9,6 +9,7 @@ reference for anyone writing their own.
 | `MongoDocStore` | documents | manifests, assignments, extraction stats, the usage log — one collection each |
 | `MongoGridFSBlobStore` | blobs | a GridFS bucket |
 | `MongoGridFSStore` | both | the two above, on one database |
+| `MongoWorkspacesStore` | the *list of* workspaces | one document per workspace, holding its `config.toml` |
 
 `MongoDocStore` is a near-direct delegation: `DocStore` was modelled on the
 MongoDB collection API, so nearly every method is one line. The blob store has
@@ -53,19 +54,110 @@ Omit a role's subtable to leave it on local disk.
 | `mongo_port` | no | `27017` |
 | `mongo_bucket` | no | `blobs` — blob stores only |
 
+## The list of workspaces
+
+`MongoWorkspacesStore` is a different kind of thing from the three above. Those hold
+**one workspace's data**; this holds **the set of workspaces a machine can open**, and
+each one's `config.toml`. Point two machines at one database and they share one list —
+`dgml --workspace ws_…` opens the same workspace on a laptop and in CI, with no config
+file passed between them.
+
+```toml
+# ~/.config/dgml/config.toml — the USER config, not a workspace's
+[workspaces]
+provider = "dgml_storage_mongo:MongoWorkspacesStore"
+mongo_host = "localhost"
+mongo_database = "dgml_workspaces"
+mongo_collection = "dgml_workspaces"   # optional
+```
+
+Read only from the user config: this store is what *finds* a workspace, so a workspace
+cannot be allowed to redefine it. `[workspaces]` in a workspace's own `config.toml` is
+ignored.
+
+One document per workspace, `_id` = its `workspace_id`:
+
+```javascript
+{
+  _id:         "ws_7qxdm2pjk3n5rwts",
+  config_toml: "…verbatim UTF-8 text…",   // AUTHORITATIVE
+  revision:    7,                          // compare-and-swap token
+  name:         "Acme Contracts",          // ↓ derived, regenerated on every write
+  organization: "acme",
+  storage_service: "bym",
+  created_at: "2026-08-26T18:04:11Z",
+  updated_at: ISODate(…),
+  schema_version: 1
+}
+```
+
+**The config is one verbatim string, not parsed sub-documents** — and not because
+parsing would be inconvenient. It does not work: TOML's bare local date
+(`d = 2026-01-01`) parses to a `datetime.date`, which BSON refuses to encode at all,
+and an offset datetime comes back with microseconds truncated and the zone normalized.
+Both are legal in a `[generation]` or `[ocr]` override, so a parsed-BSON store would
+**reject a valid config.toml**. Beyond that, dgml owns no TOML *writer* to round-trip
+back through (`workspace_config._toml_value` raises rather than guess), nothing queries
+inside a config, and text is what keeps the promise that a user's comments and key
+order survive a write *identically on both backends*. A comment that survives on local
+disk and vanishes here is exactly the defect class this package exists to surface.
+
+The scalar fields are a **projection**, regenerated from the text on every write by
+shared base-class code so the two backends cannot describe a workspace differently.
+`dgml workspace list` is then one query with `config_toml` excluded. Deliberately *not*
+projected: `storage_fingerprint`, because a queryable copy of a seal invites comparing
+against the copy instead of the thing; and any path, because where a workspace's files
+sit is per-machine and a shared column recording it is the mistake the old
+`workspaces.json` index made.
+
+### Why this store needs a revision and the local one does not
+
+A config is written **read-modify-write over the whole text**. So a lost update here
+does not drop the field being written — it discards the other machine's `[storage]`
+table, `[models]` edits and comments, and the result still parses. The old per-machine
+index tolerated interleaved writes because its rows were a cache; that argument does not
+transfer to authority.
+
+Every write is therefore conditional on the revision that was read, and a mismatch
+raises `WORKSPACES_WRITE_CONFLICT` rather than overwriting. `updated_at` is for humans
+and ordering only and must **never** be the predicate — see the GridFS notes below on
+what millisecond-resolution timestamps do to a comparison.
+
+### Reachability
+
+Every command needs the configured Mongo to be reachable. For `mongo_host = "localhost"`
+that means "is mongod running", which fails immediately and obviously. For a managed
+cluster it means `dgml workspace list` fails off-VPN. There is deliberately **no cache
+of the config text**: it names the storage backend, so serving a stale copy could open a
+workspace against the wrong backend and write there silently — and the seal cannot catch
+that, because the fingerprint lives inside the config, so a stale config and its own
+stale fingerprint agree perfectly.
+
 ## Credentials
 
 **Never put credentials in DGML config.** Mongo reads `DGML_MONGO_URI` if set (the
 full connection string, including any credentials); otherwise it connects to
-`mongo_host:mongo_port` with no auth. All three providers share this, and it
+`mongo_host:mongo_port` with no auth. All four providers share this, and it
 accepts any URI pymongo does — `mongodb+srv://…`, auth, TLS — so a managed
 cluster is only a different address.
 
 This is not stylistic. `dgml_core.storage_resolve` decides what is a secret by
 **substring match on the option name** (`key`, `secret`, `token`, `password`,
-`credential`); anything else is persisted to the plaintext workspace registry. An
+`credential`); anything else is persisted to the workspace's plaintext `config.toml`. An
 option named `mongo_uri` holding `mongodb://admin:hunter2@host` matches none of
 them, so the password would be written out in the clear.
+
+`MongoWorkspacesStore` checks `DGML_WORKSPACES_MONGO_URI` first, then falls back to
+`DGML_MONGO_URI`. Two variables rather than one because a URI is used verbatim, before a
+database is selected, so a single one cannot express both a workspace's data credentials
+and the workspaces store's — which matters because that collection holds every
+workspace's storage bindings, i.e. a map of your infrastructure, and Mongo's roles are
+per-database. Keep it in its own database.
+
+Note that the "config is likely committed or synced" argument does not apply to
+`[workspaces]`, since it lives in the user's own config. The conclusion is unchanged
+anyway: `_SECRET_HINTS` is *fingerprint* machinery and nothing hashes these options, so
+an inline URI would buy no protection at all — it would simply be a password in a file.
 
 ## Blobs in a document database
 

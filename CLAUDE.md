@@ -148,7 +148,11 @@ A DGML *workspace* is a directory holding `docsets/` and `files/`. The
 manages CRUD over these primitives.
 
 - Workspace root resolution: `--workspace` flag → `$DGML_HOME` →
-  `./dgml-workspace`.
+  `./dgml-workspace`. The first two take a filesystem path **or** a `ws_…` id, looked
+  up in the machine's *store of workspaces* (`~/dgml-workspaces/` by default, or one
+  MongoDB shared across machines). `dgml workspace create` with no path creates the
+  workspace there rather than at `./dgml-workspace`, which is now only a lookup
+  fallback for workspaces that already exist.
 - The CLI is designed for both humans and LLM agents — JSON-default
   output, structured error envelopes on stderr, no interactive prompts.
 - Full on-disk format: [docs/storage-layout.md](../docs/storage-layout.md).

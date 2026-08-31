@@ -162,9 +162,11 @@ Run the commands below against your existing workspace. Either export
 export DGML_HOME=/path/to/your/dgml-workspace
 ```
 
-…or pass `--workspace /path/to/your/dgml-workspace` to each command. Without
-either, `dgml` falls back to a `./dgml-workspace` folder in the current
-directory.
+…or pass `--workspace /path/to/your/dgml-workspace` to each command, which also
+accepts a `ws_…` id from `dgml workspace list`. Without either, `dgml` falls back
+to a `./dgml-workspace` folder in the current directory — which finds one that is
+already there, but no longer creates one: `dgml workspace create` with no path puts
+the workspace in the machine's store of workspaces.
 
 ## 10. Check your wallet on-chain
 

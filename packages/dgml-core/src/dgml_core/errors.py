@@ -118,9 +118,50 @@ class StorageProviderUnresolvable(DgmlError):
     code = "STORAGE_PROVIDER_UNRESOLVABLE"
 
 
+class WorkspacesConfigInvalid(DgmlError):
+    """The ``[workspaces]`` table — the machine's store of workspaces — is malformed,
+    or a provider was handed an option it does not accept."""
+
+    code = "WORKSPACES_CONFIG_INVALID"
+
+
+class WorkspaceNotFound(NotFoundError):
+    """``--workspace <ws_id>`` named an id the machine's store of workspaces does not
+    hold. Deliberately an error rather than a fallthrough to path resolution: an id
+    has a distinctive shape (:func:`dgml_core.workspace_id.is_workspace_id`), so a
+    caller that typed one meant a workspace, not a directory to create."""
+
+    code = "WORKSPACE_NOT_FOUND"
+
+
+class WorkspacesUnavailable(DgmlError):
+    """The machine's store of workspaces could not be reached.
+
+    Its own code because it is the ordinary operational failure of a networked store —
+    the server is down, the host is wrong, the VPN is off — and every command needs that
+    store to find a workspace. Left as an ``INTERNAL_ERROR`` it arrives as a wall of
+    driver text with nothing actionable in it."""
+
+    code = "WORKSPACES_UNAVAILABLE"
+
+
+class WorkspacesWriteConflict(DgmlError):
+    """Another writer changed this workspace's ``config.toml`` since it was read.
+
+    Not a :class:`ConflictError` — that carries ``kind``/``existing_id`` for a
+    duplicate *file or docset*, which does not apply. A workspace's config is written
+    read-modify-write over the whole file text, so a lost update would discard the
+    other writer's ``[storage]`` table and comments, not merely the field being
+    written; a backend that can detect this raises rather than silently winning."""
+
+    code = "WORKSPACES_WRITE_CONFLICT"
+
+
 class StorageBackendMismatch(DgmlError):
-    """The live ``storage`` config differs from the store this workspace was
-    created with. Changing the store is a migration, not a config edit."""
+    """The ``[storage]`` config a workspace resolves differs from the
+    ``storage_fingerprint`` sealed in its ``config.toml`` — its data is on the
+    previously sealed backend. Moving a workspace's store is a migration, not a config
+    edit; ``dgml workspace reseal`` accepts an intentional change."""
 
     code = "STORAGE_BACKEND_MISMATCH"
 
