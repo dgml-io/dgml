@@ -85,13 +85,19 @@ def test_reasoning_disables_prefill_even_on_anthropic() -> None:
     """Extended thinking and prefill are mutually exclusive on Anthropic.
 
     Mirrors the gate in call_continued; kept as a test so the interaction is
-    documented somewhere executable.
+    documented somewhere executable. The model has to be one that prefills in
+    the first place, or the assertion passes for the wrong reason — hence
+    haiku-4-5 rather than sonnet-5, which refuses prefill outright (see
+    test_sonnet5_refuses_prefill_despite_being_anthropic).
     """
-    model = "anthropic/claude-sonnet-5"
+    model = "anthropic/claude-haiku-4-5"
     with_reasoning = LLMConfig(model=model, reasoning_effort="medium")
     without = LLMConfig(model=model)
     assert supports_assistant_prefill(model) and without.reasoning_effort is None
-    gate = lambda c: supports_assistant_prefill(c.model) and c.reasoning_effort is None
+
+    def gate(c: LLMConfig) -> bool:
+        return supports_assistant_prefill(c.model) and c.reasoning_effort is None
+
     assert gate(without)
     assert not gate(with_reasoning)
 

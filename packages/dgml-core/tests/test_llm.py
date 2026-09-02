@@ -479,9 +479,12 @@ def test_is_openai_model_rejects_other_providers(model: str) -> None:
     assert llm.is_openai_model(model) is False
 
 
-def test_prefill_supported_everywhere_except_openai() -> None:
+def test_prefill_supported_on_anthropic_but_not_openai_or_gemini() -> None:
     assert llm.supports_assistant_prefill("anthropic/claude-haiku-4-5") is True
-    assert llm.supports_assistant_prefill("gemini/gemini-2.5-flash") is True
+    # Gemini refuses a trailing model turn outright ("Requests ending with a
+    # model turn are not supported", 400) — see supports_assistant_prefill and
+    # test_prefill_support.py for what the earlier assumption cost.
+    assert llm.supports_assistant_prefill("gemini/gemini-2.5-flash") is False
     # Unrecognized ids (self-hosted, proxied) keep the prefill path — it is the
     # natural behaviour of an OpenAI-compatible server that just concatenates
     # the messages into a prompt.

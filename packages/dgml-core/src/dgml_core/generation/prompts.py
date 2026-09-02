@@ -78,9 +78,7 @@ def _variants() -> dict[str, dict[str, str]]:
         if unknown:
             # A typo here would silently do nothing, which is the failure mode
             # this whole mechanism exists to avoid. Fail at load instead.
-            raise ValueError(
-                f"prompt variant {variant!r} overrides unknown prompt(s): {unknown}"
-            )
+            raise ValueError(f"prompt variant {variant!r} overrides unknown prompt(s): {unknown}")
         out[str(variant)] = {str(k): str(v) for k, v in body.items()}
     return out
 

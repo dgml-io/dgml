@@ -35,8 +35,8 @@ def test_shipped_fewshot_variant_extends_the_baseline() -> None:
 
 def test_variant_only_overrides_what_it_names() -> None:
     # `fewshot` touches label_system; everything else must fall through.
-    assert prompts.get("transcribe_system", variant="fewshot") == prompts.get(
-        "transcribe_system"
+    assert prompts.get("transcribe_system_compact", variant="fewshot") == prompts.get(
+        "transcribe_system_compact"
     )
 
 

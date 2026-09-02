@@ -60,9 +60,6 @@ from dgml_core.migrations import (
 from dgml_core.models import DocSet
 from dgml_core.pages import DEFAULT_DPI
 from dgml_core.storage import (
-    ENV_VAR as WORKSPACE_ENV_VAR,
-)
-from dgml_core.storage import (
     API_KEY_ENV_VARS,
     Workspace,
     canonical_provider,
@@ -71,6 +68,9 @@ from dgml_core.storage import (
     read_json,
     user_config_path,
     write_user_config,
+)
+from dgml_core.storage import (
+    ENV_VAR as WORKSPACE_ENV_VAR,
 )
 from dgml_core.storage_resolve import (
     DEFAULT_STORAGE_PROVIDER,
@@ -3134,13 +3134,6 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # where the trailing-slash form would be a breaking change; nothing
     # prefix-matches on it.
     output_key = layout.docset_prefix(args.docset_id).rstrip("/")
-    # The same prefix resolved against the workspace root, echoed as the
-    # payload's ``output_dir``. Store-native keys are the real contract now, so
-    # this is a convenience for the default local backend only (on a remote
-    # store it names no directory that exists) — kept because ``output_dir`` is
-    # part of the published `docset generate` JSON, and dropping a documented
-    # field is a breaking change.
-    output_dir = ws.root / output_key
 
     # Resolve each assigned file into exactly one bucket so the summary counts
     # always sum to `total`: skipped (already converted), failed (source
