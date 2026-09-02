@@ -64,6 +64,9 @@ class PromptKey(StrEnum):
     CLUSTER_GROUPING_EXISTING_INTRO = "cluster_grouping_existing_intro"
     CLUSTER_GROUPING_INSTRUCTIONS = "cluster_grouping_instructions"
 
+    # Shared LLM dispatch
+    CONTINUE_TRUNCATED = "llm_continue_truncated"
+
 
 @lru_cache(maxsize=1)
 def _prompts() -> dict[str, str]:

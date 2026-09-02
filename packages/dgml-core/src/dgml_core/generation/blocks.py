@@ -26,6 +26,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from dgml_core.utils import xml_safe
+
 # Structures the model may emit (flat). Everything else is coerced to "p".
 FLAT_STRUCTURES = {"heading", "p", "item", "row", "field"}
 
@@ -157,17 +159,69 @@ class Block:
         return f"{self.lim} {self.text}".strip() if self.lim else self.text
 
 
+# Block fields that hold document text (a single string) and those that hold a
+# list of them. Used by :func:`xml_safe_block_dict` to sanitize a cached block
+# without enumerating the dataclass by hand at every call site.
+_TEXT_FIELDS: tuple[str, ...] = ("text", "lim", "label", "value", "role")
+_TEXT_LIST_FIELDS: tuple[str, ...] = ("cells", "options", "checked")
+
+
+def xml_safe_block_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Sanitize the text fields of a serialized block, for the CACHE path.
+
+    :func:`parse_block` sanitizes model output as it arrives, but a blocks cache
+    written before that existed — or by any other producer — is deserialized
+    straight into :class:`Block` without passing through it. Re-rendering such a
+    document (which an incremental run does whenever the concept roster moved)
+    then hands lxml a character it cannot serialize, and because the re-render
+    happens OUTSIDE the per-file error boundary it takes the whole
+    ``docset generate`` down as an INTERNAL_ERROR — after the newly-converted
+    documents were already written.
+
+    Entity spans are offsets into ``text``. Sanitizing can only shorten it, so
+    when a block carries spans AND its text changed, the spans no longer
+    describe the string they were measured against and are dropped rather than
+    silently pointing a few characters off. A blocks cache is written
+    pre-labeling, so in practice there are none.
+    """
+    out = dict(raw)
+    text_changed = False
+    for key in _TEXT_FIELDS:
+        value = out.get(key)
+        if isinstance(value, str):
+            cleaned = xml_safe(value)
+            if key == "text" and cleaned != value:
+                text_changed = True
+            out[key] = cleaned
+    for key in _TEXT_LIST_FIELDS:
+        value = out.get(key)
+        if isinstance(value, list):
+            out[key] = [xml_safe(v) if isinstance(v, str) else v for v in value]
+    if text_changed and out.get("entities"):
+        out["entities"] = []
+    return out
+
+
 def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
-    """Validate/coerce one model-emitted block dict; ``None`` drops it."""
+    """Validate/coerce one model-emitted block dict; ``None`` drops it.
+
+    Every string is passed through :func:`~dgml_core.utils.xml_safe` here, at
+    the boundary where model output becomes structured data, so nothing
+    downstream — span offsets, coverage tokens, grounding, the renderer — ever
+    sees a character that cannot be serialized into the DGML. Doing it here
+    rather than at render time keeps the renderer's guarantee that its text is
+    byte-identical to the transcript: there is only ever one version of the
+    string.
+    """
     structure = str(raw.get("structure", "")).strip().lower()
     if structure not in FLAT_STRUCTURES:
         structure = "p"
-    text = str(raw.get("text", "") or "")
-    cells = [str(c) for c in raw.get("cells", []) or []]
-    label = str(raw.get("label", "") or "")
-    value = str(raw.get("value", "") or "")
-    options = [str(o).strip() for o in raw.get("options", []) or [] if str(o).strip()]
-    checked = [str(c).strip() for c in raw.get("checked", []) or [] if str(c).strip()]
+    text = xml_safe(str(raw.get("text", "") or ""))
+    cells = [xml_safe(str(c)) for c in raw.get("cells", []) or []]
+    label = xml_safe(str(raw.get("label", "") or ""))
+    value = xml_safe(str(raw.get("value", "") or ""))
+    options = [o for o in (xml_safe(str(x)).strip() for x in raw.get("options", []) or []) if o]
+    checked = [c for c in (xml_safe(str(x)).strip() for x in raw.get("checked", []) or []) if c]
     if options:
         # a selection can only be one of the PRINTED choices — a checked
         # entry outside the options is a hallucinated mark and is dropped
@@ -176,7 +230,7 @@ def parse_block(raw: dict[str, Any], block_id: str) -> Block | None:
         value = checked[0]
     # A lim alone is content: numbered-but-untitled headings ("6.4.1" + body)
     # must survive, or the sub-section they open is silently flattened.
-    lim = str(raw.get("lim", "") or "").strip()
+    lim = xml_safe(str(raw.get("lim", "") or "")).strip()
     if not text and not cells and not (label or value) and not options and not lim:
         return None
     try:

@@ -132,6 +132,35 @@ def test_init_provider_flag_forces_table(
     assert "gemini/" in user_config_path().read_text(encoding="utf-8")
 
 
+def test_init_provider_openai_writes_openai_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dgml_core.storage import user_config_path
+
+    rc = main(_ws_args(tmp_path / "ws") + ["init", "--provider", "openai"])
+    assert rc == 0
+    assert _read_stdout(capsys)["provider"] == "openai"
+    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
+
+
+def test_init_auto_detects_openai_from_its_key_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With only OPENAI_API_KEY set, auto-detection resolves to `openai`."""
+    from dgml_core.storage import user_config_path
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-dummy")
+
+    rc = main(_ws_args(tmp_path / "ws") + ["init"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["provider"] == "openai"
+    assert payload["detected_keys"] == ["OPENAI_API_KEY"]
+    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
+
+
 def test_init_provider_without_force_does_not_clobber(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2019,19 +2048,34 @@ def test_docset_generate_cache_dir_and_debug_threading(
     assert _run([], ["--cache-dir", str(explicit)]).cache_dir == explicit
 
 
-def test_docset_generate_has_no_model_flags() -> None:
-    """The model is config-only — there are no --model / --label-model flags, so
-    which model runs is a single per-workspace choice (config.toml), matching
-    every other model-consuming command. Passing the removed flags is rejected."""
+def test_docset_generate_model_flags_default_to_config() -> None:
+    """The workspace 'generation' config is still the default source: the model
+    flags parse and default to None (no override), so a plain run is unchanged.
+    --generation-config / --model / --label-model let a run name an explicit
+    model config without hand-editing config.toml."""
     from dgml.cli import _build_parser
 
     args = _build_parser().parse_args(["docset", "generate", "somedocset"])
-    assert not hasattr(args, "model")
-    assert not hasattr(args, "label_model")
-    with pytest.raises(SystemExit):
-        _build_parser().parse_args(["docset", "generate", "d", "--model", "x"])
-    with pytest.raises(SystemExit):
-        _build_parser().parse_args(["docset", "generate", "d", "--label-model", "x"])
+    assert args.generation_config is None
+    assert args.model is None
+    assert args.label_model is None
+
+    args = _build_parser().parse_args(
+        [
+            "docset",
+            "generate",
+            "d",
+            "--generation-config",
+            "fast",
+            "--model",
+            "anthropic/claude-haiku-4-5",
+            "--label-model",
+            "anthropic/claude-sonnet-4-6",
+        ]
+    )
+    assert args.generation_config == "fast"
+    assert args.model == "anthropic/claude-haiku-4-5"
+    assert args.label_model == "anthropic/claude-sonnet-4-6"
 
 
 @needs_gs
@@ -2088,10 +2132,103 @@ def test_docset_generate_models_from_config(
     with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
         rc = main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"])
     assert rc == 0
-    capsys.readouterr()
+    payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
     assert opts.model == "anthropic/claude-haiku-4-5"
     assert opts.label_model == "anthropic/claude-sonnet-4-6"
+    # The effective models are recorded in the output so the choice is visible.
+    assert payload["models"] == {
+        "model": "anthropic/claude-haiku-4-5",
+        "label_model": "anthropic/claude-sonnet-4-6",
+        "source": "config",
+    }
+
+
+@needs_gs
+def test_docset_generate_model_flags_override_config(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--model / --label-model override the workspace config for the run, and the
+    override (and its source) is recorded in the output's `models` block."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    Workspace(root=ws).config_path.write_text(
+        dump_toml(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-4-5",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        rc = main(
+            _ws_args(ws)
+            + [
+                "docset",
+                "generate",
+                did,
+                "--no-coverage",
+                "--label-model",
+                "anthropic/claude-opus-4-8",
+            ]
+        )
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    opts = mock_batch.call_args.kwargs["options"]
+    assert opts.model == "anthropic/claude-haiku-4-5"  # unchanged
+    assert opts.label_model == "anthropic/claude-opus-4-8"  # overridden
+    assert payload["models"] == {
+        "model": "anthropic/claude-haiku-4-5",
+        "label_model": "anthropic/claude-opus-4-8",
+        "source": "override",
+    }
+
+
+@needs_gs
+def test_docset_generate_profile_without_config(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--generation-config <profile> runs against a bundled model config even
+    when the workspace config.toml has no 'generation' section — the whole point
+    of the flag. The profile name is recorded as the source."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    # No 'generation' section written to config.toml.
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        rc = main(
+            _ws_args(ws)
+            + ["docset", "generate", did, "--no-coverage", "--generation-config", "fast"]
+        )
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    opts = mock_batch.call_args.kwargs["options"]
+    assert opts.model == opts.label_model  # fast tier: same cheap model for both
+    assert payload["models"]["source"] == "profile:fast"
 
 
 @needs_gs
@@ -2848,7 +2985,8 @@ def _generate_with_xml(
         on_output("contract.pdf", xml)
         return {}
 
-    # generate reads the models from config.toml's 'generation' section (no flags).
+    # generate reads the models from config.toml's 'generation' section by
+    # default (this run passes no override flags).
     # Real-provider model strings so the pre-flight check (get_llm_provider)
     # accepts them; convert_batch is mocked, so no call is ever made. The dummy
     # ANTHROPIC_API_KEY from conftest satisfies the pre-flight key check.

@@ -16,8 +16,27 @@ The PDF→DGML pipeline uses two models — ``model`` (per-page transcription) a
 ``label_model`` (the batch-wide semantic-labeling call). Each is optional here:
 when unset it falls back to a tier from the ``[models]`` block (transcription →
 ``standard``, labeling → ``advanced``). Setting the per-task field overrides the
-tier. There is no CLI flag: ``docset generate`` reads its models solely from the
-merged config. Mirrors :func:`dgml_core.grounded.load_grounded_config`.
+tier. By default ``docset generate`` reads its models solely from the merged
+config (:func:`load_generation_config`). Mirrors
+:func:`dgml_core.grounded.load_grounded_config`.
+
+Two supported ways run ``docset generate`` against an explicit model config
+without hand-editing ``config.toml`` (see :func:`resolve_generation_config`),
+mirroring the ``dgml cluster --config PRESET|PATH`` precedent:
+
+* ``--generation-config PROFILE|PATH`` — a bundled named profile
+  (:data:`GENERATION_PROFILES`) or a path to a standalone JSON config file.
+* ``--model`` / ``--label-model`` — per-run string overrides layered on top.
+
+Both are applied as the merged config's highest-precedence layer
+(``load_merged_config(cli_overrides=...)``), so they override the keys they name
+while the rest of the resolution is unchanged: unnamed keys (e.g. a workspace
+``api_key_env``) survive, and a model neither the overlay nor the config names
+still falls back to its ``[models]`` tier.
+
+Both keep the model choice visible/recorded: a profile/file is a checked-in,
+named artifact, and the effective models (plus a ``source`` label recording
+where they came from) are echoed into the ``docset generate`` JSON output.
 
 The two models can name different providers (e.g. the default ``mixed`` config
 uses Anthropic for transcription and Gemini for labeling), so each carries its
@@ -29,8 +48,12 @@ themselves carry no credentials.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
+from importlib import resources
+from pathlib import Path
+from typing import Any
 
 from dgml_core.config import load_merged_config
 from dgml_core.errors import (
@@ -72,11 +95,13 @@ class GenerationConfig:
     label_api_base: str | None = None
 
 
-def load_generation_config(workspace: Workspace) -> GenerationConfig:
-    """Resolve the two generation models (transcription, labeling) and their
-    credentials from the merged config's ``[generation]`` section and ``[models]``
-    tiers (``standard`` for transcription, ``advanced`` for labeling)."""
-    merged = load_merged_config(workspace)
+def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
+    """Resolve both generation models out of an already-merged config mapping.
+
+    Shared by :func:`load_generation_config` and :func:`resolve_generation_config`
+    so the workspace path and the ``--generation-config`` / ``--model`` /
+    ``--label-model`` override path validate and tier-resolve identically.
+    """
     transcribe = resolve_tiered_model(
         merged,
         section_name=ConfigSection.GENERATION,
@@ -109,6 +134,135 @@ def load_generation_config(workspace: Workspace) -> GenerationConfig:
         label_api_key_env=label.api_key_env,
         label_api_base=label.api_base,
     )
+
+
+def load_generation_config(workspace: Workspace) -> GenerationConfig:
+    """Resolve the two generation models (transcription, labeling) and their
+    credentials from the merged config's ``[generation]`` section and ``[models]``
+    tiers (``standard`` for transcription, ``advanced`` for labeling)."""
+    return _resolve_from_merged(load_merged_config(workspace))
+
+
+# Bundled, named generation profiles — each a checked-in ``generation`` overlay
+# using model ids already referenced by the project. ``fast`` runs the cheap tier
+# for both passes; ``balanced`` matches the shipped default (Haiku transcription +
+# Sonnet labeling); ``quality`` escalates both. Selected by name via
+# ``--generation-config <name>``; a name that is NOT one of these is treated as a
+# file path instead. Kept deliberately small — model ids drift, so the config file
+# remains the primary source of truth.
+GENERATION_PROFILES: tuple[str, ...] = ("fast", "balanced", "quality")
+
+
+def load_generation_profile(name: str) -> dict[str, Any]:
+    """Load a bundled generation profile (``fast`` / ``balanced`` / ``quality``).
+
+    Returns the profile's ``generation``-section dict (same shape as the
+    ``[generation]`` section of ``config.toml``). Raises
+    :class:`GenerationConfigInvalid` for an unknown profile name.
+    """
+    if name not in GENERATION_PROFILES:
+        raise GenerationConfigInvalid(
+            f"unknown generation profile {name!r}; choose one of "
+            f"{', '.join(GENERATION_PROFILES)}, or pass a path to a config JSON"
+        )
+    text = (resources.files("dgml_core") / f"generation_profile_{name}.json").read_text(
+        encoding="utf-8"
+    )
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise GenerationConfigInvalid(f"generation profile {name!r} is not a JSON object")
+    return data
+
+
+def load_generation_config_file(path: Path) -> dict[str, Any]:
+    """Read a standalone generation config JSON file (the ``--generation-config`` flag).
+
+    The file is a JSON object holding the same fields the ``[generation]`` section
+    of ``config.toml`` would (``model``, ``label_model``, optional
+    ``api_key`` / ``api_key_env`` / ``api_base`` and their ``label_*`` twins). For
+    convenience a full-config file wrapping the section under a top-level
+    ``"generation"`` key is also accepted (the section is unwrapped).
+
+    Raises :class:`GenerationConfigInvalid` when the file is missing, not valid
+    JSON, or not a JSON object. Field-level validation happens in
+    :func:`resolve_generation_config` via the shared tier resolution.
+    """
+    if not path.exists():
+        raise GenerationConfigInvalid(f"generation config file not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise GenerationConfigInvalid(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise GenerationConfigInvalid(f"{path} must contain a JSON object")
+    nested = data.get("generation")
+    return nested if isinstance(nested, dict) else data
+
+
+def resolve_generation_config(
+    workspace: Workspace,
+    *,
+    config: str | None = None,
+    model: str | None = None,
+    label_model: str | None = None,
+) -> tuple[GenerationConfig, str]:
+    """Resolve the effective generation config for a ``docset generate`` run.
+
+    Returns the validated :class:`GenerationConfig` and a human-readable
+    ``source`` label recording where it came from (echoed into the CLI JSON
+    output so the model choice stays visible/recorded).
+
+    Precedence, highest first:
+
+    1. ``model`` / ``label_model`` — the ``--model`` / ``--label-model`` flags.
+    2. ``config`` — the ``--generation-config`` flag: a bundled profile name in
+       :data:`GENERATION_PROFILES` (:func:`load_generation_profile`), otherwise a
+       path to a standalone config file (:func:`load_generation_config_file`).
+    3. The merged config — workspace ``config.toml`` > user config > ``[models]``
+       tiers, exactly as :func:`load_generation_config` resolves it.
+
+    1 and 2 are collapsed into one ``[generation]`` overlay handed to
+    :func:`~dgml_core.config.load_merged_config` as ``cli_overrides``, its
+    highest-precedence layer. So an overlay overrides the keys it names and
+    leaves the rest of the resolution intact — a workspace ``api_key_env`` still
+    applies, and a model the overlay doesn't name still falls back to its tier.
+    Passing both ``--model`` and ``--label-model`` therefore fully specifies the
+    models and works with no ``[generation]`` section at all.
+
+    With no ``config`` and no overrides this is exactly
+    :func:`load_generation_config` (so an unresolvable model still raises
+    :class:`GenerationConfigMissing`).
+
+    ``source`` is one of ``"config"``, ``"profile:<name>"``, ``"file"``, or
+    ``"override"``; a profile/file combined with a flag override reads
+    ``"profile:<name>+override"`` / ``"file+override"``.
+    """
+    if config is None and model is None and label_model is None:
+        return load_generation_config(workspace), "config"
+
+    if config is None:
+        overlay: dict[str, Any] = {}
+        base_source = "config"
+    elif config in GENERATION_PROFILES:
+        overlay = dict(load_generation_profile(config))
+        base_source = f"profile:{config}"
+    else:
+        overlay = dict(load_generation_config_file(Path(config)))
+        base_source = "file"
+
+    if model is not None:
+        overlay["model"] = model
+    if label_model is not None:
+        overlay["label_model"] = label_model
+
+    overridden = model is not None or label_model is not None
+    if base_source == "config":
+        source = "override" if overridden else "config"
+    else:
+        source = f"{base_source}+override" if overridden else base_source
+
+    merged = load_merged_config(workspace, cli_overrides={ConfigSection.GENERATION.value: overlay})
+    return _resolve_from_merged(merged), source
 
 
 def _resolve_key(literal: str | None, env_name: str | None, ref: str) -> str | None:

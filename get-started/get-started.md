@@ -258,6 +258,12 @@ uv run dgml docset generate <docset_id>
 ```
 This transcribes pages window-by-window, plans a shared semantic labeling schema, and writes namespaced `.dgml.xml` files for each document into `<workspace>/docsets/<docset_id>/files/<file_id>/<stem>.dgml.xml`.
 
+The models come from the `generation` section of your `config.json`. To try a different model config for a single run without editing `config.json`, pass a bundled profile or override a model directly — the effective models are recorded in the command's JSON output (`models` block):
+```bash
+uv run dgml docset generate <docset_id> --generation-config fast          # bundled: fast | balanced | quality
+uv run dgml docset generate <docset_id> --label-model anthropic/claude-opus-4-8
+```
+
 ---
 
 ## Phase 2: Automated Document Clustering

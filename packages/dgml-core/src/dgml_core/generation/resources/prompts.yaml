@@ -282,3 +282,149 @@
 
   Return JSON only: {"verdicts": [{"i": 0, "keep": true, "reason": "..."}]}
   Include one verdict per candidate index.
+
+# --------------------------------------------------------------------------
+# Prompt variants: partial overrides selected with $DGML_PROMPT_VARIANT.
+# A variant lists only the prompts it replaces; everything else stays baseline.
+# Used by the compass benchmark to A/B prompt wording as a measured axis.
+# --------------------------------------------------------------------------
+variants:
+  fewshot:
+    label_system: |
+      You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
+      belong to one document set; your single most important job is to use the
+      SAME concept for the same role across every block and every document.
+
+      REUSE BEFORE YOU COIN. A roster of concepts already in use is provided. For
+      EVERY block and entity, FIRST scan the roster for a concept whose role
+      matches what you are labeling — if one fits, use that name VERBATIM. Coin a
+      NEW concept ONLY when no roster entry fits the role. The roster should supply
+      most of your labels; coining a fresh concept for a role the roster already
+      covers is the most common and most damaging mistake you can make.
+
+      Concepts are PascalCase role names ("PaymentTerms", "CommencementDate",
+      "EquipmentName"). Name the ROLE, never the value: a concept must stay
+      correct if a different document filled it with different content.
+
+      Concept naming rules:
+      - NEVER include structural or discourse words ("Section", "Clause", "Item",
+        "Heading", "Paragraph", "List", "Title", "Text", "Block"): the block's
+        structure is recorded separately. "PaymentTerms", not "PaymentTermsClause".
+      - Be as SPECIFIC as the content supports: name what the content is about,
+        not its broad family. Prefer the precise role over an umbrella term.
+      - One concept names ONE role. If a heading covers several distinct topics,
+        pick the dominant role — never concatenate topics into one name.
+
+      Density rules:
+      - EVERY heading block gets a concept naming its section's role
+        ("RepairsAndMaintenance", "InsuranceObligations", "Definitions").
+        Never skip a heading.
+      - If a heading's TEXT is itself a value rather than a topic title, add an
+        entity quoting the whole heading text, with a concept naming that value-kind.
+      - Paragraphs get a concept when they carry an identifiable role
+        (a definition, an obligation, a notice clause); ordinary connective
+        prose stays unlabeled — that is the only category you may skip.
+      - Do NOT give a section heading, a heading nested inside it, and that
+        section's body all the SAME concept. Each names its own role — broader at
+        the top, narrower below; a body that only restates the section's topic
+        stays unlabeled rather than repeating the section's concept.
+      - Never use generic catch-alls ("section", "content", "paragraph", "misc").
+
+      Tables (row blocks) — for each row, also return:
+        "table": a name for the whole table (the kind of thing it holds, NO
+          "Table" in the name), the SAME for every row of that table; and
+        "cells": one concept per cell, in column order, each naming the kind of
+          value that column holds (what its header would be called).
+        When rows are records of the same kind (e.g. a column always holds a
+        name, the next always a price), every row gets the SAME "table",
+        the SAME row "concept", and the SAME per-column "cells" concepts —
+        consistency across rows is required. When the table instead pairs a
+        field with its value and each row is DIFFERENT information, the cell
+        concepts are specific to that row's value (they will differ between
+        rows) — name them by what each value is.
+        A single cell may pack MORE THAN ONE value into one column (for example an
+        identifier next to the name it labels). For such a cell, add an "entities"
+        list with one entry per value (each a verbatim quote + its own concept) —
+        the values are tagged inline inside the cell. Use "cells" for single-value
+        columns and "entities" for cells that carry several distinct values; a cell
+        may use either.
+
+      Lists (item blocks):
+        - Short, uniform items (a list of like things) all share ONE concept.
+        - Items that are full clauses/paragraphs each get their own specific
+          concept.
+
+      For blocks whose text contains atomic extractable values (dates, amounts,
+      durations, parties, identifiers), also add entities. Each entity is the
+      value QUOTED VERBATIM from the block's text: copy the complete value exactly
+      as printed — never a fragment of it, never surrounding words or punctuation
+      that are not part of the value, and never one value split across several
+      entities. If the same value string occurs more than once in the block, add
+      "occurrence": N (1-based) for the one you mean; otherwise omit it.
+
+      Entity concepts name the KIND OF VALUE — what a column header for that field
+      would be called — never the topic it belongs to:
+      - A block about a supplier contains values of different kinds: the supplier's
+        name is "SupplierName", its address "SupplierAddress", its registration
+        number "SupplierRegistrationNumber" — never all of them "Supplier".
+      - An entity concept must NEVER equal its block's concept — EXCEPT when the
+        entity's quote is the block's ENTIRE text (the block is itself only that one
+        value): then tag the block with that single concept and add no separate
+        entity. Otherwise the block concept names what the content is ABOUT and each
+        entity concept names the KIND of value it is. When a value would otherwise
+        take the block's own name, make the value's concept MORE SPECIFIC — name the
+        kind of value (an amount, a date, a rate, an identifier, …) — so the block
+        keeps its role and the value stays distinctly tagged.
+      - If a block is only a short label followed by its value (a "label: value"
+        line), the value carries the concept and the block stays unlabeled — tag the
+        value, not the whole line.
+      - An entity "quote" is always the VALUE text itself, never its caption or
+        label: in "Effective Date: March 1, 2022" the quote is "March 1, 2022" —
+        never "Effective Date". A caption with no value on the block gets no entity.
+      - Distinct value kinds in one block always get distinct concepts (a date is
+        never the same concept as an amount, a name never the same as an address).
+
+      Output JSON only:
+      {"labels": {"<block_id>": {"concept": "...",
+        "entities": [{"quote": "<exact substring>", "concept": "...",
+          "occurrence": <1-based; include ONLY when the same value string repeats
+          in the block, to pick which instance — omit otherwise>}]}}}
+      Every key must be a block id from the input. Label densely per the rules
+      above; omit only connective prose.
+
+      GRANULARITY — worked example (this calibrates HOW MANY concepts to emit).
+
+      Given these transcribed blocks from a clinical protocol:
+
+        h1   "2.3 Inclusion Criteria"
+        p    "Participants must be 18 to 65 years of age at screening."
+        item "Body mass index between 18.5 and 30.0 kg/m2."
+        item "Alcohol consumption below 14 units per week for females."
+        row  ["Alanine aminotransferase", "< 2.0 x ULN"]
+
+      CORRECT — one concept per distinct role, values tagged inline:
+
+        h1   -> InclusionCriteria
+        p    -> AgeRange             entity "18 to 65 years"      -> AgeRange
+        item -> BodyMassIndexRange   entity "18.5 and 30.0 kg/m2" -> BodyMassIndexLimit
+        item -> AlcoholLimitFemale   entity "14 units per week"   -> AlcoholLimit
+        row  -> LaboratoryThreshold  table LaboratoryCriteria
+                cells [LaboratoryAnalyte, LaboratoryLimit]
+
+      WRONG — too coarse. Collapsing distinct roles under one umbrella concept
+      loses every field a consumer would query:
+
+        h1 -> InclusionCriteria ; p -> InclusionCriteria ;
+        item -> InclusionCriteria ; item -> InclusionCriteria
+
+      WRONG — too fine. Naming the value instead of the role, or splitting one
+      value across concepts:
+
+        p -> ParticipantsMustBeEighteenToSixtyFive ;
+        item -> BMI_18_5 ; item -> BMI_30_0
+
+      Calibrate to the CORRECT column. Name each distinct role once, at the
+      specificity a downstream consumer would query it by ("AlcoholLimitFemale",
+      neither "InclusionCriteria" nor "AlcoholConsumptionBelowFourteenUnits").
+      If two adjacent blocks state DIFFERENT facts they get DIFFERENT concepts;
+      consolidating them is the more damaging error of the two.

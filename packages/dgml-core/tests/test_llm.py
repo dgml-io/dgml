@@ -441,6 +441,127 @@ def test_call_continued_single_call_when_not_truncated(
 
 
 # ---------------------------------------------------------------------------
+# OpenAI routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openai/gpt-5.4",
+        "openai/gpt-5.4-mini",
+        "openai/gpt-4.1",
+        "openai/o4-mini",
+        "gpt-5.4",
+        "o3",
+    ],
+)
+def test_is_openai_model_matches_openai_routed_ids(model: str) -> None:
+    assert llm.is_openai_model(model) is True
+    # The two provider predicates must never both claim a model — the cache and
+    # prefill rules key off them independently.
+    assert llm.is_anthropic_model(model) is False
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "anthropic/claude-sonnet-5",
+        "gemini/gemini-2.5-pro",
+        "ollama/llama3",
+        # Azure deployments of the same models are a different endpoint with
+        # their own quirks; nothing here has been validated against them, so
+        # they must not be silently routed down the OpenAI path.
+        "azure/gpt-5.4",
+    ],
+)
+def test_is_openai_model_rejects_other_providers(model: str) -> None:
+    assert llm.is_openai_model(model) is False
+
+
+def test_prefill_supported_on_anthropic_but_not_openai_or_gemini() -> None:
+    assert llm.supports_assistant_prefill("anthropic/claude-haiku-4-5") is True
+    # Gemini refuses a trailing model turn outright ("Requests ending with a
+    # model turn are not supported", 400) — see supports_assistant_prefill and
+    # test_prefill_support.py for what the earlier assumption cost.
+    assert llm.supports_assistant_prefill("gemini/gemini-2.5-flash") is False
+    # Unrecognized ids (self-hosted, proxied) keep the prefill path — it is the
+    # natural behaviour of an OpenAI-compatible server that just concatenates
+    # the messages into a prompt.
+    assert llm.supports_assistant_prefill("ollama/llama3") is True
+    assert llm.supports_assistant_prefill("openai/gpt-5.4") is False
+
+
+def test_call_continued_asks_openai_to_continue_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On OpenAI the partial gets an explicit continuation turn, not a bare prefill.
+
+    OpenAI reads a trailing assistant message as a *finished* turn and answers
+    afresh, so the Anthropic prefill trick re-emits the reply from the top and
+    the concatenation is garbage. The wrapper therefore appends a user turn
+    telling the model to resume. Without it this test's second call would look
+    identical to the Anthropic one.
+    """
+    import json
+
+    chunks = [
+        ('{"continues": "", "blocks": [{"structure": "p", "text": "a"}', "length"),
+        (', {"structure": "p", "text": "b"}]}', "stop"),
+    ]
+    seen: list[list[dict[str, Any]]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs["messages"])
+        return _obj_resp(*chunks[len(seen) - 1])
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+
+    out = llm.call_continued(
+        llm.LLMConfig(model="openai/gpt-5.4"),
+        system_prompt="SYS",
+        user_content=[{"type": "text", "text": "U"}],
+    )
+
+    assert json.loads(out)["blocks"] == [
+        {"structure": "p", "text": "a"},
+        {"structure": "p", "text": "b"},
+    ]
+    assert len(seen) == 2
+    assert [m["role"] for m in seen[0]] == ["system", "user"]
+    # The partial is still shown, followed by the instruction to resume it.
+    assert [m["role"] for m in seen[1]] == ["system", "user", "assistant", "user"]
+    assert seen[1][-2]["content"] == chunks[0][0]
+    assert "Continue it from exactly where it stopped" in seen[1][-1]["content"]
+
+
+def test_call_continued_sends_no_cache_markers_to_openai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`cache=True` is a no-op on OpenAI — litellm would reject the markers.
+
+    OpenAI caches stable prefixes implicitly, so there is nothing to ask for.
+    """
+    seen: list[list[dict[str, Any]]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        seen.append(kwargs["messages"])
+        return _obj_resp('{"blocks": []}', "stop")
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    llm.call_continued(
+        llm.LLMConfig(model="openai/gpt-5.4"),
+        system_prompt=("STATIC", "DYNAMIC"),
+        user_content=[{"type": "text", "text": "U"}],
+        cache=True,
+    )
+    dumped = repr(seen)
+    assert "cache_control" not in dumped
+    # The two halves of the split system prompt are simply concatenated.
+    assert seen[0][0]["content"] == "STATIC\nDYNAMIC"
+
+
+# ---------------------------------------------------------------------------
 # Auto-recording of usage from the call layer (gated on --debug via the config)
 # ---------------------------------------------------------------------------
 

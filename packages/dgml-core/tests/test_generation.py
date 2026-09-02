@@ -2483,3 +2483,143 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
     assert err is None  # RuntimeError is soft, not a reachability error
     assert calls["n"] == 2  # retried once, never split
     assert sum("labeling failed" in w for w in warnings) == 1
+
+
+# ---------------------------------------------------------------------------
+# XML-illegal characters in model output
+# ---------------------------------------------------------------------------
+
+
+def test_xml_safe_drops_only_what_xml_cannot_hold() -> None:
+    """Strip the unserializable; leave every legal character untouched."""
+    from dgml_core.utils import xml_safe
+
+    # Dropped: NUL, the non-whitespace C0 controls, and the xxFFFE/xxFFFF
+    # noncharacters on the BMP and an astral plane.
+    assert xml_safe("a\x00b\x0bc\x0cd\x1ee") == "abcde"
+    assert xml_safe("self\ufffemonitored") == "selfmonitored"
+    assert xml_safe("x\uffffy") == "xy"
+    assert xml_safe("p\U0010fffeq") == "pq"
+    # Kept: the three legal whitespace controls, accents, CJK, astral emoji,
+    # and U+FFFD (a real replacement character is content, not corruption).
+    kept = "tab\there\nnl\ré \u4e2d \U0001f600 \ufffd"
+    assert xml_safe(kept) == kept
+    assert xml_safe("") == ""
+
+
+def test_parse_block_strips_xml_illegal_characters_from_every_field() -> None:
+    """A noncharacter anywhere in a model block must not reach the renderer.
+
+    Regression: gpt-5.4-mini transcribed non-breaking hyphens as U+FFFE, and
+    lxml raises ValueError on assignment, which aborted the WHOLE `docset
+    generate` as an INTERNAL_ERROR — discarding the documents that had already
+    converted, not just the offending one.
+    """
+    from dgml_core.generation.blocks import parse_block
+
+    block = parse_block(
+        {
+            "structure": "field",
+            "text": "self\ufffemonitored",
+            "lim": "1\x0b.2",
+            "label": "Site\x00 ID",
+            "value": "AZ\uffff",
+            "cells": ["a\ufffeb", "plain"],
+            "options": ["yes\ufffe", "no"],
+            "checked": ["yes\ufffe"],
+        },
+        block_id="b0001",
+    )
+    assert block is not None
+    assert block.text == "selfmonitored"
+    assert block.lim == "1.2"
+    assert block.label == "Site ID"
+    assert block.value == "AZ"
+    assert block.cells == ["ab", "plain"]
+    # The checked entry still matches its option after both are sanitized —
+    # sanitizing one side only would silently drop the selection.
+    assert block.options == ["yes", "no"]
+    assert block.checked == ["yes"]
+
+
+def test_render_survives_a_noncharacter_end_to_end() -> None:
+    """The pipeline renders a document whose model output carried U+FFFE."""
+    from dgml_core.generation.blocks import parse_block
+    from dgml_core.generation.render import render_xml
+
+    blocks = [
+        b
+        for b in (
+            parse_block({"structure": "h", "text": "Study\ufffeDesign"}, "b0001"),
+            parse_block({"structure": "p", "text": "10-point self\ufffemonitored SMBG"}, "b0002"),
+        )
+        if b is not None
+    ]
+    xml = render_xml(blocks, doc_name="ClinicalTrial13.pdf")
+    assert "\ufffe" not in xml
+    assert "StudyDesign" in xml
+    assert "10-point selfmonitored SMBG" in xml
+
+
+def test_continuation_text_is_also_sanitized() -> None:
+    """The `continues` string is the other path from model output into a block."""
+    from dgml_core.generation.blocks import Block
+    from dgml_core.generation.transcribe import _append_continuation
+
+    blocks = [Block(id="b0001", structure="p", text="opening clause")]
+    _append_continuation(blocks, " and the\uffferemainder")
+    assert blocks[0].text == "opening clause and theremainder"
+
+
+def test_cached_blocks_are_sanitized_on_reload(tmp_path: Path) -> None:
+    """A blocks cache written before the sanitizer must not abort a re-render.
+
+    Regression: the fix in `parse_block` covers model output as it arrives, but
+    an incremental run re-renders already-converted documents from
+    `<stem>_blocks.json`, which deserializes straight into Block. A pre-existing
+    cache still carrying U+FFFE therefore still crashed — and because the
+    re-render sits outside the per-file error boundary, it took the whole
+    `docset generate` down AFTER the new documents had been written.
+    """
+    import json
+
+    from dgml_core.generation.render import render_xml
+    from dgml_core.generation.transcribe import _load_cached_blocks
+
+    (tmp_path / "Trial13_blocks.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "b0001",
+                    "structure": "item",
+                    "text": "10-point self\ufffemonitored blood glucose",
+                    "level": 1,
+                    "lim": "12.",
+                    "cells": [],
+                    "entities": [],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    blocks = _load_cached_blocks(tmp_path, "Trial13.pdf")
+    assert blocks is not None
+    assert blocks[0].text == "10-point selfmonitored blood glucose"
+    # The whole point: the reloaded blocks must survive a render.
+    assert "\ufffe" not in render_xml(blocks, doc_name="Trial13.pdf")
+
+
+def test_cached_entity_spans_are_dropped_only_when_the_text_shifts() -> None:
+    """Sanitizing shortens `text`, so stale offsets must not be kept."""
+    from dgml_core.generation.blocks import xml_safe_block_dict
+
+    span = {"start": 0, "end": 4, "concept": "Party"}
+    shifted = xml_safe_block_dict(
+        {"id": "b1", "structure": "p", "text": "Acme\ufffeCorp", "entities": [span]}
+    )
+    assert shifted["text"] == "AcmeCorp"
+    assert shifted["entities"] == []
+    intact = xml_safe_block_dict(
+        {"id": "b2", "structure": "p", "text": "Acme Corp", "entities": [span]}
+    )
+    assert intact["entities"] == [span]

@@ -1,0 +1,4 @@
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "label_model": "anthropic/claude-opus-4-8"
+}

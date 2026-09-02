@@ -62,13 +62,16 @@ The `[models]` block names four tiers — `light`, `standard`, `advanced`,
 `expert` — that back the per-task models (classification/style, transcription/
 text-extraction, labeling/value-extraction, schema-generation respectively).
 
-- **`--provider {anthropic,google,mixed}`:** write that provider's
+- **`--provider {anthropic,google,mixed,openai}`:** write that provider's
   default `[models]` table. Omit to **auto-detect** from the API-key env vars
-  that are set (both `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` → `mixed`; one of
-  them → that provider). Only presence is checked, not validity. With no keys, a
-  commented-out `[models]` placeholder is written. (Other providers such as
-  OpenAI are still usable by setting an explicit `<provider>/<model>` in the
-  config; they simply have no curated default table or key auto-detection.)
+  that are set: both `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` → `mixed`; either
+  one alone → that provider; `OPENAI_API_KEY` alone → `openai`. Only presence is
+  checked, not validity. `OPENAI_API_KEY` is checked **last**, so adding it to a
+  machine never changes what the other two keys already detected — pass
+  `--provider openai` to choose OpenAI where several keys are present. With no
+  keys, a commented-out `[models]` placeholder is written. (A provider with no
+  curated table — Azure OpenAI, Bedrock, a self-hosted endpoint — is still
+  usable by setting an explicit `<provider>/<model>` per tier or per task.)
 - **`--force`:** overwrite an existing `config.toml` (backing it up to
   `config.toml.bak` first). Without `--force`, a present file is **never**
   clobbered — a re-run with `--provider` but no `--force` is a no-op whose
@@ -623,7 +626,7 @@ dgml docset add-file <file_id> --docset <docset_id>   # auto-extracts when the
                                                      # DocSet has an extraction schema
 dgml docset remove-file <file_id> --docset <docset_id>
 dgml docset list-files <docset_id>
-dgml docset generate <docset_id> [--window-size <n>] [--max-tokens <n>] [...]
+dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <id>] [--label-model <id>] [--window-size <n>] [--max-tokens <n>] [...]
 ```
 
 `docset delete` removes the DocSet and its file-assignment markers, but
@@ -836,6 +839,7 @@ per-item `results`, each carrying a `status`), matching the bulk `file add`:
   "docset_id": "p9pjusnwg50l",
   "docset_name": "Q2 contracts",
   "summary": { "total": 3, "converted": 2, "skipped": 1, "failed": 0 },
+  "models": { "model": "anthropic/claude-haiku-4-5", "label_model": "anthropic/claude-sonnet-4-6", "source": "config" },
   "rerendered": [],
   "output_key": "docsets/p9pjusnwg50l",
   "coverage_report": "docsets/p9pjusnwg50l/coverage_report.json",
@@ -845,6 +849,13 @@ per-item `results`, each carrying a `status`), matching the bulk `file add`:
   ]
 }
 ```
+
+`models` records the effective transcription/labeling models actually used for
+the run and a `source` recording where they came from — `config` (workspace
+`generation` section), `profile:<name>` or `file` (from `--generation-config`),
+`override` (from `--model`/`--label-model`), or a combination such as
+`profile:fast+override`. This keeps the model choice visible/recorded in the
+run's own output, not just in `config.json`.
 
 `summary` counts always sum to `total`: every assigned file lands in exactly
 one of `converted` / `skipped` / `failed`. A per-file problem does not abort
