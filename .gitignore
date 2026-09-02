@@ -246,4 +246,4 @@ dgmlx-receipts/
 # The .bak is written by `dgml init --refresh`.
 local_config.json
 local_config.json.bak
-samples/
+samples//schema.rnc
