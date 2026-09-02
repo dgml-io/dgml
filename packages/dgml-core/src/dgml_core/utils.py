@@ -20,11 +20,58 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 
 from . import layout
 from .docsets import DocSetStore
 from .files import FileStore
 from .storage import Workspace
+
+# Every code point XML 1.0 forbids in character data, as lxml enforces it:
+# the C0 controls except tab/LF/CR, the surrogate range (which cannot appear in
+# well-formed text at all), and the ``xxFFFE``/``xxFFFF`` noncharacters on every
+# plane. U+FDD0-U+FDEF are the other Unicode noncharacters; lxml accepts them,
+# so they are deliberately NOT matched here — this strips what cannot be
+# serialized, not what is merely unusual.
+_XML_ILLEGAL_RE = re.compile(
+    "["
+    "\x00-\x08\x0b\x0c\x0e-\x1f"
+    "\ud800-\udfff"
+    "\ufffe\uffff"
+    "]|[\U0001fffe\U0001ffff\U0002fffe\U0002ffff\U0003fffe\U0003ffff"
+    "\U0004fffe\U0004ffff\U0005fffe\U0005ffff\U0006fffe\U0006ffff"
+    "\U0007fffe\U0007ffff\U0008fffe\U0008ffff\U0009fffe\U0009ffff"
+    "\U000afffe\U000affff\U000bfffe\U000bffff\U000cfffe\U000cffff"
+    "\U000dfffe\U000dffff\U000efffe\U000effff\U000ffffe\U000fffff"
+    "\U0010fffe\U0010ffff]"
+)
+
+
+def xml_safe(text: str) -> str:
+    """Drop the characters XML cannot represent, leaving everything else alone.
+
+    DGML's output is XML, so a code point XML 1.0 forbids is not a rendering
+    inconvenience — the document containing it can never be serialized. lxml
+    raises ``ValueError: All strings must be XML compatible`` the moment such a
+    character is assigned to element text or an attribute, which aborts the
+    whole ``docset generate`` (an INTERNAL_ERROR, not a per-file failure) and
+    loses the documents that had already converted.
+
+    Models do emit them. gpt-5.4-mini transcribed the non-breaking hyphens in a
+    clinical-protocol corpus as U+FFFE ("self<FFFE>monitored"), which is a
+    noncharacter, and took the docset down with it. Nothing is recoverable from
+    such a character — it carries no text — so it is dropped rather than
+    substituted: any stand-in would be a guess at what the page really said,
+    and would show up as content in a format whose whole claim is that its text
+    is the document's text.
+
+    Applied where model output first becomes structured data
+    (:func:`dgml_core.generation.blocks.parse_block`), so block text, entity
+    span offsets, coverage tokenization, grounding, and the renderer all agree
+    on one string. Sanitizing at render time instead would break the renderer's
+    invariant that its text is byte-identical to the transcript.
+    """
+    return _XML_ILLEGAL_RE.sub("", text)
 
 
 def gather_file_pages(workspace: Workspace, file_id: str, max_pages: int) -> list[bytes]:

@@ -62,13 +62,16 @@ The `[models]` block names four tiers — `light`, `standard`, `advanced`,
 `expert` — that back the per-task models (classification/style, transcription/
 text-extraction, labeling/value-extraction, schema-generation respectively).
 
-- **`--provider {anthropic,google,mixed}`:** write that provider's
+- **`--provider {anthropic,google,mixed,openai}`:** write that provider's
   default `[models]` table. Omit to **auto-detect** from the API-key env vars
-  that are set (both `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` → `mixed`; one of
-  them → that provider). Only presence is checked, not validity. With no keys, a
-  commented-out `[models]` placeholder is written. (Other providers such as
-  OpenAI are still usable by setting an explicit `<provider>/<model>` in the
-  config; they simply have no curated default table or key auto-detection.)
+  that are set: both `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` → `mixed`; either
+  one alone → that provider; `OPENAI_API_KEY` alone → `openai`. Only presence is
+  checked, not validity. `OPENAI_API_KEY` is checked **last**, so adding it to a
+  machine never changes what the other two keys already detected — pass
+  `--provider openai` to choose OpenAI where several keys are present. With no
+  keys, a commented-out `[models]` placeholder is written. (A provider with no
+  curated table — Azure OpenAI, Bedrock, a self-hosted endpoint — is still
+  usable by setting an explicit `<provider>/<model>` per tier or per task.)
 - **`--force`:** overwrite an existing `config.toml` (backing it up to
   `config.toml.bak` first). Without `--force`, a present file is **never**
   clobbered — a re-run with `--provider` but no `--force` is a no-op whose

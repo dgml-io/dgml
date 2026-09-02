@@ -123,18 +123,51 @@ def test_detect_provider() -> None:
     assert detect_provider({"ANTHROPIC_API_KEY": "x", "GEMINI_API_KEY": "y"}) == "mixed"
     assert detect_provider({"ANTHROPIC_API_KEY": "x"}) == "anthropic"
     assert detect_provider({"GEMINI_API_KEY": "y"}) == "google"
+    assert detect_provider({"OPENAI_API_KEY": "z"}) == "openai"
     assert detect_provider({}) is None
-    # OpenAI is not an auto-detected provider — its key alone yields no provider.
-    assert detect_provider({"OPENAI_API_KEY": "z"}) is None
-    # A recognized key wins even when an unrelated OpenAI key is also present.
-    assert detect_provider({"ANTHROPIC_API_KEY": "x", "OPENAI_API_KEY": "z"}) == "anthropic"
     # Blank values do not count as set.
     assert detect_provider({"ANTHROPIC_API_KEY": "   "}) is None
+    assert detect_provider({"OPENAI_API_KEY": "   "}) is None
+
+
+def test_detect_provider_checks_openai_last() -> None:
+    """An OPENAI_API_KEY never changes what the other two keys would detect.
+
+    The detection order is a contract: a machine that grew an OpenAI key must
+    keep resolving to the provider it resolved to before, or an existing
+    workspace silently re-provisions onto different models. `--provider openai`
+    is the way to ask for OpenAI where the other keys are also present.
+    """
+    assert detect_provider({"ANTHROPIC_API_KEY": "x", "OPENAI_API_KEY": "z"}) == "anthropic"
+    assert detect_provider({"GEMINI_API_KEY": "y", "OPENAI_API_KEY": "z"}) == "google"
+    assert (
+        detect_provider({"ANTHROPIC_API_KEY": "x", "GEMINI_API_KEY": "y", "OPENAI_API_KEY": "z"})
+        == "mixed"
+    )
 
 
 def test_detected_api_keys_report_order() -> None:
-    got = detected_api_keys({"GEMINI_API_KEY": "y", "ANTHROPIC_API_KEY": "x", "IGNORED": "q"})
-    assert got == ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+    got = detected_api_keys(
+        {
+            "OPENAI_API_KEY": "z",
+            "GEMINI_API_KEY": "y",
+            "ANTHROPIC_API_KEY": "x",
+            "IGNORED": "q",
+        }
+    )
+    assert got == ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"]
+
+
+def test_every_provider_is_reachable_by_auto_detection_or_a_flag() -> None:
+    """Each PROVIDER_MODELS key must be a legal `--provider` value.
+
+    `--provider` takes its choices from PROVIDER_MODELS, and canonical_provider
+    is what validates them, so a provider added to the table without a
+    round-trip through canonical_provider would be offered by argparse and then
+    rejected.
+    """
+    for provider in PROVIDER_MODELS:
+        assert canonical_provider(provider) == provider
 
 
 def test_canonical_provider_validates() -> None:

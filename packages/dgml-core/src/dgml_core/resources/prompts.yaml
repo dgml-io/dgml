@@ -390,3 +390,22 @@ cluster_grouping_instructions: |-
       - `key_questions`: 3-7 concrete, type-discriminating questions answerable from the first pages of this kind of document.
 
   Group by the underlying document type, not by surface appearance. Two documents belong in the SAME group whenever the same core questions could be answered from each — even if they differ in layout, length, section order, formatting, issuer, or which optional sections are present. Those are variations of one type, not separate types. Create a separate group only when a document answers a genuinely different set of questions (a different extraction schema). When two documents are borderline, put them TOGETHER. Prefer fewer, larger groups; do not split a type into sub-variants.
+
+# --- Shared LLM dispatch --------------------------------------------------
+# Sent by dgml_core.llm.call_continued to resume a reply the provider cut at
+# max_tokens, on providers that do NOT continue an assistant prefill (OpenAI
+# starts a fresh turn instead of extending the trailing assistant message, so
+# without this it re-emits the reply from the top and the concatenation is
+# garbage). The partial reply is still shown as the preceding assistant turn;
+# this only tells the model what to do with it.
+llm_continue_truncated: |-
+  Your previous reply was cut off because it hit the output-token limit.
+
+  Continue it from exactly where it stopped. Emit ONLY the remaining
+  characters, so that appending your reply directly to the text above
+  reconstructs the whole output verbatim.
+
+  Do not restart, do not re-emit any character you already produced, do not
+  re-open a code fence, and do not add any preamble, apology, or commentary.
+  If the cut landed mid-word, mid-token, or mid-string, resume mid-word — your
+  first character continues that word.

@@ -23,6 +23,15 @@ consistent:
   The wrapper drops ``reasoning_effort`` for Anthropic-routed models
   when ``tool_choice`` is forced; callers state what they want and the
   wrapper omits fields the provider would reject.
+- **Provider-aware message shaping.** Prompt-cache markers
+  (``cache_control``) are Anthropic-only, and continuing a length-truncated
+  reply by prefilling an assistant turn works on Anthropic ONLY. OpenAI treats
+  a trailing assistant message as a finished turn and starts a fresh reply;
+  Gemini refuses the request outright (``400``, "Requests ending with a model
+  turn are not supported"). Anthropic itself disallows prefill when extended
+  thinking is enabled. :func:`call_continued` asks explicitly for a
+  continuation in those cases (see :func:`supports_assistant_prefill`), so a
+  caller gets one coherent output on every provider.
 - **Usage telemetry.** The call functions record usage themselves: when a
   config carries a ``workspace`` and ``debug`` is set, each call appends one
   :class:`UsageEvent` to ``usage.jsonl`` (labelled by ``config.operation`` /
@@ -49,6 +58,8 @@ from typing import Any, cast
 import litellm
 
 from .errors import EmptyModelResponse, ModelNotSupported, now_iso, short_error_message
+from .prompts import PromptKey
+from .prompts import get as prompt
 from .storage import Workspace
 from .usage import (
     OUTCOME_ERROR,
@@ -68,12 +79,17 @@ from .usage import (
 litellm.suppress_debug_info = True
 
 # Providers disagree about which sampling knobs they accept: OpenAI's reasoning
-# families (gpt-5, o-series) reject any explicit ``temperature`` but 1, Anthropic
-# rejects it as deprecated on newer models, and litellm turns each mismatch into
-# a local ``UnsupportedParamsError`` instead of a call. Callers here state the
+# families (gpt-5, o-series) reject any explicit ``temperature`` but 1, and
+# Anthropic rejects it as deprecated on newer models. Callers here state the
 # decoding they want (extraction asks for 0.0 so the source-text → schema-slot
-# mapping is deterministic) and let litellm drop what the target model can't take,
-# rather than every call site tracking per-provider parameter support.
+# mapping is deterministic) rather than tracking per-provider support.
+#
+# `drop_params` handles most mismatches, but NOT reliably: it only drops a
+# parameter for models it has metadata for, and passes it through for one it does
+# not recognise. A new model release therefore fails closed at the provider —
+# gpt-5.5 lost 42 of 114 calls that way. So the two known-categorical rules are
+# enforced explicitly in `_build_completion_kwargs` and drop_params is the
+# backstop, not the mechanism.
 litellm.drop_params = True
 
 PDF_NATIVE_MODEL_PATTERNS = [
@@ -87,6 +103,44 @@ PDF_NATIVE_MODEL_PATTERNS = [
 ]
 
 ANTHROPIC_MODEL_PATTERNS = [r"claude", r"anthropic"]
+GEMINI_MODEL_PATTERNS = [r"gemini", r"vertex_ai", r"google"]
+
+# Anthropic models that refuse a prefilled assistant turn, despite prefill being
+# an Anthropic feature. Measured, not assumed: claude-sonnet-5 answers
+#
+#   400 "This model does not support assistant message prefill.
+#        The conversation must end with a user message."
+#
+# on the transcription path, which sets no `reasoning_effort` — so this is not
+# the documented thinking/prefill incompatibility, it is the model. It cost
+# 17-25% of documents in every claude-sonnet-5 transcriber draw, and because F1
+# is computed over the survivors the arm then scored *highest* of the sweep.
+# claude-haiku-4-5 prefills fine across thousands of calls, so this stays a
+# narrow list rather than a blanket rule.
+ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
+
+# OpenAI families that accept ONLY the default temperature (1). Prefix-matched
+# so future point releases are covered automatically; see
+# is_openai_reasoning_model().
+OPENAI_REASONING_MODEL_PATTERNS = [
+    r"gpt-5",
+    r"^o[1-9]\b",
+    r"^o[1-9]-",
+    r"/o[1-9]\b",
+    r"/o[1-9]-",
+]
+
+# Matches the model ids litellm routes to OpenAI's own API: the ``openai/``
+# prefix, plus the bare families litellm accepts without one (``gpt-5.4``,
+# ``o4-mini``, …). Deliberately NOT matched: ``azure/``-prefixed deployments of
+# the same models — Azure OpenAI is a different endpoint with its own quirks,
+# and nothing here has been validated against it.
+OPENAI_MODEL_PATTERNS = [
+    r"^openai/",
+    r"^gpt-",
+    r"^o[1-9]\b",
+    r"^o[1-9]-",
+]
 
 
 def is_model_reachability_error(exc: BaseException) -> bool:
@@ -118,6 +172,93 @@ def is_anthropic_model(model: str) -> bool:
     """
     m = model.lower()
     return any(re.search(p, m) for p in ANTHROPIC_MODEL_PATTERNS)
+
+
+def is_openai_model(model: str) -> bool:
+    """True when the model is routed to OpenAI's own API.
+
+    OpenAI differs from the other two providers in ways the wrapper has to
+    absorb rather than push onto callers: it will not extend a prefilled
+    assistant turn (see :func:`supports_assistant_prefill`), and it rejects
+    ``cache_control`` markers, which is why every marker in this module is
+    gated on :func:`is_anthropic_model` instead of "not OpenAI".
+
+    ``max_tokens`` → ``max_completion_tokens`` is left to litellm's own OpenAI
+    transformations. The ``temperature`` restriction is NOT — see
+    :func:`is_openai_reasoning_model`, which the kwarg builder consults directly
+    because ``drop_params`` was observed passing the parameter through for an
+    unrecognised model and losing the call.
+    """
+    m = model.lower()
+    return any(re.search(p, m) for p in OPENAI_MODEL_PATTERNS)
+
+
+def is_gemini_model(model: str) -> bool:
+    """True for Google Gemini / Vertex AI models."""
+    m = model.lower()
+    return any(re.search(p, m) for p in GEMINI_MODEL_PATTERNS)
+
+
+def is_openai_reasoning_model(model: str) -> bool:
+    """True for OpenAI families that accept only the default ``temperature``.
+
+    The gpt-5 line and the o-series reject an explicit temperature with a 400
+    rather than ignoring it. Matched by family prefix rather than by an
+    enumerated list of versions: a new ``gpt-5.x`` inherits the constraint, and
+    an allow-list would silently stop covering it the day it ships — which is
+    exactly how gpt-5.5 slipped through and lost 42 calls.
+    """
+    m = model.lower()
+    return any(re.search(p, m) for p in OPENAI_REASONING_MODEL_PATTERNS)
+
+
+def supports_assistant_prefill(model: str) -> bool:
+    """Can this provider *continue* a trailing assistant message?
+
+    Anthropic resumes generation from the exact end of a prefilled assistant
+    turn, which is what makes the cheap continuation in :func:`call_continued`
+    work: replay the partial reply as an assistant turn and concatenate what
+    comes back.
+
+    OpenAI does not. A trailing assistant message is read as a *completed*
+    turn, so the model answers afresh — it re-emits the reply from the top, and
+    concatenating that onto the partial yields duplicated, unparseable output.
+
+    **Gemini does not either, and refuses outright.** The API rejects any
+    request whose final message is a model turn::
+
+        400 INVALID_ARGUMENT
+        "Requests ending with a model turn are not supported."
+
+    This was previously assumed to work, and the cost of the assumption was
+    total rather than partial: every Gemini transcription that hit the
+    truncation path failed, and the affected runs produced DGML containing
+    structural chunks and *no semantic tags at all* — 3 distinct tag names
+    across an entire workspace, against ~1500 for a working model. Tag-blind
+    recall stayed near 74%, so the text was being read and simply never
+    labelled, which made the failure look like poor model quality rather than a
+    broken call.
+
+    For both providers :func:`call_continued` falls back to showing the partial
+    as an assistant turn followed by an explicit continuation instruction in a
+    final *user* turn, which satisfies Gemini's constraint and stops OpenAI
+    restarting the reply.
+
+    **Some Anthropic models refuse it too**, which is why this is not simply
+    "is it Anthropic". ``claude-sonnet-5`` returns the same shape of 400 as
+    Gemini on a path that sets no ``reasoning_effort``, so it is the model and
+    not the thinking/prefill incompatibility — see
+    ``ANTHROPIC_NO_PREFILL_PATTERNS``.
+
+    Defaults to ``True`` for anything unrecognized (a custom ``api_base``,
+    a self-hosted or proxied model): most OpenAI-compatible servers pass a
+    trailing assistant turn straight into the prompt, where prefill is the
+    natural behaviour.
+    """
+    m = model.lower()
+    if any(re.search(p, m) for p in ANTHROPIC_NO_PREFILL_PATTERNS):
+        return False
+    return not (is_openai_model(model) or is_gemini_model(model))
 
 
 def supports_native_pdf(model: str) -> bool:
@@ -521,7 +662,28 @@ def _build_completion_kwargs(
     # outright ("`temperature` is deprecated for this model") and older ones
     # reject anything but 1 when thinking is enabled — together the provider
     # default is the only always-safe value.
-    if config.temperature is not None and not is_anthropic_model(config.model):
+    # OpenAI's reasoning families accept only the default temperature (1) and
+    # reject an explicit value outright:
+    #
+    #   400 "Unsupported value: 'temperature' does not support 0.0 with this
+    #        model. Only the default (1) value is supported."
+    #
+    # `litellm.drop_params` is supposed to absorb this, and does for the models
+    # it has metadata for — but it silently passes the parameter through for one
+    # it does not recognise, and the request fails. That is what happened with
+    # gpt-5.5: 42 of 114 transcription calls died on it and the cell produced
+    # zero scoreable documents, which read as "the model cannot transcribe".
+    #
+    # Extraction asks for 0.0 to make the source-text → schema-slot mapping
+    # deterministic. Where the provider forbids that, sampling at the default is
+    # strictly better than not calling at all, so drop the parameter rather than
+    # the request. Anthropic is excluded for a different reason: newer Claude
+    # models reject temperature as deprecated.
+    if (
+        config.temperature is not None
+        and not is_anthropic_model(config.model)
+        and not is_openai_reasoning_model(config.model)
+    ):
         kwargs["temperature"] = config.temperature
     # Both caps are clamped to the model's documented ceiling — a request for
     # more output than the model allows is a provider 400, and callers ask for
@@ -745,6 +907,12 @@ def call_continued(
         _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
     )
     base: list[dict[str, Any]] = [sys_msg, {"role": "user", "content": user_blocks}]
+    # Extended thinking and assistant prefill are mutually exclusive on
+    # Anthropic: with reasoning enabled the API rejects a prefilled turn
+    # ("This model does not support assistant message prefill"). That is the
+    # other half of the truncation-path breakage — it cost ~13% of calls on one
+    # model — so gate on the request shape, not just the provider.
+    prefill = supports_assistant_prefill(config.model) and config.reasoning_effort is None
     acc = ""
     # One aggregated row for the whole continuation (all rounds summed).
     with _record_call(config) as totals:
@@ -752,7 +920,19 @@ def call_continued(
             # On continuation rounds the accumulated text becomes an assistant
             # prefill; the provider resumes from its exact end (a length cut lands
             # mid-token, so there is no trailing whitespace to trip Anthropic).
-            messages = base + ([{"role": "assistant", "content": acc}] if acc else [])
+            # Where prefill isn't honoured (OpenAI) the partial is still shown as
+            # the assistant turn, but a final user turn has to ask for the
+            # continuation explicitly — otherwise the model restarts the reply.
+            messages = list(base)
+            if acc:
+                messages.append({"role": "assistant", "content": acc})
+                if not prefill:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": prompt(PromptKey.CONTINUE_TRUNCATED),
+                        }
+                    )
             response = _completion_with_retry(_build_completion_kwargs(config, messages=messages))
             add_partial(totals, extract_cost_and_tokens(response))
             choice = response.choices[0]
@@ -907,6 +1087,7 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
 
 __all__ = [
     "ANTHROPIC_MODEL_PATTERNS",
+    "OPENAI_MODEL_PATTERNS",
     "PDF_NATIVE_MODEL_PATTERNS",
     "CallResult",
     "LLMConfig",
@@ -916,7 +1097,11 @@ __all__ = [
     "call_with_tools",
     "empty_usage_totals",
     "is_anthropic_model",
+    "is_openai_model",
     "record_usage_for",
+    "is_gemini_model",
+    "is_openai_reasoning_model",
+    "supports_assistant_prefill",
     "supports_native_pdf",
     "supports_vision",
 ]

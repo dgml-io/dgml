@@ -442,17 +442,19 @@ per task on the task's own section (e.g. `generation.api_key_env`,
 credentials, or falls back to litellm's per-provider env var when the section
 sets none.
 
-`dgml init --provider {anthropic,google,mixed}` writes a ready-made
+`dgml init --provider {anthropic,google,mixed,openai}` writes a ready-made
 `[models]` table; omit `--provider` to auto-detect from the API-key env vars
-that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`).
+that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` — checked
+in that order, so an OpenAI key never overrides a provider the other two
+already resolve).
 
 **Secrets policy.** By default config references API keys via `*_api_key_env`
 env-var-name fields (which store the env var name, not the secret). Every
 section that accepts `*_api_key_env` also accepts a literal `*_api_key`; the two
 are mutually exclusive per side and the literal wins. When neither is set,
 downstream tooling falls back to its default credential chain (Entra ID for
-Azure, the conventional `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` env vars for
-litellm, etc.).
+Azure, the conventional `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` /
+`OPENAI_API_KEY` env vars for litellm, etc.).
 
 **Migration.** The config format was JSON (`config.json`) before this release.
 A workspace whose only config is a legacy `config.json` raises

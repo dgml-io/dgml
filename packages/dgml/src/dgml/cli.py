@@ -63,6 +63,7 @@ from dgml_core.storage import (
     ENV_VAR as WORKSPACE_ENV_VAR,
 )
 from dgml_core.storage import (
+    API_KEY_ENV_VARS,
     Workspace,
     canonical_provider,
     detect_provider,
@@ -278,7 +279,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Force a provider's default [models] block. Omit to auto-detect from the "
-            "API-key env vars that are set (ANTHROPIC_API_KEY, GEMINI_API_KEY)."
+            f"API-key env vars that are set ({', '.join(API_KEY_ENV_VARS)})."
         ),
     )
     init_p.add_argument(
@@ -1248,7 +1249,12 @@ _PROVIDER_KEYS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "google": "GEMINI_API_KEY",
     "mixed": "ANTHROPIC_API_KEY and GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
 }
+
+# Rendered into the `dgml init` advisories as `--provider <a|b|c>`. Derived from
+# PROVIDER_MODELS so a provider added there shows up in the help text too.
+_PROVIDER_CHOICES = "|".join(sorted(PROVIDER_MODELS))
 
 
 def _init_models_report(provider: str) -> str:
@@ -1308,9 +1314,9 @@ def _init_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         _diag(f"[dgml init] previous config backed up to {backup}.\n")
 
     if canonical is None:
-        checked = ", ".join(("ANTHROPIC_API_KEY", "GEMINI_API_KEY"))
+        checked = ", ".join(API_KEY_ENV_VARS)
         payload["next_action"] = (
-            "set an API key, then rerun: dgml init --provider <anthropic|google|mixed>"
+            f"set an API key, then rerun: dgml init --provider <{_PROVIDER_CHOICES}>"
         )
         _diag(
             f"[dgml init] no API keys detected (checked {checked}).\n"
@@ -1335,7 +1341,7 @@ def _init_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             f"{_init_models_report(canonical)}\n"
             "[dgml init] override any task with its own field (e.g. [generation] "
             'label_model = "..."); switch providers with '
-            "dgml init --provider <anthropic|google|mixed>.\n"
+            f"dgml init --provider <{_PROVIDER_CHOICES}>.\n"
         )
     _emit(payload, fmt)
     return 0
@@ -1916,11 +1922,12 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         if not config_present:
             # Succeed but warn — LLM-backed commands will fail until the user
             # configures credentials. Always on stderr (no --verbose needed).
-            payload["next_action"] = "run `dgml init` and set ANTHROPIC_API_KEY / GEMINI_API_KEY"
+            keys = " / ".join(API_KEY_ENV_VARS)
+            payload["next_action"] = f"run `dgml init` and set one of {keys}"
             sys.stderr.write(
                 "Warning: no user-level config found.\n\n"
                 "Some commands will fail until credentials are configured.\n\n"
-                "Run `dgml init` and set ANTHROPIC_API_KEY / GEMINI_API_KEY.\n"
+                f"Run `dgml init` and set one of {keys}.\n"
             )
         if ws.workspaces_id is not None:
             # A listed workspace has no path to use as a handle, and a bare next command
@@ -2978,7 +2985,7 @@ def _generate_payload(
     ``models`` records the effective transcription/labeling models and their
     ``source`` (workspace config, a --generation-config profile/file, and/or a
     --model/--label-model override) so every run's model choice is recorded in
-    its output, not just in config.json."""
+    its output, not just in config.toml."""
     return {
         "docset_id": ds.id,
         "docset_name": ds.name,
@@ -3127,6 +3134,13 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # where the trailing-slash form would be a breaking change; nothing
     # prefix-matches on it.
     output_key = layout.docset_prefix(args.docset_id).rstrip("/")
+    # The same prefix resolved against the workspace root, echoed as the
+    # payload's ``output_dir``. Store-native keys are the real contract now, so
+    # this is a convenience for the default local backend only (on a remote
+    # store it names no directory that exists) — kept because ``output_dir`` is
+    # part of the published `docset generate` JSON, and dropping a documented
+    # field is a breaking change.
+    output_dir = ws.root / output_key
 
     # Resolve each assigned file into exactly one bucket so the summary counts
     # always sum to `total`: skipped (already converted), failed (source

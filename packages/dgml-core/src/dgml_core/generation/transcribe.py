@@ -39,9 +39,11 @@ from dgml_core.generation.blocks import (
     anchor_heading_levels,
     normalize_enumerated_paragraphs,
     parse_block,
+    xml_safe_block_dict,
 )
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.pages import pdf_page_count
+from dgml_core.utils import xml_safe
 
 _UNSAFE_FNAME_RE = re.compile(r'[<>:"/\\|?*]')
 
@@ -107,8 +109,18 @@ def _load_cached_blocks(cache_dir: Path | str | None, doc_name: str) -> list[Blo
         return None
     try:
         raw_blocks = json.loads(blocks_file.read_text(encoding="utf-8"))
+        # xml_safe_block_dict, not just Block(**b): a cache predating the
+        # sanitizer (or written by anything that bypasses parse_block) can hold
+        # a character XML cannot represent, and the re-render this feeds runs
+        # outside the per-file error boundary — one such character would abort
+        # the whole docset rather than fail its own document.
         return [
-            Block(**{**b, "entities": [Span(**sp) for sp in b.get("entities", [])]})
+            Block(
+                **{
+                    **(safe := xml_safe_block_dict(b)),
+                    "entities": [Span(**sp) for sp in safe.get("entities", [])],
+                }
+            )
             for b in raw_blocks
         ]
     except (json.JSONDecodeError, TypeError, ValueError):
@@ -406,8 +418,13 @@ def parse_window_any(raw: str, *, log: Callable[[str], None] = lambda _m: None) 
 
 
 def _append_continuation(blocks: list[Block], continuation: str) -> None:
-    """Splice mid-element continuation text onto the last text-bearing block."""
-    text = continuation.strip()
+    """Splice mid-element continuation text onto the last text-bearing block.
+
+    ``xml_safe`` here for the same reason as in :func:`parse_block`: this text
+    comes straight off the model and is written into a block, so it is the one
+    other path by which an unserializable character could reach the renderer.
+    """
+    text = xml_safe(continuation).strip()
     if not text:
         return
     for block in reversed(blocks):

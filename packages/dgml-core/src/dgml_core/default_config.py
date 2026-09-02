@@ -60,4 +60,21 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
         "advanced": "gemini/gemini-2.5-pro",
         "expert": "gemini/gemini-2.5-pro",
     },
+    "openai": {
+        # The gpt-5.4 family, sized to the tiers: nano/mini for the cheap
+        # high-volume vision work, the full model for the reasoning-heavy
+        # labeling / value-extraction / schema-generation passes. Every entry
+        # accepts native PDF input and images (which the generation pipeline
+        # requires) and allows 128K output tokens — the same ceiling the
+        # frontier Claude/Gemini tiers give, so value extraction on
+        # charge-heavy documents is not capped lower here than elsewhere.
+        # `advanced` and `expert` are deliberately the same id: OpenAI's
+        # reasoning depth is a per-call `reasoning_effort` knob rather than a
+        # separate stronger model, and the call sites already ask for the
+        # effort each task needs (see `grounded._DEFAULT_REASONING_EFFORT`).
+        "light": "openai/gpt-5.4-nano",
+        "standard": "openai/gpt-5.4-mini",
+        "advanced": "openai/gpt-5.4",
+        "expert": "openai/gpt-5.4",
+    },
 }

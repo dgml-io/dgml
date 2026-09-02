@@ -309,6 +309,12 @@ def _dummy_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     this the mocked-convert_batch generate tests would pass locally (developer
     key present) but fail in CI (no key). Set dummy keys for the providers the
     test configs name so the check is env-independent; a test that needs the key
-    *absent* (a pre-flight AUTH_ERROR) can delenv it itself."""
+    *absent* (a pre-flight AUTH_ERROR) can delenv it itself.
+
+    OPENAI_API_KEY is *unset* rather than left alone: `dgml init` reports every
+    key it detects, so a developer's own OpenAI key in the ambient environment
+    would otherwise change what the init tests observe. A test that wants the
+    OpenAI provider sets it itself."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
     monkeypatch.setenv("GEMINI_API_KEY", "test-dummy")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)

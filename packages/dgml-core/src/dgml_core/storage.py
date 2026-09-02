@@ -481,6 +481,7 @@ def user_config_path() -> Path:
 API_KEY_ENV_VARS: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
 )
 
 _OCR_GUIDANCE = """\
@@ -529,8 +530,15 @@ def canonical_provider(provider: str) -> str:
 def detect_provider(environ: dict[str, str]) -> str | None:
     """Auto-detect a provider from non-empty API-key env vars (no live check).
 
-    Both Anthropic + Gemini → ``mixed``; Anthropic only → ``anthropic``; Gemini
-    only → ``google``; none → ``None``."""
+    Both Anthropic + Gemini → ``mixed`` (the curated Gemini-light /
+    Anthropic-pipeline blend, which needs both keys); Anthropic only →
+    ``anthropic``; Gemini only → ``google``; OpenAI only → ``openai``; none →
+    ``None``.
+
+    OpenAI is checked LAST, so a key set alongside Anthropic and/or Gemini
+    doesn't change what the other two would have detected on their own — the
+    detection order is a stable contract, and ``--provider openai`` is the way
+    to ask for OpenAI on a machine that also carries the other keys."""
 
     def has(name: str) -> bool:
         return bool(environ.get(name, "").strip())
@@ -542,6 +550,8 @@ def detect_provider(environ: dict[str, str]) -> str | None:
         return "anthropic"
     if gemini:
         return "google"
+    if has("OPENAI_API_KEY"):
+        return "openai"
     return None
 
 
@@ -563,7 +573,7 @@ def render_config_toml(provider: str | None) -> str:
         return (
             f"# No API key detected (checked {checked}).\n"
             "# Set at least one key, then rerun:\n"
-            "#   dgml init --provider <anthropic|google|mixed>\n"
+            "#   dgml init --provider <anthropic|google|mixed|openai>\n"
             "#\n"
             "# [models]\n"
             '# light    = "..."\n'

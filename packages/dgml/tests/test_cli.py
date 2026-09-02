@@ -132,6 +132,35 @@ def test_init_provider_flag_forces_table(
     assert "gemini/" in user_config_path().read_text(encoding="utf-8")
 
 
+def test_init_provider_openai_writes_openai_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dgml_core.storage import user_config_path
+
+    rc = main(_ws_args(tmp_path / "ws") + ["init", "--provider", "openai"])
+    assert rc == 0
+    assert _read_stdout(capsys)["provider"] == "openai"
+    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
+
+
+def test_init_auto_detects_openai_from_its_key_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With only OPENAI_API_KEY set, auto-detection resolves to `openai`."""
+    from dgml_core.storage import user_config_path
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-dummy")
+
+    rc = main(_ws_args(tmp_path / "ws") + ["init"])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    assert payload["provider"] == "openai"
+    assert payload["detected_keys"] == ["OPENAI_API_KEY"]
+    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
+
+
 def test_init_provider_without_force_does_not_clobber(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
