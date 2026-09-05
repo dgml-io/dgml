@@ -355,7 +355,7 @@ def test_open_backfills_a_missing_id(tmp_path: Path, capsys: pytest.CaptureFixtu
 
     # The id is mirrored into config.toml so it is readable without the store. Read it
     # through a fresh Workspace: config text is memoized per object, and this one was
-    # constructed before the command that wrote it (see Workspace._config_state).
+    # constructed before the command that wrote it (see Workspace.config_text).
     assert workspace_config.read_identity(Workspace(root=ws.root)).workspace_id == wid
 
     # Second open: id unchanged.

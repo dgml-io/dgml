@@ -146,11 +146,11 @@ def write_config_text(ws: Workspace, text: str) -> None:
     from .workspaces_resolve import default_workspaces_store
 
     default_workspaces_store().write_config(ws.workspaces_id, text, expected_text=ws.config_text)
-    # Refresh the memo (see Workspace._config_state) so a write-then-read inside one
+    # Refresh the memo (see Workspace.config_text) so a write-then-read inside one
     # command needs no second round trip. Writing into __dict__ is legal on a frozen
     # dataclass — it is the same slot a cached_property would use. Only the store-backed
     # case has a memo to refresh; a file is re-read each time.
-    ws.__dict__[ws._CONFIG_CACHE_KEY] = text
+    ws.__dict__[ws._CONFIG_TEXT_CACHE_KEY] = text
 
 
 def _load(ws: Workspace) -> dict[str, Any]:

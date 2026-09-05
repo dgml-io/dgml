@@ -88,7 +88,7 @@ def _ws(tmp_path: Path, text: str = "") -> Workspace:
 
 def _reopen(ws: Workspace) -> Workspace:
     """The same workspace, freshly constructed, so nothing is memoized from before a
-    write (see ``Workspace._config_state`` and ``store_configs``)."""
+    write (see ``Workspace.config_text`` and ``store_configs``)."""
     return Workspace(
         root=ws.root, config_override=ws.config_override, workspaces_id=ws.workspaces_id
     )
