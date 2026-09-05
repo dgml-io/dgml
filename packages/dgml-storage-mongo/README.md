@@ -80,8 +80,9 @@ One document per workspace, `_id` = its `workspace_id`:
 ```javascript
 {
   _id:         "ws_7qxdm2pjk3n5rwts",
-  config_toml: "…verbatim UTF-8 text…",   // AUTHORITATIVE, and the CAS token
-  name:         "Acme Contracts",          // ↓ derived, regenerated on every write
+  config_toml: "…verbatim UTF-8 text…",   // AUTHORITATIVE
+  config_sha256: "9f86d081…",              // ↓ derived, regenerated on every write
+  name:         "Acme Contracts",          //   config_sha256 is the CAS predicate
   organization: "acme",
   storage_service: "bym",
   created_at: "2026-08-26T18:04:11Z",
@@ -117,10 +118,27 @@ table, `[models]` edits and comments, and the result still parses. The old per-m
 index tolerated interleaved writes because its rows were a cache; that argument does not
 transfer to authority.
 
-Every write is therefore conditional, and the predicate is **`config_toml` itself**: the
-document is replaced only if the stored text is still exactly what the writer read,
-otherwise `WORKSPACES_WRITE_CONFLICT` rather than an overwrite. The local backend passes
-`expected_text` too and ignores it — one writer per machine by construction.
+Every write is therefore conditional on the content the writer read, and the predicate is
+**`config_sha256`, not the text**: the document is replaced only if the stored config still
+hashes to what was read, otherwise `WORKSPACES_WRITE_CONFLICT` rather than an overwrite.
+The local backend passes `expected_text` too and ignores it — one writer per machine by
+construction.
+
+The main reason is the collation caveat below: two distinct lowercase hex digests differ in
+real characters, so no collation can fold them together. Hashing makes that structural
+rather than something whoever creates the collection has to know.
+
+There is a confidentiality argument too, and it is **narrower than it looks**.
+`storage_resolve` does support third-party providers carrying an inline credential in
+`config.toml` (that is what `_SECRET_HINTS` is for), so a config may hold a secret, and a
+hashed filter keeps it out of query-*shape* telemetry — `$queryStats`, `explain`,
+plan-cache keys. It does **not** keep the config out of `system.profile`, `db.currentOp()`
+or the slow-query log: those capture the whole command, and the `$set` payload still
+carries the text. Measured with `db.setProfilingLevel(2)` over five profiled updates: 0/5
+filters held config text, 3/5 update payloads did. So this removes one of two copies from
+those sinks, not the exposure — worth knowing before anyone relies on it.
+
+The write filter also shrinks from a whole config to 64 bytes: real, minor.
 
 There is deliberately **no `revision` counter**. It would be a second source of truth to
 keep in step with the field that already answers the question, and the reason the
@@ -134,10 +152,15 @@ was read.
 the GridFS notes below on what millisecond-resolution timestamps do to a comparison.
 Comparing content has no such tie: two different texts are two different strings.
 
-One collection-level caveat, the mirror of that same hazard: BSON string equality is
-byte-exact, but a collection created with a case- or accent-insensitive default
-`collation` would make the predicate match text that differs. Do not give this
-collection a collation.
+The hash is a projection like the rest of `_derive` — a pure function of the authority,
+verifiable from it, regenerated on every write — so "never read as authority" survives the
+predicate reading it. It cannot drift the way a counter can, because nothing updates
+`config_toml` through this store without recomputing it.
+
+Historical note, now defused: when the predicate was the text, a collection created with a
+case- or accent-insensitive default `collation` would have made it match text that differs.
+Still don't give this collection a collation, but that is hygiene rather than the load-bearing
+requirement it was.
 
 ### Reachability
 

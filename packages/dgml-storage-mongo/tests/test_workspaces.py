@@ -20,8 +20,9 @@ Three things are worth testing here and the rest follows from them:
    survives a round trip byte-for-byte, which the local backend also promises.
 2. **Lost updates.** A config is written whole, so an overwrite discards the other
    writer's `[storage]` table and comments — not just the field being written. That is
-   why this backend makes its writes conditional on the stored text and the local one
-   does not.
+   why this backend makes every write conditional on the content it read — via
+   `config_sha256` rather than the text, so no collection `collation` can fold two configs
+   together — and the local one does not.
 3. **The representation.** `config_toml` must stay a single string. A future
    "let's just parse it into BSON" refactor has to fail loudly here rather than quietly
    start dropping comments and rejecting valid TOML dates.
@@ -281,6 +282,61 @@ def test_a_current_write_is_accepted(
 
     workspaces_store.write_config(WID, text + "\n[models]\n", expected_text=text)
     assert workspaces_store.read_config(WID) == CONFIG + "\n[models]\n"
+
+
+def test_the_filter_never_carries_the_config_text(
+    workspaces_store: MongoWorkspacesStore,
+) -> None:
+    """The predicate is a digest, chiefly so a collection ``collation`` cannot fold two
+    configs together (two hex digests differ in real characters).
+
+    It also keeps the config out of query-*shape* telemetry — ``$queryStats``, ``explain``,
+    plan-cache keys. Note the limit, measured rather than assumed: it does **not** keep the
+    config out of ``system.profile`` or ``db.currentOp()``, which capture the whole command
+    including the ``$set`` payload. This test pins the filter only, which is all that is
+    actually true.
+
+    Captures the filters rather than reading the code, so an edit that "simplifies" the
+    predicate back to the text has to fail here."""
+    seen: list[dict[str, object]] = []
+    original = workspaces_store._docs.update_one
+
+    def _spy(flt: dict[str, object], *args: object, **kwargs: object) -> object:
+        seen.append(flt)
+        return original(flt, *args, **kwargs)
+
+    workspaces_store.write_config(WID, CONFIG)
+    text = workspaces_store.read_config(WID)
+    assert text is not None
+
+    workspaces_store._docs.update_one = _spy  # type: ignore[method-assign]
+    try:
+        workspaces_store.write_config(WID, text + "\n[models]\n", expected_text=text)
+    finally:
+        del workspaces_store._docs.update_one
+
+    assert seen, "no filter captured"
+    for flt in seen:
+        assert "config_toml" not in flt
+        assert CONFIG not in str(flt)
+    assert any("config_sha256" in flt for flt in seen)
+
+
+def test_the_hash_is_regenerated_from_the_text_on_every_write(
+    workspaces_store: MongoWorkspacesStore,
+) -> None:
+    """It is a projection, not a second source of truth: it must always be the digest of
+    whatever ``config_toml`` currently holds, or the store locks itself out."""
+    import hashlib
+
+    workspaces_store.write_config(WID, CONFIG)
+    for text in (CONFIG, HOSTILE, CONFIG + "# again\n"):
+        current = workspaces_store.read_config(WID)
+        assert current is not None
+        workspaces_store.write_config(WID, text, expected_text=current)
+        doc = workspaces_store._docs.find_one({"_id": WID})
+        assert doc is not None
+        assert doc["config_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def test_no_revision_counter_is_stored(
