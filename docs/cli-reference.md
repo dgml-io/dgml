@@ -2069,7 +2069,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `STORAGE_PROVIDER_UNRESOLVABLE` | hard | A storage `provider` dotted path (`module:Class`) can't be imported/resolved. |
 | `WORKSPACES_CONFIG_INVALID` | hard | The `[workspaces]` table is malformed, or its provider was handed an option it does not accept. |
 | `WORKSPACE_NOT_FOUND` | hard | `--workspace <ws_id>` named an id the store of workspaces does not hold. Deliberately an error rather than falling through to path resolution — an id has a distinctive shape, so a caller that typed one meant a workspace. |
-| `WORKSPACES_WRITE_CONFLICT` | hard | Another writer changed this workspace's `config.toml` since it was read. A config is written whole, so overwriting would discard whatever that writer changed; re-run the command to work from the current config. Only backends that issue revisions (Mongo) can report this. |
+| `WORKSPACES_WRITE_CONFLICT` | hard | Another writer changed this workspace's `config.toml` since it was read. A config is written whole, so overwriting would discard whatever that writer changed; re-run the command to work from the current config. Only backends that make writes conditional on the stored text (Mongo) can report this; the local-dir store has one writer per machine and does not. |
 | `STORAGE_BACKEND_MISMATCH` | hard | The `[storage]` configuration a workspace resolves no longer matches the `storage_fingerprint` sealed in its `config.toml` — its data is on the previously sealed backend. Accept the change with `dgml workspace reseal <root>`, or restore the `[storage]` table. |
 | `NOT_IMPLEMENTED` | hard | A requested mode/path is not implemented. |
 | `DGML_ERROR` | hard | Generic base code; specific codes above are preferred. |

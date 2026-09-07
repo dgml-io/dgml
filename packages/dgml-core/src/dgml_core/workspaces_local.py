@@ -33,8 +33,8 @@ point rather than a coincidence: there is no index to keep in sync, and a direct
 whose name is not a well-formed id is simply not a workspace, so unrelated files
 dropped in the parent are ignored rather than half-listed.
 
-This backend issues no revisions (see
-:meth:`~dgml_core.workspaces_store.WorkspacesStore.read_config`): a local directory has
+This backend detects no write conflicts (see
+:meth:`~dgml_core.workspaces_store.WorkspacesStore.write_config`): a local directory has
 one writer per machine by construction, so the read-modify-write window is the same one
 an ordinary file edit has always had.
 """
@@ -104,7 +104,7 @@ class LocalDirWorkspacesStore(WorkspacesStore):
         found = self.read_config(workspace_id)
         if found is None:
             return default
-        return local_workspace_path(found[0]) or default
+        return local_workspace_path(found) or default
 
     def _config_path(self, workspace_id: str) -> Path:
         # Deliberately not routed through `workspace_root`: this backend's own reads and
@@ -123,35 +123,34 @@ class LocalDirWorkspacesStore(WorkspacesStore):
 
     # ---- the list of workspaces ----
 
-    def read_config(self, workspace_id: str) -> tuple[str, int | None] | None:
+    def read_config(self, workspace_id: str) -> str | None:
         path = self._config_path(workspace_id)
         try:
             # Read as text with an explicit encoding rather than bytes-then-decode:
             # the caller splices this and writes it back, so it must round-trip as the
             # same string. newline="" keeps CRLF intact instead of translating it.
             with path.open("r", encoding="utf-8", newline="") as fh:
-                return fh.read(), None
+                return fh.read()
         except FileNotFoundError:
             return None
         except OSError as exc:
             raise CorruptMetadata(f"could not read {path}: {exc}") from exc
 
     def write_config(
-        self, workspace_id: str, text: str, *, expected_revision: int | None = None
-    ) -> int | None:
-        # `expected_revision` is accepted and ignored: this backend issues none, so a
-        # caller can pass back whatever `read_config` gave it without special-casing.
+        self, workspace_id: str, text: str, *, expected_text: str | None = None
+    ) -> None:
+        # `expected_text` is accepted and ignored: this backend detects no conflicts, so
+        # a caller can pass back whatever `read_config` gave it without special-casing.
         path = self._config_path(workspace_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, text)
-        return None
 
     def list_configs(self) -> dict[str, str]:
         configs: dict[str, str] = {}
         for entry in self._iter_workspace_dirs():
             found = self.read_config(entry.name)
             if found is not None:
-                configs[entry.name] = found[0]
+                configs[entry.name] = found
         return configs
 
     def list_ids(self) -> list[str]:

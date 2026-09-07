@@ -30,8 +30,8 @@ One document per workspace, ``_id`` = its ``workspace_id``:
     {
       _id:         "ws_7qxdm2pjk3n5rwts",
       config_toml: "…verbatim UTF-8 text…",   // AUTHORITATIVE
-      revision:    7,                          // CAS token, see below
-      name:         "Acme Contracts",          // ↓ derived, regenerated on every write
+      config_sha256: "9f86d081…",              // ↓ derived, regenerated on every write
+      name:         "Acme Contracts",          //   config_sha256 is the CAS predicate
       organization: "acme",
       storage_service: "bym",
       created_at: "2026-08-26T18:04:11Z",
@@ -78,11 +78,42 @@ machine's ``[storage]`` table, ``[models]`` edits and comments, and the result s
 parses. The old per-machine index tolerated interleaved writes because its rows were a
 cache; that argument does not transfer to authority.
 
-Hence ``revision``: every write is conditional on the revision that was read, and a
-mismatch raises :class:`~dgml_core.errors.WorkspacesWriteConflict` rather than
-overwriting. ``updated_at`` is for humans and ordering only and must **never** be the
-predicate — this package already contains the case study for why, in
-``gridfs_store``'s notes on millisecond ``uploadDate`` ties.
+So every write is conditional on the content the writer read. There is deliberately no
+``revision`` counter: it would be a second source of truth to keep in step with the field
+that already answers the question, and the reason the interface once needed one — that a
+backend is handed the read and the write as separate calls — is not fixed by making the
+token an integer.
+
+The predicate is ``config_sha256``, **not the text**. The strongest reason is that it
+makes the collation hazard *structural* rather than documented: two distinct lowercase hex
+digests differ in real characters, so no case- or accent-insensitive collection
+``collation`` can fold them together. A text predicate could only warn about that, and the
+warning had to be obeyed by whoever created the collection.
+
+There is a confidentiality argument too, but it is **narrower than it first appears, and
+worth stating accurately** because the obvious version of it is wrong. ``storage_resolve``
+does support third-party providers carrying an inline credential in ``config.toml`` (that
+is what its ``_SECRET_HINTS`` list is for), so a config may hold a secret — and a hashed
+filter does keep it out of query-*shape* telemetry: ``$queryStats``, ``explain`` output,
+plan-cache keys. What it does **not** do is keep the config out of ``system.profile``,
+``db.currentOp()`` or the slow-query log: those capture the whole command, and the ``$set``
+payload still carries the text. Measured with ``db.setProfilingLevel(2)`` over five
+profiled updates: 0/5 filters contained config text, 3/5 update payloads did. So this
+removes one of two copies from those sinks, not the exposure.
+
+The write filter also shrinks from a whole config to 64 bytes, which is a real but minor
+saving.
+
+The hash is a projection like the rest of ``_derive``: a pure function of the authority,
+verifiable from it, regenerated on every write. That is what keeps "never read as
+authority" intact even though the predicate reads it — it cannot drift the way a counter
+can, because nothing can update ``config_toml`` through this store without recomputing it.
+
+``updated_at`` is for humans and ordering only and must **never** be the predicate — this
+package already contains the case study for why, in ``gridfs_store``'s notes on
+millisecond ``uploadDate`` ties, where two writes inside one millisecond leave the
+ordering undefined and the failure mode is a *silent stale read*. A digest has no such
+tie: two different texts are two different digests.
 
 Credentials
 -----------
@@ -99,6 +130,7 @@ very scenario a shared list of workspaces exists for.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -121,6 +153,16 @@ DEFAULT_COLLECTION = "dgml_workspaces"
 
 #: This document shape's own version, independent of a workspace's schema_version.
 CATALOG_SCHEMA_VERSION = 1
+
+
+def _sha256(text: str) -> str:
+    """The digest that stands in for ``text`` in a query filter.
+
+    Lowercase hex rather than BSON binary so a document stays readable in ``mongosh``,
+    which is the point of the projection it lives in. Two distinct digests differ in
+    real characters, so they compare unequal even under a case- or accent-insensitive
+    collection ``collation`` — the hazard the text predicate could only warn about."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class MongoWorkspacesStore(WorkspacesStore):
@@ -197,7 +239,7 @@ class MongoWorkspacesStore(WorkspacesStore):
 
     # ---- the list of workspaces ----
 
-    def read_config(self, workspace_id: str) -> tuple[str, int | None] | None:
+    def read_config(self, workspace_id: str) -> str | None:
         with self._reachable():
             doc = self._docs.find_one({"_id": workspace_id})
         if doc is None:
@@ -208,47 +250,40 @@ class MongoWorkspacesStore(WorkspacesStore):
                 f"{self.label()} document {workspace_id!r} has no 'config_toml' string; "
                 f"something other than dgml wrote it"
             )
-        revision = doc.get("revision")
-        return text, revision if isinstance(revision, int) else None
+        return text
 
     def write_config(
-        self, workspace_id: str, text: str, *, expected_revision: int | None = None
-    ) -> int | None:
+        self, workspace_id: str, text: str, *, expected_text: str | None = None
+    ) -> None:
         derived = self._derive(workspace_id, text)
         with self._reachable():
-            return self._store(workspace_id, text, derived, expected_revision)
+            self._store(workspace_id, text, derived, expected_text)
 
     def _store(
         self,
         workspace_id: str,
         text: str,
         derived: dict[str, Any],
-        expected_revision: int | None,
-    ) -> int | None:
-        if expected_revision is None:
+        expected_text: str | None,
+    ) -> None:
+        if expected_text is None:
             # A first write, or a caller that read nothing. Upsert unconditionally: there
-            # is no revision to be stale against.
+            # is no prior text to be stale against.
             self._docs.update_one(
                 {"_id": workspace_id},
                 {
                     "$set": {"config_toml": text, **derived},
                     "$currentDate": {"updated_at": True},
-                    "$setOnInsert": {
-                        "revision": 1,
-                        "schema_version": CATALOG_SCHEMA_VERSION,
-                    },
+                    "$setOnInsert": {"schema_version": CATALOG_SCHEMA_VERSION},
                 },
                 upsert=True,
             )
-            found = self._docs.find_one({"_id": workspace_id}, {"revision": 1})
-            revision = (found or {}).get("revision")
-            return revision if isinstance(revision, int) else None
+            return
 
         result = self._docs.update_one(
-            {"_id": workspace_id, "revision": expected_revision},
+            {"_id": workspace_id, "config_sha256": _sha256(expected_text)},
             {
                 "$set": {"config_toml": text, **derived},
-                "$inc": {"revision": 1},
                 "$currentDate": {"updated_at": True},
             },
         )
@@ -266,7 +301,6 @@ class MongoWorkspacesStore(WorkspacesStore):
                 f"Its config is written whole, so overwriting would discard whatever that "
                 f"writer changed. Re-run the command to work from the current config."
             )
-        return expected_revision + 1
 
     def list_configs(self) -> dict[str, str]:
         with self._reachable():
@@ -326,6 +360,7 @@ class MongoWorkspacesStore(WorkspacesStore):
 
         identity = identity_from_text(text, workspace_id=workspace_id)
         return {
+            "config_sha256": _sha256(text),
             "name": identity.name,
             "organization": identity.organization,
             "storage_service": identity.storage_service,

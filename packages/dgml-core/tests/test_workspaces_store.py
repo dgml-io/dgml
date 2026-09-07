@@ -99,7 +99,7 @@ def test_write_then_read_round_trips(store: WorkspacesStore) -> None:
     store.write_config(wid, CONFIG)
     found = store.read_config(wid)
     assert found is not None
-    assert found[0] == CONFIG
+    assert found == CONFIG
 
 
 def test_read_missing_is_none(store: WorkspacesStore) -> None:
@@ -112,8 +112,8 @@ def test_write_replaces(store: WorkspacesStore) -> None:
     store.write_config(wid, "[workspace]\nname = 'Renamed'\n")
     found = store.read_config(wid)
     assert found is not None
-    assert "Renamed" in found[0]
-    assert "Acme Contracts" not in found[0]
+    assert "Renamed" in found
+    assert "Acme Contracts" not in found
 
 
 def test_exists_tracks_write_and_delete(store: WorkspacesStore) -> None:
@@ -203,19 +203,68 @@ def test_config_text_is_preserved_byte_for_byte(store: WorkspacesStore) -> None:
     store.write_config(wid, hostile)
     found = store.read_config(wid)
     assert found is not None
-    assert found[0] == hostile
+    assert found == hostile
 
 
-def test_revision_round_trips_through_write(store: WorkspacesStore) -> None:
-    """Whatever ``read_config`` hands back is accepted by ``write_config``, so a caller
-    never has to know whether its backend issues revisions."""
+def test_read_text_round_trips_as_the_write_token(store: WorkspacesStore) -> None:
+    """Whatever ``read_config`` hands back is accepted by ``write_config`` as
+    ``expected_text``, so a caller never has to know whether its backend detects
+    conflicts."""
     wid = new_workspace_id()
     store.write_config(wid, CONFIG)
-    found = store.read_config(wid)
-    assert found is not None
-    text, revision = found
-    store.write_config(wid, text, expected_revision=revision)
-    assert store.read_config(wid) is not None
+    text = store.read_config(wid)
+    assert text is not None
+    store.write_config(wid, text + "\n[models]\n", expected_text=text)
+    assert store.read_config(wid) == CONFIG + "\n[models]\n"
+
+
+def test_writing_identical_text_is_not_a_conflict(store: WorkspacesStore) -> None:
+    """A no-op write succeeds rather than raising: the stored text is already what the
+    writer wants, so there is nothing to lose. Backends that detect conflicts must not
+    treat "unchanged" as "changed"."""
+    wid = new_workspace_id()
+    store.write_config(wid, CONFIG)
+    store.write_config(wid, CONFIG, expected_text=CONFIG)
+    assert store.read_config(wid) == CONFIG
+
+
+def test_expected_text_none_is_unconditional(store: WorkspacesStore) -> None:
+    """``None`` means "write regardless", which is what a fresh workspace and a backend
+    with one writer by construction both rely on."""
+    wid = new_workspace_id()
+    store.write_config(wid, CONFIG)
+    store.write_config(wid, "[workspace]\nname = 'Clobbered'\n", expected_text=None)
+    assert store.read_config(wid) == "[workspace]\nname = 'Clobbered'\n"
+
+
+def test_verbatim_text_is_accepted_back_unchanged(store: WorkspacesStore) -> None:
+    """CRLF, non-ASCII, and both Unicode normal forms must survive a read and be
+    *accepted* as ``expected_text``, not judged different.
+
+    The NFC/NFD pair is the load-bearing case: it proves nothing in the path normalizes.
+    A backend that did would break conflict detection, not merely rewrite a file — and
+    the two forms must stay distinct values, which the last assertion pins."""
+    nfc, nfd = "café", "café"
+    assert nfc != nfd  # guard: the literals really are the two forms
+    for label, text in (
+        ("crlf", "[workspace]\r\nname = 'W'\r\n"),
+        ("no-trailing-newline", "[workspace]\nname = 'W'"),
+        ("nfc", f"[workspace]\nname = '{nfc}'\n"),
+        ("nfd", f"[workspace]\nname = '{nfd}'\n"),
+    ):
+        wid = new_workspace_id()
+        store.write_config(wid, text)
+        found = store.read_config(wid)
+        assert found == text, label
+        # Accepted as the token: no spurious conflict from an encoding round trip.
+        store.write_config(wid, text, expected_text=found)
+        assert store.read_config(wid) == text, label
+
+    # And the two forms are stored as distinct texts, not folded together.
+    a, b = new_workspace_id(), new_workspace_id()
+    store.write_config(a, nfc)
+    store.write_config(b, nfd)
+    assert store.read_config(a) != store.read_config(b)
 
 
 def test_label_is_non_empty(store: WorkspacesStore) -> None:

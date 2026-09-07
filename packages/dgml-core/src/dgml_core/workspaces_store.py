@@ -127,37 +127,60 @@ class WorkspacesStore(ProviderConfigFields, ABC):
     # ------------------------------------------------------------- primitives
 
     @abstractmethod
-    def read_config(self, workspace_id: str) -> tuple[str, int | None] | None:
-        """This workspace's ``config.toml`` text and its revision, or ``None`` when
-        the store holds no such workspace.
+    def read_config(self, workspace_id: str) -> str | None:
+        """This workspace's ``config.toml`` text, or ``None`` when the store holds no
+        such workspace.
 
         The text is returned **verbatim** — comments, key order, line endings and a
         missing trailing newline all intact. Callers splice it (see
         :mod:`dgml_core.workspace_config`) and hand it back, so any normalization here
-        would silently rewrite a user's file.
-
-        ``revision`` is an opaque conflict-detection token to pass back to
-        :meth:`write_config`, or ``None`` from a backend that offers none. A local
-        directory returns ``None``: there is one writer per machine by construction.
-        A shared backend must return one, because a lost update over whole-file text
-        discards the other writer's ``[storage]`` table, not just one field.
+        would silently rewrite a user's file. It is also the token
+        :meth:`write_config` compares against, so a backend that normalized would not
+        merely rewrite a file — it would break conflict detection.
         """
 
     @abstractmethod
     def write_config(
-        self, workspace_id: str, text: str, *, expected_revision: int | None = None
-    ) -> int | None:
-        """Create or replace this workspace's ``config.toml`` text, returning the new
-        revision (or ``None`` from a backend that issues none).
+        self, workspace_id: str, text: str, *, expected_text: str | None = None
+    ) -> None:
+        """Create or replace this workspace's ``config.toml`` text.
 
-        Returning it saves the caller a read-back to stay coherent after its own write,
-        which against a networked backend is a round trip on every ``reseal``.
+        ``expected_text`` is what :meth:`read_config` last returned, and the write is
+        conditional on the stored text still being exactly that. A backend able to
+        detect a mismatch must raise
+        :class:`~dgml_core.errors.WorkspacesWriteConflict` rather than overwrite, because
+        a lost update over whole-file text discards the other writer's ``[storage]``
+        table and comments, not just the field being written. ``None`` means
+        unconditional — a fresh workspace, or a backend with one writer by construction.
 
-        ``expected_revision`` is whatever :meth:`read_config` last returned. A backend
-        that issues revisions must reject the write with
-        :class:`~dgml_core.errors.WorkspacesWriteConflict` when it no longer matches,
-        rather than overwriting. ``None`` means "unconditional" — either a fresh
-        workspace, or a backend without revisions.
+        The token is the **text itself** rather than a version number because the stored
+        text is the only state there is. A counter is a second source of truth to keep in
+        step, and it exists only because this interface hands a backend the read and the
+        write as separate calls: with both inside one transaction a store could detect the
+        conflict itself, whereas comparing content needs nothing a backend is not already
+        holding.
+
+        Writing text **identical** to what is stored must succeed rather than conflict —
+        there is nothing to lose, and the contract suite pins it.
+
+        *How* a backend decides the stored text still matches is its own business:
+        comparing the text, comparing a hash of it, or mapping it back to some private
+        version of its own. One comparing content directly also finds that an A→B→A
+        sequence does not conflict, which is sound — the stored state is what was read, so
+        an edit of that text is what was intended — whereas one tracking its own counter
+        will refuse that write. Both are acceptable: a backend may refuse **more** eagerly
+        than content comparison would, never less.
+
+        Whatever the mechanism, the comparison must be **byte-exact**. A backend whose
+        equality folds case, accents, Unicode normal form or trailing whitespace will judge
+        two *different* configs equal and overwrite the other writer — precisely the failure
+        this parameter exists to prevent, arrived at silently. That is easy to inherit
+        rather than choose: MySQL's default collation (``utf8mb4_0900_ai_ci``) is case- and
+        accent-insensitive, Postgres 12+ offers non-deterministic collations, and a MongoDB
+        collection can carry a default ``collation``. So pin a byte-comparing collation, or
+        compare a hash, or compare bytes — not the engine's default notion of string
+        equality. The opposite error is harmless by comparison: judging equal text unequal
+        raises a spurious conflict, and the caller re-runs.
 
         Must be atomic with respect to concurrent readers: a reader sees the old text
         or the new one, never a partial file.

@@ -202,13 +202,16 @@ class Workspace:
         because it names the store."""
         return self.config_override or self.root / layout.CONFIG_FILE
 
-    #: Where :attr:`_config_state` keeps its memo, for the store-backed case only.
-    _CONFIG_CACHE_KEY = "_config_state_cache"
+    #: Where :attr:`config_text` keeps its memo, for the store-backed case only.
+    _CONFIG_TEXT_CACHE_KEY = "_config_text_cache"
 
     @property
-    def _config_state(self) -> tuple[str | None, int | None]:
-        """This workspace's ``config.toml`` text and its revision token, or
-        ``(None, None)`` when it has no config yet.
+    def config_text(self) -> str | None:
+        """This workspace's ``config.toml`` as text, or ``None`` if it has none.
+
+        Also the conflict-detection token handed back to
+        :meth:`~dgml_core.workspaces_store.WorkspacesStore.write_config`, which is why
+        there is no separate revision property: the text *is* the token.
 
         **Memoized only when the config is held in the machine's store of workspaces**,
         where reading it may be a network round trip and a single command asks several
@@ -217,6 +220,9 @@ class Workspace:
         file is re-read each time instead: the read is cheap, always-fresh is what every
         caller has always had, and it means there is no staleness rule to remember for
         the common case.
+
+        That asymmetry is why this is a hand-rolled memo rather than a
+        :func:`functools.cached_property`: the file-backed half must stay uncached.
 
         The memo is an optimization, never semantics — reading fresh is always correct.
         Where it does apply, a write through
@@ -228,25 +234,13 @@ class Workspace:
 
         if self.workspaces_id is None:
             return workspace_config.read_config_state(self)
-        # `is None` rather than a falsy test: a cached "(None, None)" — a workspace the
-        # store has no config for — must not be re-fetched on every access.
-        cached: tuple[str | None, int | None] | None = self.__dict__.get(self._CONFIG_CACHE_KEY)
-        if cached is None:
-            cached = workspace_config.read_config_state(self)
-            self.__dict__[self._CONFIG_CACHE_KEY] = cached
+        # Membership rather than a `.get(...) is None` test: the memoized value is the
+        # text itself, so `None` is a legitimate cached answer — a workspace the store
+        # holds no config for — and must not be re-fetched on every access.
+        if self._CONFIG_TEXT_CACHE_KEY not in self.__dict__:
+            self.__dict__[self._CONFIG_TEXT_CACHE_KEY] = workspace_config.read_config_state(self)
+        cached: str | None = self.__dict__[self._CONFIG_TEXT_CACHE_KEY]
         return cached
-
-    @property
-    def config_text(self) -> str | None:
-        """This workspace's ``config.toml`` as text, or ``None`` if it has none."""
-        return self._config_state[0]
-
-    @property
-    def config_revision(self) -> int | None:
-        """The revision token that came with :attr:`config_text`, to be handed back on
-        write so a shared backend can reject a lost update. ``None`` from a backend that
-        issues none."""
-        return self._config_state[1]
 
     @property
     def config_present(self) -> bool:
