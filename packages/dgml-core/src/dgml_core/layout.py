@@ -77,6 +77,11 @@ USAGE_FILE = "usage.jsonl"
 # JSON serialization — it drops ``example`` and omits the trailing newline), so
 # re-serializing it through the document API would drift.
 GENERATION_SCHEMA_FILE = "schema.json"
+# The vocabulary the USER supplied, kept apart from the one the pipeline
+# derived. `schema.json` is rewritten at the end of every run with
+# `seed + everything coined`, so a run that seeded from it would seed from
+# its own output — which is exactly what makes a seeded run irreproducible.
+AUTHORED_SCHEMA_FILE = "authored-schema.json"
 EXTRACTION_SCHEMA_FILE = "extraction-schema.rnc"
 EXTRACTION_GUIDANCE_FILE = "extraction-guidance.md"
 FULL_SCHEMA_FILE = "full-schema.rnc"
@@ -200,6 +205,18 @@ def docset_generation_schema_key(docset_id: str) -> str:
     return f"{docset_prefix(docset_id)}{GENERATION_SCHEMA_FILE}"
 
 
+def docset_authored_schema_key(docset_id: str) -> str:
+    """The user-supplied generation tag schema, in Schema v1 form.
+
+    Written by ``docset generate --schema-path`` and never touched by
+    ``derive_schema``, so it stays the docset's ground truth: the next run
+    re-seeds from THIS, in preference to the derived ``schema.json``. Held in
+    the canonical Schema JSON regardless of the form it was authored in (a
+    plain tag list, a ``{name: description}`` map, an RNC), so there is exactly
+    one shape to read back."""
+    return f"{docset_prefix(docset_id)}{AUTHORED_SCHEMA_FILE}"
+
+
 def dgml_grounded_xml_key(docset_id: str, file_id: str, file_stem: str) -> str:
     """The optional pre-grounded sibling of :func:`dgml_xml_key`, if a run left one."""
     return f"{docset_pair_prefix(docset_id, file_id)}{file_stem}.dgml.grounded.xml"
@@ -281,7 +298,7 @@ _BLOB_RULES: tuple[re.Pattern[str], ...] = (
     re.compile(
         rf"^{DOCSETS_DIR}/{_SEG}/"
         rf"(?:{EXTRACTION_SCHEMA_FILE}|{EXTRACTION_GUIDANCE_FILE}"
-        rf"|{FULL_SCHEMA_FILE}|{GENERATION_SCHEMA_FILE})$"
+        rf"|{FULL_SCHEMA_FILE}|{GENERATION_SCHEMA_FILE}|{AUTHORED_SCHEMA_FILE})$"
     ),
     # The optional --debug word-coverage report, directly under the docset dir.
     re.compile(rf"^{DOCSETS_DIR}/{_SEG}/{re.escape(COVERAGE_REPORT_FILE)}$"),

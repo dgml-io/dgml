@@ -688,8 +688,9 @@ concept tags across all of the docset's documents at once
 (`generation.label_model`), and the result is rendered deterministically
 into a namespaced `dg:chunk`
 document. The labeling vocabulary (the "roster") is planned automatically
-from the documents, or supplied up front with `--schema-path` to make labels
-deterministic. Unseeded runs are staged: the largest documents label first (a
+from the documents, or supplied up front with `--schema-path` — which skips
+planning and **closes** the vocabulary, so the output carries your tag names and
+no others (see [Supplying your own tag schema](#supplying-your-own-tag-schema)). Unseeded runs are staged: the largest documents label first (a
 pilot), their observed evidence — verbatim example values, kinds, hierarchy —
 confirms the planned vocabulary, and the rest of the batch labels against it.
 There is no separate transform pass.
@@ -697,10 +698,13 @@ There is no separate transform pass.
 **Incremental, consistent growth.** Already-generated files are skipped (see
 resume below), so adding a document and re-running generates only the new one.
 To keep its tags consistent with the existing docset, the new document is
-labeled seeded with the docset's own `schema.json` — full fidelity: role
-descriptions, observed examples, kind, hierarchy — falling back to the flat
-`cache/concept_roster.json` when no schema exists (default; disable both with
-`--no-roster`). Every concept is emitted in the per-docset
+labeled seeded with the docset's own `authored-schema.json` if a previous
+`--schema-path` run supplied one, else its derived `schema.json` — full
+fidelity: role descriptions, observed examples, kind, hierarchy — else the flat
+`cache/concept_roster.json` (default; disable all three with `--no-roster`).
+**A seed closes the vocabulary** unless `--allow-new-tags` is passed, so an
+added document no longer coins tags for roles the docset never planned — that
+content renders as `dg:chunk`, text intact. Every concept is emitted in the per-docset
 `docset:` vocabulary namespace (`dg:` is framework-only), so growing the docset
 never flips a tag's prefix. An already-generated file is still re-rendered
 deterministically when its output changes as the docset's schema/roster grows
@@ -830,8 +834,9 @@ The global `--debug` flag also writes the per-file
 ungrounded snippets); the `dg:origin` boxes themselves are always written
 into `<stem>.dgml.xml` regardless.
 | `--max-parallel-calls <n>` | `4` | Max documents transcribed concurrently (windows *within* a document stay serial). The LLM call is network-bound, so threads overlap the latency. Set to `1` to disable. Tune to your provider's RPM tier — e.g. Gemini free ~10-15 RPM, Gemini paid Flash 500 RPM, OpenAI free 500 RPM, Anthropic tier-1 ~50 RPM. |
-| `--schema-path <f>` | none | Exported schema to seed labeling with — either `docsets/<id>/schema.json` (Schema v1: a `tags` map of `name -> {role, kind, parent_role, …}`) or its lossless RELAX NG Compact render `docsets/<id>/full-schema.rnc` (both written by `docset generate`). When given, this vocabulary is used as-is with **full fidelity** — role descriptions, curated examples, and kind all feed the labeling prompt — and the planning pass is **skipped**, making labels deterministic across runs; the tag hierarchy (`parent_role`) also seeds entity-container grouping. Per-document labeling still extends it for roles the schema doesn't cover. A flat `{concept: description}` mapping is **not** accepted. |
-| `--no-roster` | off | Disable automatic vocabulary reuse. By default an incremental generate seeds labeling from the docset's own `schema.json` (full fidelity: descriptions, observed examples, kind, hierarchy), falling back to the flat `cache/concept_roster.json` from a prior run, so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. Unlike `--schema-path`, automatic reuse does **not** seed entity-container grouping. Ignored when `--schema-path` is given. |
+| `--schema-path <f>` | none | The tag schema to label against, in any of four forms detected by **content** (not by file extension) — see [Supplying your own tag schema](#supplying-your-own-tag-schema). The planning pass is **skipped**, and the vocabulary is **closed**: the generated DGML uses these tag names and no others. Content whose role has no matching tag is **not** dropped — it renders as `dg:chunk` with its text, structure, and `dg:origin` intact. Role descriptions, curated examples, and kind all feed the labeling prompt; the tag hierarchy (`parent_role`) seeds entity-container grouping. Pass `--allow-new-tags` to restore the previous seed-plus-coining behavior. |
+| `--allow-new-tags` | off | Let labeling coin tag names outside the seed schema. Applies to `--schema-path` and to automatic reuse alike — without it, **any** seed closes the vocabulary. |
+| `--no-roster` | off | Disable automatic vocabulary reuse. By default an incremental generate seeds labeling from the docset's own `authored-schema.json` (whatever a previous `--schema-path` run supplied), else its derived `schema.json` (full fidelity: descriptions, observed examples, kind, hierarchy), else the flat `cache/concept_roster.json`, so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. Only the authored slot seeds entity-container grouping — grouping is never inferred from a run's own observations. No seed means no closed vocabulary, so this also re-opens tag coining. Ignored when `--schema-path` is given. |
 | `--no-semlinks` | off | Skip the final semantic-link pass. By default each grounded `<stem>.dgml.xml` gets semantic links added in place — relationships the tree's nesting can't capture, written as `dg:itemprop` (predicate) + `dg:href` (`#id`, or space-separated `#id`s) on the subject, with `xml:id`s assigned to both ends. Covers references (`references`, `incorporates`, `signatoryOf`, …), relative dates (`relativeTo`/`effectiveOn`, ISO-8601 offset in `dg:value`), and derived values (`greaterOf`/`lesserOf` formulas, `escalates`, `valueFrom`). The model proposes links on the labeling model (`generation.label_model`), then a skeptical pass verifies them. Each converted file's `results` entry carries a `links` count. |
 | `--no-semlink-cache` | off | Always call the model for the semantic-link pass. By default the pass is cached on what the model actually reads — tag names and text, plus the labeling model, the link prompts, and whether the review pass runs. Attributes are deliberately excluded, because the prompt never shows them: grounding a document or renaming a namespace prefix does not change its links, so those runs replay the cache instead of paying again. The cache stores the links themselves, not a second copy of the XML, and they are written onto whatever the current render produced. This flag forces a fresh call — use it when something the key cannot see has changed, such as a provider-side model update behind a stable model id. |
 | `--no-semlink-verify` | off | Skip the second, skeptical pass that reviews each proposed link. The link pass then makes one model call per document instead of two, which cuts its wall-clock time by about 60%, and keeps roughly twice as many links — including the weaker ones the review would have dropped. Use it when you want breadth and speed over precision. Reviewed and unreviewed results are cached separately. |
@@ -943,6 +948,136 @@ Errors (run-level, error envelope + exit 1):
 
 > stdout is a single JSON object. The transcription / labeling / render
 > progress lines go to stderr, and only when `--verbose` is passed.
+
+#### Supplying your own tag schema
+
+`--schema-path` takes the vocabulary you want to see in the generated DGML.
+The pipeline then stops inventing one and labels against yours instead.
+
+> **This drives the whole document, not field extraction.** The schema is
+> applied to *every* element of the document tree — heading, clause, paragraph,
+> list item, table row, cell, inline value. DGML's separate
+> [extraction schema](#extraction-commands) (`extraction-schema.rnc`, driven by
+> `dgml extraction`) is what selects a few typed fields into a
+> `<dg:extraction>` subtree; that is a different feature and this flag does not
+> touch it.
+
+**Four input forms**, detected by content so the flag stays one flag:
+
+*A — a plain tag list.* One name per line; blank lines and `#` comments ignored.
+
+```
+# Liquor distribution purchase orders
+CustomerName
+PurchaseOrderNumber
+OrderDate
+ProductDescription
+Quantity
+UnitPrice
+PaymentTerms
+```
+
+*B — names with descriptions (recommended).* A JSON object mapping each name to
+a one-line description of the role it plays.
+
+```json
+{
+  "CustomerName":        "Legal name of the customer placing the order",
+  "PurchaseOrderNumber": "Identifier the customer assigned to this order",
+  "OrderDate":           "Date the order was placed",
+  "PaymentTerms":        "Terms governing when payment is due"
+}
+```
+
+*C — a full `schema.json`.* Use this when you need structural `kind`, example
+values, or hierarchy. It is also what `docset generate` exports, so a natural
+workflow is to generate once, hand-edit the export, and feed it back.
+
+```json
+{
+  "tags": {
+    "OrderLines":  { "role": "The table of ordered products",
+                     "kind": "section" },
+    "OrderLine":   { "role": "One product line on the order",
+                     "kind": "row",    "parent_role": "OrderLines" },
+    "OrderQuantity": { "role": "Number of units ordered on a line",
+                       "kind": "inline", "parent_role": "OrderLine" }
+  },
+  "notes": "Free-form notes about this docset's vocabulary."
+}
+```
+
+*D — `full-schema.rnc`*, the lossless RELAX NG Compact render of the same
+information, also written by `docset generate`. Recognized by the `.rnc` suffix.
+
+| field | required | what it does | reaches the model? |
+|---|---|---|---|
+| **name** | yes | The tag emitted in the DGML, as `<docset:Name>`. | yes, verbatim |
+| **role** / description | no, but recommended | One line describing what the tag holds; what the model matches content against. | yes, first 100 characters |
+| **kind** | no — defaults to `inline` | `section` (a region grouping other content), `row` (a repeating record in a table), `inline` (an atomic value). | yes, as `[section]` / `[row]` / `[value]` |
+| **examples** | no | Representative real values; up to 3 stored. | yes, first 2, 60 characters each |
+| **parent_role** | no | Name of the tag that contains this one; groups related values under a shared container. Must name a tag the schema declares. | **no** — used deterministically |
+
+**Tag names are taken verbatim.** `Notes`, `Details` and `Line Items` are all
+accepted and preserved. The one transformation: characters illegal in an XML
+element name become underscores, so `Line Items` is emitted as `Line_Items` —
+`--verbose` reports every such rewrite. Write `LineItems` if that is what you
+want to see.
+
+**Matching is forgiving about style, strict about words.** `customername`,
+`Customer_Name`, `CUSTOMER-NAME` and `Customer Name` all resolve to
+`CustomerName`, so you will not lose values to a capitalization mismatch. A
+*semantic* alias does not: `NameOfCustomer`, `ClientName`, `CustFirstLast` and
+even `CustomerNames` are **rejected**, and that block renders untagged. Guessing
+that two differently-named things mean the same role is how values end up under
+the wrong tag, and a wrong tag is harder to notice than a missing one.
+
+**Nothing is deleted.** "Closed" describes the tag vocabulary, not the output.
+A block whose role has no matching tag is emitted as a generic `dg:chunk`
+carrying its full text, its structural role, and its `dg:origin` page
+coordinates. A short schema does not produce a short document — it produces the
+same document with fewer semantically-tagged elements.
+
+**Read the rejection list.** Every converted file's `results` entry gains
+`unmatched_concepts` whenever a concept was refused:
+
+```json
+{ "status": "converted", "file_id": "k7q3xb91pmrf", "source": "order-a.pdf",
+  "unmatched_concepts": { "count": 12, "distinct": 3,
+    "examples": ["ProductPartNumber", "ShipVia", "NameOfCustomer"] } }
+```
+
+It is the fastest way to find gaps: rejects that look like roles you forgot mean
+add them; rejects that look like aliases of tags you already have mean rename
+them in your schema.
+
+Two things worth knowing:
+
+- `ColumnHeader` is a tag the renderer itself emits for a table's printed
+  column-title row. Under a closed vocabulary it obeys the same rule as
+  everything else, so declare it if you want those cells tagged.
+- Up to 400 tags are shown to the model per call; a larger vocabulary loses its
+  tail. Around 30 tags with one-line descriptions is a good target.
+
+**The schema you supply is protected from the run's own output.** It is stored
+verbatim (in canonical Schema v1 form) as `docsets/<id>/authored-schema.json`,
+which the derived `schema.json` never overwrites — so a later `generate` with no
+flags re-seeds from what you wrote, not from `yours + everything coined`.
+
+```bash
+# Pin the vocabulary for a docset
+uv run dgml docset generate <docset_id> --schema-path ./my-schema.json
+
+# Same, but let the model coin tags for roles the schema misses
+uv run dgml docset generate <docset_id> --schema-path ./my-schema.json --allow-new-tags
+```
+
+> **Behavior change.** Any seed now closes the vocabulary, including the
+> automatic reuse an incremental `generate` does from the docset's own schema.
+> Adding a document to an existing docset no longer coins tags for roles the
+> docset never planned; that content renders as `dg:chunk` instead. Use
+> `--allow-new-tags` for seeded-but-coining, or `--no-roster` to label in
+> isolation with no seed at all.
 
 > **Grounding is part of `generate`.** There is no separate `dgml docset
 > ground` command — `generate` writes `dg:origin` boxes into each

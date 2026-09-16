@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import glob
 import json
+from collections import Counter
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -49,13 +50,23 @@ from dgml_core.generation.to_semantic import (
     render_semantic_xml,
 )
 from dgml_core.generation.transcribe import transcribe_document
+from dgml_core.generation.vocab import OPEN_VOCAB, TagVocab
 from dgml_core.pages import PdfConfig
 from dgml_core.storage import Workspace
 from dgml_core.usage import OPERATION_LABEL, OPERATION_TRANSCRIBE
 
 
-def load_labeled_docs_from_cache(cache_dir: Path | str, stems: list[str]) -> dict[str, list[Block]]:
-    """Rebuild fully-labeled blocks for already-generated docs from cache."""
+def load_labeled_docs_from_cache(
+    cache_dir: Path | str, stems: list[str], vocab: TagVocab | None = None
+) -> dict[str, list[Block]]:
+    """Rebuild fully-labeled blocks for already-generated docs from cache.
+
+    *vocab* MUST be the same one a fresh run would use. This path replays the
+    cached label JSON through ``apply_labels``, so a different vocabulary here
+    would resolve the same model output differently and a replayed document
+    would diverge from a freshly-labeled one — silently breaking the
+    reproducibility a pinned schema exists to provide.
+    """
     cache = Path(cache_dir)
     docs: dict[str, list[Block]] = {}
     for stem in stems:
@@ -69,7 +80,7 @@ def load_labeled_docs_from_cache(cache_dir: Path | str, stems: list[str]) -> dic
         ]
         for label_file in sorted(cache.glob(f"label_{glob.escape(stem)}_*_raw.json")):
             payload = _parse_labels_json(label_file.read_text(encoding="utf-8"))
-            apply_labels(blocks, payload.get("labels", {}) or {}, doc_name=stem)
+            apply_labels(blocks, payload.get("labels", {}) or {}, doc_name=stem, vocab=vocab)
         propagate_table_consistency(blocks)
         propagate_list_consistency(blocks)
         wrap_detected_values(blocks)
@@ -148,6 +159,14 @@ class ConvertOptions:
     # parent/children). Drives the entity-container grouping in render_dgml
     # (e.g. BuyerAddress/BuyerPhone → BuyerInformation). None = no grouping.
     parent_map: dict[str, str] | None = None
+    # The tag vocabulary every concept — model-emitted or replayed from cache —
+    # resolves against, in BOTH labeling and rendering. A closed one makes the
+    # seed a contract: the emitted docset: tags are a subset of its names, and
+    # unmatched content renders as dg:chunk with its text intact. None = open,
+    # i.e. coin freely (today's behavior, and the right default for a library
+    # caller). Whether a seed closes the vocabulary is CLI policy, not a
+    # property of the seed — see `dgml docset generate --allow-new-tags`.
+    vocab: TagVocab | None = None
     progress: Callable[[str], None] | None = field(default=None)
     # Workspace to record LLM usage into. When set (and ``debug`` is True), the
     # transcription/labeling calls append rows to ``usage.jsonl``; None disables
@@ -177,6 +196,7 @@ def convert_batch(
     on_output: Callable[[str, str], None] | None = None,
     on_error: Callable[[str, str], None] | None = None,
     on_label_error: Callable[[str, dict[str, str]], None] | None = None,
+    on_rejected: Callable[[str, Counter[str]], None] | None = None,
     prior_docs: Mapping[str, list[Block]] | None = None,
     prior_outputs: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
@@ -204,12 +224,17 @@ def convert_batch(
     completes before any ``on_output`` fires, so a per-file result built in
     ``on_output`` can read whatever this reported.
 
+    Pass *on_rejected* — called ``(name, Counter[concept])`` — to learn which
+    concepts a CLOSED ``options.vocab`` refused for a document. Fired only for
+    documents that had any, before their output is emitted.
+
     *prior_docs* (already-generated docs from cache) are re-rendered so the
     whole docset stays consistent as its schema/roster grows; any whose render
     changes is re-emitted via *on_output* (skipped if unchanged per
     *prior_outputs*).
     """
     opts = options
+    vocab = opts.vocab or OPEN_VOCAB
     log = opts.progress or (lambda _m: None)
 
     paths = [Path(p) for p in inputs]
@@ -286,7 +311,9 @@ def convert_batch(
             log=log,
             roster_seed=opts.roster_seed,
             schema_seed=opts.schema_seed,
+            vocab=vocab,
             on_label_error=on_label_error,
+            on_rejected=on_rejected,
         )
 
     def _emit(item: tuple[str, list[Block]]) -> tuple[str, str]:
@@ -297,7 +324,9 @@ def convert_batch(
         # structure-attribute XML are kept as debug artifacts in the cache.
         name, blocks = item
         if opts.dgml_header:
-            xml = render_dgml(blocks, header=opts.dgml_header, parent_map=opts.parent_map)
+            xml = render_dgml(
+                blocks, header=opts.dgml_header, parent_map=opts.parent_map, vocab=vocab
+            )
         else:
             xml = render_semantic_xml(blocks)
         # Stream to the sink (freed immediately) or accumulate for the return.
@@ -338,7 +367,9 @@ def convert_batch(
         # calls — goes on the pool.
         changed: list[tuple[str, str]] = []
         for name, blocks in prior_docs.items():
-            xml = render_dgml(blocks, header=opts.dgml_header, parent_map=opts.parent_map)
+            xml = render_dgml(
+                blocks, header=opts.dgml_header, parent_map=opts.parent_map, vocab=vocab
+            )
             if prior_outputs is not None and prior_outputs.get(name) == xml:
                 continue
             log(f"re-rendering {name} (docset render changed)")

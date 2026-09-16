@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -2734,6 +2735,171 @@ def test_docset_generate_reuse_prefers_schema_json(
     assert options.parent_map is None  # grouping stays --schema-path opt-in
 
 
+def _generate_with_stub_batch(
+    ws: Path, did: str, extra: list[str], *, on_output_name: str = "with-text.pdf"
+) -> Any:
+    """Run `docset generate` with convert_batch stubbed out, returning the mock.
+
+    Everything these tests care about — which seed was chosen, whether the
+    vocabulary closed, what reached the JSON payload — is decided around the
+    pipeline call, so the pipeline itself is replaced by a stub that emits one
+    document. Keeps the tests free of the model and of ghostscript.
+    """
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_output(on_output_name, "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert) as mock_batch:
+        rc = main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage", *extra])
+    assert rc == 0
+    return mock_batch
+
+
+def _docset_with_one_file(ws: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    did = _init_with_docset(ws, capsys)
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+    return did
+
+
+def test_docset_generate_schema_path_closes_the_vocabulary(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D1/D2 — a supplied schema is a CONTRACT, not a suggestion. This changes
+    behavior for existing --schema-path users, who used to get seed-plus-coining.
+    --allow-new-tags is the way back."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\nDueDate\n", encoding="utf-8")
+
+    mock = _generate_with_stub_batch(ws, did, ["--schema-path", str(schema_path)])
+    vocab = mock.call_args.kwargs["options"].vocab
+    assert vocab.closed and vocab.names == {"PaymentTerms", "DueDate"}
+
+    capsys.readouterr()
+    mock = _generate_with_stub_batch(
+        ws, did, ["--schema-path", str(schema_path), "--allow-new-tags"]
+    )
+    vocab = mock.call_args.kwargs["options"].vocab
+    assert not vocab.closed and vocab.names == {"PaymentTerms", "DueDate"}
+
+
+def test_docset_generate_closure_follows_the_seed_not_the_flag(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D3 — one rule, one code path: ANY seed closes the vocabulary, including
+    automatic reuse of the docset's own schema.json. --no-roster leaves no seed
+    at all, so it is open by construction."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    (ws / "docsets" / did / "schema.json").write_text(
+        json.dumps({"tags": {"ClientName": {"name": "ClientName", "role": "the client"}}}),
+        encoding="utf-8",
+    )
+
+    for extra, closed, seeded in (
+        ([], True, True),  # auto-reuse closes
+        (["--allow-new-tags"], False, True),  # …unless told otherwise
+        (["--no-roster"], False, False),  # no seed -> nothing to close
+    ):
+        capsys.readouterr()
+        options = _generate_with_stub_batch(ws, did, extra).call_args.kwargs["options"]
+        assert options.vocab.closed is closed, extra
+        assert bool(options.vocab.names) is seeded, extra
+
+
+def test_docset_generate_protects_the_authored_schema_from_its_own_output(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """W3 — a seeded run must not become its own next input.
+
+    `derive_schema` rewrites schema.json at the end of every run with `seed
+    union everything coined`, and the next run auto-seeds from it. Parking the
+    authored vocabulary in its own slot is what makes a seeded run repeatable.
+    """
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    docset_dir = ws / "docsets" / did
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\nDueDate\n", encoding="utf-8")
+
+    _generate_with_stub_batch(ws, did, ["--schema-path", str(schema_path)])
+    authored = json.loads((docset_dir / "authored-schema.json").read_text(encoding="utf-8"))
+    assert set(authored["tags"]) == {"PaymentTerms", "DueDate"}
+
+    # A later run, with no flags at all, re-seeds from the AUTHORED vocabulary
+    # even though a (polluted) derived schema.json sits beside it.
+    (docset_dir / "schema.json").write_text(
+        json.dumps(
+            {
+                "tags": {
+                    "PaymentTerms": {"name": "PaymentTerms", "role": "x"},
+                    "DueDate": {"name": "DueDate", "role": "x"},
+                    "CoinedDuringLabeling": {"name": "CoinedDuringLabeling", "role": "x"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    options = _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"]
+    assert options.vocab.names == {"PaymentTerms", "DueDate"}
+    assert options.vocab.closed
+    # …and the authored bytes are still exactly what the run started from.
+    assert json.loads((docset_dir / "authored-schema.json").read_text(encoding="utf-8")) == authored
+
+
+def test_docset_generate_reports_unmatched_concepts_per_file(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """W4 — the rejection list is the run's most actionable output, so it rides
+    in the JSON payload rather than only in --verbose logging."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\n", encoding="utf-8")
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, on_rejected: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_rejected("with-text.pdf", Counter({"NameOfCustomer": 3, "DueDate": 1}))
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert):
+        assert (
+            main(
+                _ws_args(ws)
+                + ["docset", "generate", did, "--no-coverage", "--schema-path", str(schema_path)]
+            )
+            == 0
+        )
+    entry = next(r for r in _read_stdout(capsys)["results"] if r["status"] == "converted")
+    assert entry["unmatched_concepts"] == {
+        "count": 4,
+        "distinct": 2,
+        "examples": ["NameOfCustomer", "DueDate"],
+    }
+
+
+def test_docset_generate_omits_unmatched_concepts_when_nothing_was_refused(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Conditional keys stay conditional — an open run's payload is unchanged,
+    and JSON output is API surface."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    _generate_with_stub_batch(ws, did, [])
+    entry = next(r for r in _read_stdout(capsys)["results"] if r["status"] == "converted")
+    assert "unmatched_concepts" not in entry
+
+
 @needs_gs
 def test_docset_generate_missing_source_is_per_file_failure(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
@@ -4523,7 +4689,7 @@ def test_load_schema_seed_json_builds_roster_and_parent_map(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    schema, parent_map = _load_schema_seed(p)
+    schema, parent_map, _notes = _load_schema_seed(p)
     assert {"PartyInformation", "PartyAddress", "OrderDate"} <= set(schema.tags)
     assert schema.tags["PartyAddress"].role == "address"
     assert schema.tags["PartyInformation"].kind == "section"  # fidelity kept, not flattened
@@ -4545,12 +4711,12 @@ def test_load_schema_seed_accepts_rnc(tmp_path: Path) -> None:
         "  mixed { any.docset* }\n}\n\n"
         "# " + "-" * 20 + "\n"
         '# Description: "address"\n'
-        "# Kind: field\n"
+        "# Kind: inline\n"
         "# Parent: PartyInformation\n"
         "PartyAddress = element PartyAddress {\n  common.atts,\n  text\n}\n",
         encoding="utf-8",
     )
-    schema, parent_map = _load_schema_seed(p)
+    schema, parent_map, _notes = _load_schema_seed(p)
     assert {tag.name: tag.role for tag in schema.tags.values()} == {
         "PartyInformation": "party block",
         "PartyAddress": "address",
@@ -4558,21 +4724,79 @@ def test_load_schema_seed_accepts_rnc(tmp_path: Path) -> None:
     assert parent_map == {"PartyAddress": "PartyInformation"}
 
 
-def test_load_schema_seed_rejects_non_schema_input(tmp_path: Path) -> None:
-    """--schema-path accepts only an exported schema (a `tags` map); a flat
-    {concept: description} mapping, non-schema text, or a missing file is rejected."""
+def test_load_schema_seed_accepts_a_plain_tag_list(tmp_path: Path) -> None:
+    """Form A — one bare tag name per line, `#` comments and blanks ignored.
+
+    Names are taken VERBATIM: `Notes` and `Details` survive (`sanitize_concept`
+    would fold both to ''), and only XML validity is enforced, which turns
+    `Line Items` into `Line_Items` and says so in the notes."""
+    from dgml.cli import _load_schema_seed
+
+    p = tmp_path / "tags.txt"
+    p.write_text(
+        "# Liquor distribution purchase orders\n\nCustomerName\nNotes\n"
+        "Details\nLine Items\nAgreementSummary\n",
+        encoding="utf-8",
+    )
+    schema, parent_map, notes = _load_schema_seed(p)
+    assert list(schema.tags) == [
+        "CustomerName",
+        "Notes",
+        "Details",
+        "Line_Items",
+        "AgreementSummary",
+    ]
+    assert all(tag.kind == "inline" for tag in schema.tags.values())
+    assert parent_map == {}
+    assert any("Line Items" in note and "Line_Items" in note for note in notes)
+    assert any("kind=inline" in note for note in notes)
+
+
+def test_load_schema_seed_accepts_a_name_to_description_mapping(tmp_path: Path) -> None:
+    """Form B — the recommended shape. Previously rejected outright."""
+    from dgml.cli import _load_schema_seed
+
+    p = tmp_path / "schema.json"
+    p.write_text(
+        json.dumps({"BuyerName": "bill-to org", "OrderDate": "date the order was placed"}),
+        encoding="utf-8",
+    )
+    schema, parent_map, _notes = _load_schema_seed(p)
+    assert {n: t.role for n, t in schema.tags.items()} == {
+        "BuyerName": "bill-to org",
+        "OrderDate": "date the order was placed",
+    }
+    assert parent_map == {}
+
+
+def test_load_schema_seed_rejects_ambiguous_input(tmp_path: Path) -> None:
+    """What cannot be read UNAMBIGUOUSLY fails at load, never as a tag that
+    quietly failed to appear in the output hours later."""
     from dgml.cli import _load_schema_seed
     from dgml_core.errors import InvalidArgument
 
-    flat = tmp_path / "roster.json"  # old concept_roster shape — no `tags`
-    flat.write_text(json.dumps({"BuyerName": "bill-to org"}), encoding="utf-8")
-    with pytest.raises(InvalidArgument):
-        _load_schema_seed(flat)
+    def _reject(name: str, text: str) -> str:
+        p = tmp_path / name
+        p.write_text(text, encoding="utf-8")
+        with pytest.raises(InvalidArgument) as excinfo:
+            _load_schema_seed(p)
+        return str(excinfo.value)
 
-    junk = tmp_path / "seed.txt"  # arbitrary non-schema text
-    junk.write_text("concepts:\n  BuyerName: bill-to org\n", encoding="utf-8")
-    with pytest.raises(InvalidArgument):
-        _load_schema_seed(junk)
+    # A `key: value` file (YAML, or Form B written as text) would otherwise
+    # load as tags named "concepts_" and "BuyerName__bill-to_org".
+    assert "':'" in _reject("seed.txt", "concepts:\n  BuyerName: bill-to org\n")
+    # Two names that differ only in case/punctuation are one tag, twice.
+    assert "differ only in case" in _reject("dup.txt", "BuyerName\nbuyer_name\n")
+    # A kind outside VALID_KINDS is a typo, not a silent coercion to `inline`.
+    assert "kind" in _reject("k.json", json.dumps({"tags": {"A": {"role": "x", "kind": "field"}}}))
+    # A parent_role naming a tag that does not exist would synthesize a
+    # container outside the vocabulary.
+    assert "parent_role" in _reject(
+        "p.json", json.dumps({"tags": {"A": {"role": "x", "parent_role": "Nope"}}})
+    )
+    # An empty `tags` map, and a JSON array (neither form).
+    assert "no tags" in _reject("e.json", json.dumps({"tags": {}}))
+    assert "array" in _reject("a.json", json.dumps(["A", "B"]))
 
     with pytest.raises(InvalidArgument):
         _load_schema_seed(tmp_path / "missing.json")

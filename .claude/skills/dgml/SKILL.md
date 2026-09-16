@@ -337,7 +337,7 @@ semantic-labeling call assigns concept tags across all of the docset's
 documents at once (`generation.label_model`), and the result is rendered
 deterministically into namespaced `dg:chunk` XML. The labeling vocabulary
 (the "roster") is planned automatically from the documents, or pinned up
-front with `--schema-path` (see below). Unseeded runs are staged: the largest
+front with `--schema-path`, which also CLOSES it (see below). Unseeded runs are staged: the largest
 documents label first (a pilot) and their observed evidence — verbatim
 examples, kinds, hierarchy — confirms the vocabulary the rest of the batch
 labels against. There is no separate transform pass. The pipeline is part of
@@ -406,26 +406,52 @@ done
 uv run dgml docset generate --workspace "$wid" "$ds"
 ```
 
-**Pin the vocabulary for consistent labels (`--schema-path`).** Labeling is
-non-deterministic run-to-run; to lock the concept vocabulary, pass a schema a
-prior run exported — `schema.json` (Schema v1: a `tags` map of concept name →
-`{role, kind, parent_role, …}`) or its RELAX NG Compact render `full-schema.rnc`
-(both land at the docset root; the `.rnc` is the human-friendly editing
-surface and reverses losslessly). The planning pass is skipped and that
-vocabulary is used as-is with full fidelity — role descriptions, curated
-examples, and kind all feed the labeling prompt, and the tag hierarchy
-(`parent_role`) also seeds entity-container grouping — and per-document
-labeling still extends it for roles it doesn't cover. Only these exported
-formats are accepted (not a flat `{concept: description}` mapping). The
-natural loop is "generate once, review/curate the schema, then reuse it":
+**Pin the vocabulary (`--schema-path`) — this CLOSES it.** Labeling is
+non-deterministic run-to-run; supplying a schema locks the concept vocabulary.
+The planning pass is skipped and the generated DGML uses those tag names **and
+no others**. Content whose role has no matching tag is not dropped — it renders
+as `dg:chunk` with its text, structure, and `dg:origin` intact. Pass
+`--allow-new-tags` for the old seed-plus-coining behavior.
+
+Four input forms, detected by content:
+
+- **a plain tag list** — one name per line, `#` comments and blanks ignored;
+- **`{name: one-line description}` JSON** — recommended; the description is what
+  the model matches content against;
+- **`schema.json`** (Schema v1: a `tags` map of name → `{role, kind, examples,
+  parent_role}`) — what `generate` exports;
+- **`full-schema.rnc`** — the same, as commented RELAX NG Compact; the
+  human-friendly editing surface, and it reverses losslessly.
+
+Tag names are taken **verbatim** — `Notes`, `Details` and `Line Items` all
+survive; only XML-illegal characters become underscores (`Line Items` →
+`Line_Items`, reported under `--verbose`). Matching ignores case and separators
+(`customer_name` → `CustomerName`) but **not** word differences:
+`NameOfCustomer` is rejected, not mapped. Each converted file's `results` entry
+gains `unmatched_concepts` `{count, distinct, examples}` listing what was
+refused — read it; it is the fastest way to find gaps in the schema. Note that
+`ColumnHeader`, which the renderer emits for a table's printed column-title row,
+is subject to the same rule: declare it if you want those cells tagged.
+
+A supplied schema is stored at `docsets/<id>/authored-schema.json`, which the
+derived `schema.json` never overwrites — so later runs re-seed from what you
+wrote, not from `yours + everything coined`.
 
 ```bash
-# 1) first run plans the vocabulary and exports it to docsets/<id>/schema.json
-#    (+ full-schema.rnc, the same schema as commented RELAX NG Compact)
+# Hand-written vocabulary — the recommended shape. ~30 tags with one-line
+# roles beat both a bare name list and names-plus-example-values.
+cat > /tmp/po-tags.json <<'JSON'
+{ "CustomerName": "Legal name of the customer placing the order",
+  "PurchaseOrderNumber": "Identifier the customer assigned to this order",
+  "OrderDate": "Date the order was placed",
+  "PaymentTerms": "Terms governing when payment is due" }
+JSON
+uv run dgml docset generate --workspace "$wid" "$ds" --schema-path /tmp/po-tags.json
+
+# Or: generate once, curate the export, feed it back. --schema-path needs a
+# local file, so take the workspace root from `status` rather than assuming one —
+# this step is local-store only: on a remote blob backend the export has no path.
 uv run dgml docset generate --workspace "$wid" "$ds"
-# 2) reuse (optionally hand-curate) either export on later runs. --schema-path needs a
-#    local file, so take the workspace root from `status` rather than assuming one — and
-#    note this step is local-store only: on a remote blob backend the export has no path.
 root=$(uv run dgml status --workspace "$wid" | jq -r .workspace)
 uv run dgml docset generate --workspace "$wid" "$ds" \
   --schema-path "$root/docsets/$ds/full-schema.rnc"
@@ -499,10 +525,13 @@ generate builds its tree and carries the existing `dg:extraction` over
 
 **Growing a docset (add docs later, stay consistent).** Because existing files
 are skipped, adding a document and re-running generates only the new one — and
-by default it's labeled seeded with the docset's own `schema.json` (full
-fidelity: descriptions, observed examples, kind, hierarchy; falls back to the
-flat `cache/concept_roster.json`), so its tags stay consistent with the rest
-(no `--schema-path` needed). Every concept is emitted in the `docset:` vocabulary
+by default it's labeled seeded with the docset's own `authored-schema.json` if a
+previous `--schema-path` run supplied one, else its derived `schema.json` (full
+fidelity: descriptions, observed examples, kind, hierarchy), else the flat
+`cache/concept_roster.json`, so its tags stay consistent with the rest (no
+`--schema-path` needed). **Any seed closes the vocabulary**, so the new document
+no longer coins tags for roles the docset never planned — pass
+`--allow-new-tags` if you want it to. Every concept is emitted in the `docset:` vocabulary
 namespace (`dg:` is framework-only), so growing the docset never flips a tag's
 prefix; an already-generated file is still re-rendered deterministically when
 its output otherwise changes as the docset's schema/roster grows (reported under

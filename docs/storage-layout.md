@@ -77,6 +77,7 @@ at all — see [storage services](#storage-services-storage).
 │       ├── docset.json               # { id, name, description, key_questions }
 │       ├── extraction-schema.rnc      # grounded extraction schema, RELAX NG Compact (optional)
 │       ├── extraction-guidance.md     # docset-level extraction guidance shown to the LLM (optional)
+│       ├── authored-schema.json     # the tag schema a user SUPPLIED via --schema-path (optional)
 │       ├── schema.json               # generation tag schema, written by `generate` (present after generation)
 │       ├── full-schema.rnc           # schema.json as RELAX NG Compact, written by `generate` (see below)
 │       └── files/
@@ -813,11 +814,18 @@ the phase-1 extraction prompt after the schema. Complements the per-field
 The **generation tag schema** for the docset — the canonical set of DGML
 XML tag names that locks element structure across the docset's documents.
 Written by `dgml docset generate` (the labeling pass derives it from the
-labeled documents and saves it here). A prior run's `schema.json` can be fed
-back into a later run via `--schema-path` to pin the vocabulary — then it is
-injected as a locked contract on every generation call, so similar documents
-converge on the same tags. It is the schema captured in a file's attestation alongside that
+labeled documents and saves it here). This is the **observed** vocabulary —
+`seed ∪ everything coined during the run` — and it is rewritten at the end of
+every run. A prior run's `schema.json` can be fed back into a later run via
+`--schema-path` to pin the vocabulary — then it is injected as a locked
+contract on every generation call, so similar documents converge on the same
+tags. It is the schema captured in a file's attestation alongside that
 file's `<stem>.dgml.xml` (see [merkle-attestation.md](merkle-attestation.md)).
+
+A user-supplied vocabulary is **not** kept here — see
+[`authored-schema.json`](#docsetsidauthored-schemajson-optional) below. Keeping
+the two apart is what makes a seeded run reproducible: otherwise the run's own
+output becomes the next run's input.
 
 Distinct from `extraction-schema.rnc` above, and the two never collide: this one
 governs the generated full-document tree; the extraction schema governs the
@@ -827,7 +835,8 @@ governs the generated full-document tree; the extraction schema governs the
 `cache/` at the docset root. It holds **functional** files the next
 `generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`,
 `concept_roster.json` (the flat legacy vocabulary; incremental reuse prefers
-the docset's `schema.json` and falls back to this file), and
+the docset's `authored-schema.json`, then its `schema.json`, and falls back to
+this file), and
 `semlinks/<hash>.json` (one document's semantic links, keyed on what the link
 model reads — tag names and text — so re-rendering or grounding a document
 replays them instead of paying for the pass again) —
@@ -835,6 +844,28 @@ which are always written. Its **debug-only** artifacts (raw LLM dumps,
 `*.concept.xml`/`*.semantic.xml`, prompt listings) and the separate
 `coverage_report.json` are written only when `dgml --debug docset generate`
 is used; a default run leaves just the functional cache.
+
+## `docsets/<id>/authored-schema.json` (optional)
+
+The generation tag schema a **user supplied**, written by `dgml docset generate
+--schema-path <file>`. Same Schema v1 body as `schema.json`, and deliberately a
+separate file: `derive_schema` rewrites `schema.json` at the end of every run
+with `seed ∪ everything the labeling pass coined`, and the next incremental run
+auto-seeds from it — so ground truth goes in and a polluted vocabulary comes
+back out. This slot is never written by derivation, which is what lets a later
+`generate` with no flags re-seed from what the author actually wrote.
+
+Seed precedence for a `generate` run:
+`--schema-path` → `authored-schema.json` → `schema.json` → `cache/concept_roster.json`
+(`--no-roster` uses none of them).
+
+Stored in canonical Schema v1 form regardless of which input form it was
+authored in — a plain newline-delimited tag list, a JSON `{name: description}`
+object, a `schema.json`, or a `full-schema.rnc` — so there is exactly one shape
+to read back. See
+[Supplying your own tag schema](cli-reference.md#supplying-your-own-tag-schema).
+
+Not attested. `full_schema` still hashes `full-schema.rnc`, unchanged.
 
 ## `docsets/<id>/full-schema.rnc` (optional)
 

@@ -27,6 +27,7 @@ import os
 import shutil
 import sys
 import tomllib
+from collections import Counter
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -2902,12 +2903,25 @@ def _add_generate_subparser(
         type=Path,
         default=None,
         help=(
-            "Exported schema to seed labeling with — either docsets/<id>/schema.json "
-            "(Schema v1: a `tags` map of name -> {role, kind, parent_role, ...}) or its "
-            "RELAX NG Compact render docsets/<id>/full-schema.rnc. When given, this vocabulary "
-            "is used as-is and the planning pass is skipped (making labels deterministic), "
-            "and the tag hierarchy seeds entity-container grouping; per-document labeling "
-            "still extends it for roles the schema does not cover."
+            "Tag schema to label against. Four forms, detected by content: a plain "
+            "newline-delimited list of tag names (blank lines and `#` comments ignored); "
+            "a JSON {name: one-line description} object (RECOMMENDED — descriptions are "
+            "what the model matches content against); an exported docsets/<id>/schema.json "
+            "(a `tags` map of name -> {role, kind, examples, parent_role}); or its RELAX NG "
+            "Compact render docsets/<id>/full-schema.rnc. The planning pass is skipped, and "
+            "the vocabulary is CLOSED: the generated DGML uses these tag names and no "
+            "others. Content whose role has no matching tag is NOT dropped — it renders as "
+            "dg:chunk with its text, structure, and dg:origin intact. Pass "
+            "--allow-new-tags to let labeling coin tags for roles the schema misses."
+        ),
+    )
+    gen.add_argument(
+        "--allow-new-tags",
+        action="store_true",
+        help=(
+            "Let labeling coin tag names outside the seed schema, as it did before "
+            "closure existed. Applies to --schema-path and to automatic reuse alike. "
+            "Without it, any seed closes the vocabulary."
         ),
     )
     gen.add_argument(
@@ -2915,8 +2929,10 @@ def _add_generate_subparser(
         action="store_true",
         help=(
             "Disable automatic roster reuse. By default an incremental generate "
-            "seeds labeling with the docset's existing cache/concept_roster.json so "
-            "added documents stay tag-consistent; this labels them in isolation."
+            "seeds labeling with the docset's own authored-schema.json (if a previous run "
+            "supplied one), else schema.json, else cache/concept_roster.json, so added "
+            "documents stay tag-consistent; this labels them in isolation. No seed means "
+            "no closed vocabulary, so this also re-opens tag coining."
         ),
     )
     gen.add_argument(
@@ -2948,6 +2964,12 @@ def _add_generate_subparser(
             "the weaker ones the review would have dropped."
         ),
     )
+
+
+#: Distinct rejected concept names reported per file in `unmatched_concepts`.
+#: Enough to recognize the pattern (aliases? new roles? junk?) without turning
+#: a JSON payload into a log.
+_UNMATCHED_EXAMPLES = 10
 
 
 def _load_schema_roster(path: Path) -> dict[str, str]:
@@ -2988,52 +3010,79 @@ def _load_schema_roster(path: Path) -> dict[str, str]:
     return roster
 
 
-def _load_schema_seed(path: Path) -> tuple[Schema, dict[str, str]]:
-    """Load an exported schema — ``schema.json`` or ``full-schema.rnc`` — into
-    ``(schema, parent_map)``.
+def _schema_parent_map(schema: Schema) -> dict[str, str]:
+    """The leaf → container map ``render_dgml`` groups entity containers with.
 
-    ``--schema-path`` accepts the two formats ``docset generate`` emits at the
-    docset root: ``schema.json`` (Schema v1: a ``tags`` map of ``name ->
-    {role, kind, parent_role, ...}``) or its lossless RELAX NG Compact render
-    ``full-schema.rnc`` (a ``.rnc`` suffix; the ``# Field: value`` comment contract
-    carries the same fields). The full schema seeds the labeling vocabulary —
-    role descriptions, curated examples, kind, hierarchy (via
+    Names pass through VERBATIM (only ``sanitize_tag_name`` for XML validity):
+    the map's keys and values must be the same strings the labeling roster and
+    the emitted tags use, and ``sanitize_concept`` — written for model output —
+    would fold names like ``Notes`` to nothing and silently break the pairing.
+    """
+    from dgml_core.generation.schema import sanitize_tag_name
+
+    parent_map: dict[str, str] = {}
+    for tag in schema.tags.values():
+        if tag.name and tag.parent_role:
+            parent_map[sanitize_tag_name(tag.name)] = sanitize_tag_name(tag.parent_role)
+    return parent_map
+
+
+def _load_schema_seed(
+    path: Path, label: str = "--schema-path"
+) -> tuple[Schema, dict[str, str], list[str]]:
+    """Load a user-supplied tag schema into ``(schema, parent_map, notes)``.
+
+    ``--schema-path`` takes any of four forms, detected by CONTENT rather than
+    by file extension so the flag stays one flag:
+
+    - a plain newline-delimited tag list (``#`` comments and blanks ignored);
+    - a JSON ``{name: one-line description}`` object — the recommended form;
+    - an exported ``schema.json`` (Schema v1: a ``tags`` map of
+      ``name -> {role, kind, examples, parent_role}``);
+    - its lossless RELAX NG Compact render ``full-schema.rnc`` (``.rnc``
+      suffix; the ``# Field: value`` comment contract carries the same fields).
+
+    The schema seeds the labeling vocabulary with full fidelity — role
+    descriptions, curated examples, kind, hierarchy (via
     ``ConvertOptions.schema_seed``); each tag's ``parent_role`` also becomes
     the leaf → container ``parent_map`` that drives entity-container grouping
-    in ``render_dgml``.
+    in ``render_dgml``. *notes* are the loader's remarks about anything it had
+    to change, for ``--verbose``.
 
-    Raises ``InvalidArgument`` on a missing / malformed file, or one with no
-    tags (e.g. a flat ``{concept: description}`` mapping — that shape is not
-    accepted).
+    Deliberately NOT built on ``_load_schema_roster``: that reader exists for
+    the legacy ``concept_roster.json`` reuse path, truncates descriptions to 60
+    characters, and pushes names through ``sanitize_concept`` — the exact
+    mangling an authored schema must not suffer.
+
+    Raises ``InvalidArgument`` on a missing file, or on anything the loader
+    cannot read unambiguously. A bad schema must fail HERE, at load, and never
+    as a tag that quietly failed to appear hours later. *label* names whatever
+    asked for the file, since the automatic-reuse path reads a stored schema
+    that the user did not name on the command line.
     """
     from dgml_core.errors import InvalidArgument
-    from dgml_core.generation.blocks import sanitize_concept
-    from dgml_core.generation.schema import Schema
+    from dgml_core.generation.schema import parse_authored_schema, schema_from_dict
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise InvalidArgument(f"{label} file not found: {path}") from exc
+    except OSError as exc:
+        raise InvalidArgument(f"{label} could not be read ({path}): {exc}") from exc
 
     try:
         if Path(path).suffix.lower() == ".rnc":
             from dgml_core.generation.rnc import rnc_to_schema_dict
 
-            schema = Schema.from_dict(rnc_to_schema_dict(Path(path).read_text(encoding="utf-8")))
+            schema, notes = schema_from_dict(rnc_to_schema_dict(text))
         else:
-            schema = Schema.load(path)
-    except FileNotFoundError as exc:
-        raise InvalidArgument(f"--schema-path file not found: {path}") from exc
+            schema, notes = parse_authored_schema(text)
+    except InvalidArgument as exc:
+        raise InvalidArgument(f"{label} {path}: {exc}") from exc
     except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
-        raise InvalidArgument(f"--schema-path is not a valid schema ({path}): {exc}") from exc
+        raise InvalidArgument(f"{label} is not a valid schema ({path}): {exc}") from exc
 
-    parent_map: dict[str, str] = {}
-    for tag in schema.tags.values():
-        concept = sanitize_concept(tag.name)
-        parent = sanitize_concept(tag.parent_role or "")
-        if concept and parent:
-            parent_map[concept] = parent
-    if not schema.tags:
-        raise InvalidArgument(
-            f"--schema-path has no tags — expected an exported schema.json or full-schema.rnc "
-            f"(a flat {{concept: description}} mapping is not accepted) ({path})"
-        )
-    return schema, parent_map
+    return schema, _schema_parent_map(schema), notes
 
 
 def _file_result(status: str, file_id: str, source: str, **extra: Any) -> dict[str, Any]:
@@ -3119,6 +3168,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
     from dgml_core.generation.rnc import write_docset_rnc
     from dgml_core.generation.to_semantic import build_header
+    from dgml_core.generation.vocab import TagVocab
     from dgml_core.usage import OPERATION_LINKS
     from dgml_core.xml_grounding import ground_dgml_xml
 
@@ -3347,6 +3397,10 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # document keeps its (unlinked) DGML, so without this a rate limit or a bad
     # model id looked exactly like "this document has no links".
     link_errors: dict[str, str] = {}
+    # name -> {count, distinct, examples} for the concepts a CLOSED vocabulary
+    # refused. Absent from a file's entry when the run was open or nothing was
+    # refused, like every other conditional key here.
+    unmatched_concepts: dict[str, dict[str, Any]] = {}
 
     def _on_error(name: str, message: str) -> None:
         gen_errors[name] = message
@@ -3354,6 +3408,18 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     def _on_label_error(name: str, err: dict[str, str]) -> None:
         label_errors[name] = err
         _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
+
+    def _on_rejected(name: str, tally: Counter[str]) -> None:
+        # Which names the model reached for outside a closed schema. The most
+        # actionable output of a closed run: recognizable aliases of tags you
+        # already have, roles the schema simply omitted, or junk — each points
+        # at a different fix. Reported per file, not just logged, so it is
+        # readable without --verbose.
+        unmatched_concepts[name] = {
+            "count": sum(tally.values()),
+            "distinct": len(tally),
+            "examples": [concept for concept, _n in tally.most_common(_UNMATCHED_EXAMPLES)],
+        }
 
     def _semlink_cache_key(xml_text: str) -> str:
         """Cache address for one document's semantic links.
@@ -3526,6 +3592,9 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         link_error = link_errors.get(name)
         if link_error is not None:
             extra["link_error"] = link_error
+        unmatched = unmatched_concepts.get(name)
+        if unmatched is not None:
+            extra["unmatched_concepts"] = unmatched
         converted_by_name[name] = _file_result(
             "converted",
             filename_to_fid[name],
@@ -3555,35 +3624,57 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     ws.blobs.working_dir(layout.generation_cache_prefix(args.docset_id))
                 )
             schema_key = layout.docset_generation_schema_key(args.docset_id)
+            authored_key = layout.docset_authored_schema_key(args.docset_id)
             schema_json_local = cache_dir.parent / "schema.json"
-            if (
-                not args.cache_dir
-                and not schema_json_local.exists()
-                and ws.blobs.blob_exists(schema_key)
-            ):
-                ws.blobs.download_blob(schema_key, schema_json_local)
+            authored_local = cache_dir.parent / layout.AUTHORED_SCHEMA_FILE
+            if not args.cache_dir:
+                for key, dest in ((schema_key, schema_json_local), (authored_key, authored_local)):
+                    if not dest.exists() and ws.blobs.blob_exists(key):
+                        ws.blobs.download_blob(key, dest)
             roster_path = Path(cache_dir) / "concept_roster.json"
             schema_seed = None
             roster_seed: dict[str, str] | None = None
             parent_map_seed: dict[str, str] = {}
+            # Set on a --schema-path run: the authored vocabulary, persisted
+            # below to a slot derive_schema never writes, so the next run seeds
+            # from what the user wrote rather than from this run's own output.
+            authored_seed: Schema | None = None
             if args.schema_path:
-                schema_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
+                schema_seed, parent_map_seed, schema_notes = _load_schema_seed(
+                    Path(args.schema_path)
+                )
+                authored_seed = schema_seed
                 _diag(
                     f"Loaded schema: {len(schema_seed.tags)} concept(s), "
                     f"{len(parent_map_seed)} container link(s) from {args.schema_path}"
                 )
+                for note in schema_notes:
+                    _diag(f"[schema] {note}")
             elif not args.no_roster:
-                # Incremental reuse prefers the docset's own schema.json — full
-                # fidelity (role descriptions, observed examples, kind, hierarchy)
-                # — over the flat cache/concept_roster.json fallback. Unlike
-                # --schema-path, no parent_map is derived here: entity-container
-                # grouping stays an explicit opt-in.
+                # Incremental reuse in precedence order: the vocabulary the USER
+                # authored first (never overwritten by derive_schema), then the
+                # derived schema.json — full fidelity (role descriptions,
+                # observed examples, kind, hierarchy) — then the flat
+                # cache/concept_roster.json fallback. Only the authored slot
+                # carries hierarchy through: entity-container grouping stays
+                # something the user opted into, never inferred from a run's
+                # own observations.
                 from dgml_core.generation.schema import Schema
 
-                schema_json_path = Path(cache_dir).parent / "schema.json"
-                if schema_json_path.exists():
+                if authored_local.exists():
                     try:
-                        schema_seed = Schema.load(schema_json_path)
+                        schema_seed, parent_map_seed, _notes = _load_schema_seed(
+                            authored_local, layout.AUTHORED_SCHEMA_FILE
+                        )
+                        _diag(
+                            f"Reusing the docset's authored schema: {len(schema_seed.tags)} tag(s)"
+                        )
+                    except InvalidArgument as exc:
+                        _diag(f"[schema] authored-schema.json unusable ({exc}); ignoring")
+                        schema_seed, parent_map_seed = None, {}
+                if schema_seed is None and schema_json_local.exists():
+                    try:
+                        schema_seed = Schema.load(schema_json_local)
                         _diag(f"Reusing docset schema: {len(schema_seed.tags)} tag(s)")
                     except (json.JSONDecodeError, TypeError, ValueError, OSError):
                         schema_seed = None
@@ -3594,10 +3685,32 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     except InvalidArgument:
                         roster_seed = None
 
+            # A seed CLOSES the vocabulary unless --allow-new-tags says
+            # otherwise: labeling may then use those tag names and no others,
+            # and content whose role has no matching tag renders as dg:chunk
+            # with its text intact. One rule for every seed source — an
+            # explicit --schema-path and automatic reuse behave the same.
+            # --no-roster leaves no seed at all, so it is open by construction.
+            seed_names = (
+                list(schema_seed.tags) if schema_seed is not None else list(roster_seed or {})
+            )
+            vocab = TagVocab.build(seed_names, closed=bool(seed_names) and not args.allow_new_tags)
+            if vocab.closed:
+                _diag(
+                    f"Vocabulary CLOSED at {len(vocab.names)} tag(s): the generated DGML uses "
+                    "these tag names and no others. Unmatched content still renders "
+                    "(as dg:chunk, text intact). Pass --allow-new-tags to let labeling coin."
+                )
+            elif seed_names and args.allow_new_tags:
+                _diag(f"Vocabulary OPEN (--allow-new-tags): seeded with {len(seed_names)} tag(s)")
+
             # Reload already-generated docs from cache so the whole docset stays
             # consistent as its schema/roster grows; changed originals re-render
-            # (no re-LLM).
-            for stem, blocks in load_labeled_docs_from_cache(cache_dir, list(prior_stems)).items():
+            # (no re-LLM). Replay resolves through the SAME vocabulary a fresh
+            # run uses, or a re-rendered prior would diverge from its neighbours.
+            for stem, blocks in load_labeled_docs_from_cache(
+                cache_dir, list(prior_stems), vocab
+            ).items():
                 nm = prior_stems[stem]
                 prior_docs[nm] = blocks
                 prior_outputs[nm] = ws.blobs.get_blob(prior_out_paths[nm]).decode("utf-8")
@@ -3640,6 +3753,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     roster_seed=roster_seed,
                     schema_seed=schema_seed,
                     parent_map=parent_map_seed or None,
+                    vocab=vocab,
                     progress=_diag,
                 )
                 convert_batch(
@@ -3648,6 +3762,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     on_output=_on_output,
                     on_error=_on_error,
                     on_label_error=_on_label_error,
+                    on_rejected=_on_rejected,
                     prior_docs=prior_docs,
                     prior_outputs=prior_outputs,
                 )
@@ -3698,6 +3813,17 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             # reads it back — then flush the cache working dir to the store.
             if not args.cache_dir and schema_json_local.exists():
                 ws.blobs.put_blob(schema_key, schema_json_local.read_bytes())
+            # The authored vocabulary lands in a slot derive_schema never
+            # touches. Without this, ground truth goes in and `seed union
+            # everything coined` comes back out, and the NEXT run auto-seeds
+            # from that polluted version — which is precisely why a seeded run
+            # is not reproducible today. Stored in canonical Schema v1 form
+            # whatever form it was authored in (tag list, {name: description},
+            # RNC), so there is one shape to read back.
+            if not args.cache_dir and authored_seed is not None:
+                authored_seed.save(authored_local)
+                ws.blobs.put_blob(authored_key, authored_local.read_bytes())
+                _diag(f"[schema] wrote {layout.AUTHORED_SCHEMA_FILE} (authored vocabulary)")
     else:
         _diag("Nothing to convert — every file is already converted, missing, or a duplicate name.")
 

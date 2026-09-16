@@ -234,10 +234,35 @@
   {"concepts": {"<concept>": "<one-line role description>", ...}}
 "roster_intro": |-
   CONCEPTS ALREADY IN USE in this document set — reuse these names verbatim where the role matches:
+"roster_closed_intro": |-
+  THE COMPLETE AND ONLY CONCEPT VOCABULARY for this document set. This list is
+  EXHAUSTIVE: it is the entire set of concept names that exist. Use these names
+  VERBATIM, exactly as spelled below.
+
+  You may NOT coin, invent, rename, abbreviate, pluralize, or otherwise vary a
+  concept name. There is no such thing as a concept outside this list.
+
+  When a block's role is NOT on the list, return that block with NO concept —
+  omit the "concept" key, or give it "". The same applies to entities and to
+  table cells: a value whose kind is not on the list gets no entity at all.
+  Leaving something unlabeled is CORRECT here and costs nothing; the block's
+  text is preserved either way. Reaching for a name that is not on the list is
+  the one thing you must never do — a near-miss name is discarded, so it buys
+  nothing and loses the block.
+
+  This OVERRIDES the density rules above wherever they conflict: if no listed
+  concept names a heading's role, that heading gets no concept.
+
+  THE VOCABULARY:
 "roster_planned_intro": |-
   PLANNED CONCEPTS for this document set — proposed from the documents' shared structure, not yet observed; reuse one when its role matches rather than coining a new name:
 "section_retry": |-
   These section headings were left unlabeled. Give each a concept naming its section's role:
+"section_retry_closed": |-
+  These section headings were left unlabeled. For each one, give the concept
+  from the vocabulary above that names its section's role — reusing a listed
+  name verbatim. If NO listed concept names a heading's role, leave that
+  heading out of your reply entirely. Do not coin a name to fill a gap:
 "describe_concepts": |
   You write one-line ROLE descriptions for document field concepts. Each concept
   is a PascalCase name shown with one or more example values observed in the
