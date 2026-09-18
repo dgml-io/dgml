@@ -21,7 +21,7 @@ import pytest
 from dgml_core.storage_service import StorageConfig
 from dgml_storage_s3 import S3BlobStore
 
-from .conftest import PROVIDER, make_bucket
+from .conftest import PROVIDER, make_store_options
 
 # ------------------------------------------------------------------ config
 
@@ -127,15 +127,19 @@ def test_sha256_blob_is_plain_digest_not_etag(blobs: S3BlobStore) -> None:
 
 
 def test_prefix_isolates_tenants_sharing_a_bucket(tmp_path: Path) -> None:
-    _bucket, options = make_bucket()
+    base, options = make_store_options()
     a = S3BlobStore(
         S3BlobStore.parse_config(
-            StorageConfig(provider=PROVIDER, root=tmp_path, options={**options, "prefix": "wsA"})
+            StorageConfig(
+                provider=PROVIDER, root=tmp_path, options={**options, "prefix": f"{base}/wsA"}
+            )
         )
     )
     b = S3BlobStore(
         S3BlobStore.parse_config(
-            StorageConfig(provider=PROVIDER, root=tmp_path, options={**options, "prefix": "wsB"})
+            StorageConfig(
+                provider=PROVIDER, root=tmp_path, options={**options, "prefix": f"{base}/wsB"}
+            )
         )
     )
     a.put_blob("files/f/a.pdf", b"from-A")

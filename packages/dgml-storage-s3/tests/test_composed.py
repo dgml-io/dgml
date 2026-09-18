@@ -13,8 +13,8 @@
 """The point of the split: **S3 blobs + Mongo docs** composed into one workspace.
 
 Both sample packages are workspace members, so both import in the shared venv.
-Uses moto (from the package's autouse fixture) + mongomock, or the real MinIO +
-MongoDB when DGML_TEST_S3_ENDPOINT / DGML_TEST_MONGO_URI are set.
+Uses moto (from the package's autouse fixture) + mongomock, or the real S3 server
+and MongoDB when DGML_TEST_S3_ENDPOINT / DGML_TEST_MONGO_URI are set.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from dgml_core.storage import Workspace
 from dgml_storage_mongo import MongoDocStore
 from dgml_storage_s3 import S3BlobStore
 
-from .conftest import PROVIDER, make_bucket
+from .conftest import PROVIDER, make_store_options
 
 MONGO_PROVIDER = "dgml_storage_mongo:MongoDocStore"
 
@@ -51,8 +51,8 @@ def _fake_mongo(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 @pytest.fixture
 def mixed_workspace(_fake_mongo: None, tmp_path: Path) -> Workspace:
     """A workspace with S3 blobs and Mongo docs, as the ``default`` service."""
-    _bucket, s3_opts = make_bucket()
-    db = f"dgml_test_{_bucket[-12:]}"
+    prefix, s3_opts = make_store_options()
+    db = f"dgml_test_{prefix[-12:]}"
     root = tmp_path / "ws"
     root.mkdir(parents=True, exist_ok=True)
     s3_lines = "\n".join(f'{k} = "{v}"' for k, v in s3_opts.items())

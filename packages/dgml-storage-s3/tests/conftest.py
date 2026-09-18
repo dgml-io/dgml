@@ -21,10 +21,19 @@ Two modes, same tests:
 
 The fallback matters: a suite that skips when Docker is not running looks like
 coverage without being any. The default ``uv run pytest`` always runs the whole
-thing; CI additionally runs it against MinIO.
+thing; CI additionally runs it against SeaweedFS.
 
-Every test gets its own bucket, so runs never share state. The document half of a
-workspace uses the bundled local store here, so these tests need no Mongo.
+Every test gets its own **key prefix** inside one shared bucket, so runs never
+share state. The document half of a workspace uses the bundled local store here,
+so these tests need no Mongo.
+
+Prefix rather than bucket, deliberately: each S3 bucket becomes a SeaweedFS
+*collection*, and each new collection triggers a burst of volume growth (7
+volumes by default). A bucket per test multiplied that by the test count and
+exhausted the volume budget on CI's smaller disk, where `PutObject` then fails
+with `InternalError`. Isolating by prefix is also what ``prefix`` is *for* — it
+is how several workspaces share one bucket in a real deployment — so the fixture
+now matches how the store is actually used.
 """
 
 from __future__ import annotations
@@ -78,25 +87,48 @@ def _fake_s3(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         yield
 
 
-def make_bucket() -> tuple[str, dict[str, object]]:
-    """Create a unique bucket and return ``(bucket, S3 options)``."""
-    import boto3
+#: One bucket for the whole pytest session. Unique per run so concurrent CI jobs
+#: against a shared endpoint never collide.
+SESSION_BUCKET = f"dgml-test-{uuid.uuid4().hex[:12]}"
 
-    bucket = f"dgml-test-{uuid.uuid4().hex[:12]}"
-    options: dict[str, object] = {"bucket": bucket, "region": "us-east-1"}
+
+def make_store_options() -> tuple[str, dict[str, object]]:
+    """Return ``(prefix, S3 options)`` for a test, in the shared session bucket.
+
+    Creation is idempotent rather than once-per-session on purpose: under
+    ``moto`` the mock is torn down between tests, so the bucket has to be
+    re-created each time; against a real endpoint only the first call creates it
+    and the rest get ``BucketAlreadyOwnedByYou``, which is not an error here.
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    prefix = f"t{uuid.uuid4().hex[:12]}"
+    options: dict[str, object] = {
+        "bucket": SESSION_BUCKET,
+        "region": "us-east-1",
+        "prefix": prefix,
+    }
     endpoint = os.environ.get(S3_ENDPOINT_ENV)
     client_kwargs = {"region_name": "us-east-1"}
     if endpoint:
         options["endpoint_url"] = endpoint
         client_kwargs["endpoint_url"] = endpoint
-    boto3.client("s3", **client_kwargs).create_bucket(Bucket=bucket)
-    return bucket, options
+    try:
+        boto3.client("s3", **client_kwargs).create_bucket(Bucket=SESSION_BUCKET)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {
+            "BucketAlreadyOwnedByYou",
+            "BucketAlreadyExists",
+        }:
+            raise
+    return prefix, options
 
 
 @pytest.fixture
 def s3_config(tmp_path: Path) -> StorageConfig:
-    """A per-test bucket, created, as a resolved blob-store config."""
-    _bucket, options = make_bucket()
+    """A per-test prefix in the shared bucket, as a resolved blob-store config."""
+    _prefix, options = make_store_options()
     return StorageConfig(provider=PROVIDER, root=tmp_path / "ws", options=options)
 
 
@@ -112,7 +144,7 @@ def s3_blobs_workspace(tmp_path: Path) -> Workspace:
 
     The S3 backend is the ``default`` service's blob role, so an unregistered
     ``Workspace`` resolves it with no registry entry needed."""
-    _bucket, options = make_bucket()
+    _prefix, options = make_store_options()
     root = tmp_path / "ws"
     root.mkdir(parents=True, exist_ok=True)
     lines = [f'{k} = "{v}"' for k, v in options.items()]

@@ -4,19 +4,30 @@
 #   uv run pytest packages/dgml-storage-s3
 #
 # Neither image is redistributed by DGML; both are dev/CI services invoked over
-# the network, like ghostscript is invoked as a subprocess. MinIO server is
-# AGPL-3.0 and MongoDB Community is SSPL — see README.md. FerretDB (Apache-2.0)
+# the network, like ghostscript is invoked as a subprocess. SeaweedFS is
+# Apache-2.0; MongoDB Community is SSPL — see README.md. FerretDB (Apache-2.0)
 # is a drop-in for the mongo service if that ever matters; pymongo talks to both.
 services:
-  minio:
-    image: minio/minio:latest
-    command: server /data
-    environment:
-      MINIO_ROOT_USER: dgmltest
-      MINIO_ROOT_PASSWORD: dgmltest123
-    ports: ["9000:9000"]
+  # S3-compatible object storage. `server -s3` runs master, volume server, filer
+  # and the S3 gateway in one process, which is all a test fixture needs.
+  #
+  # The gateway listens on 8333 and is published on 9000 so DGML_TEST_S3_ENDPOINT,
+  # the CI job and the README snippets all keep the same address. No identity
+  # config is supplied, so the gateway accepts any signature — boto3 refuses to
+  # sign anonymously, so the tests still pass dummy AWS_* credentials and
+  # SeaweedFS ignores their values.
+  s3:
+    image: chrislusf/seaweedfs:4.47
+    command: server -s3 -dir=/data
+    ports: ["9000:8333"]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # Anonymous ListBuckets, which succeeds precisely because no identity is
+      # configured. Tolerates either HTTP client the image might ship.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O - http://localhost:8333/ >/dev/null 2>&1 ||
+          curl -sf http://localhost:8333/ >/dev/null 2>&1
       interval: 3s
       timeout: 3s
       retries: 20

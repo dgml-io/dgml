@@ -7,7 +7,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Docugami" }]
 readme = "README.md"
 # boto3 (Apache-2.0) is allow-list clean; see the licence note in README.md for
-# the *server* side (MinIO).
+# the *server* side (SeaweedFS, MongoDB).
 dependencies = ["dgml-core>=0.1.0", "boto3>=1.34"]
 
 [tool.uv.sources]

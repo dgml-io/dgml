@@ -53,14 +53,18 @@ run uv run mypy packages
 if [[ $fast -eq 0 ]]; then
   run uv run pytest
   # The sample-store suite runs above against in-process fakes. If the local
-  # MinIO/Mongo stack happens to be up, re-run it against the real services —
+  # S3/Mongo stack happens to be up, re-run it against the real services —
   # that is what CI's storage-parity job does, and where wire behaviour the
   # fakes only approximate (pagination, real error codes) actually gets tested.
-  if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+  #
+  # Vendor-neutral probe: any HTTP response on the S3 port means something is
+  # listening. Matching a vendor-specific health path would couple this script to
+  # whichever server we happen to run.
+  if [[ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/ 2>/dev/null)" =~ ^(200|403|404)$ ]]; then
     # boto3 refuses to sign anonymously, so the suite needs credentials even
-    # though MinIO is local. Default to the docker-compose root user; a real
-    # AWS_* already in the environment wins, so this never overrides a
-    # developer pointed at a different endpoint.
+    # though the server is local (SeaweedFS ignores their values). Default to
+    # the docker-compose ones; a real AWS_* already in the environment wins, so
+    # this never overrides a developer pointed at a different endpoint.
     DGML_TEST_S3_ENDPOINT=http://localhost:9000 \
     DGML_TEST_MONGO_URI=mongodb://localhost:27017 \
     AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-dgmltest}" \
@@ -68,7 +72,7 @@ if [[ $fast -eq 0 ]]; then
     AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
       run uv run pytest packages/dgml-storage-s3
   else
-    printf '\n· skipping real-service storage parity (MinIO not reachable);\n'
+    printf '\n· skipping real-service storage parity (S3 endpoint not reachable);\n'
     printf '  start it with: docker compose -f packages/dgml-storage-s3/docker-compose.yml up -d\n'
   fi
   # Same deny-list as the license-audit CI job; strong copyleft deps

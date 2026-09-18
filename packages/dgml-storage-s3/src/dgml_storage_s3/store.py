@@ -23,14 +23,16 @@ bundled local store) for the document half.
     [storage.acme.blobs]
     provider = "dgml_storage_s3:S3BlobStore"
     bucket = "dgml-dev"
-    endpoint_url = "http://localhost:9000"   # MinIO; omit for real AWS S3
+    endpoint_url = "http://localhost:9000"   # any S3 server; omit for real AWS S3
 
     [storage.acme.docs]
     provider = "dgml_storage_mongo:MongoDocStore"
     mongo_database = "dgml_dev"
 
-MinIO is not a separate backend — it speaks the S3 API, so the same class runs
-against it locally and against AWS in production by changing ``endpoint_url``.
+A local S3-compatible server is not a separate backend — it speaks the S3 API, so
+the same class runs against one in dev and against AWS in production by changing
+``endpoint_url``. The dev/CI stack runs SeaweedFS (see ``docker-compose.yml``);
+nothing in this module knows or cares which server is on the other end.
 
 Credentials
 -----------
@@ -193,8 +195,10 @@ def _is_missing(exc: Any) -> bool:
     """Whether a botocore ``ClientError`` means "no such key/bucket".
 
     ``head_object`` reports a missing key as ``404``/``NoSuchKey`` depending on
-    the operation and the server, and MinIO and AWS do not agree on every code,
-    so match on both.
+    the operation and the server, and S3 implementations do not agree on every
+    code, so match on all of them. This set is empirically derived — if a new
+    server reports "missing" some other way, the parity job is where that
+    surfaces, as a hard failure in ``blob_exists`` rather than silent breakage.
     """
     error = getattr(exc, "response", {}).get("Error", {})
     return str(error.get("Code")) in {"404", "NoSuchKey", "NotFound"}

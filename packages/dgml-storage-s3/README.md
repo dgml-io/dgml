@@ -12,7 +12,7 @@ on, so nearly every method is a one-line delegation.
 ## Use it
 
 ```toml
-# <workspace>/config.toml — S3 blobs + Mongo docs (local dev against MinIO)
+# <workspace>/config.toml — S3 blobs + Mongo docs (local dev against SeaweedFS)
 [storage.default.blobs]
 provider = "dgml_storage_s3:S3BlobStore"
 bucket = "dgml-dev"
@@ -23,10 +23,10 @@ provider = "dgml_storage_mongo:MongoDocStore"
 mongo_database = "dgml_dev"
 ```
 
-Drop `endpoint_url` and set `region` to run against real AWS S3. MinIO is not a
-separate backend — it speaks the S3 API, so it is only a different address. Omit
-the `[storage.default.docs]` table to keep documents on local disk and put only
-blobs in S3.
+Drop `endpoint_url` and set `region` to run against real AWS S3. A local server is
+not a separate backend — it speaks the S3 API, so it is only a different address.
+Omit the `[storage.default.docs]` table to keep documents on local disk and put
+only blobs in S3.
 
 ## Credentials
 
@@ -53,6 +53,13 @@ for S3, `mongomock` for the composed S3+Mongo test) — so it never silently ski
 The fakes verify *our* logic; the containers verify wire behaviour (pagination,
 real error codes, multipart). CI runs both.
 
+The S3 service is [SeaweedFS](https://github.com/seaweedfs/seaweedfs), published on
+port 9000 so the endpoint matches any other S3 address. It runs with no identity
+config, so it accepts any signature — boto3 will not sign anonymously, so the
+commands above still pass dummy credentials and SeaweedFS ignores their values.
+Any S3-compatible server works here; this one is a dev dependency, not a
+backend DGML knows about.
+
 ## If you adapt this for production
 
 It inherits the default path bridges (`materialize`, `staged_write`,
@@ -70,10 +77,10 @@ as the `BlobStore` docstring describes.
 |---|---|---|
 | `boto3` | Apache-2.0 | dependency of this package ✅ |
 | `moto`, `mongomock` | Apache-2.0 / ISC | dev/test only ✅ |
-| MinIO server | AGPL-3.0 | dev/CI container, never redistributed |
+| SeaweedFS server | Apache-2.0 | dev/CI container, never redistributed ✅ |
 | MongoDB Community | SSPL | dev/CI container (composed test), never redistributed |
 
 The root `CLAUDE.md` bans SSPL and AGPL for **Python packages shipped inside the
-wheel**. The two servers are network services we invoke, not code we ship — the
-same reasoning that already permits ghostscript. `pip-licenses` will not flag
-them, which is why it is written down here.
+wheel**. MongoDB is a network service we invoke, not code we ship — the same
+reasoning that already permits ghostscript. `pip-licenses` will not flag it,
+which is why it is written down here.

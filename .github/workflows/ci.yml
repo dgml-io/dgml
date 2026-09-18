@@ -62,7 +62,7 @@ jobs:
     #
     # The default `uv run pytest` already runs this suite against in-process
     # fakes (moto/mongomock), so it is never silently absent. This job points it
-    # at MinIO and MongoDB instead, which is what exercises wire behaviour the
+    # at SeaweedFS and MongoDB instead, which is what exercises wire behaviour the
     # fakes only approximate: genuine list_objects_v2 pagination, real error
     # codes, multipart. Two of the storage layer's worst defects were invisible
     # to every local-disk test, so this is the job that stops that recurring.
@@ -77,20 +77,29 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
-      - name: Start MinIO
-        # The official minio/minio image needs a `server` command to start, which
-        # GitHub Actions service containers can't provide — so run it as a step and
-        # wait for health. (Matches packages/dgml-storage-s3/docker-compose.yml.)
+      - name: Start SeaweedFS (S3)
+        # The SeaweedFS image needs a command (`server -s3`) to start, which
+        # GitHub Actions service containers can't provide — so run it as a step
+        # and wait for readiness. (Matches
+        # packages/dgml-storage-s3/docker-compose.yml.) The S3 gateway listens on
+        # 8333 and is published on 9000, so the endpoint below is a plain S3
+        # address.
+        #
+        # The probe is deliberately vendor-neutral: any HTTP response on the S3
+        # port means the gateway is listening. Matching a vendor-specific health
+        # path would couple CI to whichever server we happen to run.
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=dgmltest -e MINIO_ROOT_PASSWORD=dgmltest123 \
-            minio/minio:latest server /data
+          docker run -d --name seaweedfs -p 9000:8333 \
+            chrislusf/seaweedfs:4.47 server -s3 -dir=/data
           for _ in $(seq 1 30); do
-            curl -fs http://localhost:9000/minio/health/live && { echo "MinIO is up"; exit 0; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/ || true)
+            case "$code" in
+              200|403|404) echo "S3 endpoint is up (HTTP $code)"; exit 0 ;;
+            esac
             sleep 2
           done
-          echo "MinIO did not become healthy" >&2
-          docker logs minio || true
+          echo "S3 endpoint did not become ready" >&2
+          docker logs seaweedfs || true
           exit 1
       - name: Install ghostscript
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ghostscript
