@@ -388,6 +388,10 @@
 # Used by the compass benchmark to A/B prompt wording as a measured axis.
 # --------------------------------------------------------------------------
 variants:
+  # The fewshot worked example below is SYNTHETIC — hand-written for this
+  # prompt, not drawn from any docset. Its domain (a construction subcontract)
+  # is deliberately absent from the compass benchmark docsets so the variant
+  # is never tuned to a document it is measured on.
   fewshot:
     label_system: |
       You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
@@ -493,37 +497,37 @@ variants:
 
       GRANULARITY — worked example (this calibrates HOW MANY concepts to emit).
 
-      Given these transcribed blocks from a clinical protocol:
+      Given these transcribed blocks from a construction subcontract:
 
-        h1   "2.3 Inclusion Criteria"
-        p    "Participants must be 18 to 65 years of age at screening."
-        item "Body mass index between 18.5 and 30.0 kg/m2."
-        item "Alcohol consumption below 14 units per week for females."
-        row  ["Alanine aminotransferase", "< 2.0 x ULN"]
+        h1   "4.1 Site Access Requirements"
+        p    "Deliveries are accepted between 7:00 am and 3:30 pm on working days."
+        item "Vehicle gross weight not exceeding 7.5 tonnes on the north ramp."
+        item "Noise levels below 75 dB(A) during evening works."
+        row  ["Scaffold inspection", "every 7 days"]
 
       CORRECT — one concept per distinct role, values tagged inline:
 
-        h1   -> InclusionCriteria
-        p    -> AgeRange             entity "18 to 65 years"      -> AgeRange
-        item -> BodyMassIndexRange   entity "18.5 and 30.0 kg/m2" -> BodyMassIndexLimit
-        item -> AlcoholLimitFemale   entity "14 units per week"   -> AlcoholLimit
-        row  -> LaboratoryThreshold  table LaboratoryCriteria
-                cells [LaboratoryAnalyte, LaboratoryLimit]
+        h1   -> SiteAccessRequirements
+        p    -> DeliveryHours            entity "7:00 am and 3:30 pm" -> DeliveryWindow
+        item -> VehicleWeightRestriction entity "7.5 tonnes"          -> VehicleWeightLimit
+        item -> NoiseLimitEveningWorks   entity "75 dB(A)"            -> NoiseLimit
+        row  -> SafetyInspectionInterval table SafetyInspectionSchedule
+                cells [InspectionType, InspectionInterval]
 
       WRONG — too coarse. Collapsing distinct roles under one umbrella concept
       loses every field a consumer would query:
 
-        h1 -> InclusionCriteria ; p -> InclusionCriteria ;
-        item -> InclusionCriteria ; item -> InclusionCriteria
+        h1 -> SiteAccessRequirements ; p -> SiteAccessRequirements ;
+        item -> SiteAccessRequirements ; item -> SiteAccessRequirements
 
       WRONG — too fine. Naming the value instead of the role, or splitting one
       value across concepts:
 
-        p -> ParticipantsMustBeEighteenToSixtyFive ;
-        item -> BMI_18_5 ; item -> BMI_30_0
+        p -> DeliveriesSevenAmToThreeThirtyPm ;
+        item -> VehicleWeight_7_5 ; item -> Noise_75_dBA
 
       Calibrate to the CORRECT column. Name each distinct role once, at the
-      specificity a downstream consumer would query it by ("AlcoholLimitFemale",
-      neither "InclusionCriteria" nor "AlcoholConsumptionBelowFourteenUnits").
+      specificity a downstream consumer would query it by ("NoiseLimitEveningWorks",
+      neither "SiteAccessRequirements" nor "NoiseLevelsBelowSeventyFiveDecibels").
       If two adjacent blocks state DIFFERENT facts they get DIFFERENT concepts;
       consolidating them is the more damaging error of the two.
