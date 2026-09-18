@@ -22,10 +22,10 @@ unsupported (the CLI package re-exports nothing).
 
 ## Optional extras
 
-`aws`, `azure`, `macos`, `clustering`, and `chain` are declared here. The
-`dgml` CLI mirrors them as pass-throughs, so `pip install dgml[aws]` resolves
-to `dgml-core[aws]`. Keep the two extra lists in sync when you add or rename
-one.
+`aws`, `azure`, `macos`, `pdfium`, `clustering`, and `chain` are declared
+here. The `dgml` CLI mirrors them as pass-throughs, so `pip install dgml[aws]`
+resolves to `dgml-core[aws]`. Keep the two extra lists in sync when you add or
+rename one.
 
 ## OCR providers
 
@@ -43,3 +43,33 @@ providers never touch the disk.
 
 To add a new provider: see the "Adding a new provider" section in the
 [src/dgml_core/ocr.py](src/dgml_core/ocr.py) module docstring.
+
+## PDF engines
+
+PDF work follows the same shape as OCR. One **engine** supplies both
+capabilities DGML needs — rasterizing pages (`PageRenderer`) and slicing a
+page range (`PdfSlicer`) — and one `[pdf] provider` key selects it, because
+the motivating use case ("no system binary") is only satisfied when both
+avoid one.
+
+The two ABCs, the config loader (`load_pdf_config`) and the `EngineSpec`
+registry live in [src/dgml_core/pages.py](src/dgml_core/pages.py). Each
+engine's two implementations live together in one sibling module so they share
+a single availability probe: `src/dgml_core/pages_ghostscript.py` (the
+default, a subprocess over the system `gs` binary) and
+`src/dgml_core/pages_pypdfium2.py` (PDFium in-process, the `pdfium` extra).
+
+The shared wrappers own everything engine-independent: `render_pages` handles
+the `$DGML_PAGE_CACHE` cache, stale-image cleanup and page counting;
+`slice_pages` bounds-checks page numbers against the real page count so a bad
+request never reaches a backend.
+
+**Renderer geometry is a contract, not a preference.** A page's PNG must be
+exactly `round(pts * dpi / 72)` pixels per axis, measured from the
+**MediaBox** and after `/Rotate` — that is the space `page_text/` boxes and
+every `dg:origin` live in, and nothing at runtime checks that the two agree.
+A backend whose natural output differs must correct for it (PDFium needs both
+corrections; see `Pypdfium2Renderer._render_page`).
+
+To add a new engine: see the "Adding a new engine" section in the
+[src/dgml_core/pages.py](src/dgml_core/pages.py) module docstring.

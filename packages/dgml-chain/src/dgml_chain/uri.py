@@ -22,7 +22,9 @@ later proving step can parse them back out::
                                           (node-level; <leaf> is the 0-based
                                           Merkle leaf index)
 
-IDs are the dgml CLI's lowercase alphanumeric identifiers. This module is the
+IDs are the dgml CLI's identifiers: lowercase, and drawn from ``[a-z0-9_-]`` — a
+generated id is 12 base-36 characters, but a caller can set their own (``file add
+--id invoice-2024-q1``), so ``-`` and ``_`` appear here too. This module is the
 single source of truth for the scheme and the record-metadata shape; both the
 staking and proving halves import it so they cannot drift.
 """
@@ -38,7 +40,11 @@ from typing import Any
 # RFC-6962 Merkle leaf hashes are all SHA-256.
 CHECKSUM_ALGO = "sha256"
 
-_URI_RE = re.compile(r"^dgmlx://([a-z0-9]+)(?:/([a-z0-9]+))?(?:#(\d+))?$")
+# Deliberately looser than the id grammar in `dgml_core.ids` (which also bounds
+# length and forbids a leading separator): a URI parser should accept whatever
+# `build_uri` can emit and leave existence to the store. What it must *not*
+# accept is `/` or `#` inside an id — both are positional delimiters here.
+_URI_RE = re.compile(r"^dgmlx://([a-z0-9_-]+)(?:/([a-z0-9_-]+))?(?:#(\d+))?$")
 
 
 def build_uri(file_id: str, docset_id: str | None) -> str:

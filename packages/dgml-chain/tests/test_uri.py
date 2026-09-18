@@ -49,6 +49,26 @@ def test_build_and_parse_node_uri() -> None:
     }
 
 
+def test_build_and_parse_uri_with_separator_ids() -> None:
+    """Caller-supplied ids may contain `-` and `_` (`file add --id`), so the
+    scheme has to round-trip them."""
+    assert parse_uri(build_uri("invoice_2024_q1", None)) == {
+        "file_id": "invoice_2024_q1",
+        "docset_id": None,
+        "leaf_index": None,
+    }
+    assert parse_uri(build_uri("invoice-2024", "my_set-2")) == {
+        "file_id": "invoice-2024",
+        "docset_id": "my_set-2",
+        "leaf_index": None,
+    }
+    assert parse_uri(build_node_uri("invoice-2024", "my_set-2", 7)) == {
+        "file_id": "invoice-2024",
+        "docset_id": "my_set-2",
+        "leaf_index": 7,
+    }
+
+
 def test_parse_uri_rejects_garbage() -> None:
     with pytest.raises(ValueError):
         parse_uri("http://example.com")

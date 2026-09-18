@@ -42,7 +42,7 @@ from dgml_core.generation.blocks import (
     xml_safe_block_dict,
 )
 from dgml_core.generation.prompts import get as prompt
-from dgml_core.pages import pdf_page_count
+from dgml_core.pages import PdfConfig, pdf_page_count
 from dgml_core.utils import xml_safe
 
 _UNSAFE_FNAME_RE = re.compile(r'[<>:"/\\|?*]')
@@ -542,6 +542,7 @@ def transcribe_document(
     debug: bool = False,
     log: Callable[[str], None] = lambda _m: None,
     page_text_dir: Path | str | None = None,
+    pdf_config: PdfConfig | None = None,
 ) -> list[Block]:
     """Transcribe one document into a flat block list (Pass A).
 
@@ -583,7 +584,9 @@ def transcribe_document(
             pages: list[int], context: str, wlog: str, wfile: str
         ) -> tuple[float, str, dict[str, Any]] | None:
             """Gated attempt loop for one page range; best (recall, raw, payload)."""
-            pdf_slice = document.slice_pdf(pdf_bytes, pages)
+            # `total` was counted once for this document above; passing it keeps
+            # each window from re-walking the whole page tree.
+            pdf_slice = document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total)
             instr = _window_instruction(pages[0], pages[-1], total, context)
             exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
             n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)

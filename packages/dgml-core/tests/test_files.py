@@ -115,6 +115,19 @@ def test_add_pdf(store: FileStore, sample_pdf: Path) -> None:
     assert len(pages) == 2
 
 
+def test_add_pdf_with_pypdfium2_renderer(store: FileStore, sample_pdf: Path) -> None:
+    """A workspace configured for pypdfium2 renders through PDFium (no
+    ghostscript needed — hence no ``needs_gs``) and records the provider."""
+    from .conftest import write_config
+
+    write_config(store.ws, {"pdf": {"provider": "pypdfium2"}})
+    result = store.add(sample_pdf)
+    assert result.created
+    assert result.page_render_error is None
+    assert result.record.page_image_renderer == "pypdfium2"
+    assert len(_page_pngs(store.ws, result.record.id)) == 2
+
+
 @needs_gs
 def test_add_pdf_custom_dpi_is_rendered_and_recorded(store: FileStore, sample_pdf: Path) -> None:
     result = store.add(sample_pdf, dpi=150)
@@ -150,7 +163,10 @@ def test_add_rejects_nonpositive_dpi(store: FileStore, sample_pdf: Path) -> None
     for bad in (0, -300):
         with pytest.raises(ValueError, match="dpi"):
             store.add(sample_pdf, dpi=bad)
-    assert not any(store.ws.files_dir.iterdir())
+    # Nothing written: the directory is created by the first write, so on a rejected
+    # add it should not exist at all (and must certainly be empty if it does).
+    files_dir = store.ws.files_dir
+    assert not files_dir.exists() or not any(files_dir.iterdir())
 
 
 @needs_gs
@@ -328,3 +344,199 @@ def test_page_count_failure_soft_fails(
 
     recorded = load_recorded_errors(workspace, result.record.id)
     assert any(e.operation == "pdf_page_count" and e.permanent for e in recorded)
+
+
+# --------------------------------------------------------------------------
+# Caller-supplied file ids (`file add --id`).
+#
+# The hazard these guard: `put_doc` is an upsert on every backend, so a record
+# written under an id another record holds silently replaces it. Every rule
+# below exists to make that unreachable.
+# --------------------------------------------------------------------------
+
+
+@needs_gs
+def test_add_with_requested_id_uses_it(store: FileStore, sample_pdf: Path) -> None:
+    result = store.add(sample_pdf, file_id="my-report-1")
+    assert result.created
+    assert result.record.id == "my-report-1"
+    assert store.get("my-report-1").sha256 == result.record.sha256
+
+
+@needs_gs
+@pytest.mark.parametrize("file_id", ["abc", "a" * 40, "a_b-c", "0start"])
+def test_add_requested_id_accepts_grammar_bounds(
+    store: FileStore, sample_pdf: Path, file_id: str
+) -> None:
+    """The grammar's edges have to survive being used as a real path segment."""
+    assert store.add(sample_pdf, file_id=file_id).record.id == file_id
+
+
+@pytest.mark.parametrize("file_id", ["ab", "A" * 12, "-lead", "a.b", "a/b", ""])
+def test_add_rejects_malformed_requested_id(
+    store: FileStore, workspace: Workspace, sample_pdf: Path, file_id: str
+) -> None:
+    with pytest.raises(InvalidArgument):
+        store.add(sample_pdf, file_id=file_id)
+    # Nothing half-built — the shape check runs before any write.
+    assert store.list_all() == []
+    assert not (workspace.root / "files").exists()
+
+
+def test_uppercase_uuid_is_rejected(
+    store: FileStore, workspace: Workspace, sample_pdf: Path
+) -> None:
+    """A lowercase UUID is a valid id, so the uppercase form is a realistic trap —
+    several systems emit them that way. It must be refused before anything is
+    written, not case-folded: the id is how the caller's system and this workspace
+    name the same document."""
+    import uuid
+
+    with pytest.raises(InvalidArgument):
+        store.add(sample_pdf, file_id=str(uuid.uuid4()).upper())
+    assert store.list_all() == []
+    assert not (workspace.root / "files").exists()
+
+
+@needs_gs
+@pytest.mark.parametrize("policy", list(ConflictPolicy))
+def test_requested_id_taken_by_different_content_conflicts(
+    store: FileStore, sample_pdf: Path, sample_pdf_alt: Path, policy: ConflictPolicy
+) -> None:
+    """No --on-conflict policy may reuse an id held by different content.
+
+    The final assertion is the one that matters: an unguarded add would upsert
+    over the held record and destroy it."""
+    first = store.add(sample_pdf, file_id="keep-me")
+    with pytest.raises(ConflictError) as excinfo:
+        store.add(sample_pdf_alt, file_id="keep-me", on_conflict=policy)
+    assert excinfo.value.kind == "id"
+    assert excinfo.value.existing_id == "keep-me"
+    assert store.get("keep-me").sha256 == first.record.sha256
+
+
+@needs_gs
+def test_requested_id_same_content_skip_is_idempotent(store: FileStore, sample_pdf: Path) -> None:
+    store.add(sample_pdf, file_id="doc-1")
+    again = store.add(sample_pdf, file_id="doc-1", on_conflict=ConflictPolicy.SKIP)
+    assert not again.created
+    assert again.record.id == "doc-1"
+    assert again.conflict_kind == "hash"
+    assert len(store.list_all()) == 1
+
+
+@needs_gs
+def test_requested_id_same_content_error_raises_hash_not_id(
+    store: FileStore, sample_pdf: Path
+) -> None:
+    """Re-adding identical content still diagnoses as a hash conflict."""
+    store.add(sample_pdf, file_id="doc-1")
+    with pytest.raises(ConflictError) as excinfo:
+        store.add(sample_pdf, file_id="doc-1")
+    assert excinfo.value.kind == "hash"
+
+
+@needs_gs
+def test_requested_id_same_content_replace_is_noop(store: FileStore, sample_pdf: Path) -> None:
+    store.add(sample_pdf, file_id="doc-1")
+    again = store.add(sample_pdf, file_id="doc-1", on_conflict=ConflictPolicy.REPLACE)
+    assert not again.created
+    assert again.record.id == "doc-1"
+
+
+@needs_gs
+def test_requested_id_same_content_duplicate_rejected(store: FileStore, sample_pdf: Path) -> None:
+    """`duplicate` means "make a second record", but the named id already has
+    one — so there is nowhere to put it."""
+    store.add(sample_pdf, file_id="doc-1")
+    with pytest.raises(ConflictError) as excinfo:
+        store.add(sample_pdf, file_id="doc-1", on_conflict=ConflictPolicy.DUPLICATE)
+    assert excinfo.value.kind == "id"
+    assert len(store.list_all()) == 1
+
+
+@needs_gs
+def test_requested_id_pins_which_same_hash_record_returns(
+    store: FileStore, sample_pdf: Path
+) -> None:
+    """_find_conflicts returns the id-sorted *first* same-content record, which
+    need not be the one the caller named."""
+    store.add(sample_pdf, file_id="aaa-1")
+    store.add(sample_pdf, file_id="zzz-9", on_conflict=ConflictPolicy.DUPLICATE)
+    got = store.add(sample_pdf, file_id="zzz-9", on_conflict=ConflictPolicy.SKIP)
+    assert got.record.id == "zzz-9"
+
+
+@needs_gs
+def test_free_id_rejected_when_skip_returns_hash_match(store: FileStore, sample_pdf: Path) -> None:
+    """`skip` would hand back a record with a different id than the one asked
+    for; returning it silently is how a caller mis-addresses a document."""
+    store.add(sample_pdf)
+    with pytest.raises(InvalidArgument):
+        store.add(sample_pdf, file_id="wanted", on_conflict=ConflictPolicy.SKIP)
+    with pytest.raises(FileNotFound):
+        store.get("wanted")
+
+
+@needs_gs
+def test_free_id_rejected_when_skip_returns_path_match(
+    store: FileStore, sample_pdf: Path, sample_pdf_alt: Path
+) -> None:
+    store.add(sample_pdf)
+    shutil.copy2(sample_pdf_alt, sample_pdf)
+    with pytest.raises(InvalidArgument):
+        store.add(sample_pdf, file_id="wanted", on_conflict=ConflictPolicy.SKIP)
+
+
+@needs_gs
+def test_free_id_rejected_when_replace_is_hash_noop(store: FileStore, sample_pdf: Path) -> None:
+    store.add(sample_pdf)
+    with pytest.raises(InvalidArgument):
+        store.add(sample_pdf, file_id="wanted", on_conflict=ConflictPolicy.REPLACE)
+
+
+@needs_gs
+def test_free_id_honoured_when_replace_swaps_path(
+    store: FileStore, sample_pdf: Path, sample_pdf_alt: Path
+) -> None:
+    """`replace` on a *path* conflict creates a new record, so it can and must
+    carry the requested id — the case a policy-based rule would wrongly reject."""
+    store.add(sample_pdf)
+    shutil.copy2(sample_pdf_alt, sample_pdf)
+    second = store.add(sample_pdf, file_id="rev-2", on_conflict=ConflictPolicy.REPLACE)
+    assert second.created
+    assert second.record.id == "rev-2"
+    assert {r.id for r in store.list_all()} == {"rev-2"}
+
+
+@needs_gs
+def test_replace_reingest_keeps_requested_id(
+    store: FileStore, sample_pdf: Path, sample_pdf_alt: Path
+) -> None:
+    """Re-ingesting a revised document under its own id: the held record is the
+    one `replace` is about to delete, so the id is about to be free."""
+    first = store.add(sample_pdf, file_id="invoice-2024")
+    shutil.copy2(sample_pdf_alt, sample_pdf)
+    second = store.add(sample_pdf, file_id="invoice-2024", on_conflict=ConflictPolicy.REPLACE)
+    assert second.created
+    assert second.record.id == "invoice-2024"
+    assert second.record.sha256 != first.record.sha256
+    assert {r.id for r in store.list_all()} == {"invoice-2024"}
+
+
+@needs_gs
+def test_free_id_honoured_with_duplicate(store: FileStore, sample_pdf: Path) -> None:
+    store.add(sample_pdf)
+    second = store.add(sample_pdf, file_id="copy-2", on_conflict=ConflictPolicy.DUPLICATE)
+    assert second.created
+    assert second.record.id == "copy-2"
+    assert len(store.list_all()) == 2
+
+
+@needs_gs
+def test_add_without_id_still_mints(store: FileStore, sample_pdf: Path) -> None:
+    from dgml_core.ids import ID_LENGTH, is_record_id
+
+    record_id = store.add(sample_pdf).record.id
+    assert len(record_id) == ID_LENGTH
+    assert is_record_id(record_id)

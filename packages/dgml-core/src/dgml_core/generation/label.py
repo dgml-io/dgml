@@ -43,8 +43,9 @@ from dgml_core import llm
 from dgml_core.errors import LabelModelUnreachable, short_error_message
 from dgml_core.generation.blocks import Block, Node, Span, build_tree, sanitize_concept
 from dgml_core.generation.prompts import get as prompt
-from dgml_core.generation.schema import VALID_KINDS, Schema, SchemaTag
+from dgml_core.generation.schema import VALID_KINDS, Schema, SchemaTag, sanitize_tag_name
 from dgml_core.generation.transcribe import cache_write, loads_tolerant, strip_fences
+from dgml_core.generation.vocab import OPEN_VOCAB, TagVocab
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -146,7 +147,23 @@ def _roster_line(concept: str, entry: RosterEntry, *, confirmed: bool) -> str:
     return line
 
 
-def render_roster(roster: Mapping[str, RosterEntry]) -> str:
+def _roster_intro(vocab: TagVocab | None) -> str:
+    """Which framing the roster is introduced with.
+
+    Three modes, and the wrong one is costly either way: an exhaustive framing
+    on a vocabulary that may grow suppresses labeling, and a merely-suggestive
+    framing on an authored one lets coined names drown it.
+    """
+    if vocab is None:
+        return prompt("roster_intro")
+    if vocab.closed:
+        return prompt("roster_closed_intro")
+    if vocab.extends:
+        return prompt("roster_extend_intro")
+    return prompt("roster_intro")
+
+
+def render_roster(roster: Mapping[str, RosterEntry], *, vocab: TagVocab | None = None) -> str:
     """The concept roster, shown to every labeling call — two tiers.
 
     CONFIRMED concepts (seeded, or observed in this run) render rich — kind
@@ -156,13 +173,28 @@ def render_roster(roster: Mapping[str, RosterEntry]) -> str:
     The split gives the labeler an honest confidence signal instead of one
     uniform list; descriptions and examples are never conflated. Confirmed
     entries fill the size cap first.
+
+    A CLOSED vocabulary collapses the two tiers into ONE list: every entry is
+    equally legal and nothing else is, so a second heading implying "and here
+    are some more" would undercut the one claim that prompt has to make — that
+    the list is exhaustive. Confirmed entries still come first, and still
+    render rich. An EXTEND vocabulary keeps the normal two tiers (it may grow),
+    but is introduced as authoritative rather than merely available.
     """
     confirmed = [(n, e) for n, e in roster.items() if e.confirmed]
     planned = [(n, e) for n, e in roster.items() if not e.confirmed]
     lines: list[str] = []
     budget = _ROSTER_MAX_ENTRIES
+    if vocab is not None and vocab.closed:
+        if not confirmed and not planned:
+            return ""
+        lines.append(prompt("roster_closed_intro"))
+        lines.extend(_roster_line(n, e, confirmed=True) for n, e in confirmed[:budget])
+        budget -= len(confirmed[:budget])
+        lines.extend(_roster_line(n, e, confirmed=False) for n, e in planned[:budget])
+        return "\n".join(lines)
     if confirmed:
-        lines.append(prompt("roster_intro"))
+        lines.append(_roster_intro(vocab))
         lines.extend(_roster_line(n, e, confirmed=True) for n, e in confirmed[:budget])
         budget -= len(confirmed[:budget])
     if planned and budget > 0:
@@ -174,7 +206,7 @@ def render_roster(roster: Mapping[str, RosterEntry]) -> str:
 
 
 def _roster_content_blocks(
-    roster: Mapping[str, RosterEntry], *, model: str
+    roster: Mapping[str, RosterEntry], *, model: str, vocab: TagVocab | None = None
 ) -> list[dict[str, Any]]:
     """The rendered roster as a user-content block, marked cacheable.
 
@@ -186,7 +218,7 @@ def _roster_content_blocks(
     concept/example landed between calls. Non-Anthropic providers cache stable
     prefixes implicitly, so the marker is omitted (litellm would reject it).
     """
-    text = render_roster(roster)
+    text = render_roster(roster, vocab=vocab)
     if not text:
         return []
     block: dict[str, Any] = {"type": "text", "text": text}
@@ -226,18 +258,68 @@ def _locate_quote(text: str, raw_span: Mapping[str, Any]) -> tuple[int, int] | N
     return start, start + len(quote)
 
 
+def _resolved(raw: str, vocab: TagVocab, off_schema: list[str] | None) -> str:
+    """One model-emitted concept → the tag to use, or ``''`` to leave untagged.
+
+    *off_schema* collects every concept the model reached for that is NOT in an
+    authored vocabulary — one channel, two meanings, decided by the mode:
+
+    - STRICT: the name was refused; the block renders untagged. The list is
+      "what your schema is missing".
+    - EXTEND: the name was coined and IS used. The list is "what was added",
+      i.e. the candidate set for the next revision of your schema.
+
+    Nothing is collected for a derived seed or an unseeded run: the pipeline
+    naming things outside a vocabulary it wrote itself is not a gap in
+    anyone's schema, and reporting it as one would be noise.
+
+    Tallied HERE, at ingest. Labeling is serial within ``label_documents``,
+    whereas ``render_dgml`` runs on a thread pool — a counter on the (frozen,
+    shared) vocabulary would be racy, so ``resolve`` stays pure and the count
+    lives with the caller.
+    """
+    name = vocab.resolve(raw)
+    if off_schema is not None and vocab.authored:
+        # Three ways a concept lands outside the SUPPLIED names, all recorded
+        # on one channel and labeled by the caller:
+        #   strict  — refused outright (name is None); "your schema is missing this"
+        #   extend  — coined ad hoc and used; "this was added"
+        #   bounded — resolved to a PLANNED addition; also "this was added",
+        #             but from a set decided up front rather than per document.
+        if name is None:
+            if vocab.closed and not vocab.added and raw.strip():
+                off_schema.append(raw.strip())
+        elif not vocab.is_supplied(name):
+            off_schema.append(name)
+    return name or ""
+
+
 def apply_labels(
     blocks: list[Block],
     labels: Mapping[str, Any],
     *,
     doc_name: str = "",
+    vocab: TagVocab | None = None,
+    off_schema: list[str] | None = None,
 ) -> list[str]:
     """Apply a validated subset of one call's labels in place.
 
     Returns warnings for everything dropped. Quotes that don't occur
     verbatim, mid-token offset spans, overlapping spans, and unknown ids are
     discarded — labeling can only annotate, never corrupt.
+
+    *vocab* is the tag vocabulary every model-emitted concept resolves against
+    (default: open, i.e. exactly ``sanitize_concept``). When it is CLOSED, a
+    concept outside it is refused and the block stays untagged — it still
+    renders, with its text and structure intact. *off_schema* collects every
+    concept that fell outside an AUTHORED vocabulary — refused under strict,
+    coined under extend; pass ``None`` to skip the tally.
+
+    Every replay path must pass the SAME vocab — ``pipeline`` reruns this over
+    the cached label JSON, and a replay resolving differently from the fresh
+    run would break the reproducibility the whole feature exists for.
     """
+    vocab = vocab or OPEN_VOCAB
     warnings: list[str] = []
     by_id = {b.id: b for b in blocks}
     for block_id, payload in labels.items():
@@ -246,7 +328,7 @@ def apply_labels(
             warnings.append(f"{doc_name}: unknown block {block_id!r}; dropped")
             continue
         raw_concept = str(payload.get("concept", "") or "")
-        concept = sanitize_concept(raw_concept)
+        concept = _resolved(raw_concept, vocab, off_schema)
         if concept:
             block.concept = concept
         elif raw_concept.strip():
@@ -265,7 +347,9 @@ def apply_labels(
                 ),
                 None,
             )
-            value_concept = sanitize_concept(str(whole.get("concept", "") or "")) if whole else ""
+            value_concept = (
+                _resolved(str(whole.get("concept", "") or ""), vocab, off_schema) if whole else ""
+            )
             if value_concept:
                 block.value_concept = value_concept
                 if value_concept == block.concept:
@@ -293,7 +377,7 @@ def apply_labels(
                 None,
             )
             if whole is not None and block.value.strip():
-                value_concept = sanitize_concept(str(whole.get("concept", "") or ""))
+                value_concept = _resolved(str(whole.get("concept", "") or ""), vocab, off_schema)
                 if value_concept:
                     block.concept = value_concept
         # An entity quote that IS the list marker (a date or number used as the
@@ -305,7 +389,7 @@ def apply_labels(
             for raw_span in payload.get("entities", []) or []:
                 if not isinstance(raw_span, Mapping):
                     continue
-                lim_concept = sanitize_concept(str(raw_span.get("concept", "") or ""))
+                lim_concept = _resolved(str(raw_span.get("concept", "") or ""), vocab, off_schema)
                 if lim_concept and str(raw_span.get("quote", "") or "").split() == lim_tokens:
                     block.lim_concept = lim_concept
                     break
@@ -325,7 +409,7 @@ def apply_labels(
             # (e.g. a SellerAddress block that also holds VendorId/OrgName/Phone)
             # — the block must become a dg:chunk container, not a leaf wrapper.
             other_concepts = {
-                sanitize_concept(str(e.get("concept", "") or ""))
+                _resolved(str(e.get("concept", "") or ""), vocab, off_schema)
                 for e in (payload.get("entities", []) or [])
                 if isinstance(e, Mapping)
             }
@@ -333,7 +417,7 @@ def apply_labels(
             for raw_span in payload.get("entities", []) or []:
                 if not isinstance(raw_span, Mapping):
                     continue
-                span_concept = sanitize_concept(str(raw_span.get("concept", "") or ""))
+                span_concept = _resolved(str(raw_span.get("concept", "") or ""), vocab, off_schema)
                 if not span_concept:
                     continue
                 if (
@@ -407,7 +491,7 @@ def apply_labels(
         #     a split cell over its positional concept, so a count mismatch no
         #     longer discards the row's labels.
         if block.structure == "row":
-            group = sanitize_concept(str(payload.get("table", "") or ""))
+            group = _resolved(str(payload.get("table", "") or ""), vocab, off_schema)
             if group:
                 block.group_concept = group
             raw_cells = payload.get("cells", []) or []
@@ -437,9 +521,9 @@ def apply_labels(
                 # are kept: a whole-cell span either duplicates the positional
                 # concept or contradicts it, and the positional column model
                 # wins whole-cell (cross-row consistency).
-                block.cell_concepts = [sanitize_concept(c) for c in cell_names]
+                block.cell_concepts = [_resolved(c, vocab, off_schema) for c in cell_names]
                 resolved = _resolve_cell_entities(
-                    block, row_entities, concept, doc_name, block_id, []
+                    block, row_entities, concept, doc_name, block_id, [], vocab, off_schema
                 )
                 block.cell_entities = [
                     [
@@ -463,7 +547,7 @@ def apply_labels(
                         f"!= {len(block.cells)} cells; using inline cell entities instead"
                     )
                 block.cell_entities = _resolve_cell_entities(
-                    block, row_entities, concept, doc_name, block_id, warnings
+                    block, row_entities, concept, doc_name, block_id, warnings, vocab, off_schema
                 )
         # Field (key-value) blocks: sub-values packed inside the value (a name
         # beside a code in one "label: value" line) arrive as entity quotes.
@@ -477,7 +561,7 @@ def apply_labels(
             for raw_span in payload.get("entities", []) or []:
                 if not isinstance(raw_span, Mapping):
                     continue
-                span_concept = sanitize_concept(str(raw_span.get("concept", "") or ""))
+                span_concept = _resolved(str(raw_span.get("concept", "") or ""), vocab, off_schema)
                 quote = str(raw_span.get("quote", "") or "")
                 if not span_concept or not quote:
                     continue
@@ -542,6 +626,8 @@ def _resolve_cell_entities(
     doc_name: str,
     block_id: str,
     warnings: list[str],
+    vocab: TagVocab,
+    off_schema: list[str] | None,
 ) -> list[list[Span]]:
     """Place each model entity quote inside the cell that contains it.
 
@@ -556,7 +642,7 @@ def _resolve_cell_entities(
     for raw_span in raw_entities:
         if not isinstance(raw_span, Mapping):
             continue
-        span_concept = sanitize_concept(str(raw_span.get("concept", "") or ""))
+        span_concept = _resolved(str(raw_span.get("concept", "") or ""), vocab, off_schema)
         if not span_concept or span_concept == block_concept:
             continue
         quote = str(raw_span.get("quote", "") or "")
@@ -862,6 +948,7 @@ def plan_concept_roster(
     debug: bool = False,
     log: Callable[[str], None] = lambda _m: None,
     refine: bool = True,
+    existing: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """ONE call over every document's skeleton → the shared concept roster.
 
@@ -874,6 +961,15 @@ def plan_concept_roster(
     recurring roles it missed in the draft (add-only — no merge/rename), which
     improves roster completeness and cross-run stability at the cost of one
     extra call. Set ``refine=False`` to skip it.
+
+    *existing* switches this into GAP-PLANNING mode for a run that already has
+    a user-supplied vocabulary but is allowed to add to it
+    (``--extend-schema``). The supplied concepts are shown alongside the
+    skeletons and the model is asked for the recurring roles they do NOT cover,
+    which gives the additions the same cross-document planning the unseeded
+    path has always had — without it the supplement is invented per document,
+    mid-labeling, and differs run to run. Returns ONLY the additions; the
+    caller merges them.
     """
     # Cap the planning input. Sample the LARGEST documents (most blocks): a
     # richer skeleton seeds a more complete roster, so the biggest docs cover
@@ -891,9 +987,28 @@ def plan_concept_roster(
             "(largest skeletons) for roster planning"
         )
 
-    log(f"Pass B.1: planning concept roster from {len(planning_docs)} doc skeleton(s)...")
+    gap_mode = existing is not None
+    what = "vocabulary gaps" if gap_mode else "concept roster"
+    log(f"Pass B.1: planning {what} from {len(planning_docs)} doc skeleton(s)...")
     listing = render_skeleton_listing(planning_docs)
-    cache_write(cache_dir, "plan_roster_input.txt", listing, debug=debug)
+    if gap_mode:
+        # The supplied vocabulary leads, so "does an existing concept already
+        # cover this?" is answerable before the skeletons are even read.
+        supplied = "\n".join(
+            f"- {name}" + (f" — {desc[:100]}" if desc else "")
+            for name, desc in sorted((existing or {}).items())
+        )
+        listing = (
+            f"EXISTING VOCABULARY ({len(existing or {})} concepts):\n{supplied}\n\n"
+            f"DOCUMENT SKELETONS:\n{listing}"
+        )
+    system_prompt = prompt("plan_gaps_system") if gap_mode else PLAN_SYSTEM_PROMPT
+    cache_write(
+        cache_dir,
+        "plan_gaps_input.txt" if gap_mode else "plan_roster_input.txt",
+        listing,
+        debug=debug,
+    )
     try:
         if refine:
             # Two-turn grounded build: draft the roster, then have the model
@@ -901,7 +1016,7 @@ def plan_concept_roster(
             # Add-only — no synonym merging — so it can only raise recall.
             draft_raw, raw = llm.call_with_refinement(
                 config,
-                system_prompt=PLAN_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
                 refine_instruction=[{"type": "text", "text": prompt("roster_complete")}],
                 cache=True,
@@ -913,14 +1028,14 @@ def plan_concept_roster(
             # Single-call roster: the draft only, without the add-only completion turn.
             raw = llm.call(
                 config,
-                system_prompt=PLAN_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
                 cache=True,
             )
         cache_write(cache_dir, "plan_roster_raw.json", strip_fences(raw), debug=debug)
         payload = _parse_labels_json(raw)
     except Exception as exc:
-        log(f"[label] roster planning failed ({exc}); labeling proceeds without it")
+        log(f"[label] {what} planning failed ({exc}); labeling proceeds without it")
         return {}
     roster: dict[str, str] = {}
     for name, description in (payload.get("concepts", {}) or {}).items():
@@ -929,7 +1044,17 @@ def plan_concept_roster(
             # Keep the FULL description — it becomes the schema.json `role`.
             # render_roster truncates for the compact in-prompt listing.
             roster[concept] = str(description)
-    log(f"Pass B.1: planned {len(roster)} shared concept(s)")
+    if gap_mode:
+        # Never let a "gap" shadow a supplied name: the resolver would fold a
+        # formatting variant back onto the authored spelling anyway, and a
+        # word-level variant is exactly the fragmentation this prompt forbids.
+        supplied_keys = {re.sub(r"[^a-z0-9]", "", n.lower()) for n in (existing or {})}
+        roster = {
+            n: d
+            for n, d in roster.items()
+            if re.sub(r"[^a-z0-9]", "", n.lower()) not in supplied_keys
+        }
+    log(f"Pass B.1: planned {len(roster)} {'gap-filling' if gap_mode else 'shared'} concept(s)")
     return roster
 
 
@@ -1091,6 +1216,7 @@ def derive_schema(
     docs: Mapping[str, list[Block]],
     roster: Mapping[str, RosterEntry],
     descriptions: Mapping[str, str],
+    vocab: TagVocab | None = None,
 ) -> Schema:
     """Build a v1-format ``Schema`` from the already-labeled blocks.
 
@@ -1108,7 +1234,15 @@ def derive_schema(
     fill the gaps for concepts NOT observed in *docs* (e.g. an incremental run
     whose new documents never use an old tag), so re-deriving the schema never
     degrades fields a previous run established.
+
+    *vocab* keeps AUTHORED names intact on the way out. Block concepts have
+    already been resolved against it by ``apply_labels``, so re-sanitizing them
+    here would only undo that — dropping a tag like ``Notes`` from the export
+    while the XML happily carries ``<docset:Notes>``, and then listing it as an
+    "unplanned" tag in the RNC. Default (``None``) keeps the model-output
+    sanitizer, which is right for an unseeded run.
     """
+    resolve = (vocab or OPEN_VOCAB).resolve
     # Examples must be internally consistent per concept: an inline concept's
     # examples are observed VALUES, a section concept's examples are how the
     # section announces itself (its heading). Body snippets of blocks labeled
@@ -1128,7 +1262,7 @@ def derive_schema(
         return bool(t) and (t == _squash(name) or t == _squash(_humanize_concept(name)))
 
     def record(raw: str, kind: str, parent: str, example: str, *, body: bool = False) -> str:
-        name = sanitize_concept(raw)
+        name = resolve(raw)
         if not name:
             return ""
         kinds.setdefault(name, kind)
@@ -1207,19 +1341,24 @@ def derive_schema(
 
 
 def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
-    """Roster entries from an exported schema — full fidelity, frozen.
+    """Roster entries from a supplied schema — full fidelity, frozen, VERBATIM.
 
-    Names/parents are normalized through ``sanitize_concept`` so a hand-edited
-    schema meets the labeling vocabulary's naming rules; ``kind`` is kept only
-    when valid. Entries are confirmed (the seed is authoritative) and frozen
-    (observations never mutate them, keeping the rendered roster cache-stable
-    for the whole batch).
+    Names and parents carry through exactly as authored, guarded only by
+    ``sanitize_tag_name`` (XML validity). ``sanitize_concept`` must NOT run
+    here: it exists to tame MODEL output — leaked ``Concept`` prefixes,
+    ``str()``-ified payload fragments, whole sentences as tag names — and
+    applied to human input it silently deletes legitimate tags, folding
+    ``Notes``, ``Details``, ``Line Items`` and ``Section3`` all to ``''``.
+    A user who writes ``Notes`` gets ``<docset:Notes>``.
+
+    ``kind`` is kept only when valid (``Schema.add`` has already coerced an
+    invalid one, and the authored loader refuses it outright). Entries are
+    confirmed (the seed is authoritative) and frozen (observations never mutate
+    them, keeping the rendered roster cache-stable for the whole batch).
     """
     roster: dict[str, RosterEntry] = {}
     for tag in schema.tags.values():
-        name = sanitize_concept(tag.name)
-        if not name:
-            continue
+        name = sanitize_tag_name(tag.name)
         roster[name] = RosterEntry(
             description=str(tag.role or ""),
             examples=[
@@ -1227,7 +1366,7 @@ def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
                 for ex in (tag.examples or ([tag.example] if tag.example else []))
             ][:_SCHEMA_MAX_EXAMPLES],
             kind=tag.kind if tag.kind in VALID_KINDS else "",
-            parent=sanitize_concept(tag.parent_role or ""),
+            parent=sanitize_tag_name(tag.parent_role) if tag.parent_role else "",
             confirmed=True,
             frozen=True,
         )
@@ -1247,6 +1386,8 @@ def _label_chunk(
     stem: str,
     label_tag: str,
     warnings: list[str],
+    vocab: TagVocab,
+    off_schema: list[str],
 ) -> dict[str, str] | None:
     """Label one chunk in place; bisect and recurse on an unparseable reply.
 
@@ -1299,6 +1440,8 @@ def _label_chunk(
                     stem=stem,
                     label_tag=f"{label_tag}a",
                     warnings=warnings,
+                    vocab=vocab,
+                    off_schema=off_schema,
                 )
                 err_b = _label_chunk(
                     doc_name,
@@ -1312,13 +1455,30 @@ def _label_chunk(
                     stem=stem,
                     label_tag=f"{label_tag}b",
                     warnings=warnings,
+                    vocab=vocab,
+                    off_schema=off_schema,
                 )
                 return err_a or err_b
             if attempt:
                 warnings.append(f"{msg}: {exc}")
             continue
-        warnings.extend(apply_labels(chunk, payload.get("labels", {}) or {}, doc_name=doc_name))
+        warnings.extend(
+            apply_labels(
+                chunk,
+                payload.get("labels", {}) or {},
+                doc_name=doc_name,
+                vocab=vocab,
+                off_schema=off_schema,
+            )
+        )
         labeled = sum(1 for b in chunk if b.concept)
+        # Applies under a closed vocabulary TOO. An earlier version skipped it
+        # when closed, reasoning that a small schema legitimately leaves most
+        # blocks untagged. That was wrong in the way that matters: a closed run
+        # can collapse to labeling almost nothing, and this retry is the only
+        # thing that detects it. A correctly-labeling closed run sits far above
+        # the threshold, so the retry stays rare; when it fires, something is
+        # wrong and one call is the cheapest way to find out.
         if attempt or labeled >= len(chunk) * _MIN_LABELED_FRACTION:
             break
         log(f"[label] {doc_name} {label_tag} under-labeled ({labeled}/{len(chunk)}); retrying")
@@ -1335,16 +1495,24 @@ def _label_one_document(
     cache_dir: Path | str | None,
     debug: bool,
     log: Callable[[str], None],
-) -> tuple[list[str], dict[str, str] | None]:
+    vocab: TagVocab,
+) -> tuple[list[str], dict[str, str] | None, list[str]]:
     """Label one document's blocks against (and into) the shared roster.
 
-    Returns ``(warnings, label_error)``. ``label_error`` is a ``{code, message}``
+    Returns ``(warnings, label_error, off_schema)``, where *off_schema* lists
+    every concept that fell outside an authored vocabulary — refused under
+    strict, coined under extend (empty otherwise).
+    ``label_error`` is a ``{code, message}``
     set only when a label-model call *could not be reached at all* (auth, bad
     model id, connection) — the first such failure for this document. A call
     that succeeds but returns few/no labels is a soft outcome and leaves
     ``label_error`` ``None``; the transcription is never lost either way.
     """
     warnings: list[str] = []
+    # Concepts that fell outside an authored vocabulary, in encounter order
+    # (duplicates kept — the caller tallies them). Filled serially: every chunk
+    # of this document is labeled in sequence.
+    off_schema: list[str] = []
     # Populated on the first model-reachability failure (see is_model_reachability_error);
     # recorded once because such failures (e.g. a bad key) recur on every chunk.
     label_error: dict[str, str] | None = None
@@ -1352,7 +1520,7 @@ def _label_one_document(
     # One roster snapshot per document: every call for this document reuses the
     # same rendered block, so it stays byte-stable (and cacheable) across the
     # document's chunks and its section retry.
-    roster_blocks = _roster_content_blocks(roster, model=config.model)
+    roster_blocks = _roster_content_blocks(roster, model=config.model, vocab=vocab)
     for chunk_idx, chunk in enumerate(_chunks(blocks)):
         err = _label_chunk(
             doc_name,
@@ -1366,6 +1534,8 @@ def _label_one_document(
             stem=stem,
             label_tag=f"c{chunk_idx + 1:02d}",
             warnings=warnings,
+            vocab=vocab,
+            off_schema=off_schema,
         )
         if label_error is None and err is not None:
             label_error = err
@@ -1375,7 +1545,11 @@ def _label_one_document(
     # exist); the model still supplies the concept name.
     missing = [b for b in blocks if _needs_label(b)]
     if missing:
-        listing = prompt("section_retry") + "\n\n" + render_block_listing(doc_name, missing)
+        # Under closure the retry keeps its recall value — a heading the model
+        # skipped may well have a legal tag — but its instruction must not
+        # push for a coined name, since every such name is discarded anyway.
+        retry_prompt = prompt("section_retry_closed" if vocab.closed else "section_retry")
+        listing = retry_prompt + "\n\n" + render_block_listing(doc_name, missing)
         user_content = [*roster_blocks, {"type": "text", "text": listing}]
         user_text = "\n\n".join(str(part["text"]) for part in user_content)
         cache_write(cache_dir, f"label_{stem}_section_retry_input.txt", user_text, debug=debug)
@@ -1394,7 +1568,11 @@ def _label_one_document(
             )
             warnings.extend(
                 apply_labels(
-                    missing, _parse_labels_json(raw).get("labels", {}) or {}, doc_name=doc_name
+                    missing,
+                    _parse_labels_json(raw).get("labels", {}) or {},
+                    doc_name=doc_name,
+                    vocab=vocab,
+                    off_schema=off_schema,
                 )
             )
             _update_roster(roster, missing)
@@ -1414,7 +1592,7 @@ def _label_one_document(
     wrap_detected_values(blocks)
     labeled = sum(1 for b in blocks if b.concept)
     log(f"Pass B: {doc_name}: {labeled}/{len(blocks)} block(s) labeled")
-    return warnings, label_error
+    return warnings, label_error, off_schema
 
 
 def _promote_pilot(
@@ -1451,7 +1629,10 @@ def label_documents(
     roster_refine: bool = True,
     roster_seed: Mapping[str, str] | None = None,
     schema_seed: Schema | None = None,
+    gap_seed: Mapping[str, str] | None = None,
+    vocab: TagVocab | None = None,
     on_label_error: Callable[[str, dict[str, str]], None] | None = None,
+    on_off_schema: Callable[[str, Counter[str]], None] | None = None,
 ) -> list[str]:
     """Label every document, chunked, carrying the roster between calls.
 
@@ -1478,6 +1659,23 @@ def label_documents(
     ``{concept: description}`` seed (``cache/concept_roster.json``) — same
     semantics, no examples/kind/hierarchy; ignored when *schema_seed* is given.
 
+    *vocab* is the tag vocabulary every model-emitted concept resolves against.
+    A CLOSED one makes the seed a contract rather than a suggestion: the prompt
+    says the list is exhaustive and the resolver enforces it, so the emitted
+    tags are a subset of the supplied names and nothing else. Content is never
+    dropped — an unmatched block renders as ``dg:chunk`` with its text intact.
+    Default (``None``) is the open vocabulary, i.e. today's coin-freely
+    behavior. Deciding WHEN to close is the caller's policy, not this
+    function's: the CLI closes on a vocabulary a PERSON authored and not on one
+    it derived from its own labels.
+
+    *on_off_schema* — called ``(doc_name, Counter[concept])`` once per document
+    that had any — reports the concepts that fell outside an AUTHORED
+    vocabulary. Under strict these were refused, and the list says what the
+    schema is missing; under extend they were coined and used, and the list is
+    the candidate set for the schema's next revision. Either way it is the most
+    actionable output of the run.
+
     Unseeded runs are STAGED: after planning, the largest documents label
     first (a pilot), their observations promote the planned roster to
     confirmed — real examples, observed kinds, tree-derived parents — and the
@@ -1492,6 +1690,7 @@ def label_documents(
     """
     total_blocks = sum(len(b) for b in docs.values())
     log(f"Pass B: labeling {total_blocks} block(s) across {len(docs)} doc(s)...")
+    vocab = vocab or OPEN_VOCAB
     warnings: list[str] = []
     # The roster (a.k.a. the docset's concept "schema" — see --schema-path;
     # called a roster because it ACCUMULATES during labeling, unlike a static schema).
@@ -1502,7 +1701,20 @@ def label_documents(
     roster: dict[str, RosterEntry]
     if schema_seed is not None:
         roster = _seed_entries_from_schema(schema_seed)
-        log(f"Pass B.1: seeded roster from schema ({len(roster)} concept(s)); planning skipped")
+        if gap_seed:
+            # Planned additions, decided ONCE for the whole batch by the
+            # caller (convert_batch), because the vocabulary they form has to
+            # govern rendering as well as labeling. They enter PLANNED — not
+            # confirmed, not frozen — so the authored entries keep the
+            # authoritative tier and these render under the softer one.
+            for name, desc in gap_seed.items():
+                roster.setdefault(name, RosterEntry(description=str(desc)))
+            log(
+                f"Pass B.1: seeded roster from schema ({len(schema_seed.tags)} authored "
+                f"+ {len(gap_seed)} planned)"
+            )
+        else:
+            log(f"Pass B.1: seeded roster from schema ({len(roster)} concept(s)); planning skipped")
     elif roster_seed is not None:
         # Legacy flat seed: confirmed (it is a prior run's vocabulary) but not
         # frozen — it carries no examples, so observed ones still enrich it.
@@ -1520,6 +1732,21 @@ def label_documents(
     # before per-document labeling coins description-less concepts, so the
     # schema `role` comes from descriptions (never a leaked value).
     descriptions = {name: entry.description for name, entry in roster.items() if entry.description}
+    if vocab.closed:
+        log(
+            f"Pass B: vocabulary CLOSED at {len(vocab.names)} tag(s) — concepts outside it "
+            "are refused and their blocks render untagged (text preserved)"
+        )
+    elif vocab.extends:
+        log(
+            f"Pass B: vocabulary EXTENDS {len(vocab.names)} authored tag(s) — reuse is "
+            "preferred, and any concept coined for a genuine gap is reported back"
+        )
+    elif vocab.added:
+        log(
+            f"Pass B: vocabulary CLOSED at {len(vocab.supplied)} authored "
+            f"+ {len(vocab.added)} planned tag(s) — nothing outside the two is emitted"
+        )
 
     # Pilot staging (unseeded runs only): the LARGEST documents (same sort as
     # planning) label first, then _promote_pilot folds their observations into
@@ -1535,7 +1762,7 @@ def label_documents(
         log(f"Pass B: pilot stage — labeling the {len(pilot)} largest doc(s) first")
 
     for idx, doc_name in enumerate(order):
-        warns, label_err = _label_one_document(
+        warns, label_err, off_schema = _label_one_document(
             doc_name,
             docs[doc_name],
             roster,
@@ -1543,10 +1770,26 @@ def label_documents(
             cache_dir=cache_dir,
             debug=debug,
             log=log,
+            vocab=vocab,
         )
         warnings.extend(warns)
         if label_err is not None and on_label_error is not None:
             on_label_error(doc_name, label_err)
+        if off_schema:
+            tally = Counter(off_schema)
+            shown = ", ".join(f"{name} x{n}" if n > 1 else name for name, n in tally.most_common(5))
+            # Keyed on `added`, not `closed`. A BOUNDED vocabulary is closed
+            # AND has additions, and the names on this channel are then
+            # planned concepts being USED — reporting them as "left untagged"
+            # (as keying on `closed` alone did) tells the author the opposite
+            # of what happened.
+            fate = "left untagged" if (vocab.closed and not vocab.added) else "used"
+            log(
+                f"Pass B: {doc_name}: {len(off_schema)} concept use(s) outside the schema "
+                f"({len(tally)} distinct) {fate}: {shown}" + (" …" if len(tally) > 5 else "")
+            )
+            if on_off_schema is not None:
+                on_off_schema(doc_name, tally)
         if pilot and idx == len(pilot) - 1:
             _promote_pilot(docs, pilot, roster, descriptions, log)
 
@@ -1578,13 +1821,18 @@ def label_documents(
                 for name, entry in roster.items()
                 if not entry.description
             }
-            if undescribed:
+            # describe_concepts exists to write roles for concepts COINED
+            # during labeling. A closed run coins none, and the authored
+            # schema — not this export — is what the next run seeds from, so
+            # the call could change neither a prompt nor a seed. Skipping it
+            # removes an LLM call that cannot affect the outcome.
+            if undescribed and not vocab.closed:
                 descriptions.update(
                     describe_concepts(
                         undescribed, config=config, cache_dir=cache_dir, debug=debug, log=log
                     )
                 )
-            schema = derive_schema(docs, roster, descriptions)
+            schema = derive_schema(docs, roster, descriptions, vocab=vocab)
             schema.save(Path(cache_dir).parent / "schema.json")
             log(f"Pass B: wrote schema.json ({len(schema.tags)} tag(s))")
         except Exception as exc:  # schema export must never sink a labeled batch

@@ -26,6 +26,10 @@ azure = ["dgml-core[azure]"]
 # Install with `pip install dgml[macos]` to enable on-device OCR via Apple
 # Vision (macOS only; the default provider when no OCR config is set).
 macos = ["dgml-core[macos]"]
+# Install with `pip install dgml[pdfium]` for page rendering and slicing with
+# PDFium (`[pdf] provider = "pypdfium2"`) instead of the system ghostscript
+# binary.
+pdfium = ["dgml-core[pdfium]"]
 # Install with `pip install dgml[clustering]` to enable `dgml cluster`.
 clustering = ["dgml-core[clustering]"]
 # Install with `pip install dgml[chain]` to enable on-chain attestation

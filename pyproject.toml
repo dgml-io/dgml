@@ -18,6 +18,10 @@ dev-dependencies = [
     # Linux/Windows CI (those tests skip).
     "pyobjc-framework-Vision>=10.0 ; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.0 ; sys_platform == 'darwin'",
+    # The `dgml[pdfium]` page-render extra, installed in dev so its provider
+    # tests run against the real PDFium (no network involved).
+    "pypdfium2>=4.30",
+    "pillow>=10.2",
     # Type stubs for PyYAML (the runtime dep moved to `dgml` core).
     "types-PyYAML>=6.0",
     # Type stubs (typeshed, Apache-2.0) so mypy can check the translators-pdf
@@ -98,6 +102,9 @@ module = [
     "leidenalg.*",
     "umap.*",
     "geoopt.*",
+    # pypdfium2 ships no py.typed marker; the renderer wraps it behind the
+    # typed PageRenderer interface.
+    "pypdfium2.*",
     # Aspose.Words is a proprietary commercial library and ships no type
     # stubs; it's an optional converter backend imported lazily.
     "aspose",

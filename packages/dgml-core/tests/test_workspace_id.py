@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Workspace id minting and the id-vs-path shape test."""
+"""Workspace id generating and what makes an id valid."""
 
 from __future__ import annotations
 
@@ -29,31 +29,39 @@ def test_new_workspace_id_shape_and_uniqueness() -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        "ws_abcdefghijklmnop",
+        "ws_abcdefghijklmnop",  # a generated id
         "ws_2345672345672345",
         "ws_fixturexxxxxxxxx",  # the CLI test fixture's id — must stay addressable
+        "my-workspace",  # `workspace create --id` — no prefix required
+        "my_workspace",
+        "notes",
+        "a1b",  # the shortest an id may be
+        "2024-q3",  # leading digit is fine
+        "a" * 40,  # the longest
+        "dgml-workspace",
     ],
 )
-def test_is_workspace_id_accepts_real_ids(value: str) -> None:
+def test_is_workspace_id_accepts_valid_ids(value: str) -> None:
     assert is_workspace_id(value)
 
 
 @pytest.mark.parametrize(
     "value",
     [
-        "ws_abcdefghijklmno",  # 15 chars — one short
-        "ws_abcdefghijklmnopq",  # 17 chars — one long
-        "ws_ABCDEFGHIJKLMNOP",  # uppercase is not in the base32-lower alphabet
-        "ws_abcdefghijklmn0p",  # 0 and 1 are outside [a-z2-7]
-        "ws_abcdefghijklmn1p",
-        "./ws_abcdefghijklmnop",  # the documented escape for a same-named directory
-        "ws_abcdefghijklmnop/",  # a trailing separator makes it a path
-        "ws_abcdefghij/klmnop",
-        "ws_abcdefghijklmnop.bak",
-        "workspace_abcdefghijklmnop",  # wrong prefix
-        "dgml-workspace",
+        "ab",  # 2 chars — one short
+        "a" * 41,  # one long
+        "-my-workspace",  # must start with a letter or digit
+        "_my_workspace",
+        "MyWorkspace",  # uppercase would collide on a case-insensitive filesystem
+        "ws_ABCDEFGHIJKLMNOP",
+        "./my-workspace",  # the documented escape for a same-named directory
+        "my-workspace/",  # a trailing separator makes it a path
+        "my/workspace",
+        "my-workspace.bak",  # a dot is not a legal id character
+        "my workspace",
         "",
         ".",
+        "..",
     ],
 )
 def test_is_workspace_id_rejects_paths_and_near_misses(value: str) -> None:
@@ -66,4 +74,4 @@ def test_is_workspace_id_is_anchored_at_both_ends() -> None:
     wid = new_workspace_id()
     assert not is_workspace_id(f"/tmp/{wid}")
     assert not is_workspace_id(f"{wid}\n")
-    assert not is_workspace_id(f"{wid}{wid}")
+    assert not is_workspace_id(f"{wid}/docsets")

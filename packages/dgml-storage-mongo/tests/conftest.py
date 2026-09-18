@@ -115,7 +115,6 @@ def mongo_docs_workspace(tmp_path: Path) -> Workspace:
         encoding="utf-8",
     )
     ws = Workspace(root=root)
-    ws.init()  # docs → Mongo, blobs → local disk
     return ws
 
 
@@ -174,7 +173,6 @@ def mongo_gridfs_workspace(tmp_path: Path) -> Workspace:
         encoding="utf-8",
     )
     ws = Workspace(root=root)
-    ws.init()
     return ws
 
 

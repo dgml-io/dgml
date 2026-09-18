@@ -83,7 +83,7 @@ def _seed_page_image(workspace: Workspace, file_id: str) -> None:
 @pytest.fixture
 def workspace(tmp_path: Path) -> Workspace:
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
+    ws.root.mkdir(parents=True, exist_ok=True)  # nothing scaffolds it now
     return ws
 
 
@@ -339,7 +339,6 @@ def test_corpus_dir_is_materialized_for_a_non_local_blob_store(tmp_path: Path) -
     # Both roles on the bridge store, so nothing resolves to a plain LocalStore.
     ws.__dict__["blobs"] = store
     ws.__dict__["docs"] = store
-    ws.init()
 
     for fid, words in (("f1", ["invoice", "total", "due"]), ("f2", ["lease", "tenant", "rent"])):
         _seed_file(ws, fid)
@@ -400,7 +399,6 @@ def _bridge_workspace(tmp_path: Path) -> Workspace:
     ws = Workspace(root=root)
     ws.__dict__["blobs"] = store
     ws.__dict__["docs"] = store
-    ws.init()
     return ws
 
 
@@ -487,7 +485,6 @@ def test_corpus_covers_every_file_not_just_the_ones_being_clustered(tmp_path: Pa
     ws = Workspace(root=root)
     ws.__dict__["blobs"] = store
     ws.__dict__["docs"] = store
-    ws.init()
 
     # "assigned" belongs to a docset, so it is never a clustering candidate —
     # but it is part of the corpus.

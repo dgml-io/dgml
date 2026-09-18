@@ -14,12 +14,11 @@
 
 from __future__ import annotations
 
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
 from dgml_core.conversion import ConverterConfig, convert_to_pdf_bytes
-from dgml_core.pages import extract_pdf_pages
+from dgml_core.pages import PdfConfig, slice_pages
 
 
 def load_pdf(path: Path) -> bytes:
@@ -53,19 +52,25 @@ def load_document_as_pdf(
     return convert_to_pdf_bytes(path, converters)
 
 
-def slice_pdf(pdf_bytes: bytes, page_indices: list[int]) -> bytes:
+def slice_pdf(
+    pdf_bytes: bytes,
+    page_indices: list[int],
+    *,
+    config: PdfConfig | None = None,
+    total_pages: int | None = None,
+) -> bytes:
     """Extract the given 0-based page indices into a new PDF and return its bytes.
 
-    Slicing goes through ghostscript's ``pdfwrite`` device (see
-    :func:`dgml_core.pages.extract_pdf_pages`); no Python PDF library is involved.
+    Slicing goes through the configured PDF engine (see
+    :func:`dgml_core.pages.slice_pages`) — ghostscript's ``pdfwrite`` by
+    default, or PDFium in-process when the workspace selects it.
     """
-    with tempfile.TemporaryDirectory(prefix="dgml-slice-") as tmp:
-        tmpdir = Path(tmp)
-        src = tmpdir / "in.pdf"
-        out = tmpdir / "out.pdf"
-        src.write_bytes(pdf_bytes)
-        extract_pdf_pages(src, out, [i + 1 for i in page_indices])
-        return out.read_bytes()
+    return slice_pages(
+        pdf_bytes,
+        [i + 1 for i in page_indices],
+        config=config,
+        total_pages=total_pages,
+    )
 
 
 def iter_windows(total_pages: int, window_size: int, overlap: int) -> list[list[int]]:

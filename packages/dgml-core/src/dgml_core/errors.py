@@ -64,7 +64,16 @@ class InvalidPDF(DgmlError):
     code = "INVALID_PDF"
 
 
-class GhostscriptNotFound(DgmlError):
+class EngineNotAvailable(DgmlError):
+    """The configured PDF engine cannot run — its binary or Python package is
+    not installed. Raised for either capability (rendering or slicing), since
+    both come from one engine. Subclassed by :class:`GhostscriptNotFound`;
+    catch this base to handle "engine missing" uniformly across providers."""
+
+    code = "ENGINE_NOT_AVAILABLE"
+
+
+class GhostscriptNotFound(EngineNotAvailable):
     code = "GHOSTSCRIPT_NOT_FOUND"
 
 
@@ -126,10 +135,13 @@ class WorkspacesConfigInvalid(DgmlError):
 
 
 class WorkspaceNotFound(NotFoundError):
-    """``--workspace <ws_id>`` named an id the machine's store of workspaces does not
-    hold. Deliberately an error rather than a fallthrough to path resolution: an id
-    has a distinctive shape (:func:`dgml_core.workspace_id.is_workspace_id`), so a
-    caller that typed one meant a workspace, not a directory to create."""
+    """``--workspace <id>`` named something the machine's store of workspaces does not
+    hold and that is not an existing directory either.
+
+    Deliberately an error rather than a fallthrough to path resolution: with both
+    places looked in and neither answering, the likeliest explanation is a typo in an
+    id, and resolving to a path would silently turn that typo into a new directory in
+    the working directory."""
 
     code = "WORKSPACE_NOT_FOUND"
 
@@ -176,6 +188,10 @@ class WorkspaceMigrationFailed(DgmlError):
     empty — and a wrong answer is worse than a refusal."""
 
     code = "WORKSPACE_MIGRATION_FAILED"
+
+
+class PdfConfigInvalid(DgmlError):
+    code = "PDF_CONFIG_INVALID"
 
 
 class OcrConfigInvalid(DgmlError):
@@ -239,6 +255,18 @@ class ClassificationConfigInvalid(DgmlError):
 
 class ClassificationFailed(DgmlError):
     code = "CLASSIFICATION_FAILED"
+
+
+class NoExistingDocSets(DgmlError):
+    """Assign-only classification was asked for in a workspace with no DocSets.
+
+    A precondition, not a runtime failure: ``--auto-classify existing`` must
+    place the file in an existing DocSet, so with none to choose from there is
+    no outcome it could produce. Raised rather than silently degrading to
+    "unassigned", which is what the mode exists to avoid.
+    """
+
+    code = "NO_EXISTING_DOCSETS"
 
 
 class ClusteringConfigInvalid(DgmlError):

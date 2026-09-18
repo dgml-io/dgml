@@ -1,0 +1,53 @@
+{
+  "tags": {
+    "LineItems": {
+      "role": "The table of line items on the record",
+      "kind": "section",
+      "examples": [],
+      "parent_role": ""
+    },
+    "LineItem": {
+      "role": "One line on the record",
+      "kind": "row",
+      "examples": [],
+      "parent_role": "LineItems"
+    },
+    "LineItemCode": {
+      "role": "Identifier for the thing a line refers to",
+      "kind": "row",
+      "examples": [],
+      "parent_role": "LineItem"
+    },
+    "LineItemLabel": {
+      "role": "Printed name of the thing a line refers to",
+      "kind": "row",
+      "examples": [],
+      "parent_role": "LineItem"
+    },
+    "LineItemCount": {
+      "role": "How many units a line covers",
+      "kind": "row",
+      "examples": [],
+      "parent_role": "LineItem"
+    },
+    "LineItemUnit": {
+      "role": "Unit the count is expressed in",
+      "kind": "row",
+      "examples": [],
+      "parent_role": "LineItem"
+    },
+    "LineItemAmount": {
+      "role": "Amount for a single unit on a line",
+      "kind": "inline",
+      "examples": [],
+      "parent_role": "LineItem"
+    },
+    "RecordNumber": {
+      "role": "Identifier assigned to the record as a whole",
+      "kind": "inline",
+      "examples": [],
+      "parent_role": ""
+    }
+  },
+  "notes": "Invented vocabulary for tests. Exercises the shapes the loader has to handle: 8 tags, a collection, a repeating row, a two-level parent chain, and both structural kinds. No example values and no content from any real document."
+}

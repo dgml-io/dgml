@@ -37,7 +37,7 @@ from dgml_core.storage_resolve import (
     storage_fingerprint_pair,
     verify_storage_fingerprint,
 )
-from dgml_core.workspace_id import mint_workspace_id
+from dgml_core.workspace_id import generate_unique_workspace_id
 from dgml_core.workspaces_resolve import default_workspaces_store
 
 LOCAL = "dgml_core.storage_local:LocalStore"
@@ -76,7 +76,7 @@ def _ws(tmp_path: Path, text: str = "") -> Workspace:
     store code path is the one actually exercised."""
     if _BACKING[0] == "store":
         store = default_workspaces_store()
-        wid = mint_workspace_id(store)
+        wid = generate_unique_workspace_id(store)
         store.write_config(wid, text)
         return Workspace(root=store.workspace_root(wid), workspaces_id=wid)
     root = tmp_path / "ws"
@@ -88,7 +88,7 @@ def _ws(tmp_path: Path, text: str = "") -> Workspace:
 
 def _reopen(ws: Workspace) -> Workspace:
     """The same workspace, freshly constructed, so nothing is memoized from before a
-    write (see ``Workspace._config_state`` and ``store_configs``)."""
+    write (see ``Workspace.config_text`` and ``store_configs``)."""
     return Workspace(
         root=ws.root, config_override=ws.config_override, workspaces_id=ws.workspaces_id
     )
@@ -118,11 +118,11 @@ def test_the_backing_under_test_is_the_one_being_exercised(tmp_path: Path) -> No
     assert ws.workspaces_id is not None
     store = default_workspaces_store()
     found = store.read_config(ws.workspaces_id)
-    assert found is not None and "name = 'W'" in found[0]
+    assert found is not None and "name = 'W'" in found
 
     wc.write_identity(ws, organization="acme")
     written = store.read_config(ws.workspaces_id)
-    assert written is not None and "acme" in written[0]
+    assert written is not None and "acme" in written
 
 
 # ------------------------------------------------------------------- identity

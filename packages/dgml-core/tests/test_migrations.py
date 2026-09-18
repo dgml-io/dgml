@@ -149,7 +149,7 @@ def test_backfill_workspace_id_mints_and_is_idempotent(workspace: Workspace) -> 
     wid = workspace.workspace_id
     assert wid is not None and wid.startswith("ws_")
 
-    # Re-run against already-migrated data: no new id, none minted, nothing changes.
+    # Re-run against already-migrated data: no new id, none generated, nothing changes.
     stamp_schema_version(workspace, 0)
     assert migrate_workspace(workspace)[0].changed == 0
     assert workspace.workspace_id == wid  # unchanged

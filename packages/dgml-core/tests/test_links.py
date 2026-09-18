@@ -169,7 +169,7 @@ def _renamed(xml: str) -> str:
 def _linked_positions(xml: str, plan: list[dict[str, object]]) -> list[tuple[int, str, list[int]]]:
     """Every applied link as (subject position, predicate, object positions).
 
-    Positions, not ids: `_ensure_id` mints an id from the tag name, so a renamed
+    Positions, not ids: `_ensure_id` generates an id from the tag name, so a renamed
     tree correctly gets different id strings for the same elements.
     """
     from dgml_core.generation.links import _elements, apply_plan

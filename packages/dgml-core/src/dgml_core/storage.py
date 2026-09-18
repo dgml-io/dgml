@@ -68,12 +68,13 @@ class Workspace:
         """Resolve a workspace from ``override`` (the ``--workspace`` value), then
         ``$DGML_HOME``, then ``./dgml-workspace``.
 
-        ``override`` may be a **path** or a **workspace id**. An id (``ws_`` + 16
-        base32 chars — no separator, no dot, no uppercase) is looked up in the machine's
-        store of workspaces; anything else is a path. ``$DGML_HOME`` takes either too,
-        so a container can name a workspace rather than a directory. A directory whose
-        name happens to be id-shaped is still addressable as ``./ws_…``, which fails the
-        id test on the ``./``.
+        ``override`` may be a **path** or a **workspace id**, decided by
+        :meth:`_from_workspaces_store`: a value the store of workspaces holds is that
+        workspace, an existing directory of that name is a path, and an id-shaped value
+        that is neither raises :class:`~dgml_core.errors.WorkspaceNotFound` rather than
+        being taken as a directory to create. ``$DGML_HOME`` takes either form too, so a
+        container can name a workspace rather than a directory. A directory whose name
+        collides with a listed id is still addressable as ``./name``.
 
         ``config`` (the ``--workspace-config`` value) points at a ``config.toml``
         outside the workspace directory. It applies only to a workspace addressed by
@@ -98,19 +99,27 @@ class Workspace:
     @classmethod
     def _from_workspaces_store(cls, value: str, config: Path | None) -> Workspace | None:
         """``value`` resolved through the machine's store of workspaces, or ``None`` when
-        it is not an id at all and should be treated as a path.
+        it should be treated as a path instead.
 
-        The id test is on **shape** (:func:`dgml_core.workspace_id.is_workspace_id`), not
-        on what the store happens to hold. That matters: the old test asked "is this
-        string in the index", so the same argument could mean a workspace on one machine
-        and a directory to create on another. With a shape test, an id-shaped argument
-        the store does not know is an error — which is almost always what the caller
-        wants to hear, rather than having a ``ws_…`` directory appear in the current
-        working directory.
+        An id no longer carries a distinguishing prefix — ``my-workspace`` is as valid
+        an id as ``ws_qf7imkc7f6oqzfwt`` — and is also a legal relative directory name,
+        so the two cannot be told apart by shape alone. The rule, in order:
 
-        Raises :class:`~dgml_core.errors.WorkspaceNotFound` for an unknown id, and
-        :class:`~dgml_core.errors.InvalidArgument` if a config override is combined with
-        one."""
+        1. Not :func:`~dgml_core.workspace_id.is_workspace_id` — it carries a separator,
+           a dot, uppercase, or the wrong length — so it is a path, and no store is
+           built to decide that.
+        2. The store holds it: that workspace.
+        3. A directory of that name exists: a path. Note this is the *same*
+           cwd-relative reading a path argument has always had, so nothing about
+           ``--workspace notes`` moves; and because step 2 comes first, no ``mkdir`` can
+           redirect a working command at a different workspace.
+        4. Neither: :class:`~dgml_core.errors.WorkspaceNotFound`, naming both places
+           looked in. Falling through to path resolution here is what the shape test
+           used to prevent, and the reason is unchanged — a typo'd id must not become a
+           new directory in the working directory.
+
+        Also raises :class:`~dgml_core.errors.InvalidArgument` if a config override is
+        combined with an id."""
         from .workspace_id import is_workspace_id
 
         if not is_workspace_id(value):
@@ -119,15 +128,28 @@ class Workspace:
         from .errors import InvalidArgument, WorkspaceNotFound
         from .workspaces_resolve import default_workspaces_store
 
+        store = default_workspaces_store()
+        if not store.exists(value):
+            # `is_dir`, not `exists`: a *file* of that name is no more a workspace root
+            # than a missing one, and saying so beats resolving to it and failing later
+            # with a message about an uninitialized workspace.
+            if Path(value).expanduser().is_dir():
+                return None
+            raise WorkspaceNotFound(
+                f"no workspace {value} in {store.label()}, and no directory ./{value}. "
+                f"'dgml workspace list' shows the workspaces this machine holds; "
+                f"'dgml workspace create --id {value}' would create this one."
+            )
+
+        # Checked only now that `value` is known to be an id: reaching it earlier would
+        # reject `--workspace-config` alongside a plain path, which is exactly the case
+        # the flag exists for.
         if config is not None:
             raise InvalidArgument(
                 f"a workspace config cannot be supplied for {value}: its config lives in "
                 f"the machine's store of workspaces, which is where that workspace was "
                 f"found. Address the workspace by path to use your own config file."
             )
-        store = default_workspaces_store()
-        if not store.exists(value):
-            raise WorkspaceNotFound(f"no workspace {value} in {store.label()}")
 
         # The store answers where the workspace's files are, including honouring a
         # `workspace_path` its config declares. Asking it — rather than parsing the
@@ -202,13 +224,16 @@ class Workspace:
         because it names the store."""
         return self.config_override or self.root / layout.CONFIG_FILE
 
-    #: Where :attr:`_config_state` keeps its memo, for the store-backed case only.
-    _CONFIG_CACHE_KEY = "_config_state_cache"
+    #: Where :attr:`config_text` keeps its memo, for the store-backed case only.
+    _CONFIG_TEXT_CACHE_KEY = "_config_text_cache"
 
     @property
-    def _config_state(self) -> tuple[str | None, int | None]:
-        """This workspace's ``config.toml`` text and its revision token, or
-        ``(None, None)`` when it has no config yet.
+    def config_text(self) -> str | None:
+        """This workspace's ``config.toml`` as text, or ``None`` if it has none.
+
+        Also the conflict-detection token handed back to
+        :meth:`~dgml_core.workspaces_store.WorkspacesStore.write_config`, which is why
+        there is no separate revision property: the text *is* the token.
 
         **Memoized only when the config is held in the machine's store of workspaces**,
         where reading it may be a network round trip and a single command asks several
@@ -217,6 +242,9 @@ class Workspace:
         file is re-read each time instead: the read is cheap, always-fresh is what every
         caller has always had, and it means there is no staleness rule to remember for
         the common case.
+
+        That asymmetry is why this is a hand-rolled memo rather than a
+        :func:`functools.cached_property`: the file-backed half must stay uncached.
 
         The memo is an optimization, never semantics — reading fresh is always correct.
         Where it does apply, a write through
@@ -228,25 +256,13 @@ class Workspace:
 
         if self.workspaces_id is None:
             return workspace_config.read_config_state(self)
-        # `is None` rather than a falsy test: a cached "(None, None)" — a workspace the
-        # store has no config for — must not be re-fetched on every access.
-        cached: tuple[str | None, int | None] | None = self.__dict__.get(self._CONFIG_CACHE_KEY)
-        if cached is None:
-            cached = workspace_config.read_config_state(self)
-            self.__dict__[self._CONFIG_CACHE_KEY] = cached
+        # Membership rather than a `.get(...) is None` test: the memoized value is the
+        # text itself, so `None` is a legitimate cached answer — a workspace the store
+        # holds no config for — and must not be re-fetched on every access.
+        if self._CONFIG_TEXT_CACHE_KEY not in self.__dict__:
+            self.__dict__[self._CONFIG_TEXT_CACHE_KEY] = workspace_config.read_config_state(self)
+        cached: str | None = self.__dict__[self._CONFIG_TEXT_CACHE_KEY]
         return cached
-
-    @property
-    def config_text(self) -> str | None:
-        """This workspace's ``config.toml`` as text, or ``None`` if it has none."""
-        return self._config_state[0]
-
-    @property
-    def config_revision(self) -> int | None:
-        """The revision token that came with :attr:`config_text`, to be handed back on
-        write so a shared backend can reject a lost update. ``None`` from a backend that
-        issues none."""
-        return self._config_state[1]
 
     @property
     def config_present(self) -> bool:
@@ -354,7 +370,7 @@ class Workspace:
 
         Merge-preserving: reads the existing meta and updates only these fields, so
         it never drops ``schema_version`` (stamped by migrations) or an existing
-        ``workspace_id`` — pass ``workspace_id`` only when setting/minting one."""
+        ``workspace_id`` — pass ``workspace_id`` only when setting or generating one."""
         meta = dict(self.read_meta())
         meta["name"] = name
         meta["organization"] = organization
@@ -387,11 +403,25 @@ class Workspace:
         return name if isinstance(name, str) and name else self.root.name
 
     def is_initialized(self) -> bool:
-        return self.docsets_dir.is_dir() and self.files_dir.is_dir()
+        """Whether this root is a workspace at all.
 
-    def init(self) -> None:
-        self.docsets_dir.mkdir(parents=True, exist_ok=True)
-        self.files_dir.mkdir(parents=True, exist_ok=True)
+        The config is the marker. Every workspace has one — ``workspace create``
+        writes it even for the zero-config local default, where it names
+        ``LocalStore`` explicitly — and it is the only evidence that means the same
+        thing on every backend, addressed by path or by id.
+
+        This used to test for the ``files/`` and ``docsets/`` directories, which
+        described ``LocalStore``'s layout rather than a workspace: a remote-backed
+        workspace could satisfy it only by scaffolding two directories it never
+        wrote to, and deleting them made a fully-populated remote workspace report
+        uninitialized.
+
+        There is deliberately no scaffolding step to go with this. Stores
+        materialize their own containers on write — ``LocalStore``'s write paths
+        create their parents — so a workspace becomes usable by being configured,
+        not by being pre-built.
+        """
+        return self.config_present
 
     def has_legacy_json_config(self) -> bool:
         """True when a pre-migration ``config.json`` is present but the new
@@ -499,6 +529,14 @@ _OCR_GUIDANCE = """\
 # api_key_env = "AZURE_DOCINTEL_KEY"
 """
 
+_PDF_GUIDANCE = """\
+# PDF work — rendering page images and slicing page ranges — defaults to the
+# system ghostscript binary. To use PDFium in-process instead (no system
+# binary; `pip install dgml[pdfium]`), uncomment:
+# [pdf]
+# provider = "pypdfium2"
+"""
+
 # Both features are off unless `enabled = true`. They ship as real (rather than
 # commented-out) sections so `dgml init` advertises that they exist and the user
 # only has to flip the flag — a section on its own switches nothing on.
@@ -580,14 +618,16 @@ def render_config_toml(provider: str | None) -> str:
             '# standard = "..."\n'
             '# advanced = "..."\n'
             '# expert   = "..."\n'
-            "\n" + _OCR_GUIDANCE + "\n" + _FEATURE_GUIDANCE
+            "\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
         )
     tiers = PROVIDER_MODELS[provider]
     width = max(len(t) for t in tiers)
     lines = ["[models]"]
     for tier in ("light", "standard", "advanced", "expert"):
         lines.append(f'{tier.ljust(width)} = "{tiers[tier]}"')
-    return "\n".join(lines) + "\n\n" + _OCR_GUIDANCE + "\n" + _FEATURE_GUIDANCE
+    return (
+        "\n".join(lines) + "\n\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
+    )
 
 
 def write_user_config(provider: str | None, *, overwrite: bool) -> tuple[bool, Path | None]:

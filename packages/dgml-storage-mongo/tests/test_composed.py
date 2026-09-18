@@ -85,16 +85,14 @@ def test_nothing_lands_on_local_disk(ws: Workspace) -> None:
     _populate(ws, "f1")
     assert ws.blobs.get_blob(layout.file_source_key("f1", "report.pdf")) == SOURCE
     assert ws.docs.get_doc(layout.Collection.FILES, "f1") == _manifest("f1")
-    # ``init`` scaffolds files/ and docsets/ on local disk unconditionally, but
-    # no artifact lands in them: config.toml is the only local content, because
-    # the config names the store and so cannot live inside it.
-    assert list((ws.root / layout.FILES_DIR).rglob("*")) == []
-    assert list((ws.root / layout.DOCSETS_DIR).rglob("*")) == []
-    assert sorted(p.name for p in ws.root.iterdir()) == [
-        layout.CONFIG_FILE,
-        layout.DOCSETS_DIR,
-        layout.FILES_DIR,
-    ]
+    # Nothing local at all beyond the config. The directories used to be created
+    # unconditionally by ``Workspace.init()``, which left an all-Mongo workspace
+    # with two empty local directories it never wrote to — they looked like the
+    # place data belonged. Stores now build only what they write into, so a remote
+    # workspace's whole local footprint is the config that names its backend.
+    assert not (ws.root / layout.FILES_DIR).exists()
+    assert not (ws.root / layout.DOCSETS_DIR).exists()
+    assert sorted(p.name for p in ws.root.iterdir()) == [layout.CONFIG_FILE]
 
 
 def test_documents_and_blobs_share_a_database_without_colliding(ws: Workspace) -> None:
@@ -141,7 +139,6 @@ def test_attestation_root_is_backend_independent(ws: Workspace, tmp_path: Path) 
     local_root = tmp_path / "local-ws"
     local_root.mkdir()
     local_ws = Workspace(root=local_root)
-    local_ws.init()  # no config.toml → bundled local store for both roles
 
     roots = {}
     for label, workspace in {"gridfs": ws, "local": local_ws}.items():

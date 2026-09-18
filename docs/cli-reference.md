@@ -20,11 +20,13 @@ flag-driven (no interactive prompts) and idempotent where reasonable.
 driving the CLI directly.
 
 **Boolean flags** follow one convention: a positive `--flag` (e.g.
-`--auto-classify`, `--recursive`, `--force`, `--skip-existing`) turns on a
-behavior that is **off by default**; a `--no-*` flag (e.g. `docset
-generate`'s `--no-coverage`) opts **out** of a step that is **on by
-default**. So `--no-*` appears only where the default is "do it"; everything
-else is opt-in.
+`--recursive`, `--force`, `--skip-existing`) turns on a behavior that is
+**off by default**; a `--no-*` flag (e.g. `docset generate`'s
+`--no-coverage`) opts **out** of a step that is **on by default**. So
+`--no-*` appears only where the default is "do it"; everything else is
+opt-in. `--auto-classify` is the one opt-in flag that also accepts an
+optional value to pick *which* variant of the behavior to run — see
+"Auto-classification".
 
 A complete list of error `code` values is in the [Error code
 reference](#error-code-reference) at the end of this document.
@@ -37,7 +39,7 @@ or after a command group (`dgml docset --format text list`).
 
 | Flag             | Description |
 |------------------|-------------|
-| `--workspace`    | Override the workspace to open — a filesystem path **or** a `ws_…` id from `dgml workspace list`. The two are told apart by **shape**: an id is `ws_` + exactly 16 base32-lowercase chars (`[a-z2-7]`), anything else is a path. An id is looked up in the store of workspaces; one it does not hold fails with `WORKSPACE_NOT_FOUND` rather than being treated as a path to create. Default: `$DGML_HOME` (also either form) then `./dgml-workspace`. |
+| `--workspace`    | Override the workspace to open — a filesystem path **or** a workspace id from `dgml workspace list`. An id is 3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit (`my-workspace`, or a generated `ws_…`), so it can also be a directory name; the two are told apart by **looking**: a value the store of workspaces holds is that workspace, an existing directory of that name is a path, and a value that is neither fails with `WORKSPACE_NOT_FOUND` rather than being treated as a path to create. A listed id wins over a same-named directory — address the directory as `./name`. Anything carrying a separator, a dot or an uppercase letter is always a path. Default: `$DGML_HOME` (also either form) then `./dgml-workspace`. |
 | `--workspace-config` | **Removed.** Still accepted so an existing caller gets a JSON error envelope instead of an argparse usage dump; passing it (or setting `$DGML_CONFIG`) fails with `INVALID_ARGUMENT` naming the replacement. It only ever worked as an address because the per-machine index recorded the location and handed it back on the next open. To start a workspace from a config you authored, use `dgml workspace create --from-config <path>`. |
 | `--format`       | `json` (default) or `text`. |
 | `--verbose`      | Emit informational diagnostics to stderr. Controls hybrid text-mode warnings (digital/OCR conflicts, OCR misses) and the per-page merge summary, plus the `docset generate` pipeline's progress lines. Off by default — stderr stays reserved for error envelopes. |
@@ -94,7 +96,7 @@ The human-readable report (detected keys, the `[models]` block with inline
 tier→capability comments, next steps) goes to **stderr**; stdout stays the JSON
 contract. `provider` is `null` when no keys were detected.
 
-### `dgml workspace create [PATH] --organization ORG [--name NAME] [--storage NAME] [--from-config PATH]`
+### `dgml workspace create [PATH] --organization ORG [--name NAME] [--id WORKSPACE_ID] [--storage NAME] [--from-config PATH]`
 
 **Where the workspace goes depends on whether you name a place for it.**
 
@@ -117,11 +119,11 @@ Steps:
    to whichever of the two places above applies. This happens **first**: everything
    after it is built through the backend that config names.
 2. Creates `docsets/` and `files/` on that storage service.
-3. Writes the workspace identity (`name` + `organization` + the minted stable
+3. Writes the workspace identity (`name` + `organization` + the generated stable
    `workspace_id`) to `workspace.json`, through the store.
 
 Re-running is safe: an existing `[storage.<service>]` is never overwritten, and the
-recorded `workspace_id`, `name` and `created_at` are reused rather than re-minted.
+recorded `workspace_id`, `name` and `created_at` are reused rather than regenerated.
 
 Note one consequence of the config *being* the record: for a listed workspace it must
 exist before any store can be built, so it can no longer be written last. An
@@ -148,6 +150,27 @@ the corpus across two namespaces with nothing to flag it later.
 
 `--name` is optional human-readable identity metadata; it likewise falls back to the
 recorded name, then to the workspace directory name.
+
+`--id WORKSPACE_ID` sets the workspace's stable handle instead of generating one — useful
+when the id is decided elsewhere (a tenant id, a fixture, an IaC template) or when a
+workspace is being re-created deterministically. It must be **3 to 40 characters using
+only lowercase letters, digits, hyphens and underscores, and starting with a letter or
+digit** — the id is what `--workspace` addresses the workspace by and the folder name the
+local store of workspaces gives it, so it has to be a safe, unambiguous path segment.
+Anything else fails with `INVALID_ARGUMENT`. No `ws_` prefix is required:
+`--id my-workspace` is as valid as the generated `ws_…` form.
+
+Three rules keep it from doing damage, all checked **before** anything is written, so a
+rejected `--id` never leaves a half-built workspace behind:
+
+- An id this machine's store of workspaces already holds fails with `CONFLICT`. It is
+  never an overwrite — the store's write is an upsert, so proceeding would replace that
+  workspace's config (and its `[storage]` binding) while its corpus stayed where it was.
+- An `--id` matching the id the workspace already has is a **no-op**, so `create` stays
+  safe to re-run.
+- An `--id` that *differs* from the id the workspace already has fails with
+  `INVALID_ARGUMENT`. An id is how every other record refers to a workspace, so `create`
+  never re-identifies an existing one.
 
 `--storage NAME` selects the **storage service** the workspace is created on — a
 `[storage.<name>]` template in your user-level `config.toml` (see
@@ -198,10 +221,10 @@ always names where that config lives, as a path or as `<store>/<workspace_id>`, 
 what error messages quote. `listed` says which of the two kinds of workspace this is.
 `config_path`/`config_present` refer to the **user-level** config.
 
-`workspace_id` is the stable handle (`ws_` + 16 base32 chars) minted for this
-workspace; pass it to any command as `--workspace <workspace_id>`. It survives a
-directory rename, is written to `workspace.json`, and is how the store of workspaces
-keys it. `config_present` reports whether the user-level config exists. When it
+`workspace_id` is the stable handle for this workspace — generated (`ws_` + 16 base32
+chars) unless `--id` supplied one; pass it to any command as `--workspace
+<workspace_id>`. It survives a directory rename, is written to `workspace.json`, and is
+how the store of workspaces keys it. `config_present` reports whether the user-level config exists. When it
 is `false`, an extra `next_action` field is present and the stderr warning above
 is emitted — but the workspace is created regardless (exit `0`).
 
@@ -269,12 +292,14 @@ Two things are still refused, because neither can be reconstructed:
 
 - **No workspace identity** — no `[workspace] workspace_id`, no `workspace.json`, and no
   legacy row. A directory that merely has `docsets/` and `files/` in it is not a
-  workspace; minting an id would adopt an arbitrary directory as one.
-- **A malformed `workspace_id`** — anything other than `ws_` plus exactly 16 characters
-  from `[a-z2-7]`. Such an id addresses nothing: the local backend filters its folders by
-  that same test, so the workspace would be written where `workspace list` never looks and
-  `--workspace <id>` never resolves. dgml's generator only emits well-formed ids, so this
-  is a hand-edited value; the failure names both places to correct it.
+  workspace; generating an id would adopt an arbitrary directory as one.
+- **A malformed `workspace_id`** — anything that is not 3 to 40 characters using only
+  lowercase letters, digits, hyphens and underscores, starting with a letter or digit.
+  Such an id addresses nothing: the local backend filters its folders by that same test,
+  so the workspace would be written where `workspace list` never looks and
+  `--workspace <id>` never resolves. dgml's generator only emits
+  well-formed ids, so this is a hand-edited value; the failure names both places to
+  correct it.
 
 `--on-conflict` decides what happens when the store already holds that id: `skip`
 (default), `fail`, or `replace` the stored config. The legacy index is left in place, so
@@ -372,7 +397,7 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `pdf_unreadable` | file | pypdf can't parse the PDF (records a permanent error so the next check skips re-parsing) |
 | `pdf_unreadable_permanent` | file | A previous parse recorded a permanent failure; not retried without `--retry-errors` |
 | `page_count_mismatch` | file | `page_images/` has the wrong number of PNGs (`repaired: true` if rerendered successfully) |
-| `page_render_failed` | file | ghostscript failed during rerender |
+| `page_render_failed` | file | the configured page renderer failed during rerender |
 | `page_render_failed_permanent` | file | A previous render recorded a permanent failure; not retried without `--retry-errors` |
 | `page_text_count_mismatch` | file | `page_text/` has the wrong number of per-page JSONs (`repaired: true` if re-extracted successfully) |
 | `page_text_corrupt` | file | A `page_text/page_N.json` exists but is not valid JSON / missing required fields |
@@ -636,7 +661,8 @@ dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <
 **Auto-extract on assignment.** When the target DocSet has an extraction
 schema set (`extraction-schema.rnc`), every assignment path fires value
 extraction on the newly-assigned file: `docset add-file`, `file add
---auto-classify` (existing-DocSet decisions), and `cluster` (existing-DocSet
+--auto-classify` (existing-DocSet decisions, which is every decision under
+`--auto-classify existing`), and `cluster` (existing-DocSet
 matches — a DocSet created mid-run can't have a schema yet). The payload
 gains an `extraction` block; extraction failures are **soft** (the error
 lands in `extraction.error`, the assignment stands, exit stays 0). No schema
@@ -665,8 +691,9 @@ concept tags across all of the docset's documents at once
 (`generation.label_model`), and the result is rendered deterministically
 into a namespaced `dg:chunk`
 document. The labeling vocabulary (the "roster") is planned automatically
-from the documents, or supplied up front with `--schema-path` to make labels
-deterministic. Unseeded runs are staged: the largest documents label first (a
+from the documents, or supplied up front with `--schema-path` — which skips
+planning and **closes** the vocabulary, so the output carries your tag names and
+no others (see [Supplying your own tag schema](#supplying-your-own-tag-schema)). Unseeded runs are staged: the largest documents label first (a
 pilot), their observed evidence — verbatim example values, kinds, hierarchy —
 confirms the planned vocabulary, and the rest of the batch labels against it.
 There is no separate transform pass.
@@ -674,10 +701,13 @@ There is no separate transform pass.
 **Incremental, consistent growth.** Already-generated files are skipped (see
 resume below), so adding a document and re-running generates only the new one.
 To keep its tags consistent with the existing docset, the new document is
-labeled seeded with the docset's own `schema.json` — full fidelity: role
-descriptions, observed examples, kind, hierarchy — falling back to the flat
-`cache/concept_roster.json` when no schema exists (default; disable both with
-`--no-roster`). Every concept is emitted in the per-docset
+labeled seeded with the docset's own `authored-schema.json` if a previous
+`--schema-path` run supplied one, else its derived `schema.json` — full
+fidelity: role descriptions, observed examples, kind, hierarchy — else the flat
+`cache/concept_roster.json` (default; disable all three with `--no-roster`).
+A remembered **authored** schema closes the vocabulary, so an added document is
+labeled against exactly the tags you supplied; a **derived** `schema.json` only
+seeds, and labeling still coins for roles it doesn't cover. Every concept is emitted in the per-docset
 `docset:` vocabulary namespace (`dg:` is framework-only), so growing the docset
 never flips a tag's prefix. An already-generated file is still re-rendered
 deterministically when its output changes as the docset's schema/roster grows
@@ -781,7 +811,8 @@ the workspace's pre-rendered `page_images/page_N.png` files at LLM
 input time, so no extra rasterizer is needed at run time (and no
 GPL/poppler escape hatch). For non-workspace inputs (library callers
 passing arbitrary paths), the pipeline renders to a tempdir via the
-same canonical `pages.render_pages` (ghostscript).
+same canonical `pages.render_pages` (the configured engine — ghostscript by
+default; see [PDF engine configuration](#pdf-engine-configuration)).
 
 The models are **not** CLI flags — like every other model-consuming command
 (`extraction generate-schema`, `extraction extract`, `discover`), `generate` reads them
@@ -806,8 +837,9 @@ The global `--debug` flag also writes the per-file
 ungrounded snippets); the `dg:origin` boxes themselves are always written
 into `<stem>.dgml.xml` regardless.
 | `--max-parallel-calls <n>` | `4` | Max documents transcribed concurrently (windows *within* a document stay serial). The LLM call is network-bound, so threads overlap the latency. Set to `1` to disable. Tune to your provider's RPM tier — e.g. Gemini free ~10-15 RPM, Gemini paid Flash 500 RPM, OpenAI free 500 RPM, Anthropic tier-1 ~50 RPM. |
-| `--schema-path <f>` | none | Exported schema to seed labeling with — either `docsets/<id>/schema.json` (Schema v1: a `tags` map of `name -> {role, kind, parent_role, …}`) or its lossless RELAX NG Compact render `docsets/<id>/full-schema.rnc` (both written by `docset generate`). When given, this vocabulary is used as-is with **full fidelity** — role descriptions, curated examples, and kind all feed the labeling prompt — and the planning pass is **skipped**, making labels deterministic across runs; the tag hierarchy (`parent_role`) also seeds entity-container grouping. Per-document labeling still extends it for roles the schema doesn't cover. A flat `{concept: description}` mapping is **not** accepted. |
-| `--no-roster` | off | Disable automatic vocabulary reuse. By default an incremental generate seeds labeling from the docset's own `schema.json` (full fidelity: descriptions, observed examples, kind, hierarchy), falling back to the flat `cache/concept_roster.json` from a prior run, so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. Unlike `--schema-path`, automatic reuse does **not** seed entity-container grouping. Ignored when `--schema-path` is given. |
+| `--schema-path <f>` | none | The tag schema to label against, in any of four forms detected by **content** (not by file extension) — see [Supplying your own tag schema](#supplying-your-own-tag-schema). Supplying a schema means the generated DGML uses **those tag names and no others**: the planning pass is skipped and the vocabulary is closed. Content whose role has no matching tag is **not** dropped — it renders as `dg:chunk` with its text, structure, and `dg:origin` intact. Role descriptions, curated examples, and kind all feed the labeling prompt; the tag hierarchy (`parent_role`) seeds entity-container grouping. To let labeling invent its own vocabulary instead, don't supply a schema. |
+| `--extend-schema` | off | Treat the supplied schema as a **foundation** rather than the whole vocabulary: your tag names are reused wherever one fits, and labeling may coin a new name for a recurring role your schema doesn't cover. Coined names are reported per file under `added_concepts` — the candidate list for your next revision. Requires a supplied schema (`--schema-path`, or one a previous run remembered); errors without one. The mode is **per-run**, not remembered — a later run with no flags goes back to strict. |
+| `--no-roster` | off | Disable automatic vocabulary reuse. By default an incremental generate seeds labeling from the docset's own `authored-schema.json` (whatever a previous `--schema-path` run supplied), else its derived `schema.json` (full fidelity: descriptions, observed examples, kind, hierarchy), else the flat `cache/concept_roster.json`, so newly-added documents stay tag-consistent with the existing docset; this flag labels them in isolation instead. A remembered **authored** schema closes the vocabulary exactly as `--schema-path` does; a schema the pipeline **derived** only seeds, and labeling keeps coining. Only the authored slot seeds entity-container grouping. Ignored when `--schema-path` is given. |
 | `--no-semlinks` | off | Skip the final semantic-link pass. By default each grounded `<stem>.dgml.xml` gets semantic links added in place — relationships the tree's nesting can't capture, written as `dg:itemprop` (predicate) + `dg:href` (`#id`, or space-separated `#id`s) on the subject, with `xml:id`s assigned to both ends. Covers references (`references`, `incorporates`, `signatoryOf`, …), relative dates (`relativeTo`/`effectiveOn`, ISO-8601 offset in `dg:value`), and derived values (`greaterOf`/`lesserOf` formulas, `escalates`, `valueFrom`). The model proposes links on the labeling model (`generation.label_model`), then a skeptical pass verifies them. Each converted file's `results` entry carries a `links` count. |
 | `--no-semlink-cache` | off | Always call the model for the semantic-link pass. By default the pass is cached on what the model actually reads — tag names and text, plus the labeling model, the link prompts, and whether the review pass runs. Attributes are deliberately excluded, because the prompt never shows them: grounding a document or renaming a namespace prefix does not change its links, so those runs replay the cache instead of paying again. The cache stores the links themselves, not a second copy of the XML, and they are written onto whatever the current render produced. This flag forces a fresh call — use it when something the key cannot see has changed, such as a provider-side model update behind a stable model id. |
 | `--no-semlink-verify` | off | Skip the second, skeptical pass that reviews each proposed link. The link pass then makes one model call per document instead of two, which cuts its wall-clock time by about 60%, and keeps roughly twice as many links — including the weaker ones the review would have dropped. Use it when you want breadth and speed over precision. Reviewed and unreviewed results are cached separately. |
@@ -927,6 +959,182 @@ Errors (run-level, error envelope + exit 1):
 
 > stdout is a single JSON object. The transcription / labeling / render
 > progress lines go to stderr, and only when `--verbose` is passed.
+
+#### Supplying your own tag schema
+
+`--schema-path` takes the vocabulary you want to see in the generated DGML.
+The pipeline then stops inventing one and labels against yours instead.
+
+There are two ways to use it, for two different situations:
+
+| you want | use | what comes out |
+|---|---|---|
+| only your vocabulary | `--schema-path X` | your tag names and **no others** |
+| your vocabulary, plus whatever you missed | `--schema-path X --extend-schema` | your names reused first; new names coined only for roles you didn't cover, each reported back |
+
+**Strict** is for when the schema *is* the specification — a fixed downstream
+contract, a regulated vocabulary, anything where an unexpected tag is a defect.
+**Extend** is for when you have a solid foundation but expect gaps: you get your
+vocabulary applied first and a reviewed list of what the documents needed beyond
+it, which you fold into the next revision.
+
+> **How much of the output stays under your tags depends on how much of the
+> document your schema covers** — a property of your documents, not of how many
+> tags you wrote. The same schema can carry most of a short, regular document
+> and a quarter of a long, dense one.
+>
+> So on rich documents extend adds far more than it reuses, and
+> `added_concepts` gets long. That is the mode working — those are real
+> recurring roles your schema does not name — but the output is then mostly not
+> your vocabulary. To keep it yours on a dense corpus, either grow the schema
+> until it covers the document, or use strict and let unmatched content stay
+> untagged.
+
+> **Extend is an authoring aid, not a setting to leave on.** Your supplied tags
+> are stable across runs by construction; the names it *coins* are not — the
+> supplement is largely re-invented each run, which is the tag drift DGML exists
+> to prevent. Treat extend as one step in a loop: run it, review
+> `added_concepts`, fold what you want into your schema, then run strict for
+> output you intend to keep or query.
+
+Neither mode is a way to improve extraction accuracy — against a no-schema run
+neither scores better. What a supplied schema buys is control: your vocabulary,
+applied consistently, with a report of what fell outside it.
+
+Neither mode plans a vocabulary of its own, and both keep every downstream pass
+— grounding, semantic links, value typing, table and list consolidation — exactly
+as a default run does. What a supplied schema removes is vocabulary *invention*,
+not augmentation.
+
+> **This drives the whole document, not field extraction.** The schema is
+> applied to *every* element of the document tree — heading, clause, paragraph,
+> list item, table row, cell, inline value. DGML's separate
+> [extraction schema](#extraction-commands) (`extraction-schema.rnc`, driven by
+> `dgml extraction`) is what selects a few typed fields into a
+> `<dg:extraction>` subtree; that is a different feature and this flag does not
+> touch it.
+
+**Four input forms**, detected by content so the flag stays one flag:
+
+*A — a plain tag list.* One name per line; blank lines and `#` comments ignored.
+
+```
+# Liquor distribution purchase orders
+CustomerName
+PurchaseOrderNumber
+OrderDate
+ProductDescription
+Quantity
+UnitPrice
+PaymentTerms
+```
+
+*B — names with descriptions (recommended).* A JSON object mapping each name to
+a one-line description of the role it plays.
+
+```json
+{
+  "CustomerName":        "Legal name of the customer placing the order",
+  "PurchaseOrderNumber": "Identifier the customer assigned to this order",
+  "OrderDate":           "Date the order was placed",
+  "PaymentTerms":        "Terms governing when payment is due"
+}
+```
+
+*C — a full `schema.json`.* Use this when you need structural `kind`, example
+values, or hierarchy. It is also what `docset generate` exports, so a natural
+workflow is to generate once, hand-edit the export, and feed it back.
+
+```json
+{
+  "tags": {
+    "OrderLines":  { "role": "The table of ordered products",
+                     "kind": "section" },
+    "OrderLine":   { "role": "One product line on the order",
+                     "kind": "row",    "parent_role": "OrderLines" },
+    "OrderQuantity": { "role": "Number of units ordered on a line",
+                       "kind": "inline", "parent_role": "OrderLine" }
+  },
+  "notes": "Free-form notes about this docset's vocabulary."
+}
+```
+
+*D — `full-schema.rnc`*, the lossless RELAX NG Compact render of the same
+information, also written by `docset generate`. Recognized by the `.rnc` suffix.
+
+| field | required | what it does | reaches the model? |
+|---|---|---|---|
+| **name** | yes | The tag emitted in the DGML, as `<docset:Name>`. | yes, verbatim |
+| **role** / description | no, but **recommended** | One line describing what the tag holds; what the model matches content against. This is the field worth writing. | yes, first 100 characters |
+| **kind** | no — defaults to `inline` | `section` (a region grouping other content), `row` (a repeating record in a table), `inline` (an atomic value). | yes, as `[section]` / `[row]` / `[value]` |
+| **examples** | no — and not recommended | Representative real values; up to 3 stored. Testing found no benefit, and a way they can hurt: tags carrying examples get used less, while tags without them absorb that content — the example reads as a fence rather than a hint. Put the effort into `role` instead. | yes, first 2, 60 characters each |
+| **parent_role** | no | Name of the tag that contains this one; groups related values under a shared container. Must name a tag the schema declares. | **no** — used deterministically |
+
+**Tag names are taken verbatim.** `Notes`, `Details` and `Line Items` are all
+accepted and preserved. The one transformation: characters illegal in an XML
+element name become underscores, so `Line Items` is emitted as `Line_Items` —
+`--verbose` reports every such rewrite. Write `LineItems` if that is what you
+want to see.
+
+**Matching is forgiving about style, strict about words.** `customername`,
+`Customer_Name`, `CUSTOMER-NAME` and `Customer Name` all resolve to
+`CustomerName`, so you will not lose values to a capitalization mismatch. A
+*semantic* alias does not: `NameOfCustomer`, `ClientName`, `CustFirstLast` and
+even `CustomerNames` are **rejected**, and that block renders untagged. Guessing
+that two differently-named things mean the same role is how values end up under
+the wrong tag, and a wrong tag is harder to notice than a missing one.
+
+**Nothing is deleted.** "Closed" describes the tag vocabulary, not the output.
+A block whose role has no matching tag is emitted as a generic `dg:chunk`
+carrying its full text, its structural role, and its `dg:origin` page
+coordinates. A short schema does not produce a short document — it produces the
+same document with fewer semantically-tagged elements.
+
+**Read the off-schema list.** Every converted file's `results` entry reports
+the concepts that fell outside your schema — as `unmatched_concepts` under
+strict (refused, so this is what your schema is missing) or `added_concepts`
+under `--extend-schema` (coined and used, so this is what to consider adding):
+
+```json
+{ "status": "converted", "file_id": "k7q3xb91pmrf", "source": "order-a.pdf",
+  "unmatched_concepts": { "count": 12, "distinct": 3,
+    "examples": ["ProductPartNumber", "ShipVia", "NameOfCustomer"] } }
+```
+
+It is the fastest way to find gaps: rejects that look like roles you forgot mean
+add them; rejects that look like aliases of tags you already have mean rename
+them in your schema.
+
+Two things worth knowing:
+
+- `ColumnHeader` is a tag the renderer itself emits for a table's printed
+  column-title row. Under a closed vocabulary it obeys the same rule as
+  everything else, so declare it if you want those cells tagged.
+- Up to 400 tags are shown to the model per call; a larger vocabulary loses its
+  tail. Around 30 tags with one-line descriptions is a good target.
+
+**The schema you supply is protected from the run's own output.** It is stored
+verbatim (in canonical Schema v1 form) as `docsets/<id>/authored-schema.json`,
+which the derived `schema.json` never overwrites — so a later `generate` with no
+flags re-seeds from what you wrote, not from `yours + everything coined`.
+
+```bash
+# Strict: the output carries your tag names and no others
+uv run dgml docset generate <docset_id> --schema-path ./my-schema.json
+
+# Later runs remember the schema — no need to re-supply the file
+uv run dgml docset generate <docset_id>
+
+# Extend: your vocabulary first, gaps coined and reported as added_concepts
+uv run dgml docset generate <docset_id> --schema-path ./my-schema.json --extend-schema
+```
+
+**Ordinary incremental runs are unaffected.** Closure follows *authorship*, not
+the mere presence of a seed. A schema **you** wrote is a specification and is
+applied as one; a `schema.json` the **pipeline** derived from its own labels is
+a consistency hint, so the automatic reuse an incremental `generate` has always
+done still seeds and still coins. Adding a document to a docset that never had
+a supplied schema behaves exactly as before.
 
 > **Grounding is part of `generate`.** There is no separate `dgml docset
 > ground` command — `generate` writes `dg:origin` boxes into each
@@ -1188,7 +1396,7 @@ Errors across the group: `DOCSET_NOT_FOUND`, `FILE_NOT_FOUND`,
 
 ## File commands
 
-### `dgml file add <path> [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify]`
+### `dgml file add <path> [--id FILE_ID] [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify [MODE]]`
 
 Add a File. The source is copied into the workspace, hashed, its pages
 are rendered to PNGs via `gs` (300 dpi by default — see `--dpi`), and
@@ -1208,6 +1416,19 @@ converter. See [Document conversion](conversion.md).
 added in a single run — see [Bulk add (a directory)](#bulk-add-a-directory)
 below. `--recursive` controls whether subdirectories are walked; it is
 ignored when `<path>` is a single file.
+
+`--id FILE_ID` sets the File's id instead of generating one — useful when the id is decided
+elsewhere (a tenant id, a source-system document number). It must be **3 to 40 characters
+using only lowercase letters, digits, hyphens and underscores, and starting with a letter
+or digit**. Omit it for a generated
+12-character id.
+
+Fails with `CONFLICT` if another File already holds the id with different content, under
+every `--on-conflict` policy — except when re-ingesting a revised document under its own
+id with `--on-conflict replace`, which keeps it. Re-adding identical content under the
+same id is a no-op. Fails with `INVALID_ARGUMENT` if the id is malformed, if `<path>` is
+a directory (one id cannot name many Files), or if `--on-conflict` would return an
+existing record that does not carry the requested id.
 
 | `--on-conflict` | Behavior |
 |---|---|
@@ -1243,6 +1464,8 @@ Conflict types recorded in the success payload as `conflict_kind`:
 - **`hash`** — exact byte-for-byte duplicate of an existing File.
 - **`path`** — different content but the same source path
   (`original_path`) as an existing File.
+- **`id`** — `--id` named an id another File already holds. Only ever a
+  `CONFLICT` error, never a success payload.
 
 The `dgml file add` response also includes:
 
@@ -1250,7 +1473,7 @@ The `dgml file add` response also includes:
 - `note` — human-readable explanation when the policy did something
   surprising (e.g. `replace` on a hash-conflict is a no-op since content is
   already identical).
-- `page_render_error` — set if ghostscript failed or rendered a wrong page count.
+- `page_render_error` — set if the page renderer failed or rendered a wrong page count.
 - `page_count_error` — set if pypdf could not parse the PDF to extract a
   page count. The File record is still created (with `page_count: null`)
   and a permanent error is recorded; consistency check will skip retrying
@@ -1265,7 +1488,8 @@ The `dgml file add` response also includes:
   File record is still created (with `page_count: null`) and a permanent error
   is recorded. `null` for PDFs and successful conversions.
 - `classification` — present **only** when `--auto-classify` is passed.
-  See "Auto-classification" below.
+  `decision` is `"existing"` or `"new"` (always `"existing"` under
+  `--auto-classify existing`). See "Auto-classification" below.
 
 Error codes that can come back on `file add`:
 
@@ -1277,15 +1501,18 @@ Error codes that can come back on `file add`:
 | `UNSUPPORTED_FILE_TYPE` | Path is not a `.pdf` and is not a convertible source with a converter configured for its format family. |
 | `INVALID_PDF` | File does not start with the `%PDF-` magic. |
 | `CONVERSION_CONFIG_INVALID` | The `conversion` section of `<workspace>/config.toml` is malformed or names an unresolvable/invalid provider. |
-| `CONFLICT` | Hash- or path-conflict and `--on-conflict error`. |
+| `CONFLICT` | Hash- or path-conflict and `--on-conflict error`; or `--id <id>` naming an id another File already holds (`conflict_kind: "id"`, under any policy). (Also `workspace create --id <id>` when the store of workspaces already holds that id.) |
+| `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
 | `CLASSIFICATION_CONFIG_INVALID` | The `classification` section exists but a required field is missing or malformed. |
+| `NO_EXISTING_DOCSETS` | `--auto-classify existing` was passed but the workspace has no DocSets to assign to. |
 
 The classification config is a precondition for `--auto-classify`, so a
 missing/invalid one is a **hard** error (exit 1) rather than a per-file
-soft error — every file would otherwise report the same thing. For a bulk
-directory add the config is checked once up front, so the run aborts before
-any file is added.
+soft error — every file would otherwise report the same thing. Having at
+least one DocSet is the same kind of precondition for `--auto-classify
+existing`, and is treated the same way. For a bulk directory add both are
+checked once up front, so the run aborts before any file is added.
 
 Soft-fail codes recorded on the File rather than returned as an envelope (OCR/hybrid-specific):
 
@@ -1315,6 +1542,9 @@ exactly as for a single add. `--on-conflict skip` is the recommended
 bulk flag — it makes re-runs idempotent. With `--auto-classify`, a
 DocSet created for one file becomes visible to the files processed
 after it, so similar PDFs in the batch cluster into the same DocSet.
+Under `--auto-classify existing` no DocSets are created, so that in-run
+growth doesn't happen: every file is assigned within the same curated set
+the run started with.
 
 Each file commits independently: a single bad PDF (or a conflict under
 `--on-conflict error`) is recorded in its entry and the run continues.
@@ -1383,8 +1613,37 @@ whole workspace.
 
 `--auto-classify` on `dgml file add` uses a configured vision LLM to look at
 the new file's rendered page images and either assign it to an existing
-DocSet or create a new one. Configure the model via the `classification`
-section in `<workspace>/config.toml`:
+DocSet or create a new one.
+
+The flag takes an optional `MODE`:
+
+| Invocation | Behavior |
+|---|---|
+| `--auto-classify` | Same as `existing-or-new` — the historical default. |
+| `--auto-classify existing-or-new` | Assign to an existing DocSet if one fits; otherwise create one. |
+| `--auto-classify existing` | Always assign to an existing DocSet — the best-fitting one. Never creates a DocSet, and never declines. |
+
+Use `existing` when the workspace's DocSets are curated and an ingest run
+must not grow new ones — otherwise one odd file anchors a one-document
+DocSet that someone has to notice and clean up.
+
+> **`existing` assumes the files belong.** The LLM is required to return a
+> DocSet, so a document whose type isn't represented in the workspace is
+> assigned to the closest one anyway rather than flagged. Only pass
+> `existing` when you already know each file fits one of the DocSets; for a
+> mixed or unknown batch use `existing-or-new`, or `dgml cluster`. With no
+> DocSets to choose from the command fails with `NO_EXISTING_DOCSETS`
+> (exit 1) instead of guessing.
+
+> **Argument order matters.** `MODE` is optional, so the parser takes the
+> *next* token as its value. Put `<path>` **before** the flag —
+> `dgml file add doc.pdf --auto-classify` — or name the mode explicitly:
+> `dgml file add --auto-classify existing doc.pdf`. Writing
+> `dgml file add --auto-classify doc.pdf` exits 2 with
+> `invalid choice: 'doc.pdf'`.
+
+Configure the model via the `classification` section in
+`<workspace>/config.toml`:
 
 ```json
 {
@@ -1419,6 +1678,24 @@ The LLM is forced to pick exactly one of two tools:
   document type can answer. The `key_questions` are persisted on the
   new DocSet and shown to future classifications.
 
+`--auto-classify existing` offers only `assign_to_existing_docset`, so
+with `tool_choice="required"` a choice is forced: the LLM is told a
+perfect fit isn't required and to return the closest DocSet. `decision`
+is therefore always `"existing"`. A model that calls `create_new_docset`
+anyway is refused with `CLASSIFICATION_FAILED`.
+
+Two cases skip the LLM entirely, since neither leaves anything to decide:
+
+- **Exactly one DocSet** — the file is assigned to it, with the same
+  payload the model would have returned. This mode creates no DocSets,
+  so a whole bulk run over a one-DocSet workspace costs no LLM calls.
+  (`existing-or-new` still calls here — it may need a new DocSet.)
+- **No DocSets** — the command fails with `NO_EXISTING_DOCSETS`
+  (exit 1). Both preconditions (config, and at least one DocSet) are
+  checked *before* the file is ingested, single and bulk alike, so a
+  failed run adds nothing — erroring after the add would leave behind
+  the unassigned file this mode exists to avoid.
+
 Classification runs **after** the file is added, and only when `created`
 is `true`. Re-runs on a duplicate (`--on-conflict skip`) skip the LLM
 call entirely: `classification.performed` is `false` and the existing
@@ -1447,6 +1724,10 @@ The `classification` payload block:
 (empty list for DocSets created without them). When `decision`
 is `"new"`, this is the list the LLM just proposed and that has been
 persisted on the freshly-created DocSet.
+
+Under `--auto-classify existing` the block looks the same as the
+`"existing"` example above; `decision` is never `"new"` and never
+anything else, since the assign tool is the only one offered.
 
 When the file already existed (`created: false`):
 
@@ -1510,6 +1791,44 @@ Auth resolution, in order of precedence:
 - `profile` is **optional**. When omitted, boto3's default credential
   chain is used (env vars, `~/.aws/credentials`, IAM role, SSO).
 - Textract is invoked once per rendered page image (5 MB sync limit).
+
+## PDF engine configuration
+
+DGML needs two things from a PDF library: rasterizing pages into
+`page_images/`, and slicing a page range into a new PDF (the per-window
+payload `docset generate` sends to the model). Both come from one
+**engine**, selected by the `pdf` section of `<workspace>/config.toml` (or
+the user config — the same layered resolution as every other section). With
+no section, the system **ghostscript** binary is used, as always. To use
+PDFium in-process instead — no system binary needed, `pip install
+dgml[pdfium]`:
+
+```toml
+[pdf]
+provider = "pypdfium2"
+```
+
+One key governs both capabilities on purpose: the reason to switch is usually
+"don't require a system binary", which is only satisfied when neither
+rendering nor slicing shells out.
+
+Valid providers: `ghostscript` (default), `pypdfium2`. An unknown provider or
+a stray key yields `PDF_CONFIG_INVALID`. Selecting `pypdfium2` without the
+`pdfium` extra installed yields `ENGINE_NOT_AVAILABLE`, recorded as a soft
+per-file page-render failure like any other engine error (and as a per-file
+`failed` entry during `docset generate`).
+
+The renderer used at add time is recorded on each File
+(`page_image_renderer`) and `dgml check --retry-errors` re-renders with the
+*recorded* renderer, so repaired pages reproduce the file's existing pixels
+(backends differ subtly — anti-aliasing, ±1 px dimension rounding). Changing
+the config only affects files added afterwards. PDF page *slicing* is not
+Page *slicing* follows the same engine: ghostscript's `pdfwrite` by default,
+or PDFium's structural page import when configured. The two are
+interchangeable in what a slice contains, but not byte-for-byte — ghostscript
+re-encodes images (smaller payloads on scans, lossily), while PDFium copies
+them verbatim (higher fidelity, up to ~2x larger). Slices are never persisted
+or hashed, so switching engines cannot invalidate an attestation or a cache.
 
 ## Managing secrets locally
 
@@ -2029,18 +2348,18 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 
 | Code | Kind | Meaning |
 |---|---|---|
-| `WORKSPACE_NOT_INITIALIZED` | hard | A command that needs a workspace ran against a directory with no workspace layout. The message names the resolved path and offers two remedies that work against *that* workspace: `dgml workspace create <path> --organization <org>` to make one there, or `dgml workspace list` to find one you already have. (It deliberately does not say a bare `dgml workspace create`, which would create a workspace elsewhere and leave the command failing identically.) |
+| `WORKSPACE_NOT_INITIALIZED` | hard | A command that needs a workspace ran against a directory that has no workspace **config** — which is what makes a directory a workspace, since the config names the storage backend and cannot be reconstructed. This covers both "never a workspace" and "a workspace whose `config.toml` was deleted"; nothing on disk distinguishes them for a remote-backed workspace, so one error carries all the remedies. The message names the resolved path and offers remedies that work against *that* workspace: `dgml workspace create <path> --organization <org>` to make one there, `dgml workspace list` to find one you already have, or restoring the config from backup. (It deliberately does not say a bare `dgml workspace create`, which would create a workspace elsewhere and leave the command failing identically.) |
 | `LEGACY_CONFIG_PRESENT` | hard | A pre-migration `<workspace>/config.toml` is the only config present; the format is now TOML. Run `dgml init` to write `~/.config/dgml/config.toml`, then migrate any settings. |
 | `MODELS_CONFIG_INVALID` | hard | The `[models]` tier block is malformed (a tier is set to a non-string / empty value). |
 | `MISSING_EXTRA` | hard | A command needs an optional extra that isn't installed (e.g. `dgml[clustering]`). |
-| `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`). |
+| `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`, a `file add --id` that is malformed, passed with a directory, or unsatisfiable under the chosen `--on-conflict`). |
 | `INTERNAL_ERROR` | hard | Unexpected exception; the message is a short, single-line `<ExcType>: <msg>` (capped, whitespace collapsed). Pass `--verbose` (or set `DGML_DEBUG=1`) for the full stderr traceback. |
 | `NOT_FOUND` | hard | Generic not-found (base for the specific codes below). |
 | `DOCSET_NOT_FOUND` | hard | No DocSet with the given id. |
 | `FILE_NOT_FOUND` | hard / soft | A File id, assignment, or source is missing. Soft as a per-item `results` entry in `docset generate`/`ground`. |
 | `UNSUPPORTED_FILE_TYPE` | hard | `file add` path is neither a PDF nor a convertible source. |
 | `INVALID_PDF` | hard | File does not start with the `%PDF-` magic. |
-| `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`. |
+| `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
 | `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed. |
 | `CONVERSION_FAILED` | hard / soft | A docx/xlsx→PDF conversion failed (soft as `conversion_error` on a bulk add entry). |
 | `OCR_CONFIG_MISSING` | hard | `--text-mode ocr`/`hybrid` with no `ocr` config section. |
@@ -2053,6 +2372,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CLASSIFICATION_CONFIG_MISSING` | hard | `--auto-classify` with no `classification` config. |
 | `CLASSIFICATION_CONFIG_INVALID` | hard | The `classification` config has a missing/invalid field. |
 | `CLASSIFICATION_FAILED` | soft | The classification LLM call failed; lands in `classification.error`. |
+| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` in a workspace with no DocSets to assign to. |
 | `CLUSTERING_CONFIG_INVALID` | hard | The optional `clustering` config section failed validation. |
 | `GROUNDING_FAILED` | soft | Grounding a file failed; surfaces as `grounded: false` with a `grounding_error` on that file's `docset generate` result entry. |
 | `LABEL_MODEL_UNREACHABLE` | soft | A file's labeling could not reach the `label_model` at all (auth / bad model id / network); surfaces as a `label_error` on that file's `docset generate` result entry. The file still converts, unlabeled. |
@@ -2071,16 +2391,18 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `WALLET_KEY_MISSING` | hard | No signing key in the OS keyring, or it doesn't control `--from`. |
 | `RECORD_NOT_FOUND` | hard | `prove` could not find the anchored record (bad checksum/registry). |
 | `MANIFEST_INVALID` | hard | A `dgmlx verify` bundle is structurally broken (missing/duplicate page number, absent artifact). |
-| `GHOSTSCRIPT_NOT_FOUND` | soft | The ghostscript binary (`gs`, or `gswin64c`/`gswin32c` on Windows) is not on `PATH`; recorded as a page-render failure. |
-| `PAGE_RENDER_FAILED` | soft | ghostscript failed to render a page; recorded on the File (`page_render_error`). |
-| `PDF_SLICE_FAILED` | soft | A PDF page-slice operation failed during generation. |
+| `ENGINE_NOT_AVAILABLE` | soft | The configured PDF engine cannot run (e.g. `pypdfium2` without the `pdfium` extra installed); recorded as a page-render failure, or a per-file `failed` entry when it was slicing. |
+| `GHOSTSCRIPT_NOT_FOUND` | soft | The ghostscript binary (`gs`, or `gswin64c`/`gswin32c` on Windows) is not on `PATH` (an `ENGINE_NOT_AVAILABLE` subtype); recorded as a page-render failure. |
+| `PAGE_RENDER_FAILED` | soft | The page renderer failed to render a page; recorded on the File (`page_render_error`). |
+| `PDF_CONFIG_INVALID` | hard | The `pdf` config section is malformed (unknown provider or stray key). |
+| `PDF_SLICE_FAILED` | soft | A PDF page-slice operation failed during generation (bad page range, or a backend error). |
 | `TEXT_EXTRACTION_FAILED` | soft | pdfminer.six extracted no digital text; recorded (`text_extraction_error`). |
 | `CORRUPT_METADATA` | hard / soft | A `file.json`/`docset.json` is not valid JSON (also reported by `dgml check`). |
-| `STORAGE_CONFIG_INVALID` | hard | A `[storage]` / `[storage.<name>]` table is malformed, `--storage NAME` names a service that isn't configured, or an initialized workspace has **no `config.toml`** — that file names its storage backend and cannot be reconstructed from anything else. |
+| `STORAGE_CONFIG_INVALID` | hard | A `[storage]` / `[storage.<name>]` table is malformed, or `--storage NAME` names a service that isn't configured. (A workspace with **no** config reports `WORKSPACE_NOT_INITIALIZED` instead — having a config is what being a workspace means.) |
 | `STORAGE_PROVIDER_UNRESOLVABLE` | hard | A storage `provider` dotted path (`module:Class`) can't be imported/resolved. |
 | `WORKSPACES_CONFIG_INVALID` | hard | The `[workspaces]` table is malformed, or its provider was handed an option it does not accept. |
-| `WORKSPACE_NOT_FOUND` | hard | `--workspace <ws_id>` named an id the store of workspaces does not hold. Deliberately an error rather than falling through to path resolution — an id has a distinctive shape, so a caller that typed one meant a workspace. |
-| `WORKSPACES_WRITE_CONFLICT` | hard | Another writer changed this workspace's `config.toml` since it was read. A config is written whole, so overwriting would discard whatever that writer changed; re-run the command to work from the current config. Only backends that issue revisions (Mongo) can report this. |
+| `WORKSPACE_NOT_FOUND` | hard | `--workspace <id>` named something the store of workspaces does not hold and that is not an existing directory either. Deliberately an error rather than falling through to path resolution: with both places looked in and neither answering, the likeliest explanation is a typo'd id, and resolving to a path would turn that typo into a new directory. |
+| `WORKSPACES_WRITE_CONFLICT` | hard | Another writer changed this workspace's `config.toml` since it was read. A config is written whole, so overwriting would discard whatever that writer changed; re-run the command to work from the current config. Only backends that make writes conditional on the stored text (Mongo) can report this; the local-dir store has one writer per machine and does not. |
 | `STORAGE_BACKEND_MISMATCH` | hard | The `[storage]` configuration a workspace resolves no longer matches the `storage_fingerprint` sealed in its `config.toml` — its data is on the previously sealed backend. Accept the change with `dgml workspace reseal <root>`, or restore the `[storage]` table. |
 | `NOT_IMPLEMENTED` | hard | A requested mode/path is not implemented. |
 | `DGML_ERROR` | hard | Generic base code; specific codes above are preferred. |
@@ -2093,9 +2415,13 @@ per-file soft-fail fields.
 ## System requirements
 
 - Python 3.11+
-- Ghostscript (`gs`) — installed system-wide for page-image rendering.
-  See [CLAUDE.md](../CLAUDE.md) for the licensing rationale (ghostscript
-  is AGPL but invoked as a subprocess; it is not bundled with `dgml`).
+- Ghostscript (`gs`) — the default PDF engine, installed system-wide for
+  page-image rendering and page slicing. See [CLAUDE.md](../CLAUDE.md) for the
+  licensing rationale (ghostscript is AGPL but invoked as a subprocess; it is
+  not bundled with `dgml`). **Optional:** `pip install dgml[pdfium]` plus
+  `[pdf] provider = "pypdfium2"` uses PDFium in-process for both operations,
+  removing the system-binary requirement entirely (see
+  [PDF engine configuration](#pdf-engine-configuration)).
 
 ## Examples for an LLM agent
 

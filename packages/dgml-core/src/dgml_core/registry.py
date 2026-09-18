@@ -39,7 +39,7 @@ from typing import Any
 from .storage import read_json, user_config_path
 
 # Re-exported (redundant-alias spelling, so ``mypy --strict`` accepts it) for the
-# legacy tests that still reach for it here. Id minting itself lives in
+# legacy tests that still reach for it here. Id generation itself lives in
 # :mod:`dgml_core.workspace_id`.
 from .workspace_id import new_workspace_id as new_workspace_id
 

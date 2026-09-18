@@ -28,7 +28,7 @@ import pytest
 from dgml_core.errors import CorruptMetadata, StorageProviderUnresolvable, WorkspacesConfigInvalid
 from dgml_core.provider import import_provider_class
 from dgml_core.storage_local import LocalStore
-from dgml_core.workspace_id import mint_workspace_id, new_workspace_id
+from dgml_core.workspace_id import generate_unique_workspace_id, new_workspace_id
 from dgml_core.workspaces_local import LocalDirWorkspacesStore
 from dgml_core.workspaces_resolve import (
     DEFAULT_WORKSPACES_PROVIDER,
@@ -99,7 +99,7 @@ def test_write_then_read_round_trips(store: WorkspacesStore) -> None:
     store.write_config(wid, CONFIG)
     found = store.read_config(wid)
     assert found is not None
-    assert found[0] == CONFIG
+    assert found == CONFIG
 
 
 def test_read_missing_is_none(store: WorkspacesStore) -> None:
@@ -112,8 +112,8 @@ def test_write_replaces(store: WorkspacesStore) -> None:
     store.write_config(wid, "[workspace]\nname = 'Renamed'\n")
     found = store.read_config(wid)
     assert found is not None
-    assert "Renamed" in found[0]
-    assert "Acme Contracts" not in found[0]
+    assert "Renamed" in found
+    assert "Acme Contracts" not in found
 
 
 def test_exists_tracks_write_and_delete(store: WorkspacesStore) -> None:
@@ -203,19 +203,68 @@ def test_config_text_is_preserved_byte_for_byte(store: WorkspacesStore) -> None:
     store.write_config(wid, hostile)
     found = store.read_config(wid)
     assert found is not None
-    assert found[0] == hostile
+    assert found == hostile
 
 
-def test_revision_round_trips_through_write(store: WorkspacesStore) -> None:
-    """Whatever ``read_config`` hands back is accepted by ``write_config``, so a caller
-    never has to know whether its backend issues revisions."""
+def test_read_text_round_trips_as_the_write_token(store: WorkspacesStore) -> None:
+    """Whatever ``read_config`` hands back is accepted by ``write_config`` as
+    ``expected_text``, so a caller never has to know whether its backend detects
+    conflicts."""
     wid = new_workspace_id()
     store.write_config(wid, CONFIG)
-    found = store.read_config(wid)
-    assert found is not None
-    text, revision = found
-    store.write_config(wid, text, expected_revision=revision)
-    assert store.read_config(wid) is not None
+    text = store.read_config(wid)
+    assert text is not None
+    store.write_config(wid, text + "\n[models]\n", expected_text=text)
+    assert store.read_config(wid) == CONFIG + "\n[models]\n"
+
+
+def test_writing_identical_text_is_not_a_conflict(store: WorkspacesStore) -> None:
+    """A no-op write succeeds rather than raising: the stored text is already what the
+    writer wants, so there is nothing to lose. Backends that detect conflicts must not
+    treat "unchanged" as "changed"."""
+    wid = new_workspace_id()
+    store.write_config(wid, CONFIG)
+    store.write_config(wid, CONFIG, expected_text=CONFIG)
+    assert store.read_config(wid) == CONFIG
+
+
+def test_expected_text_none_is_unconditional(store: WorkspacesStore) -> None:
+    """``None`` means "write regardless", which is what a fresh workspace and a backend
+    with one writer by construction both rely on."""
+    wid = new_workspace_id()
+    store.write_config(wid, CONFIG)
+    store.write_config(wid, "[workspace]\nname = 'Clobbered'\n", expected_text=None)
+    assert store.read_config(wid) == "[workspace]\nname = 'Clobbered'\n"
+
+
+def test_verbatim_text_is_accepted_back_unchanged(store: WorkspacesStore) -> None:
+    """CRLF, non-ASCII, and both Unicode normal forms must survive a read and be
+    *accepted* as ``expected_text``, not judged different.
+
+    The NFC/NFD pair is the load-bearing case: it proves nothing in the path normalizes.
+    A backend that did would break conflict detection, not merely rewrite a file — and
+    the two forms must stay distinct values, which the last assertion pins."""
+    nfc, nfd = "café", "café"
+    assert nfc != nfd  # guard: the literals really are the two forms
+    for label, text in (
+        ("crlf", "[workspace]\r\nname = 'W'\r\n"),
+        ("no-trailing-newline", "[workspace]\nname = 'W'"),
+        ("nfc", f"[workspace]\nname = '{nfc}'\n"),
+        ("nfd", f"[workspace]\nname = '{nfd}'\n"),
+    ):
+        wid = new_workspace_id()
+        store.write_config(wid, text)
+        found = store.read_config(wid)
+        assert found == text, label
+        # Accepted as the token: no spurious conflict from an encoding round trip.
+        store.write_config(wid, text, expected_text=found)
+        assert store.read_config(wid) == text, label
+
+    # And the two forms are stored as distinct texts, not folded together.
+    a, b = new_workspace_id(), new_workspace_id()
+    store.write_config(a, nfc)
+    store.write_config(b, nfd)
+    assert store.read_config(a) != store.read_config(b)
 
 
 def test_label_is_non_empty(store: WorkspacesStore) -> None:
@@ -242,16 +291,32 @@ def test_workspace_root_is_the_folder(tmp_path: Path) -> None:
 
 def test_stray_directories_are_not_workspaces(tmp_path: Path) -> None:
     """The parent is an ordinary directory a user may look inside, so anything whose
-    name is not a well-formed id has to be ignored rather than half-listed."""
+    name could not be an id has to be ignored rather than half-listed.
+
+    Since an id no longer needs a prefix, that name filter is weak — a plain lowercase
+    folder name *is* a well-formed id — so what actually keeps a stray out of the
+    listing is the `config.toml` requirement (see the test below). Only names that could
+    never be an id are excluded on name alone."""
     root = tmp_path / "workspaces"
     store = _local(root)
     wid = new_workspace_id()
     store.write_config(wid, CONFIG)
-    for stray in ("notes", "ws_short", f"{wid}.bak", "ws_UPPERCASEAAAAAAAA"):
+    for stray in (f"{wid}.bak", "UPPERCASE", "x"):
         (root / stray).mkdir(parents=True, exist_ok=True)
         (root / stray / "config.toml").write_text(CONFIG, encoding="utf-8")
     (root / "loose.toml").write_text(CONFIG, encoding="utf-8")
     assert store.list_ids() == [wid]
+
+
+def test_a_prefix_free_id_round_trips(tmp_path: Path) -> None:
+    """`workspace create --id my-workspace` names the folder, and the folder names the
+    workspace — the same identity the generated `ws_…` ids have always had."""
+    root = tmp_path / "workspaces"
+    store = _local(root)
+    store.write_config("my-workspace", CONFIG)
+    assert store.exists("my-workspace")
+    assert store.list_ids() == ["my-workspace"]
+    assert store.workspace_root("my-workspace") == root / "my-workspace"
 
 
 def test_a_folder_without_a_config_is_not_listed(tmp_path: Path) -> None:
@@ -285,7 +350,7 @@ def test_delete_prunes_the_folder_when_nothing_remains(tmp_path: Path) -> None:
     assert not (root / wid).exists()
 
 
-# ------------------------------------------------------------------ minting ids
+# ------------------------------------------------------------------ generating ids
 
 
 def test_mint_rerolls_past_an_id_the_store_holds(
@@ -297,14 +362,14 @@ def test_mint_rerolls_past_an_id_the_store_holds(
     store.write_config(taken, CONFIG)
     rolls = iter([taken, free])
     monkeypatch.setattr("dgml_core.workspace_id.new_workspace_id", lambda: next(rolls))
-    assert mint_workspace_id(store) == free
+    assert generate_unique_workspace_id(store) == free
 
 
 def test_mint_without_a_store_does_not_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No store means no list to consult — an unchecked mint is the honest answer, not
+    """No store means no list to consult — an unchecked generate is the honest answer, not
     a silent fallback to some other list."""
     monkeypatch.setattr("dgml_core.workspace_id.new_workspace_id", lambda: "ws_aaaaaaaaaaaaaaaa")
-    assert mint_workspace_id() == "ws_aaaaaaaaaaaaaaaa"
+    assert generate_unique_workspace_id() == "ws_aaaaaaaaaaaaaaaa"
 
 
 # ---------------------------------------------------------------- configuration
@@ -436,7 +501,7 @@ def test_workspace_root_honors_a_declared_workspace_path(tmp_path: Path) -> None
 
 def test_workspace_root_falls_back_for_an_unknown_workspace(tmp_path: Path) -> None:
     """Asked about a workspace it does not hold, the store still answers where one would
-    go — `workspace create` needs that to derive a root from a freshly minted id."""
+    go — `workspace create` needs that to derive a root from a freshly generated id."""
     store = _local(tmp_path / "workspaces")
     wid = new_workspace_id()
     assert store.workspace_root(wid) == tmp_path / "workspaces" / wid

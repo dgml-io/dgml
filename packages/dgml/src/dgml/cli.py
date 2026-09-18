@@ -27,12 +27,14 @@ import os
 import shutil
 import sys
 import tomllib
+from collections import Counter
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
 from dgml_core import layout
 from dgml_core.classification import (
     ClassificationConfig,
+    ClassifyMode,
     classify_file,
     load_classification_config,
 )
@@ -44,13 +46,14 @@ from dgml_core.errors import (
     ConflictError,
     DgmlError,
     InvalidArgument,
+    NoExistingDocSets,
     StorageBackendMismatch,
-    StorageConfigInvalid,
     WorkspaceNotInitialized,
     now_iso,
     short_error_message,
 )
 from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
+from dgml_core.ids import RECORD_ID_SHAPE
 from dgml_core.migrations import (
     MigrationResult,
     migrate_workspace,
@@ -58,7 +61,7 @@ from dgml_core.migrations import (
     stamp_schema_version,
 )
 from dgml_core.models import DocSet
-from dgml_core.pages import DEFAULT_DPI
+from dgml_core.pages import DEFAULT_DPI, load_pdf_config
 from dgml_core.storage import (
     API_KEY_ENV_VARS,
     Workspace,
@@ -80,7 +83,7 @@ from dgml_core.storage_resolve import (
     verify_storage_fingerprint,
 )
 from dgml_core.text_extraction import TextMode
-from dgml_core.workspace_id import is_workspace_id, mint_workspace_id
+from dgml_core.workspace_id import ID_SHAPE, generate_unique_workspace_id, is_workspace_id
 from dgml_core.workspaces_resolve import default_workspaces_store
 from dgml_core.workspaces_store import WorkspacesStore
 
@@ -188,7 +191,10 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, suppress: bool) -> Non
     at parser-construction time, taking ``dgml --help`` down with it."""
     parser.add_argument(
         "--workspace",
-        type=Path,
+        # Deliberately *not* `type=Path`: `Path("./notes")` normalizes to `notes`, and
+        # that leading `./` is load-bearing. It is how a caller says "the directory, not
+        # the workspace of that name" — the escape when a listed id shadows a local
+        # directory — and `Workspace.resolve` can only honour it if it survives argparse.
         default=argparse.SUPPRESS if suppress else None,
         help=_WORKSPACE_HELP,
     )
@@ -334,6 +340,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Human-readable workspace name (identity metadata, stored in workspace.json). "
             "Defaults to the workspace directory name."
+        ),
+    )
+    ws_create.add_argument(
+        "--id",
+        default=None,
+        metavar="WORKSPACE_ID",
+        help=(
+            f"Set the workspace's stable handle instead of generating one — {ID_SHAPE}, "
+            "e.g. 'my-workspace'. It is what --workspace and $DGML_HOME address the "
+            "workspace by, and the folder name the local store of workspaces gives it. "
+            "Fails with CONFLICT if this machine's store of workspaces already holds "
+            "that id. Omit it for a generated ws_… id."
         ),
     )
     ws_create.add_argument(
@@ -601,6 +619,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     fl_add.add_argument(
+        "--id",
+        default=None,
+        metavar="FILE_ID",
+        help=(
+            f"Assign this id to the new File instead of generating one — {RECORD_ID_SHAPE}, "
+            "e.g. 'invoice-2024-q1'. Fails with CONFLICT if another File already holds "
+            "it with different content — no --on-conflict policy overrides that. "
+            "Re-adding identical content under the same id is a no-op. Not allowed when "
+            "PATH is a directory. Omit it for a generated 12-character id."
+        ),
+    )
+    fl_add.add_argument(
         "--on-conflict",
         choices=[p.value for p in ConflictPolicy],
         default=ConflictPolicy.ERROR.value,
@@ -639,15 +669,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fl_add.add_argument(
         "--auto-classify",
-        action="store_true",
+        nargs="?",
+        metavar="MODE",
+        const=ClassifyMode.EXISTING_OR_NEW.value,
+        default=None,
+        choices=[m.value for m in ClassifyMode],
         help=(
             "After adding, use the configured vision LLM to assign the file "
-            "to a DocSet — assigning to an existing DocSet if one fits, "
-            "otherwise creating a new one. Requires a 'classification' section "
-            "in <workspace>/config.toml; a missing or invalid config is a hard "
-            "error (exit 1). Failures of the classification call itself (LLM "
-            "error, auth) are reported in the 'classification' field of the "
-            "response payload without aborting the file add."
+            "to a DocSet. MODE is 'existing-or-new' (the default when the flag "
+            "is passed bare): assign to an existing DocSet if one fits, "
+            "otherwise create a new one. 'existing' never creates a DocSet — "
+            "the LLM must pick the best-fitting existing one, and is required "
+            "to choose even when the fit is poor. Use 'existing' ONLY when you "
+            "already know the file belongs in one of the workspace's DocSets: "
+            "an off-type document is assigned to the closest DocSet anyway, "
+            "not flagged. With no DocSets to choose from it is an error "
+            "(NO_EXISTING_DOCSETS, exit 1). Note MODE is consumed greedily, so "
+            "put PATH before this flag (or pass MODE explicitly). Requires a "
+            "'classification' section in <workspace>/config.toml; a missing or "
+            "invalid config is a hard error (exit 1). Failures of the "
+            "classification call itself (LLM error, auth) are reported in the "
+            "'classification' field of the response payload without aborting "
+            "the file add."
         ),
     )
     files.add_parser("list", parents=[common], help="List Files.")
@@ -1196,16 +1239,14 @@ def main(argv: list[str] | None = None) -> int:
             # silently opening an empty backend. `workspace reseal` (exempt above,
             # under the `workspace` group) is how an intended change is accepted.
             verify_storage_fingerprint(ws)
+            # One check, not two: `is_initialized()` *is* "has a config". The config
+            # names the backend and cannot be reconstructed from anything else, so an
+            # absent one is indistinguishable from "never a workspace" — and both want
+            # the same answer from the caller. The message covers both readings.
             if not ws.is_initialized():
                 raise WorkspaceNotInitialized(
                     _uninitialized_message(ws, from_default=_root_is_the_cwd_default(args))
                 )
-            if not ws.config_present:
-                # The config names the backend and cannot be reconstructed from
-                # anything else — an absent one is indistinguishable from "this was a
-                # remote workspace whose config was deleted", which would otherwise
-                # fall through to the local default and report an empty workspace.
-                raise StorageConfigInvalid(_missing_config_message(ws))
             _warn_if_config_declares_workspaces(ws)
             # Upgrade an older workspace in place before anything reads it. This
             # is the one point every command passes through, so there is no
@@ -1359,27 +1400,22 @@ def _root_is_the_cwd_default(args: argparse.Namespace, *, path: Path | None = No
 
 
 def _uninitialized_message(ws: Workspace, *, from_default: bool) -> str:
-    """Why this workspace cannot be used, and two remedies that actually work.
+    """Why this workspace cannot be used, and remedies that actually work.
 
-    The old wording was "run 'dgml workspace create'", which became a loop: a bare
-    `create` now puts the workspace in the store of workspaces, so following the advice
-    literally creates one *somewhere else* and leaves the next command failing
-    identically. Both suggestions here resolve to the workspace the caller was asking
-    about — the same property :func:`_missing_config_message` has."""
-    looked = (
-        " (dgml looked there because neither --workspace nor $DGML_HOME was set)"
-        if from_default
-        else ""
-    )
-    return (
-        f"workspace at {ws.root} is not initialized{looked}. Create one there with "
-        f"'dgml workspace create {ws.root} --organization <org>', or, if you already have "
-        f"a workspace, find it with 'dgml workspace list' and pass --workspace <ws_id>."
-    )
+    ``is_initialized()`` is "has a config", so this one message answers two readings
+    of the same fact: *never a workspace*, and *a workspace whose config is gone*.
+    Nothing on disk distinguishes them for a remote-backed workspace, and for a local
+    one the distinction would not change the advice — so both remedies are offered
+    rather than guessed between.
 
+    Addressed by id, the root is meaningless (the workspace lives in a store, not at a
+    path), so that case names the store and the id instead.
 
-def _missing_config_message(ws: Workspace) -> str:
-    """Why this workspace cannot be opened, and what would fix it."""
+    "Run 'dgml workspace create'" alone would be a loop: a bare `create` puts the
+    workspace in the store of workspaces, so following it literally creates one
+    *somewhere else* and leaves the next command failing identically. Every suggestion
+    below resolves to the workspace the caller was actually asking about.
+    """
     if ws.workspaces_id is not None:
         return (
             f"{ws.config_location} holds no config for {ws.workspaces_id}. It names this "
@@ -1387,11 +1423,17 @@ def _missing_config_message(ws: Workspace) -> str:
             f"backup, or run 'dgml workspace list' to see what this machine's store of "
             f"workspaces does hold."
         )
+    looked = (
+        " (dgml looked there because neither --workspace nor $DGML_HOME was set)"
+        if from_default
+        else ""
+    )
     return (
-        f"{ws.config_path} is missing. It names this workspace's storage backend and "
-        f"cannot be reconstructed — restore it from backup, or, if this workspace is on "
-        f"default local storage, re-run 'dgml workspace create {ws.root} "
-        f"--organization <org>'."
+        f"no workspace at {ws.root}: {ws.config_path} is missing{looked}. The config "
+        f"names the storage backend and cannot be reconstructed — create a workspace "
+        f"there with 'dgml workspace create {ws.root} --organization <org>', restore the "
+        f"config from backup, or, if you already have a workspace, find it with "
+        f"'dgml workspace list' and pass --workspace <ws_id>."
     )
 
 
@@ -1585,7 +1627,7 @@ def _import_one(
         # No identity anywhere: no `[workspace] workspace_id`, no `workspace.json`, and no
         # legacy index row. That is not a workspace dgml ever created — a directory with
         # `docsets/` and `files/` in it is not enough — so there is nothing to import it
-        # *as*, and minting an id here would adopt an arbitrary directory as a workspace.
+        # *as*, and generating an id here would adopt an arbitrary directory as a workspace.
         return {
             **row,
             "status": "failed",
@@ -1609,8 +1651,8 @@ def _import_one(
             **row,
             "status": "failed",
             "reason": (
-                f"workspace_id {workspace_id!r} is not well-formed — it must be 'ws_' "
-                f"followed by exactly 16 characters from [a-z2-7], or nothing can address "
+                f"workspace_id {workspace_id!r} is not well-formed — it must be "
+                f"{ID_SHAPE}, or nothing can address "
                 f"or list this workspace. Correct it in {source.config_location} (the "
                 f"[workspace] block) and in {root / layout.WORKSPACE_FILE}, then re-run. "
                 f"The legacy index is left in place, so nothing is lost meanwhile."
@@ -1734,6 +1776,89 @@ def _workspace_import(args: argparse.Namespace, fmt: str) -> int:
     return 0 if not payload["failed"] else 2
 
 
+def _requested_workspace_id(args: argparse.Namespace, ws: Workspace, *, listed: bool) -> str | None:
+    """``workspace create --id``, validated against the workspace being created.
+
+    Returns the id to use, or ``None`` when the caller passed none and one should be
+    generated. Everything here runs before the workspace's config, directory or store row
+    exists, so a rejected ``--id`` leaves nothing behind.
+
+    Three ways it can fail, and they are different errors on purpose: a malformed id is
+    the caller's typo (``INVALID_ARGUMENT``); an id that disagrees with one this
+    workspace already records is a re-run that would *re-identify* an existing
+    workspace, which ``create`` never does, and is also the caller's mistake; an id
+    another workspace already holds is a genuine collision (``CONFLICT``), because
+    proceeding would overwrite that workspace's config in the store.
+
+    ``listed`` says a **new** store-listed workspace is being created, in which case
+    ``ws`` is not it — it is whatever ``Workspace.resolve`` fell back to, and the caller
+    discards it. See the comment on ``known`` below.
+    """
+    from dgml_core import workspace_config as wsconfig
+
+    requested: str | None = args.id
+    if requested is None:
+        return None
+    if not is_workspace_id(requested):
+        raise InvalidArgument(
+            f"--id {requested!r} is not a well-formed workspace id: it must be {ID_SHAPE}."
+        )
+
+    # What this workspace is *already* called, if anything: the id it is listed under,
+    # else the one its own config records. `create` is documented as safe to re-run, so
+    # an --id that agrees with it is a no-op rather than a conflict — including for a
+    # detached workspace that has since been imported into the store, where the naive
+    # `store.exists` check below would otherwise report the workspace colliding with
+    # itself.
+    #
+    # Except when a new listed workspace is being created: then `ws` is only what
+    # `Workspace.resolve` fell back to — `./dgml-workspace` in the working directory —
+    # and the caller replaces it wholesale with one rooted at the new id. Reading an
+    # identity off it would make `create --id` fail wherever a `./dgml-workspace`
+    # happens to sit, complaining that "this workspace" has a different id, while the
+    # same command without `--id` cheerfully generates one and ignores that directory.
+    if listed and ws.workspaces_id is None:
+        known = None
+    else:
+        known = ws.workspaces_id or wsconfig.read_identity(ws).workspace_id
+    if known is not None:
+        if known != requested:
+            # Name *how* this workspace came to be addressed. Someone passing --id has
+            # almost always come to create a new workspace and not realized something is
+            # pointing at an existing one — easy when $DGML_HOME is set once and then
+            # forgotten — so the message names that thing rather than describing "this
+            # workspace" and leaving them to guess what to change.
+            if args.path is not None:
+                addressed = f"the path {str(args.path)!r} you gave"
+                stop = "drop that path argument"
+            elif getattr(args, "workspace", None) is not None:
+                addressed = f"--workspace {str(args.workspace)!r}"
+                stop = "drop --workspace"
+            elif os.environ.get(WORKSPACE_ENV_VAR, "").strip():
+                addressed = f"${WORKSPACE_ENV_VAR}"
+                stop = f"unset {WORKSPACE_ENV_VAR}"
+            else:  # pragma: no cover - defensive; one of the three is always set here
+                addressed = "the workspace this command resolved"
+                stop = "stop addressing it"
+            raise InvalidArgument(
+                f"--id {requested!r} does not match {known!r}, the id of the workspace "
+                f"addressed by {addressed}.\n\n"
+                f"To create a *new* workspace called {requested!r}, {stop} — it is what "
+                f"points this command at the existing one."
+            )
+        return requested
+
+    store = default_workspaces_store()
+    if store.exists(requested):
+        raise ConflictError(
+            f"{store.label()} already holds a workspace {requested}. Pick another --id, "
+            f"or open the existing one with --workspace {requested}.",
+            kind="workspace",
+            existing_id=requested,
+        )
+    return requested
+
+
 def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Workspace lifecycle: create, list, reseal.
 
@@ -1761,13 +1886,18 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             # `dgml workspace create ./ws …` reads without doubling --workspace.
             ws = Workspace(root=Path(args.path).expanduser().resolve())
 
+        # --id, settled before anything is written. A rejected id must not leave a
+        # half-built workspace behind, and for a listed workspace the id decides the
+        # root, so there is no later point at which this could be checked.
+        requested_id = _requested_workspace_id(args, ws, listed=listed)
+
         seed = _read_seed_config(args)
 
         if listed and ws.workspaces_id is None:
             # The id has to come first, because for a store-listed workspace the root is
             # derived from it — the reverse of the detached order.
             store = default_workspaces_store()
-            new_id = mint_workspace_id(store)
+            new_id = requested_id or generate_unique_workspace_id(store)
             store.write_config(new_id, seed or "")
             ws = Workspace(root=store.workspace_root(new_id), workspaces_id=new_id)
         elif seed is not None and not ws.config_present:
@@ -1869,13 +1999,18 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         # command once the pointer became readable.
         ws.root.mkdir(parents=True, exist_ok=True)
         _write_workspace_config(ws, service, seed is not None)
-        # Reuse the id the config already carries; mint only for a genuinely new
+        # Reuse the id the config already carries; generate only for a genuinely new
         # workspace. Minting unconditionally broke the documented "idempotent and safe
         # to re-run" promise in two ways: re-running on the same machine forked the id
         # and left two rows for one workspace, and running it on a second machine
         # against a shared config changed the org's workspace identity — including the
         # `workspace` record in the remote doc store.
-        workspace_id = ws.workspaces_id or recorded.workspace_id or mint_workspace_id()
+        workspace_id = (
+            ws.workspaces_id
+            or recorded.workspace_id
+            or requested_id
+            or generate_unique_workspace_id()
+        )
         wsconfig.write_identity(
             ws,
             workspace_id=workspace_id,
@@ -1891,8 +2026,9 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         ws = Workspace(root=ws.root, workspaces_id=ws.workspaces_id)
         wsconfig.write_identity(ws, storage_fingerprint=storage_fingerprint_pair(*ws.store_configs))
 
-        # Now build the workspace through the selected backend.
-        ws.init()
+        # Now build the workspace through the selected backend. Nothing is
+        # scaffolded first: stores create their own containers on write, so the
+        # workspace exists by virtue of its config and this first document.
         ws.write_meta(name=name, organization=organization, workspace_id=workspace_id)
         # Stamp the current layout revision so a brand-new workspace is never
         # mistaken for an old one and re-scanned by the migration on first use.
@@ -2810,12 +2946,30 @@ def _add_generate_subparser(
         type=Path,
         default=None,
         help=(
-            "Exported schema to seed labeling with — either docsets/<id>/schema.json "
-            "(Schema v1: a `tags` map of name -> {role, kind, parent_role, ...}) or its "
-            "RELAX NG Compact render docsets/<id>/full-schema.rnc. When given, this vocabulary "
-            "is used as-is and the planning pass is skipped (making labels deterministic), "
-            "and the tag hierarchy seeds entity-container grouping; per-document labeling "
-            "still extends it for roles the schema does not cover."
+            "Tag schema to label against. Four forms, detected by content: a plain "
+            "newline-delimited list of tag names (blank lines and `#` comments ignored); "
+            "a JSON {name: one-line description} object (RECOMMENDED — descriptions are "
+            "what the model matches content against); an exported docsets/<id>/schema.json "
+            "(a `tags` map of name -> {role, kind, examples, parent_role}); or its RELAX NG "
+            "Compact render docsets/<id>/full-schema.rnc. Supplying a schema means the "
+            "generated DGML uses THOSE tag names and no others: the planning pass is "
+            "skipped and the vocabulary is closed. Content whose role has no matching tag "
+            "is NOT dropped — it renders as dg:chunk with its text, structure, and "
+            "dg:origin intact. To let labeling invent its own vocabulary instead, do not "
+            "supply a schema."
+        ),
+    )
+    gen.add_argument(
+        "--extend-schema",
+        action="store_true",
+        help=(
+            "Treat the supplied schema as a foundation rather than the whole "
+            "vocabulary: labeling reuses your tag names wherever one fits, and may "
+            "coin a new name for a recurring role your schema does not cover. Every "
+            "coined name is reported per file under `added_concepts`, so it can be "
+            "folded into the next revision of your schema. Requires a supplied "
+            "schema (--schema-path, or one a previous run remembered); without this "
+            "flag a supplied schema is used strictly and nothing else is emitted."
         ),
     )
     gen.add_argument(
@@ -2823,8 +2977,11 @@ def _add_generate_subparser(
         action="store_true",
         help=(
             "Disable automatic roster reuse. By default an incremental generate "
-            "seeds labeling with the docset's existing cache/concept_roster.json so "
-            "added documents stay tag-consistent; this labels them in isolation."
+            "seeds labeling with the docset's own authored-schema.json (if a previous run "
+            "supplied one), else schema.json, else cache/concept_roster.json, so added "
+            "documents stay tag-consistent; this labels them in isolation. A remembered "
+            "authored schema closes the vocabulary the same way --schema-path does; a "
+            "schema the pipeline derived itself only seeds."
         ),
     )
     gen.add_argument(
@@ -2856,6 +3013,12 @@ def _add_generate_subparser(
             "the weaker ones the review would have dropped."
         ),
     )
+
+
+#: Distinct rejected concept names reported per file in `unmatched_concepts`.
+#: Enough to recognize the pattern (aliases? new roles? junk?) without turning
+#: a JSON payload into a log.
+_UNMATCHED_EXAMPLES = 10
 
 
 def _load_schema_roster(path: Path) -> dict[str, str]:
@@ -2896,52 +3059,79 @@ def _load_schema_roster(path: Path) -> dict[str, str]:
     return roster
 
 
-def _load_schema_seed(path: Path) -> tuple[Schema, dict[str, str]]:
-    """Load an exported schema — ``schema.json`` or ``full-schema.rnc`` — into
-    ``(schema, parent_map)``.
+def _schema_parent_map(schema: Schema) -> dict[str, str]:
+    """The leaf → container map ``render_dgml`` groups entity containers with.
 
-    ``--schema-path`` accepts the two formats ``docset generate`` emits at the
-    docset root: ``schema.json`` (Schema v1: a ``tags`` map of ``name ->
-    {role, kind, parent_role, ...}``) or its lossless RELAX NG Compact render
-    ``full-schema.rnc`` (a ``.rnc`` suffix; the ``# Field: value`` comment contract
-    carries the same fields). The full schema seeds the labeling vocabulary —
-    role descriptions, curated examples, kind, hierarchy (via
+    Names pass through VERBATIM (only ``sanitize_tag_name`` for XML validity):
+    the map's keys and values must be the same strings the labeling roster and
+    the emitted tags use, and ``sanitize_concept`` — written for model output —
+    would fold names like ``Notes`` to nothing and silently break the pairing.
+    """
+    from dgml_core.generation.schema import sanitize_tag_name
+
+    parent_map: dict[str, str] = {}
+    for tag in schema.tags.values():
+        if tag.name and tag.parent_role:
+            parent_map[sanitize_tag_name(tag.name)] = sanitize_tag_name(tag.parent_role)
+    return parent_map
+
+
+def _load_schema_seed(
+    path: Path, label: str = "--schema-path"
+) -> tuple[Schema, dict[str, str], list[str]]:
+    """Load a user-supplied tag schema into ``(schema, parent_map, notes)``.
+
+    ``--schema-path`` takes any of four forms, detected by CONTENT rather than
+    by file extension so the flag stays one flag:
+
+    - a plain newline-delimited tag list (``#`` comments and blanks ignored);
+    - a JSON ``{name: one-line description}`` object — the recommended form;
+    - an exported ``schema.json`` (Schema v1: a ``tags`` map of
+      ``name -> {role, kind, examples, parent_role}``);
+    - its lossless RELAX NG Compact render ``full-schema.rnc`` (``.rnc``
+      suffix; the ``# Field: value`` comment contract carries the same fields).
+
+    The schema seeds the labeling vocabulary with full fidelity — role
+    descriptions, curated examples, kind, hierarchy (via
     ``ConvertOptions.schema_seed``); each tag's ``parent_role`` also becomes
     the leaf → container ``parent_map`` that drives entity-container grouping
-    in ``render_dgml``.
+    in ``render_dgml``. *notes* are the loader's remarks about anything it had
+    to change, for ``--verbose``.
 
-    Raises ``InvalidArgument`` on a missing / malformed file, or one with no
-    tags (e.g. a flat ``{concept: description}`` mapping — that shape is not
-    accepted).
+    Deliberately NOT built on ``_load_schema_roster``: that reader exists for
+    the legacy ``concept_roster.json`` reuse path, truncates descriptions to 60
+    characters, and pushes names through ``sanitize_concept`` — the exact
+    mangling an authored schema must not suffer.
+
+    Raises ``InvalidArgument`` on a missing file, or on anything the loader
+    cannot read unambiguously. A bad schema must fail HERE, at load, and never
+    as a tag that quietly failed to appear hours later. *label* names whatever
+    asked for the file, since the automatic-reuse path reads a stored schema
+    that the user did not name on the command line.
     """
     from dgml_core.errors import InvalidArgument
-    from dgml_core.generation.blocks import sanitize_concept
-    from dgml_core.generation.schema import Schema
+    from dgml_core.generation.schema import parse_authored_schema, schema_from_dict
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise InvalidArgument(f"{label} file not found: {path}") from exc
+    except OSError as exc:
+        raise InvalidArgument(f"{label} could not be read ({path}): {exc}") from exc
 
     try:
         if Path(path).suffix.lower() == ".rnc":
             from dgml_core.generation.rnc import rnc_to_schema_dict
 
-            schema = Schema.from_dict(rnc_to_schema_dict(Path(path).read_text(encoding="utf-8")))
+            schema, notes = schema_from_dict(rnc_to_schema_dict(text))
         else:
-            schema = Schema.load(path)
-    except FileNotFoundError as exc:
-        raise InvalidArgument(f"--schema-path file not found: {path}") from exc
+            schema, notes = parse_authored_schema(text)
+    except InvalidArgument as exc:
+        raise InvalidArgument(f"{label} {path}: {exc}") from exc
     except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
-        raise InvalidArgument(f"--schema-path is not a valid schema ({path}): {exc}") from exc
+        raise InvalidArgument(f"{label} is not a valid schema ({path}): {exc}") from exc
 
-    parent_map: dict[str, str] = {}
-    for tag in schema.tags.values():
-        concept = sanitize_concept(tag.name)
-        parent = sanitize_concept(tag.parent_role or "")
-        if concept and parent:
-            parent_map[concept] = parent
-    if not schema.tags:
-        raise InvalidArgument(
-            f"--schema-path has no tags — expected an exported schema.json or full-schema.rnc "
-            f"(a flat {{concept: description}} mapping is not accepted) ({path})"
-        )
-    return schema, parent_map
+    return schema, _schema_parent_map(schema), notes
 
 
 def _file_result(status: str, file_id: str, source: str, **extra: Any) -> dict[str, Any]:
@@ -3034,6 +3224,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
     from dgml_core.generation.rnc import write_docset_rnc
     from dgml_core.generation.to_semantic import build_header
+    from dgml_core.generation.vocab import TagVocab
     from dgml_core.usage import OPERATION_LINKS
     from dgml_core.xml_grounding import ground_dgml_xml
 
@@ -3272,6 +3463,13 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # document keeps its (unlinked) DGML, so without this a rate limit or a bad
     # model id looked exactly like "this document has no links".
     link_errors: dict[str, str] = {}
+    # name -> {count, distinct, examples} for the concepts that fell outside an
+    # AUTHORED vocabulary. Reported as `unmatched_concepts` under a strict
+    # schema (refused, so the list is what the schema is missing) and as
+    # `added_concepts` under --extend-schema (coined and used, so the list is
+    # the candidate set for the schema's next revision). Absent from a file's
+    # entry when nothing went outside, like every other conditional key here.
+    off_schema_concepts: dict[str, dict[str, Any]] = {}
 
     def _on_error(name: str, message: str) -> None:
         gen_errors[name] = message
@@ -3279,6 +3477,18 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     def _on_label_error(name: str, err: dict[str, str]) -> None:
         label_errors[name] = err
         _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
+
+    def _on_off_schema(name: str, tally: Counter[str]) -> None:
+        # Which names the model reached for outside the supplied schema. The
+        # most actionable output of either mode — under strict these are gaps
+        # to consider adding, under extend they are additions to review.
+        # Reported per file, not just logged, so it is readable without
+        # --verbose.
+        off_schema_concepts[name] = {
+            "count": sum(tally.values()),
+            "distinct": len(tally),
+            "examples": [concept for concept, _n in tally.most_common(_UNMATCHED_EXAMPLES)],
+        }
 
     def _semlink_cache_key(xml_text: str) -> str:
         """Cache address for one document's semantic links.
@@ -3451,6 +3661,9 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         link_error = link_errors.get(name)
         if link_error is not None:
             extra["link_error"] = link_error
+        off_schema = off_schema_concepts.get(name)
+        if off_schema is not None:
+            extra["added_concepts" if args.extend_schema else "unmatched_concepts"] = off_schema
         converted_by_name[name] = _file_result(
             "converted",
             filename_to_fid[name],
@@ -3480,35 +3693,63 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     ws.blobs.working_dir(layout.generation_cache_prefix(args.docset_id))
                 )
             schema_key = layout.docset_generation_schema_key(args.docset_id)
+            authored_key = layout.docset_authored_schema_key(args.docset_id)
             schema_json_local = cache_dir.parent / "schema.json"
-            if (
-                not args.cache_dir
-                and not schema_json_local.exists()
-                and ws.blobs.blob_exists(schema_key)
-            ):
-                ws.blobs.download_blob(schema_key, schema_json_local)
+            authored_local = cache_dir.parent / layout.AUTHORED_SCHEMA_FILE
+            if not args.cache_dir:
+                for key, dest in ((schema_key, schema_json_local), (authored_key, authored_local)):
+                    if not dest.exists() and ws.blobs.blob_exists(key):
+                        ws.blobs.download_blob(key, dest)
             roster_path = Path(cache_dir) / "concept_roster.json"
             schema_seed = None
             roster_seed: dict[str, str] | None = None
             parent_map_seed: dict[str, str] = {}
+            # Set on a --schema-path run: the authored vocabulary, persisted
+            # below to a slot derive_schema never writes, so the next run seeds
+            # from what the user wrote rather than from this run's own output.
+            authored_seed: Schema | None = None
+            # Whether the seed in hand is one a PERSON wrote (this run's
+            # --schema-path, or one a previous run remembered) as opposed to one
+            # the pipeline derived from its own labels. Only the former closes.
+            authored = False
             if args.schema_path:
-                schema_seed, parent_map_seed = _load_schema_seed(Path(args.schema_path))
+                schema_seed, parent_map_seed, schema_notes = _load_schema_seed(
+                    Path(args.schema_path)
+                )
+                authored_seed = schema_seed
+                authored = True
                 _diag(
                     f"Loaded schema: {len(schema_seed.tags)} concept(s), "
                     f"{len(parent_map_seed)} container link(s) from {args.schema_path}"
                 )
+                for note in schema_notes:
+                    _diag(f"[schema] {note}")
             elif not args.no_roster:
-                # Incremental reuse prefers the docset's own schema.json — full
-                # fidelity (role descriptions, observed examples, kind, hierarchy)
-                # — over the flat cache/concept_roster.json fallback. Unlike
-                # --schema-path, no parent_map is derived here: entity-container
-                # grouping stays an explicit opt-in.
+                # Incremental reuse in precedence order: the vocabulary the USER
+                # authored first (never overwritten by derive_schema), then the
+                # derived schema.json — full fidelity (role descriptions,
+                # observed examples, kind, hierarchy) — then the flat
+                # cache/concept_roster.json fallback. Only the authored slot
+                # carries hierarchy through: entity-container grouping stays
+                # something the user opted into, never inferred from a run's
+                # own observations.
                 from dgml_core.generation.schema import Schema
 
-                schema_json_path = Path(cache_dir).parent / "schema.json"
-                if schema_json_path.exists():
+                if authored_local.exists():
                     try:
-                        schema_seed = Schema.load(schema_json_path)
+                        schema_seed, parent_map_seed, _notes = _load_schema_seed(
+                            authored_local, layout.AUTHORED_SCHEMA_FILE
+                        )
+                        authored = True
+                        _diag(
+                            f"Reusing the docset's authored schema: {len(schema_seed.tags)} tag(s)"
+                        )
+                    except InvalidArgument as exc:
+                        _diag(f"[schema] authored-schema.json unusable ({exc}); ignoring")
+                        schema_seed, parent_map_seed = None, {}
+                if schema_seed is None and schema_json_local.exists():
+                    try:
+                        schema_seed = Schema.load(schema_json_local)
                         _diag(f"Reusing docset schema: {len(schema_seed.tags)} tag(s)")
                     except (json.JSONDecodeError, TypeError, ValueError, OSError):
                         schema_seed = None
@@ -3519,10 +3760,58 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     except InvalidArgument:
                         roster_seed = None
 
+            # Closure keys on AUTHORSHIP, not on the mere presence of a seed.
+            # A vocabulary a PERSON wrote is a specification: supplying one
+            # means the output carries those tag names and no others, with no
+            # flag to half-apply it. A vocabulary the PIPELINE derived from its
+            # own previous output is not a specification — it is a hint for
+            # consistency — so automatic reuse of schema.json /
+            # concept_roster.json seeds exactly as it always has and keeps
+            # coining. That distinction is what lets this feature be all-or-
+            # nothing without changing what an ordinary incremental generate
+            # does.
+            seed_names = (
+                list(schema_seed.tags) if schema_seed is not None else list(roster_seed or {})
+            )
+            # --extend-schema keeps an AUTHORED vocabulary open: the user's names
+            # are still authoritative and reused first, but labeling may coin for
+            # a role they did not cover, and every coinage is reported back as a
+            # candidate for the next revision. It is meaningless without an
+            # authored schema, so say so rather than silently doing nothing.
+            if args.extend_schema and not authored:
+                raise InvalidArgument(
+                    "--extend-schema needs a supplied schema to extend. Pass "
+                    "--schema-path <file>, or run it on a docset where a previous "
+                    "--schema-path run left an authored schema. (Without a supplied "
+                    "schema, labeling already coins its own vocabulary.)"
+                )
+            vocab = TagVocab.build(
+                seed_names,
+                closed=authored and bool(seed_names) and not args.extend_schema,
+                authored=authored,
+            )
+            if vocab.closed:
+                _diag(
+                    f"Vocabulary CLOSED at {len(vocab.names)} tag(s): the generated DGML uses "
+                    "these tag names and no others. Unmatched content still renders "
+                    "(as dg:chunk, text intact)."
+                )
+            elif vocab.extends:
+                _diag(
+                    f"Vocabulary EXTENDS {len(vocab.names)} authored tag(s): these are reused "
+                    "wherever one fits; a role they do not cover may be coined, and every "
+                    "coinage is reported under added_concepts."
+                )
+            elif seed_names:
+                _diag(f"Seeded with {len(seed_names)} derived tag(s); labeling may coin more")
+
             # Reload already-generated docs from cache so the whole docset stays
             # consistent as its schema/roster grows; changed originals re-render
-            # (no re-LLM).
-            for stem, blocks in load_labeled_docs_from_cache(cache_dir, list(prior_stems)).items():
+            # (no re-LLM). Replay resolves through the SAME vocabulary a fresh
+            # run uses, or a re-rendered prior would diverge from its neighbours.
+            for stem, blocks in load_labeled_docs_from_cache(
+                cache_dir, list(prior_stems), vocab
+            ).items():
                 nm = prior_stems[stem]
                 prior_docs[nm] = blocks
                 prior_outputs[nm] = ws.blobs.get_blob(prior_out_paths[nm]).decode("utf-8")
@@ -3561,9 +3850,11 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     workspace=ws,
                     dgml_header=build_header(ws.organization, ds.name),
                     converters=load_conversion_config(ws),
+                    pdf_config=load_pdf_config(ws),
                     roster_seed=roster_seed,
                     schema_seed=schema_seed,
                     parent_map=parent_map_seed or None,
+                    vocab=vocab,
                     progress=_diag,
                 )
                 convert_batch(
@@ -3572,6 +3863,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     on_output=_on_output,
                     on_error=_on_error,
                     on_label_error=_on_label_error,
+                    on_off_schema=_on_off_schema,
                     prior_docs=prior_docs,
                     prior_outputs=prior_outputs,
                 )
@@ -3622,6 +3914,17 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             # reads it back — then flush the cache working dir to the store.
             if not args.cache_dir and schema_json_local.exists():
                 ws.blobs.put_blob(schema_key, schema_json_local.read_bytes())
+            # The authored vocabulary lands in a slot derive_schema never
+            # touches. Without this, ground truth goes in and `seed union
+            # everything coined` comes back out, and the NEXT run auto-seeds
+            # from that polluted version — which is precisely why a seeded run
+            # is not reproducible today. Stored in canonical Schema v1 form
+            # whatever form it was authored in (tag list, {name: description},
+            # RNC), so there is one shape to read back.
+            if not args.cache_dir and authored_seed is not None:
+                authored_seed.save(authored_local)
+                ws.blobs.put_blob(authored_key, authored_local.read_bytes())
+                _diag(f"[schema] wrote {layout.AUTHORED_SCHEMA_FILE} (authored vocabulary)")
     else:
         _diag("Nothing to convert — every file is already converted, missing, or a duplicate name.")
 
@@ -3751,6 +4054,20 @@ def _gather_pdfs(directory: Path, *, recursive: bool, suffixes: frozenset[str]) 
     return sorted(p for p in candidates if p.is_file() and p.suffix.lower() in suffixes)
 
 
+def _require_existing_docsets(docsets: list[DocSet]) -> None:
+    """Guard the ``--auto-classify existing`` precondition.
+
+    That mode must place the file in an existing DocSet, so an empty workspace
+    admits no outcome at all. Raising beats degrading to "unassigned", which is
+    the very thing the mode is chosen to avoid.
+    """
+    if not docsets:
+        raise NoExistingDocSets(
+            "no DocSets to assign to; create one with `dgml docset create`, "
+            f"or use `--auto-classify {ClassifyMode.EXISTING_OR_NEW}`"
+        )
+
+
 def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fmt: str) -> int:
     """Add every PDF under a directory in one run, emitting a single envelope.
 
@@ -3768,7 +4085,9 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
     recursive: bool = args.recursive
     pdfs = _gather_pdfs(directory, recursive=recursive, suffixes=_ingestible_suffixes(ws))
 
-    auto_classify = getattr(args, "auto_classify", False)
+    classify_mode = getattr(args, "auto_classify", None)
+    auto_classify = classify_mode is not None
+    allow_new = classify_mode != ClassifyMode.EXISTING
     config: ClassificationConfig | None = None
     docsets: list[DocSet] | None = None
     if auto_classify:
@@ -3779,6 +4098,10 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         # Read existing DocSets once; _auto_classify appends newly-created
         # ones so similar PDFs cluster within the run without re-scanning.
         docsets = DocSetStore(ws).list_all()
+        if not allow_new:
+            # Checked here so the run aborts before any file is added rather
+            # than on the first one.
+            _require_existing_docsets(docsets)
 
     on_conflict = ConflictPolicy(args.on_conflict)
     text_mode = TextMode(args.text_mode)
@@ -3821,7 +4144,12 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         entry: dict[str, Any] = {"status": status, "path": str(pdf), **_file_add_payload(result)}
         if auto_classify:
             entry["classification"] = _auto_classify(
-                ws, result, config=config, docsets=docsets, debug=args.debug
+                ws,
+                result,
+                config=config,
+                docsets=docsets,
+                allow_new=allow_new,
+                debug=args.debug,
             )
         entries.append(entry)
 
@@ -3840,9 +4168,31 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     sub = args.file_command
     if sub == "add":
         if args.path.is_dir():
+            # Checked here rather than in FileStore.add: "directory" is a
+            # CLI-surface concept the store never sees (its is_file() check
+            # would fail first, with a misleading "does not exist").
+            if args.id is not None:
+                raise InvalidArgument(
+                    f"--id names one File and cannot be used when PATH is a directory "
+                    f"({args.path}) — a bulk run adds many. Add the files one at a time "
+                    f"to choose each id."
+                )
             return _file_add_bulk(args, ws, store, fmt)
+        classify_mode = getattr(args, "auto_classify", None)
+        allow_new = classify_mode != ClassifyMode.EXISTING
+        config: ClassificationConfig | None = None
+        docsets: list[DocSet] | None = None
+        if classify_mode is not None and not allow_new:
+            # Assign-only mode has to land the file in an existing DocSet, so
+            # both its preconditions are checked *before* ingesting: erroring
+            # out after the add would leave behind exactly the unassigned file
+            # this mode exists to prevent. Same order as the bulk path.
+            config = load_classification_config(ws)
+            docsets = DocSetStore(ws).list_all()
+            _require_existing_docsets(docsets)
         result = store.add(
             args.path,
+            file_id=args.id,
             on_conflict=ConflictPolicy(args.on_conflict),
             text_mode=TextMode(args.text_mode),
             dpi=args.dpi,
@@ -3850,10 +4200,18 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             debug=args.debug,
         )
         payload: dict[str, Any] = _file_add_payload(result)
-        if getattr(args, "auto_classify", False):
-            # _auto_classify loads the classification config itself; a
-            # missing/invalid one raises straight through to an error envelope.
-            payload["classification"] = _auto_classify(ws, result, debug=args.debug)
+        if classify_mode is not None:
+            # In the default mode _auto_classify loads the classification
+            # config itself; a missing/invalid one raises straight through to
+            # an error envelope.
+            payload["classification"] = _auto_classify(
+                ws,
+                result,
+                config=config,
+                docsets=docsets,
+                allow_new=allow_new,
+                debug=args.debug,
+            )
         _emit(payload, fmt)
     elif sub == "list":
         _emit({"files": [f.to_json() for f in store.list_all()]}, fmt)
@@ -3873,11 +4231,21 @@ def _auto_classify(
     *,
     config: ClassificationConfig | None = None,
     docsets: list[DocSet] | None = None,
+    allow_new: bool = True,
     debug: bool = False,
 ) -> dict[str, Any]:
     """Run LLM auto-classification on a freshly added File and assign it.
 
     Returns the ``classification`` block embedded in ``dgml file add`` output.
+
+    ``allow_new=False`` (``--auto-classify existing``) forbids creating a
+    DocSet and always assigns: the LLM is given only the assign tool and must
+    return the best-fitting DocSet even when the fit is poor. With no DocSets
+    to choose from the mode has no possible outcome, so it is a **hard** error
+    (``NO_EXISTING_DOCSETS``) — a precondition on the request rather than a
+    failure of the classification call. Callers check it via
+    :func:`_require_existing_docsets` before adding any file; the re-raise
+    below keeps it hard if one ever doesn't.
 
     A missing or invalid classification config is a **hard** failure: when
     ``config`` is not supplied it is loaded here via
@@ -3919,7 +4287,14 @@ def _auto_classify(
     }
 
     try:
-        decision = classify_file(ws, file_id, config=config, docsets=docsets, debug=debug)
+        decision = classify_file(
+            ws, file_id, config=config, docsets=docsets, allow_new=allow_new, debug=debug
+        )
+    except NoExistingDocSets:
+        # A precondition on the request, not a failure of the call — callers
+        # check it before ingesting anything. Kept hard even if one didn't:
+        # soft-failing would leave the unassigned file this mode prevents.
+        raise
     except DgmlError as exc:
         block["error"] = f"{exc.code}: {exc}"
         return block
@@ -3945,7 +4320,7 @@ def _auto_classify(
             )
             if extraction_block is not None:
                 block["extraction"] = extraction_block
-        else:
+        elif decision.decision == "new":
             assert decision.new_name is not None and decision.new_description is not None
             created = docset_store.create(
                 name=decision.new_name,
@@ -3962,6 +4337,8 @@ def _auto_classify(
                 docset_name=created.name,
                 docset_key_questions=list(created.key_questions),
             )
+        else:  # unreachable — classify_file returns only these three
+            raise AssertionError(f"unhandled classification decision: {decision.decision}")
     except DgmlError as exc:
         block["error"] = f"{exc.code}: {exc}"
     return block

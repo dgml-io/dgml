@@ -30,11 +30,13 @@ from .errors import (
     CorruptMetadata,
     DgmlError,
     DocSetNotFound,
+    EngineNotAvailable,
     FileNotFound,
     GhostscriptNotFound,
     InvalidArgument,
     InvalidPDF,
     PageRenderFailed,
+    PdfConfigInvalid,
     UnsupportedFileType,
     WorkspaceMigrationFailed,
     WorkspaceNotInitialized,
@@ -59,6 +61,7 @@ from .file_attestation import (
     write_attestation,
 )
 from .files import AddFileResult, ConflictPolicy, FileStore
+from .ids import RECORD_ID_SHAPE, is_record_id
 from .layout import Collection
 from .migrations import (
     WORKSPACE_SCHEMA_VERSION,
@@ -70,6 +73,7 @@ from .migrations import (
     workspace_schema_version,
 )
 from .models import DocSet, FileRecord
+from .pages import EngineName, PdfConfig, PdfSlicer, load_pdf_config, slice_pages
 from .storage import Workspace
 from .storage_local import LocalStore
 from .storage_resolve import (
@@ -87,7 +91,12 @@ from .storage_service import (
     StorageConfig,
 )
 from .workspace_config import WorkspaceIdentity
-from .workspace_id import is_workspace_id, mint_workspace_id, new_workspace_id
+from .workspace_id import (
+    ID_SHAPE,
+    generate_unique_workspace_id,
+    is_workspace_id,
+    new_workspace_id,
+)
 from .workspace_ops import WorkspaceOps
 from .workspaces_local import LocalDirWorkspacesStore
 from .workspaces_resolve import (
@@ -104,6 +113,8 @@ __all__ = [
     "DEFAULT_STORAGE_PROVIDER",
     "DEFAULT_STORAGE_SERVICE",
     "DEFAULT_WORKSPACES_PROVIDER",
+    "ID_SHAPE",
+    "RECORD_ID_SHAPE",
     "WORKSPACE_SCHEMA_VERSION",
     "AddFileResult",
     "ArtifactKind",
@@ -125,6 +136,8 @@ __all__ = [
     "DocSetNotFound",
     "DocSetStore",
     "DocStore",
+    "EngineName",
+    "EngineNotAvailable",
     "FileAttestation",
     "FileNotFound",
     "FileRecord",
@@ -139,6 +152,9 @@ __all__ = [
     "Migration",
     "MigrationResult",
     "PageRenderFailed",
+    "PdfConfig",
+    "PdfConfigInvalid",
+    "PdfSlicer",
     "StorageConfig",
     "UnsupportedFileType",
     "VerifyResult",
@@ -158,9 +174,12 @@ __all__ = [
     "default_workspaces_root",
     "default_workspaces_store",
     "export_attestation",
+    "generate_unique_workspace_id",
+    "is_record_id",
     "is_workspace_id",
     "layout",
     "load_conversion_config",
+    "load_pdf_config",
     "load_store_configs",
     "load_workspaces_config",
     "make_blob_store",
@@ -168,11 +187,11 @@ __all__ = [
     "make_doc_store",
     "make_workspaces_store",
     "migrate_workspace",
-    "mint_workspace_id",
     "new_workspace_id",
     "pending_migrations",
     "read_attestation",
     "resolve_store_configs",
+    "slice_pages",
     "stamp_schema_version",
     "storage_fingerprint",
     "verify_attestation_dir",

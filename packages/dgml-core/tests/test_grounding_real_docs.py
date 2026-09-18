@@ -98,7 +98,6 @@ def _load_workspace(tmp_path: Path, case: str) -> tuple[Workspace, dict[str, Any
     text — all the matcher reads — and return it with the parsed inputs."""
     inputs = json.loads((FIXTURES / case / "inputs.json").read_text())
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     file_id = inputs["source"]["file_id"]
     text_prefix = layout.file_text_prefix(file_id)
     for page_text in sorted((FIXTURES / case / "page_text").glob("page_*.json")):

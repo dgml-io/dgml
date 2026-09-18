@@ -59,14 +59,15 @@ class ConfigSection(StrEnum):
     the lookup key into the merged config mapping and formats to the bare name in
     error messages. The tier-backed sections (``classification``, ``style``,
     ``text_extraction``, ``generation``, ``grounded``) are the ones passed to
-    :func:`resolve_tiered_model`; the rest (``models``, ``ocr``, ``conversion``,
-    ``clustering``) configure non-LLM or tier-source settings."""
+    :func:`resolve_tiered_model`; the rest (``models``, ``ocr``, ``pdf``,
+    ``conversion``, ``clustering``) configure non-LLM or tier-source settings."""
 
     MODELS = "models"
     GENERATION = "generation"
     GROUNDED = "grounded"
     CLASSIFICATION = "classification"
     OCR = "ocr"
+    PDF = "pdf"
     STYLE = "style"
     TEXT_EXTRACTION = "text_extraction"
     CONVERSION = "conversion"

@@ -97,8 +97,9 @@ export DGML_HOME=./my-dgml-workspace
 uv run dgml workspace create --organization "Acme" --name "Getting Started"
 ```
 *Note: `workspace create` is idempotent and safe to re-run. It creates the
-workspace (`docsets/` + `files/`), records its identity in `workspace.json`,
-including a stable `workspace_id` (`ws_…`, echoed in the JSON output), and writes
+workspace, records its identity in `workspace.json`,
+including a stable `workspace_id` (generated as `ws_…` and echoed in the JSON output, or
+set outright with `--id my-workspace`), and writes
 `<workspace>/config.toml`. `workspace create` does **not** create or touch your
 user-level config — that's `dgml init`'s job (run once per machine; see §1.4). If you
 haven't run `dgml init` yet, `workspace create` still succeeds but prints a warning to
@@ -115,7 +116,7 @@ workspace into the store later if you want it listed.*
 
 > **Keep `<workspace>/config.toml` with the workspace — don't delete it.** It names
 > the storage backend the workspace's data lives on, and nothing else records that.
-> A workspace whose config is missing fails with `STORAGE_CONFIG_INVALID` rather than
+> A workspace whose config is missing fails with `WORKSPACE_NOT_INITIALIZED` rather than
 > quietly opening an empty one. To override models for this workspace, **edit** that
 > file: every section except `[storage]` deep-merges over your user config.*
 
@@ -226,7 +227,7 @@ uv run dgml status
 ```
 
 #### List Ingested Files
-Retrieve all files in the workspace with their unique 12-char base-36 IDs (e.g., `k7q3xb91pmrf`):
+Retrieve all files in the workspace with their unique IDs — generated as 12-char base-36 (e.g., `k7q3xb91pmrf`), or whatever you passed to `file add --id`:
 ```bash
 uv run dgml file list
 ```

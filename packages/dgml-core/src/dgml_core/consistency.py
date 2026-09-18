@@ -23,7 +23,7 @@ from .errors import (
     AuthError,
     CorruptMetadata,
     DgmlError,
-    GhostscriptNotFound,
+    EngineNotAvailable,
     OcrFailed,
     PageRenderFailed,
     RecordedError,
@@ -35,7 +35,13 @@ from .errors import (
 )
 from .hybrid import extract_text_hybrid
 from .ocr import extract_text_ocr, load_ocr_config
-from .pages import DEFAULT_DPI, render_pages
+from .pages import (
+    DEFAULT_DPI,
+    EngineName,
+    PdfConfig,
+    load_pdf_config,
+    render_pages,
+)
 from .storage import Workspace
 from .text_extraction import (
     ExtractDigitalResult,
@@ -173,6 +179,7 @@ def _check_file(
     page_count: int | None = record_data.get("page_count")
     original_filename = record_data.get("original_filename")
     dpi = _recorded_dpi(record_data)
+    render_config = _recorded_renderer(record_data, ws)
 
     if not original_filename:
         report.issues.append(
@@ -251,6 +258,7 @@ def _check_file(
                 permanent_ops=permanent_ops,
                 file_id=file_id,
                 dpi=dpi,
+                render_config=render_config,
                 report=report,
             )
             if not recovered:
@@ -267,6 +275,7 @@ def _check_file(
         permanent_ops=permanent_ops,
         file_id=file_id,
         dpi=dpi,
+        render_config=render_config,
         report=report,
     )
 
@@ -291,16 +300,16 @@ def _check_file(
         )
 
 
-def _render(ws: Workspace, source_key: str, pages_prefix: str, dpi: int) -> int:
+def _render(ws: Workspace, source_key: str, pages_prefix: str, dpi: int, config: PdfConfig) -> int:
     """Render the source PDF's page images through the store.
 
-    Materialize the source to a real path (ghostscript needs one) and render
+    Materialize the source to a real path (the renderer needs one) and render
     into a store-backed staging directory; ``render_pages`` clears stale images
-    itself. ``dpi`` reproduces the file's existing render resolution so repaired
-    pages stay aligned with the ``page_text/`` boxes already stored. Returns the
-    page count."""
+    itself. ``dpi`` and ``config`` reproduce the file's existing render
+    resolution and backend so repaired pages stay aligned with the
+    ``page_text/`` boxes already stored. Returns the page count."""
     with ws.blobs.materialize(source_key) as pdf_path, ws.blobs.staged_write(pages_prefix) as tmp:
-        return render_pages(pdf_path, tmp, dpi=dpi)
+        return render_pages(pdf_path, tmp, dpi=dpi, config=config)
 
 
 def _recorded_dpi(record_data: dict[str, Any]) -> int:
@@ -319,6 +328,24 @@ def _recorded_dpi(record_data: dict[str, Any]) -> int:
     return DEFAULT_DPI
 
 
+def _recorded_renderer(record_data: dict[str, Any], ws: Workspace) -> PdfConfig:
+    """The renderer this file's pages were produced with, per its own record.
+
+    Same rationale as :func:`_recorded_dpi`: a repair must reproduce the
+    file's *existing* render, and different backends produce (subtly)
+    different pixels. Records written before renderers were configurable all
+    say ``"ghostscript"``. When the record names no (or an unknown) renderer,
+    fall back to the workspace's configured one.
+    """
+    recorded = record_data.get("page_image_renderer")
+    if isinstance(recorded, str):
+        try:
+            return PdfConfig(provider=EngineName(recorded))
+        except ValueError:
+            pass
+    return load_pdf_config(ws)
+
+
 def _recover_missing_pages(
     *,
     ws: Workspace,
@@ -327,12 +354,13 @@ def _recover_missing_pages(
     permanent_ops: set[str],
     file_id: str,
     dpi: int,
+    render_config: PdfConfig,
     report: CheckReport,
 ) -> int:
     """Recover a file whose stored page count is unknown/bogus and which has
     no rendered pages stored, by attempting a fresh render.
 
-    Ghostscript is the authority on how many pages a PDF has, so a successful
+    The renderer is the authority on how many pages a PDF has, so a successful
     render establishes the true count. Returns the number of pages rendered,
     or 0 if it could not be recovered — in which case an explanatory ``Issue``
     has already been appended to ``report``.
@@ -349,8 +377,8 @@ def _recover_missing_pages(
         return 0
 
     try:
-        actual = _render(ws, source_key, pages_prefix, dpi)
-    except (GhostscriptNotFound, PageRenderFailed) as exc:
+        actual = _render(ws, source_key, pages_prefix, dpi, render_config)
+    except (EngineNotAvailable, PageRenderFailed) as exc:
         append_recorded_error(
             ws,
             file_id,
@@ -377,7 +405,7 @@ def _recover_missing_pages(
                 kind="pdf_unreadable",
                 target_type="file",
                 target_id=file_id,
-                message="page count unavailable and ghostscript rendered no pages",
+                message="page count unavailable and the renderer produced no pages",
             )
         )
         return 0
@@ -404,6 +432,7 @@ def _check_page_rendering(
     permanent_ops: set[str],
     file_id: str,
     dpi: int,
+    render_config: PdfConfig,
     report: CheckReport,
 ) -> None:
     if rendered == expected:
@@ -424,8 +453,8 @@ def _check_page_rendering(
         return
 
     try:
-        actual = _render(ws, source_key, pages_prefix, dpi)
-    except (GhostscriptNotFound, PageRenderFailed) as exc:
+        actual = _render(ws, source_key, pages_prefix, dpi, render_config)
+    except (EngineNotAvailable, PageRenderFailed) as exc:
         append_recorded_error(
             ws,
             file_id,

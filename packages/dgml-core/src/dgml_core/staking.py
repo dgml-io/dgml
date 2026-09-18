@@ -378,8 +378,12 @@ def registry_list(
 
 
 def _default_bundle_dir(ws: Workspace, file_id: str, docset_id: str | None) -> Path:
-    stem = file_id + (f"-{docset_id}" if docset_id else "")
-    return ws.root / "dgmlx-bundles" / stem
+    # Nested, not joined into one `<file>-<docset>` stem: ids may contain hyphens
+    # (`file add --id`), so concatenating makes ("report-v2", "alpha") and
+    # ("report", "v2-alpha") collide on one directory. Each id is already a
+    # safe single path segment, so a segment apiece is unambiguous.
+    base = ws.root / "dgmlx-bundles" / file_id
+    return base / docset_id if docset_id else base
 
 
 def stake_file(

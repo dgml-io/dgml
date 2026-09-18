@@ -81,6 +81,17 @@ def test_composite_ids_and_delete(docs: MongoDocStore) -> None:
     assert docs.get_doc("assignments", "d1/f1") is None
 
 
+def test_ids_with_separators_round_trip(docs: MongoDocStore) -> None:
+    """Caller-supplied ids may contain `-` and `_` (`file add --id`). They are
+    Mongo `_id` values and one half of a composite `<docset>/<file>` id."""
+    docs.put_doc("files", "invoice_2024_q1", {"id": "invoice_2024_q1"})
+    assert docs.get_doc("files", "invoice_2024_q1") == {"id": "invoice_2024_q1"}
+    docs.put_doc("assignments", "my_set-2/invoice_2024", {"file_id": "invoice_2024"})
+    assert docs.get_doc("assignments", "my_set-2/invoice_2024") == {"file_id": "invoice_2024"}
+    docs.delete_doc("files", "invoice_2024_q1")
+    assert docs.get_doc("files", "invoice_2024_q1") is None
+
+
 def test_delete_docs_returns_count(docs: MongoDocStore) -> None:
     for n in range(3):
         docs.put_doc("files", f"f{n}", {"id": f"f{n}", "kind": "pdf"})

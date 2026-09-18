@@ -31,6 +31,7 @@ from .errors import (
     AuthError,
     ConflictError,
     DgmlError,
+    EngineNotAvailable,
     FileNotFound,
     InvalidArgument,
     InvalidPDF,
@@ -44,10 +45,16 @@ from .errors import (
 )
 from .hashing import sha256_file
 from .hybrid import extract_text_hybrid
-from .ids import new_id
+from .ids import RECORD_ID_SHAPE, is_record_id, new_id
 from .models import FileRecord
 from .ocr import extract_text_ocr, load_ocr_config
-from .pages import DEFAULT_DPI, RENDERER_NAME, pdf_page_count, render_pages
+from .pages import (
+    DEFAULT_DPI,
+    PdfConfig,
+    load_pdf_config,
+    pdf_page_count,
+    render_pages,
+)
 from .storage import Workspace
 from .text_extraction import TextMode, classify_extraction_outcome, extract_text_digital
 from .text_extraction_config import load_text_extraction_config
@@ -138,6 +145,7 @@ class FileStore:
         self,
         source_path: Path,
         *,
+        file_id: str | None = None,
         on_conflict: ConflictPolicy = ConflictPolicy.ERROR,
         text_mode: TextMode = TextMode.DIGITAL,
         dpi: int = DEFAULT_DPI,
@@ -148,6 +156,16 @@ class FileStore:
         # add leaves the workspace untouched rather than half-built.
         if dpi <= 0:
             raise ValueError(f"dpi must be a positive integer; got {dpi!r}")
+        if file_id is not None and not is_record_id(file_id):
+            # Shape costs nothing to check — no digest, no store read — so the
+            # common typo is rejected before the source is even opened. The id is
+            # never case-folded for the caller: it is how their system and this
+            # workspace name the same document, so rewriting it would let the two
+            # diverge silently. RECORD_ID_SHAPE says outright that letters must be
+            # lowercase, which is the whole of what a caller needs to fix it.
+            raise InvalidArgument(
+                f"file id {file_id!r} is not well formed: it must be {RECORD_ID_SHAPE}."
+            )
         if text_mode in (TextMode.OCR, TextMode.HYBRID):
             # Validate OCR config *before* touching the filesystem so a
             # rejected add leaves the workspace untouched. Hybrid needs OCR
@@ -163,6 +181,50 @@ class FileStore:
         original_path = self._relative_original_path(source_path)
         same_hash, same_path = self._find_conflicts(digest, original_path)
 
+        # A requested id is the one input that can *destroy* data if unchecked:
+        # put_doc is an upsert on every backend, so writing a record under an id
+        # another record holds would silently replace it. Everything above is
+        # reads only, so every exit from here still leaves the workspace
+        # untouched. This has to come after the digest — whether a taken id is a
+        # collision or an idempotent re-add of the same bytes is not knowable
+        # without it — and after _find_conflicts, because the same-content
+        # branch re-points same_hash. Best-effort against a race: get_doc ->
+        # put_doc is not atomic and no backend offers a conditional insert, the
+        # same posture as generate_unique_workspace_id.
+        if file_id is not None:
+            held_data = self.ws.docs.get_doc(layout.Collection.FILES, file_id)
+            if held_data is not None:
+                held = FileRecord.from_json(held_data)
+                reingesting = (
+                    on_conflict is ConflictPolicy.REPLACE
+                    and same_path is not None
+                    and same_path.id == file_id
+                )
+                if held.sha256 != digest and not reingesting:
+                    raise ConflictError(
+                        f"file id '{file_id}' is already held by a file with different "
+                        f"content (added from '{held.original_path}'). Pick an unused id, "
+                        f"or delete '{file_id}' first. No --on-conflict policy overrides "
+                        f"this: reusing the id would destroy that record.",
+                        kind="id",
+                        existing_id=file_id,
+                    )
+                if held.sha256 == digest:
+                    if on_conflict is ConflictPolicy.DUPLICATE:
+                        raise ConflictError(
+                            f"duplicate creates a second record, but file id '{file_id}' "
+                            f"is already taken (by this same content). Omit the id to "
+                            f"generate one, or pick an unused id.",
+                            kind="id",
+                            existing_id=file_id,
+                        )
+                    # An idempotent re-add of *this* record. Pin the hash conflict
+                    # to it: _find_conflicts scans in id-sorted order and returns
+                    # whichever same-content record sorts first, which need not be
+                    # the one the caller named (the same bytes can legitimately be
+                    # present twice after an earlier `duplicate`).
+                    same_hash = held
+
         if same_hash is not None:
             if on_conflict is ConflictPolicy.ERROR:
                 raise ConflictError(
@@ -171,16 +233,18 @@ class FileStore:
                     existing_id=same_hash.id,
                 )
             if on_conflict is ConflictPolicy.SKIP:
-                return AddFileResult(
-                    record=same_hash,
-                    created=False,
+                return self._existing_result(
+                    same_hash,
+                    file_id,
+                    on_conflict,
                     conflict_kind="hash",
                     note="existing record returned (identical content)",
                 )
             if on_conflict is ConflictPolicy.REPLACE:
-                return AddFileResult(
-                    record=same_hash,
-                    created=False,
+                return self._existing_result(
+                    same_hash,
+                    file_id,
+                    on_conflict,
                     conflict_kind="hash",
                     note="replace is a no-op when content is identical; existing record returned",
                 )
@@ -194,9 +258,10 @@ class FileStore:
                     existing_id=same_path.id,
                 )
             if on_conflict is ConflictPolicy.SKIP:
-                return AddFileResult(
-                    record=same_path,
-                    created=False,
+                return self._existing_result(
+                    same_path,
+                    file_id,
+                    on_conflict,
                     conflict_kind="path",
                     note="existing record returned (same source path, different content)",
                 )
@@ -207,6 +272,7 @@ class FileStore:
         return self._create_record(
             source_path,
             digest,
+            file_id=file_id,
             original_path=original_path,
             conflict_kind=("hash" if same_hash else "path" if same_path else None),
             text_mode=text_mode,
@@ -214,6 +280,37 @@ class FileStore:
             verbose=verbose,
             debug=debug,
         )
+
+    def _existing_result(
+        self,
+        record: FileRecord,
+        requested_id: str | None,
+        on_conflict: ConflictPolicy,
+        *,
+        conflict_kind: str,
+        note: str,
+    ) -> AddFileResult:
+        """Hand back a record dedup already matched — unless the caller named a
+        different id.
+
+        Every "return the existing one" path routes through here deliberately. The
+        caller said the result must be called X; returning a record called Y is not
+        that, and doing it silently is how a caller ends up writing ``dgmlx://X``
+        URIs for a file that is not X. The workspace is intact, so it is the
+        *request* that cannot be satisfied — InvalidArgument, not ConflictError.
+
+        Stated as an outcome rather than a policy test on purpose: ``replace`` on a
+        *path* conflict deletes the old record and creates a new one, which can and
+        should carry the requested id, so it never reaches here."""
+        if requested_id is not None and record.id != requested_id:
+            raise InvalidArgument(
+                f"file id {requested_id!r} cannot be honoured: this content is already "
+                f"in the workspace as '{record.id}' ({conflict_kind} match), and "
+                f"--on-conflict {on_conflict.value} returns that record instead of "
+                f"creating one. Use --on-conflict duplicate to add a second record as "
+                f"{requested_id!r}, delete '{record.id}', or omit the id."
+            )
+        return AddFileResult(record=record, created=False, conflict_kind=conflict_kind, note=note)
 
     def _relative_original_path(self, source_path: Path) -> str:
         """The source's location as a path relative to the workspace root.
@@ -264,13 +361,17 @@ class FileStore:
         original_path: str,
         conflict_kind: str | None,
         text_mode: TextMode,
+        file_id: str | None = None,
         dpi: int = DEFAULT_DPI,
         verbose: bool = False,
         debug: bool = False,
     ) -> AddFileResult:
-        file_id = new_id()
-        # The store owns container creation (upload_blob writes the source blob);
-        # a fresh new_id never collides, so no directory is created up front.
+        file_id = file_id or new_id()
+        # The store owns container creation (upload_blob writes the source blob),
+        # so no directory is created up front. A fresh new_id never collides, and
+        # a caller-supplied id was shape-checked and proved free by `add` — which
+        # is where that check has to live, since only `add` holds the digest that
+        # tells a collision from an idempotent re-add.
         # The original source is stored under its own name (a blob). A convertible
         # source is converted to a PDF here (persisted alongside it as
         # `<stem>.pdf` by _ensure_pdf) to drive page rendering / count / text
@@ -301,9 +402,12 @@ class FileStore:
         # Page count, render, and text extraction all need a real PDF path; one
         # materialize yields it (zero-copy on LocalStore, a temp download on a
         # remote store) and all three share it.
+        render_config = load_pdf_config(self.ws)
         with self.ws.blobs.materialize(pdf_key) as pdf_path:
             page_count, page_count_error = self._safe_page_count(pdf_path, file_id)
-            page_render_error = self._render_pages(pdf_path, file_id, expected=page_count, dpi=dpi)
+            page_render_error = self._render_pages(
+                pdf_path, file_id, expected=page_count, dpi=dpi, config=render_config
+            )
             text_extraction_error, text_summary = self._extract_text(
                 pdf_path,
                 file_id,
@@ -323,7 +427,7 @@ class FileStore:
             page_count=page_count,
             text_mode=text_mode.value,
             page_image_dpi=dpi,
-            page_image_renderer=RENDERER_NAME,
+            page_image_renderer=render_config.provider.value,
             pdf_converter=pdf_converter,
         )
         self.ws.docs.put_doc(layout.Collection.FILES, file_id, record.to_json())
@@ -407,15 +511,26 @@ class FileStore:
             return None, message
 
     def _render_pages(
-        self, pdf_path: Path, file_id: str, *, expected: int | None, dpi: int = DEFAULT_DPI
+        self,
+        pdf_path: Path,
+        file_id: str,
+        *,
+        expected: int | None,
+        dpi: int = DEFAULT_DPI,
+        config: PdfConfig | None = None,
     ) -> str | None:
         """Render pages, recording errors. Returns a human-readable error
         message on failure or partial success, or ``None`` on full success."""
         try:
             pages_prefix = layout.file_pages_prefix(file_id)
             with self.ws.blobs.staged_write(pages_prefix) as pages_dir:
-                rendered = render_pages(pdf_path, pages_dir, dpi=dpi)
-        except PageRenderFailed as exc:
+                rendered = render_pages(pdf_path, pages_dir, dpi=dpi, config=config)
+        # EngineNotAvailable is caught with PageRenderFailed, not left to
+        # escape: the source blob is already uploaded by this point, so an
+        # uncaught raise strands it with no file.json and `dgml check` reports
+        # the workspace broken. A misconfigured renderer is a soft, recorded
+        # per-file failure — the same shape consistency.py already uses.
+        except (EngineNotAvailable, PageRenderFailed) as exc:
             append_recorded_error(
                 self.ws,
                 file_id,

@@ -52,7 +52,7 @@ GridFS addresses a blob by ``filename`` **plus** ``uploadDate``; a
 ``BlobStore`` addresses it by key alone. Reconciling the two is the whole
 substance of this class:
 
-``upload_from_stream`` *versions* — it mints a new file id and leaves the prior
+``upload_from_stream`` *versions* — it generates a new file id and leaves the prior
 revision in place. So :meth:`put_blob` captures the prior revision ids before
 uploading and deletes them after. That imposes replace semantics, and orders the
 write so the new bytes land complete before the old are collected: a crash

@@ -82,6 +82,9 @@ def dump_toml(data: dict[str, Any], _prefix: str = "") -> str:
 
 def write_config(workspace: Workspace, data: dict[str, Any]) -> None:
     """Write ``<workspace>/config.toml`` (resolution layer 3) from a dict."""
+    # Nothing scaffolds the workspace root any more (`Workspace.init()` is gone),
+    # so a helper that writes into it has to make sure it exists.
+    workspace.root.mkdir(parents=True, exist_ok=True)
     workspace.config_path.write_text(dump_toml(data) + "\n", encoding="utf-8")
 
 
@@ -157,10 +160,84 @@ def _write_text_pdf(path: Path, pages_text: list[str]) -> None:
     path.write_bytes(bytes(out))
 
 
+def _write_pdf_with_cropbox(path: Path, crop: tuple[int, int, int, int]) -> None:
+    """US Letter MediaBox with a smaller CropBox, text inside the crop.
+
+    The case that separates a MediaBox rasterizer from a CropBox one.
+    """
+    _write_page_variant_pdf(path, extra=f" /CropBox [{crop[0]} {crop[1]} {crop[2]} {crop[3]}]")
+
+
+def _write_pdf_with_mediabox(path: Path, media: tuple[float, float, float, float]) -> None:
+    """One-page PDF with an arbitrary (possibly degenerate) MediaBox."""
+    box = " ".join(str(v) for v in media)
+    _write_page_variant_pdf(path, media_override=box)
+
+
+def _write_pdf_with_bad_count(path: Path, *, real_pages: int, declared: int) -> None:
+    """A PDF whose ``/Count`` overstates how many page objects exist."""
+    _write_page_variant_pdf(path, pages=real_pages, count_override=declared)
+
+
+def _write_page_variant_pdf(
+    path: Path,
+    *,
+    extra: str = "",
+    pages: int = 1,
+    count_override: int | None = None,
+    media_override: str | None = None,
+) -> None:
+    """Hand-built PDF with per-page dictionary extras and an optional bogus
+    ``/Count`` — the structural knobs the geometry tests need."""
+    out = bytearray()
+    offsets: list[int] = []
+
+    def add(body: bytes) -> int:
+        offsets.append(len(out))
+        n = len(offsets)
+        out.extend(f"{n} 0 obj\n".encode())
+        out.extend(body)
+        out.extend(b"\nendobj\n")
+        return n
+
+    out.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    pages_id, font_id = 2, 3
+    page_ids = list(range(4, 4 + pages))
+    content_ids = list(range(page_ids[-1] + 1, page_ids[-1] + 1 + pages))
+    add(f"<< /Type /Catalog /Pages {pages_id} 0 R >>".encode())
+    kids = " ".join(f"{p} 0 R" for p in page_ids)
+    count = count_override if count_override is not None else pages
+    add(f"<< /Type /Pages /Kids [{kids}] /Count {count} >>".encode())
+    add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    for pid, cid in zip(page_ids, content_ids, strict=True):
+        body = (
+            f"<< /Type /Page /Parent {pages_id} 0 R "
+            f"/MediaBox [{media_override or f'0 0 {PAGE_WIDTH_PTS} {PAGE_HEIGHT_PTS}'}]{extra} "
+            f"/Contents {cid} 0 R "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> >>"
+        ).encode()
+        assert add(body) == pid
+    for _cid in content_ids:
+        stream = b"BT /F1 12 Tf 200 400 Td (Inside) Tj ET\n"
+        add(f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"endstream")
+    xref = len(out)
+    n_obj = len(offsets)
+    out.extend(f"xref\n0 {n_obj + 1}\n".encode())
+    out.extend(b"0000000000 65535 f \n")
+    for off in offsets:
+        out.extend(f"{off:010d} 00000 n \n".encode())
+    out.extend(
+        (f"trailer\n<< /Size {n_obj + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").encode()
+    )
+    path.write_bytes(bytes(out))
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> Workspace:
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
+    # Nothing scaffolds the root now that `init()` is gone; stores create what they
+    # write into, but a test writing directly under the root needs it to exist.
+    ws.root.mkdir(parents=True, exist_ok=True)
     return ws
 
 

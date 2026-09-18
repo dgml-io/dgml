@@ -257,12 +257,14 @@ def _backfill_workspace_id(ws: Workspace) -> int:
     no-op once an id is present. Because it must run everywhere, it lives outside
     the LocalStore guard below (calling it unconditionally is the point).
     """
-    from .workspace_id import mint_workspace_id
+    from .workspace_id import generate_unique_workspace_id
 
     if ws.workspace_id is not None:
         return 0
     ws.write_meta(
-        name=ws.display_name, organization=ws.organization, workspace_id=mint_workspace_id()
+        name=ws.display_name,
+        organization=ws.organization,
+        workspace_id=generate_unique_workspace_id(),
     )
     return 1
 
@@ -312,7 +314,7 @@ def _migrate_to_v1(ws: Workspace) -> int:
     - :func:`_backfill_workspace_id` — store-agnostic; runs on every backend.
     - :func:`_mirror_identity_into_config` — store-free write of that id (and the
       organization) into ``config.toml``; ordered after the backfill so a
-      freshly-minted id is mirrored in the same pass.
+      freshly generated id is mirrored in the same pass.
     - :func:`_upgrade_assignments_to_documents` — LocalStore-only (self-guarded).
 
     These are **one** migration deliberately: separate ``Migration`` entries at the

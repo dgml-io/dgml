@@ -99,30 +99,29 @@ class WorkspaceIdentity:
 # ------------------------------------------------------------------- reading
 
 
-def read_config_state(ws: Workspace) -> tuple[str | None, int | None]:
-    """This workspace's ``config.toml`` text and revision, from wherever it lives.
+def read_config_state(ws: Workspace) -> str | None:
+    """This workspace's ``config.toml`` text, from wherever it lives.
 
     The single read funnel, and the one place that knows a config may not be a file: a
     workspace held in the machine's store of workspaces gets its text from that store,
-    one addressed by path from ``ws.config_path``. ``(None, None)`` when there is no
-    config yet — the normal state of a directory that is not a workspace.
+    one addressed by path from ``ws.config_path``. ``None`` when there is no config yet
+    — the normal state of a directory that is not a workspace.
 
     Reached through :attr:`dgml_core.storage.Workspace.config_text`, which caches it;
     call that rather than this."""
     if ws.workspaces_id is not None:
         from .workspaces_resolve import default_workspaces_store
 
-        found = default_workspaces_store().read_config(ws.workspaces_id)
-        return found if found is not None else (None, None)
+        return default_workspaces_store().read_config(ws.workspaces_id)
 
     path = ws.config_path
     try:
         # newline="" so a CRLF file round-trips unchanged: the text read here is what
         # gets spliced and written back.
         with path.open("r", encoding="utf-8", newline="") as fh:
-            return fh.read(), None
+            return fh.read()
     except FileNotFoundError:
-        return None, None
+        return None
     except OSError as exc:
         raise CorruptMetadata(f"could not read {path}: {exc}") from exc
 
@@ -130,11 +129,14 @@ def read_config_state(ws: Workspace) -> tuple[str | None, int | None]:
 def write_config_text(ws: Workspace, text: str) -> None:
     """Write this workspace's ``config.toml``, to wherever it lives.
 
-    The single write funnel. Hands back the revision that came with the text so a
-    shared backend can reject a lost update rather than silently discarding the other
-    writer's ``[storage]`` table and comments, then refreshes the workspace's cached
-    text so a write-then-read inside one command stays coherent without a second
-    round trip."""
+    The single write funnel. Hands back the text the config was read as, so a shared
+    backend can reject a lost update rather than silently discarding the other writer's
+    ``[storage]`` table and comments, then refreshes the workspace's cached text so a
+    write-then-read inside one command stays coherent without a second round trip.
+
+    ``ws.config_text`` is both the conditional token and already in hand — the splice
+    that produced ``text`` started from it — so detecting a conflict costs no extra
+    read."""
     if ws.workspaces_id is None:
         path = ws.config_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,14 +145,12 @@ def write_config_text(ws: Workspace, text: str) -> None:
 
     from .workspaces_resolve import default_workspaces_store
 
-    revision = default_workspaces_store().write_config(
-        ws.workspaces_id, text, expected_revision=ws.config_revision
-    )
-    # Refresh the memo (see Workspace._config_state) so a write-then-read inside one
+    default_workspaces_store().write_config(ws.workspaces_id, text, expected_text=ws.config_text)
+    # Refresh the memo (see Workspace.config_text) so a write-then-read inside one
     # command needs no second round trip. Writing into __dict__ is legal on a frozen
     # dataclass — it is the same slot a cached_property would use. Only the store-backed
     # case has a memo to refresh; a file is re-read each time.
-    ws.__dict__[ws._CONFIG_CACHE_KEY] = (text, revision)
+    ws.__dict__[ws._CONFIG_TEXT_CACHE_KEY] = text
 
 
 def _load(ws: Workspace) -> dict[str, Any]:

@@ -264,7 +264,6 @@ def test_annotate_style_from_image(tmp_path: Path, monkeypatch) -> None:  # type
     from lxml import etree  # type: ignore[import-untyped]
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     file_id = "ocrfile12345"
     ws.blobs.put_blob(layout.file_page_image_key(file_id, 1), b"\x89PNG\r\n\x1a\n fake")
 
@@ -307,7 +306,7 @@ def _ws_with_config(tmp_path: Path, config: dict | None):  # type: ignore[type-a
     from dgml_core.storage import Workspace
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
+    ws.root.mkdir(parents=True, exist_ok=True)
     if config is not None:
         ws.config_path.write_text(dump_toml(config), encoding="utf-8")
     return ws
@@ -429,7 +428,6 @@ def test_ground_honors_style_config_for_ocr(tmp_path: Path, monkeypatch) -> None
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     fid = "ocrwire12345"
     ws.docs.put_doc(
         "files",
@@ -500,7 +498,6 @@ def _seed_ocr_style_workspace(tmp_path: Path):  # type: ignore[no-untyped-def]
     from dgml_core.storage import Workspace
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     fid = "ocrwireusage"
     ws.docs.put_doc(
         "files",
@@ -590,7 +587,6 @@ def test_ground_skips_style_config_when_disabled(tmp_path: Path, monkeypatch) ->
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     fid = "ocrwire67890"
     ws.docs.put_doc(
         "files",
@@ -645,7 +641,6 @@ def test_style_credential_failure_preserves_grounding(tmp_path: Path, monkeypatc
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     fid = "ocrwireauth1"
     ws.docs.put_doc(
         "files",
@@ -721,7 +716,6 @@ def _multipage_style_tree(
     from lxml import etree
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     file_id = "multipagestyl"
     pages = range(1, n_pages + 1)
     for page in images_for if images_for is not None else pages:
@@ -909,7 +903,6 @@ def test_ground_records_one_style_usage_row_per_page(tmp_path: Path, monkeypatch
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     fid = "ocrmultipage1"
     n_pages = 3
     ws.docs.put_doc(

@@ -48,6 +48,7 @@ from dgml_core.generation.semantic_transform import (
     docset_slug,
     org_ns_segment,
 )
+from dgml_core.generation.vocab import OPEN_VOCAB, TagVocab
 
 _CP = "dg:chunk"  # generic chunk for any element with no semantic concept
 _ST = "dg:structure"  # spec-namespaced layout-role attribute (final dgml only)
@@ -201,7 +202,7 @@ def render_semantic_xml(blocks: list[Block]) -> str:
 # ── final dgml ───────────────────────────────────────────────────────────────
 
 
-def _concept_tag(concept: str) -> str | None:
+def _concept_tag(concept: str, vocab: TagVocab) -> str | None:
     """A concept always renders in the per-docset vocabulary namespace.
 
     ``docset:`` is the home of ALL semantic concepts — recurring across the
@@ -209,8 +210,17 @@ def _concept_tag(concept: str) -> str | None:
     ``dg:chunk`` scaffolding element and ``dg:*`` attributes); nothing semantic
     is ever emitted there. Whether a concept is currently shared is a property
     of the batch, not of the concept, so it must not drive the namespace.
+
+    This is the ONLY place a concept becomes a tag on the product path, which
+    makes it the place the closed-vocabulary guarantee is actually enforceable.
+    ``apply_labels`` has already resolved every block concept, so under an open
+    vocabulary this is the long-standing ``sanitize_concept`` call; under a
+    closed one it is also the backstop that keeps a name nobody declared —
+    including the renderer's own ``ColumnHeader`` literal — out of the output.
+    A refused tag renders ``dg:chunk``: the content is untouched, only its
+    semantic name is withheld.
     """
-    name = sanitize_concept(concept)
+    name = vocab.resolve(concept)
     if not name:
         return None
     return f"docset:{name}"
@@ -226,12 +236,12 @@ def _apply_typing(el: ET.Element, text: str, extra_formats: bool) -> None:
         el.set("dg:value", value)
 
 
-def _dgml_lim(parent: ET.Element, block: Block, extra_formats: bool) -> None:
+def _dgml_lim(parent: ET.Element, block: Block, extra_formats: bool, vocab: TagVocab) -> None:
     if block.lim:
         # A lim carrying a concept (a date/number used as the list marker) is
         # emitted under its concept tag — dg:structure="lim" keeps the layout
         # role — and typed like any other value; an unlabeled lim stays dg:chunk.
-        tag = (_concept_tag(block.lim_concept) if block.lim_concept else None) or _CP
+        tag = (_concept_tag(block.lim_concept, vocab) if block.lim_concept else None) or _CP
         lim = ET.SubElement(parent, tag)
         lim.set(_ST, "lim")
         lim.text = block.lim
@@ -240,7 +250,9 @@ def _dgml_lim(parent: ET.Element, block: Block, extra_formats: bool) -> None:
         lim.tail = " "
 
 
-def _dgml_fill(el: ET.Element, text: str, spans: list[Span], extra_formats: bool) -> None:
+def _dgml_fill(
+    el: ET.Element, text: str, spans: list[Span], extra_formats: bool, vocab: TagVocab
+) -> None:
     """Text after the lim, entity values wrapped in concept elements + typing."""
     children = list(el)
     state = {"last": children[-1] if children else None}
@@ -257,7 +269,7 @@ def _dgml_fill(el: ET.Element, text: str, spans: list[Span], extra_formats: bool
     for span in spans:
         write(text[cursor : span.start])
         value = text[span.start : span.end]
-        tag = _concept_tag(span.concept) or _CP
+        tag = _concept_tag(span.concept, vocab) or _CP
         inline = ET.SubElement(el, tag)
         if tag == _CP:
             inline.set(_ST, "span")
@@ -268,38 +280,40 @@ def _dgml_fill(el: ET.Element, text: str, spans: list[Span], extra_formats: bool
     write(text[cursor:])
 
 
-def _dgml_leaf(parent: ET.Element, structure: str, block: Block, extra_formats: bool) -> None:
-    tag = (_concept_tag(block.concept) if block.concept else None) or _CP
+def _dgml_leaf(
+    parent: ET.Element, structure: str, block: Block, extra_formats: bool, vocab: TagVocab
+) -> None:
+    tag = (_concept_tag(block.concept, vocab) if block.concept else None) or _CP
     el = ET.SubElement(parent, tag)
     el.set(_ST, structure)
-    _dgml_lim(el, block, extra_formats)
-    _dgml_fill(el, block.text, block.entities, extra_formats)
+    _dgml_lim(el, block, extra_formats, vocab)
+    _dgml_fill(el, block.text, block.entities, extra_formats, vocab)
 
 
-def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> None:
+def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab: TagVocab) -> None:
     block = node.block
     if node.kind == "h":
         assert block is not None
-        tag = (_concept_tag(block.value_concept) if block.value_concept else None) or _CP
+        tag = (_concept_tag(block.value_concept, vocab) if block.value_concept else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "header")
-        _dgml_lim(el, block, extra_formats)
-        _dgml_fill(el, block.text, block.entities, extra_formats)
+        _dgml_lim(el, block, extra_formats, vocab)
+        _dgml_fill(el, block.text, block.entities, extra_formats, vocab)
         return
     if node.kind in ("p", "li"):
         assert block is not None
-        _dgml_leaf(parent, node.kind, block, extra_formats)
+        _dgml_leaf(parent, node.kind, block, extra_formats, vocab)
         return
     if node.kind == "tr":
         assert block is not None
-        tag = (_concept_tag(block.concept) if block.concept else None) or _CP
+        tag = (_concept_tag(block.concept, vocab) if block.concept else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "tr")
         if block.header_row:
             # A demoted printed-title row renders as ColumnHeader structure-td
             # cells, so the table is not counted headerless.
             for cell in block.cells:
-                th = ET.SubElement(el, _concept_tag("ColumnHeader") or _CP)
+                th = ET.SubElement(el, _concept_tag("ColumnHeader", vocab) or _CP)
                 th.set(_ST, "td")
                 th.text = cell
                 _apply_typing(th, cell, extra_formats)
@@ -327,9 +341,9 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> No
                 )
                 concept = cc or whole
                 if ents and not whole:
-                    _dgml_fill(td, cell, ents, extra_formats)
+                    _dgml_fill(td, cell, ents, extra_formats, vocab)
                 elif concept:
-                    inner = ET.SubElement(td, _concept_tag(concept) or _CP)
+                    inner = ET.SubElement(td, _concept_tag(concept, vocab) or _CP)
                     inner.set(_ST, "span")
                     inner.text = cell
                     _apply_typing(inner, cell, extra_formats)
@@ -355,15 +369,15 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> No
                 # (when present) as the td tag — same pattern as a concept leaf
                 # with inline entity spans; without one it stays a generic td.
                 cc = block.cell_concepts[i] if i < len(block.cell_concepts) else ""
-                td_tag = (_concept_tag(cc) if cc else None) or _CP
+                td_tag = (_concept_tag(cc, vocab) if cc else None) or _CP
                 td = ET.SubElement(el, td_tag)
                 td.set(_ST, "td")
-                _dgml_fill(td, cell, ents, extra_formats)
+                _dgml_fill(td, cell, ents, extra_formats, vocab)
                 continue
             # Positional column concept wins (cross-row consistent); a whole-cell
             # entity concept is the fallback when no column concept aligned.
             concept = cell_concept or whole
-            td_tag = (_concept_tag(concept) if concept else None) or _CP
+            td_tag = (_concept_tag(concept, vocab) if concept else None) or _CP
             td = ET.SubElement(el, td_tag)
             # Every cell carries the td layout role, regardless of whether it
             # also has a semantic concept tag — same as the tr/header/leaf
@@ -377,23 +391,23 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> No
         assert block is not None
         el = ET.SubElement(parent, _CP)
         el.set(_ST, "li")
-        _dgml_lim(el, block, extra_formats)
+        _dgml_lim(el, block, extra_formats, vocab)
         if block.label:
             label = ET.SubElement(el, _CP)
             label.set(_ST, "header")
             if block.label_entities:
-                _dgml_fill(label, block.label, block.label_entities, extra_formats)
+                _dgml_fill(label, block.label, block.label_entities, extra_formats, vocab)
             else:
                 label.text = block.label
         value = ET.SubElement(el, _CP)
         value.set(_ST, "p")
-        value_tag = _concept_tag(block.concept) if block.concept else None
+        value_tag = _concept_tag(block.concept, vocab) if block.concept else None
         target = ET.SubElement(value, value_tag) if value_tag else value
         if block.entities:
             # Sub-values packed inside the field's value render as inline
             # concept spans within the (concept-wrapped) value — the same
             # compose pattern as a leaf with inline entities.
-            _dgml_fill(target, block.value, block.entities, extra_formats)
+            _dgml_fill(target, block.value, block.entities, extra_formats, vocab)
         else:
             target.text = block.value
             if value_tag:
@@ -405,7 +419,7 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> No
         # A synthesized entity container carries its concept directly; a normal
         # section hoists it from the heading child.
         concept = node.concept or (head.concept if head and head.concept else "")
-        tag = (_concept_tag(concept) if concept else None) or _CP
+        tag = (_concept_tag(concept, vocab) if concept else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "section")
     elif node.kind == "list":
@@ -422,7 +436,7 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> No
             ),
             "",
         )
-        tag = (_concept_tag(group) if group else None) or _CP
+        tag = (_concept_tag(group, vocab) if group else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "table")
     elif node.kind == "form":
@@ -432,7 +446,7 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool) -> No
         el = ET.SubElement(parent, _CP)
         el.set(_ST, "section")
     for child in node.children:
-        _render_dgml_node(el, child, extra_formats)
+        _render_dgml_node(el, child, extra_formats, vocab)
 
 
 def render_dgml(
@@ -441,6 +455,7 @@ def render_dgml(
     header: str,
     extra_formats: bool = True,
     parent_map: Mapping[str, str] | None = None,
+    vocab: TagVocab | None = None,
 ) -> str:
     """Blocks → final ``dg:chunk`` dgml (the conversion's product).
 
@@ -451,11 +466,18 @@ def render_dgml(
     the entity-container grouping in ``build_tree``. Every concept renders as
     ``docset:`` regardless of how often it recurs, so container concepts need
     no special namespace handling.
+
+    *vocab* is the tag vocabulary each concept renders through. A CLOSED one
+    makes this render's ``docset:`` tag set a subset of the supplied names —
+    the guarantee the whole feature exists to provide — and it must be the SAME
+    vocabulary labeling used, or a replay would diverge from a fresh run.
+    Default (``None``) is the open vocabulary: today's behavior exactly.
     """
+    vocab = vocab or OPEN_VOCAB
     tree = build_tree(blocks, parent_map)
     root = ET.Element("doc")
     for child in tree.children:
-        _render_dgml_node(root, child, extra_formats)
+        _render_dgml_node(root, child, extra_formats, vocab)
     ET.indent(root)  # safe on mixed content: only blank/None whitespace is set
     if len(root) == 0:
         # No renderable content (e.g. a document that transcribed to zero

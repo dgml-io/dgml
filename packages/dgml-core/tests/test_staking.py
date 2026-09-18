@@ -14,18 +14,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 from dgml_chain import ChainConfig
 from dgml_core.errors import ChainTxReverted, RecordNotFound
 from dgml_core.staking import (
+    _default_bundle_dir,
     _fetch_record,
     _find_record,
     _finish_stake,
     _wait_for_receipt,
     _wei_to_eth,
 )
+from dgml_core.storage import Workspace
 
 
 @pytest.mark.parametrize(
@@ -149,3 +152,15 @@ def test_finish_stake_writes_named_record(tmp_path: Any) -> None:
     assert not (save_dir / "record.json").exists()
     assert out["record_path"].endswith("record-node-1.json")
     assert out["receipt_status"] == "success"
+
+
+def test_default_bundle_dir_does_not_collide(tmp_path: Path) -> None:
+    """Ids may contain hyphens (`file add --id`), so the default bundle dir
+    cannot be a `<file>-<docset>` stem: that makes ("report-v2", "alpha")
+    and ("report", "v2-alpha") the same directory."""
+    ws = Workspace(root=tmp_path / "ws")
+    a = _default_bundle_dir(ws, "report-v2", "alpha")
+    b = _default_bundle_dir(ws, "report", "v2-alpha")
+    assert a != b
+    # Without a docset the path stays a single segment under the bundles dir.
+    assert _default_bundle_dir(ws, "report-v2", None) == ws.root / "dgmlx-bundles" / "report-v2"

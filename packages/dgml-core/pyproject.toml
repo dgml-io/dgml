@@ -41,6 +41,14 @@ macos = [
     "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
 ]
+# Install with `pip install dgml-core[pdfium]` for page rendering and slicing
+# with PDFium (`[pdf] provider = "pypdfium2"`) instead of the system
+# ghostscript binary. pypdfium2 is (Apache-2.0 OR BSD-3-Clause) and PDFium is
+# BSD-3-Clause; Pillow (MIT-CMU) writes the PNGs.
+pdfium = [
+    "pypdfium2>=4.30",
+    "pillow>=10.2",
+]
 # Install with `pip install dgml-core[clustering]` to enable the clustering
 # pipelines (S1/S2 scenario pipelines, embedding models, networkx, scipy,
 # sklearn — a heavyweight ML stack that not all users need).

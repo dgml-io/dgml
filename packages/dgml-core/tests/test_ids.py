@@ -12,14 +12,18 @@
 
 from __future__ import annotations
 
-from dgml_core.ids import ID_LENGTH, is_valid_id, new_id
+import pytest
+from dgml_core.ids import ID_ALPHABET, ID_LENGTH, is_record_id, new_id
 
 
 def test_new_id_format() -> None:
     for _ in range(100):
         i = new_id()
         assert len(i) == ID_LENGTH
-        assert is_valid_id(i)
+        assert all(c in ID_ALPHABET for c in i)
+        # The subset invariant: everything new_id has ever generated stays valid
+        # under the wider caller-supplied grammar, so no id needs migrating.
+        assert is_record_id(i)
 
 
 def test_new_id_collisions_rare() -> None:
@@ -27,8 +31,40 @@ def test_new_id_collisions_rare() -> None:
     assert len(s) == 10_000
 
 
-def test_is_valid_id_rejects() -> None:
-    assert not is_valid_id("abc")
-    assert not is_valid_id("Z" * ID_LENGTH)
-    assert not is_valid_id("a-b-c-d-e-f-g")
-    assert not is_valid_id("")
+@pytest.mark.parametrize(
+    "value",
+    [
+        "abc",  # the 3-char floor
+        "a" * 40,  # the 40-char ceiling
+        "a-b",
+        "a_b",
+        "0aa",
+        "9-9_9",
+        "invoice-2024-q1",
+        "invoice_2024_q1",
+    ],
+)
+def test_is_record_id_accepts(value: str) -> None:
+    assert is_record_id(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "ab",  # one short of the floor
+        "a" * 41,  # one past the ceiling
+        "Z" * ID_LENGTH,
+        "AbC",  # uppercase: would collide on a case-insensitive filesystem
+        "-abc",  # leading separator
+        "_abc",
+        "a.b",
+        "a/b",  # would break layout.pair_id and the dgmlx:// scheme
+        "a b",
+        "abc\n",  # proves the pattern is \Z-anchored, not $
+        ".",
+        "..",
+    ],
+)
+def test_is_record_id_rejects(value: str) -> None:
+    assert not is_record_id(value)

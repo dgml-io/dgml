@@ -71,7 +71,6 @@ def test_file_add_ocr_mode_with_invalid_config_errors(
     is created, so the workspace stays clean. (A missing config is not
     an error: it falls back to the zero-config on-device macOS provider.)"""
     ws = tmp_path / "ws"
-    Workspace(root=ws).init()
     # Azure provider with no endpoint → OcrConfigInvalid at load time.
     write_config(Workspace(root=ws), {"ocr": {"provider": "azure"}})
     capsys.readouterr()
@@ -83,7 +82,8 @@ def test_file_add_ocr_mode_with_invalid_config_errors(
 
     # No file record was created on the rejected add.
     files_dir = ws / "files"
-    assert not any(files_dir.iterdir())
+    # Created by the first write, so a rejected add leaves it absent entirely.
+    assert not files_dir.exists() or not any(files_dir.iterdir())
 
 
 def test_file_add_hybrid_mode_with_invalid_config_errors(
@@ -93,7 +93,6 @@ def test_file_add_hybrid_mode_with_invalid_config_errors(
     workspace OCR config blocks the add before any filesystem state is
     created."""
     ws = tmp_path / "ws"
-    Workspace(root=ws).init()
     write_config(Workspace(root=ws), {"ocr": {"provider": "azure"}})
     capsys.readouterr()
 
@@ -103,4 +102,5 @@ def test_file_add_hybrid_mode_with_invalid_config_errors(
     assert err["error"]["code"] == "OCR_CONFIG_INVALID"
 
     files_dir = ws / "files"
-    assert not any(files_dir.iterdir())
+    # Created by the first write, so a rejected add leaves it absent entirely.
+    assert not files_dir.exists() or not any(files_dir.iterdir())

@@ -51,6 +51,9 @@ def dump_toml(data: dict[str, Any], _prefix: str = "") -> str:
 
 def write_config(workspace: Workspace, data: dict[str, Any]) -> None:
     """Write ``<workspace>/config.toml`` (resolution layer 3) from a dict."""
+    # Nothing scaffolds the workspace root any more (`Workspace.init()` is gone),
+    # so a helper that writes into it has to make sure it exists.
+    workspace.root.mkdir(parents=True, exist_ok=True)
     workspace.config_path.write_text(dump_toml(data) + "\n", encoding="utf-8")
 
 
@@ -141,7 +144,7 @@ def workspace(tmp_path: Path) -> Workspace:
     from dgml_core import workspace_config
 
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
+    ws.root.mkdir(parents=True, exist_ok=True)
     workspace_config.write_identity(
         ws,
         workspace_id="ws_fixturexxxxxxxxx",

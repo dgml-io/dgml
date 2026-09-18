@@ -141,7 +141,6 @@ def _new_group(name: str, members: list[str], **extra: Any) -> dict[str, Any]:
 @pytest.fixture
 def workspace(tmp_path: Path) -> Workspace:
     ws = Workspace(root=tmp_path / "ws")
-    ws.init()
     return ws
 
 

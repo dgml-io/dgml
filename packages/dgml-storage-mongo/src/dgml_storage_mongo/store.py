@@ -125,7 +125,7 @@ class MongoDocStore(DocStore):
 
     def append_doc(self, collection: str, doc: dict[str, Any]) -> None:
         # Append-only (the usage log): no id, never fetched or replaced
-        # individually. Mongo mints its own ``_id``, which reads strip.
+        # individually. Mongo generates its own ``_id``, which reads strip.
         #
         # Rejected for every other collection, matching LocalStore. Mongo would
         # happily insert an id-less document anywhere, but appending to an

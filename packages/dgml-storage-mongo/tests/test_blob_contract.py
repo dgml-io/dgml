@@ -136,6 +136,15 @@ def test_list_blobs_is_sorted(blobs: MongoGridFSBlobStore) -> None:
     ]
 
 
+def test_separator_ids_scope_correctly(blobs: MongoGridFSBlobStore) -> None:
+    """An id is a key segment and may contain `-`/`_`; a prefix listing must not
+    bleed between two similarly-named ids."""
+    blobs.put_blob("files/invoice_2024_q1/report.pdf", b"a")
+    blobs.put_blob("files/invoice_2024/report.pdf", b"b")
+    assert blobs.list_blobs("files/invoice_2024_q1/") == ["files/invoice_2024_q1/report.pdf"]
+    assert blobs.get_blob("files/invoice_2024/report.pdf") == b"b"
+
+
 def test_prefix_metacharacters_are_not_regex(blobs: MongoGridFSBlobStore) -> None:
     """Keys hold filenames. An unescaped ``.`` would match any character."""
     blobs.put_blob("files/f1/page_1.png", b"real")
