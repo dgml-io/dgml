@@ -28,6 +28,7 @@ from PIL import Image
 
 from . import layout
 from .storage import Workspace
+from .utils import gather_file_pages
 
 
 class WorkspaceFileDataset(DocumentDataset):
@@ -81,16 +82,11 @@ class WorkspaceFileDataset(DocumentDataset):
 
         file_id = self.file_ids[index]
         ws = self.workspace
-        page_keys = ws.blobs.list_blobs(layout.file_pages_prefix(file_id))
-        if not page_keys:
+        # Up to max_pages page renders, for optional multi-page pooling.
+        raw_pages = gather_file_pages(ws, file_id, self.max_pages)
+        if not raw_pages:
             raise FileNotFoundError(f"no rendered page images for file '{file_id}'")
-        # Load the first ``max_pages`` renders for optional multi-page pooling,
-        # reading each through the store (zero-copy on LocalStore). ``page_keys``
-        # is sorted, so this is pages 1..max_pages in order.
-        page_images = tuple(
-            Image.open(io.BytesIO(ws.blobs.get_blob(k))).convert("RGB")
-            for k in page_keys[: self.max_pages]
-        )
+        page_images = tuple(Image.open(io.BytesIO(b)).convert("RGB") for b in raw_pages)
         # `_build_text` reads `<file_dir>/page_text/*.json`; hand it a materialized
         # copy of the file's artifacts (the real dir on LocalStore, zero-copy).
         with ws.blobs.materialize_dir(layout.file_prefix(file_id)) as file_dir:
