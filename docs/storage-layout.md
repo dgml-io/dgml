@@ -855,6 +855,10 @@ auto-seeds from it — so ground truth goes in and a polluted vocabulary comes
 back out. This slot is never written by derivation, which is what lets a later
 `generate` with no flags re-seed from what the author actually wrote.
 
+Whether the remembered schema is applied strictly or as a foundation is a
+per-run choice (`--extend-schema`), not a property of the file: the vocabulary
+persists, the mode does not.
+
 Seed precedence for a `generate` run:
 `--schema-path` → `authored-schema.json` → `schema.json` → `cache/concept_roster.json`
 (`--no-roster` uses none of them).

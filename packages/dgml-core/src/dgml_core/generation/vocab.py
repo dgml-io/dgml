@@ -66,9 +66,80 @@ class TagVocab:
     names: frozenset[str]
     index: Mapping[str, str]
     closed: bool
+    #: Whether *names* came from a vocabulary a PERSON wrote, as opposed to one
+    #: the pipeline derived from its own previous labels. Three states matter
+    #: downstream, and this plus ``closed`` distinguishes them:
+    #:   authored + closed  — STRICT: these names and no others;
+    #:   authored + open    — EXTEND: these names first, coin only for a genuine
+    #:                        gap, and report every coinage as a schema candidate;
+    #:   not authored       — the long-standing behavior, whether seeded from a
+    #:                        derived schema or not seeded at all.
+    #: A derived seed must never be reported as "you missed these" — the
+    #: pipeline writing about its own output is not a gap in anyone's schema.
+    authored: bool = False
+    #: Names in *names* that the pipeline PLANNED rather than the user writing
+    #: them. Both are legal to emit; the split exists so a run can tell the
+    #: author "these are yours" from "these were added for roles you did not
+    #: cover", which is the report that makes an extended vocabulary reviewable
+    #: instead of merely larger.
+    added: frozenset[str] = frozenset()
+
+    @property
+    def extends(self) -> bool:
+        """EXTEND mode: an authored vocabulary that may still be added to."""
+        return self.authored and not self.closed
+
+    @property
+    def supplied(self) -> frozenset[str]:
+        """The names the USER wrote, as opposed to the planned additions."""
+        return self.names - self.added
+
+    def with_additions(self, names: Iterable[str]) -> TagVocab:
+        """A closed vocabulary of ``supplied + planned``.
+
+        This is what makes an extended vocabulary bounded. Coining freely
+        during labeling produced an output vocabulary larger than an unseeded
+        run's, most of it not the user's, because a supplied schema skips the
+        planning pass and leaves labeling inventing per document. Planning the
+        additions up front and closing over the union keeps them a reviewed,
+        bounded set rather than an open tail.
+        """
+        # Squash-aware, not exact-match: an addition that differs from a
+        # supplied name only in case or punctuation IS that name — the
+        # resolver would fold it back anyway, and admitting it would put two
+        # spellings of one tag in the vocabulary.
+        seen = {squash(n) for n in self.names}
+        extra: list[str] = []
+        for raw in names:
+            name = raw.strip()
+            key = squash(name)
+            if not name or not key or key in seen:
+                continue
+            seen.add(key)
+            extra.append(name)
+        if not extra:
+            return TagVocab(
+                names=self.names,
+                index=self.index,
+                closed=True,
+                authored=self.authored,
+                added=self.added,
+            )
+        merged = TagVocab.build([*sorted(self.names), *extra], closed=True, authored=self.authored)
+        return TagVocab(
+            names=merged.names,
+            index=merged.index,
+            closed=True,
+            authored=merged.authored,
+            added=self.added | frozenset(extra),
+        )
+
+    def is_supplied(self, name: str) -> bool:
+        """Whether *name* is one the USER wrote — not a planned addition."""
+        return name in self.names and name not in self.added
 
     @classmethod
-    def build(cls, names: Iterable[str], *, closed: bool) -> TagVocab:
+    def build(cls, names: Iterable[str], *, closed: bool, authored: bool = False) -> TagVocab:
         """Build a vocabulary from authoritative spellings, in priority order.
 
         Two names that squash alike (``ABCorp`` / ``AbCorp``) are a genuine
@@ -90,6 +161,7 @@ class TagVocab:
             names=frozenset(authoritative),
             index=MappingProxyType(index),
             closed=closed,
+            authored=authored,
         )
 
     def resolve(self, raw: str) -> str | None:

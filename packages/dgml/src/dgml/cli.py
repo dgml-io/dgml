@@ -2908,20 +2908,25 @@ def _add_generate_subparser(
             "a JSON {name: one-line description} object (RECOMMENDED — descriptions are "
             "what the model matches content against); an exported docsets/<id>/schema.json "
             "(a `tags` map of name -> {role, kind, examples, parent_role}); or its RELAX NG "
-            "Compact render docsets/<id>/full-schema.rnc. The planning pass is skipped, and "
-            "the vocabulary is CLOSED: the generated DGML uses these tag names and no "
-            "others. Content whose role has no matching tag is NOT dropped — it renders as "
-            "dg:chunk with its text, structure, and dg:origin intact. Pass "
-            "--allow-new-tags to let labeling coin tags for roles the schema misses."
+            "Compact render docsets/<id>/full-schema.rnc. Supplying a schema means the "
+            "generated DGML uses THOSE tag names and no others: the planning pass is "
+            "skipped and the vocabulary is closed. Content whose role has no matching tag "
+            "is NOT dropped — it renders as dg:chunk with its text, structure, and "
+            "dg:origin intact. To let labeling invent its own vocabulary instead, do not "
+            "supply a schema."
         ),
     )
     gen.add_argument(
-        "--allow-new-tags",
+        "--extend-schema",
         action="store_true",
         help=(
-            "Let labeling coin tag names outside the seed schema, as it did before "
-            "closure existed. Applies to --schema-path and to automatic reuse alike. "
-            "Without it, any seed closes the vocabulary."
+            "Treat the supplied schema as a foundation rather than the whole "
+            "vocabulary: labeling reuses your tag names wherever one fits, and may "
+            "coin a new name for a recurring role your schema does not cover. Every "
+            "coined name is reported per file under `added_concepts`, so it can be "
+            "folded into the next revision of your schema. Requires a supplied "
+            "schema (--schema-path, or one a previous run remembered); without this "
+            "flag a supplied schema is used strictly and nothing else is emitted."
         ),
     )
     gen.add_argument(
@@ -2931,8 +2936,9 @@ def _add_generate_subparser(
             "Disable automatic roster reuse. By default an incremental generate "
             "seeds labeling with the docset's own authored-schema.json (if a previous run "
             "supplied one), else schema.json, else cache/concept_roster.json, so added "
-            "documents stay tag-consistent; this labels them in isolation. No seed means "
-            "no closed vocabulary, so this also re-opens tag coining."
+            "documents stay tag-consistent; this labels them in isolation. A remembered "
+            "authored schema closes the vocabulary the same way --schema-path does; a "
+            "schema the pipeline derived itself only seeds."
         ),
     )
     gen.add_argument(
@@ -3397,10 +3403,13 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # document keeps its (unlinked) DGML, so without this a rate limit or a bad
     # model id looked exactly like "this document has no links".
     link_errors: dict[str, str] = {}
-    # name -> {count, distinct, examples} for the concepts a CLOSED vocabulary
-    # refused. Absent from a file's entry when the run was open or nothing was
-    # refused, like every other conditional key here.
-    unmatched_concepts: dict[str, dict[str, Any]] = {}
+    # name -> {count, distinct, examples} for the concepts that fell outside an
+    # AUTHORED vocabulary. Reported as `unmatched_concepts` under a strict
+    # schema (refused, so the list is what the schema is missing) and as
+    # `added_concepts` under --extend-schema (coined and used, so the list is
+    # the candidate set for the schema's next revision). Absent from a file's
+    # entry when nothing went outside, like every other conditional key here.
+    off_schema_concepts: dict[str, dict[str, Any]] = {}
 
     def _on_error(name: str, message: str) -> None:
         gen_errors[name] = message
@@ -3409,13 +3418,13 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         label_errors[name] = err
         _diag(f"[label] {name}: model unreachable ({err.get('message', '')})")
 
-    def _on_rejected(name: str, tally: Counter[str]) -> None:
-        # Which names the model reached for outside a closed schema. The most
-        # actionable output of a closed run: recognizable aliases of tags you
-        # already have, roles the schema simply omitted, or junk — each points
-        # at a different fix. Reported per file, not just logged, so it is
-        # readable without --verbose.
-        unmatched_concepts[name] = {
+    def _on_off_schema(name: str, tally: Counter[str]) -> None:
+        # Which names the model reached for outside the supplied schema. The
+        # most actionable output of either mode — under strict these are gaps
+        # to consider adding, under extend they are additions to review.
+        # Reported per file, not just logged, so it is readable without
+        # --verbose.
+        off_schema_concepts[name] = {
             "count": sum(tally.values()),
             "distinct": len(tally),
             "examples": [concept for concept, _n in tally.most_common(_UNMATCHED_EXAMPLES)],
@@ -3592,9 +3601,9 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         link_error = link_errors.get(name)
         if link_error is not None:
             extra["link_error"] = link_error
-        unmatched = unmatched_concepts.get(name)
-        if unmatched is not None:
-            extra["unmatched_concepts"] = unmatched
+        off_schema = off_schema_concepts.get(name)
+        if off_schema is not None:
+            extra["added_concepts" if args.extend_schema else "unmatched_concepts"] = off_schema
         converted_by_name[name] = _file_result(
             "converted",
             filename_to_fid[name],
@@ -3639,11 +3648,16 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             # below to a slot derive_schema never writes, so the next run seeds
             # from what the user wrote rather than from this run's own output.
             authored_seed: Schema | None = None
+            # Whether the seed in hand is one a PERSON wrote (this run's
+            # --schema-path, or one a previous run remembered) as opposed to one
+            # the pipeline derived from its own labels. Only the former closes.
+            authored = False
             if args.schema_path:
                 schema_seed, parent_map_seed, schema_notes = _load_schema_seed(
                     Path(args.schema_path)
                 )
                 authored_seed = schema_seed
+                authored = True
                 _diag(
                     f"Loaded schema: {len(schema_seed.tags)} concept(s), "
                     f"{len(parent_map_seed)} container link(s) from {args.schema_path}"
@@ -3666,6 +3680,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                         schema_seed, parent_map_seed, _notes = _load_schema_seed(
                             authored_local, layout.AUTHORED_SCHEMA_FILE
                         )
+                        authored = True
                         _diag(
                             f"Reusing the docset's authored schema: {len(schema_seed.tags)} tag(s)"
                         )
@@ -3685,24 +3700,50 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     except InvalidArgument:
                         roster_seed = None
 
-            # A seed CLOSES the vocabulary unless --allow-new-tags says
-            # otherwise: labeling may then use those tag names and no others,
-            # and content whose role has no matching tag renders as dg:chunk
-            # with its text intact. One rule for every seed source — an
-            # explicit --schema-path and automatic reuse behave the same.
-            # --no-roster leaves no seed at all, so it is open by construction.
+            # Closure keys on AUTHORSHIP, not on the mere presence of a seed.
+            # A vocabulary a PERSON wrote is a specification: supplying one
+            # means the output carries those tag names and no others, with no
+            # flag to half-apply it. A vocabulary the PIPELINE derived from its
+            # own previous output is not a specification — it is a hint for
+            # consistency — so automatic reuse of schema.json /
+            # concept_roster.json seeds exactly as it always has and keeps
+            # coining. That distinction is what lets this feature be all-or-
+            # nothing without changing what an ordinary incremental generate
+            # does.
             seed_names = (
                 list(schema_seed.tags) if schema_seed is not None else list(roster_seed or {})
             )
-            vocab = TagVocab.build(seed_names, closed=bool(seed_names) and not args.allow_new_tags)
+            # --extend-schema keeps an AUTHORED vocabulary open: the user's names
+            # are still authoritative and reused first, but labeling may coin for
+            # a role they did not cover, and every coinage is reported back as a
+            # candidate for the next revision. It is meaningless without an
+            # authored schema, so say so rather than silently doing nothing.
+            if args.extend_schema and not authored:
+                raise InvalidArgument(
+                    "--extend-schema needs a supplied schema to extend. Pass "
+                    "--schema-path <file>, or run it on a docset where a previous "
+                    "--schema-path run left an authored schema. (Without a supplied "
+                    "schema, labeling already coins its own vocabulary.)"
+                )
+            vocab = TagVocab.build(
+                seed_names,
+                closed=authored and bool(seed_names) and not args.extend_schema,
+                authored=authored,
+            )
             if vocab.closed:
                 _diag(
                     f"Vocabulary CLOSED at {len(vocab.names)} tag(s): the generated DGML uses "
                     "these tag names and no others. Unmatched content still renders "
-                    "(as dg:chunk, text intact). Pass --allow-new-tags to let labeling coin."
+                    "(as dg:chunk, text intact)."
                 )
-            elif seed_names and args.allow_new_tags:
-                _diag(f"Vocabulary OPEN (--allow-new-tags): seeded with {len(seed_names)} tag(s)")
+            elif vocab.extends:
+                _diag(
+                    f"Vocabulary EXTENDS {len(vocab.names)} authored tag(s): these are reused "
+                    "wherever one fits; a role they do not cover may be coined, and every "
+                    "coinage is reported under added_concepts."
+                )
+            elif seed_names:
+                _diag(f"Seeded with {len(seed_names)} derived tag(s); labeling may coin more")
 
             # Reload already-generated docs from cache so the whole docset stays
             # consistent as its schema/roster grows; changed originals re-render
@@ -3762,7 +3803,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     on_output=_on_output,
                     on_error=_on_error,
                     on_label_error=_on_label_error,
-                    on_rejected=_on_rejected,
+                    on_off_schema=_on_off_schema,
                     prior_docs=prior_docs,
                     prior_outputs=prior_outputs,
                 )

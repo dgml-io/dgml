@@ -39,6 +39,7 @@ from dgml_core.generation.label import (
     _parse_labels_json,
     apply_labels,
     label_documents,
+    plan_concept_roster,
     propagate_list_consistency,
     propagate_table_consistency,
     wrap_detected_values,
@@ -165,7 +166,10 @@ class ConvertOptions:
     # unmatched content renders as dg:chunk with its text intact. None = open,
     # i.e. coin freely (today's behavior, and the right default for a library
     # caller). Whether a seed closes the vocabulary is CLI policy, not a
-    # property of the seed — see `dgml docset generate --allow-new-tags`.
+    # property of the seed: the CLI closes on a vocabulary a PERSON authored
+    # (`--schema-path`, or one a previous run remembered) and not on one it
+    # derived from its own labels — and `--extend-schema` keeps an authored
+    # vocabulary open so labeling may add to it.
     vocab: TagVocab | None = None
     progress: Callable[[str], None] | None = field(default=None)
     # Workspace to record LLM usage into. When set (and ``debug`` is True), the
@@ -196,7 +200,7 @@ def convert_batch(
     on_output: Callable[[str, str], None] | None = None,
     on_error: Callable[[str, str], None] | None = None,
     on_label_error: Callable[[str, dict[str, str]], None] | None = None,
-    on_rejected: Callable[[str, Counter[str]], None] | None = None,
+    on_off_schema: Callable[[str, Counter[str]], None] | None = None,
     prior_docs: Mapping[str, list[Block]] | None = None,
     prior_outputs: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
@@ -224,8 +228,9 @@ def convert_batch(
     completes before any ``on_output`` fires, so a per-file result built in
     ``on_output`` can read whatever this reported.
 
-    Pass *on_rejected* — called ``(name, Counter[concept])`` — to learn which
-    concepts a CLOSED ``options.vocab`` refused for a document. Fired only for
+    Pass *on_off_schema* — called ``(name, Counter[concept])`` — to learn which
+    concepts fell outside an AUTHORED ``options.vocab`` for a document: refused
+    under a closed vocabulary, coined under one that extends. Fired only for
     documents that had any, before their output is emitted.
 
     *prior_docs* (already-generated docs from cache) are re-rendered so the
@@ -302,6 +307,43 @@ def convert_batch(
         operation=OPERATION_LABEL,
     )
     label_config.context = {"doc_count": len(docs)}
+
+    # An extendable authored vocabulary gets its additions PLANNED, once, here
+    # — before labeling, because the vocabulary they form has to govern the
+    # render too, and `render_dgml` runs after `label_documents` returns.
+    #
+    # Coining freely during labeling produced an output vocabulary larger than
+    # an unseeded run's, most of it not the user's, because supplying a schema
+    # skips the planning pass and leaves labeling inventing per document. One
+    # gap-planning call over every skeleton names the shared roles the schema
+    # misses; closing over the union keeps the additions a bounded, reviewable
+    # set instead of an open tail.
+    gap_seed: dict[str, str] = {}
+    if vocab.extends and opts.schema_seed is not None and docs:
+        with llm.record_usage_for(label_config):
+            gap_seed = plan_concept_roster(
+                docs,
+                config=label_config,
+                cache_dir=opts.cache_dir,
+                debug=opts.debug,
+                log=log,
+                refine=False,  # over-proposing is the failure mode here
+                existing={tag.name: tag.role for tag in opts.schema_seed.tags.values()},
+            )
+        if gap_seed:
+            vocab = vocab.with_additions(gap_seed)
+            log(
+                f"Pass B.1: vocabulary bounded at {len(vocab.supplied)} authored "
+                f"+ {len(vocab.added)} planned tag(s)"
+            )
+        else:
+            # Planning is best-effort — it returns {} both when the schema
+            # genuinely covers the documents and when the call failed. Closing
+            # on an empty result would silently turn an extend run into a
+            # strict one, which is a stricter contract than the user asked
+            # for, so degrade to unbounded coining instead.
+            log("Pass B.1: no gap concepts planned; labeling may coin unbounded")
+
     with llm.record_usage_for(label_config):
         label_documents(
             docs,
@@ -311,9 +353,10 @@ def convert_batch(
             log=log,
             roster_seed=opts.roster_seed,
             schema_seed=opts.schema_seed,
+            gap_seed=gap_seed or None,
             vocab=vocab,
             on_label_error=on_label_error,
-            on_rejected=on_rejected,
+            on_off_schema=on_off_schema,
         )
 
     def _emit(item: tuple[str, list[Block]]) -> tuple[str, str]:

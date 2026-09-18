@@ -223,6 +223,41 @@
 
   Output JSON only:
   {"concepts": {"<concept>": "<one-line role description>", ...}}
+# Gap planning for --extend-schema: propose the roles the supplied schema
+# misses, from every document's skeleton at once. Without it the additions
+# get invented per document and differ run to run.
+"plan_gaps_system": |
+  You extend an EXISTING concept vocabulary for a set of related documents.
+
+  You are shown two things: the vocabulary its owner already wrote, and the
+  structural skeleton (headings, form fields, table rows, first list items) of
+  every document. Your job is to propose concepts for the RECURRING ROLES THE
+  EXISTING VOCABULARY DOES NOT COVER — and nothing else.
+
+  Rules, in order of importance:
+  - Propose NOTHING that an existing concept already covers. Check the list
+    first, every time. If a role is covered, it is not a gap.
+  - Never propose a VARIANT of an existing name. If `ItemPrice` exists, do
+    not propose `ItemPricing`, `ItemPrices`, or `PriceByItem`.
+    Differences of wording, number, or word order are not new concepts.
+  - Propose only roles that RECUR across the documents. A one-off is not worth
+    a shared concept; the per-document labeling can handle it.
+  - Container roles are the most commonly missed: authors write the fields and
+    forget the box around them (an order's line-item collection, a signature
+    block, a fee schedule). Look for repeating groups that have no container.
+  - Name them the way the existing vocabulary is named — same style, same level
+    of specificity — so the combined list reads as ONE vocabulary.
+
+  Concepts are PascalCase role names. Name the ROLE, never the value. Never
+  include structural or discourse words ("Section", "Clause", "Item",
+  "Heading", "Paragraph", "List", "Title"). Never propose generic catch-alls
+  ("Information", "Details", "Data", "Other").
+
+  A SHORT, well-judged list is the goal. Proposing few or none is a perfectly
+  good answer when the existing vocabulary already covers the documents.
+
+  Output JSON only, and include ONLY your additions:
+  {"concepts": {"<concept>": "<one-line role description>", ...}}
 "roster_complete": |-
   Review your roster against the document skeletons above. A first-pass roster
   routinely MISSES recurring roles. ADD every recurring section, field, column,
@@ -234,24 +269,62 @@
   {"concepts": {"<concept>": "<one-line role description>", ...}}
 "roster_intro": |-
   CONCEPTS ALREADY IN USE in this document set — reuse these names verbatim where the role matches:
+# Closing the vocabulary must not also switch off density. An earlier version
+# framed leaving a block unlabeled as free and reaching outside the list as
+# the cardinal sin; the model responded by labeling almost nothing. Forbid
+# inventing names, but keep dense labeling the job.
 "roster_closed_intro": |-
-  THE COMPLETE AND ONLY CONCEPT VOCABULARY for this document set. This list is
-  EXHAUSTIVE: it is the entire set of concept names that exist. Use these names
-  VERBATIM, exactly as spelled below.
+  THE COMPLETE CONCEPT VOCABULARY for this document set. These names are the
+  entire palette you have to work with: use them VERBATIM, exactly as spelled
+  below. Do not coin, invent, rename, abbreviate, or pluralize any other name.
 
-  You may NOT coin, invent, rename, abbreviate, pluralize, or otherwise vary a
-  concept name. There is no such thing as a concept outside this list.
+  Your job is unchanged: label DENSELY, following every density rule above.
+  This list is not a filter to be applied sparingly — it is the vocabulary this
+  whole document set is written in, and MOST blocks have a concept on it that
+  fits. For every block, entity, and table cell, first find the listed concept
+  whose ROLE best matches what you are labeling, and use that name. A listed
+  concept whose role matches is always the right answer, even when the wording
+  printed on the page is different from the concept's name — you are matching
+  roles, not spellings.
 
-  When a block's role is NOT on the list, return that block with NO concept —
-  omit the "concept" key, or give it "". The same applies to entities and to
-  table cells: a value whose kind is not on the list gets no entity at all.
-  Leaving something unlabeled is CORRECT here and costs nothing; the block's
-  text is preserved either way. Reaching for a name that is not on the list is
-  the one thing you must never do — a near-miss name is discarded, so it buys
-  nothing and loses the block.
+  EVERY heading still gets a concept naming its section's role, and repeating
+  rows, columns, and fields still get theirs, exactly as described above.
 
-  This OVERRIDES the density rules above wherever they conflict: if no listed
-  concept names a heading's role, that heading gets no concept.
+  Only when NO listed concept names a block's role at all should you return it
+  with no concept (omit the "concept" key, or give it ""). That is the
+  exception, not the default: an unlabeled block loses its meaning, so look for
+  the listed concept that genuinely fits before leaving anything untagged. What
+  you must not do is answer with a name that is not on the list — such a name
+  is discarded, so it helps nothing.
+
+  THE VOCABULARY:
+# Used instead of roster_intro when the schema may be added to. The softer
+# wording let coined names crowd out the supplied ones, so three things must
+# survive any rewrite: reuse is the default action, coining is the exception,
+# and coining a variant of a listed name is forbidden.
+"roster_extend_intro": |-
+  THE VOCABULARY FOR THIS DOCUMENT SET, supplied by the person who owns these
+  documents. It is AUTHORITATIVE: these are the names they want to see, and
+  reusing them is your default action, not a fallback.
+
+  For EVERY block, entity, and table cell: first look for a listed concept
+  whose ROLE matches what you are labeling, and if one does, use that name
+  VERBATIM, exactly as spelled. Match on role, not on wording — a listed
+  concept is still the right answer when the text printed on the page uses
+  different words from the concept's name.
+
+  You MAY coin a new name, but only for a genuine gap: a recurring role that
+  no listed concept covers at all. Before you coin, check the list once more.
+
+  Never coin a VARIANT of a listed name. If the list has `ItemPrice`, do
+  not answer `ItemPricing`, `ItemPrices`, or `PriceByItem` — reuse
+  the listed spelling. Near-duplicates of the supplied vocabulary are the one
+  thing this mode must not produce; they fragment the very consistency the
+  supplied schema exists to provide.
+
+  Label densely, following every density rule above. Anything you do coin will
+  be reported back to the owner as a candidate to add to their schema, so coin
+  deliberately and name it as carefully as they named theirs.
 
   THE VOCABULARY:
 "roster_planned_intro": |-
@@ -259,10 +332,11 @@
 "section_retry": |-
   These section headings were left unlabeled. Give each a concept naming its section's role:
 "section_retry_closed": |-
-  These section headings were left unlabeled. For each one, give the concept
-  from the vocabulary above that names its section's role — reusing a listed
-  name verbatim. If NO listed concept names a heading's role, leave that
-  heading out of your reply entirely. Do not coin a name to fill a gap:
+  These section headings were left unlabeled. Give each one the concept from
+  the vocabulary above that names its section's role, reusing a listed name
+  verbatim — most of these headings have one that fits, so work through them
+  one by one and find it. Leave a heading out of your reply only when no listed
+  concept names its role at all. Do not coin a name to fill a gap:
 "describe_concepts": |
   You write one-line ROLE descriptions for document field concepts. Each concept
   is a PascalCase name shown with one or more example values observed in the

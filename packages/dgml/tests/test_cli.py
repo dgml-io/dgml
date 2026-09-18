@@ -2770,9 +2770,9 @@ def _docset_with_one_file(ws: Path, text_pdf: Path, capsys: pytest.CaptureFixtur
 def test_docset_generate_schema_path_closes_the_vocabulary(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """D1/D2 — a supplied schema is a CONTRACT, not a suggestion. This changes
-    behavior for existing --schema-path users, who used to get seed-plus-coining.
-    --allow-new-tags is the way back."""
+    """Supplying a schema is all-or-nothing: the output carries those tag names
+    and no others, with no flag to half-apply it. To let labeling invent its own
+    vocabulary, don't supply a schema."""
     ws = tmp_path / "ws"
     did = _docset_with_one_file(ws, text_pdf, capsys)
     schema_path = tmp_path / "tags.txt"
@@ -2782,36 +2782,113 @@ def test_docset_generate_schema_path_closes_the_vocabulary(
     vocab = mock.call_args.kwargs["options"].vocab
     assert vocab.closed and vocab.names == {"PaymentTerms", "DueDate"}
 
-    capsys.readouterr()
-    mock = _generate_with_stub_batch(
-        ws, did, ["--schema-path", str(schema_path), "--allow-new-tags"]
-    )
-    vocab = mock.call_args.kwargs["options"].vocab
-    assert not vocab.closed and vocab.names == {"PaymentTerms", "DueDate"}
 
-
-def test_docset_generate_closure_follows_the_seed_not_the_flag(
+def test_docset_generate_closes_only_on_an_authored_vocabulary(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """D3 — one rule, one code path: ANY seed closes the vocabulary, including
-    automatic reuse of the docset's own schema.json. --no-roster leaves no seed
-    at all, so it is open by construction."""
+    """Closure keys on AUTHORSHIP, not on the presence of a seed.
+
+    A vocabulary a person wrote is a specification and is applied as one. A
+    vocabulary the pipeline derived from its own previous labels is a
+    consistency hint, so automatic reuse of `schema.json` seeds exactly as it
+    always has and keeps coining — an ordinary incremental generate is
+    unaffected by this feature existing.
+    """
     ws = tmp_path / "ws"
     did = _docset_with_one_file(ws, text_pdf, capsys)
-    (ws / "docsets" / did / "schema.json").write_text(
+    docset_dir = ws / "docsets" / did
+    docset_dir.mkdir(parents=True, exist_ok=True)
+    (docset_dir / "schema.json").write_text(
         json.dumps({"tags": {"ClientName": {"name": "ClientName", "role": "the client"}}}),
         encoding="utf-8",
     )
 
-    for extra, closed, seeded in (
-        ([], True, True),  # auto-reuse closes
-        (["--allow-new-tags"], False, True),  # …unless told otherwise
-        (["--no-roster"], False, False),  # no seed -> nothing to close
-    ):
+    # Derived schema.json: seeds, does NOT close.
+    options = _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"]
+    assert options.vocab.names == {"ClientName"}
+    assert not options.vocab.closed
+
+    # No seed at all.
+    capsys.readouterr()
+    options = _generate_with_stub_batch(ws, did, ["--no-roster"]).call_args.kwargs["options"]
+    assert not options.vocab.names and not options.vocab.closed
+
+    # A remembered AUTHORED schema closes, with no flag and no re-supply — it
+    # outranks the derived schema.json sitting beside it.
+    capsys.readouterr()
+    (docset_dir / "authored-schema.json").write_text(
+        json.dumps({"tags": {"PaymentTerms": {"name": "PaymentTerms", "role": "when due"}}}),
+        encoding="utf-8",
+    )
+    options = _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"]
+    assert options.vocab.names == {"PaymentTerms"}
+    assert options.vocab.closed
+
+
+def test_docset_generate_extend_schema_keeps_the_vocabulary_open(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--extend-schema is the second use case: the supplied schema is a
+    foundation the run may add to, not the whole vocabulary."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\nDueDate\n", encoding="utf-8")
+
+    opts = _generate_with_stub_batch(
+        ws, did, ["--schema-path", str(schema_path), "--extend-schema"]
+    ).call_args.kwargs["options"]
+    assert opts.vocab.names == {"PaymentTerms", "DueDate"}
+    assert opts.vocab.authored and not opts.vocab.closed and opts.vocab.extends
+
+    # …and a remembered authored schema extends the same way, no re-supply.
+    capsys.readouterr()
+    opts = _generate_with_stub_batch(ws, did, ["--extend-schema"]).call_args.kwargs["options"]
+    assert opts.vocab.extends and opts.vocab.names == {"PaymentTerms", "DueDate"}
+    # The MODE is per-run, not remembered: a bare run goes back to strict.
+    capsys.readouterr()
+    assert _generate_with_stub_batch(ws, did, []).call_args.kwargs["options"].vocab.closed
+
+
+def test_docset_generate_extend_schema_requires_a_schema(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With nothing to extend the flag is meaningless, so it fails loudly
+    rather than silently doing nothing."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    assert main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage", "--extend-schema"]) == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_docset_generate_reports_added_concepts_under_extend_schema(
+    tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same channel reports refusals under strict and additions under
+    extend — the second being the candidate list for the next schema."""
+    ws = tmp_path / "ws"
+    did = _docset_with_one_file(ws, text_pdf, capsys)
+    schema_path = tmp_path / "tags.txt"
+    schema_path.write_text("PaymentTerms\n", encoding="utf-8")
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, on_off_schema: Any, **_kw: object
+    ) -> dict[str, str]:
+        on_off_schema("with-text.pdf", Counter({"DeliveryDate": 2}))
+        on_output("with-text.pdf", "<xml/>")
+        return {}
+
+    for extra, key in ((["--extend-schema"], "added_concepts"), ([], "unmatched_concepts")):
         capsys.readouterr()
-        options = _generate_with_stub_batch(ws, did, extra).call_args.kwargs["options"]
-        assert options.vocab.closed is closed, extra
-        assert bool(options.vocab.names) is seeded, extra
+        with patch("dgml_core.generation.convert_batch", side_effect=fake_convert):
+            main(
+                _ws_args(ws)
+                + ["docset", "generate", did, "--no-coverage", "--schema-path", str(schema_path)]
+                + extra
+            )
+        entry = next(r for r in _read_stdout(capsys)["results"] if r["status"] == "converted")
+        assert entry[key] == {"count": 2, "distinct": 1, "examples": ["DeliveryDate"]}
+        assert len([k for k in entry if k.endswith("_concepts")]) == 1
 
 
 def test_docset_generate_protects_the_authored_schema_from_its_own_output(
@@ -2866,9 +2943,9 @@ def test_docset_generate_reports_unmatched_concepts_per_file(
     schema_path.write_text("PaymentTerms\n", encoding="utf-8")
 
     def fake_convert(
-        paths: object, *, options: object, on_output: Any, on_rejected: Any, **_kw: object
+        paths: object, *, options: object, on_output: Any, on_off_schema: Any, **_kw: object
     ) -> dict[str, str]:
-        on_rejected("with-text.pdf", Counter({"NameOfCustomer": 3, "DueDate": 1}))
+        on_off_schema("with-text.pdf", Counter({"NameOfCustomer": 3, "DueDate": 1}))
         on_output("with-text.pdf", "<xml/>")
         return {}
 
