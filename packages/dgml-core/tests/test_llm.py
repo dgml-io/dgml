@@ -871,3 +871,43 @@ def test_prefill_on_continuation_follows_thinking_mode(
     # With prefill the partial is the LAST turn; without it a user turn has to
     # follow and ask for the rest.
     assert (roles[-1] == "assistant") is expect_prefill
+
+
+def test_call_raises_with_a_reason_when_the_reply_has_no_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reasoning-only reply used to be cast to str and pushed downstream,
+    where it read as unparseable model output. Name the cause instead."""
+    from dgml_core.errors import EmptyModelResponse
+
+    monkeypatch.setattr(
+        litellm,
+        "completion",
+        lambda **_k: _reply(None, "stop", reasoning_content="thought about it"),
+    )
+    with pytest.raises(EmptyModelResponse) as exc:
+        llm.call(
+            llm.LLMConfig(model="anthropic/claude-sonnet-5"),
+            system_prompt="s",
+            user_content=[{"type": "text", "text": "u"}],
+        )
+    assert "reasoning only" in str(exc.value)
+    assert "finish_reason='stop'" in str(exc.value)
+
+
+def test_call_continued_raises_when_every_round_is_textless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget went entirely into reasoning. Returning "" here sent an empty
+    transcription window on as if the document itself were empty."""
+    from dgml_core.errors import EmptyModelResponse
+
+    monkeypatch.setattr(
+        litellm, "completion", lambda **_k: _reply(None, "length", reasoning_content="thinking")
+    )
+    with pytest.raises(EmptyModelResponse, match="no message content"):
+        llm.call_continued(
+            llm.LLMConfig(model="anthropic/claude-sonnet-5"),
+            system_prompt="s",
+            user_content=[{"type": "text", "text": "u"}],
+        )

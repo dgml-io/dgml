@@ -900,6 +900,32 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
             )
 
 
+def _no_text_detail(response: Any) -> str:
+    """Why a reply carries no assistant text, as a short parenthetical.
+
+    Two causes need different fixes and the bare message told them apart in
+    neither: ``finish_reason="length"`` means the output budget ran out before
+    any text was emitted (raise ``max_tokens``, or ask for less), while a reply
+    whose only content is reasoning means the model spent the budget thinking
+    (disable thinking, or raise the budget). Extended thinking makes the second
+    case reachable on any Claude 4.6+/5 model that is left on its default.
+    """
+    reason: Any = None
+    reasoning_only = False
+    try:
+        choice = response.choices[0]
+        reason = getattr(choice, "finish_reason", None)
+        reasoning_only = bool(getattr(choice.message, "reasoning_content", None))
+    except (AttributeError, IndexError, KeyError, TypeError):
+        pass
+    parts = [
+        f"finish_reason={reason!r}" if reason else "",
+        "reasoning only" if reasoning_only else "",
+    ]
+    detail = ", ".join(x for x in parts if x)
+    return f", {detail}" if detail else ""
+
+
 def call(
     config: LLMConfig,
     *,
@@ -928,7 +954,15 @@ def call(
     with _record_call(config) as totals:
         response = _completion_with_retry(kwargs)
         add_partial(totals, extract_cost_and_tokens(response))
-        return cast(str, response["choices"][0]["message"]["content"])
+        content = response["choices"][0]["message"]["content"]
+        if content is None:
+            # Casting None to str used to push the failure downstream, where it
+            # surfaced as an unparseable payload with no hint of the cause.
+            raise EmptyModelResponse(
+                f"model returned no message content (model={config.model!r}"
+                f"{_no_text_detail(response)})"
+            )
+        return cast(str, content)
 
 
 def call_continued(
@@ -967,6 +1001,9 @@ def call_continued(
         and config.thinking != "adaptive"
     )
     acc = ""
+    # Held for the failure path below, so a caller that set max_rounds=0 gets
+    # the same error as one whose rounds all came back textless.
+    response: Any = None
     # One aggregated row for the whole continuation (all rounds summed).
     with _record_call(config) as totals:
         for _ in range(max_rounds):
@@ -992,6 +1029,14 @@ def call_continued(
             acc += cast(str, choice.message.content or "")
             if getattr(choice, "finish_reason", None) != "length":
                 break
+    if not acc:
+        # Every round returned reasoning, or nothing at all. Returning "" here
+        # sent an empty transcription window downstream, where it read as a
+        # document the model could not transcribe rather than a call that never
+        # produced text.
+        raise EmptyModelResponse(
+            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
+        )
     return acc
 
 
