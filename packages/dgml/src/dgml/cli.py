@@ -2786,7 +2786,9 @@ def _add_generate_subparser(
     )
     gen.add_argument("--window-size", type=int, default=10, help="Pages per transcription window.")
     gen.add_argument("--temperature", type=float, default=0.0)
-    gen.add_argument("--max-tokens", type=int, default=32000)
+    # Keep in step with ConvertOptions.max_tokens — see the note there for
+    # why the ceiling is 64000 rather than 32000.
+    gen.add_argument("--max-tokens", type=int, default=64000)
     gen.add_argument(
         "--no-coverage",
         action="store_true",
