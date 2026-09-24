@@ -116,6 +116,11 @@ class ConvertOptions:
     window_size: int = 10
     temperature: float = 0.0
     max_tokens: int = 32000
+    # Anthropic extended thinking for both passes, one of
+    # :data:`~dgml_core.llm.ANTHROPIC_THINKING_MODES`; ``None`` leaves the
+    # model's own default in force (adaptive, on Claude 4.6+/5). The CLI passes
+    # ``[generation] thinking``, which defaults to ``"disabled"``.
+    thinking: str | None = None
     cache_dir: Path | str | None = None
     # document name → its page_text/ dir (per-page word JSONs written before
     # generation). When a document has one, each transcription window is
@@ -187,6 +192,7 @@ def _config(
         api_base=opts.api_base,
         temperature=opts.temperature,
         max_tokens=opts.max_tokens,
+        thinking=opts.thinking,
         workspace=opts.workspace,
         debug=opts.debug,
         operation=operation,
@@ -302,6 +308,7 @@ def convert_batch(
         api_base=opts.label_api_base,
         temperature=opts.temperature,
         max_tokens=opts.max_tokens,
+        thinking=opts.thinking,
         workspace=opts.workspace,
         debug=opts.debug,
         operation=OPERATION_LABEL,

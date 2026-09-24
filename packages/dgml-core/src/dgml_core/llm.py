@@ -119,6 +119,21 @@ GEMINI_MODEL_PATTERNS = [r"gemini", r"vertex_ai", r"google"]
 # narrow list rather than a blanket rule.
 ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
 
+# Accepted values for `LLMConfig.thinking`, Anthropic's extended-thinking switch.
+#
+#   "disabled" — no thinking tokens.
+#   "adaptive" — the model decides per request (Claude 4.6+/5 only).
+#
+# OMITTING the field is not the same as "disabled": Claude 4.6+/5 models think
+# adaptively when a request carries no `thinking`, so a caller that never sets it
+# gets reasoning tokens (and their cost) silently. That is why the generation
+# pipeline states the mode explicitly instead of relying on the default.
+#
+# `{"type": "enabled", "budget_tokens": N}` is deliberately not offered here:
+# claude-sonnet-5 rejects `budget_tokens`. A caller that needs it can pass the
+# whole dict through `LLMConfig.extra`.
+ANTHROPIC_THINKING_MODES = ("disabled", "adaptive")
+
 # OpenAI families that accept ONLY the default temperature (1). Prefix-matched
 # so future point releases are covered automatically; see
 # is_openai_reasoning_model().
@@ -311,6 +326,12 @@ class LLMConfig:
     max_completion_tokens: int | None = None
     timeout: float | None = None
     reasoning_effort: str | None = None
+    # Anthropic extended thinking; one of :data:`ANTHROPIC_THINKING_MODES`.
+    # ``None`` means "don't send the field" and therefore leaves the model's own
+    # default in force — which for Claude 4.6+/5 is adaptive thinking, not off.
+    # Ignored for non-Anthropic models, and skipped when ``reasoning_effort``
+    # already expresses the same intent (see :func:`_build_completion_kwargs`).
+    thinking: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     # ---- Usage telemetry -------------------------------------------------
@@ -328,6 +349,16 @@ class LLMConfig:
     # the call functions fold their usage into it (one aggregated row for the
     # whole scope) instead of each writing its own row. Never set by callers.
     _usage_sink: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Fail here rather than let the provider 400 on an unknown mode: the
+        # value usually arrives from config, and the config file is where the
+        # typo is.
+        if self.thinking is not None and self.thinking not in ANTHROPIC_THINKING_MODES:
+            raise ValueError(
+                f"thinking must be one of {list(ANTHROPIC_THINKING_MODES)} or None "
+                f"(got {self.thinking!r})"
+            )
 
 
 @dataclass
@@ -652,6 +683,10 @@ def _build_completion_kwargs(
     ``reasoning_effort`` if the config set one. ``temperature`` is never
     sent to Anthropic-routed models — newer Claude models reject it as
     deprecated, and older ones only accept 1 with thinking enabled.
+
+    ``thinking`` follows the same shape: sent only to Anthropic-routed
+    models, and only when ``reasoning_effort`` did not already claim the
+    field.
     """
     _require_supported_model(config.model, config.api_base)
     kwargs: dict[str, Any] = {
@@ -711,6 +746,18 @@ def _build_completion_kwargs(
         forced = _is_tool_choice_forced(tool_choice)
         if not (forced and is_anthropic_model(config.model)):
             kwargs["reasoning_effort"] = config.reasoning_effort
+
+    # Extended thinking, Anthropic only — the field is Anthropic-shaped, and
+    # every other provider spells reasoning differently. Skipped when
+    # `reasoning_effort` survived the rule above, because litellm translates
+    # that into the same `thinking` field for Anthropic and sending both makes
+    # the request self-contradictory; the caller's explicit effort wins.
+    if (
+        config.thinking is not None
+        and is_anthropic_model(config.model)
+        and "reasoning_effort" not in kwargs
+    ):
+        kwargs["thinking"] = {"type": config.thinking}
 
     kwargs.update(config.extra)
     return kwargs
@@ -912,7 +959,13 @@ def call_continued(
     # ("This model does not support assistant message prefill"). That is the
     # other half of the truncation-path breakage — it cost ~13% of calls on one
     # model — so gate on the request shape, not just the provider.
-    prefill = supports_assistant_prefill(config.model) and config.reasoning_effort is None
+    prefill = (
+        supports_assistant_prefill(config.model)
+        and config.reasoning_effort is None
+        # `thinking="disabled"` is what makes prefill usable again on these
+        # models, so only an ENABLED mode has to suppress it.
+        and config.thinking != "adaptive"
+    )
     acc = ""
     # One aggregated row for the whole continuation (all rounds summed).
     with _record_call(config) as totals:

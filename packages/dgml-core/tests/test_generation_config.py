@@ -402,3 +402,35 @@ def test_resolve_overlay_preserves_unnamed_keys(workspace: Workspace) -> None:
     assert cfg.label_model != LABEL_MODEL  # profile replaced the models...
     assert cfg.api_key_env == "MY_KEY"  # ...but not the credentials
     assert source == "profile:fast"
+
+
+# ── [generation] thinking ───────────────────────────────────────────────────
+
+
+def test_thinking_defaults_to_disabled(workspace: Workspace) -> None:
+    """The shipped labeling model is a Claude 5 model, which thinks adaptively
+    whenever the request omits the field. Generation states the mode instead of
+    inheriting it, so a config that says nothing gets thinking OFF."""
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    assert load_generation_config(workspace).thinking == "disabled"
+
+
+def test_thinking_can_be_set_back_to_adaptive(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "adaptive"})
+    assert load_generation_config(workspace).thinking == "adaptive"
+
+
+def test_invalid_thinking_mode_is_a_config_error(workspace: Workspace) -> None:
+    """Caught at load time, where the message can name the file, rather than as
+    a provider 400 after transcription has already been paid for."""
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "sometimes"})
+    with pytest.raises(GenerationConfigInvalid, match=r"generation\.thinking"):
+        load_generation_config(workspace)
+
+
+def test_thinking_survives_a_model_override(workspace: Workspace) -> None:
+    """--model / --label-model overlay the [generation] section; the thinking
+    key is not one of the overlaid fields and must not be lost with them."""
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "adaptive"})
+    cfg, _source = resolve_generation_config(workspace, model=MODEL, label_model=LABEL_MODEL)
+    assert cfg.thinking == "adaptive"

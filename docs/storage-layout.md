@@ -617,6 +617,8 @@ tier resolves a model, generation fails with `GENERATION_CONFIG_MISSING`.
 [generation]
 # Overrides (optional — the tiers cover both by default):
 label_model = "anthropic/claude-opus-5"
+# Anthropic extended thinking for both passes. Default "disabled".
+thinking = "adaptive"
 ```
 
 Field rules:
@@ -631,6 +633,16 @@ Field rules:
   they may name different providers (e.g. the default `mixed` config transcribes
   on Anthropic and labels on Gemini). These apply whether the models are set here
   or come from their tiers; when unset, litellm uses its per-provider env var.
+- `thinking` — optional; `"disabled"` (default) or `"adaptive"`. Anthropic
+  extended thinking, applied to **both** passes; ignored for non-Anthropic
+  models. Omitting the field on the wire is not the same as turning thinking
+  off: Claude 4.6+/5 models think adaptively unless told not to, so generation
+  states the mode rather than inheriting it. The default is `"disabled"`
+  because on an internal 5-docset benchmark (three draws per arm, transcription
+  frozen so only labeling varied) it scored higher than adaptive on
+  exact-match and token-overlap F1, individually and pooled, at roughly 2.7x
+  less cost and 4.5x less wall time. Set `"adaptive"` to restore the model
+  default. Any other value fails with `GENERATION_CONFIG_INVALID`.
 
 A malformed section fails the next `docset generate` with
 `GENERATION_CONFIG_INVALID`.

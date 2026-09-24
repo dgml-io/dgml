@@ -824,7 +824,10 @@ field nor a tier names a model it fails with `GENERATION_CONFIG_MISSING`, a
 malformed one with `GENERATION_CONFIG_INVALID`. The two models carry independent
 credentials (`api_key`/`api_key_env`/`api_base` for transcription,
 `label_api_key`/`label_api_key_env`/`label_api_base` for labeling) since they may
-name different providers. See the [`generation` config
+name different providers. Anthropic extended thinking is off for both passes
+unless `generation.thinking = "adaptive"` says otherwise — a Claude 4.6+/5 model
+thinks adaptively when a request omits the field, so the mode is stated rather
+than inherited. See the [`generation` config
 section](storage-layout.md#generation-required-for-dgml-docset-generate).
 | `--window-size <n>` | `10` | Pages per transcription window. |
 | `--temperature <f>` | `0.0` | LLM temperature. |

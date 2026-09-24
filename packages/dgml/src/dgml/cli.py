@@ -3710,6 +3710,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     window_size=args.window_size,
                     temperature=args.temperature,
                     max_tokens=args.max_tokens,
+                    thinking=gen_cfg.thinking,
                     max_parallel_docs=args.max_parallel_calls,
                     cache_dir=cache_dir,
                     debug=args.debug,
