@@ -48,6 +48,7 @@ import base64
 import copy
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -647,6 +648,7 @@ def extract_values(
     phase1_tool_schema_mode = "inlined"
     phase1_chunk_calls = 0
     phase1_truncated_retries = 0
+    phase1_counters = {"envelope_repairs": 0}
 
     try:
         # --- Phase 1: text + page numbers, no bboxes (LLM) ----------
@@ -712,6 +714,8 @@ def extract_values(
                 phase1_args, phase1_tool_calls, phase1_chunk_calls = _run_extract_loop(
                     workspace=workspace,
                     file_id=file_id,
+                    vocab=vocab,
+                    counters=phase1_counters,
                     messages=_phase1_messages(chunked=chunked),
                     tools=_phase1_tools(tool_schema, chunked=chunked),
                     chunked=chunked,
@@ -737,6 +741,26 @@ def extract_values(
                 # Gemini's constrained decoder rejected the inlined schema;
                 # the model still sees the full schema in the user prompt.
                 phase1_tool_schema_mode = "permissive"
+        phase1_duration = round(time.monotonic() - phase1_started, 3)
+        # Keys that name no schema root, and roots whose value has the wrong
+        # shape, are dropped at serialization (the writer walks vocab.roots).
+        # A tree that had keys but keeps nothing would land as an empty
+        # <dg:extraction/> reported as success: refuse it here so the failure
+        # is visible. An empty tree, or one whose roots are all null, stays a
+        # legal "nothing found" outcome (the serializer reads null as "not
+        # extracted"), and leaf internals (a leaf without text, a collection
+        # of malformed entries) stay the serializer's business, as before.
+        submitted_keys = sorted(k for k, v in phase1_args["values"].items() if v is not None)
+        kept = _prune_to_vocabulary(phase1_args["values"], vocab)
+        if submitted_keys and not kept:
+            shown = ", ".join(repr(k) for k in submitted_keys[:6])
+            if len(submitted_keys) > 6:
+                shown += f" and {len(submitted_keys) - 6} more"
+            raise ValuesExtractionFailed(
+                f"{_TOOL_SUBMIT_VALUES!r} returned nothing that fits the schema: got keys "
+                f"{shown}, expected roots {sorted(tag.name for tag in vocab.roots)} "
+                "shaped as the schema defines; refusing to write an empty extraction"
+            )
         # Enforce the vocabulary code-side on exactly the paths whose payload
         # never met a provider-side shape check: permissive mode (the values
         # parameter was a bare object) and chunked mode (append_entries
@@ -746,13 +770,12 @@ def extract_values(
         # phases 2/3 rather than at serialization — a behavior change beyond
         # what these fallbacks need.
         if phase1_tool_schema_mode == "permissive" or chunked:
-            phase1_args["values"] = _prune_to_vocabulary(phase1_args["values"], vocab)
+            phase1_args["values"] = kept
         phase1_values = phase1_args["values"]
         phase1_layout = phase1_args.get("layout") or None
         if not isinstance(phase1_layout, dict):
             phase1_layout = None
         tool_calls_total += phase1_tool_calls
-        phase1_duration = round(time.monotonic() - phase1_started, 3)
         # The merged extracted_value leaf shape lets a sloppy model blur the
         # grounded/computed boundary; normalize before phases 2/3 (and the
         # serializer) so their invariants hold regardless.
@@ -893,6 +916,7 @@ def extract_values(
                     phase1_tool_schema=phase1_tool_schema_mode,
                     phase1_chunk_calls=phase1_chunk_calls,
                     phase1_truncated_retries=phase1_truncated_retries,
+                    phase1_envelope_repairs=phase1_counters["envelope_repairs"],
                 )
         except Exception:
             pass
@@ -957,6 +981,7 @@ def _write_extraction_stats(
     phase1_tool_schema: str,
     phase1_chunk_calls: int,
     phase1_truncated_retries: int,
+    phase1_envelope_repairs: int,
 ) -> None:
     """Write ``extraction_stats.json`` into the file's marker directory.
 
@@ -979,6 +1004,9 @@ def _write_extraction_stats(
                 # times phase 1 was restarted with the explicit chunking
                 # directive after a finish_reason='length' truncation.
                 "truncated_retries": phase1_truncated_retries,
+                # submit_values calls whose envelope had to be repaired before
+                # the tree could be read (see _repair_submit_values_args).
+                "envelope_repairs": phase1_envelope_repairs,
                 **phase1_totals,
             },
             "phase2": {"duration_s": phase2_duration},
@@ -1510,6 +1538,156 @@ def _append_entries_tool() -> dict[str, Any]:
     }
 
 
+_ENVELOPE_KEYS = frozenset({"values", "layout", "done"})
+
+
+def _repair_submit_values_args(
+    args: dict[str, Any], vocab: Vocabulary, *, chunked: bool = False
+) -> tuple[dict[str, Any], str | None]:
+    """Undo the ways a model mis-shapes a ``submit_values`` call, or leave it alone.
+
+    Three shapes have been captured in the wild, all from Anthropic models on
+    ordinary one-page invoices (dgml-io/dgml#154, #150). The tree inside each
+    is complete and correct; only the envelope around it is wrong:
+
+    * ``{"values": {"values": {...}, "layout": {...}}}`` -- the tool's own
+      parameter envelope repeated one level down, with ``values`` the only
+      top-level key.
+    * ``{"values": {"values": {...}}, "layout": {...}}`` -- the same, with
+      ``layout`` left at the top.
+    * ``{"values": "{\"values\": {...}}, \"layout\": {...} }"}`` -- the
+      envelope serialized as a JSON *string*, usually with the outer object
+      closed one brace early so the rest of the envelope trails it as text
+      (see :func:`_decode_string_envelope`).
+
+    Left alone, the first two pass every later phase (the nested leaves ground
+    fine) and then serialize as an empty ``<dg:extraction/>`` reported as a
+    success; the third raises.
+
+    The decision is by shape, not by key name: a candidate tree *fits* when
+    :func:`_prune_to_vocabulary` keeps something of it, the same check that
+    decides what serializes. A ``values`` object that fits is never touched,
+    whatever else it carries, so a well-formed tree always wins; a repair
+    happens only when the object as sent fits nothing and exactly one
+    candidate (one level down, or inside the string) does. When a schema
+    itself names a root ``values`` or ``layout`` the readings can collide: a
+    nested envelope then looks well-formed and is left alone, and a string
+    both readings of which fit is refused rather than guessed; either call
+    behaves as before this repair existed. Fitting is the vocabulary's
+    root-and-shape check, not a leaf check, so a leaf missing its ``text``
+    is the serializer's business as before. One envelope needs no fit: an
+    inner tree that is empty (a legal "nothing found") is recognized when
+    the wrapper around it carries only the envelope's own keys. Returns the
+    repaired ``args`` and a short label of the repair, or ``(args, None)``.
+    """
+
+    def fits(candidate: Any) -> bool:
+        return isinstance(candidate, dict) and bool(_prune_to_vocabulary(candidate, vocab))
+
+    def wraps_an_empty_tree(candidate: dict[str, Any]) -> bool:
+        inner = candidate.get("values")
+        return isinstance(inner, dict) and not inner and set(candidate) <= _ENVELOPE_KEYS
+
+    values = args.get("values")
+    if fits(values):
+        return args, None
+    repaired: dict[str, Any]
+    if isinstance(values, str) and values.lstrip().startswith("{"):
+        envelope = _decode_string_envelope(values)
+        if envelope is None:
+            return args, None
+        inner_fits, outer_fits = fits(envelope.get("values")), fits(envelope)
+        if (inner_fits or wraps_an_empty_tree(envelope)) and not outer_fits:
+            repaired = {"values": envelope["values"]}
+            _carry_envelope_fields(repaired, args, envelope, chunked=chunked)
+        elif outer_fits and not inner_fits:
+            # The string held the tree itself. A layout or done beside its
+            # roots is carried out as an envelope field; in the tree it is
+            # not a root and the serializer ignores it, as before.
+            repaired = {"values": envelope}
+            _carry_envelope_fields(repaired, args, envelope, chunked=chunked)
+        else:
+            return args, None
+        return repaired, "string"
+    if isinstance(values, dict) and (fits(values.get("values")) or wraps_an_empty_tree(values)):
+        repaired = {"values": values["values"]}
+        _carry_envelope_fields(repaired, args, values, chunked=chunked)
+        return repaired, "nested"
+    return args, None
+
+
+def _is_layout(candidate: Any) -> bool:
+    """Whether ``candidate`` is a ``layout`` the loop can use: a dict of
+    per-array descriptors of the shape :func:`_layout_param_schema`
+    declares (a known ``kind``, ``columns`` a list of names when present,
+    nothing else)."""
+    if not isinstance(candidate, dict):
+        return False
+    for descriptor in candidate.values():
+        if not isinstance(descriptor, dict) or not set(descriptor) <= {"kind", "columns"}:
+            return False
+        if descriptor.get("kind") not in ("table", "free_form"):
+            return False
+        columns = descriptor.get("columns")
+        if columns is not None and not (
+            isinstance(columns, list) and all(isinstance(c, str) for c in columns)
+        ):
+            return False
+    return True
+
+
+def _carry_envelope_fields(
+    repaired: dict[str, Any],
+    outer: dict[str, Any],
+    inner: dict[str, Any] | None,
+    *,
+    chunked: bool,
+) -> None:
+    """Carry ``layout`` and ``done`` into a repaired call, by validity.
+
+    The call's own field wins when it is valid (a layout of known
+    descriptors, a ``bool`` done); otherwise the copy the model left inside
+    the mis-shaped ``values`` fills in, when it is valid. Anything else is
+    dropped, and the loop's defaults apply. ``done`` is a chunked-protocol
+    field: in single-shot mode it is not carried, so a stray ``done: false``
+    cannot turn one submission into a continuation the model was never
+    offered.
+    """
+    checks: list[tuple[str, Callable[[Any], bool]]] = [("layout", _is_layout)]
+    if chunked:
+        checks.append(("done", lambda v: isinstance(v, bool)))
+    for key, valid in checks:
+        outer_value = outer.get(key)
+        inner_value = inner.get(key) if inner is not None else None
+        if valid(outer_value):
+            repaired[key] = outer_value
+        elif valid(inner_value):
+            repaired[key] = inner_value
+
+
+def _decode_string_envelope(text: str) -> dict[str, Any] | None:
+    """Decode a ``submit_values`` envelope the model serialized as a string.
+
+    The damage seen is the outer object closed one brace early, so the rest
+    of the envelope (``"layout": {...}``, ``"done": false``) trails the first
+    complete object as extra text. Moving that brace to the end turns the
+    whole string back into the object the model meant to send, every field
+    included. Trailing text that does not read that way is not understood,
+    and ``None`` leaves the call to fail loudly as before.
+    """
+    text = text.strip()
+    try:
+        lead, end = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return None
+    if text[end:].strip():
+        try:
+            lead = json.loads(text[: end - 1] + text[end:])
+        except ValueError:
+            return None
+    return lead if isinstance(lead, dict) else None
+
+
 def _run_extract_loop(
     *,
     workspace: Workspace,
@@ -1521,17 +1699,23 @@ def _run_extract_loop(
     api_base: str | None,
     max_tool_iters: int,
     totals: dict[str, Any],
+    vocab: Vocabulary,
+    counters: dict[str, int],
     chunked: bool = False,
 ) -> tuple[dict[str, Any], int, int]:
     """Run a multi-turn extraction loop until the model finishes submitting.
 
-    Returns ``(submit_args, tool_calls_run, chunk_calls)`` — ``submit_args``
+    Returns ``(submit_args, tool_calls_run, chunk_calls)``: ``submit_args``
     carries the merged ``values`` tree plus optional sibling fields like
     ``layout``; ``chunk_calls`` counts the submission calls (1 for the
     ordinary single ``submit_values``, more when the model used the chunked
-    protocol). Mutates ``totals`` by adding cost/token deltas from every
-    litellm call so the surrounding ``extract_values`` records a single
-    usage row across both phases.
+    protocol).
+    Mutates ``totals`` by adding cost/token deltas from every litellm call
+    so the surrounding ``extract_values`` records a single usage row across
+    both phases, and ``counters["envelope_repairs"]`` for every submission
+    whose argument envelope had to be unwrapped first (see
+    :func:`_repair_submit_values_args`, which decides against ``vocab``);
+    both survive a loop that fails after the repair.
 
     Two submission protocols:
 
@@ -1633,6 +1817,9 @@ def _run_extract_loop(
                 ) from exc
 
             if name == _TOOL_SUBMIT_VALUES:
+                args, repaired = _repair_submit_values_args(args, vocab, chunked=chunked)
+                if repaired is not None:
+                    counters["envelope_repairs"] += 1
                 values = args.get("values")
                 if not isinstance(values, dict):
                     raise ValuesExtractionFailed(

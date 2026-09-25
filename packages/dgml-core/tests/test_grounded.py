@@ -34,7 +34,10 @@ from dgml_core.grounded import (
     _SCHEMA_TREE_MAX_DEPTH,
     DEFAULT_MAX_TOOL_ITERS,
     GroundedConfig,
+    _empty_totals,
     _field_node_schema,
+    _repair_submit_values_args,
+    _run_extract_loop,
     _submit_schema_tool,
     extract_values,
     generate_schema,
@@ -1040,6 +1043,7 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "duration_s",
         "chunk_calls",
         "truncated_retries",
+        "envelope_repairs",
         "cost_usd",
         "prompt_tokens",
         "completion_tokens",
@@ -1049,6 +1053,7 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
     }
     assert stats["phases"]["phase1"]["chunk_calls"] == 1
     assert stats["phases"]["phase1"]["truncated_retries"] == 0
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 0
     assert set(stats["phases"]["phase2"].keys()) == {"duration_s"}
     assert set(stats["phases"]["phase3"].keys()) == {
         "duration_s",
@@ -2320,3 +2325,429 @@ def test_phase3_never_cached(workspace: Workspace) -> None:
     assert len(m.call_args_list) >= 2, "phase 3 did not run; test would be vacuous"
     for call in m.call_args_list[1:]:
         assert _cache_control_paths(call.kwargs["messages"]) == []
+
+
+# ---------------------------------------------------------------------------
+# submit_values envelope repair (dgml-io/dgml#154, #150)
+# ---------------------------------------------------------------------------
+
+_TITLE_LAYOUT = {"title": {"kind": "free_form"}}
+_TITLE_VOCAB = parse_rnc(_TITLE_RNC)
+# The same schema with its root named after the envelope's own key.
+_VALUES_ROOT_RNC = """\
+namespace dg = "http://dgml.io/ns/dg#"
+namespace docset = "http://www.dgml.io/ws/Test"
+
+start =
+  element dg:chunk {
+    (text | values)*
+  }
+
+values =
+  element docset:values {
+    text
+  }
+"""
+_VALUES_ROOT_VOCAB = parse_rnc(_VALUES_ROOT_RNC)
+
+
+def _hello_title() -> dict[str, Any]:
+    return {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+
+
+def _extract_with_submit_args(
+    workspace: Workspace, args: dict[str, Any]
+) -> tuple[Any, dict[str, Any] | None]:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", return_value=_tool_call_response("submit_values", args)):
+        result = extract_values(workspace, ds_id, fid, config=config)
+    return result, workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(
+            {"values": {"values": _hello_title(), "layout": _TITLE_LAYOUT}},
+            id="envelope-repeated-under-values",
+        ),
+        pytest.param(
+            {"values": {"values": _hello_title()}, "layout": _TITLE_LAYOUT},
+            id="values-nested-layout-beside",
+        ),
+        pytest.param(
+            {
+                "values": json.dumps({"values": _hello_title()})
+                + ', "layout": '
+                + json.dumps(_TITLE_LAYOUT)
+                + " }"
+            },
+            id="values-as-json-string-with-trailing-layout",
+        ),
+    ],
+)
+def test_extract_values_repairs_a_mis_shaped_submit_values(
+    workspace: Workspace, args: dict[str, Any]
+) -> None:
+    """The three envelope shapes seen from Anthropic models carry a complete
+    tree one level down or inside a string. Each is repaired before the tree
+    is read: the value is grounded by phase 2 exactly as a well-formed call
+    would be, the repair is counted in the stats sidecar, and the layout
+    survives wherever the model left it."""
+    result, stats = _extract_with_submit_args(workspace, args)
+    assert result.values["title"]["text"] == "Hello world"
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 210, 290, 242]}
+    ]
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert "<dg:extraction>" in xml and "<dg:extraction/>" not in xml
+    assert stats is not None
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 1
+    assert stats["phase1_layout"] == _TITLE_LAYOUT
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param({"values": {"values": {}, "layout": _TITLE_LAYOUT}}, id="nested-empty"),
+        pytest.param({"values": json.dumps({"values": {}})}, id="string-empty"),
+    ],
+)
+def test_extract_values_unwraps_an_empty_tree_from_an_envelope(
+    workspace: Workspace, args: dict[str, Any]
+) -> None:
+    """An empty tree fits nothing, so the envelope around it is recognized
+    by its keys instead; "nothing found" stays legal inside a mis-shaped call."""
+    result, stats = _extract_with_submit_args(workspace, args)
+    assert result.values == {}
+    assert stats is not None
+    assert stats["outcome"] == "ok"
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 1
+
+
+def test_extract_values_keeps_an_all_null_tree_as_a_legal_outcome(workspace: Workspace) -> None:
+    """A null root is "not extracted" to the serializer, the same as an
+    absent one; it is not a tree that fits nothing."""
+    result, stats = _extract_with_submit_args(workspace, {"values": {"title": None}})
+    assert result.values == {"title": None}
+    assert stats is not None
+    assert stats["outcome"] == "ok"
+
+
+def test_extract_values_does_not_continue_a_single_shot_call_over_a_stray_done(
+    workspace: Workspace,
+) -> None:
+    """``done`` belongs to the chunked protocol; a ``done: false`` the model
+    left inside a nested envelope must not buy it a second turn."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    args = {"values": {"values": _hello_title(), "done": False}}
+    with patch(
+        "litellm.completion", return_value=_tool_call_response("submit_values", args)
+    ) as completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+    assert result.values["title"]["text"] == "Hello world"
+    assert completion.call_count == 1
+
+
+def test_extract_values_records_a_repair_even_when_the_run_fails_later(
+    workspace: Workspace,
+) -> None:
+    """The count lives in a counter the caller owns, so the error stats of a
+    run that fails after phase 1 still show the repair."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=2)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    # A leaf on page 2, which has no image: phase 3 fails after the repair.
+    tree = {"title": {"text": "Goodnight", "locations": [{"page_number": 2}]}}
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": {"values": tree}}),
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="no page image"):
+            extract_values(workspace, ds_id, fid, config=config)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["outcome"] == "error"
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 1
+
+
+def test_run_extract_loop_keeps_the_repair_count_when_a_later_turn_fails(
+    workspace: Workspace,
+) -> None:
+    """The counter the caller owns survives a loop that fails after the
+    repair: a chunked first batch arrives in a nested envelope (repaired,
+    ``done: false`` carried), and the next turn is an unknown tool."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    counters = {"envelope_repairs": 0}
+    first = _tool_call_response(
+        "submit_values", {"values": {"values": _hello_title(), "done": False}}, call_id="p1"
+    )
+    second = _tool_call_response("not_a_tool", {}, call_id="p2")
+    with patch("litellm.completion", side_effect=[first, second]):
+        with pytest.raises(ValuesExtractionFailed):
+            _run_extract_loop(
+                workspace=workspace,
+                file_id=fid,
+                messages=[{"role": "user", "content": "extract"}],
+                tools=[],
+                model=DEFAULT_VALUES_MODEL,
+                api_key=None,
+                api_base=None,
+                max_tool_iters=3,
+                totals=_empty_totals(),
+                vocab=_TITLE_VOCAB,
+                counters=counters,
+                chunked=True,
+            )
+    assert counters["envelope_repairs"] == 1
+
+
+def test_extract_values_records_the_phase1_duration_on_the_refusal(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The duration is captured before the refusal raises, so the error
+    stats carry the phase-1 time (the clock here advances one second per
+    reading)."""
+    import itertools
+    import time
+
+    ticks = itertools.count(start=100.0, step=1.0)
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    bogus = {"values": {"Bogus": {"text": "x", "locations": [{"page_number": 1}]}}}
+    with patch("litellm.completion", return_value=_tool_call_response("submit_values", bogus)):
+        with pytest.raises(ValuesExtractionFailed, match="nothing that fits the schema"):
+            extract_values(workspace, ds_id, fid, config=config)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert stats["phases"]["phase1"]["duration_s"] >= 1.0
+
+
+def test_extract_values_names_the_keys_it_refused_and_how_many_more(workspace: Workspace) -> None:
+    values = {f"Bogus{i}": {"text": "x", "locations": [{"page_number": 1}]} for i in range(8)}
+    with pytest.raises(ValuesExtractionFailed, match=r"'Bogus5' and 2 more, expected roots"):
+        _extract_with_submit_args(workspace, {"values": values})
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param({"Bogus": {"text": "x", "locations": [{"page_number": 1}]}}, id="no-root"),
+        pytest.param({"title": "Hello world"}, id="root-with-wrong-shape"),
+    ],
+)
+def test_extract_values_refuses_a_tree_nothing_of_which_fits_the_schema(
+    workspace: Workspace, values: dict[str, Any]
+) -> None:
+    """A key that names no root, or a root whose value has the wrong shape,
+    is dropped at serialization; a tree made only of those would be written
+    as an empty extraction reported as success, the silent failure behind
+    #154. Refuse it by name instead, on the ordinary inlined path too, and
+    record the error in the stats sidecar."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    response = _tool_call_response("submit_values", {"values": values})
+    with patch("litellm.completion", return_value=response):
+        with pytest.raises(ValuesExtractionFailed, match=r"nothing that fits the schema.*'title'"):
+            extract_values(workspace, ds_id, fid, config=config)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert workspace.blobs.blob_exists(layout.dgml_xml_key(ds_id, fid, "doc")) is False
+
+
+def test_extract_values_refuses_a_tree_pruned_to_nothing_in_permissive_mode(
+    workspace: Workspace,
+) -> None:
+    """Permissive mode prunes code-side; the same refusal applies there."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            Exception("BadRequestError: The specified schema produces too many states for serving"),
+            _tool_call_response("submit_values", {"values": {"title": "Hello world"}}),
+        ],
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="nothing that fits the schema"):
+            extract_values(workspace, ds_id, fid, config=config)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+
+
+def test_extract_values_keeps_an_empty_tree_as_a_legal_outcome(workspace: Workspace) -> None:
+    """A model that finds nothing submits an empty object; that is not the
+    failure above and must still write the (empty) extraction."""
+    result, stats = _extract_with_submit_args(workspace, {"values": {}})
+    assert result.values == {}
+    assert stats is not None and stats["outcome"] == "ok"
+
+
+def test_extract_values_still_fails_loudly_on_a_string_it_cannot_decode(
+    workspace: Workspace,
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    bad = {"values": '{"title": {"text": "Hello world"}} trailing prose'}
+    with patch("litellm.completion", return_value=_tool_call_response("submit_values", bad)):
+        with pytest.raises(ValuesExtractionFailed, match="without a 'values' object"):
+            extract_values(workspace, ds_id, fid, config=config)
+
+
+def test_repair_never_touches_a_tree_the_schema_keeps() -> None:
+    """The decision is by shape. A tree that fits is left alone even when its
+    root is literally called ``values``; the same object under a schema it
+    does not fit is the nested envelope."""
+    leaf = {"text": "x", "locations": [{"page_number": 1}]}
+    args = {"values": {"values": leaf}}
+    assert _repair_submit_values_args(args, _VALUES_ROOT_VOCAB) == (args, None)
+    nested = {"values": {"values": {"title": leaf}}}
+    assert _repair_submit_values_args(nested, _TITLE_VOCAB)[1] == "nested"
+
+
+def test_repair_reads_a_string_bare_tree_rooted_at_values_as_the_tree() -> None:
+    args = {"values": '{"values": {"text": "x", "locations": [{"page_number": 1}]}}'}
+    repaired, label = _repair_submit_values_args(args, _VALUES_ROOT_VOCAB)
+    assert label == "string"
+    assert repaired["values"] == {"values": {"text": "x", "locations": [{"page_number": 1}]}}
+
+
+_VALUES_AND_CHILD_RNC = """\
+namespace dg = "http://dgml.io/ns/dg#"
+namespace docset = "http://www.dgml.io/ws/Test"
+
+start =
+  element dg:chunk {
+    (text | values | title)*
+  }
+
+values =
+  element docset:values {
+    (text | title)*
+  }
+
+title =
+  element docset:title {
+    text
+  }
+"""
+
+
+def test_repair_refuses_a_string_both_readings_of_which_fit() -> None:
+    """A schema that names both a ``values`` container and its child as
+    roots makes a stringified bare ``values`` tree ambiguous: the whole
+    object fits, and so does its ``values`` member. No guess is made; the
+    call fails loudly as it does today."""
+    vocab = parse_rnc(_VALUES_AND_CHILD_RNC)
+    assert {tag.name for tag in vocab.roots} == {"values", "title"}
+    args = {"values": '{"values": {"title": {"text": "x", "locations": [{"page_number": 1}]}}}'}
+    assert _repair_submit_values_args(args, vocab) == (args, None)
+
+
+def test_repair_leaves_a_string_that_is_not_an_object_alone() -> None:
+    args = {"values": "not json at all"}
+    assert _repair_submit_values_args(args, _TITLE_VOCAB) == (args, None)
+
+
+def test_repair_refuses_a_string_envelope_it_cannot_fully_decode() -> None:
+    args = {"values": '{"values": {"title": {"text": "x"}}} and then some prose'}
+    assert _repair_submit_values_args(args, _TITLE_VOCAB) == (args, None)
+
+
+def test_repair_keeps_the_done_flag_that_trails_a_string_envelope() -> None:
+    """A chunked first batch serialized as a string, closed one brace early:
+    the trailing ``done: false`` must survive or the loop would stop after
+    the first batch and silently drop the append_entries that follow."""
+    args = {"values": '{"values": {"title": {"text": "1"}}}, "done": false }'}
+    repaired, label = _repair_submit_values_args(args, _TITLE_VOCAB, chunked=True)
+    assert label == "string"
+    assert repaired == {"values": {"title": {"text": "1"}}, "done": False}
+
+
+def test_repair_prefers_the_call_s_own_layout_over_the_string_s() -> None:
+    args = {
+        "values": '{"values": {"title": {"text": "x"}}, "layout": {"title": {"kind": "list"}}}',
+        "layout": _TITLE_LAYOUT,
+    }
+    repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert repaired["layout"] == _TITLE_LAYOUT
+
+
+def test_repair_carries_envelope_fields_by_validity() -> None:
+    """An outer field of the wrong type does not shadow a valid inner one:
+    ``done: "false"`` is a truthy string that would end a chunked run."""
+    args = {
+        "values": {"values": {"title": {"text": "x"}}, "done": False, "layout": _TITLE_LAYOUT},
+        "done": "false",
+        "layout": None,
+    }
+    repaired, label = _repair_submit_values_args(args, _TITLE_VOCAB, chunked=True)
+    assert label == "nested"
+    assert repaired == {"values": {"title": {"text": "x"}}, "done": False, "layout": _TITLE_LAYOUT}
+
+
+def test_repair_prefers_a_valid_inner_layout_over_an_invalid_outer_one() -> None:
+    """Validity, not presence, decides: an outer ``layout`` of unknown
+    descriptors must not shadow the usable one inside the envelope."""
+    inner_layout = {"Items": {"kind": "table", "columns": ["Amount"]}}
+    args = {
+        "values": {"values": _hello_title(), "layout": inner_layout},
+        "layout": {"Items": {"kind": "scalar"}},
+    }
+    repaired, label = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert label == "nested"
+    assert repaired["layout"] == inner_layout
+
+
+def test_repair_carries_a_string_bare_tree_s_layout_out_as_an_envelope_field() -> None:
+    text = json.dumps({**_hello_title(), "layout": _TITLE_LAYOUT})
+    repaired, label = _repair_submit_values_args({"values": text}, _TITLE_VOCAB)
+    assert label == "string"
+    assert repaired["values"]["title"] == _hello_title()["title"]
+    assert repaired["layout"] == _TITLE_LAYOUT
+
+
+def test_repair_carries_done_only_under_the_chunked_protocol() -> None:
+    args = {"values": {"values": _hello_title(), "done": False}}
+    repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert "done" not in repaired
+    repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB, chunked=True)
+    assert repaired["done"] is False
+
+
+def test_repair_rejects_a_layout_whose_descriptor_has_the_wrong_shape() -> None:
+    """A descriptor with a string ``columns`` or an unknown key is not a
+    layout, so it does not shadow the valid one inside the envelope."""
+    inner = {"Items": {"kind": "table", "columns": ["Amount"]}}
+    for outer in (
+        {"Items": {"kind": "table", "columns": "Amount"}},
+        {"Items": {"kind": "table", "columns": ["Amount"], "rows": 3}},
+        {"Items": "table"},
+    ):
+        args = {"values": {"values": _hello_title(), "layout": inner}, "layout": outer}
+        repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB)
+        assert repaired["layout"] == inner, outer

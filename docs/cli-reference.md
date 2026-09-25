@@ -1344,8 +1344,15 @@ on the last — merged and vocabulary-checked code-side, transparent in the CLI
 payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
-`phases.phase1`: `chunk_calls` (1 = ordinary single submission) and
-`truncated_retries`.
+`phases.phase1`: `chunk_calls` (1 = ordinary single submission),
+`truncated_retries`, and `envelope_repairs`. The last counts `submit_values`
+calls that arrived with the tool's argument envelope repeated one level down,
+or serialized as a JSON string, and were unwrapped before the tree was read.
+A submission of which the vocabulary keeps nothing (no key names a schema
+root, or every named root carries a value of the wrong kind) is refused as an
+extraction error rather than written as an empty result; an empty tree, or
+one whose roots are all null, is still "nothing found". Leaf internals are
+not checked here.
 
 **Schema-declared invariants.** A field may carry a `## Invariant:` annotation
 naming a checkable relation against the rest of the submission — the
