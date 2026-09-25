@@ -73,8 +73,11 @@ _IDENTITY_BANNER = (
 
 # A table header on its own line: ``[workspace]`` with optional surrounding space.
 # Deliberately exact — ``[[workspace]]`` (array-of-tables) and ``[workspace.sub]``
-# are refused rather than matched, see :func:`_identity_span`.
-_IDENTITY_HEADER = re.compile(r"^[ \t]*\[" + IDENTITY_TABLE + r"\][ \t]*$", re.MULTILINE)
+# are refused rather than matched, see :func:`_identity_span`. The optional carriage
+# return is for a CRLF file: ``$`` under ``re.MULTILINE`` matches before ``\n`` only,
+# so without it an existing ``[workspace]\r\n`` header is never found, the splice
+# appends a second table, and the write refuses itself.
+_IDENTITY_HEADER = re.compile(r"^[ \t]*\[" + IDENTITY_TABLE + r"\][ \t]*\r?$", re.MULTILINE)
 _ANY_HEADER = re.compile(r"^[ \t]*\[", re.MULTILINE)
 _REJECTED_HEADER = re.compile(
     r"^[ \t]*(\[\[" + IDENTITY_TABLE + r"\]\]|\[" + IDENTITY_TABLE + r"\.)",
@@ -394,22 +397,23 @@ def _extend_over_banner(text: str, start: int) -> int:
     return scan if first_line.startswith(_GENERATED_MARKERS) else start
 
 
-def _splice(text: str, block: str, span: tuple[int, int] | None) -> str:
+def _splice(text: str, block: str, span: tuple[int, int] | None, nl: str = "\n") -> str:
     """Replace ``span`` with ``block``, or append ``block`` at the end.
 
     Appending a table at EOF is always valid TOML, which is why this module only ever
     writes whole tables and never edits a key in place. A blank line is kept between
     the block and whatever follows it, so repeated rewrites do not slowly close up the
-    spacing of a hand-authored file."""
+    spacing of a hand-authored file. ``nl`` is the file's own line ending; ``block``
+    is expected to use it already, so the separators added here match the file."""
     if span is not None:
         start, end = span
         tail = text[end:]
-        if tail and not tail.startswith("\n"):
-            block = block if block.endswith("\n\n") else block.rstrip("\n") + "\n\n"
+        if tail and not tail.startswith(nl):
+            block = block if block.endswith(nl + nl) else block.rstrip("\r\n") + nl + nl
         return text[:start] + block + tail
     if not text:
         return block
-    separator = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    separator = "" if text.endswith(nl + nl) else (nl if text.endswith(nl) else nl + nl)
     return text + separator + block
 
 
@@ -437,15 +441,20 @@ def _write_tables(
                 f"{label} is not valid TOML ({exc}); dgml will not write to it. Fix or remove it."
             ) from exc
 
+    # Rendered blocks use bare LF; a CRLF file gets them in its own convention so a
+    # rewrite does not leave it with mixed line endings.
+    nl = "\r\n" if "\r\n" in text else "\n"
     for name, values in tables.items():
         block = render_table(name, values)
         banner = _IDENTITY_BANNER if name == IDENTITY_TABLE else (banners or {}).get(name)
         if banner:
             block = banner + block
+        if nl != "\n":
+            block = block.replace("\n", nl)
         # Both spans absorb any comment block directly above the header, so a banner
         # is replaced rather than stacked on each rewrite.
         span = _identity_span(text, label) if name == IDENTITY_TABLE else _named_span(text, name)
-        text = _splice(text, block, span)
+        text = _splice(text, block, span, nl)
 
     try:
         parsed = tomllib.loads(text)

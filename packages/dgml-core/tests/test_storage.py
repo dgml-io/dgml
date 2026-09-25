@@ -27,6 +27,7 @@ from dgml_core.storage import (
     render_config_toml,
     user_config_path,
     write_json_atomic,
+    write_text_atomic,
     write_user_config,
 )
 from dgml_core.workspace_id import new_workspace_id
@@ -401,6 +402,20 @@ def test_write_user_config_create_then_refresh_with_backup(
     assert "anthropic/claude" in backup3.read_text(encoding="utf-8")
 
 
+def test_write_user_config_backup_is_the_same_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The .bak is the file it backs up, byte for byte, on every platform."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    path = user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = b'# mine\r\n[models]\r\nschema = "x/y"\r\n'
+    path.write_bytes(original)
+    _, backup = write_user_config("google", overwrite=True)
+    assert backup is not None
+    assert backup.read_bytes() == original
+
+
 def test_has_legacy_json_config(tmp_path: Path) -> None:
     ws = Workspace(root=tmp_path / "ws")
     ws.root.mkdir(parents=True)  # nothing scaffolds the root now that init() is gone
@@ -424,3 +439,41 @@ def test_workspace_meta_roundtrip_and_org_fallback(tmp_path: Path) -> None:
     assert ws.read_meta() == {"name": "My Workspace", "organization": "Acme"}
     assert ws.organization == "Acme"
     assert ws.display_name == "My Workspace"
+
+
+def test_write_text_atomic_keeps_the_given_newlines(tmp_path: Path) -> None:
+    """Mixed CRLF and LF text comes back byte for byte (Windows text mode used
+    to double the carriage returns; on Linux the next test pins the argument)."""
+    path = tmp_path / "config.toml"
+    text = '[storage]\r\nprovider = "local"\r\n\n[models]\n'
+    write_text_atomic(path, text)
+    assert path.read_bytes() == text.encode("utf-8")
+
+
+def test_atomic_text_writers_switch_off_newline_translation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both atomic writers pass newline="" (Linux CI cannot see the translation)."""
+    from dgml_core import storage_local
+
+    seen: list[object] = []
+    real_write_text = Path.write_text
+
+    def _spy(self: Path, data: str, *args: object, **kwargs: object) -> int:
+        seen.append(kwargs.get("newline", "absent"))
+        return real_write_text(self, data, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", _spy)
+    write_text_atomic(tmp_path / "a.txt", "x\n")
+    storage_local._write_text_atomic(tmp_path / "b.txt", "y\n")
+    write_json_atomic(tmp_path / "c.json", {"k": 1})
+    assert seen == ["", "", ""]
+
+
+def test_write_json_atomic_writes_bare_lf(tmp_path: Path) -> None:
+    """The JSON writer puts down the LF it renders, not the platform's line ending."""
+    path = tmp_path / "stats.json"
+    write_json_atomic(path, {"k": [1, 2]})
+    raw = path.read_bytes()
+    assert b"\r" not in raw
+    assert raw.endswith(b"}\n")

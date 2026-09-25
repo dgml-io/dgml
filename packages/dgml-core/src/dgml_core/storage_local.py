@@ -15,8 +15,8 @@
 Implements both interfaces over one directory, so the zero-config default keeps
 blobs and documents on local disk. Maps both APIs onto the **existing** workspace
 directory layout (see
-``docs/storage-layout.md``), so a local workspace on disk is byte-for-byte what
-it is today — no migration, and everything that reads the tree directly
+``docs/storage-layout.md``), so a local workspace on disk keeps the layout it
+has today — no migration, and everything that reads the tree directly
 (``dgml check``, attestation, DGMLX bundles, external tooling) keeps working.
 
 - **Blob keys are the on-disk relative paths** themselves: a blob is stored at
@@ -109,7 +109,8 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
 def _write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    # newline="" writes the text's own line endings; see storage.write_text_atomic.
+    tmp.write_text(text, encoding="utf-8", newline="")
     tmp.replace(path)
 
 
@@ -406,7 +407,10 @@ class LocalStore(BlobStore, DocStore):
         line = json.dumps(doc, separators=(",", ":"), ensure_ascii=False)
         path = self._root / USAGE_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
+        # newline="" as in the atomic writers: a log this code creates or
+        # rewrites uses LF on every platform. An existing CRLF log is not
+        # normalized for an append; the appended row is LF.
+        with path.open("a", encoding="utf-8", newline="") as fh:
             fh.write(line + "\n")
 
     def get_doc(self, collection: str, doc_id: str) -> dict[str, Any] | None:
@@ -422,7 +426,7 @@ class LocalStore(BlobStore, DocStore):
 
     def put_doc(self, collection: str, doc_id: str, doc: dict[str, Any]) -> None:
         # Stored verbatim — the manifest keeps its own fields (e.g. ``id``); no
-        # ``_id`` is injected, so ``file.json`` is byte-identical to today.
+        # ``_id`` is injected, so ``file.json`` keeps the shape it has today.
         _write_text_atomic(
             self._doc_path(collection, doc_id),
             json.dumps(doc, indent=2, ensure_ascii=False) + "\n",

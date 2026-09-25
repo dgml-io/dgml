@@ -328,6 +328,26 @@ def test_usage_is_append_only(tmp_path: Path) -> None:
     assert [e["op"] for e in store.find_docs("usage", {})] == ["label"]
 
 
+def test_usage_append_switches_off_newline_translation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The append path opens with newline="" like the atomic writers (pinned
+    on the argument: Linux CI cannot see the translation it switches off)."""
+    seen: list[object] = []
+    real_open = Path.open
+
+    def _spy(self: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        if "a" in mode:
+            seen.append(kwargs.get("newline", "absent"))
+        return real_open(self, mode, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(Path, "open", _spy)
+    store = local_store(tmp_path)
+    store.append_doc("usage", {"op": "transcribe", "cost_usd": 0.01})
+    assert seen == [""]
+    assert (tmp_path / "usage.jsonl").read_bytes().endswith(b"}\n")
+
+
 def test_usage_tolerates_corrupt_tail(tmp_path: Path) -> None:
     store = local_store(tmp_path)
     store.append_doc("usage", {"op": "ok"})

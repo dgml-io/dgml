@@ -394,3 +394,54 @@ def test_config_override_is_honored(tmp_path: Path) -> None:
     assert blob_cfg.root == root  # the anchor is still the workspace, not the config
     assert not (root / "config.toml").exists()
     assert wc.read_identity(ws).storage_service == "acme"
+
+
+def _assert_crlf_only(raw: bytes) -> None:
+    """Every line ending in ``raw`` is CR LF: no doubled carriage return, no bare LF."""
+    assert b"\r\r" not in raw
+    assert raw.count(b"\n") == raw.count(b"\r\n")
+
+
+def test_crlf_config_round_trips_without_doubling_carriage_returns(tmp_path: Path) -> None:
+    """``workspace create`` on Windows wrote CR CR LF and refused its own
+    file; a CRLF config must come back without a doubled carriage return,
+    with the spliced table in the file's own line endings, and still parse."""
+    ws = _ws(tmp_path, f'[storage]\nprovider = "{LOCAL}"\n')
+    # Seed the CRLF bytes directly: Path.write_text would translate them on Windows.
+    ws.config_path.write_bytes(f'[storage]\r\nprovider = "{LOCAL}"\r\n'.encode())
+    ws = _reopen(ws)
+    wc.write_identity(ws, workspace_id="ws_a", name="W", organization="Acme")
+    raw = ws.config_path.read_bytes()
+    _assert_crlf_only(raw)
+    assert wc.read_identity(ws).organization == "Acme"
+
+
+def test_crlf_config_with_an_existing_identity_table_is_rewritten_in_place(
+    tmp_path: Path,
+) -> None:
+    """A CRLF config that already has a ``[workspace]`` table (edited in Notepad,
+    checked out with autocrlf, or written by an older release on Windows) must be
+    found by the header match and rewritten in place. ``$`` under ``re.MULTILINE``
+    does not match before CR LF, so the header went unrecognised, the splice
+    appended a second ``[workspace]`` table, and reseal or a migration refused its
+    own write with "Cannot declare ('workspace',) twice"."""
+    ws = _ws(tmp_path, f'[storage]\nprovider = "{LOCAL}"\n')
+    ws.config_path.write_bytes(
+        f'[storage]\r\nprovider = "{LOCAL}"\r\n\r\n'
+        f'[workspace]\r\nworkspace_id = "ws_a"\r\nname = "W"\r\n'.encode()
+    )
+    ws = _reopen(ws)
+    wc.write_identity(ws, workspace_id="ws_a", name="W", organization="Acme")
+    raw = ws.config_path.read_bytes()
+    assert raw.count(b"[workspace]") == 1
+    _assert_crlf_only(raw)
+    assert raw.startswith(f'[storage]\r\nprovider = "{LOCAL}"\r\n'.encode())
+    identity = wc.read_identity(_reopen(ws))
+    assert (identity.workspace_id, identity.name, identity.organization) == ("ws_a", "W", "Acme")
+    # A second rewrite finds the table it just wrote, banner included, and does not stack.
+    wc.write_identity(_reopen(ws), workspace_id="ws_a", name="W2", organization="Acme")
+    raw = ws.config_path.read_bytes()
+    assert raw.count(b"[workspace]") == 1
+    assert raw.count(b"# Written by dgml") == 1
+    _assert_crlf_only(raw)
+    assert wc.read_identity(_reopen(ws)).name == "W2"

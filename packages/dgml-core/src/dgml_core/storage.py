@@ -495,15 +495,23 @@ def write_json_atomic(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    tmp.write_text(text, encoding="utf-8")
+    # newline="" for the same reason as write_text_atomic: every atomic writer puts
+    # down the text's own line endings on every platform.
+    tmp.write_text(text, encoding="utf-8", newline="")
     tmp.replace(path)
 
 
 def write_text_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via write-then-rename (e.g. ``extraction-schema.rnc``)."""
+    """Write ``text`` to ``path`` via write-then-rename (e.g. ``extraction-schema.rnc``).
+
+    ``newline=""`` writes the text's own line endings. Without it, Windows
+    text mode turns every newline into carriage return plus newline, and a
+    config read with ``newline=""`` (which keeps a CRLF file's endings) came
+    back with a doubled carriage return that the TOML parser refused.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8", newline="")
     tmp.replace(path)
 
 
@@ -699,7 +707,7 @@ def write_user_config(provider: str | None, *, overwrite: bool) -> tuple[bool, P
     backup: Path | None = None
     if path.exists():
         backup = path.with_suffix(path.suffix + ".bak")
-        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        backup.write_bytes(path.read_bytes())  # the same bytes, newlines included
     resolved = canonical_provider(provider) if provider is not None else None
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, render_config_toml(resolved))
