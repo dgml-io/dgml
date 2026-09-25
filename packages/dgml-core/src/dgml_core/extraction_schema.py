@@ -609,7 +609,7 @@ def _resolve_schema_dialect(schema: dict[str, Any]) -> dict[str, Any]:
         if _is_leaf_shape(node):
             leaf: dict[str, Any] = {"$ref": _EXTRACTED_VALUE_REF}
             leaf.update(_value_subschema_types(node.get("properties", {}).get("value")))
-            for k in ("title", "description", "prompt", "example"):
+            for k in ("title", "description", "prompt", "example", "invariant"):
                 v = node.get(k)
                 if isinstance(v, str) and v.strip():
                     leaf[k] = v
@@ -643,7 +643,9 @@ def json_schema_to_vocabulary(schema: dict[str, Any], *, namespace_uri: str) -> 
     roots = _properties_to_tags(resolved.get("properties"))
     if not roots:
         raise SchemaInvalid("schema has no 'properties' — nothing to extract")
-    return Vocabulary(namespace_uri=namespace_uri, roots=_disambiguate_names(roots))
+    return check_invariant_paths(
+        Vocabulary(namespace_uri=namespace_uri, roots=_disambiguate_names(roots))
+    )
 
 
 # ── Typed field tree → Vocabulary ────────────────────────────────────────────
@@ -759,13 +761,159 @@ def parse_invariant(text: str) -> tuple[str, str, str | None] | None:
 
 
 def _validate_invariant(text: str) -> str:
-    """Accept a supported invariant form, else raise :class:`SchemaInvalid`."""
+    """Accept a supported invariant form, else raise :class:`SchemaInvalid`.
+
+    The form only: the path is checked against the assembled vocabulary by
+    :func:`check_invariant_paths` once every tag exists."""
     if parse_invariant(text) is None:
         raise SchemaInvalid(
             f"unsupported '## Invariant:' {text!r}; expected count(Path.To.Collection) "
             "or sum(Path.To.Collection[].LeafName)"
         )
     return text.strip()
+
+
+def resolve_invariant_path(vocab: Vocabulary, path: str) -> str | None:
+    """The root-qualified form of an invariant's collection path, or ``None``.
+
+    A path is read from the schema's roots, one tag name per segment: it
+    resolves when each segment names a child of the tag before it. A path
+    that does not start at a root is tried under the schema's one root, so
+    ``LineItems`` may stand for ``CommercialInvoice.LineItems`` in a
+    single-root schema; with several roots the path must say which.
+    """
+    if _walk_tag_path(vocab.roots, path) is not None:
+        return path
+    if len(vocab.roots) == 1:
+        qualified = f"{vocab.roots[0].name}.{path}"
+        if _walk_tag_path(vocab.roots, qualified) is not None:
+            return qualified
+    return None
+
+
+def _walk_tag_path(roots: list[Tag], path: str) -> Tag | None:
+    tags = roots
+    tag: Tag | None = None
+    for segment in path.split("."):
+        tag = next((t for t in tags if t.name == segment), None)
+        if tag is None:
+            return None
+        tags = tag.children
+    return tag
+
+
+def _collection_paths(vocab: Vocabulary) -> list[str]:
+    """The collection paths an invariant can name: those reached through object
+    hops only, since a collection inside another's entries is not reachable."""
+    out: list[str] = []
+
+    def visit(tag: Tag, prefix: str) -> None:
+        path = f"{prefix}.{tag.name}" if prefix else tag.name
+        if tag.kind == "collection":
+            out.append(path)
+            return
+        for child in tag.children:
+            visit(child, path)
+
+    for root in vocab.roots:
+        visit(root, "")
+    return out
+
+
+# Kinds whose instance is a value: a field, or a choice in its scalar form (a
+# container or a collection by that name never is). The check is structural; a
+# value that is not numeric is skipped at check time as before.
+_VALUE_KINDS = frozenset({"field", "choice"})
+
+
+def _through_collection(roots: list[Tag], path: str) -> str | None:
+    """The name of the first collection a path passes *through* (not ends at)."""
+    tags = roots
+    segments = path.split(".")
+    for segment in segments[:-1]:
+        tag = next((t for t in tags if t.name == segment), None)
+        if tag is None:
+            return None
+        if tag.kind == "collection":
+            return tag.name
+        tags = tag.children
+    return None
+
+
+def check_invariant_paths(vocab: Vocabulary) -> Vocabulary:
+    """Refuse an invariant whose path could never resolve.
+
+    ``check_invariants`` skips a path it cannot resolve in a submission, since
+    "not extracted" is a legal outcome. A path that could never resolve (a
+    collection the schema does not have, a path that ends at a field, a sum
+    leaf the entries do not carry or that is not a value field, a path that
+    runs through a collection where only object hops are followed, a path
+    without a root under several roots) was therefore accepted and silently
+    never checked, run after run. Such a path is rejected here, with what the
+    schema does have, so it fails loudly like an unexpressible form does.
+    The check is structural: it does not read datatypes.
+
+    It runs where a schema is stored (:func:`validate_rnc`, the two builders)
+    and where one is used to extract, not on every read of a stored schema,
+    so a docset whose schema predates the check still reads back; storing
+    the corrected schema is the remedy.
+    """
+    here = f"collections here: {', '.join(_collection_paths(vocab)) or 'none'}"
+
+    def refuse(tag: Tag, reason: str) -> SchemaInvalid:
+        return SchemaInvalid(f"'## Invariant: {tag.invariant}' on field '{tag.name}' {reason}")
+
+    def visit(tag: Tag) -> None:
+        if tag.invariant:
+            parsed = parse_invariant(tag.invariant)
+            assert parsed is not None  # _validate_invariant accepted the form
+            _kind, path, leaf_name = parsed
+            qualified = resolve_invariant_path(vocab, path)
+            if qualified is None:
+                under_a_root = any(
+                    _walk_tag_path(vocab.roots, f"{root.name}.{path}") is not None
+                    for root in vocab.roots
+                )
+                if len(vocab.roots) > 1 and under_a_root:
+                    roots = ", ".join(root.name for root in vocab.roots)
+                    raise refuse(
+                        tag,
+                        f"names {path!r} without a root; this schema has several ({roots}), "
+                        f"so the path must start at one ({here})",
+                    )
+                raise refuse(tag, f"names no collection in this schema: {path!r} ({here})")
+            collection = _walk_tag_path(vocab.roots, qualified)
+            assert collection is not None  # resolve_invariant_path walked it
+            if collection.kind != "collection":
+                raise refuse(
+                    tag, f"ends at the {collection.kind} '{qualified}', not a collection ({here})"
+                )
+            through = _through_collection(vocab.roots, qualified)
+            if through is not None:
+                raise refuse(
+                    tag,
+                    f"runs through the collection '{through}'; a path resolves from the "
+                    "submission root through object hops only, so it could never be checked",
+                )
+            if leaf_name is not None:
+                leaf = next((c for c in collection.children if c.name == leaf_name), None)
+                if leaf is None or leaf.kind not in _VALUE_KINDS:
+                    fields = ", ".join(
+                        c.name for c in collection.children if c.kind in _VALUE_KINDS
+                    )
+                    raise refuse(
+                        tag,
+                        f"sums {leaf_name!r}, which is not a value field of '{qualified}' "
+                        f"entries (value fields there: {fields or 'none'})",
+                    )
+        if tag.item is not None and tag.item.kind == "field":
+            visit(tag.item)  # a collection of bare values: the item is the leaf itself
+        for child in tag.children:
+            visit(child)
+
+    for root in vocab.roots:
+        visit(root)
+    return vocab
 
 
 def _leaf_value_types(
@@ -889,7 +1037,9 @@ def field_tree_to_vocabulary(fields: Any, *, namespace_uri: str) -> Vocabulary:
     roots = _field_nodes_to_tags(fields, context="<root>")
     if not roots:
         raise SchemaInvalid("field tree is empty — nothing to extract")
-    return Vocabulary(namespace_uri=namespace_uri, roots=_disambiguate_names(roots))
+    return check_invariant_paths(
+        Vocabulary(namespace_uri=namespace_uri, roots=_disambiguate_names(roots))
+    )
 
 
 # ── Vocabulary → JSON Schema ─────────────────────────────────────────────────
@@ -1448,8 +1598,10 @@ def parse_rnc(rnc: str) -> Vocabulary:
 
 
 def validate_rnc(rnc: str) -> None:
-    """Validate that *rnc* is well-formed within the supported subset."""
-    parse_rnc(rnc)
+    """Validate that *rnc* is well-formed within the supported subset and
+    that every ``## Invariant:`` names a path the schema can resolve
+    (:func:`check_invariant_paths`)."""
+    check_invariant_paths(parse_rnc(rnc))
 
 
 # ── Top-level conveniences ───────────────────────────────────────────────────

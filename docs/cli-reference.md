@@ -1368,6 +1368,18 @@ values are never adjusted to satisfy one — and results land in
 each violation's text under `invariant_violations`. A field or collection that
 wasn't extracted is skipped rather than counted, since every field is nullable.
 
+The path is checked against the schema when the schema is stored
+(`set-schema`) and when an extraction runs with it: a collection the schema
+does not have, a path that ends at a field, a sum leaf its entries do not
+carry (or that is not a value field), or a path that runs through a
+collection (the second limit below) is a `SCHEMA_INVALID` error naming what
+the schema does have, rather than an annotation that is accepted and then
+silently never checked. A schema stored before this check still reads back;
+`set-schema` with the corrected path is the remedy. Under a schema with one
+root the path may leave that root out (`sum(LineItems[].LineAmount)` on a
+`CommercialInvoice` schema reads as `CommercialInvoice.LineItems`); with
+several roots it must start at one.
+
 Two limits are deliberate and decide whether a rule is expressible: an
 invariant is **one term** (`sum(A[].x) + sum(B[].y)` has no form — a rule
 spanning two collections must not be approximated by one of them, which would

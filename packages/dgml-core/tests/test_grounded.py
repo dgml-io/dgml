@@ -2320,3 +2320,26 @@ def test_phase3_never_cached(workspace: Workspace) -> None:
     assert len(m.call_args_list) >= 2, "phase 3 did not run; test would be vacuous"
     for call in m.call_args_list[1:]:
         assert _cache_control_paths(call.kwargs["messages"]) == []
+
+
+def test_extract_values_refuses_a_stored_schema_whose_invariant_cannot_resolve(
+    workspace: Workspace,
+) -> None:
+    """A schema stored before the load-time check (written here around
+    ``set_schema``, which now refuses it) still reads back, but an extraction
+    with it fails before any model call instead of never checking the rule."""
+    from dgml_core.errors import SchemaInvalid
+
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    bad = _TITLE_RNC.replace("title =\n", "## Invariant: count(Missing)\ntitle =\n", 1)
+    assert bad != _TITLE_RNC
+    workspace.blobs.put_blob(layout.docset_extraction_schema_key(ds_id), bad.encode("utf-8"))
+    assert DocSetStore(workspace).get_schema(ds_id) == bad
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion") as completion:
+        with pytest.raises(SchemaInvalid, match="names no collection"):
+            extract_values(workspace, ds_id, fid, config=config)
+    assert completion.call_count == 0

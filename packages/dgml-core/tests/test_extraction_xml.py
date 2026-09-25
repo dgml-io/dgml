@@ -953,3 +953,67 @@ def test_invariant_cannot_reach_a_sibling_collection_inside_an_entry() -> None:
         "LineItems": [{"Amount": {"text": "$1", "value": "1"}}],
     }
     assert check_invariants(values, vocab) == (0, [])
+
+
+_SINGLE_ROOT_INVOICE_RNC = """\
+namespace docset = "http://www.dgml.io/acme/invoices#"
+
+CommercialInvoice =
+  element docset:CommercialInvoice {
+    (text | DocumentTotal | LineItems)*
+  }
+
+## Total of the invoice
+## Invariant: sum(LineItems[].LineAmount)
+DocumentTotal =
+  element docset:DocumentTotal {
+    xsd:decimal
+  }
+
+LineItems =
+  element docset:LineItems {
+    LineItem*
+  }
+
+LineItem =
+  element docset:LineItem {
+    (text | LineAmount)*
+  }
+
+LineAmount =
+  element docset:LineAmount {
+    xsd:decimal
+  }
+"""
+
+
+def test_invariant_under_a_single_root_is_checked_unqualified() -> None:
+    """The schema's one root is ``CommercialInvoice`` and the invariant says
+    ``LineItems``, not ``CommercialInvoice.LineItems``. That path never
+    resolved from the submission root, so every run reported
+    ``invariants_checked: 0``; it is now read under the root."""
+    from dgml_core.extraction_xml import check_invariants
+
+    vocab = parse_rnc(_SINGLE_ROOT_INVOICE_RNC)
+    items = [
+        {"LineAmount": {"text": "$149.85", "value": "149.85"}},
+        {"LineAmount": {"text": "$200.00", "value": "200.00"}},
+    ]
+    ok = {
+        "CommercialInvoice": {
+            "DocumentTotal": {"text": "$349.85", "value": "349.85"},
+            "LineItems": items,
+        }
+    }
+    assert check_invariants(ok, vocab) == (1, [])
+    bad = {
+        "CommercialInvoice": {
+            "DocumentTotal": {"text": "$500.00", "value": "500.00"},
+            "LineItems": items,
+        }
+    }
+    checked, violations = check_invariants(bad, vocab)
+    assert checked == 1
+    assert violations == [
+        "DocumentTotal: expected sum(LineItems[].LineAmount) = 349.85, got 500.00"
+    ]

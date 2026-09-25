@@ -69,6 +69,7 @@ from .extraction_schema import (
     FIELD_DATATYPES,
     Tag,
     Vocabulary,
+    check_invariant_paths,
     field_tree_to_rnc,
     parse_rnc,
     rnc_to_json_schema,
@@ -612,7 +613,8 @@ def extract_values(
     """
     store = DocSetStore(workspace)
     rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
-    vocab = parse_rnc(rnc_schema)
+    # A stored schema is not re-checked on read; here it is about to be used.
+    vocab = check_invariant_paths(parse_rnc(rnc_schema))
     schema = rnc_to_json_schema(rnc_schema)
     guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
     pdf_bytes = _pdf_bytes(workspace, file_id)

@@ -17,10 +17,13 @@ import copy
 import pytest
 from dgml_core.errors import SchemaInvalid
 from dgml_core.extraction_schema import (
+    check_invariant_paths,
     field_tree_to_rnc,
     field_tree_to_vocabulary,
     json_schema_to_rnc,
+    json_schema_to_vocabulary,
     parse_rnc,
+    resolve_invariant_path,
     rnc_to_json_schema,
     validate_rnc,
     vocabulary_to_rnc,
@@ -908,3 +911,260 @@ def test_root_that_is_also_referenced_gets_explicit_start_rule() -> None:
 def test_simple_schema_emits_no_start_rule() -> None:
     rnc = field_tree_to_rnc([{"name": "title", "kind": "field"}], workspace="ws", docset_name="d")
     assert "start =" not in rnc
+
+
+# ---------------------------------------------------------------------------
+# invariant paths are checked against the schema at load
+# ---------------------------------------------------------------------------
+
+_INVOICE_RNC = """\
+namespace docset = "http://www.dgml.io/acme/invoices#"
+
+CommercialInvoice =
+  element docset:CommercialInvoice {
+    (text | DocumentTotal | LineItems)*
+  }
+
+## Invariant: sum(LineItems[].LineAmount)
+DocumentTotal =
+  element docset:DocumentTotal {
+    xsd:decimal
+  }
+
+LineItems =
+  element docset:LineItems {
+    LineItem*
+  }
+
+LineItem =
+  element docset:LineItem {
+    (text | LineAmount)*
+  }
+
+LineAmount =
+  element docset:LineAmount {
+    xsd:decimal
+  }
+"""
+
+
+def test_invariant_path_is_read_under_a_single_root() -> None:
+    vocab = parse_rnc(_INVOICE_RNC)
+    assert resolve_invariant_path(vocab, "LineItems") == "CommercialInvoice.LineItems"
+    assert (
+        resolve_invariant_path(vocab, "CommercialInvoice.LineItems")
+        == "CommercialInvoice.LineItems"
+    )
+    assert resolve_invariant_path(vocab, "Items") is None
+
+
+def test_invariant_naming_no_collection_is_a_schema_error() -> None:
+    """Accepted at load and silently never checked before: the path matched
+    the grammar but named nothing in the schema."""
+    bad = _INVOICE_RNC.replace("sum(LineItems[].LineAmount)", "sum(Items[].LineAmount)")
+    with pytest.raises(
+        SchemaInvalid, match=r"names no collection.*'Items'.*CommercialInvoice.LineItems"
+    ):
+        validate_rnc(bad)
+
+
+def test_invariant_check_is_not_on_the_read_path() -> None:
+    """A schema stored before the check still parses (get-schema, the
+    extraction listing); storing it again, or extracting with it, refuses."""
+    bad = _INVOICE_RNC.replace("sum(LineItems[].LineAmount)", "sum(Items[].LineAmount)")
+    vocab = parse_rnc(bad)
+    assert vocab.roots[0].name == "CommercialInvoice"
+    with pytest.raises(SchemaInvalid, match="names no collection"):
+        check_invariant_paths(vocab)
+
+
+def test_invariant_naming_no_leaf_of_the_collection_is_a_schema_error() -> None:
+    bad = _INVOICE_RNC.replace("sum(LineItems[].LineAmount)", "sum(LineItems[].Amount)")
+    with pytest.raises(
+        SchemaInvalid,
+        match=r"'Amount', which is not a value field of 'CommercialInvoice.LineItems'",
+    ):
+        validate_rnc(bad)
+
+
+def test_invariant_path_needs_a_root_when_the_schema_has_several() -> None:
+    """Two roots: an unqualified path is ambiguous and must say which root."""
+    two_roots = _INVOICE_RNC.replace(
+        "CommercialInvoice =",
+        "Notes =\n  element docset:Notes {\n    text\n  }\n\nCommercialInvoice =",
+    )
+    qualified = two_roots.replace("sum(LineItems[]", "sum(CommercialInvoice.LineItems[]")
+    validate_rnc(qualified)
+    assert {tag.name for tag in parse_rnc(qualified).roots} == {"Notes", "CommercialInvoice"}
+    with pytest.raises(
+        SchemaInvalid, match=r"without a root; this schema has several \(Notes, CommercialInvoice\)"
+    ):
+        validate_rnc(two_roots)
+
+
+def test_invariant_count_path_must_end_at_a_collection() -> None:
+    bad = _INVOICE_RNC.replace("sum(LineItems[].LineAmount)", "count(DocumentTotal)")
+    with pytest.raises(
+        SchemaInvalid,
+        match=r"ends at the field 'CommercialInvoice.DocumentTotal', not a collection",
+    ):
+        validate_rnc(bad)
+
+
+def _invoice_with_parts(invariant: str) -> str:
+    """The invoice schema with a ``Parts`` collection inside each line item
+    (a collection an invariant cannot reach) and the given invariant."""
+    return _INVOICE_RNC.replace(
+        "LineItem =\n  element docset:LineItem {\n    (text | LineAmount)*\n  }",
+        "LineItem =\n  element docset:LineItem {\n    (text | LineAmount | Parts)*\n  }\n\n"
+        "Parts =\n  element docset:Parts {\n    Part*\n  }\n\n"
+        "Part =\n  element docset:Part {\n    (text | PartAmount)*\n  }\n\n"
+        "PartAmount =\n  element docset:PartAmount {\n    xsd:decimal\n  }",
+    ).replace("sum(LineItems[].LineAmount)", invariant)
+
+
+def test_invariant_path_through_a_collection_is_a_schema_error() -> None:
+    """A path that passes through a collection could never be checked (the
+    checker follows object hops only), so it is refused at load."""
+    with pytest.raises(SchemaInvalid, match="runs through the collection 'LineItems'"):
+        validate_rnc(_invoice_with_parts("sum(LineItems.Parts[].PartAmount)"))
+
+
+def test_collections_offered_as_a_remedy_are_the_reachable_ones() -> None:
+    """A collection inside another collection's entries cannot be named by an
+    invariant, so it is not offered as one."""
+    with pytest.raises(SchemaInvalid) as excinfo:
+        validate_rnc(_invoice_with_parts("sum(Items[].LineAmount)"))
+    assert "(collections here: CommercialInvoice.LineItems)" in str(excinfo.value)
+
+
+def test_invariant_sum_leaf_must_be_a_value_field() -> None:
+    rnc = _INVOICE_RNC.replace(
+        "LineAmount =\n  element docset:LineAmount {\n    xsd:decimal\n  }",
+        "LineAmount =\n  element docset:LineAmount {\n    (text | Cents)*\n  }\n\n"
+        "Cents =\n  element docset:Cents {\n    xsd:integer\n  }",
+    )
+    with pytest.raises(SchemaInvalid, match=r"not a value field of 'CommercialInvoice.LineItems'"):
+        validate_rnc(rnc)
+
+
+def test_invariant_sum_leaf_may_be_a_choice() -> None:
+    """A choice is a typed scalar or a group; its scalar form is summable, so
+    it is an acceptable target (a group instance is skipped at check time)."""
+    rnc = _INVOICE_RNC.replace(
+        "LineAmount =\n  element docset:LineAmount {\n    xsd:decimal\n  }",
+        "LineAmount =\n  element docset:LineAmount {\n"
+        "    ( xsd:decimal | ( MinAmount, MaxAmount ) )\n  }\n\n"
+        "MinAmount =\n  element docset:MinAmount {\n    xsd:decimal\n  }\n\n"
+        "MaxAmount =\n  element docset:MaxAmount {\n    xsd:decimal\n  }",
+    )
+    validate_rnc(rnc)
+    line_items = next(t for t in parse_rnc(rnc).roots[0].children if t.name == "LineItems")
+    assert line_items.kind == "collection"
+    assert next(t for t in line_items.children if t.name == "LineAmount").kind == "choice"
+
+
+def test_invariant_on_a_collection_of_bare_values_is_checked_too() -> None:
+    """A collection of typed values has no mirrored children; its item is the
+    leaf itself and carries the annotation."""
+    rnc = """\
+namespace docset = "http://www.dgml.io/acme/invoices#"
+
+Numbers =
+  element docset:Numbers {
+    Number*
+  }
+
+## Invariant: count(Missing)
+Number =
+  element docset:Number {
+    xsd:decimal
+  }
+"""
+    with pytest.raises(SchemaInvalid, match="names no collection"):
+        validate_rnc(rnc)
+
+
+def test_field_tree_invariant_is_checked_against_the_runtime_names() -> None:
+    """Disambiguation renames a nested tag that collides with an outer one
+    (``line_items`` under two containers). The builder checks the invariant
+    against the names the vocabulary ends up with."""
+
+    def tree(invariant: str) -> list[dict[str, object]]:
+        return [
+            {
+                "name": "summary",
+                "kind": "container",
+                "fields": [
+                    {
+                        "name": "line_items",
+                        "kind": "collection",
+                        "fields": [{"name": "amount", "kind": "field", "datatype": "decimal"}],
+                    }
+                ],
+            },
+            {
+                "name": "detail",
+                "kind": "container",
+                "fields": [
+                    {
+                        "name": "line_items",
+                        "kind": "collection",
+                        "fields": [{"name": "cost", "kind": "field", "datatype": "decimal"}],
+                    },
+                    {
+                        "name": "total",
+                        "kind": "field",
+                        "datatype": "decimal",
+                        "invariant": invariant,
+                    },
+                ],
+            },
+        ]
+
+    with pytest.raises(SchemaInvalid, match="names no collection in this schema"):
+        field_tree_to_vocabulary(tree("sum(Detail.LineItems[].Cost)"), namespace_uri="urn:x")
+    vocab = field_tree_to_vocabulary(
+        tree("sum(Detail.DetailLineItems[].Cost)"), namespace_uri="urn:x"
+    )
+    assert resolve_invariant_path(vocab, "Detail.DetailLineItems") == "Detail.DetailLineItems"
+
+
+def _standard_dialect_invoice(invariant: str) -> dict[str, object]:
+    """A standard-dialect schema whose leaves are inline extracted-value shapes
+    (not ``$ref``s to a shared definition), with an invariant on the total."""
+    amount = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}, "value": {"type": "number"}},
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "line_items": {
+                "title": "LineItems",
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"amount": {"title": "Amount", **amount}},
+                },
+            },
+            "total": {"title": "Total", "invariant": invariant, **amount},
+        },
+    }
+
+
+def test_standard_dialect_inline_leaf_keeps_its_invariant() -> None:
+    """An inline leaf shape used to drop ``invariant`` in the dialect
+    conversion, so the annotation never reached the vocabulary (and a bad one
+    was never refused)."""
+    vocab = json_schema_to_vocabulary(
+        _standard_dialect_invoice("sum(LineItems[].Amount)"), namespace_uri="urn:x"
+    )
+    total = next(t for t in vocab.roots if t.name == "Total")
+    assert total.invariant == "sum(LineItems[].Amount)"
+    assert "## Invariant: sum(LineItems[].Amount)" in vocabulary_to_rnc(vocab)
+
+    with pytest.raises(SchemaInvalid, match="names no collection in this schema"):
+        json_schema_to_vocabulary(
+            _standard_dialect_invoice("count(Missing)"), namespace_uri="urn:x"
+        )
