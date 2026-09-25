@@ -22,7 +22,8 @@ comes in pairs:
   ``[storage.<name>.blobs]`` / ``.docs`` templates from the merged ``config.toml``
   into a ``(blob_cfg, doc_cfg)`` pair of :class:`StorageConfig`.
 - **Build** — :func:`make_blob_store` / :func:`make_doc_store` resolve a
-  ``provider`` dotted path to its interface subclass and construct it.
+  ``provider`` dotted path to its interface subclass and construct it;
+  :func:`check_store_configs` does the same resolution without constructing.
 - **Identify** — :func:`storage_fingerprint` hashes one backend's credential-free
   identity; :func:`storage_fingerprint_pair` seals the two together.
 - **Decide** — :func:`resolve_store_configs` picks *which* pair a given workspace
@@ -107,6 +108,16 @@ def make_doc_store(config: StorageConfig) -> DocStore:
     cls = _import_store_class(config.provider, DocStore)
     store: DocStore = cls(cls.parse_config(config))
     return store
+
+
+def check_store_configs(blob_cfg: StorageConfig, doc_cfg: StorageConfig) -> None:
+    """Resolve and validate both providers without constructing either store.
+
+    Everything :func:`make_blob_store` / :func:`make_doc_store` can reject from config
+    alone, but with no connection made — so a caller can fail fast before it writes
+    anything."""
+    for cfg, base in ((blob_cfg, BlobStore), (doc_cfg, DocStore)):
+        _import_store_class(cfg.provider, base).parse_config(cfg)
 
 
 # ------------------------------------------------------------ reading config
@@ -255,6 +266,16 @@ def resolve_store_configs(workspace: Workspace) -> tuple[StorageConfig, StorageC
     from . import workspace_config
 
     service = workspace_config.read_identity(workspace).storage_service or DEFAULT_STORAGE_SERVICE
+    return resolve_service_configs(workspace, service)
+
+
+def resolve_service_configs(
+    workspace: Workspace, service: str
+) -> tuple[StorageConfig, StorageConfig]:
+    """The pair ``workspace`` would open with if bound to ``service`` — its own
+    ``[storage.<service>]`` whole when it defines one, else the merged config's."""
+    from . import workspace_config
+
     own = workspace_config.read_storage_table(workspace, service)
     if own is not None:
         root = workspace.root

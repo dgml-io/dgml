@@ -36,6 +36,7 @@ from dgml_core.migrations import (
 from dgml_core.run_clustering import DocPrediction
 from dgml_core.storage import ENV_VAR as WORKSPACE_ENV_VAR
 from dgml_core.storage import Workspace
+from dgml_core.storage_local import LocalStore
 from dgml_core.workspaces_resolve import default_workspaces_store
 
 from .conftest import (
@@ -420,7 +421,93 @@ def test_create_refuses_an_id_the_store_already_holds(
     error = _read_stderr(capsys)["error"]
     assert error["code"] == "CONFLICT"
     assert "my-workspace" in error["message"]
+    assert "--workspace my-workspace workspace create" in error["message"]
     assert store.read_config("my-workspace") == before
+
+
+def _bad_provider_seed(tmp_path: Path) -> Path:
+    seed = tmp_path / "seed.toml"
+    seed.write_text(
+        '[storage.acme.blobs]\nprovider = "local"\n\n[storage.acme.docs]\nprovider = "local"\n',
+        encoding="utf-8",
+    )
+    return seed
+
+
+def test_create_with_an_unresolvable_provider_leaves_no_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The provider is resolved before anything is built, and the row this run claimed is
+    removed on failure — so fixing the seed and retrying the same id just works."""
+    seed = _bad_provider_seed(tmp_path)
+    args = ["workspace", "create", "--id", "acme-corp", "--organization", "Acme"]
+    args += ["--storage", "acme", "--from-config", str(seed)]
+
+    assert main(args) == 1
+    assert _read_stderr(capsys)["error"]["code"] == "STORAGE_PROVIDER_UNRESOLVABLE"
+    assert not default_workspaces_store().exists("acme-corp")
+
+    seed.write_text(seed.read_text(encoding="utf-8").replace('"local"', f'"{_LOCAL}"'))
+    assert main(args) == 0
+    assert _read_stdout(capsys)["workspace_id"] == "acme-corp"
+
+
+def test_create_without_organization_leaves_no_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Otherwise every retry mints another orphan, since a generated id never repeats."""
+    assert main(["workspace", "create"]) == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_create_refuses_a_seed_that_would_replace_a_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A seed against a workspace that already has a different config is an error, never
+    silently dropped."""
+    ws = tmp_path / "ws"
+    assert main(["workspace", "create", str(ws), "--organization", "Acme"]) == 0
+    capsys.readouterr()
+    before = (ws / "config.toml").read_text(encoding="utf-8")
+
+    seed = tmp_path / "seed.toml"
+    seed.write_text(f'[storage.acme]\nprovider = "{_LOCAL}"\n', encoding="utf-8")
+    rc = main(["workspace", "create", str(ws), "--storage", "acme", "--from-config", str(seed)])
+    assert rc == 1
+    error = _read_stderr(capsys)["error"]
+    assert error["code"] == "INVALID_ARGUMENT"
+    assert "seed config" in error["message"]
+    assert (ws / "config.toml").read_text(encoding="utf-8") == before
+
+
+def test_create_rerun_with_the_same_seed_is_a_no_op(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = tmp_path / "seed.toml"
+    seed.write_text(f'[storage.acme]\nprovider = "{_LOCAL}"\n', encoding="utf-8")
+    args = ["workspace", "create", str(tmp_path / "ws"), "--organization", "Acme"]
+    args += ["--storage", "acme", "--from-config", str(seed)]
+    assert main(args) == 0
+    first = _read_stdout(capsys)["workspace_id"]
+    assert main(args) == 0
+    assert _read_stdout(capsys)["workspace_id"] == first
+
+
+def test_create_applies_a_seed_to_an_empty_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty config (e.g. a row stranded by an older dgml) is not a config to protect:
+    the seed is applied rather than ignored."""
+    default_workspaces_store().write_config("acme-corp", "")
+    seed = tmp_path / "seed.toml"
+    seed.write_text(f'[storage.acme]\nprovider = "{_LOCAL}"\n', encoding="utf-8")
+
+    args = ["--workspace", "acme-corp", "workspace", "create", "--organization", "Acme"]
+    assert main(args + ["--storage", "acme", "--from-config", str(seed)]) == 0
+    capsys.readouterr()
+    text = default_workspaces_store().read_config("acme-corp")
+    assert text is not None and "[storage.acme]" in text
 
 
 @pytest.mark.parametrize("bad", ["MyWorkspace", "ab", "my/ws", "my.ws", "-ws"])
@@ -617,6 +704,16 @@ def test_a_copied_workspace_directory_still_opens(
 # A named storage service pointing at the bundled local store — a real, working
 # backend exercised through the named-service path (no fake provider needed).
 _LOCAL = "dgml_core.storage_local:LocalStore"
+
+
+class _PrefixedLocalStore(LocalStore):
+    """The local store plus a ``prefix`` option — an identity-bearing option, so a seed
+    naming it seals to something other than the default service."""
+
+    config_fields = LocalStore.config_fields | {"prefix"}
+
+
+_PREFIXED = f"{__name__}:_PrefixedLocalStore"
 
 
 def _repoint_storage(ws_root: Path, service: str, provider: str) -> None:
@@ -6079,7 +6176,7 @@ def test_from_config_binds_to_the_named_service(
 
     seed = tmp_path / "cfg" / "acme.toml"
     seed.parent.mkdir(parents=True)
-    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_LOCAL}"\nprefix = "acme"\n')
+    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_PREFIXED}"\nprefix = "acme"\n')
 
     ws = tmp_path / "ws"
     rc = main(
@@ -6115,7 +6212,7 @@ def test_create_seals_the_service_it_actually_bound_to(
     been created successfully.
     """
     seed = tmp_path / "acme.toml"
-    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_LOCAL}"\nprefix = "acme"\n')
+    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_PREFIXED}"\nprefix = "acme"\n')
 
     ws = tmp_path / "ws"
     main(
@@ -6441,7 +6538,7 @@ def test_re_running_create_keeps_the_recorded_storage_service(
     from dgml_core import workspace_config
 
     seed = tmp_path / "seed.toml"
-    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_LOCAL}"\nprefix = "acme"\n')
+    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_PREFIXED}"\nprefix = "acme"\n')
     ws = tmp_path / "ws"
     main(
         [

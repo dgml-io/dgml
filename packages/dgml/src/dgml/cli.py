@@ -1816,8 +1816,9 @@ def _requested_workspace_id(args: argparse.Namespace, ws: Workspace, *, listed: 
     store = default_workspaces_store()
     if store.exists(requested):
         raise ConflictError(
-            f"{store.label()} already holds a workspace {requested}. Pick another --id, "
-            f"or open the existing one with --workspace {requested}.",
+            f"{store.label()} already holds a workspace {requested}. If it is this "
+            f"workspace, re-run addressed to it — dgml --workspace {requested} workspace "
+            f"create … (create is safe to re-run). Otherwise pick another --id.",
             kind="workspace",
             existing_id=requested,
         )

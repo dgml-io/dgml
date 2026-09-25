@@ -126,10 +126,14 @@ Re-running is safe: an existing `[storage.<service>]` is never overwritten, and 
 recorded `workspace_id`, `name` and `created_at` are reused rather than regenerated.
 
 Note one consequence of the config *being* the record: for a listed workspace it must
-exist before any store can be built, so it can no longer be written last. An
-interrupted `create` therefore leaves a workspace that is listed but not finished.
-Re-running the same `create` finishes it: the command is idempotent, and an unsealed
-workspace opens fine, so there is nothing to clean up first.
+exist before any store can be built, so it can no longer be written last. The
+`[storage]` binding — its shape *and* its `provider` classes — is validated before
+anything is built, and if a new listed workspace's `create` fails after its row was
+written, that row is removed again, so the same `create` (same `--id`) can simply be
+retried once the cause is fixed. Only a hard kill mid-command can leave a listed but
+unfinished workspace; re-running the same `create` addressed to it
+(`dgml --workspace <id> workspace create …`) finishes it — an unsealed workspace opens
+fine, so there is nothing to clean up first.
 
 The **user-level** config (`~/.config/dgml/config.toml`) is owned by `dgml init` —
 `workspace create` does not create or touch it. If it is **absent**, the workspace is
@@ -166,6 +170,9 @@ rejected `--id` never leaves a half-built workspace behind:
 - An id this machine's store of workspaces already holds fails with `CONFLICT`. It is
   never an overwrite — the store's write is an upsert, so proceeding would replace that
   workspace's config (and its `[storage]` binding) while its corpus stayed where it was.
+  If the held workspace *is* the one you mean, re-run addressed to it —
+  `dgml --workspace <id> workspace create …` — which is the idempotent path; the error
+  message says so.
 - An `--id` matching the id the workspace already has is a **no-op**, so `create` stays
   safe to re-run.
 - An `--id` that *differs* from the id the workspace already has fails with
@@ -186,6 +193,13 @@ It is a **template, not an adopted file** — the source is not tracked, and lat
 it have no effect on the workspace. A `[workspaces]` table in it is rejected rather than
 ignored: that table selects the store of workspaces, is read only from the user config,
 and would be silently inert here.
+
+A seed only initializes a workspace that has **no** config yet (or an empty one). Against
+a workspace whose config already exists, `create` accepts `--from-config` only when every
+table the seed declares already stands in that config as written — the re-run of the same
+seeded `create`, a no-op. A seed that differs fails with `INVALID_ARGUMENT` rather than
+being silently ignored or replacing the workspace's config; edit that config directly
+instead.
 
 `--storage` **composes with** `--from-config`: that flag supplies a config to start
 from, `--storage` says *which* `[storage.<name>]` table in it to bind to.

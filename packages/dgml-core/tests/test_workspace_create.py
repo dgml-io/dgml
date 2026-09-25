@@ -25,7 +25,10 @@ from pathlib import Path
 import pytest
 from dgml_core import (
     ConflictError,
+    CorruptMetadata,
     InvalidArgument,
+    StorageConfigInvalid,
+    StorageProviderUnresolvable,
     Workspace,
     create_workspace,
     default_workspaces_store,
@@ -185,6 +188,7 @@ def test_seed_that_is_not_toml_is_rejected_before_anything_is_written() -> None:
 def test_organization_is_required_for_a_new_workspace() -> None:
     with pytest.raises(InvalidArgument, match="organization is required"):
         create_workspace(workspace_id="acme")
+    assert default_workspaces_store().list_ids() == []
 
 
 def test_seed_that_declares_only_other_services_is_refused() -> None:
@@ -197,6 +201,92 @@ def test_seed_that_declares_only_other_services_is_refused() -> None:
             storage_service="default",
             seed_toml=SEED_SVCA,
         )
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_unknown_storage_service_leaves_no_row() -> None:
+    with pytest.raises(StorageConfigInvalid):
+        create_workspace(workspace_id="bad-svc", organization="A", storage_service="nope")
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_unresolvable_provider_leaves_no_row_and_retry_succeeds() -> None:
+    """Resolved before anything is built, and the claimed row removed on failure — so the
+    same id can be retried once the seed is fixed."""
+    bad = SEED_SVCA.replace('"dgml_core.storage_local:LocalStore"', '"local"')
+    with pytest.raises(StorageProviderUnresolvable):
+        create_workspace(
+            workspace_id="acme", organization="Acme", storage_service="svca", seed_toml=bad
+        )
+    assert default_workspaces_store().list_ids() == []
+
+    result = create_workspace(
+        workspace_id="acme", organization="Acme", storage_service="svca", seed_toml=SEED_SVCA
+    )
+    assert result.identity.workspace_id == "acme"
+
+
+def test_seed_is_refused_against_a_different_existing_config(tmp_path: Path) -> None:
+    ws = Workspace(root=tmp_path / "ws")
+    create_workspace(ws, organization="Acme")
+    before = ws.config_text
+    with pytest.raises(InvalidArgument, match="differs from the seed config"):
+        create_workspace(ws, storage_service="svca", seed_toml=SEED_SVCA)
+    assert Workspace(root=ws.root).config_text == before
+
+
+def test_detached_seeded_create_that_fails_leaves_no_config(tmp_path: Path) -> None:
+    """The seed this call wrote is removed on failure — so the documented retry with a
+    fixed seed succeeds instead of being refused as 'differs from the seed'."""
+    root = tmp_path / "ws"
+    bad = SEED_SVCA.replace('"dgml_core.storage_local:LocalStore"', '"local"')
+    with pytest.raises(StorageProviderUnresolvable):
+        create_workspace(
+            Workspace(root=root), organization="Acme", storage_service="svca", seed_toml=bad
+        )
+    assert not root.exists()
+
+    result = create_workspace(
+        Workspace(root=root), organization="Acme", storage_service="svca", seed_toml=SEED_SVCA
+    )
+    assert result.identity.storage_service == "svca"
+
+
+def test_failed_seeded_create_keeps_a_preexisting_directory(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "notes.txt").write_text("keep me", encoding="utf-8")
+    bad = SEED_SVCA.replace('"dgml_core.storage_local:LocalStore"', '"local"')
+    with pytest.raises(StorageProviderUnresolvable):
+        create_workspace(
+            Workspace(root=root), organization="Acme", storage_service="svca", seed_toml=bad
+        )
+    assert not (root / "config.toml").exists()
+    assert (root / "notes.txt").read_text(encoding="utf-8") == "keep me"
+
+
+def test_seed_against_a_corrupt_config_reports_the_corruption(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "config.toml").write_text("[storage\nnot toml\n", encoding="utf-8")
+    with pytest.raises(CorruptMetadata, match="invalid TOML"):
+        create_workspace(Workspace(root=root), organization="Acme", seed_toml=SEED_SVCA)
+
+
+def test_a_failing_rollback_does_not_mask_the_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(workspace_id: str) -> bool:
+        raise OSError("disk went away")
+
+    monkeypatch.setattr(default_workspaces_store(), "delete", boom)
+    with pytest.raises(InvalidArgument, match="organization is required"):
+        create_workspace(workspace_id="acme")
+
+
+def test_rerun_with_the_same_seed_is_a_no_op(tmp_path: Path) -> None:
+    ws = Workspace(root=tmp_path / "ws")
+    first = create_workspace(ws, organization="Acme", storage_service="svca", seed_toml=SEED_SVCA)
+    again = create_workspace(ws, storage_service="svca", seed_toml=SEED_SVCA)
+    assert again.identity.workspace_id == first.identity.workspace_id
 
 
 # --------------------------------------- the store is consulted only when needed

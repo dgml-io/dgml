@@ -18,17 +18,20 @@ store of workspaces — which is most of why the order below is what it is.
 
 from __future__ import annotations
 
+import contextlib
 import tomllib
 from dataclasses import dataclass
 from typing import Any
 
 from . import workspace_config as wsconfig
-from .errors import ConflictError, InvalidArgument, now_iso
+from .errors import ConflictError, CorruptMetadata, InvalidArgument, now_iso
 from .migrations import stamp_schema_version
 from .storage import Workspace
 from .storage_resolve import (
     DEFAULT_STORAGE_SERVICE,
+    check_store_configs,
     load_store_configs,
+    resolve_service_configs,
     storage_fingerprint_pair,
 )
 from .workspace_config import WorkspaceIdentity
@@ -72,6 +75,17 @@ def _validate_seed_config(text: str) -> None:
             "store of workspaces and is read only from the user config, so it would have "
             "no effect here. Remove it."
         )
+
+
+def _seed_already_applied(ws: Workspace, seed_toml: str) -> bool:
+    """Whether every table ``seed_toml`` declares already stands, as written, in ``ws``'s
+    config — the re-run of a seeded create, which must stay a no-op."""
+    try:
+        existing = tomllib.loads(ws.config_text or "")
+    except tomllib.TOMLDecodeError as exc:
+        # The same failure every other reader of the config reports.
+        raise CorruptMetadata(f"invalid TOML in {ws.config_location}: {exc}") from exc
+    return all(existing.get(k) == v for k, v in tomllib.loads(seed_toml).items())
 
 
 def _materialize_storage_table(ws: Workspace, service: str, *, seeded: bool) -> None:
@@ -138,7 +152,10 @@ def create_workspace(
         store = default_workspaces_store()
         if workspace_id is not None and store.exists(workspace_id):
             raise ConflictError(
-                f"{store.label()} already holds a workspace {workspace_id}.",
+                f"{store.label()} already holds a workspace {workspace_id}. If it is this "
+                f"workspace, re-run create against it — create_workspace("
+                f"Workspace.resolve({workspace_id!r})) is safe to re-run. Otherwise pick "
+                f"another id.",
                 kind="workspace",
                 existing_id=workspace_id,
             )
@@ -147,6 +164,15 @@ def create_workspace(
         new_id = workspace_id or generate_unique_workspace_id(store)
         store.write_config(new_id, seed_toml or "")
         ws = Workspace(root=store.workspace_root(new_id), workspaces_id=new_id)
+        try:
+            return _build(ws, workspace_id, organization, name, storage_service, seed_toml)
+        except BaseException:
+            # This call claimed the row, so any failure past here must remove it: a
+            # stranded row raises ConflictError on every retry of the same id. A cleanup
+            # that fails must not mask the cause.
+            with contextlib.suppress(Exception):
+                store.delete(new_id)
+            raise
     else:
         ws = workspace
         if workspace_id is not None:
@@ -170,9 +196,47 @@ def create_workspace(
                         kind="workspace",
                         existing_id=workspace_id,
                     )
-        if seed_toml is not None and not ws.config_present:
+    wrote_seed = False
+    made_root = not ws.root.exists()
+    if seed_toml is not None:
+        if not (ws.config_text or "").strip():
             ws.root.mkdir(parents=True, exist_ok=True)
             wsconfig.write_config_text(ws, seed_toml)
+            wrote_seed = True
+        elif not _seed_already_applied(ws, seed_toml):
+            # Refused, never silently dropped: ignoring it would bind through the user
+            # config instead of the backend the seed names.
+            raise InvalidArgument(
+                f"{ws.config_location} already has a config, and it differs from the seed "
+                f"config. A seed only initializes a workspace with no config; it never "
+                f"replaces one. Edit that config directly, or re-run without the seed."
+            )
+    try:
+        return _build(ws, workspace_id, organization, name, storage_service, seed_toml)
+    except BaseException:
+        # Same promise as the listed path: a seed this call wrote must not survive a
+        # failed create, or the documented retry is refused as "differs from the seed".
+        if wrote_seed:
+            with contextlib.suppress(Exception):
+                if ws.workspaces_id is not None:
+                    wsconfig.write_config_text(ws, "")  # an addressed row: back to empty
+                else:
+                    ws.config_path.unlink()
+                    if made_root:
+                        ws.root.rmdir()
+        raise
+
+
+def _build(
+    ws: Workspace,
+    workspace_id: str | None,
+    organization: str | None,
+    name: str | None,
+    storage_service: str | None,
+    seed_toml: str | None,
+) -> CreateWorkspaceResult:
+    """Everything after the seed is in place and, for a listed workspace, its row is
+    claimed."""
     seeded = seed_toml is not None
 
     # Read once: on a re-run (or a second machine sharing a store) these are the
@@ -213,9 +277,9 @@ def create_workspace(
         else None
     )
 
-    # Validate the named service before anything is created, so a bad service fails
-    # without leaving a half-built workspace behind.
-    load_store_configs(ws, service)
+    # Validate the named service — shape *and* provider classes — before anything is
+    # built, so a bad service or `provider =` fails without a half-built workspace.
+    check_store_configs(*resolve_service_configs(ws, service))
     if seeded:
         # A seed exists to name a backend. If it declares services but not the one
         # selected, binding would fall through to the bundled local store — building
