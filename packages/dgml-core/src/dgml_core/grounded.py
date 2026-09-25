@@ -47,8 +47,11 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import math
+import threading
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +115,7 @@ from .usage import (
     add_partial,
     record_usage,
 )
+from .utils import fit_image_for_vision
 
 # ---- Constants ------------------------------------------------------------
 
@@ -1025,6 +1029,10 @@ def _write_extraction_stats(
 
 
 _PHASE3_MAX_PARALLEL = 8
+# Decoding a dense 300 DPI page is on the order of a hundred megabytes of
+# pixels; one decode at a time keeps the eight-way page pool from holding
+# eight, and the decode is short against the model call that follows.
+_PHASE3_IMAGE_FIT_SLOTS = threading.BoundedSemaphore(1)
 
 
 def _run_phase3(
@@ -1130,17 +1138,44 @@ def _phase3_call_for_page(
         raise ValuesExtractionFailed(
             f"phase 3: no page image for file '{file_id}' page {page_number}"
         )
+    image = workspace.blobs.get_blob(image_key)
+    scale: _PageScale | None = None
+    if is_anthropic_model(model):
+        # The caps are Anthropic's; the other providers take a full page.
+        try:
+            with _PHASE3_IMAGE_FIT_SLOTS:
+                fitted = fit_image_for_vision(image)
+        except ValueError as exc:
+            raise ValuesExtractionFailed(f"phase 3 page {page_number}: {exc}") from exc
+        image = fitted.image
+        if (
+            fitted.original_size is not None
+            and fitted.sent_size is not None
+            and fitted.sent_size != fitted.original_size
+        ):
+            scale = _PageScale(page=fitted.original_size, sent=fitted.sent_size)
 
     try:
         page_words = get_page_words(workspace, file_id, page_number)
     except FileNotFound:
         page_words = {"page": page_number, "total_words": 0, "words": []}
+    page_anchors = _collect_page_anchors(values, page_number)
+    if scale is not None:
+        # The model reads and writes one pixel space: the image it sees. A
+        # render shrunk to fit the provider moves that space, so the OCR
+        # words and the anchors go in moved the same way, and the boxes
+        # come back moved into the render (_parse_submit_locations).
+        page_words = _scale_page_words(page_words, scale)
+        page_anchors = [
+            {**anchor, "bounding_box": scale.to_sent(anchor["bounding_box"])}
+            for anchor in page_anchors
+        ]
 
     user_text = _phase3_user_prompt(
         page_number=page_number,
         items=items,
         page_words=page_words,
-        page_anchors=_collect_page_anchors(values, page_number),
+        page_anchors=page_anchors,
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": prompt(PromptKey.VALUES_PHASE3_SYSTEM)},
@@ -1148,7 +1183,7 @@ def _phase3_call_for_page(
             "role": "user",
             "content": [
                 {"type": "text", "text": user_text},
-                _image_content_block(workspace.blobs.get_blob(image_key)),
+                _image_content_block(image),
             ],
         },
     ]
@@ -1199,19 +1234,75 @@ def _phase3_call_for_page(
             raise ValuesExtractionFailed(
                 f"phase 3 page {page_number}: malformed JSON args: {exc}"
             ) from exc
-        return _parse_submit_locations(args, page_number)
+        return _parse_submit_locations(args, page_number, scale=scale)
 
     raise ValuesExtractionFailed(
         f"phase 3 page {page_number} exceeded max_tool_iters={max_tool_iters}"
     )
 
 
+@dataclass(frozen=True)
+class _PageScale:
+    """The two pixel spaces of a phase-3 page, as ``(width, height)``: the
+    render (``page``) and the smaller image sent to the model (``sent``)."""
+
+    page: tuple[int, int]
+    sent: tuple[int, int]
+
+    def to_sent(self, box: list[Any]) -> list[int]:
+        return _scale_box(box, self.page, self.sent)
+
+    def to_page(self, box: list[Any]) -> list[int]:
+        return _scale_box(box, self.sent, self.page)
+
+
+def _scale_box(box: list[Any], source: tuple[int, int], target: tuple[int, int]) -> list[int]:
+    """``[left, top, right, bottom]`` moved from ``source`` pixels to
+    ``target`` pixels. The ratio is exact (integer sizes, no float factor),
+    the rounding is outward (floor the near edge, ceil the far one) so a box
+    inside the image never loses a word to rounding and never collapses, and
+    the result is clamped to the target image; a box wholly outside it comes
+    back with no extent, which the caller drops."""
+    fx = Fraction(target[0], source[0])
+    fy = Fraction(target[1], source[1])
+    left, top, right, bottom = box
+    return [
+        _scaled(left, fx, target[0], far=False),
+        _scaled(top, fy, target[1], far=False),
+        _scaled(right, fx, target[0], far=True),
+        _scaled(bottom, fy, target[1], far=True),
+    ]
+
+
+def _scaled(coordinate: float, factor: Fraction, limit: int, *, far: bool) -> int:
+    exact = Fraction(coordinate) * factor
+    value = math.ceil(exact) if far else math.floor(exact)
+    return min(max(value, 0), limit)
+
+
+def _scale_page_words(page_words: dict[str, Any], scale: _PageScale) -> dict[str, Any]:
+    """A copy of a ``get_page_words`` payload in the sent image's pixels."""
+    words = [
+        {
+            **word,
+            "location": {
+                **word["location"],
+                "bounding_box": scale.to_sent(word["location"]["bounding_box"]),
+            },
+        }
+        for word in page_words.get("words", [])
+    ]
+    return {**page_words, "words": words}
+
+
 def _parse_submit_locations(
-    args: dict[str, Any], page_number: int
+    args: dict[str, Any], page_number: int, *, scale: _PageScale | None = None
 ) -> dict[str, list[dict[str, Any]]]:
     """Parse a ``submit_locations`` tool-args payload into
     ``{id → locations}``. Malformed entries are dropped silently —
-    they'll show up as unresolved in the stats."""
+    they'll show up as unresolved in the stats. With ``scale`` the page
+    image was shrunk before the call, the model's boxes are in that image's
+    pixels, and they come back in the render's, rounded outward."""
     raw = args.get("locations")
     out: dict[str, list[dict[str, Any]]] = {}
     if not isinstance(raw, list):
@@ -1230,7 +1321,13 @@ def _parse_submit_locations(
             if not all(isinstance(c, (int, float)) for c in bbox):
                 continue
             # Boxes are integer image pixels [left, top, right, bottom].
-            locs.append({"page_number": page_number, "bounding_box": [round(c) for c in bbox]})
+            if scale is None:
+                box = [round(c) for c in bbox]
+            else:
+                box = scale.to_page(bbox)
+                if box[2] <= box[0] or box[3] <= box[1]:
+                    continue  # the model put it outside the image it saw
+            locs.append({"page_number": page_number, "bounding_box": box})
         if locs:
             out[item_id] = locs
     return out

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -2320,3 +2321,193 @@ def test_phase3_never_cached(workspace: Workspace) -> None:
     assert len(m.call_args_list) >= 2, "phase 3 did not run; test would be vacuous"
     for call in m.call_args_list[1:]:
         assert _cache_control_paths(call.kwargs["messages"]) == []
+
+
+# ---------------------------------------------------------------------------
+# phase 3 sends a page image that fits the provider (dgml-io/dgml#157)
+# ---------------------------------------------------------------------------
+
+
+_TITLE_SUBTITLE_RNC = (
+    _TITLE_RNC.replace("(text | title)*", "(text | title | subtitle)*")
+    + """\
+
+subtitle =
+  element docset:subtitle {
+    text
+  }
+"""
+)
+
+
+_ANTHROPIC_VALUES_MODEL = "anthropic/claude-sonnet-5"
+
+
+def _seed_rendered_page(workspace: Workspace, fid: str) -> str:
+    """A one-page file with a real 300 x 200 PNG render, two OCR words inside
+    it, and a docset whose schema declares ``title`` and ``subtitle``."""
+    import io
+
+    from PIL import Image
+
+    _seed_file(workspace, fid)
+    _seed_page_text(
+        workspace,
+        fid,
+        page=1,
+        width=300,
+        height=200,
+        words=[{"t": "Hello", "l": [30, 20, 80, 40]}, {"t": "world", "l": [90, 20, 150, 40]}],
+    )
+    buf = io.BytesIO()
+    Image.new("RGB", (300, 200), (10, 20, 30)).save(buf, "PNG")
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), buf.getvalue())
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _TITLE_SUBTITLE_RNC)
+    store.add_file(ds.id, fid)
+    return ds.id
+
+
+# "Hello world" is matched by phase 2 (an anchor on the page); "Goodnight"
+# is not, so phase 3 is asked for it.
+_TWO_LEAVES_ONE_UNMATCHED = {
+    "title": {"text": "Hello world", "locations": [{"page_number": 1}]},
+    "subtitle": {"text": "Goodnight", "locations": [{"page_number": 1}]},
+}
+_ONE_BOX = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
+
+
+def _sent_page_image(mock_completion: Any) -> tuple[Any, str]:
+    """The decoded image and the user text of the phase-3 call (the second)."""
+    import io
+
+    from PIL import Image
+
+    content = mock_completion.call_args_list[1].kwargs["messages"][1]["content"]
+    images = [block for block in content if block.get("type") == "image_url"]
+    assert len(images) == 1
+    url = images[0]["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
+    return Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))), content[0]["text"]
+
+
+def test_extract_values_phase3_sends_a_page_image_inside_the_vision_caps(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The phase-3 page image is shrunk to the single-image caps before it is
+    encoded, and the model keeps one pixel space: the OCR words and the
+    anchors it reads are moved into the sent image, and the boxes it returns
+    are moved back into the render, rounded outward. The cap is patched down
+    so a 300 x 200 render is 'too large' (sent at 100 x 67)."""
+    import math
+    from fractions import Fraction
+
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed_rendered_page(workspace, fid)
+    monkeypatch.setattr("dgml_core.utils.VISION_MAX_EDGE", 100)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=_ANTHROPIC_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response(
+                "submit_values", {"values": _TWO_LEAVES_ONE_UNMATCHED}, call_id="p1"
+            ),
+            _tool_call_response("submit_locations", _ONE_BOX, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 2
+    sent, user_text = _sent_page_image(mock_completion)
+    assert sent.size == (100, 67)
+    sx, sy = Fraction(100, 300), Fraction(67, 200)
+    # The words and the anchor the model reads are in the sent image's pixels,
+    # rounded outward: Hello [30,20,80,40] and the anchor [30,20,150,40].
+    hello = [math.floor(30 * sx), math.floor(20 * sy), math.ceil(80 * sx), math.ceil(40 * sy)]
+    anchor = [math.floor(30 * sx), math.floor(20 * sy), math.ceil(150 * sx), math.ceil(40 * sy)]
+    assert hello == [10, 6, 27, 14] and anchor == [10, 6, 50, 14]
+    assert f"Hello,{hello[0]},{hello[1]},{hello[2]},{hello[3]}" in user_text
+    assert f"bbox={anchor}" in user_text
+    # The box the model returned is in those pixels too; it comes back into
+    # the render's, rounded outward, so it still encloses what it enclosed.
+    back = [math.floor(10 / sx), math.floor(20 / sy), math.ceil(30 / sx), math.ceil(40 / sy)]
+    assert back == [30, 59, 90, 120]
+    assert result.values["subtitle"]["locations"] == [{"page_number": 1, "bounding_box": back}]
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [30, 20, 150, 40]}
+    ]
+
+
+def test_extract_values_phase3_sends_the_full_render_to_a_non_anthropic_model(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caps are Anthropic's. Under the default (Gemini) model the render
+    goes out as it is, over the patched cap, and the words are not moved."""
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed_rendered_page(workspace, fid)
+    monkeypatch.setattr("dgml_core.utils.VISION_MAX_EDGE", 100)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response(
+                "submit_values", {"values": _TWO_LEAVES_ONE_UNMATCHED}, call_id="p1"
+            ),
+            _tool_call_response("submit_locations", _ONE_BOX, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    sent, user_text = _sent_page_image(mock_completion)
+    assert sent.size == (300, 200)
+    assert "Hello,30,20,80,40" in user_text
+    assert result.values["subtitle"]["locations"] == [
+        {"page_number": 1, "bounding_box": [10, 20, 30, 40]}
+    ]
+
+
+def test_extract_values_phase3_drops_a_box_the_model_put_outside_the_image(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clamping a box that lies wholly outside the sent image would leave a
+    zero-area box that reads as located; such a box is dropped and the leaf
+    stays unmatched."""
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed_rendered_page(workspace, fid)
+    monkeypatch.setattr("dgml_core.utils.VISION_MAX_EDGE", 100)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=_ANTHROPIC_VALUES_MODEL)
+    outside = {"locations": [{"id": "a", "bounding_boxes": [[101.0, 20.0, 102.0, 30.0]]}]}
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response(
+                "submit_values", {"values": _TWO_LEAVES_ONE_UNMATCHED}, call_id="p1"
+            ),
+            _tool_call_response("submit_locations", outside, call_id="p3"),
+        ],
+    ):
+        result = extract_values(workspace, ds_id, fid, config=config)
+    assert result.values["subtitle"]["locations"] == [{"page_number": 1}]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["matching"]["unmatched"] == 1
+
+
+def test_extract_values_phase3_fails_the_page_it_cannot_fit_before_any_phase3_call(
+    workspace: Workspace,
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed_rendered_page(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=_ANTHROPIC_VALUES_MODEL)
+    with (
+        patch(
+            "litellm.completion",
+            return_value=_tool_call_response(
+                "submit_values", {"values": _TWO_LEAVES_ONE_UNMATCHED}
+            ),
+        ) as mock_completion,
+        patch("dgml_core.grounded.fit_image_for_vision", side_effect=ValueError("over the cap")),
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="phase 3 page 1: over the cap"):
+            extract_values(workspace, ds_id, fid, config=config)
+    assert mock_completion.call_count == 1  # phase 1 only
