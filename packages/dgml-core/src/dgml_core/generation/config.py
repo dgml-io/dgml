@@ -65,16 +65,35 @@ from dgml_core.errors import (
 from dgml_core.models_config import ConfigSection, Tier, resolve_tiered_model
 from dgml_core.storage import Workspace
 
+# Extended thinking is OFF for generation unless the config says otherwise.
+#
+# Not a cost decision alone. Measured on an internal 5-docset benchmark, three
+# draws per arm, with transcription frozen so only labeling varied: thinking
+# disabled scored higher than the adaptive default on exact-match and
+# token-overlap F1, individually and pooled, while costing ~2.7x less and
+# running ~4.5x faster. Labeling assigns a concept from a roster to text that is
+# already extracted; the reasoning budget mostly went into re-deliberating
+# choices the roster had settled.
+#
+# Set ``thinking = "adaptive"`` under ``[generation]`` to restore the model
+# default.
+DEFAULT_THINKING = "disabled"
+
 
 @dataclass(frozen=True)
 class GenerationConfig:
     """Parsed ``generation`` models, with each model's resolved credentials.
 
     ``model`` (per-page transcription) and ``label_model`` (the single
-    batch-wide semantic-labeling call) each resolve from the per-task field or
-    its ``[models]`` tier (``standard`` / ``advanced``). Transcription is the
-    bulk of the calls and runs well on a cheaper tier; labeling is a handful of
-    small-output calls per batch that benefit from a stronger model.
+    batch-wide semantic-labeling call) both resolve from the per-task field or,
+    failing that, the ``standard`` ``[models]`` tier.
+
+    Labeling used to default to the ``advanced`` tier on the assumption that it
+    benefits from a stronger model. Measurement does not support that: over 13
+    docsets in two independent corpora, 3 draws each, the ``standard`` tier
+    scored at least as well on every metric and was markedly steadier per
+    docset, at roughly half the cost. Set ``label_model`` explicitly to use a
+    different model; the tier fallback no longer reaches ``advanced``.
 
     Each model has independent credentials so the two may name different
     providers. For either, API-key resolution precedence is: literal
@@ -93,6 +112,34 @@ class GenerationConfig:
     label_api_key: str | None = None
     label_api_key_env: str | None = None
     label_api_base: str | None = None
+    # Anthropic extended thinking for BOTH generation passes, one of
+    # :data:`~dgml_core.llm.ANTHROPIC_THINKING_MODES`. Defaults to ``"disabled"``
+    # rather than to "whatever the model does", because the shipped labeling
+    # model is a Claude 5 model and those think adaptively unless told not to —
+    # see the note on :data:`DEFAULT_THINKING`. Ignored for non-Anthropic models.
+    thinking: str = DEFAULT_THINKING
+
+
+def _resolve_thinking(merged: dict[ConfigSection, Any]) -> str:
+    """Read ``[generation] thinking``, defaulting to :data:`DEFAULT_THINKING`.
+
+    Validated here, at the config boundary, so a typo names the file it came
+    from instead of surfacing as a provider 400 mid-run.
+    """
+    # Imported lazily: `dgml_core.llm` pulls in litellm (~1.4s), which #160
+    # deliberately kept off the eager import path. Config resolution runs once
+    # per command and is already past that point when it needs the modes.
+    from dgml_core.llm import ANTHROPIC_THINKING_MODES
+
+    section = merged.get(ConfigSection.GENERATION) or {}
+    if not isinstance(section, dict):
+        return DEFAULT_THINKING
+    value = section.get("thinking", DEFAULT_THINKING)
+    if value not in ANTHROPIC_THINKING_MODES:
+        raise GenerationConfigInvalid(
+            f"'generation.thinking' must be one of {list(ANTHROPIC_THINKING_MODES)} (got {value!r})"
+        )
+    return str(value)
 
 
 def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
@@ -116,7 +163,11 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
     label = resolve_tiered_model(
         merged,
         section_name=ConfigSection.GENERATION,
-        tier=Tier.ADVANCED,
+        # STANDARD, not ADVANCED. Labeling assigns a concept from an already-fixed
+        # roster to text that is already extracted; it is a compliance task, not a
+        # reasoning one, and measurement does not reward spending the stronger tier
+        # on it — see the note on the label_model field.
+        tier=Tier.STANDARD,
         invalid=GenerationConfigInvalid,
         missing=GenerationConfigMissing,
         model_field="label_model",
@@ -125,6 +176,7 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
         base_field="label_api_base",
     )
     return GenerationConfig(
+        thinking=_resolve_thinking(merged),
         model=transcribe.model,
         label_model=label.model,
         api_key=transcribe.api_key,

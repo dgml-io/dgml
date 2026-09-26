@@ -3272,3 +3272,32 @@ def test_extend_stays_unbounded_when_gap_planning_yields_nothing(
         on_output=lambda name, xml: outputs.__setitem__(name, xml),
     )
     assert "<docset:CoinedAnyway" in outputs["a.pdf"]
+
+
+def test_loads_tolerant_accepts_a_literal_newline_inside_a_string() -> None:
+    """Asked to quote a span of a document, a model reproduces its line breaks
+    literally instead of as \\n. RFC 8259 forbids that, and rejecting it threw
+    away every label in the chunk over a character the model had no reason to
+    think mattered. Observed on a multi-line address field."""
+    from dgml_core.generation.transcribe import loads_tolerant
+
+    raw = (
+        '{"labels": [{"concept": "BillToParty", '
+        '"quote": "Acme Holdings Ltd\nSuite 4\nSpringfield"}]}'
+    )
+    out = loads_tolerant(raw)
+    assert out["labels"][0]["concept"] == "BillToParty"
+    # the line breaks survive — the quote must still match the source text
+    assert out["labels"][0]["quote"].splitlines() == ["Acme Holdings Ltd", "Suite 4", "Springfield"]
+
+
+def test_loads_tolerant_still_rejects_genuine_garbage() -> None:
+    """Tolerance must not become "accept anything": a truncated reply has to
+    keep failing so the caller bisects the chunk instead of labeling nothing."""
+    import json
+
+    import pytest as _pytest
+    from dgml_core.generation.transcribe import loads_tolerant
+
+    with _pytest.raises(json.JSONDecodeError):
+        loads_tolerant('{"labels": [{"concept": "Buyer", "quote": "trunc')

@@ -2786,7 +2786,21 @@ def _add_generate_subparser(
     )
     gen.add_argument("--window-size", type=int, default=10, help="Pages per transcription window.")
     gen.add_argument("--temperature", type=float, default=0.0)
-    gen.add_argument("--max-tokens", type=int, default=32000)
+    # Keep in step with ConvertOptions.max_tokens — see the note there for
+    # why the ceiling is 64000 rather than 32000.
+    gen.add_argument("--max-tokens", type=int, default=64000)
+    gen.add_argument(
+        "--thinking",
+        choices=["disabled", "adaptive"],
+        default=None,
+        help=(
+            "Anthropic extended thinking for both generation passes. Overrides "
+            "[generation] thinking, whose default is 'disabled'. Omitting the "
+            "field on the wire is NOT the same as turning thinking off: Claude "
+            "4.6+/5 models reason adaptively unless told not to. Ignored for "
+            "non-Anthropic models."
+        ),
+    )
     gen.add_argument(
         "--no-coverage",
         action="store_true",
@@ -3710,6 +3724,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     window_size=args.window_size,
                     temperature=args.temperature,
                     max_tokens=args.max_tokens,
+                    thinking=args.thinking or gen_cfg.thinking,
                     max_parallel_docs=args.max_parallel_calls,
                     cache_dir=cache_dir,
                     debug=args.debug,

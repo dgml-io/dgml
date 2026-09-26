@@ -748,3 +748,166 @@ def test_non_transient_errors_still_raise_immediately(
     with pytest.raises(Exception, match="AuthenticationError"):
         llm._completion_with_retry({"model": "claude-sonnet-4-5"})
     assert len(attempts) == 1
+
+
+# ── Anthropic extended thinking (LLMConfig.thinking) ────────────────────────
+
+
+def test_thinking_sent_to_anthropic_models() -> None:
+    """The mode reaches the wire as Anthropic's `thinking` object."""
+    msgs = [{"role": "user", "content": "hi"}]
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking="disabled"), messages=msgs
+    )
+    assert kwargs["thinking"] == {"type": "disabled"}
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking="adaptive"), messages=msgs
+    )
+    assert kwargs["thinking"] == {"type": "adaptive"}
+
+
+def test_thinking_omitted_when_unset() -> None:
+    """Unset means "say nothing", which leaves the model's own default in
+    force — deliberately NOT the same as "disabled"."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-sonnet-5"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert "thinking" not in kwargs
+
+
+def test_thinking_not_sent_to_non_anthropic_models() -> None:
+    """The field is Anthropic-shaped; other providers spell reasoning their
+    own way and reject it."""
+    for model in ("gemini/gemini-2.5-pro", "openai/gpt-5"):
+        kwargs = llm._build_completion_kwargs(
+            llm.LLMConfig(model=model, thinking="disabled"),
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert "thinking" not in kwargs, model
+
+
+def test_reasoning_effort_wins_over_thinking() -> None:
+    """litellm translates reasoning_effort into the same Anthropic field, so
+    sending both would contradict itself. The caller's explicit effort wins."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(
+            model="anthropic/claude-sonnet-5", reasoning_effort="high", thinking="disabled"
+        ),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert kwargs["reasoning_effort"] == "high"
+    assert "thinking" not in kwargs
+
+
+def test_thinking_still_sent_when_reasoning_effort_was_dropped() -> None:
+    """A forced tool_choice drops reasoning_effort for Anthropic, which frees
+    the field — so the configured mode applies rather than silently vanishing."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(
+            model="anthropic/claude-sonnet-5", reasoning_effort="high", thinking="disabled"
+        ),
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        tool_choice={"type": "function", "function": {"name": "f"}},
+    )
+    assert "reasoning_effort" not in kwargs
+    assert kwargs["thinking"] == {"type": "disabled"}
+
+
+def test_invalid_thinking_mode_rejected_at_construction() -> None:
+    """A typo is a config error; catching it here names the value instead of
+    letting the provider answer 400 mid-run."""
+    with pytest.raises(ValueError, match="thinking must be one of"):
+        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking="enabled")
+
+
+class _Reply:
+    """A minimal litellm-shaped response.
+
+    Both access styles are supported because the two entry points differ:
+    :func:`llm.call` subscripts the response, :func:`llm.call_continued` reads
+    attributes.
+    """
+
+    def __init__(self, content: str | None, finish_reason: str, **extra: Any) -> None:
+        from types import SimpleNamespace
+
+        message = SimpleNamespace(content=content, tool_calls=None, **extra)
+        self.choices = [SimpleNamespace(message=message, finish_reason=finish_reason)]
+        self.usage = None
+        self._mapping = {"choices": [{"message": {"content": content}}]}
+
+    def __getitem__(self, key: str) -> Any:
+        return self._mapping[key]
+
+
+def _reply(content: str | None, finish_reason: str, **extra: Any) -> Any:
+    return _Reply(content, finish_reason, **extra)
+
+
+@pytest.mark.parametrize("thinking,expect_prefill", [("disabled", True), ("adaptive", False)])
+def test_prefill_on_continuation_follows_thinking_mode(
+    monkeypatch: pytest.MonkeyPatch, thinking: str, expect_prefill: bool
+) -> None:
+    """Anthropic rejects a prefilled assistant turn while thinking is on, so a
+    truncated reply may only be continued by prefill when thinking is off.
+    Turning thinking off is what makes the cheap continuation path usable."""
+    seen: list[list[dict[str, Any]]] = []
+    replies = [_reply("part one", "length"), _reply(" and two", "stop")]
+
+    def fake(**kwargs: Any) -> Any:
+        seen.append(kwargs["messages"])
+        return replies[len(seen) - 1]
+
+    monkeypatch.setattr(litellm, "completion", fake)
+    out = llm.call_continued(
+        llm.LLMConfig(model="anthropic/claude-haiku-4-5", thinking=thinking),
+        system_prompt="s",
+        user_content=[{"type": "text", "text": "u"}],
+    )
+    assert out == "part one and two"
+    roles = [m["role"] for m in seen[1]]
+    # With prefill the partial is the LAST turn; without it a user turn has to
+    # follow and ask for the rest.
+    assert (roles[-1] == "assistant") is expect_prefill
+
+
+def test_call_raises_with_a_reason_when_the_reply_has_no_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reasoning-only reply used to be cast to str and pushed downstream,
+    where it read as unparseable model output. Name the cause instead."""
+    from dgml_core.errors import EmptyModelResponse
+
+    monkeypatch.setattr(
+        litellm,
+        "completion",
+        lambda **_k: _reply(None, "stop", reasoning_content="thought about it"),
+    )
+    with pytest.raises(EmptyModelResponse) as exc:
+        llm.call(
+            llm.LLMConfig(model="anthropic/claude-sonnet-5"),
+            system_prompt="s",
+            user_content=[{"type": "text", "text": "u"}],
+        )
+    assert "reasoning only" in str(exc.value)
+    assert "finish_reason='stop'" in str(exc.value)
+
+
+def test_call_continued_raises_when_every_round_is_textless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget went entirely into reasoning. Returning "" here sent an empty
+    transcription window on as if the document itself were empty."""
+    from dgml_core.errors import EmptyModelResponse
+
+    monkeypatch.setattr(
+        litellm, "completion", lambda **_k: _reply(None, "length", reasoning_content="thinking")
+    )
+    with pytest.raises(EmptyModelResponse, match="no message content"):
+        llm.call_continued(
+            llm.LLMConfig(model="anthropic/claude-sonnet-5"),
+            system_prompt="s",
+            user_content=[{"type": "text", "text": "u"}],
+        )

@@ -229,6 +229,21 @@ def _escape_inner_quotes(text: str) -> str:
 
 
 def loads_tolerant(text: str) -> Any:
+    """Decode a model's JSON reply, tolerating the ways models bend the grammar.
+
+    In order: strict; then the outermost ``{...}`` span, dropping any prose the
+    model wrapped around it; then ``strict=False``, which permits literal
+    control characters inside strings; then quote-escaping.
+
+    ``strict=False`` earns its place on quoted source text. Asked to echo a
+    span of a document, a model reproduces it with its line breaks intact —
+
+        {"quote": "Acme Holdings Ltd\n1 Example Way\nSpringfield"}
+
+    with a real newline rather than the ``\\n`` escape RFC 8259 requires. The
+    JSON is otherwise well-formed, so rejecting it discards a whole chunk's
+    labels over a character the model had no reason to think mattered.
+    """
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -238,7 +253,10 @@ def loads_tolerant(text: str) -> Any:
                 return json.loads(text[start : end + 1])
             except json.JSONDecodeError:
                 text = text[start : end + 1]
-        return json.loads(_escape_inner_quotes(text))
+        try:
+            return json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            return json.loads(_escape_inner_quotes(text))
 
 
 def _parse_window_json(raw: str) -> dict[str, Any]:

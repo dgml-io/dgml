@@ -818,17 +818,22 @@ The models are **not** CLI flags — like every other model-consuming command
 (`extraction generate-schema`, `extraction extract`, `discover`), `generate` reads them
 solely from the merged config, so each is one visible, deliberate choice. Each
 model resolves from its per-task field (`generation.model`,
-`generation.label_model`) or, when unset, its `[models]` tier (`standard` for
-transcription, `advanced` for labeling). There is no code default: if neither a
+`generation.label_model`) or, when unset, the `standard` `[models]` tier — for
+both tasks, since measurement did not support paying the `advanced` tier for
+labeling. There is no code default: if neither a
 field nor a tier names a model it fails with `GENERATION_CONFIG_MISSING`, a
 malformed one with `GENERATION_CONFIG_INVALID`. The two models carry independent
 credentials (`api_key`/`api_key_env`/`api_base` for transcription,
 `label_api_key`/`label_api_key_env`/`label_api_base` for labeling) since they may
-name different providers. See the [`generation` config
+name different providers. Anthropic extended thinking is off for both passes
+unless `generation.thinking = "adaptive"` says otherwise — a Claude 4.6+/5 model
+thinks adaptively when a request omits the field, so the mode is stated rather
+than inherited. See the [`generation` config
 section](storage-layout.md#generation-required-for-dgml-docset-generate).
 | `--window-size <n>` | `10` | Pages per transcription window. |
 | `--temperature <f>` | `0.0` | LLM temperature. |
-| `--max-tokens <n>` | `32000` | LLM max output tokens per call. |
+| `--max-tokens <n>` | `64000` | LLM max output tokens per call, clamped to each model's own ceiling. A long document produces *more* calls rather than bigger ones (transcription is windowed, labeling is chunked), so this is headroom rather than a target — the largest reply measured across 1,884 cached calls was ~29.9K tokens, from the roster-sized `describe_concepts` call. Raising the ceiling costs nothing on calls that don't use it, since billing is on tokens actually produced. |
+| `--thinking <mode>` | from config | Anthropic extended thinking for both generation passes: `disabled` or `adaptive`. Overrides `generation.thinking`, whose default is `disabled`. Omitting the field on the wire is **not** the same as turning thinking off — Claude 4.6+/5 models reason adaptively unless told not to, so the mode is stated rather than inherited. Ignored for non-Anthropic models. |
 | `--no-coverage` | off | Skip word-coverage metrics (unique-lexicon recall, ROUGE-1/2) computed against the workspace `page_text/`. |
 | `--cache-dir <dir>` | `<docset-dir>/cache` | Directory for the generation cache (functional `*_blocks.json` / `label_*_cNN_raw.json` / `concept_roster.json`, always written; plus per-window debug snapshots when `--debug` is set). |
 

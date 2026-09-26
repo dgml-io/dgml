@@ -115,7 +115,22 @@ class ConvertOptions:
     label_api_base: str | None = None
     window_size: int = 10
     temperature: float = 0.0
-    max_tokens: int = 32000
+    # Output ceiling per call, clamped per model downstream. Headroom, not a
+    # target: a long document produces MORE calls, not bigger ones, because
+    # transcription is windowed (`window_size`) and labeling is chunked
+    # (label._MAX_CHUNK_CHARS). Measured over 1,884 cached replies the largest
+    # window is ~16.7K tokens and the largest label chunk ~19.4K. The one call
+    # that scales with the CORPUS rather than a chunk is describe_concepts,
+    # whose output grows with the concept roster and has been observed at
+    # ~29.9K — 93% of the previous 32000 default. 64000 is ~2x the largest
+    # reply seen, matches claude-haiku-4-5's own ceiling (so transcription is
+    # unaffected either way), and still bounds a runaway reply.
+    max_tokens: int = 64000
+    # Anthropic extended thinking for both passes, one of
+    # :data:`~dgml_core.llm.ANTHROPIC_THINKING_MODES`; ``None`` leaves the
+    # model's own default in force (adaptive, on Claude 4.6+/5). The CLI passes
+    # ``[generation] thinking``, which defaults to ``"disabled"``.
+    thinking: str | None = None
     cache_dir: Path | str | None = None
     # document name → its page_text/ dir (per-page word JSONs written before
     # generation). When a document has one, each transcription window is
@@ -187,6 +202,7 @@ def _config(
         api_base=opts.api_base,
         temperature=opts.temperature,
         max_tokens=opts.max_tokens,
+        thinking=opts.thinking,
         workspace=opts.workspace,
         debug=opts.debug,
         operation=operation,
@@ -302,6 +318,7 @@ def convert_batch(
         api_base=opts.label_api_base,
         temperature=opts.temperature,
         max_tokens=opts.max_tokens,
+        thinking=opts.thinking,
         workspace=opts.workspace,
         debug=opts.debug,
         operation=OPERATION_LABEL,
