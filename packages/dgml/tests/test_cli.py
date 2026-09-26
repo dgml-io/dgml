@@ -6987,6 +6987,8 @@ def test_missing_chain_extra_reports_missing_extra(
     err = _read_stderr(capsys)["error"]
     assert err["code"] == "MISSING_EXTRA"
     assert err["message"] == "The 'chain' extra is not installed. Run: pip install dgml[chain]"
+
+
 def test_generate_max_tokens_default_matches_the_library() -> None:
     """The flag default and ConvertOptions.max_tokens are two copies of one
     number. They have to move together: a CLI run that silently used a lower
@@ -7006,3 +7008,25 @@ def test_generate_max_tokens_default_clears_the_largest_observed_reply() -> None
     from dgml_core.generation.pipeline import ConvertOptions
 
     assert ConvertOptions.max_tokens >= 2 * 30_000
+
+
+def test_generate_thinking_flag_defaults_to_none() -> None:
+    """Unset means "defer to [generation] thinking". The flag must not carry a
+    value of its own, or it would silently override the config on every run."""
+    from dgml.cli import _build_parser
+
+    args = _build_parser().parse_args(["docset", "generate", "somedocset"])
+    assert args.thinking is None
+
+
+def test_generate_thinking_flag_accepts_only_known_modes() -> None:
+    """A typo is rejected by argparse rather than reaching the provider as a
+    400 after transcription has already been paid for."""
+    import pytest as _pytest
+    from dgml.cli import _build_parser
+
+    for mode in ("disabled", "adaptive"):
+        args = _build_parser().parse_args(["docset", "generate", "d", "--thinking", mode])
+        assert args.thinking == mode
+    with _pytest.raises(SystemExit):
+        _build_parser().parse_args(["docset", "generate", "d", "--thinking", "sometimes"])

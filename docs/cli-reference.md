@@ -833,6 +833,7 @@ section](storage-layout.md#generation-required-for-dgml-docset-generate).
 | `--window-size <n>` | `10` | Pages per transcription window. |
 | `--temperature <f>` | `0.0` | LLM temperature. |
 | `--max-tokens <n>` | `64000` | LLM max output tokens per call, clamped to each model's own ceiling. A long document produces *more* calls rather than bigger ones (transcription is windowed, labeling is chunked), so this is headroom rather than a target — the largest reply measured across 1,884 cached calls was ~29.9K tokens, from the roster-sized `describe_concepts` call. Raising the ceiling costs nothing on calls that don't use it, since billing is on tokens actually produced. |
+| `--thinking <mode>` | from config | Anthropic extended thinking for both generation passes: `disabled` or `adaptive`. Overrides `generation.thinking`, whose default is `disabled`. Omitting the field on the wire is **not** the same as turning thinking off — Claude 4.6+/5 models reason adaptively unless told not to, so the mode is stated rather than inherited. Ignored for non-Anthropic models. |
 | `--no-coverage` | off | Skip word-coverage metrics (unique-lexicon recall, ROUGE-1/2) computed against the workspace `page_text/`. |
 | `--cache-dir <dir>` | `<docset-dir>/cache` | Directory for the generation cache (functional `*_blocks.json` / `label_*_cNN_raw.json` / `concept_roster.json`, always written; plus per-window debug snapshots when `--debug` is set). |
 
