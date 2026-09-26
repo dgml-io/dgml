@@ -109,14 +109,16 @@ def test_minimal_explicit_config(workspace: Workspace) -> None:
 
 
 def test_models_resolve_from_tiers(workspace: Workspace) -> None:
-    # No [generation] section: transcription ← standard, labeling ← advanced.
+    # No [generation] section: BOTH tasks fall back to the standard tier.
+    # Labeling used to take `advanced`; measurement did not support paying for
+    # it, so the fallback was moved down (see GenerationConfig's docstring).
     write_config(
         workspace,
         {"models": {"standard": MODEL, "advanced": LABEL_MODEL, "light": MODEL, "expert": MODEL}},
     )
     cfg = load_generation_config(workspace)
     assert cfg.model == MODEL  # standard
-    assert cfg.label_model == LABEL_MODEL  # advanced
+    assert cfg.label_model == MODEL  # standard too — NOT advanced
 
 
 def test_section_model_overrides_tier(workspace: Workspace) -> None:
@@ -137,7 +139,7 @@ def test_tier_models_carry_no_credentials(workspace: Workspace) -> None:
     # has no api_key/api_key_env/api_base (litellm uses its per-provider env var).
     write_config(workspace, {"models": {"standard": MODEL, "advanced": "gemini/gemini-2.5-pro"}})
     cfg = load_generation_config(workspace)
-    assert (cfg.model, cfg.label_model) == (MODEL, "gemini/gemini-2.5-pro")
+    assert (cfg.model, cfg.label_model) == (MODEL, MODEL)  # both from standard
     assert (cfg.api_key, cfg.api_key_env, cfg.api_base) == (None, None, None)
     assert (cfg.label_api_key, cfg.label_api_key_env, cfg.label_api_base) == (None, None, None)
 
@@ -161,11 +163,25 @@ def test_per_task_credentials_apply_to_tier_models(workspace: Workspace) -> None
 
 
 def test_env_var_overrides_config(workspace: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both generation tasks read the standard tier, so that is the one an env
+    # var has to move to change them.
+    write_config(workspace, {"models": {"standard": MODEL, "advanced": LABEL_MODEL}})
+    monkeypatch.setenv("DGML_MODELS__STANDARD", "openai/gpt-5")
+    cfg = load_generation_config(workspace)
+    assert cfg.model == "openai/gpt-5"
+    assert cfg.label_model == "openai/gpt-5"
+
+
+def test_advanced_tier_no_longer_reaches_generation(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving `advanced` must not move labeling any more — it is reserved for
+    the tasks that still ask for it (grounded extraction). A config that only
+    sets `advanced` leaves generation on `standard`."""
     write_config(workspace, {"models": {"standard": MODEL, "advanced": LABEL_MODEL}})
     monkeypatch.setenv("DGML_MODELS__ADVANCED", "openai/gpt-5")
     cfg = load_generation_config(workspace)
-    assert cfg.model == MODEL  # standard, unchanged
-    assert cfg.label_model == "openai/gpt-5"  # env overrides the advanced tier
+    assert cfg.label_model == MODEL
 
 
 def test_user_and_workspace_configs_deep_merge(workspace: Workspace) -> None:
@@ -187,10 +203,12 @@ def test_user_and_workspace_configs_deep_merge(workspace: Workspace) -> None:
         ),
         encoding="utf-8",
     )
-    write_config(workspace, {"models": {"advanced": "openai/gpt-5"}})
+    write_config(workspace, {"models": {"standard": "openai/gpt-5"}})
     cfg = load_generation_config(workspace)
-    assert cfg.model == MODEL  # standard inherited from the user config
-    assert cfg.label_model == "openai/gpt-5"  # advanced overridden by the workspace config
+    # The workspace overrides `standard`; the other tiers still come from the
+    # user config, which is what the deep merge is here to prove.
+    assert cfg.model == "openai/gpt-5"
+    assert cfg.label_model == "openai/gpt-5"
 
 
 def test_full_config_round_trips(workspace: Workspace) -> None:

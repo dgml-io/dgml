@@ -85,10 +85,15 @@ class GenerationConfig:
     """Parsed ``generation`` models, with each model's resolved credentials.
 
     ``model`` (per-page transcription) and ``label_model`` (the single
-    batch-wide semantic-labeling call) each resolve from the per-task field or
-    its ``[models]`` tier (``standard`` / ``advanced``). Transcription is the
-    bulk of the calls and runs well on a cheaper tier; labeling is a handful of
-    small-output calls per batch that benefit from a stronger model.
+    batch-wide semantic-labeling call) both resolve from the per-task field or,
+    failing that, the ``standard`` ``[models]`` tier.
+
+    Labeling used to default to the ``advanced`` tier on the assumption that it
+    benefits from a stronger model. Measurement does not support that: over 13
+    docsets in two independent corpora, 3 draws each, the ``standard`` tier
+    scored at least as well on every metric and was markedly steadier per
+    docset, at roughly half the cost. Set ``label_model`` explicitly to use a
+    different model; the tier fallback no longer reaches ``advanced``.
 
     Each model has independent credentials so the two may name different
     providers. For either, API-key resolution precedence is: literal
@@ -158,7 +163,11 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
     label = resolve_tiered_model(
         merged,
         section_name=ConfigSection.GENERATION,
-        tier=Tier.ADVANCED,
+        # STANDARD, not ADVANCED. Labeling assigns a concept from an already-fixed
+        # roster to text that is already extracted; it is a compliance task, not a
+        # reasoning one, and measurement does not reward spending the stronger tier
+        # on it — see the note on the label_model field.
+        tier=Tier.STANDARD,
         invalid=GenerationConfigInvalid,
         missing=GenerationConfigMissing,
         model_field="label_model",

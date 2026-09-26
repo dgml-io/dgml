@@ -818,8 +818,9 @@ The models are **not** CLI flags — like every other model-consuming command
 (`extraction generate-schema`, `extraction extract`, `discover`), `generate` reads them
 solely from the merged config, so each is one visible, deliberate choice. Each
 model resolves from its per-task field (`generation.model`,
-`generation.label_model`) or, when unset, its `[models]` tier (`standard` for
-transcription, `advanced` for labeling). There is no code default: if neither a
+`generation.label_model`) or, when unset, the `standard` `[models]` tier — for
+both tasks, since measurement did not support paying the `advanced` tier for
+labeling. There is no code default: if neither a
 field nor a tier names a model it fails with `GENERATION_CONFIG_MISSING`, a
 malformed one with `GENERATION_CONFIG_INVALID`. The two models carry independent
 credentials (`api_key`/`api_key_env`/`api_base` for transcription,
