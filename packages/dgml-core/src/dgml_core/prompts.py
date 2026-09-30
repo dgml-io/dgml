@@ -57,6 +57,8 @@ class PromptKey(StrEnum):
     # Extraction: value extraction, phase 3 (attach bounding boxes)
     VALUES_PHASE3_SYSTEM = "extraction_values_phase3_system"
     VALUES_PHASE3_USER = "extraction_values_phase3_user"
+    VALUES_PHASE3_SYSTEM_NO_WORDS = "extraction_values_phase3_system_no_words"
+    VALUES_PHASE3_USER_NO_WORDS = "extraction_values_phase3_user_no_words"
 
     # LLM clustering
     CLUSTER_GROUPING_INTRO = "cluster_grouping_intro"

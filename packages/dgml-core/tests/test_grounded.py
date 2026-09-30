@@ -40,6 +40,7 @@ from dgml_core.grounded import (
     GroundedConfig,
     _field_node_schema,
     _submit_schema_tool,
+    _to_page_pixels,
     extract_values,
     generate_schema,
     get_page_words,
@@ -137,6 +138,12 @@ def _seed_page_image(workspace: Workspace, file_id: str, page: int) -> None:
     """Drop a minimal PNG so phase-3 ``image_path.exists()`` passes.
     Bytes never reach a real decoder — litellm is mocked in these tests."""
     workspace.blobs.put_blob(layout.file_page_image_key(file_id, page), b"\x89PNG\r\n\x1a\n")
+
+
+def _png_header(width: int, height: int) -> bytes:
+    """The PNG signature plus an IHDR chunk: enough for the size to be read."""
+    ihdr = width.to_bytes(4, "big") + height.to_bytes(4, "big") + b"\x08\x02\x00\x00\x00"
+    return b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR" + ihdr + b"\x00" * 4
 
 
 def _tool_call_response(
@@ -635,13 +642,14 @@ def test_extract_values_drops_temperature_for_anthropic(
 
 def test_lower_values_budget_does_not_reach_location_grounding(workspace: Workspace) -> None:
     """Value extraction runs at a lower reasoning budget than the rest of the
-    pipeline; location grounding must keep the module default.
+    pipeline; location grounding on a page with OCR words must keep the module
+    default (only the no-words grid path is lowered, by its own constant).
 
     Location grounding forces ``tool_choice``, so Anthropic drops the setting
-    either way — but other providers keep it, and lowering their budget was never
-    measured. A Gemini values model makes the value observable on both calls, so
-    this pins the boundary instead of trusting it. Needs text phase 2 cannot
-    match, which is what sends grounding to the LLM at all."""
+    either way — but other providers keep it. A Gemini values model makes the
+    value observable on both calls, so this pins the boundary instead of
+    trusting it. Needs text phase 2 cannot match, which is what sends
+    grounding to the LLM at all."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)  # only contains "Hello", "world"
@@ -921,6 +929,192 @@ def test_extract_values_phase3_words_are_toon_encoded(
     ]
 
 
+def test_extract_values_phase3_page_without_words_uses_the_grid(workspace: Workspace) -> None:
+    """A page with no OCR words (a scan added in digital mode) gives the model
+    nothing to measure pixels against. Phase 3 then asks for boxes on a 0-1000
+    grid, says the page has no words, and scales the answer to page pixels."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300, words=[])
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 50, 200, 60]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    kwargs = mock_completion.call_args_list[1].kwargs
+    messages = kwargs["messages"]
+    assert "0-1000 grid" in messages[0]["content"]
+    assert "IMAGE PIXELS" not in messages[0]["content"]
+    user_text = messages[1]["content"][0]["text"]
+    assert "no OCR words" in user_text and "words[" not in user_text
+    assert kwargs["reasoning_effort"] == "medium"
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [255, 165, 510, 198]}
+    ]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    phase3 = stats["phases"]["phase3"]
+    assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (1, 0)
+
+
+def test_extract_values_phase3_states_the_image_size(workspace: Workspace) -> None:
+    """With words on the page the pixel contract stays, and the prompt says how
+    big the image is, so pixel coordinates have a known frame."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300)
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    kwargs = mock_completion.call_args_list[1].kwargs
+    assert "IMAGE PIXELS" in kwargs["messages"][0]["content"]
+    assert "2550 x 3300 pixels (width x height)" in kwargs["messages"][1]["content"][0]["text"]
+    # pages with words keep the default budget; only the grid path is lowered
+    assert kwargs["reasoning_effort"] == "high"
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 56, 200, 76]}
+    ]
+
+
+def test_extract_values_phase3_drops_a_box_off_the_page(workspace: Workspace) -> None:
+    """A box that lies outside the page image is dropped, not stored: the value
+    stays without a box instead of pointing at the wrong spot."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(1000, 1000))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[900, 56, 1400, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ):
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert result.values["title"]["locations"] == [{"page_number": 1}]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    phase3 = stats["phases"]["phase3"]
+    assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("bbox", "normalized", "expected"),
+    [
+        ([100, 50, 200, 60], True, [255, 165, 510, 198]),
+        ([100, 56, 200, 76], False, [100, 56, 200, 76]),
+        # an edge a few pixels past the border is clamped, on either axis
+        ([2500, 10, 2590, 40], False, [2500, 10, 2550, 40]),
+        ([100, 3250, 200, 3350], False, [100, 3250, 200, 3300]),
+        ([100, -20, 200, 40], False, [100, 0, 200, 40]),
+        # well off the page, on any side, inverted, or empty: dropped
+        ([2700, 10, 2800, 40], False, None),
+        ([100, 3400, 200, 3500], False, None),
+        ([100, 3000, 200, 3500], False, None),
+        ([2400, 10, 2800, 40], False, None),
+        ([100, -200, 200, 40], False, None),
+        ([200, 10, 100, 40], False, None),
+        ([100, 10, 100, 40], False, None),
+        ([100.2, 10, 100.4, 40], False, None),
+        # a grid box past 1000 is off the page too
+        ([100, 50, 1100, 60], True, None),
+    ],
+)
+def test_to_page_pixels(bbox: list[float], normalized: bool, expected: list[int] | None) -> None:
+    assert _to_page_pixels(bbox, image_size=(2550, 3300), normalized=normalized) == expected
+
+
+def test_to_page_pixels_without_a_known_size_keeps_the_box() -> None:
+    assert _to_page_pixels([100, 5, 99999, 60], image_size=None, normalized=False) == [
+        100,
+        5,
+        99999,
+        60,
+    ]
+
+
+def test_extract_values_phase3_size_from_page_text_when_the_image_header_is_unreadable(
+    workspace: Workspace,
+) -> None:
+    """The size comes from the PNG header, else from ``page_text``. A page with
+    no words and an unreadable header still takes the grid path."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300, words=[])
+    _seed_page_image(workspace, fid, 1)  # signature only, no IHDR
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 50, 200, 60]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert "0-1000 grid" in mock_completion.call_args_list[1].kwargs["messages"][0]["content"]
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [255, 165, 510, 198]}
+    ]
+
+
+def test_extract_values_phase3_zero_size_keeps_the_pixel_prompt(workspace: Workspace) -> None:
+    """A header reporting a zero size is no size: no grid, no size line."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=0, height=0, words=[])
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(0, 0))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        extract_values(workspace, ds_id, fid, config=config)
+
+    messages = mock_completion.call_args_list[1].kwargs["messages"]
+    assert "IMAGE PIXELS" in messages[0]["content"]
+    assert "pixels (width x height)" not in messages[1]["content"][0]["text"]
+
+
 def test_extract_values_phase3_merges_costs_across_parallel_pages(
     workspace: Workspace,
 ) -> None:
@@ -1057,6 +1251,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
     assert set(stats["phases"]["phase3"].keys()) == {
         "duration_s",
         "page_calls",
+        "grid_pages",
+        "boxes_dropped",
         "pages_out_of_range",
         "cost_usd",
         "prompt_tokens",

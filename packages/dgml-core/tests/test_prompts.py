@@ -54,11 +54,18 @@ def test_templated_prompts_accept_their_placeholders() -> None:
     assert "MY_RULES" in get(PromptKey.VALUES_PHASE1_GUIDANCE).format(guidance="MY_RULES")
     filled = get(PromptKey.VALUES_PHASE3_USER).format(
         page_number=7,
+        image_size="The page image is 2550 x 3300 pixels (width x height).",
         ocr_words="[]",
         known_locations="(none)",
         needs_locating="- id: x",
     )
-    assert "page 7" in filled and "- id: x" in filled
+    assert "page 7" in filled and "- id: x" in filled and "2550 x 3300" in filled
+    filled = get(PromptKey.VALUES_PHASE3_USER_NO_WORDS).format(
+        page_number=7,
+        known_locations="(none)",
+        needs_locating="- id: x",
+    )
+    assert "page 7" in filled and "- id: x" in filled and "0-1000" in filled
 
 
 def test_verbatim_prompts_keep_literal_braces() -> None:

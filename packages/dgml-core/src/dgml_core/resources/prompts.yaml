@@ -302,7 +302,7 @@ extraction_values_phase1_retry_chunked: |-
 # The OCR word listing is rendered as a compact TOON table (see dgml_core.toon):
 # a header line `words[N]{idx,text,left,top,right,bottom}:` then one
 # comma-separated row per word. System prompt is verbatim; the user prompt is
-# .format()'d with {page_number}, {ocr_words}, {known_locations},
+# .format()'d with {page_number}, {image_size}, {ocr_words}, {known_locations},
 # {needs_locating} (dgml_core.grounded).
 extraction_values_phase3_system: |-
   You are given one page of a PDF (as an image) plus the OCR words on
@@ -349,13 +349,49 @@ extraction_values_phase3_system: |-
   - Do NOT change the value text — your only job is to attach bboxes.
 
 extraction_values_phase3_user: |-
-  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool. The OCR words table below carries pixel-accurate positions; the page image is provided as a visual fallback.
+  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool. The OCR words table below carries pixel-accurate positions; the page image is provided as a visual fallback.{image_size}
 
   OCR_WORDS as a TOON table — a header line names the columns, then one comma-separated row per word (idx = the word's OCR index; left,top,right,bottom = its pixel bounding box). All words are on page {page_number}:
   {ocr_words}
 
   KNOWN_LOCATIONS on page {page_number} (already located, for row anchoring — do NOT include these in your output):
   {known_locations}
+
+  NEEDS_LOCATING (return exactly these ids):
+  {needs_locating}
+
+# Phase 3 for a page that has no OCR words (a scan added in digital mode, a
+# page whose text layer is empty). There is no word table to union, so the
+# model reads positions off the image on a 0-1000 grid (Gemini's native box
+# frame, and independent of how a provider resizes the image);
+# dgml_core.grounded scales the boxes to page pixels. The
+# user prompt is .format()'d with {page_number}, {needs_locating}. No
+# KNOWN_LOCATIONS: a page without words has had nothing placed on it by phase 2.
+extraction_values_phase3_system_no_words: |-
+  You are given one page of a PDF as an image and a list of values that need
+  to be located on it. No OCR words are available for this page: read the
+  positions off the image. For each value, return its bounding box (or several
+  if the text wraps across visual lines) via the ``submit_locations`` tool call.
+
+  BOUNDING BOX CONTRACT — non-negotiable:
+
+  1. Coordinates are ``[left, top, right, bottom]`` on a 0-1000 grid over the
+     page image: (0, 0) is the top-left corner, (1000, 1000) the bottom-right,
+     whatever the image's pixel size. NOT pixels; NOT [ymin,xmin,ymax,xmax].
+  2. Always ``left < right`` AND ``top < bottom``.
+  3. The bbox must FULLY ENCLOSE the text it grounds, edge to edge. Prefer
+     over-covering slightly to clipping the rightmost word.
+  4. For text spanning multiple visual lines, return ONE bbox per line
+     (in reading order), all as separate entries in ``bounding_boxes``.
+
+  ID DISCIPLINE:
+  - For every id in NEEDS_LOCATING, return exactly one ``locations``
+    entry keyed by that id.
+  - Do NOT echo ids that are not in NEEDS_LOCATING. Do NOT invent ids.
+  - Do NOT change the value text — your only job is to attach bboxes.
+
+extraction_values_phase3_user_no_words: |-
+  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool, with boxes on the 0-1000 grid of the page image. This page has no OCR words.
 
   NEEDS_LOCATING (return exactly these ids):
   {needs_locating}
