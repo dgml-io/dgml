@@ -20,10 +20,12 @@ being spelled twice (and drifting).
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from typing import Any
 
 from dgml_core.errors import DgmlError, StorageConfigInvalid
+from dgml_core.storage_service import StorageConfig
 
 #: Environment variable holding the full MongoDB connection string, including
 #: any credentials. Deliberately not a config key — see :mod:`.store`.
@@ -38,6 +40,65 @@ WORKSPACES_URI_ENV = "DGML_WORKSPACES_MONGO_URI"
 #: The identity options every store in this package accepts. Host, port, and
 #: database — never a credential.
 IDENTITY_FIELDS = frozenset({"mongo_host", "mongo_port", "mongo_database"})
+
+#: Outer part of every workspace-data collection name when the config sets no
+#: ``prefix`` — see :func:`workspace_namespace`.
+DEFAULT_PREFIX = "dgml"
+
+#: What a workspace-data store's ``prefix`` may look like. Excludes ``$`` and ``.``: ``$``
+#: is not allowed in a collection name, and a ``.`` could make a name that ends like
+#: GridFS's own ``<bucket>.files`` / ``<bucket>.chunks``.
+_PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+
+#: Longest ``prefix`` accepted, so the full collection name stays well inside Mongo's
+#: 255-byte namespace limit.
+MAX_PREFIX_LEN = 16
+
+
+def validate_prefix(
+    options: Mapping[str, Any], *, error: type[DgmlError] = StorageConfigInvalid
+) -> None:
+    """Check the optional ``prefix`` option, or raise ``error``."""
+    prefix = options.get("prefix")
+    if prefix is None:
+        return
+    if not isinstance(prefix, str) or not _PREFIX_RE.match(prefix):
+        raise error(
+            f"'prefix' must start with a letter or digit and contain only letters, "
+            f"digits, '_' and '-' (got {prefix!r})"
+        )
+    if len(prefix) > MAX_PREFIX_LEN:
+        raise error(f"'prefix' must be at most {MAX_PREFIX_LEN} characters (got {prefix!r})")
+
+
+def require_workspace_id(provider_name: str, config: StorageConfig) -> None:
+    """Refuse a config with no workspace id, rather than default one.
+
+    Names built without the id would be shared by every id-less workspace on the
+    database, and would move the moment this workspace got an id."""
+    if not config.workspace_id:
+        raise StorageConfigInvalid(
+            f"provider {provider_name!r} needs the workspace's id to name its collections, "
+            f"and this workspace records none"
+        )
+
+
+def workspace_namespace(config: StorageConfig) -> str:
+    """``<prefix>_<workspace id>``, with ``prefix`` defaulting to ``dgml``.
+
+    The id is always part of it, so any number of workspaces — and other applications —
+    can share one database. Documents and GridFS's bucket both live under it, so one
+    workspace's data stays together."""
+    prefix = config.options.get("prefix") or DEFAULT_PREFIX
+    return f"{prefix}_{config.workspace_id}"
+
+
+def prefixed(namespace: str, name: str) -> str:
+    """``name`` in ``namespace``: ``<namespace>_<name>``.
+
+    Every collection a workspace-data store touches goes through here, so one
+    workspace's names can never meet another's in a shared database."""
+    return f"{namespace}_{name}"
 
 
 def validate_identity(

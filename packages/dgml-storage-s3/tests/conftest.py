@@ -129,12 +129,19 @@ def make_store_options() -> tuple[str, dict[str, object]]:
 def s3_config(tmp_path: Path) -> StorageConfig:
     """A per-test prefix in the shared bucket, as a resolved blob-store config."""
     _prefix, options = make_store_options()
-    return StorageConfig(provider=PROVIDER, root=tmp_path / "ws", options=options)
+    return StorageConfig(
+        provider=PROVIDER, root=tmp_path / "ws", options=options, workspace_id="ws-test"
+    )
 
 
 @pytest.fixture
 def blobs(s3_config: StorageConfig) -> S3BlobStore:
     return S3BlobStore(S3BlobStore.parse_config(s3_config))
+
+
+#: The identity block ``workspace create`` writes. A store that shares its backend
+#: between workspaces reads the id from here, so a hand-built test workspace needs it.
+WORKSPACE_ID_TABLE = '\n[workspace]\nworkspace_id = "ws-test"\n'
 
 
 @pytest.fixture
@@ -149,7 +156,10 @@ def s3_blobs_workspace(tmp_path: Path) -> Workspace:
     root.mkdir(parents=True, exist_ok=True)
     lines = [f'{k} = "{v}"' for k, v in options.items()]
     (root / "config.toml").write_text(
-        f'[storage.default.blobs]\nprovider = "{PROVIDER}"\n' + "\n".join(lines) + "\n",
+        f'[storage.default.blobs]\nprovider = "{PROVIDER}"\n'
+        + "\n".join(lines)
+        + "\n"
+        + WORKSPACE_ID_TABLE,
         encoding="utf-8",
     )
     ws = Workspace(root=root)
