@@ -1385,8 +1385,17 @@ on the last — merged and vocabulary-checked code-side, transparent in the CLI
 payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
-`phases.phase1`: `chunk_calls` (1 = ordinary single submission) and
-`truncated_retries`. `phases.phase3.pages_out_of_range` counts the pages
+`phases.phase1`: `chunk_calls` (1 = ordinary single submission),
+`truncated_retries`, and `envelope_repairs`. The last counts `submit_values`
+calls that arrived with the tool's argument envelope repeated one level down,
+or serialized as a JSON string, and were unwrapped before the tree was read.
+A submission of which the vocabulary keeps nothing (no key names a schema
+root, or every named root carries a value of the wrong kind) is refused as an
+extraction error rather than written as an empty result; an empty tree, or
+one whose roots are all null, is still "nothing found". Leaf internals are
+not checked here.
+
+`phases.phase3.pages_out_of_range` counts the pages
 phase 1 cited that the file does not have (outside `1..page_count`, with no
 page image): their items make no phase-3 call and stay unmatched, like any
 other leaf phase 3 could not resolve, and the run still writes the tree.
