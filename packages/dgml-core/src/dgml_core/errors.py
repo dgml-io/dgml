@@ -303,6 +303,35 @@ class OcrFailed(DgmlError):
     code = "OCR_FAILED"
 
 
+class BatchUnavailable(DgmlError):
+    """Batch mode was requested for a model it cannot serve.
+
+    Raised at resolve time — before any request is sent — when the model's
+    provider (as litellm resolves it) has no registered batch backend, or the
+    backend's optional dependency is not installed. The message names the
+    model and the provider; for an unregistered provider it lists the
+    providers that do have a backend, and for a missing dependency it quotes
+    the install hint the backend registered, when it registered one. Batch
+    mode never falls back to a full-price synchronous run.
+    """
+
+    code = "BATCH_UNAVAILABLE"
+
+
+class BatchExecutionFailed(DgmlError):
+    """A submitted batch could not be brought to completion.
+
+    Raised by the batch executor when a batch is still not finished after the
+    executor's polling deadline (it is cancelled first so no further spend
+    accrues), when the provider accepted none of a wave's batches, or when a
+    batch create's outcome is unknown or was refused at the account's rate
+    limit or quota. A per-request failure inside an otherwise delivered batch
+    is NOT this error: those are retried or executed synchronously.
+    """
+
+    code = "BATCH_EXECUTION_FAILED"
+
+
 class ClassificationConfigMissing(DgmlError):
     code = "CLASSIFICATION_CONFIG_MISSING"
 
