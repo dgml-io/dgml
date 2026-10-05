@@ -29,7 +29,7 @@ from dgml_core.storage import Workspace
 from dgml_storage_mongo import MongoDocStore
 from dgml_storage_s3 import S3BlobStore
 
-from .conftest import PROVIDER, make_store_options
+from .conftest import PROVIDER, WORKSPACE_ID_TABLE, make_store_options
 
 MONGO_PROVIDER = "dgml_storage_mongo:MongoDocStore"
 
@@ -58,7 +58,8 @@ def mixed_workspace(_fake_mongo: None, tmp_path: Path) -> Workspace:
     s3_lines = "\n".join(f'{k} = "{v}"' for k, v in s3_opts.items())
     (root / "config.toml").write_text(
         f'[storage.default.blobs]\nprovider = "{PROVIDER}"\n{s3_lines}\n\n'
-        f'[storage.default.docs]\nprovider = "{MONGO_PROVIDER}"\nmongo_database = "{db}"\n',
+        f'[storage.default.docs]\nprovider = "{MONGO_PROVIDER}"\nmongo_database = "{db}"\n'
+        + WORKSPACE_ID_TABLE,
         encoding="utf-8",
     )
     ws = Workspace(root=root)

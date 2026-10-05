@@ -642,7 +642,7 @@ def canonical_provider(provider: str) -> str:
 def detect_provider(environ: dict[str, str]) -> str | None:
     """Auto-detect a provider from non-empty API-key env vars (no live check).
 
-    Both Anthropic + Gemini → ``mixed`` (the curated Gemini-light /
+    Both Anthropic + Gemini → ``anthropic_google`` (the curated Gemini-light /
     Anthropic-pipeline blend, which needs both keys); Anthropic only →
     ``anthropic``; Gemini only → ``google``; OpenAI only → ``openai``; none →
     ``None``.
@@ -657,7 +657,7 @@ def detect_provider(environ: dict[str, str]) -> str | None:
 
     anthropic, gemini = has("ANTHROPIC_API_KEY"), has("GEMINI_API_KEY")
     if anthropic and gemini:
-        return "mixed"
+        return "anthropic_google"
     if anthropic:
         return "anthropic"
     if gemini:
@@ -677,30 +677,28 @@ def render_config_toml(provider: str | None) -> str:
 
     ``provider`` names a :data:`PROVIDER_MODELS` key (aliases already resolved),
     or ``None`` to emit a commented-out ``[models]`` placeholder (no keys
-    detected). The ``[models]`` block carries no tier→capability comments — that
-    mapping is documented in the CLI reference and may change without rewriting
-    a user's file."""
+    detected). The ``[models]`` block names only the family — the expanded tiers
+    are reported on stderr by ``dgml init``, never written, so the config tracks
+    dgml's defaults across upgrades."""
+    choices = "|".join(sorted(PROVIDER_MODELS))
     if provider is None:
         checked = ", ".join(API_KEY_ENV_VARS)
         return (
             f"# No API key detected (checked {checked}).\n"
             "# Set at least one key, then rerun:\n"
-            "#   dgml init --provider <anthropic|google|mixed|openai>\n"
+            f"#   dgml init --provider <{choices}>\n"
             "#\n"
             "# [models]\n"
-            '# light    = "..."\n'
-            '# standard = "..."\n'
-            '# advanced = "..."\n'
-            '# expert   = "..."\n'
+            f'# family = "<{choices}>"\n'
             "\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
         )
-    tiers = PROVIDER_MODELS[provider]
-    width = max(len(t) for t in tiers)
-    lines = ["[models]"]
-    for tier in ("light", "standard", "advanced", "expert"):
-        lines.append(f'{tier.ljust(width)} = "{tiers[tier]}"')
     return (
-        "\n".join(lines) + "\n\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
+        "[models]\n"
+        "# One key picks a whole provider family's model defaults. Override any\n"
+        "# single tier by adding it here (light/standard/advanced/expert); the\n"
+        "# tier->task mapping and per-task overrides are in the CLI reference.\n"
+        f'family = "{provider}"\n'
+        "\n" + _OCR_GUIDANCE + "\n" + _PDF_GUIDANCE + "\n" + _FEATURE_GUIDANCE
     )
 
 
