@@ -148,6 +148,13 @@ only at the leaf (`src/dgml/clustering/__init__.py`).
 - Tests live next to the package they cover (`packages/<name>/tests/`).
   Integration tests that span packages can live in a top-level `tests/` if
   one is later added.
+- Tests run **offline**. The root `conftest.py` refuses every connection and
+  DNS lookup to a non-loopback host and fails the test that tried, even when
+  the code under test swallowed the error. The one exception is litellm's
+  model-cost-map fetch from raw.githubusercontent.com. Mock the model call
+  (`litellm.completion`, `llm.call`, or the stage's own seam) instead of
+  relying on it failing; only opt-in live tests carry
+  `@pytest.mark.allow_network`.
 
 ## Workspaces and the `dgml` CLI
 
