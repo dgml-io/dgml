@@ -440,7 +440,9 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `semlink_nested` | docset | A semantic link points at the subject's own ancestor or descendant, stating a relationship the tree's nesting already states. Newly generated files can't carry one — re-generating clears it |
 
 `--retry-errors` clears recorded permanent errors and re-attempts the
-failed operations.
+failed operations. A cleared error for pages whose fonts map no glyphs to
+Unicode re-runs text extraction even though every `page_text/` file is
+present, so an OCR provider configured since then is used.
 
 > **Note:** `check` validates the stored **original** for each file (the
 > `original_filename` named in `file.json` — its presence and sha256). For a
@@ -1497,7 +1499,7 @@ existing record that does not carry the requested id.
 
 | `--text-mode` | Behavior |
 |---|---|
-| `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). |
+| `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). A page whose fonts map no glyphs to Unicode (more than 10 pdfminer `(cid:N)` words) is taken from OCR instead, with the provider `--text-mode ocr` would use (the `ocr` config, or Apple Vision on macOS). Other pages keep their digital text, and a file with no such page never reads the OCR config. With no OCR provider, a warning names the pages, their `(cid:N)` words are dropped, and a permanent error is recorded; configure a provider and run `dgml check --retry-errors` to recover them. |
 | `ocr` | Send each rendered page image to the provider configured in `<workspace>/config.toml` (a bundled one, or your own — see [ocr-providers.md](ocr-providers.md)). The bundled cloud providers require the `azure` or `aws` extra (`uv sync --extra azure` / `uv sync --extra aws` from a repo checkout; `pip install dgml[azure]`/`dgml[aws]` once DGML is published to PyPI). See "OCR configuration" below. |
 | `hybrid` | Run `digital` then `ocr` and merge the two per-page results by grouping words covering the same area into overlap regions (boxes overlap on IoU > 0.5 *or* one mostly contained in the other, so split/merge tokenization is resolved as a unit). Each region is resolved as a whole: OCR-only regions are kept; digital-only regions (no overlapping OCR) are assumed invisible to the human eye and dropped; mixed regions compare both sides' concatenated text by dash-normalized Levenshtein distance — if they agree (distance ≤ 2) digital wins (its characters come straight from the PDF font, more reliable than OCR even when OCR's tokenization is finer), and if they disagree OCR wins. A page whose digital text is mostly unresolved glyphs (pdfminer `(cid:N)` sentinels) falls back to OCR entirely. Default is silent — pass the global `--verbose` flag to surface per-page warnings and the merge summary on stderr. Requires the same `ocr` workspace config as `--text-mode ocr`. Optionally, an LLM can make the per-region decision instead of this heuristic — declare a `text_extraction` section in `config.toml` (e.g. a local Ollama model); see [storage-layout.md](storage-layout.md#text_extraction-optional). Any LLM failure falls back to the heuristic for that page. |
 
@@ -1540,7 +1542,11 @@ The `dgml file add` response also includes:
   the PDF had no extractable digital text on any page. The File record is
   still created and a permanent error is recorded.
 - `text_extraction` — summary object on success: `{ mode, pages_written,
-  pages_with_words, total_words }`. `null` when extraction itself failed.
+  pages_with_words, total_words }`. `null` when extraction itself failed. A
+  digital-mode summary also carries `ocr_fallback_pages` (pages taken from OCR
+  because their fonts map no glyphs to Unicode) and `unusable_pages`
+  (`{page: reason}` for such pages OCR could not recover; reason
+  `unresolved_glyphs`), each only when non-empty.
 - `conversion_error` — set if a convertible source (docx/xlsx/…) could not be
   converted to PDF (missing converter binary/SDK, conversion failure). The
   File record is still created (with `page_count: null`) and a permanent error

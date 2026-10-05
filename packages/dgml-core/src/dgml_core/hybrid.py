@@ -106,8 +106,10 @@ from .prompts import get as prompt
 from .rotation import rotate_word_boxes
 from .storage import Workspace
 from .text_extraction import (
+    MAX_CID_WORDS_PER_PAGE,
     PAGE_TEXT_GLOB,
     ExtractDigitalResult,
+    count_cid_words,
     extract_text_digital,
 )
 from .text_extraction_config import TextExtractionConfig, resolve_api_key
@@ -126,11 +128,8 @@ COVERAGE_THRESHOLD = 0.8
 # Unicode minus or en-dash variants PDFs often use) without flattening
 # genuinely different short tokens.
 LEVENSHTEIN_THRESHOLD = 2
-# If digital text on a page has more than this many words containing the
-# pdfminer "(cid:N)" sentinel — meaning the PDF's font CMap didn't resolve
-# glyph IDs to Unicode — we treat the page's digital output as unusable
-# and fall back to OCR for that page.
-MAX_CID_WORDS_PER_PAGE = 10
+# MAX_CID_WORDS_PER_PAGE (the CID guard's threshold) is shared with the
+# digital path, which OCRs the same pages; it lives in text_extraction.
 # A page whose largest placed image covers at least this fraction of the page
 # area is a scan: a picture of a document rather than a document. Scanned
 # pages run 0.8-0.99 here (the margin the scanner trimmed is the difference);
@@ -352,7 +351,7 @@ def _merge_words(
         )
         return list(ocr_words)
 
-    cid_count = _count_cid_words(digital_words)
+    cid_count = count_cid_words(digital_words)
     if cid_count > MAX_CID_WORDS_PER_PAGE:
         logger.info(
             "unicode error: file_id=%s page=%s: digital text has %s words "
@@ -1014,16 +1013,6 @@ def _raster_page_numbers(pdf_path: Path) -> set[int]:
         # correct without this, just less careful, so never fail ingest here.
         return set()
     return raster
-
-
-def _count_cid_words(words: list[dict[str, Any]]) -> int:
-    """Count words whose text contains the pdfminer ``(cid:N)`` sentinel."""
-    count = 0
-    for w in words:
-        text = w.get("t", "")
-        if isinstance(text, str) and "(cid:" in text:
-            count += 1
-    return count
 
 
 # Dash-family code points that PDFs and OCR engines disagree about. Folding

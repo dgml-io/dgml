@@ -34,7 +34,7 @@ from .errors import (
     now_iso,
 )
 from .hybrid import extract_text_hybrid
-from .ocr import extract_text_ocr, load_ocr_config
+from .ocr import extract_text_ocr, load_ocr_config, recover_unusable_pages
 from .pages import (
     DEFAULT_DPI,
     EngineName,
@@ -44,6 +44,7 @@ from .pages import (
 )
 from .storage import Workspace
 from .text_extraction import (
+    UNRESOLVED_GLYPHS_ERROR,
     ExtractDigitalResult,
     TextMode,
     classify_extraction_outcome,
@@ -146,7 +147,15 @@ def _check_file(
     debug: bool,
     report: CheckReport,
 ) -> None:
+    # Pages whose fonts map no glyphs to Unicode leave a full set of page_text
+    # files behind, so clearing that error alone would not re-run extraction;
+    # re-run it explicitly so a provider configured since gets used.
+    retry_unresolved_glyphs = False
     if retry_errors:
+        retry_unresolved_glyphs = any(
+            e.operation == "text_extraction" and UNRESOLVED_GLYPHS_ERROR in e.message
+            for e in load_recorded_errors(ws, file_id)
+        )
         clear_recorded_errors(ws, file_id)
 
     try:
@@ -294,6 +303,7 @@ def _check_file(
             dpi=dpi,
             debug=debug,
             report=report,
+            retry=retry_unresolved_glyphs,
         )
 
 
@@ -514,6 +524,7 @@ def _check_text_extraction(
     dpi: int,
     debug: bool,
     report: CheckReport,
+    retry: bool = False,
 ) -> None:
     text_keys = ws.blobs.list_blobs(layout.file_text_prefix(file_id))
     corrupt = [k for k in text_keys if not _is_valid_text_json(ws, k)]
@@ -545,7 +556,7 @@ def _check_text_extraction(
         )
         return
 
-    if not corrupt and len(text_keys) == expected:
+    if not retry and not corrupt and len(text_keys) == expected:
         return
 
     try:
@@ -657,7 +668,12 @@ def _reextract(
                     dpi=dpi,
                     debug=debug,
                 )
-        return extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
+        result = extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
+        # Same per-page OCR fallback as `file add`, so configuring a provider and
+        # re-running with --retry-errors recovers the page.
+        return recover_unusable_pages(
+            ws, pdf_path, text_dir, result, file_id=file_id, pages_prefix=pages_prefix
+        )
 
 
 def _is_valid_text_json(ws: Workspace, key: str) -> bool:

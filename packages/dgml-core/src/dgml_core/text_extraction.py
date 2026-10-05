@@ -20,14 +20,25 @@ image pixels matching the corresponding ``page_images/page_N.png`` render.
 OCR and hybrid extraction live in :mod:`dgml.ocr` and :mod:`dgml.hybrid` and
 share the per-page JSON shape emitted here so downstream consumers don't have
 to care which mode produced the words.
+
+**Unresolved glyphs.** Some PDFs embed fonts that map no character codes to
+Unicode (an ``Identity-H`` subset without a ``ToUnicode`` CMap), so pdfminer
+emits a ``(cid:N)`` placeholder per glyph. Such a page carries plenty of words
+and none of them is text. Each page is checked as it is extracted (see
+:func:`page_text_defect`) and the verdict lands on
+:attr:`ExtractDigitalResult.defects`; the words themselves are written as
+pdfminer produced them. :func:`dgml_core.ocr.recover_unusable_pages` acts on
+the verdict. The threshold (:data:`MAX_CID_WORDS_PER_PAGE`) sits in an empty
+gap of the eval corpus (587 PDFs): pages with unresolved fonts carry 24-642
+``(cid:N)`` words, every other page at most 1 (a stray symbol glyph).
 """
 
 from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from statistics import median
@@ -39,6 +50,12 @@ from .style import fontname_is_bold, fontname_is_italic, rgb_to_named
 
 PAGE_TEXT_FILENAME = "page_{page}.json"
 PAGE_TEXT_GLOB = "page_*.json"
+
+# If a page's digital text has more than this many words containing the
+# pdfminer "(cid:N)" sentinel (the PDF's fonts didn't resolve glyph IDs to
+# Unicode), the page's digital output is unusable. Shared by the digital path
+# (OCR fallback for that page) and the hybrid merge (OCR takes the whole page).
+MAX_CID_WORDS_PER_PAGE = 10
 
 
 def split_word_into_tokens(
@@ -95,19 +112,79 @@ class TextMode(StrEnum):
     HYBRID = "hybrid"
 
 
+class PageTextDefect(StrEnum):
+    """Why a page's digital text layer cannot stand for the page.
+
+    ``UNRESOLVED_GLYPHS``: the fonts map no glyphs to Unicode, so the words are
+    ``(cid:N)`` placeholders (see the module docstring).
+    """
+
+    UNRESOLVED_GLYPHS = "unresolved_glyphs"
+
+
 @dataclass
 class ExtractDigitalResult:
     pages_written: int
     pages_with_words: int
     total_words: int
+    # Pages (1-based) whose digital text layer is unusable and was not replaced,
+    # with the reason. Only the digital path fills it; OCR fallback removes every
+    # page it recovers (see :func:`dgml_core.ocr.recover_unusable_pages`).
+    defects: dict[int, PageTextDefect] = field(default_factory=dict)
+    # Pages a digital-mode extraction took from OCR instead.
+    ocr_fallback_pages: list[int] = field(default_factory=list)
+    # Why OCR fallback could not recover ``defects`` (no provider configured, a
+    # provider failure), when it was attempted.
+    ocr_fallback_error: str | None = None
 
     def to_summary(self) -> dict[str, Any]:
-        return {
+        summary: dict[str, Any] = {
             "mode": TextMode.DIGITAL.value,
             "pages_written": self.pages_written,
             "pages_with_words": self.pages_with_words,
             "total_words": self.total_words,
         }
+        # Present only when something happened, so a healthy extraction's
+        # summary is exactly what it always was.
+        if self.ocr_fallback_pages:
+            summary["ocr_fallback_pages"] = sorted(self.ocr_fallback_pages)
+        if self.defects:
+            summary["unusable_pages"] = {
+                str(page): reason.value for page, reason in sorted(self.defects.items())
+            }
+        return summary
+
+
+def is_cid_word(text: object) -> bool:
+    """Whether ``text`` contains the pdfminer ``(cid:N)`` sentinel."""
+    return isinstance(text, str) and "(cid:" in text
+
+
+def count_cid_words(words: list[dict[str, Any]]) -> int:
+    """Count words whose text contains the pdfminer ``(cid:N)`` sentinel."""
+    return sum(1 for w in words if is_cid_word(w.get("t")))
+
+
+def page_text_defect(words: list[dict[str, Any]]) -> PageTextDefect | None:
+    """Classify one page's digital words; ``None`` when the layer is usable."""
+    if count_cid_words(words) > MAX_CID_WORDS_PER_PAGE:
+        return PageTextDefect.UNRESOLVED_GLYPHS
+    return None
+
+
+def format_pages(pages: Iterable[int]) -> str:
+    """``[1, 2, 3, 5]`` -> ``"pages 1-3, 5"``; ``[4]`` -> ``"page 4"``."""
+    nums = sorted(set(pages))
+    parts: list[str] = []
+    i = 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        parts.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    noun = "page" if len(nums) == 1 else "pages"
+    return f"{noun} {', '.join(parts)}"
 
 
 @dataclass
@@ -125,6 +202,13 @@ class ExtractionOutcome:
     permanent: bool = False
 
 
+# Names the recorded error :func:`classify_extraction_outcome` writes for pages
+# OCR could not recover. ``dgml check --retry-errors`` looks for it: digital mode
+# writes every page_text file before judging them, so that error leaves no
+# missing file behind to trigger re-extraction.
+UNRESOLVED_GLYPHS_ERROR = "use fonts with no Unicode mapping"
+
+
 def classify_extraction_outcome(
     result: ExtractDigitalResult, expected_page_count: int | None
 ) -> ExtractionOutcome:
@@ -132,7 +216,27 @@ def classify_extraction_outcome(
 
     Used by both :func:`FileStore._extract_text` at add time and the
     consistency check at re-extract time so the two paths stay aligned.
+
+    Unrecovered unusable pages (``result.defects``) come first and are
+    permanent: re-running pdfminer reads the same fonts, so only OCR changes
+    the outcome.
     """
+    if result.defects:
+        why = (
+            f"OCR fallback failed: {result.ocr_fallback_error}"
+            if result.ocr_fallback_error
+            else "no OCR fallback was attempted"
+        )
+        return ExtractionOutcome(
+            message=(
+                f"{len(result.defects)}/{result.pages_written} pages {UNRESOLVED_GLYPHS_ERROR} "
+                f"({format_pages(result.defects)}); {why}. "
+                "Configure an OCR provider and run `dgml check --retry-errors`, or "
+                "re-add the file with --text-mode ocr or --text-mode hybrid"
+            ),
+            permanent=True,
+        )
+
     if result.pages_written == 0 or result.pages_with_words == 0:
         msg = (
             f"no digital text found on any of {result.pages_written} pages"
@@ -180,6 +284,10 @@ def extract_text_digital(
     Raises :class:`TextExtractionFailed` if pdfminer.six cannot parse the PDF.
     A successful run with zero words on every page returns a result with
     ``pages_with_words == 0`` — the caller decides how to treat that.
+
+    Pages whose fonts map no glyphs to Unicode (see :func:`page_text_defect`)
+    are listed in ``defects``; their words are still written as extracted.
+    :func:`dgml_core.ocr.recover_unusable_pages` is what acts on that.
     """
     # Lazy import so a missing pdfminer install fails with a clear, actionable
     # error path rather than a module-load-time ImportError.
@@ -198,6 +306,7 @@ def extract_text_digital(
     pages_written = 0
     pages_with_words = 0
     total_words = 0
+    defects: dict[int, PageTextDefect] = {}
 
     try:
         # ``all_texts=True`` makes pdfminer run line-grouping on text inside
@@ -239,6 +348,9 @@ def extract_text_digital(
                 "height": height_px,
                 "words": words,
             }
+            defect = page_text_defect(words)
+            if defect is not None:
+                defects[page_num] = defect
             out_path = output_dir / PAGE_TEXT_FILENAME.format(page=page_num)
             # Compact one-line JSON — `page_text/` is per-page so files stay
             # small; pretty-printing would bloat workspaces with thousands of
@@ -262,6 +374,7 @@ def extract_text_digital(
         pages_written=pages_written,
         pages_with_words=pages_with_words,
         total_words=total_words,
+        defects=defects,
     )
 
 
