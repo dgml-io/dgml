@@ -30,6 +30,8 @@ from .docsets import DocSetStore
 from .errors import (
     AttestationInvalid,
     AuthError,
+    BatchExecutionFailed,
+    BatchUnavailable,
     ChainConfigError,
     ChainRpcFailed,
     ChainTxReverted,
@@ -225,6 +227,8 @@ __all__ = [
     "AttestationInvalid",
     "AttestationInventory",
     "AuthError",
+    "BatchExecutionFailed",
+    "BatchUnavailable",
     "BlobStore",
     "ChainConfigError",
     "ChainRpcFailed",
