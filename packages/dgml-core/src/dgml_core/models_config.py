@@ -24,6 +24,13 @@ task's own section (e.g. ``generation.api_key_env``, ``grounded.schema_api_key``
 a model sourced from a tier uses its task section's credentials, or falls back to
 litellm's per-provider env-var conventions when the section sets none.
 
+``family`` picks a whole provider family's defaults: one of the
+:data:`~dgml_core.default_config.PROVIDER_MODELS` keys. It is shorthand for that
+family's four tiers *within its config layer* (see :func:`expand_family`): tiers
+the same layer sets win, and the expanded tiers override any a lower layer set.
+A family-based config tracks dgml's shipped defaults across upgrades; explicit
+tiers are the pinning mechanism.
+
 A tier that is unset falls back to the nearest set tier (nearest *lower* first,
 then higher), emitting a warning — so a minimal config that sets only, say,
 ``standard`` still resolves every task.
@@ -36,6 +43,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from .default_config import PROVIDER_MODELS
 from .errors import DgmlError, ModelsConfigInvalid
 
 logger = logging.getLogger(__name__)
@@ -140,14 +148,32 @@ def _validate_optional_str(value: Any, field: str) -> str | None:
     return value
 
 
+def expand_family(models: dict[str, Any]) -> dict[str, Any]:
+    """Return one config layer's ``[models]`` table with its ``family`` expanded
+    into the tiers the table leaves unset. Called per layer *before* the merge, so
+    a family overrides lower-layer tiers. A malformed or unknown family is left
+    as-is for :func:`load_models_config` to reject."""
+    family = models.get("family")
+    defaults = PROVIDER_MODELS.get(family) if isinstance(family, str) else None
+    return models if defaults is None else {**defaults, **models}
+
+
 def load_models_config(merged: dict[ConfigSection, Any]) -> ModelsConfig:
     """Build a :class:`ModelsConfig` from the merged config mapping's
-    ``[models]`` section (an empty section yields an all-``None`` config)."""
+    ``[models]`` section (an empty section yields an all-``None`` config).
+
+    ``family`` is validated here but not expanded — :func:`expand_family` has
+    already done that per layer during the merge."""
     section = merged.get(ConfigSection.MODELS)
     if section is None:
         return ModelsConfig()
     if not isinstance(section, dict):
         raise ModelsConfigInvalid("'models' must be a table")
+    family = _validate_optional_str(section.get("family"), "family")
+    if family is not None and family not in PROVIDER_MODELS:
+        raise ModelsConfigInvalid(
+            f"'models.family' must be one of {', '.join(sorted(PROVIDER_MODELS))}; got {family!r}"
+        )
     return ModelsConfig(
         **{t.value: _validate_optional_str(section.get(t.value), t.value) for t in TIERS}
     )
@@ -249,8 +275,8 @@ def resolve_tiered_model(
         model = load_models_config(merged).resolve(tier)
     if not isinstance(model, str) or not model.strip():
         raise missing(
-            f"no {model_field} for {section_name}: set [models].{tier} or "
-            f"'{section_name}.{model_field}' in the config"
+            f"no {model_field} for {section_name}: set [models].family, [models].{tier}, "
+            f"or '{section_name}.{model_field}' in the config"
         )
 
     return ResolvedModel(model=model, api_key=api_key, api_key_env=api_key_env, api_base=api_base)

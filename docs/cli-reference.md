@@ -74,20 +74,29 @@ It does **not** create `docsets/`, `files/`, or any workspace config — that is
 this config (see [storage-layout.md](storage-layout.md) for the full resolution
 order).
 
-The `[models]` block names four tiers — `light`, `standard`, `advanced`,
-`expert` — that back the per-task models (classification/style, transcription/
-text-extraction, labeling/value-extraction, schema-generation respectively).
+The written `[models]` block names a single **family** — `family = "<provider>"`
+— which dgml expands at runtime into the four tiers (`light`, `standard`,
+`advanced`, `expert`) that back the per-task models (classification/style,
+transcription/text-extraction, labeling/value-extraction, schema-generation
+respectively). The expansion uses dgml's curated per-family defaults, so a
+family-based config picks up updated defaults across dgml upgrades; set an
+explicit tier (`[models] advanced = "..."`) to override its family default and
+pin a model. A family expands within its own config layer, so it overrides
+tiers set in lower layers (e.g. a workspace `family` replaces user-level tiers).
+`DGML_MODELS__FAMILY=<provider>` overrides the family from the environment. An
+env var set to an empty value is an error (`MODELS_CONFIG_INVALID`), not an
+unset — unset the variable instead.
 
-- **`--provider {anthropic,google,mixed,openai}`:** write that provider's
-  default `[models]` table. Omit to **auto-detect** from the API-key env vars
-  that are set: both `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` → `mixed`; either
-  one alone → that provider; `OPENAI_API_KEY` alone → `openai`. Only presence is
-  checked, not validity. `OPENAI_API_KEY` is checked **last**, so adding it to a
-  machine never changes what the other two keys already detected — pass
-  `--provider openai` to choose OpenAI where several keys are present. With no
-  keys, a commented-out `[models]` placeholder is written. (A provider with no
-  curated table — Azure OpenAI, Bedrock, a self-hosted endpoint — is still
-  usable by setting an explicit `<provider>/<model>` per tier or per task.)
+- **`--provider {anthropic,anthropic_google,google,openai}`:** write that
+  family. Omit to **auto-detect** from the API-key env vars that are set: both
+  `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` → `anthropic_google`; either one alone
+  → that provider; `OPENAI_API_KEY` alone → `openai`. Only presence is checked,
+  not validity. `OPENAI_API_KEY` is checked **last**, so adding it to a machine
+  never changes what the other two keys already detected — pass `--provider
+  openai` to choose OpenAI where several keys are present. With no keys, a
+  commented-out `[models]` placeholder is written. (A provider with no curated
+  family — Azure OpenAI, Bedrock, a self-hosted endpoint — is still usable by
+  setting an explicit `<provider>/<model>` per tier or per task.)
 - **`--force`:** overwrite an existing `config.toml` (backing it up to
   `config.toml.bak` first). Without `--force`, a present file is **never**
   clobbered — a re-run with `--provider` but no `--force` is a no-op whose
@@ -99,16 +108,16 @@ Output (JSON):
 {
   "config_path": "~/.config/dgml/config.toml",
   "config_created": true,
-  "provider": "mixed",
+  "provider": "anthropic_google",
   "detected_keys": ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"],
   "forced": false,
   "next_action": "dgml workspace create --organization <org>"
 }
 ```
 
-The human-readable report (detected keys, the `[models]` block with inline
-tier→capability comments, next steps) goes to **stderr**; stdout stays the JSON
-contract. `provider` is `null` when no keys were detected.
+The human-readable report (detected keys, what the family expands to with
+inline tier→capability comments, next steps) goes to **stderr**; stdout stays
+the JSON contract. `provider` is `null` when no keys were detected.
 
 ### `dgml workspace create [PATH] --organization ORG [--name NAME] [--id WORKSPACE_ID] [--storage NAME] [--from-config PATH]`
 
@@ -1387,8 +1396,17 @@ on the last — merged and vocabulary-checked code-side, transparent in the CLI
 payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
-`phases.phase1`: `chunk_calls` (1 = ordinary single submission) and
-`truncated_retries`. `phases.phase3.pages_out_of_range` counts the pages
+`phases.phase1`: `chunk_calls` (1 = ordinary single submission),
+`truncated_retries`, and `envelope_repairs`. The last counts `submit_values`
+calls that arrived with the tool's argument envelope repeated one level down,
+or serialized as a JSON string, and were unwrapped before the tree was read.
+A submission of which the vocabulary keeps nothing (no key names a schema
+root, or every named root carries a value of the wrong kind) is refused as an
+extraction error rather than written as an empty result; an empty tree, or
+one whose roots are all null, is still "nothing found". Leaf internals are
+not checked here.
+
+`phases.phase3.pages_out_of_range` counts the pages
 phase 1 cited that the file does not have (outside `1..page_count`, with no
 page image): their items make no phase-3 call and stay unmatched, like any
 other leaf phase 3 could not resolve, and the run still writes the tree.
@@ -2430,7 +2448,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 |---|---|---|
 | `WORKSPACE_NOT_INITIALIZED` | hard | A command that needs a workspace ran against a directory that has no workspace **config** — which is what makes a directory a workspace, since the config names the storage backend and cannot be reconstructed. This covers both "never a workspace" and "a workspace whose `config.toml` was deleted"; nothing on disk distinguishes them for a remote-backed workspace, so one error carries all the remedies. The message names the resolved path and offers remedies that work against *that* workspace: `dgml workspace create <path> --organization <org>` to make one there, `dgml workspace list` to find one you already have, or restoring the config from backup. (It deliberately does not say a bare `dgml workspace create`, which would create a workspace elsewhere and leave the command failing identically.) |
 | `LEGACY_CONFIG_PRESENT` | hard | A pre-migration `<workspace>/config.toml` is the only config present; the format is now TOML. Run `dgml init` to write `~/.config/dgml/config.toml`, then migrate any settings. |
-| `MODELS_CONFIG_INVALID` | hard | The `[models]` tier block is malformed (a tier is set to a non-string / empty value). |
+| `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier or `family` set to a non-string or empty value, or `family` naming an unknown provider family). |
 | `MISSING_EXTRA` | hard | A command needs an optional extra that isn't installed (e.g. `dgml[clustering]`). |
 | `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`, a `file add --id` that is malformed, passed with a directory, or unsatisfiable under the chosen `--on-conflict`). |
 | `INTERNAL_ERROR` | hard | Unexpected exception; the message is a short, single-line `<ExcType>: <msg>` (capped, whitespace collapsed). Pass `--verbose` (or set `DGML_DEBUG=1`) for the full stderr traceback. |

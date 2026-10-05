@@ -497,11 +497,22 @@ mongo_database = "dgml"
 
 ### The `[models]` tiers
 
-The simplest way to configure models is the `[models]` block — four tiers that
-back the per-task models:
+The simplest way to configure models is the `[models]` block. One `family` key
+picks a whole provider family's curated defaults for the four tiers that back
+the per-task models:
 
 ```toml
 [models]
+family = "anthropic_google"   # or anthropic / google / openai
+```
+
+A family-based config *tracks* dgml's shipped defaults — an upgrade may move a
+tier to a newer model. To pin models, set explicit tiers, with or without a
+family (an explicit tier always overrides its family default):
+
+```toml
+[models]
+family   = "anthropic_google"
 light    = "gemini/gemini-flash-lite-latest"  # classification, style
 standard = "anthropic/claude-haiku-4-5"    # transcription, text extraction
 advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
@@ -515,17 +526,24 @@ falls back to the nearest set tier (nearest lower first, then higher) with a
 warning — so a minimal config that sets only, say, `standard` still resolves
 every task.
 
+`family` is shorthand for its four tiers *within its config layer*: tiers that
+layer leaves unset are filled from the family before the layers merge. So a
+workspace config (or `DGML_MODELS__FAMILY`) setting `family = "openai"` replaces
+explicit tiers in the user config, while tiers set in the same layer as the
+family, or a higher one, still override it. To drop a user-level pin in one
+workspace, restate the family there.
+
 Tiers name only models — they carry no credentials. Credentials are configured
 per task on the task's own section (e.g. `generation.api_key_env`,
 `grounded.schema_api_key`); a model sourced from a tier uses its task section's
 credentials, or falls back to litellm's per-provider env var when the section
 sets none.
 
-`dgml init --provider {anthropic,google,mixed,openai}` writes a ready-made
-`[models]` table; omit `--provider` to auto-detect from the API-key env vars
-that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` — checked
-in that order, so an OpenAI key never overrides a provider the other two
-already resolve).
+`dgml init --provider {anthropic,anthropic_google,google,openai}` writes a
+family-only `[models]` block; omit `--provider` to auto-detect from the API-key
+env vars that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`
+— checked in that order, so an OpenAI key never overrides a provider the other
+two already resolve).
 
 **Secrets policy.** By default config references API keys via `*_api_key_env`
 env-var-name fields (which store the env var name, not the secret). Every
@@ -666,8 +684,8 @@ Field rules:
 - Transcription credentials: `api_key` / `api_key_env` / `api_base`.
 - Labeling credentials: `label_api_key` / `label_api_key_env` /
   `label_api_base`. The two models carry **independent** credentials because
-  they may name different providers (e.g. the default `mixed` config transcribes
-  on Anthropic and labels on Gemini). These apply whether the models are set here
+  they may name different providers (e.g. the `anthropic_google` family blends
+  Gemini and Anthropic models). These apply whether the models are set here
   or come from their tiers; when unset, litellm uses its per-provider env var.
 - `thinking` — optional; `"disabled"` (default) or `"adaptive"`. Anthropic
   extended thinking, applied to **both** passes; ignored for non-Anthropic
@@ -912,7 +930,8 @@ governs the generated full-document tree; the extraction schema governs the
 (`full-extraction`). The body is the planner's `Schema` document
 (canonical tag names plus per-tag metadata). Generation also writes a
 `cache/` at the docset root. It holds **functional** files the next
-`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`,
+`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json` (one per
+chunk whose reply parsed; a bisected chunk's halves are `cNNa`/`cNNb`),
 `concept_roster.json` (the flat legacy vocabulary; incremental reuse prefers
 the docset's `authored-schema.json`, then its `schema.json`, and falls back to
 this file), and

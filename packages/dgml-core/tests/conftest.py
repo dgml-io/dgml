@@ -352,6 +352,22 @@ def azure_config(workspace: Workspace) -> Workspace:
 
 
 @pytest.fixture
+def offline_aws(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Fake static AWS credentials, so building a real boto3 client resolves
+    them from the environment instead of walking the chain out to the EC2
+    instance-metadata endpoint (a network call) or the developer's own
+    ``~/.aws`` files."""
+    empty = tmp_path_factory.mktemp("aws")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(empty / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(empty / "credentials"))
+    for name in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SESSION_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
 def aws_config(workspace: Workspace) -> Workspace:
     write_ocr_config(
         workspace,
