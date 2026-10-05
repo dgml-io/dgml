@@ -50,13 +50,14 @@ Coordinate space contract:
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import layout, llm
 from .config import load_merged_config
@@ -121,6 +122,7 @@ from .usage import (
     OPERATION_SCHEMA_GENERATE,
     OUTCOME_ERROR,
     OUTCOME_OK,
+    TIER_STANDARD,
     TIERS_KEY,
     UsageEvent,
     add_partial,
@@ -129,6 +131,11 @@ from .usage import (
     scope_events,
     with_tier,
 )
+
+if TYPE_CHECKING:
+    # Type-only: the batch package imports litellm, which upstream keeps off
+    # the deterministic import path; it is imported lazily where it is used.
+    from .batch import BatchExecutor
 
 # ---- Constants ------------------------------------------------------------
 
@@ -472,6 +479,8 @@ def generate_schema(
 
     Raises :class:`SchemaGenerationFailed` on any non-config failure
     (no files, missing PDF, malformed LLM response, network error).
+    :func:`generate_schema_batch` is the same request through a provider's
+    batch API.
     """
     llm_config, steps = generate_schema_steps(workspace, file_ids, config=config, debug=debug)
     try:
@@ -479,6 +488,32 @@ def generate_schema(
     except Exception as exc:
         raise _schema_call_failed(exc) from exc
     return schema_rnc_from_result(result, workspace=workspace, docset_name=docset_name)
+
+
+def generate_schema_batch(
+    workspace: Workspace,
+    file_ids: list[str],
+    *,
+    config: GroundedConfig,
+    docset_name: str,
+    executor: BatchExecutor,
+    debug: bool = False,
+) -> str:
+    """:func:`generate_schema` with its one request sent through *executor*'s
+    batch API (one wave, one round trip).
+
+    Same preparation, same RNC, same errors and messages; the usage row is the
+    synchronous one tagged ``tier="batch"``. Build *executor* with
+    :func:`schema_batch_executor`."""
+    from .batch import Unit, run_stage
+
+    llm_config, steps = generate_schema_steps(workspace, file_ids, config=config, debug=debug)
+    outcome = run_stage(
+        [Unit(name="schema", config=llm_config, steps=steps)], executor, stage="schema"
+    )["schema"]
+    if outcome.error is not None:
+        raise _schema_call_failed(outcome.error) from outcome.error
+    return schema_rnc_from_result(outcome.result, workspace=workspace, docset_name=docset_name)
 
 
 def generate_schema_steps(
@@ -491,12 +526,12 @@ def generate_schema_steps(
     """The schema-generation request as ``(config, steps)``.
 
     Everything that can fail before a request exists — no files, an unreadable
-    PDF, an unset key env var — fails HERE, eagerly, so no driver ever sends
-    (or pays for) a request that could not succeed. *steps* yields the single
-    forced ``submit_schema`` call and returns its
-    :class:`~dgml_core.llm.CallResult`; turn that into RNC with
+    PDF, an unset key env var — fails HERE, eagerly, so neither a synchronous
+    nor a batch driver ever sends (or pays for) a request that could not
+    succeed. *steps* yields the single forced ``submit_schema`` call and
+    returns its :class:`~dgml_core.llm.CallResult`; turn that into RNC with
     :func:`schema_rnc_from_result`. Drive it with :func:`dgml_core.llm.drive`
-    (which writes the one usage row from *config*)."""
+    (which writes the one usage row from *config*) or a batch stage."""
     if not file_ids:
         raise SchemaGenerationFailed(
             "schema generation requires at least one example file_id; got an empty list"
@@ -552,7 +587,7 @@ def generate_schema_steps(
 
 
 def _schema_call_failed(exc: BaseException) -> SchemaGenerationFailed:
-    """The error a failed schema request surfaces as."""
+    """The error a failed schema request surfaces as (sync and batch alike)."""
     return SchemaGenerationFailed(f"schema generation call failed: {type(exc).__name__}: {exc}")
 
 
@@ -571,6 +606,33 @@ def schema_rnc_from_result(result: CallResult, *, workspace: Workspace, docset_n
         return field_tree_to_rnc(fields, workspace=workspace.organization, docset_name=docset_name)
     except SchemaInvalid as exc:
         raise SchemaGenerationFailed(f"LLM returned an invalid field tree: {exc}") from exc
+
+
+def schema_batch_executor(
+    config: GroundedConfig,
+    *,
+    poll_interval_s: float = 30.0,
+    max_poll_s: float | None = None,
+    min_wave_size: int = 1,
+    log: Callable[[str], None] = lambda _m: None,
+) -> BatchExecutor:
+    """:func:`dgml_core.batch.make_executor` for *config*'s schema model, with
+    its credentials resolved the way :func:`generate_schema` resolves them.
+
+    Raises :class:`~dgml_core.errors.AuthError` for an unset
+    ``schema_api_key_env`` and :class:`~dgml_core.errors.BatchUnavailable` when
+    the provider has no batch backend. Imports the batch package lazily."""
+    from .batch import make_executor
+
+    return make_executor(
+        config.schema_model,
+        api_key=_resolve_api_key(config.schema_api_key, config.schema_api_key_env),
+        api_base=config.schema_api_base,
+        poll_interval_s=poll_interval_s,
+        max_poll_s=max_poll_s,
+        min_wave_size=min_wave_size,
+        log=log,
+    )
 
 
 def _schema_user_prompt(n_files: int) -> str:
@@ -735,6 +797,9 @@ def extract_values(
     written to ``extraction_stats.json`` (unless ``write_stats=False``, which
     the CLI sets unless ``--debug``) so the UX can render them without
     re-deriving anything from the usage log.
+
+    :func:`extract_values_batch` runs the same per-file steps for many files,
+    with each LLM phase submitted as one batch wave.
     """
     run = _FileExtraction(
         workspace, docset_id, file_id, config=config, write_stats=write_stats, debug=debug
@@ -775,14 +840,14 @@ _PageOutcome = tuple[int, list[UnmatchedItem], _Phase3PageResult, dict[str, Any]
 
 
 class _FileExtraction:
-    """Every non-LLM step of extracting one file, around the phase-1 and
-    phase-3 generators :func:`extract_values` drives.
+    """Every non-LLM step of extracting one file, shared by the sync
+    :func:`extract_values` and the batch :func:`extract_values_batch`.
 
-    Drivers differ only in how the phase-1 and phase-3 generators are
+    The two drivers differ only in how the phase-1 and phase-3 generators are
     executed; everything else — schema load, the phase-1 request, post-phase-1
     normalization and checks, phase-2 matching, patching the phase-3 boxes in,
     the XML write, the usage row and ``extraction_stats`` — lives here once, so
-    no driver can drift from it. Construction does the setup that
+    the two paths cannot drift. Construction does the setup that
     :func:`extract_values` always did *before* it started recording (schema,
     guidance, PDF, credentials), so a setup failure raises from the constructor
     and leaves no usage row or stats, exactly as before.
@@ -801,6 +866,7 @@ class _FileExtraction:
         config: GroundedConfig,
         write_stats: bool,
         debug: bool,
+        tier: str = TIER_STANDARD,
     ) -> None:
         self.workspace = workspace
         self.docset_id = docset_id
@@ -808,6 +874,7 @@ class _FileExtraction:
         self.config = config
         self.write_stats = write_stats
         self.debug = debug
+        self.tier = tier
 
         store = DocSetStore(workspace)
         rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
@@ -916,7 +983,7 @@ class _FileExtraction:
 
         # Both phase-1 fallbacks (chunked retry on truncation, permissive
         # schema on a "too many states" refusal) are latches inside
-        # phase1_steps, so every driver just runs it.
+        # phase1_steps, so every driver — sync or batch — just runs it.
         return phase1_steps(
             workspace=self.workspace,
             file_id=self.file_id,
@@ -1096,9 +1163,10 @@ class _FileExtraction:
                     "tool_calls": self.tool_calls_total,
                 },
                 error=self.error_msg,
+                tier=self.tier,
             )
             # One row, or one per tier when phase 1 and phase 3 responses
-            # were served by different tiers.
+            # were served by different tiers (a batch plus sync fallbacks).
             for part in scope_events(event, merged_totals):
                 record_usage(self.workspace, part)
         # Even on failure, partial numbers help diagnose where we
@@ -1166,6 +1234,314 @@ def _run_phase3_pages(
     workers = min(_PHASE3_MAX_PARALLEL, max(1, len(pages)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         return list(ex.map(lambda kv: _do_page(*kv), pages))
+
+
+def extract_values_batch(
+    workspace: Workspace,
+    docset_id: str,
+    file_ids: list[str],
+    *,
+    config: GroundedConfig,
+    executor: BatchExecutor,
+    write_stats: bool = False,
+    debug: bool = False,
+) -> dict[str, ExtractionResult | Exception]:
+    """:func:`extract_values` for many files of one DocSet, each LLM phase one
+    batch wave. A thin wrapper over :func:`extract_values_batch_pairs`; returns
+    ``{file_id: ExtractionResult | Exception}`` in *file_ids* order. Duplicate
+    *file_ids* raise :class:`ValueError`."""
+    results = extract_values_batch_pairs(
+        workspace,
+        [(docset_id, fid) for fid in file_ids],
+        config=config,
+        executor=executor,
+        write_stats=write_stats,
+        debug=debug,
+    )
+    return {fid: results[(docset_id, fid)] for fid in file_ids}
+
+
+@dataclass
+class ManyExtraction:
+    """What :func:`extract_values_many` did: one outcome per file, in the
+    order asked (an :class:`ExtractionResult`, or the ``Exception`` that file
+    failed with), and — when the batch API ran — ``batch``, the run's
+    ``{"provider", **WaveStats}`` block (else ``None``)."""
+
+    outcomes: dict[str, ExtractionResult | Exception]
+    batch: dict[str, Any] | None = None
+
+
+def extract_values_many(
+    workspace: Workspace,
+    docset_id: str,
+    file_ids: list[str],
+    *,
+    config: GroundedConfig,
+    batch: bool = False,
+    poll_interval_s: float = 30.0,
+    log: Callable[[str], None] = lambda _m: None,
+    write_stats: bool = False,
+    debug: bool = False,
+) -> ManyExtraction:
+    """:func:`extract_values` over several files of one DocSet, each extracted
+    independently: a failure is that file's outcome, never the run's.
+
+    With *batch*, both LLM phases go through the provider's batch API
+    (:func:`extract_values_batch`); a values model with no batch backend is
+    :class:`~dgml_core.errors.BatchUnavailable`, raised before any request. An
+    unset ``values_api_key_env`` is not fatal there: the synchronous run fails
+    each file on it at setup, before any request, so the files are run
+    synchronously and each reports that error (no LLM call is made, and
+    ``batch`` stays ``None``).
+    """
+    if batch:
+        from .batch import assert_batchable
+
+        assert_batchable(values_batch_stages(config.values_model, config.values_reasoning_effort))
+        try:
+            executor = values_batch_executor(config, poll_interval_s=poll_interval_s, log=log)
+        except AuthError:
+            pass
+        else:
+            outcomes = extract_values_batch(
+                workspace,
+                docset_id,
+                file_ids,
+                config=config,
+                executor=executor,
+                write_stats=write_stats,
+                debug=debug,
+            )
+            return ManyExtraction(
+                dict(outcomes),
+                {"provider": executor.backend.provider, **executor.stats.to_json()},
+            )
+    sync: dict[str, ExtractionResult | Exception] = {}
+    for fid in file_ids:
+        try:
+            sync[fid] = extract_values(
+                workspace, docset_id, fid, config=config, write_stats=write_stats, debug=debug
+            )
+        except Exception as exc:
+            sync[fid] = exc
+    return ManyExtraction(sync)
+
+
+#: One extraction job: ``(docset_id, file_id)``.
+ExtractionPair = tuple[str, str]
+
+
+def extract_values_batch_pairs(
+    workspace: Workspace,
+    pairs: list[ExtractionPair],
+    *,
+    config: GroundedConfig,
+    executor: BatchExecutor,
+    write_stats: bool = False,
+    debug: bool = False,
+) -> dict[ExtractionPair, ExtractionResult | Exception]:
+    """:func:`extract_values` for many ``(docset_id, file_id)`` pairs — across
+    any number of DocSets — with each LLM phase submitted as ONE batch wave.
+
+    Phase 1 for every pair is one :func:`dgml_core.batch.run_stage` (a pair
+    whose phase 1 takes several turns — the chunked protocol, the truncation
+    retry, the permissive-schema fallback — simply rides extra waves); phase 2
+    runs locally per pair; then phase 3 for every ``(pair, page)`` is one more
+    stage. So a run is two batch round-trips however many DocSets it spans.
+    Everything else is the per-file code :func:`extract_values` runs, so
+    values, the XML written, ``extraction_stats`` and the usage row match the
+    synchronous result — the row differs only in ``tier="batch"`` (or, when
+    some of a file's requests fell back to the synchronous tier, it is split
+    into one row per tier; see :func:`dgml_core.usage.scope_events`).
+
+    Returns ``{pair: ExtractionResult | Exception}`` in *pairs* order. Pairs
+    are isolated: any ``Exception`` raised for one pair — its setup, a phase,
+    phase 2, the XML write, even writing its usage row or stats — becomes that
+    pair's entry (the same exception :func:`extract_values` would raise for it)
+    and never affects another. A failure of the batch machinery itself
+    (:class:`~dgml_core.errors.BatchExecutionFailed`) is the entry of every
+    pair still in flight (a pair with any page unfinished is in flight); pairs
+    that finished keep their results. Only interrupts (non-``Exception``) propagate, after
+    every open pair's row and stats are written.
+
+    Duplicate *pairs* raise :class:`ValueError`.
+    """
+    from .batch import Unit, UnitOutcome, run_stage
+    from .usage import TIER_BATCH
+
+    if len(set(pairs)) != len(pairs):
+        dupes = sorted({p for p in pairs if pairs.count(p) > 1})
+        raise ValueError(f"(docset_id, file_id) pairs must be unique; duplicated: {dupes}")
+
+    results: dict[ExtractionPair, ExtractionResult | Exception] = {}
+    runs: dict[ExtractionPair, _FileExtraction] = {}
+
+    def _name(pair: ExtractionPair) -> str:
+        return f"{pair[0]}/{pair[1]}"
+
+    def _fail(pair: ExtractionPair, exc: Exception) -> None:
+        """Close *pair* as failed: record its row and stats, as the sync
+        path's ``finally`` does. A failure writing them replaces the original
+        error, exactly as an exception raised in that ``finally`` would."""
+        run = runs.pop(pair)
+        run.fail(exc)
+        try:
+            run.record()
+        except Exception as record_exc:
+            exc = record_exc
+        results[pair] = exc
+
+    def _succeed(pair: ExtractionPair, result: ExtractionResult) -> None:
+        run = runs.pop(pair)
+        try:
+            run.record()
+        except Exception as record_exc:
+            # Sync: an exception from the ``finally`` replaces the return value.
+            results[pair] = record_exc
+            return
+        results[pair] = result
+
+    for pair in pairs:
+        docset_id, fid = pair
+        try:
+            runs[pair] = _FileExtraction(
+                workspace,
+                docset_id,
+                fid,
+                config=config,
+                write_stats=write_stats,
+                debug=debug,
+                tier=TIER_BATCH,
+            )
+        except Exception as exc:
+            # Setup failure (no schema, no PDF, unset key env, …): raised before
+            # any recording in the sync path too, so no row and no stats here.
+            results[pair] = exc
+
+    try:
+        # --- Phase 1: one stage over every pair ------------------------
+        units: list[Unit] = []
+        unit_pairs: dict[str, ExtractionPair] = {}
+        for pair, run in list(runs.items()):
+            try:
+                units.append(Unit(_name(pair), run.phase1_config(), run.phase1_steps()))
+                unit_pairs[_name(pair)] = pair
+            except Exception as exc:
+                _fail(pair, exc)
+        # A stage-wide failure is the outcome of every unit still in flight
+        # (``stage_error``); units that finished keep their results.
+        outcomes: dict[str, UnitOutcome] = {}
+        if units:
+            outcomes = run_stage(units, executor, stage="extraction phase 1")
+
+        pages_by_pair: dict[ExtractionPair, list[tuple[int, list[UnmatchedItem]]]] = {}
+        for name, outcome in outcomes.items():
+            pair = unit_pairs[name]
+            run = runs[pair]
+            try:
+                run.mirror_phase1()
+                if outcome.error is not None:
+                    raise _as_exception(outcome.error)
+                pages_by_pair[pair] = run.after_phase1()
+            except Exception as exc:
+                _fail(pair, exc)
+
+        # --- Phase 3: one stage over every (pair, page) ----------------
+        page_units: list[Unit] = []
+        page_totals: dict[str, dict[str, Any]] = {}
+        for pair in list(pages_by_pair):
+            run = runs[pair]
+            built: list[Unit] = []
+            try:
+                for page, items in pages_by_pair[pair]:
+                    name = f"{_name(pair)}/p{page}"
+                    page_totals[name] = _empty_totals()
+                    built.append(
+                        Unit(
+                            name,
+                            run.phase3_config(),
+                            run.phase3_steps(page, items, page_totals[name]),
+                        )
+                    )
+            except Exception as exc:
+                for unit in built:
+                    unit.steps.close()
+                del pages_by_pair[pair]
+                _fail(pair, exc)
+                continue
+            page_units.extend(built)
+        page_outcomes: dict[str, UnitOutcome] = {}
+        if page_units:
+            page_outcomes = run_stage(page_units, executor, stage="extraction phase 3")
+
+        # --- Finish each surviving pair, in input order ----------------
+        for pair in pairs:
+            maybe_run = runs.get(pair)
+            if maybe_run is None:
+                continue
+            try:
+                per_page: list[_PageOutcome] = []
+                for page, items in pages_by_pair.get(pair, []):
+                    name = f"{_name(pair)}/p{page}"
+                    page_outcome = page_outcomes[name]
+                    if page_outcome.error is not None:
+                        # Mirrors the sync pool: the first failing page in page
+                        # order is reported, and no page's usage is folded in.
+                        raise _as_exception(page_outcome.error)
+                    per_page.append((page, items, page_outcome.result, page_totals[name]))
+                result = maybe_run.finish(per_page)
+            except Exception as exc:
+                _fail(pair, exc)
+                continue
+            _succeed(pair, result)
+    except BaseException as exc:
+        # Only an interrupt gets here: every Exception above is caught per
+        # pair. It records every open pair before propagating.
+        for pair in list(runs):
+            run = runs.pop(pair)
+            run.fail(exc)
+            with contextlib.suppress(Exception):
+                run.record()
+        raise
+    return {pair: results[pair] for pair in pairs}
+
+
+def _as_exception(error: BaseException) -> Exception:
+    """A unit outcome's error as the ``Exception`` a file result carries.
+
+    :func:`dgml_core.batch.run_stage` captures only ``Exception`` per unit
+    (interrupts propagate), so this is a narrowing, not a conversion."""
+    assert isinstance(error, Exception)
+    return error
+
+
+def values_batch_executor(
+    config: GroundedConfig,
+    *,
+    poll_interval_s: float = 30.0,
+    max_poll_s: float | None = None,
+    min_wave_size: int = 1,
+    log: Callable[[str], None] = lambda _m: None,
+) -> BatchExecutor:
+    """:func:`dgml_core.batch.make_executor` for *config*'s values model, with
+    its credentials resolved the way :func:`extract_values` resolves them.
+
+    Raises :class:`~dgml_core.errors.AuthError` for an unset
+    ``values_api_key_env`` (the same error, same message, the synchronous
+    extraction raises) and :class:`~dgml_core.errors.BatchUnavailable` when the
+    provider has no batch backend. Imports the batch package lazily."""
+    from .batch import make_executor
+
+    return make_executor(
+        config.values_model,
+        api_key=_resolve_api_key(config.values_api_key, config.values_api_key_env),
+        api_base=config.values_api_base,
+        poll_interval_s=poll_interval_s,
+        max_poll_s=max_poll_s,
+        min_wave_size=min_wave_size,
+        log=log,
+    )
 
 
 def _empty_totals() -> dict[str, Any]:
@@ -1342,8 +1718,8 @@ def _tool_call_step(
 
     Drivers deliver a failed request by throwing its exception in at the pending
     ``yield`` (see :data:`~dgml_core.llm.LLMSteps`), so executor failures land
-    here too and get the same single prefix, whichever driver runs it. Only
-    ``Exception`` is wrapped;
+    here too and get the same single prefix — the message is identical under
+    the sync driver and a batch driver. Only ``Exception`` is wrapped;
     ``KeyboardInterrupt`` and ``GeneratorExit`` pass through untouched.
     """
     try:
@@ -1412,6 +1788,65 @@ def _phase3_llm_config(
         timeout=_DEFAULT_TIMEOUT_SECONDS,
         reasoning_effort=reasoning_effort or _DEFAULT_REASONING_EFFORT,
     )
+
+
+# ---- Batch pre-flight: the request shapes these stages send -----------------
+#
+# ``assert_batchable`` refuses a stage whose requests a batch backend could
+# never serve, and for some models that depends on the request's shape, not
+# just its model: litellm bridges an OpenAI gpt-5.4+ call carrying tools AND
+# reasoning_effort to the Responses API, which batch mode cannot encode. Both
+# stages below always send both, so the pre-flight is given that shape (from
+# the same configs and tools the stages use) rather than a bare model id.
+
+
+def schema_batch_request(model: str) -> dict[str, Any]:
+    """A representative schema-generation request for ``assert_batchable``."""
+    return {
+        "model": model,
+        "tools": [_submit_schema_tool()],
+        "reasoning_effort": _DEFAULT_REASONING_EFFORT,
+    }
+
+
+def values_batch_request(
+    model: str, reasoning_effort: str | None = _VALUES_REASONING_EFFORT
+) -> dict[str, Any]:
+    """A representative value-extraction request for ``assert_batchable``:
+    phase 1's shape, with the CONFIGURED values reasoning effort
+    (``grounded.values_reasoning_effort``; ``None`` = none sent, so the key is
+    absent), so ``responses_routed`` judges the request the run will send."""
+    config = _phase1_llm_config(model, None, None, reasoning_effort)
+    request: dict[str, Any] = {
+        "model": model,
+        "tools": _phase1_tools({"type": "object", "properties": {}}, chunked=False),
+    }
+    if config.reasoning_effort is not None:
+        request["reasoning_effort"] = config.reasoning_effort
+    return request
+
+
+def values_batch_stages(
+    model: str,
+    reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+    *,
+    stage: str = "extraction",
+) -> dict[str, dict[str, Any]]:
+    """Both value-extraction request shapes for ``assert_batchable``, keyed by
+    stage name: *stage* is phase 1 (:func:`values_batch_request`, with the
+    configured effort) and ``"<stage>.locations"`` is phase 3, which always
+    sends ``submit_locations`` and its own fixed reasoning effort whatever
+    ``grounded.values_reasoning_effort`` says. Both are checked because a
+    configured ``"default"`` takes phase 1 off the Responses-API bridge but
+    not phase 3, which would otherwise fail at encode after phase 1 had paid."""
+    return {
+        stage: values_batch_request(model, reasoning_effort),
+        f"{stage}.locations": {
+            "model": model,
+            "tools": [_submit_locations_tool(["a"])],
+            "reasoning_effort": _phase3_llm_config(model, None, None).reasoning_effort,
+        },
+    }
 
 
 # ---- Phase 3: per-page LLM for unmatched items ----------------------------
@@ -1505,7 +1940,8 @@ def phase3_page_steps(
     counts. A page with no OCR words is asked for boxes on a 0-1000 grid (at
     :data:`_PHASE3_GRID_REASONING_EFFORT`), scaled to pixels when parsed. One
     generator per page, so a driver can fan a file's pages out concurrently
-    (the sync :func:`_run_phase3_pages` does so on a thread pool). Drive it with the config from
+    (the sync :func:`_run_phase3_pages` does so on a thread pool; a batch
+    driver puts them in one wave). Drive it with the config from
     :func:`_phase3_llm_config`; a failed request thrown in at the pending
     ``yield`` surfaces as :class:`ValuesExtractionFailed` ``"phase 3 page <n>
     call failed: <Type>: <message>"``. Each response's usage is folded into
@@ -2058,7 +2494,7 @@ def phase1_steps(
     chunked protocol (``submit_values`` with ``done: false`` then
     ``append_entries``) and the truncation retry (a ``finish_reason='length'``
     turn restarts the attempt in chunked mode with the mandatory directive) are
-    simply more steps of the same generator.
+    simply more steps, so a batch driver runs them as more waves.
 
     Two one-way latches, each enabled by the failure it answers, restart the
     attempt; since a latch only ever flips off → on and its handler re-raises
@@ -2069,8 +2505,8 @@ def phase1_steps(
     * the provider refusing the inlined tool schema ("too many states",
       Gemini's constrained decoder) → the permissive object parameter plus
       code-side vocabulary pruning (``run.tool_schema_mode``). That refusal is
-      an executor failure the driver throws in at the pending ``yield``, so
-      every driver gets the fallback without doing anything.
+      an executor failure the driver throws in at the pending ``yield``, so a
+      batch driver gets the fallback without doing anything.
 
     *messages_factory* is called as ``messages_factory(chunked=...)`` for each
     attempt and must return a fresh list (the attempt appends to it).

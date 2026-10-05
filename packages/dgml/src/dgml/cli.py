@@ -35,10 +35,15 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
 from dgml_core import layout
+from dgml_core.auto_classification import (
+    BulkClassifyBatch,
+    classify_bulk_batch,
+    prepare_bulk_classify,
+)
+from dgml_core.auto_classification import auto_classify as run_auto_classify
 from dgml_core.classification import (
     ClassificationConfig,
     ClassifyMode,
-    classify_file,
     load_classification_config,
 )
 from dgml_core.concurrency import map_concurrent
@@ -87,6 +92,7 @@ from dgml_core.workspaces_store import WorkspacesStore
 
 if TYPE_CHECKING:
     from dgml_core.generation.schema import Schema
+    from dgml_core.grounded import GroundedConfig
 
 # The CLI's own logger (``dgml.cli``); routed to stderr with the library's by
 # `_configure_logging`. Diagnostics only — the JSON payload and the error
@@ -701,6 +707,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "classification call itself (LLM error, auth) are reported in the "
             "'classification' field of the response payload without aborting "
             "the file add."
+        ),
+    )
+    _add_batch_arguments(
+        fl_add,
+        what="the classification (and auto-extraction) of a directory add",
+        extra=(
+            " Requires PATH to be a directory and --auto-classify. In 'existing' mode "
+            "every file is classified in one wave; in the default mode the files are "
+            "classified in order, one wave per file, because a DocSet created for one "
+            "file must be visible to the next."
         ),
     )
     files.add_parser("list", parents=[common], help="List Files.")
@@ -2669,6 +2685,11 @@ def _add_extraction_subparsers(
         default=None,
         help="Override grounded.schema_model for this call (LiteLLM model string).",
     )
+    _add_batch_arguments(
+        ex_gen,
+        what="the schema-generation",
+        extra=" Schema generation is one request, so batch mode is one round trip.",
+    )
 
     ex_set = extraction.add_parser(
         "set-schema",
@@ -2722,7 +2743,22 @@ def _add_extraction_subparsers(
         help="Extract grounded values from a file against its DocSet schema.",
     )
     ex_extract.add_argument("docset_id")
-    ex_extract.add_argument("file_id")
+    ex_extract.add_argument(
+        "file_ids",
+        nargs="*",
+        metavar="file_id",
+        help=(
+            "File(s) to extract. One id alone (no --all) keeps the single-file "
+            "output (plus a `batch` block under --batch). Several ids, or --all, "
+            "return one result per file and a failed file is reported in its entry "
+            "instead of aborting the run."
+        ),
+    )
+    ex_extract.add_argument(
+        "--all",
+        action="store_true",
+        help="Extract every file in the DocSet (instead of naming file ids).",
+    )
     ex_extract.add_argument(
         "--values-model",
         default=None,
@@ -2736,6 +2772,7 @@ def _add_extraction_subparsers(
             "low, medium, high, xhigh, or 'default' to send no reasoning effort."
         ),
     )
+    _add_batch_arguments(ex_extract, what="extraction")
 
     ex_get_values = extraction.add_parser(
         "get-values",
@@ -2778,6 +2815,113 @@ def _coerce_schema_to_rnc(raw: str, path: Path, workspace_name: str, docset_name
     return raw
 
 
+def _error_block(exc: BaseException) -> dict[str, str]:
+    """A per-item ``{code, message}`` block: a DgmlError keeps its code, anything
+    else is an INTERNAL_ERROR with the same one-line message the top-level
+    envelope would carry."""
+    if isinstance(exc, DgmlError):
+        return {"code": exc.code, "message": str(exc)}
+    return {"code": "INTERNAL_ERROR", "message": short_error_message(exc)}
+
+
+def _extract_many(
+    args: argparse.Namespace,
+    ws: Workspace,
+    fmt: str,
+    *,
+    config: GroundedConfig,
+    file_ids: list[str],
+    single: bool = False,
+) -> int:
+    """``extraction extract`` over several files (ids, or ``--all``), or over
+    one file id under ``--batch`` (*single*: the single-file payload plus a
+    ``batch`` block, and the single-file form's errors).
+
+    Each file is extracted independently and reported in its own ``results``
+    entry — a failure is that entry's ``error``, never the run's. Under
+    ``--batch`` both LLM phases go through the provider's batch API
+    (:func:`dgml_core.grounded.extract_values_many`) and the payload gains a
+    ``batch`` block; the per-file entries are the same either way.
+    """
+    from dgml_core.grounded import extract_values_many, values_batch_stages
+
+    store = DocSetStore(ws)
+    store.get(args.docset_id)  # raises DocSetNotFound
+    if args.all:
+        file_ids = store.list_files(args.docset_id)
+    if len(set(file_ids)) != len(file_ids):
+        raise InvalidArgument("file ids must be unique")
+
+    if args.batch:
+        # Checked before any file is read.
+        _batch_preflight(values_batch_stages(config.values_model, config.values_reasoning_effort))
+    many = extract_values_many(
+        ws,
+        args.docset_id,
+        file_ids,
+        config=config,
+        batch=args.batch,
+        poll_interval_s=args.batch_poll_interval,
+        log=_batch_log(args),
+        write_stats=args.debug,
+        debug=args.debug,
+    )
+    outcomes = many.outcomes
+    batch_block = many.batch
+
+    if single:
+        # One file id under --batch: the single-file form's payload and errors,
+        # plus the run's `batch` block.
+        (fid,) = file_ids
+        outcome = outcomes[fid]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        one: dict[str, Any] = {
+            "docset_id": args.docset_id,
+            "file_id": fid,
+            "model": config.values_model,
+            "mode": outcome.mode,
+            "tool_calls": outcome.tool_calls,
+            "field_count": len(outcome.values),
+            "xml_key": outcome.xml_key,
+        }
+        if batch_block is not None:
+            one["batch"] = batch_block
+        _emit(one, fmt)
+        return 0
+
+    results: list[dict[str, Any]] = []
+    for fid in file_ids:
+        outcome = outcomes[fid]
+        if isinstance(outcome, BaseException):
+            results.append({"file_id": fid, "status": "failed", "error": _error_block(outcome)})
+        else:
+            results.append(
+                {
+                    "file_id": fid,
+                    "status": "ok",
+                    "mode": outcome.mode,
+                    "tool_calls": outcome.tool_calls,
+                    "field_count": len(outcome.values),
+                    "xml_key": outcome.xml_key,
+                }
+            )
+    payload: dict[str, Any] = {
+        "docset_id": args.docset_id,
+        "model": config.values_model,
+        "summary": {
+            "total": len(results),
+            "ok": sum(r["status"] == "ok" for r in results),
+            "failed": sum(r["status"] == "failed" for r in results),
+        },
+        "results": results,
+    }
+    if batch_block is not None:
+        payload["batch"] = batch_block
+    _emit(payload, fmt)
+    return 0
+
+
 def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Dispatch the `extraction` command group."""
     from dataclasses import replace
@@ -2789,6 +2933,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         generate_schema,
         load_grounded_config,
         parse_values_reasoning_effort,
+        schema_batch_request,
     )
 
     store = DocSetStore(ws)
@@ -2799,6 +2944,10 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         config = load_grounded_config(ws)
         if args.schema_model:
             config = replace(config, schema_model=args.schema_model)
+        if args.batch:
+            # Before any PDF is read: an unsupported provider is BATCH_UNAVAILABLE,
+            # never a silent full-price call.
+            _batch_preflight({"schema": schema_batch_request(config.schema_model)})
         file_ids = args.from_files or store.list_files(args.docset_id)
         if not file_ids:
             return _emit_error(
@@ -2806,18 +2955,37 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 f"docset '{args.docset_id}' has no files; pass --from-file or add files first",
                 fmt,
             )
-        rnc = generate_schema(ws, file_ids, config=config, docset_name=ds.name, debug=args.debug)
+        batch_block: dict[str, Any] | None = None
+        if args.batch:
+            from dgml_core.grounded import generate_schema_batch, schema_batch_executor
+
+            executor = schema_batch_executor(
+                config, poll_interval_s=args.batch_poll_interval, log=_batch_log(args)
+            )
+            rnc = generate_schema_batch(
+                ws,
+                file_ids,
+                config=config,
+                docset_name=ds.name,
+                executor=executor,
+                debug=args.debug,
+            )
+            batch_block = {"provider": executor.backend.provider, **executor.stats.to_json()}
+        else:
+            rnc = generate_schema(
+                ws, file_ids, config=config, docset_name=ds.name, debug=args.debug
+            )
         store.set_schema(args.docset_id, rnc)
-        _emit(
-            {
-                "docset_id": args.docset_id,
-                "schema_format": "rnc",
-                "schema": rnc,
-                "from_file_ids": list(file_ids),
-                "model": config.schema_model,
-            },
-            fmt,
-        )
+        payload: dict[str, Any] = {
+            "docset_id": args.docset_id,
+            "schema_format": "rnc",
+            "schema": rnc,
+            "from_file_ids": list(file_ids),
+            "model": config.schema_model,
+        }
+        if batch_block is not None:
+            payload["batch"] = batch_block
+        _emit(payload, fmt)
         return 0
 
     if sub == "set-schema":
@@ -2856,6 +3024,11 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         return 0
 
     if sub == "extract":
+        extract_ids: list[str] = list(args.file_ids)
+        if args.all and extract_ids:
+            raise InvalidArgument("pass file ids or --all, not both")
+        if not args.all and not extract_ids:
+            raise InvalidArgument("name at least one file id, or pass --all")
         config = load_grounded_config(ws)
         if args.values_model:
             config = replace(config, values_model=args.values_model)
@@ -2866,27 +3039,37 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     args.values_effort, source="--values-effort"
                 ),
             )
-        result = extract_values(
+        if len(extract_ids) == 1 and not args.all and not args.batch:
+            # The original single-file form: output and errors unchanged.
+            result = extract_values(
+                ws,
+                args.docset_id,
+                extract_ids[0],
+                config=config,
+                write_stats=args.debug,
+                debug=args.debug,
+            )
+            _emit(
+                {
+                    "docset_id": args.docset_id,
+                    "file_id": extract_ids[0],
+                    "model": config.values_model,
+                    "mode": result.mode,
+                    "tool_calls": result.tool_calls,
+                    "field_count": len(result.values),
+                    "xml_key": result.xml_key,
+                },
+                fmt,
+            )
+            return 0
+        return _extract_many(
+            args,
             ws,
-            args.docset_id,
-            args.file_id,
-            config=config,
-            write_stats=args.debug,
-            debug=args.debug,
-        )
-        _emit(
-            {
-                "docset_id": args.docset_id,
-                "file_id": args.file_id,
-                "model": config.values_model,
-                "mode": result.mode,
-                "tool_calls": result.tool_calls,
-                "field_count": len(result.values),
-                "xml_key": result.xml_key,
-            },
             fmt,
+            config=config,
+            file_ids=extract_ids,
+            single=len(extract_ids) == 1 and not args.all,
         )
-        return 0
 
     if sub == "get-values":
         from dgml_core.extraction_xml import has_extraction
@@ -4274,13 +4457,32 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         # config is a hard failure that aborts the run before any file is
         # added, rather than recording the same error on every file.
         config = load_classification_config(ws)
-        # Read existing DocSets once; _auto_classify appends newly-created
+        # Read existing DocSets once; auto_classify appends newly-created
         # ones so similar PDFs cluster within the run without re-scanning.
         docsets = DocSetStore(ws).list_all()
         if not allow_new:
             # Checked here so the run aborts before any file is added rather
             # than on the first one.
             _require_existing_docsets(docsets)
+
+    # --batch is validated (mode, batch backends) before any file is added.
+    batch: BulkClassifyBatch | None = None
+    if getattr(args, "batch", False):
+        if classify_mode is None:
+            # Classification (and the auto-extraction after it) is all a
+            # directory add sends to a model that a batch can serve.
+            raise InvalidArgument(
+                "--batch on a directory add batches its classification: pass "
+                "--auto-classify (default mode or 'existing')"
+            )
+        assert config is not None and docsets is not None
+        batch = prepare_bulk_classify(
+            ws,
+            config=config,
+            docsets=docsets,
+            poll_interval_s=args.batch_poll_interval,
+            log=_batch_log(args),
+        )
 
     on_conflict = ConflictPolicy(args.on_conflict)
     text_mode = TextMode(args.text_mode)
@@ -4321,8 +4523,11 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         counts[status] += 1
 
         entry: dict[str, Any] = {"status": status, "path": str(pdf), **_file_add_payload(result)}
-        if auto_classify:
-            entry["classification"] = _auto_classify(
+        if batch is not None:
+            # Classified together once every file is in (see classify_bulk_batch).
+            batch.pending.append((entry, result))
+        elif auto_classify:
+            entry["classification"] = run_auto_classify(
                 ws,
                 result,
                 config=config,
@@ -4338,6 +4543,11 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         "summary": {"total": len(pdfs), **counts},
         "results": entries,
     }
+    if batch is not None:
+        assert config is not None and docsets is not None
+        payload["batch"] = classify_bulk_batch(
+            ws, batch, config=config, docsets=docsets, debug=args.debug, allow_new=allow_new
+        )
     _emit(payload, fmt)
     return 0
 
@@ -4357,6 +4567,11 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     f"to choose each id."
                 )
             return _file_add_bulk(args, ws, store, fmt)
+        if getattr(args, "batch", False):
+            raise InvalidArgument(
+                "--batch applies to a directory add (PATH is a directory): one file "
+                "is one request, which a batch cannot make cheaper to wait for"
+            )
         classify_mode = getattr(args, "auto_classify", None)
         allow_new = classify_mode != ClassifyMode.EXISTING
         config: ClassificationConfig | None = None
@@ -4379,10 +4594,10 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         )
         payload: dict[str, Any] = _file_add_payload(result)
         if classify_mode is not None:
-            # In the default mode _auto_classify loads the classification
+            # In the default mode auto_classify loads the classification
             # config itself; a missing/invalid one raises straight through to
             # an error envelope.
-            payload["classification"] = _auto_classify(
+            payload["classification"] = run_auto_classify(
                 ws,
                 result,
                 config=config,
@@ -4401,125 +4616,6 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     else:  # unreachable — argparse `required=True` rejects unknown subcommands
         raise AssertionError(f"unhandled file subcommand: {sub}")
     return 0
-
-
-def _auto_classify(
-    ws: Workspace,
-    result: AddFileResult,
-    *,
-    config: ClassificationConfig | None = None,
-    docsets: list[DocSet] | None = None,
-    allow_new: bool = True,
-    debug: bool = False,
-) -> dict[str, Any]:
-    """Run LLM auto-classification on a freshly added File and assign it.
-
-    Returns the ``classification`` block embedded in ``dgml file add`` output.
-
-    ``allow_new=False`` (``--auto-classify existing``) forbids creating a
-    DocSet and always assigns: the LLM is given only the assign tool and must
-    return the best-fitting DocSet even when the fit is poor. With no DocSets
-    to choose from the mode has no possible outcome, so it is a **hard** error
-    (``NO_EXISTING_DOCSETS``) — a precondition on the request rather than a
-    failure of the classification call. Callers check it via
-    :func:`_require_existing_docsets` before adding any file; the re-raise
-    below keeps it hard if one ever doesn't.
-
-    A missing or invalid classification config is a **hard** failure: when
-    ``config`` is not supplied it is loaded here via
-    :func:`load_classification_config`, whose error propagates straight to the
-    CLI error envelope (exit 1) rather than soft-failing per file. Bulk callers
-    load the config once up front and pass it in, so the run aborts before any
-    file is processed when it's missing. Failures *after* config is in hand —
-    the LLM/classify call, auth — stay soft: the File record is already on
-    disk, so they land in ``classification.error`` with exit 0.
-
-    ``docsets``, when supplied, is a mutable list the caller maintains across
-    a bulk run: it is forwarded to :func:`classify_file` so the LLM sees
-    DocSets created earlier in the same run, and any freshly-created DocSet
-    is appended to it here so later files can be assigned to it.
-
-    Skipped (and reported as ``performed: false``) when the add returned an
-    existing record rather than creating a new one — re-runs stay idempotent,
-    and we neither require config nor burn an LLM call on a duplicate.
-    """
-    if not result.created:
-        return {
-            "performed": False,
-            "reason": "file already existed; classification skipped",
-        }
-
-    if config is None:
-        config = load_classification_config(ws)
-
-    file_id = result.record.id
-    block: dict[str, Any] = {
-        "performed": True,
-        "model": config.model,
-        "decision": None,
-        "docset_id": None,
-        "docset_created": False,
-        "docset_name": None,
-        "docset_key_questions": [],
-        "error": None,
-    }
-
-    try:
-        decision = classify_file(
-            ws, file_id, config=config, docsets=docsets, allow_new=allow_new, debug=debug
-        )
-    except NoExistingDocSets:
-        # A precondition on the request, not a failure of the call — callers
-        # check it before ingesting anything. Kept hard even if one didn't:
-        # soft-failing would leave the unassigned file this mode prevents.
-        raise
-    except DgmlError as exc:
-        block["error"] = f"{exc.code}: {exc}"
-        return block
-
-    docset_store = DocSetStore(ws)
-    try:
-        if decision.decision == "existing":
-            assert decision.existing_docset_id is not None
-            # Assign, and auto-extract when the target DocSet has an
-            # extraction schema set (soft-fail — the extraction block
-            # carries any error; the assignment itself stands).
-            from dgml_core.extraction import add_file_and_extract
-
-            extraction_block = add_file_and_extract(
-                ws, decision.existing_docset_id, file_id, write_stats=debug, debug=debug
-            )
-            existing = docset_store.get(decision.existing_docset_id)
-            block.update(
-                decision="existing",
-                docset_id=existing.id,
-                docset_name=existing.name,
-                docset_key_questions=list(existing.key_questions),
-            )
-            if extraction_block is not None:
-                block["extraction"] = extraction_block
-        elif decision.decision == "new":
-            assert decision.new_name is not None and decision.new_description is not None
-            created = docset_store.create(
-                name=decision.new_name,
-                description=decision.new_description,
-                key_questions=list(decision.new_key_questions),
-            )
-            docset_store.add_file(created.id, file_id)
-            if docsets is not None:
-                docsets.append(created)
-            block.update(
-                decision="new",
-                docset_id=created.id,
-                docset_created=True,
-                docset_name=created.name,
-                docset_key_questions=list(created.key_questions),
-            )
-        else:  # unreachable — classify_file returns only these three
-            raise AssertionError(f"unhandled classification decision: {decision.decision}")
-    except DgmlError as exc:
-        block["error"] = f"{exc.code}: {exc}"
-    return block
 
 
 if __name__ == "__main__":

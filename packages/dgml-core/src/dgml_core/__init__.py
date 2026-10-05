@@ -171,8 +171,15 @@ from .workspaces_resolve import (
 from .workspaces_store import WorkspacesConfig, WorkspacesStore, default_workspaces_root
 
 if TYPE_CHECKING:
+    from .auto_classification import (
+        BulkClassifyBatch,
+        auto_classify,
+        classify_bulk_batch,
+        prepare_bulk_classify,
+    )
     from .consistency import CheckReport, Issue, check_workspace
     from .generation.link_stage import LinkOutcome, LinkStage, StagedDocument
+    from .grounded import ManyExtraction, extract_values_many
 
 __version__ = "0.1.0"
 
@@ -190,12 +197,19 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 #: times per session (bill extraction) spend that entire budget on an unused
 #: client. Importing ``dgml_core.consistency`` directly, or touching any name
 #: below, still loads it exactly as before.
-#: The semantic-link stage is lazy for the same reason, and so that
+#: The orchestration API below (auto-classification, multi-file extraction,
+#: the semantic-link stage) is lazy for the same reason, and so that
 #: ``dgml_core.batch`` is never on the default import path.
 _LAZY_SUBMODULES = {
     "CheckReport": ".consistency",
     "Issue": ".consistency",
     "check_workspace": ".consistency",
+    "BulkClassifyBatch": ".auto_classification",
+    "auto_classify": ".auto_classification",
+    "classify_bulk_batch": ".auto_classification",
+    "prepare_bulk_classify": ".auto_classification",
+    "ManyExtraction": ".grounded",
+    "extract_values_many": ".grounded",
     "LinkOutcome": ".generation.link_stage",
     "LinkStage": ".generation.link_stage",
     "StagedDocument": ".generation.link_stage",
@@ -236,6 +250,7 @@ __all__ = [
     "BatchExecutionFailed",
     "BatchUnavailable",
     "BlobStore",
+    "BulkClassifyBatch",
     "ChainConfigError",
     "ChainRpcFailed",
     "ChainTxReverted",
@@ -285,6 +300,7 @@ __all__ = [
     "LinkStage",
     "LocalDirWorkspacesStore",
     "LocalStore",
+    "ManyExtraction",
     "Migration",
     "MigrationResult",
     "MissingExtra",
@@ -335,13 +351,16 @@ __all__ = [
     "__version__",
     "attest_file",
     "attest_file_version",
+    "auto_classify",
     "check_workspace",
+    "classify_bulk_batch",
     "collect_file_version",
     "collect_from_attestation",
     "create_workspace",
     "default_workspaces_root",
     "default_workspaces_store",
     "export_attestation",
+    "extract_values_many",
     "generate_unique_workspace_id",
     "is_record_id",
     "is_workspace_id",
@@ -359,6 +378,7 @@ __all__ = [
     "migrate_workspace",
     "new_workspace_id",
     "pending_migrations",
+    "prepare_bulk_classify",
     "read_attestation",
     "resolve_store_configs",
     "slice_pages",

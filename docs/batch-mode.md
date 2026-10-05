@@ -10,9 +10,10 @@ suits bulk ingestion, backfills and evaluation runs, not a person waiting at a
 terminal. It is opt-in and off by default. Without `--batch`, every command
 behaves and prints exactly as it always has.
 
-Today `dgml docset generate` takes `--batch`. This page explains what batches,
-what does not, and why. For flags and payload fields, see the
-[CLI reference](cli-reference.md#dgml-docset-generate-docset_id-flags).
+`dgml docset generate`, `dgml extraction extract`, `dgml extraction
+generate-schema` and `dgml file add <dir> --auto-classify` take `--batch`. This
+page explains what batches, what does not, and why. For flags and payload
+fields, see the [CLI reference](cli-reference.md).
 
 ## Providers
 
@@ -91,6 +92,62 @@ for a batch backend before any work starts. The labeling model is checked
 under every vocabulary, because planning, descriptions and links batch over it
 even when labeling itself stays synchronous.
 
+## `dgml extraction extract <docset_id> <file_id>... | --all --batch`
+
+| Call | Batches? | Stage | Round trips | Why |
+|---|---|---|---|---|
+| Value extraction (phase 1), location (phase 3) | Yes | `extraction phase 1` / `3` | 2 | Files and pages are independent; phase 3 needs phase 1's values. |
+
+Both LLM phases of grounded extraction batch across every file: phase 1 (value
+extraction) for all files in one wave, the deterministic phase-2 matching
+locally, then phase 3 (locating unresolved values on page images) for every
+file and page in one wave. A file whose phase 1 takes extra turns (the chunked
+protocol, a truncation retry, the permissive-schema fallback) rides extra
+waves. One file id keeps the single-file payload (plus the `batch` block).
+
+## `dgml extraction generate-schema <docset_id> --batch`
+
+Schema generation is one request per docset (the configured `schema_model`,
+Opus on the default profile), so batch mode is a single round trip. The stored
+schema, the payload and the usage row are the same as a synchronous run's,
+apart from the `batch` block and `tier: "batch"`. On a small docset this call
+can be the largest single line of a run's cost, which is why it batches.
+
+## `dgml file add <dir> --auto-classify [existing] --batch`
+
+| Call | Batches? | Stage | Round trips | Why |
+|---|---|---|---|---|
+| Classification, `--auto-classify existing` | Yes | `classification` | 1 | No file can add a DocSet, so every request is built from the same list. |
+| Classification, default mode (`existing-or-new`) | Yes, in order | `classification` | one per file | Any reply may create a DocSet that the next file's request lists (by id); see below. |
+| Auto-extraction of assigned files | Yes | `extraction` | 2 | As `extraction extract`, across every DocSet the files landed in. |
+| Hybrid text merge (`--text-mode hybrid` with a `[text_extraction]` model) | No | — | — | Runs inside ingest, page by page; see below. |
+
+Ingests every file, classifies them, then runs the auto-extraction of the
+assigned files as one batched extraction across all their docsets.
+
+- **`--auto-classify existing`** classifies every file in one wave: no file can
+  create a docset, so each request depends only on the docsets the run started
+  with.
+- **The default mode** classifies the files in order, **one wave per file**.
+  A file's request lists every docset that exists when it is built, by id, in
+  its prompt and in its tool schema, and any reply may create a new docset.
+  So the request for file *k*+1 cannot be built until file *k*'s reply is in
+  and applied, exactly as in the synchronous file-by-file loop. Grouping
+  consecutive files would be exact only if none of them could create a
+  docset, which nothing guarantees. A directory of *N* files therefore takes
+  *N* classification round trips (a file that makes no request, such as one
+  with no rendered page, takes none). Prefer `existing` mode for large curated
+  ingests where that latency matters.
+
+`--batch` needs `--auto-classify`; without it, a directory add is rejected
+before any file is added. A single-file add rejects `--batch` too.
+
+**Why the hybrid text merge stays synchronous.** `--text-mode hybrid` with a
+`[text_extraction]` model asks that model to merge each page's digital and
+OCR words while the file is ingested. Those calls run inside ingest, page by
+page, with a heuristic fallback per request, and the merge model is typically
+a local one with no batch API. It runs at standard price.
+
 ## How ordering works
 
 Providers process a batch's requests concurrently and return results in any
@@ -163,6 +220,20 @@ and `style` appear only when that call ran (`style` reports
 `{"skipped": "no OCR document with a page to style"}` when it is enabled but
 nothing needed it).
 
+`extraction extract` and `extraction generate-schema` report one block for the
+run, the same counters and cost fields plus `provider` (no `stages`):
+
+```jsonc
+"batch": {"provider": "anthropic", "waves": 2, "batches": 2, "requests": 5,
+          "batch_ok": 5, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+          "batch_ids": ["msgbatch_…", "msgbatch_…"],
+          "cost_usd": 0.041, "standard_cost_usd": 0.082, "saved_usd": 0.041}
+```
+
+`file add <dir>` reports one such block per stage that ran, keyed
+`classification` and `extraction` (the latter with the `docset_ids` it
+covered).
+
 **`"tier": "batch"` on usage rows.** Rows in `usage.jsonl` (written under
 `--debug`) record which pricing tier was billed, and `cost_usd` on a batch row
 is already the batch price. A batch row's `duration_s` includes the time the
@@ -176,9 +247,10 @@ tier, marked `context.tier_split: true`.
   request, is resubmitted once in a follow-up wave. If it still fails, or the
   error isn't retryable, that request alone runs synchronously at the standard
   price, and counts in the stage's `sync_fallbacks`.
-- **One document fails.** It fails the way it would without `--batch`, with
-  the same error, and the others carry on: a document whose transcription
-  fails is dropped and reported failed.
+- **One document or file fails.** It fails the way it would without
+  `--batch`, with the same error, and the others carry on: a document whose
+  transcription fails is dropped and reported failed; a file whose extraction
+  or classification fails gets its error in its result entry.
 - **The provider rejects a batch as a whole** (too large, over a queue limit).
   The batch is split in half and each half resubmitted, down to single
   requests; only a single request still rejected runs synchronously. The
@@ -192,15 +264,16 @@ tier, marked `context.tier_split: true`.
   an hour). Open batches are cancelled. Documents that had already finished
   keep their results; one still transcribing is dropped, one still labeling is
   written with a `label_error`, and a failed link stage gives each document a
-  `link_error` and still writes it. Batch mode does not silently rerun the
-  whole wave at full price.
+  `link_error` and still writes it. In `extraction extract` and `file add`, a
+  file still in flight gets `BATCH_EXECUTION_FAILED` as its entry. Batch mode
+  does not silently rerun the whole wave at full price.
 
 ## Configuration
 
 | Setting | Effect |
 |---|---|
 | `--batch` | Turn batch mode on for this run. |
-| `--no-batch` | Force synchronous, overriding the config. |
+| `--no-batch` (`docset generate`) | Force synchronous, overriding the config. |
 | `[generation] batch = true` | Make batch mode the default for `docset generate` in this workspace. Anything but a boolean is `GENERATION_CONFIG_INVALID`. |
 | `DGML_GENERATION__BATCH=true` | The same, from the environment (`true`/`false`, `1`/`0`, `yes`/`no`). |
 | `--batch-poll-interval SECONDS` | Seconds between batch status checks (default 30). |
