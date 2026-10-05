@@ -1583,6 +1583,11 @@ def empty_usage_totals() -> dict[str, Any]:
     }
 
 
+#: Key a batch driver sets on an open :func:`record_usage_for` sink to mark the
+#: scope's row with its tier (the scope config's own ``tier`` otherwise).
+SINK_TIER_KEY = "_tier"
+
+
 @contextmanager
 def record_usage_for(config: LLMConfig) -> Iterator[None]:
     """Aggregate every LLM call made with *config* inside this block into ONE
@@ -1598,8 +1603,9 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
     a shared accumulator rather than each writing a row; on exit — success or
     exception — one combined :class:`UsageEvent` is appended. Its ``tier`` is
     the one that served the scope's responses (each response's tier marker,
-    else the driving config's tier), or the scope config's own when it saw no
-    response; a scope whose responses span tiers appends one row per tier
+    else the driving config's tier); a scope with no responses falls back to
+    the scope config's tier, or batch when a batch driver marked the sink via
+    ``totals[SINK_TIER_KEY]``; a scope whose responses span tiers appends one row per tier
     instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
     an inner scope defers to the outer one. The write can never break the
     caller (see :func:`record_usage`); exceptions propagate after the row.
@@ -1638,7 +1644,7 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
                 outcome=outcome,
                 context=config.context or {},
                 error=error_msg,
-                tier=config.tier,
+                tier=str(totals.get(SINK_TIER_KEY) or config.tier),
             )
             # One row, or one per tier when the responses span tiers.
             for part in scope_events(event, totals):
@@ -1649,6 +1655,7 @@ __all__ = [
     "ANTHROPIC_MODEL_PATTERNS",
     "OPENAI_MODEL_PATTERNS",
     "PDF_NATIVE_MODEL_PATTERNS",
+    "SINK_TIER_KEY",
     "CallResult",
     "LLMConfig",
     "LLMStep",
