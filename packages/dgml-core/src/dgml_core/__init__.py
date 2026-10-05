@@ -24,6 +24,7 @@ from .conversion import (
     load_conversion_config,
     make_converter,
 )
+from .docset_generate import GenerateFileResult, GenerateReport, generate_docset
 from .docsets import DocSetStore
 
 # Exported in full, and pinned so by tests/test_error_codes.py.
@@ -43,6 +44,7 @@ from .errors import (
     CorruptMetadata,
     DgmlError,
     DocSetNotFound,
+    EmptyDocSet,
     EmptyModelResponse,
     EngineNotAvailable,
     FileNotFound,
@@ -248,6 +250,7 @@ __all__ = [
     "DocSetNotFound",
     "DocSetStore",
     "DocStore",
+    "EmptyDocSet",
     "EmptyModelResponse",
     "EngineName",
     "EngineNotAvailable",
@@ -256,6 +259,8 @@ __all__ = [
     "FileRecord",
     "FileStore",
     "FileVersion",
+    "GenerateFileResult",
+    "GenerateReport",
     "GenerationConfigInvalid",
     "GenerationConfigMissing",
     "GenerationFailed",
@@ -329,6 +334,7 @@ __all__ = [
     "default_workspaces_root",
     "default_workspaces_store",
     "export_attestation",
+    "generate_docset",
     "generate_unique_workspace_id",
     "is_record_id",
     "is_workspace_id",

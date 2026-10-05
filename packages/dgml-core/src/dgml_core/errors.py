@@ -24,9 +24,9 @@ dead:
   results payload. Callers read ``TheClass.code``.
 - *CLI-layer codes* have no class at all. ``INTERNAL_ERROR`` is permanently one
   (it exists for exceptions that are *not* a :class:`DgmlError`).
-  ``EMPTY_DOCSET``, ``NO_FILES`` and ``VALUES_NOT_FOUND`` are domain
-  preconditions that become classes when their operations move out of
-  ``cli.py``.
+  ``NO_FILES`` and ``VALUES_NOT_FOUND`` are domain preconditions that become
+  classes when ``extraction`` moves out of ``cli.py`` (as ``EMPTY_DOCSET``
+  became :class:`EmptyDocSet` when ``docset generate`` did).
 """
 
 from __future__ import annotations
@@ -361,6 +361,12 @@ class GroundedConfigMissing(DgmlError):
 
 class GroundedConfigInvalid(DgmlError):
     code = "GROUNDED_CONFIG_INVALID"
+
+
+class EmptyDocSet(DgmlError):
+    """Generation was pointed at a DocSet that exists but has no files assigned."""
+
+    code = "EMPTY_DOCSET"
 
 
 class GenerationConfigMissing(DgmlError):

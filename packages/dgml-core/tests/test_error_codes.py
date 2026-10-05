@@ -51,8 +51,8 @@ CLI_ONLY_CODES = frozenset(
         "INTERNAL_ERROR",
         # Domain preconditions currently checked in `cli.py` because the
         # operations that check them live there. These become real classes when
-        # `docset generate` / `extraction` move into `dgml_core`.
-        "EMPTY_DOCSET",
+        # `extraction` moves into `dgml_core` (as EMPTY_DOCSET became
+        # `EmptyDocSet` when `docset generate` did).
         "NO_FILES",
         "VALUES_NOT_FOUND",
     }

@@ -27,6 +27,13 @@ a workspace calls; `Workspace.resolve(...)` only answers "which workspace" and
 is for the handful of operations that run before one exists. Creating one is
 `create_workspace(...)`, not a `Workspace` constructor.
 
+Generating a DocSet is `generate_docset(ws, docset_id, ...)` (module
+[src/dgml_core/docset_generate.py](src/dgml_core/docset_generate.py)) — the
+whole `dgml docset generate` orchestration (transcription, labeling, grounding,
+semantic links, coverage, schema artifacts), returning a `GenerateReport`
+whose `to_json()` is exactly the CLI's payload. `convert_batch` underneath it
+is the raw pipeline for callers that bring their own files and options.
+
 ## Logging
 
 Library code logs through `logger = logging.getLogger(__name__)`, so every
