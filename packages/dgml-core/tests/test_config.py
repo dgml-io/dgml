@@ -123,6 +123,69 @@ def test_cli_overrides_take_precedence(workspace: Workspace) -> None:
     assert merged[ConfigSection.MODELS]["light"] == "cli/model"
 
 
+_ALL_TIERS = {"light": "u/l", "standard": "u/s", "advanced": "u/a", "expert": "u/e"}
+
+
+def _family(name: str, **tiers: str) -> dict[str, str]:
+    """A family's expanded [models] table, with *tiers* overriding."""
+    from dgml_core.default_config import PROVIDER_MODELS
+
+    return {**PROVIDER_MODELS[name], "family": name, **tiers}
+
+
+def test_workspace_family_replaces_user_tiers(workspace: Workspace) -> None:
+    """A user config with all four tiers (what the old `dgml init` wrote) must not
+    silently defeat a higher layer's family."""
+    _write_user_config({"models": _ALL_TIERS})
+    write_config(workspace, {"models": {"family": "openai"}})
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == _family("openai")
+
+
+def test_env_family_replaces_lower_tiers(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_user_config({"models": _ALL_TIERS})
+    write_config(workspace, {"models": {"expert": "ws/e"}})
+    monkeypatch.setenv("DGML_MODELS__FAMILY", "openai")
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == _family("openai")
+
+
+def test_higher_family_drops_lower_pins_too(workspace: Workspace) -> None:
+    """Switching family in a higher layer replaces the whole set, including tiers
+    the lower layer pinned next to its own family."""
+    _write_user_config({"models": {"family": "anthropic", "advanced": "u/a"}})
+    write_config(workspace, {"models": {"family": "openai"}})
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == _family("openai")
+
+
+def test_tiers_beside_or_above_family_still_win(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_user_config({"models": {"light": "u/l"}})
+    write_config(workspace, {"models": {"family": "openai", "advanced": "ws/a"}})
+    monkeypatch.setenv("DGML_MODELS__EXPERT", "env/e")
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == _family(
+        "openai", advanced="ws/a", expert="env/e"
+    )
+
+
+def test_lower_family_fills_tiers_a_higher_layer_leaves_unset(workspace: Workspace) -> None:
+    _write_user_config({"models": {"family": "google"}})
+    write_config(workspace, {"models": {"advanced": "ws/a"}})
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == _family("google", advanced="ws/a")
+
+
+def test_unknown_family_is_not_expanded(workspace: Workspace) -> None:
+    """Left for `load_models_config` to reject rather than failing the merge."""
+    write_config(workspace, {"models": {"family": "nope"}})
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == {"family": "nope"}
+
+
+def test_env_var_sets_family(workspace: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DGML_MODELS__FAMILY", "openai")
+    assert load_merged_config(workspace)[ConfigSection.MODELS]["family"] == "openai"
+
+
 # ---- Malformed input --------------------------------------------------------
 
 

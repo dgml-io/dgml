@@ -81,11 +81,18 @@ class StorageConfig:
     location and nothing more: a remote store has no use for it, and it is **not** a
     scratch location — staging goes through ``tempfile`` and ``$TMPDIR`` (see the path
     bridge on :class:`BlobStore`).
+
+    ``workspace_id`` is the id of the workspace the store is being opened for, taken
+    from its ``config.toml`` identity block. A backend that several workspaces can share
+    — one S3 bucket, one MongoDB database — uses it to keep each workspace's data in its
+    own namespace. ``None`` only for a config built by hand, or one created
+    before workspaces had ids.
     """
 
     provider: str
     root: Path
     options: Mapping[str, Any] = field(default_factory=dict)
+    workspace_id: str | None = None
 
 
 class _StoreBase(ProviderConfigFields, ABC):

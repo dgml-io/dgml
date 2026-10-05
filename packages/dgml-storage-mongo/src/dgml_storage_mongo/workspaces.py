@@ -142,14 +142,12 @@ from dgml_core.errors import (
     WorkspacesUnavailable,
     WorkspacesWriteConflict,
 )
-from dgml_core.layout import Collection
 from dgml_core.workspaces_store import WorkspacesConfig, WorkspacesStore
 
 from ._client import IDENTITY_FIELDS, WORKSPACES_URI_ENV, connect, validate_identity
 
-#: Default collection. Prefixed rather than a bare ``workspaces`` because that is one
-#: character from ``Collection.WORKSPACE`` — safe today, but not a thing to rely on in a
-#: database that may also hold a workspace's own documents.
+#: Default collection. Prefixed rather than a bare ``workspaces`` so it reads as DGML's
+#: in a database that may also hold other applications' collections.
 DEFAULT_COLLECTION = "dgml_workspaces"
 
 #: This document shape's own version, independent of a workspace's schema_version.
@@ -190,15 +188,9 @@ class MongoWorkspacesStore(WorkspacesStore):
             raise WorkspacesConfigInvalid(
                 "'workspaces.mongo_collection' must be a non-empty string"
             )
-        # Executable form of the collision argument the GridFS store only makes in prose:
-        # this collection may share a database with a workspace's own documents, so it
-        # must not be able to shadow one of them or a GridFS bucket.
-        if collection in {member.value for member in Collection}:
-            raise WorkspacesConfigInvalid(
-                f"'workspaces.mongo_collection' cannot be {collection!r}: that is a "
-                f"collection a workspace's own documents use, and the two may share a "
-                f"database"
-            )
+        # This collection may share a database with a workspace's own documents. Those
+        # are named `<prefix>_<workspace id>_<name>`, which a collection name would only
+        # match on purpose — but a GridFS bucket's collections are easy to hit.
         if collection.endswith((".files", ".chunks")):
             raise WorkspacesConfigInvalid(
                 f"'workspaces.mongo_collection' cannot be {collection!r}: '.files' and "

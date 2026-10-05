@@ -53,6 +53,15 @@ Omit a role's subtable to leave it on local disk.
 | `mongo_host` | no | `localhost` |
 | `mongo_port` | no | `27017` |
 | `mongo_bucket` | no | `blobs` — blob stores only |
+| `prefix` | no | `dgml` |
+
+**Every collection is named `<prefix>_<workspace id>_<name>`**, so any number of
+workspaces — and other applications — can share one database, and one config can serve
+them all. Documents go in `dgml_<id>_files`, `dgml_<id>_docsets`, … and blobs in the GridFS
+bucket `dgml_<id>_blobs` (or `dgml_<id>_<mongo_bucket>`). The id is added when the store is
+opened, from the `workspace_id` in the workspace's `config.toml`; it is not written into
+`prefix`. A `prefix` is at most 16 characters: letters, digits, `_` and `-`, starting with
+a letter or digit.
 
 ## The list of workspaces
 
@@ -208,9 +217,10 @@ seek, so a large artifact can be served by byte range.
 
 The collections are the spec's: **`<bucket>.files`** (one document per revision —
 `filename`, `length`, `chunkSize`, `uploadDate`, `metadata`) and
-**`<bucket>.chunks`** (`files_id`, `n`, `data`). Neither collides with a
-`dgml_core.layout.Collection` member, which is what lets blobs and documents
-share one database.
+**`<bucket>.chunks`** (`files_id`, `n`, `data`). The bucket is named
+`<prefix>_<workspace id>_<mongo_bucket>`, the same namespace the document store uses,
+so with the defaults a workspace's blobs are in `dgml_<id>_blobs.files` /
+`dgml_<id>_blobs.chunks`, beside its `dgml_<id>_files` and the rest.
 
 The blob key is the GridFS `filename`. Chunks are 1 MiB rather than the 255 KiB
 GridFS default: at 255 KiB a 300 DPI page image is a dozen documents, and page
