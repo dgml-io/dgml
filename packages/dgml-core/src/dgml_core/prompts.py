@@ -53,6 +53,7 @@ class PromptKey(StrEnum):
     VALUES_PHASE1_USER = "extraction_values_phase1_user"
     VALUES_PHASE1_GUIDANCE = "extraction_values_phase1_guidance"
     VALUES_PHASE1_RETRY_CHUNKED = "extraction_values_phase1_retry_chunked"
+    VALUES_PHASE1_PART = "extraction_values_phase1_part"
 
     # Extraction: value extraction, phase 3 (attach bounding boxes)
     VALUES_PHASE3_SYSTEM = "extraction_values_phase3_system"
