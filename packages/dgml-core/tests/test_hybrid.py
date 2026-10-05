@@ -26,7 +26,6 @@ from dgml_core.errors import OcrFailed
 from dgml_core.files import FileStore
 from dgml_core.hybrid import (
     LEVENSHTEIN_THRESHOLD,
-    MAX_CID_WORDS_PER_PAGE,
     MERGE_BATCH_SIZE,
     _iou,
     _levenshtein_distance,
@@ -36,7 +35,7 @@ from dgml_core.hybrid import (
 )
 from dgml_core.ocr import BUILTIN_OCR_PROVIDERS, OcrConfig, OcrProvider, OcrProviderName
 from dgml_core.storage import Workspace
-from dgml_core.text_extraction import TextMode
+from dgml_core.text_extraction import MAX_CID_WORDS_PER_PAGE, TextMode
 
 from .conftest import make_fake_png, write_ocr_config
 

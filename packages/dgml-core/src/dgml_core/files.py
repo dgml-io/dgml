@@ -48,7 +48,7 @@ from .errors import (
 from .hashing import sha256_file
 from .ids import RECORD_ID_SHAPE, is_record_id, new_id
 from .models import FileRecord
-from .ocr import extract_text_ocr, load_ocr_config
+from .ocr import extract_text_ocr, load_ocr_config, recover_unusable_pages
 from .pages import (
     DEFAULT_DPI,
     PdfConfig,
@@ -599,6 +599,16 @@ class FileStore:
         try:
             with self.ws.blobs.staged_write(text_prefix) as text_dir:
                 result = extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
+                # Pages whose fonts map no glyphs to Unicode are OCR'd when a
+                # provider is available.
+                result = recover_unusable_pages(
+                    self.ws,
+                    pdf_path,
+                    text_dir,
+                    result,
+                    file_id=file_id,
+                    pages_prefix=layout.file_pages_prefix(file_id),
+                )
         except TextExtractionFailed as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
         return self._classify_and_record(result, file_id, page_count, mode_label="digital")
