@@ -462,6 +462,7 @@ def _run_dgml_json(args: list[str]) -> Any:
         [*_dgml_cmd(), "--workspace", get_workspace_root(), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",  # the CLI writes UTF-8 to a pipe whatever the locale
         timeout=180,
     )
     if proc.returncode != 0:

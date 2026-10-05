@@ -233,3 +233,12 @@ def test_workspace_blobs_is_resolved_once(tmp_path: Path, monkeypatch: pytest.Mo
     # Caching is per-workspace, not global: a separate instance resolves its own.
     assert Workspace(root=tmp_path).blobs is not first
     assert built == 2
+
+
+def test_pdf_filename_keeps_a_pdf_source_as_stored_and_converts_others() -> None:
+    assert layout.pdf_filename("invoice.pdf") == "invoice.pdf"
+    assert layout.pdf_filename("INVOICE.PDF") == "INVOICE.PDF"
+    assert layout.pdf_filename("report.docx") == "report.pdf"
+    assert layout.pdf_filename("Q1.final.XLSX") == "Q1.final.pdf"
+    assert layout.file_pdf_key("f1", "INVOICE.PDF") == "files/f1/INVOICE.PDF"
+    assert layout.file_pdf_key("f1", "report.docx") == "files/f1/report.pdf"

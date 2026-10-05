@@ -34,10 +34,10 @@ Layout
 Standard GridFS, so the collections are the spec's: ``<bucket>.files`` (one
 document per revision, holding ``filename``, ``length``, ``chunkSize``,
 ``uploadDate``, ``metadata``) and ``<bucket>.chunks`` (``files_id``, ``n``,
-``data``). Default bucket name ``blobs``, so ``blobs.files`` /
-``blobs.chunks`` — neither collides with a
-:class:`~dgml_core.layout.Collection` member, so blobs and documents can share
-one database.
+``data``). The bucket is named ``<prefix>_<workspace id>_<mongo_bucket>`` — the
+same namespace the document store puts its collections in — so with the defaults a
+workspace's blobs are in ``dgml_<id>_blobs.files`` / ``dgml_<id>_blobs.chunks``,
+beside its ``dgml_<id>_files`` and the rest.
 
 The blob key is the GridFS ``filename``. ``sha256`` is written into
 ``metadata`` at upload time, which keeps :meth:`sha256_blob` a single indexed
@@ -90,7 +90,15 @@ from dgml_core.errors import DgmlError
 from dgml_core.hashing import sha256_file
 from dgml_core.storage_service import BlobStore, StorageConfig
 
-from ._client import IDENTITY_FIELDS, connect, validate_identity
+from ._client import (
+    IDENTITY_FIELDS,
+    connect,
+    prefixed,
+    require_workspace_id,
+    validate_identity,
+    validate_prefix,
+    workspace_namespace,
+)
 
 #: Default GridFS bucket name, overridable with the ``mongo_bucket`` option so
 #: several workspaces can share a database.
@@ -108,10 +116,14 @@ _READ_ATTEMPTS = 3
 class MongoGridFSBlobStore(BlobStore):
     """Blobs in a GridFS bucket. Inherits the path bridge
     (:meth:`~dgml_core.storage_service.BlobStore.materialize` and friends) from
-    :class:`~dgml_core.storage_service.BlobStore`."""
+    :class:`~dgml_core.storage_service.BlobStore`.
+
+    The bucket is ``<prefix>_<workspace id>_<bucket>`` — ``dgml_ws_7qx…_blobs`` by
+    default — matching :class:`~dgml_storage_mongo.store.MongoDocStore`'s collections, so
+    a workspace's blobs and documents share one namespace."""
 
     name = "mongo-gridfs"
-    config_fields = IDENTITY_FIELDS | {"mongo_bucket"}
+    config_fields = IDENTITY_FIELDS | {"mongo_bucket", "prefix"}
 
     # ---- configuration ----
 
@@ -119,15 +131,18 @@ class MongoGridFSBlobStore(BlobStore):
     def parse_config(cls, config: StorageConfig) -> StorageConfig:
         cls._check_no_extra_fields(config.options)
         validate_identity(cls.name, config.options)
+        validate_prefix(config.options)
         bucket = config.options.get("mongo_bucket")
         if bucket is not None and (not isinstance(bucket, str) or not bucket.strip()):
             raise _invalid("'mongo_bucket' must be a non-empty string")
+        require_workspace_id(cls.name, config)
         return config
 
     def __init__(self, config: StorageConfig) -> None:
-        self._bind_gridfs(connect(config.options), config.options.get("mongo_bucket"))
+        opts = config.options
+        self._bind_gridfs(connect(opts), opts.get("mongo_bucket"), workspace_namespace(config))
 
-    def _bind_gridfs(self, db: Any, bucket: str | None = None) -> None:
+    def _bind_gridfs(self, db: Any, bucket: str | None, namespace: str) -> None:
         """Attach a GridFS bucket to an open database.
 
         Split out of ``__init__`` so :class:`~dgml_storage_mongo.MongoGridFSStore`
@@ -140,7 +155,7 @@ class MongoGridFSBlobStore(BlobStore):
         # make this module unimportable without it.
         import gridfs
 
-        name = str(bucket or DEFAULT_BUCKET)
+        name = prefixed(namespace, str(bucket or DEFAULT_BUCKET))
         self._bucket: Any = gridfs.GridFSBucket(db, bucket_name=name, chunk_size_bytes=CHUNK_BYTES)
         self._files: Any = db[f"{name}.files"]
 

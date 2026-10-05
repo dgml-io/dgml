@@ -22,7 +22,8 @@ comes in pairs:
   ``[storage.<name>.blobs]`` / ``.docs`` templates from the merged ``config.toml``
   into a ``(blob_cfg, doc_cfg)`` pair of :class:`StorageConfig`.
 - **Build** — :func:`make_blob_store` / :func:`make_doc_store` resolve a
-  ``provider`` dotted path to its interface subclass and construct it.
+  ``provider`` dotted path to its interface subclass and construct it;
+  :func:`check_store_configs` does the same resolution without constructing.
 - **Identify** — :func:`storage_fingerprint` hashes one backend's credential-free
   identity; :func:`storage_fingerprint_pair` seals the two together.
 - **Decide** — :func:`resolve_store_configs` picks *which* pair a given workspace
@@ -109,10 +110,20 @@ def make_doc_store(config: StorageConfig) -> DocStore:
     return store
 
 
+def check_store_configs(blob_cfg: StorageConfig, doc_cfg: StorageConfig) -> None:
+    """Resolve and validate both providers without constructing either store.
+
+    Everything :func:`make_blob_store` / :func:`make_doc_store` can reject from config
+    alone, but with no connection made — so a caller can fail fast before it writes
+    anything."""
+    for cfg, base in ((blob_cfg, BlobStore), (doc_cfg, DocStore)):
+        _import_store_class(cfg.provider, base).parse_config(cfg)
+
+
 # ------------------------------------------------------------ reading config
 
 
-def _config_from(section: Mapping[str, Any], root: Path) -> StorageConfig:
+def _config_from(section: Mapping[str, Any], root: Path, workspace_id: str | None) -> StorageConfig:
     """Build a :class:`StorageConfig` from one role table (``provider`` + the rest
     as ``options``). Raises :class:`StorageConfigInvalid` for a bad shape.
 
@@ -129,7 +140,7 @@ def _config_from(section: Mapping[str, Any], root: Path) -> StorageConfig:
         for k, v in section.items()
         if k != "provider" and k not in _ROLE_KEYS and not isinstance(v, dict)
     }
-    return StorageConfig(provider=provider, root=root, options=options)
+    return StorageConfig(provider=provider, root=root, options=options, workspace_id=workspace_id)
 
 
 def _select_service_table(section: Mapping[str, Any], service: str) -> Mapping[str, Any] | None:
@@ -154,7 +165,34 @@ def _select_service_table(section: Mapping[str, Any], service: str) -> Mapping[s
     return sub
 
 
-def _role_config(table: Mapping[str, Any] | None, role: str, root: Path) -> StorageConfig:
+def _workspace_id(workspace: Workspace) -> str | None:
+    """The id every :class:`StorageConfig` for ``workspace`` carries (see
+    :attr:`~dgml_core.storage_service.StorageConfig.workspace_id`).
+
+    Read store-free — from the store of workspaces for a listed workspace, else from
+    ``config.toml``'s ``[workspace]`` block — never from ``workspace.json``, which lives
+    *in* the document store and so cannot be read before that store is built."""
+    from . import workspace_config
+
+    return workspace.workspaces_id or workspace_config.read_identity(workspace).workspace_id
+
+
+def _role_configs(
+    table: Mapping[str, Any] | None, workspace: Workspace, workspace_id: str | None
+) -> tuple[StorageConfig, StorageConfig]:
+    """Resolve both roles (``blobs``, ``docs``) of a service table, for ``workspace_id``
+    when given, else for the id ``workspace`` records."""
+    root = workspace.root
+    workspace_id = workspace_id or _workspace_id(workspace)
+    return (
+        _role_config(table, "blobs", root, workspace_id),
+        _role_config(table, "docs", root, workspace_id),
+    )
+
+
+def _role_config(
+    table: Mapping[str, Any] | None, role: str, root: Path, workspace_id: str | None
+) -> StorageConfig:
     """Resolve one role (``"blobs"``/``"docs"``) of a service table to a
     :class:`StorageConfig`. A per-role sub-table wins; else a flat top-level
     ``provider`` serves both roles; else (role omitted / no config) the bundled
@@ -162,14 +200,17 @@ def _role_config(table: Mapping[str, Any] | None, role: str, root: Path) -> Stor
     if table is not None:
         sub = table.get(role)
         if isinstance(sub, dict):
-            return _config_from(sub, root)
+            return _config_from(sub, root, workspace_id)
         if isinstance(table.get("provider"), str):
-            return _config_from(table, root)  # flat: one provider for both roles
-    return StorageConfig(provider=DEFAULT_STORAGE_PROVIDER, root=root)
+            return _config_from(table, root, workspace_id)  # flat: one provider for both roles
+    return StorageConfig(provider=DEFAULT_STORAGE_PROVIDER, root=root, workspace_id=workspace_id)
 
 
 def load_store_configs(
-    workspace: Workspace, service: str = DEFAULT_STORAGE_SERVICE
+    workspace: Workspace,
+    service: str = DEFAULT_STORAGE_SERVICE,
+    *,
+    workspace_id: str | None = None,
 ) -> tuple[StorageConfig, StorageConfig]:
     """Resolve a named service into a ``(blob_cfg, doc_cfg)`` pair.
 
@@ -181,11 +222,14 @@ def load_store_configs(
     ``"default"`` service; no ``[storage]`` at all → both roles on local disk (zero
     config).
 
+    ``workspace_id`` is the id the configs are for; by default the one ``workspace``
+    records. ``workspace create`` passes the id it is about to write, so it can validate
+    the binding before the config exists.
+
     Validates only the *generic shape* — provider resolution and field validation
     happen lazily in :func:`make_blob_store` / :func:`make_doc_store`. Raises
     :class:`StorageConfigInvalid` for a malformed shape or an unknown named service.
     """
-    root = workspace.root
     section = load_merged_config(workspace).get(ConfigSection.STORAGE) or {}
     if not isinstance(section, dict):
         raise StorageConfigInvalid("'storage' must be a table")
@@ -194,7 +238,7 @@ def load_store_configs(
         raise StorageConfigInvalid(f"no [storage.{service}] configured")
     if table is not None:
         _reject_mixed_form(table, service)
-    blobs, docs = _role_config(table, "blobs", root), _role_config(table, "docs", root)
+    blobs, docs = _role_configs(table, workspace, workspace_id)
     _reject_borrowed_workspace_path(blobs, docs, service, workspace)
     return blobs, docs
 
@@ -255,12 +299,22 @@ def resolve_store_configs(workspace: Workspace) -> tuple[StorageConfig, StorageC
     from . import workspace_config
 
     service = workspace_config.read_identity(workspace).storage_service or DEFAULT_STORAGE_SERVICE
+    return resolve_service_configs(workspace, service)
+
+
+def resolve_service_configs(
+    workspace: Workspace, service: str, *, workspace_id: str | None = None
+) -> tuple[StorageConfig, StorageConfig]:
+    """The pair ``workspace`` would open with if bound to ``service`` — its own
+    ``[storage.<service>]`` whole when it defines one, else the merged config's.
+    ``workspace_id`` as in :func:`load_store_configs`."""
+    from . import workspace_config
+
     own = workspace_config.read_storage_table(workspace, service)
-    if own is not None:
-        root = workspace.root
-        _reject_mixed_form(own, service)
-        return _role_config(own, "blobs", root), _role_config(own, "docs", root)
-    return load_store_configs(workspace, service)
+    if own is None:
+        return load_store_configs(workspace, service, workspace_id=workspace_id)
+    _reject_mixed_form(own, service)
+    return _role_configs(own, workspace, workspace_id)
 
 
 def verify_storage_fingerprint(workspace: Workspace) -> None:

@@ -43,6 +43,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath
 
 # ---------------------------------------------------------------- directories
 
@@ -140,6 +141,25 @@ def file_prefix(file_id: str) -> str:
 def file_source_key(file_id: str, filename: str) -> str:
     """The stored original (or the PDF converted from it), under its own name."""
     return f"{file_prefix(file_id)}{filename}"
+
+
+def pdf_filename(filename: str) -> str:
+    """The name of the PDF for a source called *filename*.
+
+    A ``.pdf`` source (any case of the suffix) is its own PDF and keeps its
+    name as stored, so ``INVOICE.PDF`` stays ``INVOICE.PDF``. A convertible
+    source gets the PDF converted from it as a sibling, ``<stem>.pdf``. This is
+    the one place that rule is written: ``file add`` stores by it, and
+    extraction and generation find the PDF by it."""
+    if filename.lower().endswith(".pdf"):
+        return filename
+    return str(PurePosixPath(filename).with_suffix(".pdf"))
+
+
+def file_pdf_key(file_id: str, original_filename: str) -> str:
+    """The stored PDF for a file added as *original_filename*: the source
+    itself for a ``.pdf``, else the PDF converted from it."""
+    return file_source_key(file_id, pdf_filename(original_filename))
 
 
 def file_pages_prefix(file_id: str) -> str:

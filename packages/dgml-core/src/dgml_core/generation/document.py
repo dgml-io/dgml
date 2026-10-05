@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
+from dgml_core import layout
 from dgml_core.conversion import ConverterConfig, convert_to_pdf_bytes
 from dgml_core.pages import PdfConfig, slice_pages
 
@@ -46,7 +47,7 @@ def load_document_as_pdf(
     # byte-identical to what the workspace page images were rendered from.
     # Falls through to on-demand conversion for files added before conversions
     # were persisted, or non-workspace inputs.
-    converted = path.with_suffix(".pdf")
+    converted = path.with_name(layout.pdf_filename(path.name))
     if converted.exists():
         return load_pdf(converted)
     return convert_to_pdf_bytes(path, converters)

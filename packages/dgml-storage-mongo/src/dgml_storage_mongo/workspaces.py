@@ -133,6 +133,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 from dgml_core.errors import (
@@ -141,14 +142,12 @@ from dgml_core.errors import (
     WorkspacesUnavailable,
     WorkspacesWriteConflict,
 )
-from dgml_core.layout import Collection
 from dgml_core.workspaces_store import WorkspacesConfig, WorkspacesStore
 
 from ._client import IDENTITY_FIELDS, WORKSPACES_URI_ENV, connect, validate_identity
 
-#: Default collection. Prefixed rather than a bare ``workspaces`` because that is one
-#: character from ``Collection.WORKSPACE`` — safe today, but not a thing to rely on in a
-#: database that may also hold a workspace's own documents.
+#: Default collection. Prefixed rather than a bare ``workspaces`` so it reads as DGML's
+#: in a database that may also hold other applications' collections.
 DEFAULT_COLLECTION = "dgml_workspaces"
 
 #: This document shape's own version, independent of a workspace's schema_version.
@@ -189,15 +188,9 @@ class MongoWorkspacesStore(WorkspacesStore):
             raise WorkspacesConfigInvalid(
                 "'workspaces.mongo_collection' must be a non-empty string"
             )
-        # Executable form of the collision argument the GridFS store only makes in prose:
-        # this collection may share a database with a workspace's own documents, so it
-        # must not be able to shadow one of them or a GridFS bucket.
-        if collection in {member.value for member in Collection}:
-            raise WorkspacesConfigInvalid(
-                f"'workspaces.mongo_collection' cannot be {collection!r}: that is a "
-                f"collection a workspace's own documents use, and the two may share a "
-                f"database"
-            )
+        # This collection may share a database with a workspace's own documents. Those
+        # are named `<prefix>_<workspace id>_<name>`, which a collection name would only
+        # match on purpose — but a GridFS bucket's collections are easy to hit.
         if collection.endswith((".files", ".chunks")):
             raise WorkspacesConfigInvalid(
                 f"'workspaces.mongo_collection' cannot be {collection!r}: '.files' and "
@@ -301,6 +294,30 @@ class MongoWorkspacesStore(WorkspacesStore):
                 f"Its config is written whole, so overwriting would discard whatever that "
                 f"writer changed. Re-run the command to work from the current config."
             )
+
+    def create_config(self, workspace_id: str, text: str) -> None:
+        # A plain insert, so the unique `_id` index decides a race: of two concurrent
+        # claims exactly one succeeds, and the loser conflicts instead of replacing the
+        # winner's row — the semantics an upsert cannot give.
+        from pymongo.errors import DuplicateKeyError
+
+        derived = self._derive(workspace_id, text)
+        with self._reachable():
+            try:
+                self._docs.insert_one(
+                    {
+                        "_id": workspace_id,
+                        "config_toml": text,
+                        **derived,
+                        "updated_at": datetime.now(tz=UTC),
+                        "schema_version": CATALOG_SCHEMA_VERSION,
+                    }
+                )
+            except DuplicateKeyError:
+                raise WorkspacesWriteConflict(
+                    f"cannot create a config for {workspace_id} in {self.label()}: it "
+                    f"already holds one, and creating never replaces it."
+                ) from None
 
     def list_configs(self) -> dict[str, str]:
         with self._reachable():

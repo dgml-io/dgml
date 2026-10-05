@@ -476,14 +476,43 @@ mongo_database = "dgml"
   not define the service itself resolves it from here, so an edit takes effect after
   `dgml workspace reseal <path>` accepts it. A workspace that *does* define
   `[storage.<name>]` in its own config is unaffected — storage does not layer.
+- **Each workspace gets its own namespace in a shared backend.** A bucket or database
+  named in a template is usually shared — by every workspace created from it, and
+  often by other applications. So the S3 and MongoDB stores always put a workspace's
+  data under its **workspace id**, after an optional `prefix` you choose:
+
+  | Backend | `prefix` | Data lands in |
+  |---|---|---|
+  | S3 | not set | `s3://<bucket>/dgml/<id>/files/…` |
+  | S3 | `"contracts"` | `s3://<bucket>/contracts/<id>/files/…` |
+  | MongoDB | not set | collections `dgml_<id>_files`, …, GridFS bucket `dgml_<id>_blobs` |
+  | MongoDB | `"contracts"` | collections `contracts_<id>_files`, …, GridFS bucket `contracts_<id>_blobs` |
+
+  The id is added when the store is opened, not written into config, so `config.toml`
+  holds only the `prefix` you wrote — and a template can be shared by any number of
+  workspaces as it is. It comes from the `workspace_id` in `config.toml`'s
+  `[workspace]` block, which `workspace create` writes and which never changes, so a
+  workspace's data never moves. Local-disk storage is already per-workspace and has no
+  prefix.
 
 ### The `[models]` tiers
 
-The simplest way to configure models is the `[models]` block — four tiers that
-back the per-task models:
+The simplest way to configure models is the `[models]` block. One `family` key
+picks a whole provider family's curated defaults for the four tiers that back
+the per-task models:
 
 ```toml
 [models]
+family = "anthropic_google"   # or anthropic / google / openai
+```
+
+A family-based config *tracks* dgml's shipped defaults — an upgrade may move a
+tier to a newer model. To pin models, set explicit tiers, with or without a
+family (an explicit tier always overrides its family default):
+
+```toml
+[models]
+family   = "anthropic_google"
 light    = "gemini/gemini-flash-lite-latest"  # classification, style
 standard = "anthropic/claude-haiku-4-5"    # transcription, text extraction
 advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
@@ -497,17 +526,24 @@ falls back to the nearest set tier (nearest lower first, then higher) with a
 warning — so a minimal config that sets only, say, `standard` still resolves
 every task.
 
+`family` is shorthand for its four tiers *within its config layer*: tiers that
+layer leaves unset are filled from the family before the layers merge. So a
+workspace config (or `DGML_MODELS__FAMILY`) setting `family = "openai"` replaces
+explicit tiers in the user config, while tiers set in the same layer as the
+family, or a higher one, still override it. To drop a user-level pin in one
+workspace, restate the family there.
+
 Tiers name only models — they carry no credentials. Credentials are configured
 per task on the task's own section (e.g. `generation.api_key_env`,
 `grounded.schema_api_key`); a model sourced from a tier uses its task section's
 credentials, or falls back to litellm's per-provider env var when the section
 sets none.
 
-`dgml init --provider {anthropic,google,mixed,openai}` writes a ready-made
-`[models]` table; omit `--provider` to auto-detect from the API-key env vars
-that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` — checked
-in that order, so an OpenAI key never overrides a provider the other two
-already resolve).
+`dgml init --provider {anthropic,anthropic_google,google,openai}` writes a
+family-only `[models]` block; omit `--provider` to auto-detect from the API-key
+env vars that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`
+— checked in that order, so an OpenAI key never overrides a provider the other
+two already resolve).
 
 **Secrets policy.** By default config references API keys via `*_api_key_env`
 env-var-name fields (which store the env var name, not the secret). Every
@@ -610,6 +646,12 @@ Field rules:
   its tier; when unset, litellm uses its per-provider env var.
 - `max_tool_iters` — optional positive int, default 20. Cap on
   `get_page_words` tool calls per extraction.
+- `values_reasoning_effort` — optional, default `"medium"`. The reasoning budget
+  of the value-extraction call: one of `"none"`, `"minimal"`, `"low"`,
+  `"medium"`, `"high"`, `"xhigh"` (passed to the provider through litellm), or
+  `"default"` to send no reasoning effort and take the provider's own default.
+  It is the largest cost and latency dial on extraction, and the right setting
+  differs by model. Location grounding is not affected.
 
 ### `generation` (required for `dgml docset generate`)
 
@@ -642,8 +684,8 @@ Field rules:
 - Transcription credentials: `api_key` / `api_key_env` / `api_base`.
 - Labeling credentials: `label_api_key` / `label_api_key_env` /
   `label_api_base`. The two models carry **independent** credentials because
-  they may name different providers (e.g. the default `mixed` config transcribes
-  on Anthropic and labels on Gemini). These apply whether the models are set here
+  they may name different providers (e.g. the `anthropic_google` family blends
+  Gemini and Anthropic models). These apply whether the models are set here
   or come from their tiers; when unset, litellm uses its per-provider env var.
 - `thinking` — optional; `"disabled"` (default) or `"adaptive"`. Anthropic
   extended thinking, applied to **both** passes; ignored for non-Anthropic
@@ -888,7 +930,8 @@ governs the generated full-document tree; the extraction schema governs the
 (`full-extraction`). The body is the planner's `Schema` document
 (canonical tag names plus per-tag metadata). Generation also writes a
 `cache/` at the docset root. It holds **functional** files the next
-`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`,
+`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json` (one per
+chunk whose reply parsed; a bisected chunk's halves are `cNNa`/`cNNb`),
 `concept_roster.json` (the flat legacy vocabulary; incremental reuse prefers
 the docset's `authored-schema.json`, then its `schema.json`, and falls back to
 this file), and

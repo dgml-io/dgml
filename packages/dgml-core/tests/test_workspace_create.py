@@ -25,8 +25,13 @@ from pathlib import Path
 import pytest
 from dgml_core import (
     ConflictError,
+    CorruptMetadata,
     InvalidArgument,
+    StorageConfigInvalid,
+    StorageProviderUnresolvable,
     Workspace,
+    WorkspacesUnavailable,
+    WorkspacesWriteConflict,
     create_workspace,
     default_workspaces_store,
 )
@@ -78,6 +83,37 @@ def test_detached_create_at_a_path(tmp_path: Path) -> None:
     assert result.identity.name == "det"  # falls back to the directory name
     # A detached workspace is not listed.
     assert default_workspaces_store().list_ids() == []
+
+
+def test_detached_create_validates_under_the_id_it_will_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store that namespaces by workspace id refuses a config without one, and create
+    validates the binding before the config exists — so the check must run under the id
+    about to be written, not under none."""
+    import sys
+
+    from dgml_core import LocalStore, StorageConfig
+
+    seen: list[str | None] = []
+
+    class IdRequiringStore(LocalStore):
+        @classmethod
+        def parse_config(cls, config: StorageConfig) -> StorageConfig:
+            seen.append(config.workspace_id)
+            if not config.workspace_id:
+                raise StorageConfigInvalid("needs the workspace's id")
+            return super().parse_config(config)
+
+    monkeypatch.setattr(sys.modules[__name__], "IdRequiringStore", IdRequiringStore, raising=False)
+    seed = f'[storage.svcb]\nprovider = "{__name__}:IdRequiringStore"\n'
+    result = create_workspace(
+        Workspace(root=tmp_path / "det"),
+        organization="Acme",
+        storage_service="svcb",
+        seed_toml=seed,
+    )
+    assert seen and all(wid == result.identity.workspace_id for wid in seen)
 
 
 def test_rerun_preserves_recorded_identity() -> None:
@@ -185,6 +221,7 @@ def test_seed_that_is_not_toml_is_rejected_before_anything_is_written() -> None:
 def test_organization_is_required_for_a_new_workspace() -> None:
     with pytest.raises(InvalidArgument, match="organization is required"):
         create_workspace(workspace_id="acme")
+    assert default_workspaces_store().list_ids() == []
 
 
 def test_seed_that_declares_only_other_services_is_refused() -> None:
@@ -197,6 +234,225 @@ def test_seed_that_declares_only_other_services_is_refused() -> None:
             storage_service="default",
             seed_toml=SEED_SVCA,
         )
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_seeded_unknown_service_is_answered_with_the_declared_ones() -> None:
+    """A mistyped service must be answered with the services the seed *does* declare —
+    resolving it first buried that under a bare 'no [storage.<service>] configured'."""
+    with pytest.raises(InvalidArgument, match=r"does declare \[storage.svca\]"):
+        create_workspace(
+            workspace_id="acme",
+            organization="Acme",
+            storage_service="mystorage",
+            seed_toml=SEED_SVCA,
+        )
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_unknown_storage_service_leaves_no_row() -> None:
+    with pytest.raises(StorageConfigInvalid):
+        create_workspace(workspace_id="bad-svc", organization="A", storage_service="nope")
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_unresolvable_provider_leaves_no_row_and_retry_succeeds() -> None:
+    """Resolved before anything is built, and the claimed row removed on failure — so the
+    same id can be retried once the seed is fixed."""
+    bad = SEED_SVCA.replace('"dgml_core.storage_local:LocalStore"', '"local"')
+    with pytest.raises(StorageProviderUnresolvable):
+        create_workspace(
+            workspace_id="acme", organization="Acme", storage_service="svca", seed_toml=bad
+        )
+    assert default_workspaces_store().list_ids() == []
+
+    result = create_workspace(
+        workspace_id="acme", organization="Acme", storage_service="svca", seed_toml=SEED_SVCA
+    )
+    assert result.identity.workspace_id == "acme"
+
+
+def test_seed_is_refused_against_a_different_existing_config(tmp_path: Path) -> None:
+    ws = Workspace(root=tmp_path / "ws")
+    create_workspace(ws, organization="Acme")
+    before = ws.config_text
+    with pytest.raises(InvalidArgument, match="differs from the seed config"):
+        create_workspace(ws, storage_service="svca", seed_toml=SEED_SVCA)
+    assert Workspace(root=ws.root).config_text == before
+
+
+def test_detached_seeded_create_that_fails_leaves_no_config(tmp_path: Path) -> None:
+    """The seed this call wrote is removed on failure — so the documented retry with a
+    fixed seed succeeds instead of being refused as 'differs from the seed'."""
+    root = tmp_path / "ws"
+    bad = SEED_SVCA.replace('"dgml_core.storage_local:LocalStore"', '"local"')
+    with pytest.raises(StorageProviderUnresolvable):
+        create_workspace(
+            Workspace(root=root), organization="Acme", storage_service="svca", seed_toml=bad
+        )
+    assert not root.exists()
+
+    result = create_workspace(
+        Workspace(root=root), organization="Acme", storage_service="svca", seed_toml=SEED_SVCA
+    )
+    assert result.identity.storage_service == "svca"
+
+
+def test_failed_seeded_create_keeps_a_preexisting_directory(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "notes.txt").write_text("keep me", encoding="utf-8")
+    bad = SEED_SVCA.replace('"dgml_core.storage_local:LocalStore"', '"local"')
+    with pytest.raises(StorageProviderUnresolvable):
+        create_workspace(
+            Workspace(root=root), organization="Acme", storage_service="svca", seed_toml=bad
+        )
+    assert not (root / "config.toml").exists()
+    assert (root / "notes.txt").read_text(encoding="utf-8") == "keep me"
+
+
+def test_seed_against_a_corrupt_config_reports_the_corruption(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "config.toml").write_text("[storage\nnot toml\n", encoding="utf-8")
+    with pytest.raises(CorruptMetadata, match="invalid TOML"):
+        create_workspace(Workspace(root=root), organization="Acme", seed_toml=SEED_SVCA)
+
+
+def test_a_failing_rollback_does_not_mask_the_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(workspace_id: str) -> bool:
+        raise OSError("disk went away")
+
+    monkeypatch.setattr(default_workspaces_store(), "delete", boom)
+    with pytest.raises(InvalidArgument, match="organization is required"):
+        create_workspace(workspace_id="acme")
+
+
+def test_addressed_rollback_holds_on_a_conflict_detecting_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resetting a row addressed by id must be conditional on the store's *current* text, not the
+    stale memo of the Workspace the create started from. The build's last write goes
+    through a fresh Workspace, so on a backend that enforces ``expected_text`` (Mongo,
+    Postgres) a stale token makes the reset fail silently — stranding the seed, and with
+    it the documented retry. The local store ignores the token, so this test teaches it
+    to enforce it."""
+    store = default_workspaces_store()
+    real_write = store.write_config
+
+    def conditional(workspace_id: str, text: str, *, expected_text: str | None = None) -> None:
+        if expected_text is not None and store.read_config(workspace_id) != expected_text:
+            raise WorkspacesWriteConflict("another writer changed it since it was read")
+        real_write(workspace_id, text, expected_text=expected_text)
+
+    monkeypatch.setattr(store, "write_config", conditional)
+    store.create_config("acme", "")
+    ws = Workspace(root=store.workspace_root("acme"), workspaces_id="acme")
+
+    from dgml_core.migrations import stamp_schema_version
+
+    calls = {"n": 0}
+
+    def flaky_stamp(workspace: Workspace) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("the backend went away after the seal")
+        stamp_schema_version(workspace)
+
+    monkeypatch.setattr("dgml_core.workspace_create.stamp_schema_version", flaky_stamp)
+    with pytest.raises(RuntimeError):
+        create_workspace(ws, organization="Acme", storage_service="svca", seed_toml=SEED_SVCA)
+    assert store.read_config("acme") == ""  # the seed this call wrote is gone
+
+    retry = create_workspace(
+        Workspace(root=store.workspace_root("acme"), workspaces_id="acme"),
+        organization="Acme",
+        storage_service="svca",
+        seed_toml=SEED_SVCA,
+    )
+    assert retry.identity.workspace_id == "acme"
+    assert retry.identity.storage_service == "svca"
+
+
+def test_a_claim_that_fails_after_applying_is_rolled_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ack of a successful claim can be lost (connection drops after the server
+    applied the insert). The failure must still remove the row, or every retry of the
+    same id is refused as CONFLICT — the stranding this create promises away."""
+    store = default_workspaces_store()
+    real = store.create_config
+
+    def applied_but_ack_lost(workspace_id: str, text: str) -> None:
+        real(workspace_id, text)
+        raise WorkspacesUnavailable("connection reset before the acknowledgement")
+
+    monkeypatch.setattr(store, "create_config", applied_but_ack_lost)
+    with pytest.raises(WorkspacesUnavailable):
+        create_workspace(workspace_id="acme", organization="Acme")
+    assert not store.exists("acme")
+
+    monkeypatch.undo()
+    assert create_workspace(workspace_id="acme", organization="Acme").identity.workspace_id
+
+
+def test_a_claim_that_fails_before_applying_leaves_another_writers_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same error can mean the insert never applied. If a row already sits under
+    the id, it is someone else's, and the lost-ack rollback must not delete it."""
+    store = default_workspaces_store()
+    theirs = create_workspace(workspace_id="acme", organization="Theirs")
+    their_text = store.read_config("acme")
+
+    def never_applied(workspace_id: str, text: str) -> None:
+        raise WorkspacesUnavailable("timed out before the insert was sent")
+
+    # `exists` is blinded so the pre-check does not refuse the id first: the claim
+    # itself must be what fails, with their row already there.
+    monkeypatch.setattr(store, "create_config", never_applied)
+    monkeypatch.setattr(store, "exists", lambda workspace_id: False)
+    with pytest.raises(WorkspacesUnavailable):
+        create_workspace(workspace_id="acme", organization="Acme")
+
+    assert store.read_config("acme") == their_text
+    assert theirs.identity.workspace_id == "acme"
+
+
+def test_a_conflicting_write_does_not_delete_the_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``WorkspacesWriteConflict`` during the build means another writer changed the
+    claimed row — it is theirs now, so the rollback must leave it in the store."""
+    store = default_workspaces_store()
+
+    def taken(*args: object, **kwargs: object) -> None:
+        raise WorkspacesWriteConflict("another writer changed it since it was read")
+
+    monkeypatch.setattr(store, "write_config", taken)
+    with pytest.raises(WorkspacesWriteConflict):
+        create_workspace(workspace_id="acme", organization="Acme")
+    assert store.exists("acme")
+
+
+def test_losing_the_claim_race_is_a_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A claim that loses the create-if-absent race reads exactly like an id the store
+    already held — the caller cannot tell them apart and should not have to."""
+    store = default_workspaces_store()
+
+    def lost(workspace_id: str, text: str) -> None:
+        raise WorkspacesWriteConflict("already holds one")
+
+    monkeypatch.setattr(store, "create_config", lost)
+    with pytest.raises(ConflictError) as caught:
+        create_workspace(workspace_id="acme", organization="Acme")
+    assert caught.value.kind == "workspace"
+    assert caught.value.existing_id == "acme"
+
+
+def test_rerun_with_the_same_seed_is_a_no_op(tmp_path: Path) -> None:
+    ws = Workspace(root=tmp_path / "ws")
+    first = create_workspace(ws, organization="Acme", storage_service="svca", seed_toml=SEED_SVCA)
+    again = create_workspace(ws, storage_service="svca", seed_toml=SEED_SVCA)
+    assert again.identity.workspace_id == first.identity.workspace_id
 
 
 # --------------------------------------- the store is consulted only when needed
@@ -212,6 +468,31 @@ def _configure_unimportable_workspaces_store() -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('[workspaces]\nprovider = "no_such_module:NoSuchStore"\n', encoding="utf-8")
     default_workspaces_store.cache_clear()
+
+
+def test_rerun_with_a_seed_declaring_workspace_keys_is_a_no_op(tmp_path: Path) -> None:
+    """``write_identity`` adds machine-managed keys (``workspace_id``, ``created_at``,
+    ``storage_fingerprint``…) beside what the seed declared, so the no-op check must ask
+    whether the keys the seed declares still stand — not whether the whole table stayed
+    exactly as written, which after a successful create it never has."""
+    seed = SEED_SVCA + '\n[workspace]\norganization = "Acme"\n'
+    first = create_workspace(
+        Workspace(root=tmp_path / "ws"), storage_service="svca", seed_toml=seed
+    )
+    assert first.identity.organization == "Acme"
+
+    again = create_workspace(
+        Workspace(root=tmp_path / "ws"), storage_service="svca", seed_toml=seed
+    )
+    assert again.identity.workspace_id == first.identity.workspace_id
+
+    # A seed whose declared value genuinely differs is still refused.
+    with pytest.raises(InvalidArgument, match="differs from the seed"):
+        create_workspace(
+            Workspace(root=tmp_path / "ws"),
+            storage_service="svca",
+            seed_toml=seed.replace('"Acme"', '"Beta"'),
+        )
 
 
 def test_detached_create_does_not_need_the_workspaces_store(tmp_path: Path) -> None:

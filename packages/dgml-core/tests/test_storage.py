@@ -16,9 +16,10 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from dgml_core.default_config import PROVIDER_MODELS
+from dgml_core.default_config import PROVIDER_API_KEYS, PROVIDER_MODELS
 from dgml_core.errors import InvalidArgument, WorkspaceNotFound
 from dgml_core.storage import (
+    API_KEY_ENV_VARS,
     Workspace,
     canonical_provider,
     detect_provider,
@@ -277,7 +278,7 @@ def test_user_config_path_xdg_wins_on_every_platform(
 
 
 def test_detect_provider() -> None:
-    assert detect_provider({"ANTHROPIC_API_KEY": "x", "GEMINI_API_KEY": "y"}) == "mixed"
+    assert detect_provider({"ANTHROPIC_API_KEY": "x", "GEMINI_API_KEY": "y"}) == "anthropic_google"
     assert detect_provider({"ANTHROPIC_API_KEY": "x"}) == "anthropic"
     assert detect_provider({"GEMINI_API_KEY": "y"}) == "google"
     assert detect_provider({"OPENAI_API_KEY": "z"}) == "openai"
@@ -299,7 +300,7 @@ def test_detect_provider_checks_openai_last() -> None:
     assert detect_provider({"GEMINI_API_KEY": "y", "OPENAI_API_KEY": "z"}) == "google"
     assert (
         detect_provider({"ANTHROPIC_API_KEY": "x", "GEMINI_API_KEY": "y", "OPENAI_API_KEY": "z"})
-        == "mixed"
+        == "anthropic_google"
     )
 
 
@@ -327,11 +328,21 @@ def test_every_provider_is_reachable_by_auto_detection_or_a_flag() -> None:
         assert canonical_provider(provider) == provider
 
 
+def test_every_provider_names_its_api_keys() -> None:
+    """`dgml init --provider X` looks X up in PROVIDER_API_KEYS after the config
+    is written, so a family in one table but not the other would crash there."""
+    assert set(PROVIDER_API_KEYS) == set(PROVIDER_MODELS)
+    for keys in PROVIDER_API_KEYS.values():
+        assert keys and set(keys) <= set(API_KEY_ENV_VARS)
+
+
 def test_canonical_provider_validates() -> None:
     assert canonical_provider("google") == "google"
-    assert canonical_provider("mixed") == "mixed"
+    assert canonical_provider("anthropic_google") == "anthropic_google"
     with pytest.raises(KeyError):
         canonical_provider("gemini")
+    with pytest.raises(KeyError):
+        canonical_provider("mixed")  # renamed to anthropic_google; no alias
     with pytest.raises(KeyError):
         canonical_provider("bogus")
 
@@ -339,17 +350,29 @@ def test_canonical_provider_validates() -> None:
 def test_render_config_toml_is_valid_and_complete() -> None:
     for provider in PROVIDER_MODELS:
         data = tomllib.loads(render_config_toml(provider))
-        assert set(data["models"]) == {"light", "standard", "advanced", "expert"}
+        assert data["models"] == {"family": provider}
     # Placeholder (no keys): the [models] block is commented out.
     placeholder = render_config_toml(None)
     assert "models" not in tomllib.loads(placeholder)
     assert "# [models]" in placeholder
+    assert '# family = "' in placeholder
+
+
+def test_rendered_family_expands_to_the_provider_defaults() -> None:
+    """Init-output → runtime round trip: the family-only [models] block that
+    `dgml init` writes must resolve every tier to PROVIDER_MODELS[provider]."""
+    from dgml_core.models_config import ConfigSection, expand_family, load_models_config
+
+    for provider, tiers in PROVIDER_MODELS.items():
+        models = tomllib.loads(render_config_toml(provider))["models"]
+        cfg = load_models_config({ConfigSection.MODELS: expand_family(models)})
+        assert {t: getattr(cfg, t) for t in tiers} == tiers
 
 
 def test_default_models_are_recognized_by_the_provider_router() -> None:
     """Every shipped default must be an id litellm knows.
 
-    `dgml init --provider X` writes these verbatim, and the LLM layer
+    `[models] family = "X"` resolves these at runtime, and the LLM layer
     pre-flights each model through `litellm.get_model_info`
     (`llm._require_supported_model`). A stale or mistyped default therefore
     produces a config that only fails on the user's first LLM call, with a
@@ -362,7 +385,7 @@ def test_default_models_are_recognized_by_the_provider_router() -> None:
         for tier, model in tiers.items():
             assert model_max_output_tokens(model) is not None, (
                 f"default {provider}/{tier} = {model!r} is not a model id litellm "
-                "recognizes; `dgml init` would write a config that fails on first use"
+                "recognizes; a family-based config would fail on first use"
             )
 
 
@@ -385,21 +408,25 @@ def test_write_user_config_create_then_refresh_with_backup(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     path = user_config_path()
 
+    def family(text: str) -> str:
+        value: str = tomllib.loads(text)["models"]["family"]
+        return value
+
     written, backup = write_user_config("anthropic", overwrite=False)
     assert written is True and backup is None
-    assert "anthropic/claude" in path.read_text(encoding="utf-8")
+    assert family(path.read_text(encoding="utf-8")) == "anthropic"
 
     # Without --refresh a present file is never clobbered.
     written2, backup2 = write_user_config("google", overwrite=False)
     assert written2 is False and backup2 is None
-    assert "anthropic/claude" in path.read_text(encoding="utf-8")
+    assert family(path.read_text(encoding="utf-8")) == "anthropic"
 
     # --refresh overwrites and backs up first.
     written3, backup3 = write_user_config("google", overwrite=True)
     assert written3 is True
     assert backup3 == path.with_suffix(".toml.bak")
-    assert "gemini/" in path.read_text(encoding="utf-8")
-    assert "anthropic/claude" in backup3.read_text(encoding="utf-8")
+    assert family(path.read_text(encoding="utf-8")) == "google"
+    assert family(backup3.read_text(encoding="utf-8")) == "anthropic"
 
 
 def test_write_user_config_backup_is_the_same_bytes(

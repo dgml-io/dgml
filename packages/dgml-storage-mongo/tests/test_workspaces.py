@@ -37,7 +37,6 @@ from dgml_core.errors import (
     WorkspacesUnavailable,
     WorkspacesWriteConflict,
 )
-from dgml_core.layout import Collection
 from dgml_core.workspaces_local import LocalDirWorkspacesStore
 from dgml_core.workspaces_store import WorkspacesConfig, WorkspacesStore
 from dgml_storage_mongo import MongoWorkspacesStore
@@ -86,19 +85,6 @@ def test_unknown_or_credential_fields_are_rejected(field: str) -> None:
         MongoWorkspacesStore.parse_config(cfg)
 
 
-@pytest.mark.parametrize("collection", sorted(member.value for member in Collection))
-def test_a_workspace_document_collection_is_refused(collection: str) -> None:
-    """This collection may share a database with a workspace's own documents, so it must
-    not be able to shadow one of them. The GridFS store makes this argument in prose;
-    here it is enforced."""
-    cfg = WorkspacesConfig(
-        provider="dgml_storage_mongo:MongoWorkspacesStore",
-        options={"mongo_database": "db", "mongo_collection": collection},
-    )
-    with pytest.raises(WorkspacesConfigInvalid, match="workspace's own documents"):
-        MongoWorkspacesStore.parse_config(cfg)
-
-
 @pytest.mark.parametrize("collection", ["blobs.files", "blobs.chunks"])
 def test_a_gridfs_collection_is_refused(collection: str) -> None:
     cfg = WorkspacesConfig(
@@ -135,6 +121,29 @@ def test_write_read_list_delete(workspaces_store: MongoWorkspacesStore) -> None:
     assert workspaces_store.delete(WID) is True
     assert workspaces_store.delete(WID) is False
     assert workspaces_store.list_ids() == []
+
+
+def test_create_config_claims_a_fresh_id(workspaces_store: MongoWorkspacesStore) -> None:
+    """The insert-only claim: the row lands complete — text, derived projection and
+    catalog version — exactly as a `write_config` row would."""
+    import hashlib
+
+    workspaces_store.create_config(WID, CONFIG)
+    assert workspaces_store.read_config(WID) == CONFIG
+    doc = workspaces_store._docs.find_one({"_id": WID})
+    assert doc is not None
+    assert doc["name"] == "Acme Contracts"
+    assert doc["config_sha256"] == hashlib.sha256(CONFIG.encode("utf-8")).hexdigest()
+    assert doc["schema_version"] == 1
+
+
+def test_create_config_never_replaces(workspaces_store: MongoWorkspacesStore) -> None:
+    """The unique `_id` index decides the race: the loser conflicts, the winner's row
+    survives byte for byte."""
+    workspaces_store.create_config(WID, CONFIG)
+    with pytest.raises(WorkspacesWriteConflict, match="never replaces"):
+        workspaces_store.create_config(WID, "[workspace]\nname = 'Usurper'\n")
+    assert workspaces_store.read_config(WID) == CONFIG
 
 
 def test_list_entries_derives_from_the_config(

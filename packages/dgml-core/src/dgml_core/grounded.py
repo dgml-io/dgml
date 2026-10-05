@@ -53,7 +53,7 @@ import base64
 import copy
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,6 +78,7 @@ from .extraction_schema import (
     FIELD_DATATYPES,
     Tag,
     Vocabulary,
+    check_invariant_paths,
     field_tree_to_rnc,
     parse_rnc,
     rnc_to_json_schema,
@@ -172,6 +173,14 @@ _DEFAULT_REASONING_EFFORT = "high"
 # keeps the default; see _PHASE3_GRID_REASONING_EFFORT for pages without them.
 _VALUES_REASONING_EFFORT = "medium"
 
+# What ``grounded.values_reasoning_effort`` (and ``--values-effort``) accept: the
+# effort names litellm takes, sent as given, plus ``"default"``, which sends no
+# ``reasoning_effort`` at all and leaves the budget to the provider. ``"none"``
+# is litellm's own value and is sent (it asks the provider to turn thinking
+# off), which is why omitting the field needs a word of its own.
+VALUES_REASONING_EFFORT_CHOICES = ("none", "minimal", "low", "medium", "high", "xhigh")
+VALUES_REASONING_EFFORT_PROVIDER_DEFAULT = "default"
+
 # Location grounding on a page with no OCR words (the 0-1000 grid path) runs at
 # "medium". There the model only reads a position off the image; at "high" it
 # spent most of its output reasoning without placing boxes any better. Measured
@@ -236,6 +245,26 @@ class GroundedConfig:
     schema_api_base: str | None = None
     values_api_base: str | None = None
     max_tool_iters: int = DEFAULT_MAX_TOOL_ITERS
+    # Reasoning budget of the value-extraction call (phase 1). ``None`` sends no
+    # ``reasoning_effort``; location grounding keeps its own constants.
+    values_reasoning_effort: str | None = _VALUES_REASONING_EFFORT
+
+
+def parse_values_reasoning_effort(raw: Any, *, source: str) -> str | None:
+    """Validate a values reasoning effort from the config file or the CLI.
+
+    Returns the effort to send, or ``None`` for ``"default"`` (send nothing).
+    ``source`` names where the value came from, for the error message.
+    """
+    if raw == VALUES_REASONING_EFFORT_PROVIDER_DEFAULT:
+        return None
+    if isinstance(raw, str) and raw in VALUES_REASONING_EFFORT_CHOICES:
+        return raw
+    accepted = ", ".join(
+        repr(v)
+        for v in (*VALUES_REASONING_EFFORT_CHOICES, VALUES_REASONING_EFFORT_PROVIDER_DEFAULT)
+    )
+    raise GroundedConfigInvalid(f"{source} must be one of {accepted} if set (got {raw!r})")
 
 
 def load_grounded_config(workspace: Workspace) -> GroundedConfig:
@@ -276,6 +305,13 @@ def load_grounded_config(workspace: Workspace) -> GroundedConfig:
         or max_tool_iters_raw < 1
     ):
         raise GroundedConfigInvalid("'grounded.max_tool_iters' must be a positive integer if set")
+    values_reasoning_effort = (
+        parse_values_reasoning_effort(
+            sec["values_reasoning_effort"], source="'grounded.values_reasoning_effort'"
+        )
+        if "values_reasoning_effort" in sec
+        else _VALUES_REASONING_EFFORT
+    )
 
     return GroundedConfig(
         schema_model=schema.model,
@@ -287,6 +323,7 @@ def load_grounded_config(workspace: Workspace) -> GroundedConfig:
         schema_api_base=schema.api_base,
         values_api_base=values.api_base,
         max_tool_iters=max_tool_iters_raw,
+        values_reasoning_effort=values_reasoning_effort,
     )
 
 
@@ -350,35 +387,41 @@ def get_page_words(
 def _pdf_bytes(workspace: Workspace, file_id: str) -> bytes:
     """Return the bytes of the single ``*.pdf`` stored for ``file_id``.
 
+    The PDF is found by the name ``file add`` stored it under
+    (:func:`layout.file_pdf_key`, from the record's ``original_filename``),
+    not by matching a suffix: a source named ``INVOICE.PDF`` is stored under
+    that name, so a case-sensitive ``.pdf`` match missed it. There is no
+    fallback scan: a filename is not unique in the workspace, so a PDF found
+    anywhere else under the prefix could belong to another source.
+
     A convertible source whose conversion failed at ``file add`` has a
     record but no PDF, and the converter's error is among the file's
     recorded errors: such a file raises :class:`ConversionFailed` repeating
     that error. A file with no PDF and no recorded conversion error raises
     :class:`FileNotFound` as before.
     """
-    keys = workspace.blobs.list_blobs(layout.file_prefix(file_id))
-    pdfs = [k for k in keys if k.endswith(".pdf")]
-    if not pdfs:
-        try:
-            failed = [
-                err.message.strip()
-                for err in load_recorded_errors(workspace, file_id)
-                if err.operation == CONVERT_TO_PDF_OPERATION
-                and isinstance(err.message, str)
-                and err.message.strip()
-            ]
-        except (TypeError, KeyError, ValueError, AttributeError):
-            # The lookup is a diagnostic: a malformed errors document (a
-            # wrong shape, a missing field) must not turn the missing PDF
-            # into an internal error; a record without a usable message is
-            # skipped the same way.
-            failed = []
-        if failed:
-            raise ConversionFailed(
-                f"file '{file_id}' has no source PDF: converting it failed: {failed[-1]}"
-            )
-        raise FileNotFound(f"file '{file_id}' has no source PDF")
-    return workspace.blobs.get_blob(pdfs[0])
+    pdf_key = layout.file_pdf_key(file_id, FileStore(workspace).get(file_id).original_filename)
+    if workspace.blobs.blob_exists(pdf_key):
+        return workspace.blobs.get_blob(pdf_key)
+    try:
+        failed = [
+            err.message.strip()
+            for err in load_recorded_errors(workspace, file_id)
+            if err.operation == CONVERT_TO_PDF_OPERATION
+            and isinstance(err.message, str)
+            and err.message.strip()
+        ]
+    except (TypeError, KeyError, ValueError, AttributeError):
+        # The lookup is a diagnostic: a malformed errors document (a
+        # wrong shape, a missing field) must not turn the missing PDF
+        # into an internal error; a record without a usable message is
+        # skipped the same way.
+        failed = []
+    if failed:
+        raise ConversionFailed(
+            f"file '{file_id}' has no source PDF: converting it failed: {failed[-1]}"
+        )
+    raise FileNotFound(f"file '{file_id}' has no source PDF")
 
 
 def _pdf_content_block(pdf_bytes: bytes) -> dict[str, Any]:
@@ -656,7 +699,8 @@ def extract_values(
     """
     store = DocSetStore(workspace)
     rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
-    vocab = parse_rnc(rnc_schema)
+    # A stored schema is not re-checked on read; here it is about to be used.
+    vocab = check_invariant_paths(parse_rnc(rnc_schema))
     schema = rnc_to_json_schema(rnc_schema)
     guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
     pdf_bytes = _pdf_bytes(workspace, file_id)
@@ -694,6 +738,7 @@ def extract_values(
     phase1_tool_schema_mode = "inlined"
     phase1_chunk_calls = 0
     phase1_truncated_retries = 0
+    phase1_counters = {"envelope_repairs": 0}
 
     try:
         # --- Phase 1: text + page numbers, no bboxes (LLM) ----------
@@ -759,6 +804,8 @@ def extract_values(
                 phase1_args, phase1_tool_calls, phase1_chunk_calls = _run_extract_loop(
                     workspace=workspace,
                     file_id=file_id,
+                    vocab=vocab,
+                    counters=phase1_counters,
                     messages=_phase1_messages(chunked=chunked),
                     tools=_phase1_tools(tool_schema, chunked=chunked),
                     chunked=chunked,
@@ -767,6 +814,7 @@ def extract_values(
                     api_base=api_base,
                     max_tool_iters=config.max_tool_iters,
                     totals=phase1_totals,
+                    reasoning_effort=config.values_reasoning_effort,
                 )
                 break
             except _OutputTruncated as exc:
@@ -784,6 +832,32 @@ def extract_values(
                 # Gemini's constrained decoder rejected the inlined schema;
                 # the model still sees the full schema in the user prompt.
                 phase1_tool_schema_mode = "permissive"
+        phase1_duration = round(time.monotonic() - phase1_started, 3)
+        # Keys that name no schema root, and roots whose value has the wrong
+        # shape, are dropped at serialization (the writer walks vocab.roots).
+        # A tree that had keys but keeps nothing would land as an empty
+        # <dg:extraction/> reported as success: refuse it here so the failure
+        # is visible. An empty tree, or one whose roots are all null, stays a
+        # legal "nothing found" outcome (the serializer reads null as "not
+        # extracted"), and leaf internals (a leaf without text, a collection
+        # of malformed entries) stay the serializer's business, as before.
+        # Recorded before the refusal below can raise, so a refused run's
+        # --debug usage row and stats sidecar still carry what phase 1 did.
+        tool_calls_total += phase1_tool_calls
+        phase1_layout = phase1_args.get("layout") or None
+        if not isinstance(phase1_layout, dict):
+            phase1_layout = None
+        submitted_keys = sorted(k for k, v in phase1_args["values"].items() if v is not None)
+        kept = _prune_to_vocabulary(phase1_args["values"], vocab)
+        if submitted_keys and not kept:
+            shown = ", ".join(repr(k) for k in submitted_keys[:6])
+            if len(submitted_keys) > 6:
+                shown += f" and {len(submitted_keys) - 6} more"
+            raise ValuesExtractionFailed(
+                f"{_TOOL_SUBMIT_VALUES!r} returned nothing that fits the schema: got keys "
+                f"{shown}, expected roots {sorted(tag.name for tag in vocab.roots)} "
+                "shaped as the schema defines; refusing to write an empty extraction"
+            )
         # Enforce the vocabulary code-side on exactly the paths whose payload
         # never met a provider-side shape check: permissive mode (the values
         # parameter was a bare object) and chunked mode (append_entries
@@ -793,13 +867,8 @@ def extract_values(
         # phases 2/3 rather than at serialization — a behavior change beyond
         # what these fallbacks need.
         if phase1_tool_schema_mode == "permissive" or chunked:
-            phase1_args["values"] = _prune_to_vocabulary(phase1_args["values"], vocab)
+            phase1_args["values"] = kept
         phase1_values = phase1_args["values"]
-        phase1_layout = phase1_args.get("layout") or None
-        if not isinstance(phase1_layout, dict):
-            phase1_layout = None
-        tool_calls_total += phase1_tool_calls
-        phase1_duration = round(time.monotonic() - phase1_started, 3)
         # The merged extracted_value leaf shape lets a sloppy model blur the
         # grounded/computed boundary; normalize before phases 2/3 (and the
         # serializer) so their invariants hold regardless.
@@ -957,6 +1026,7 @@ def extract_values(
                     phase1_tool_schema=phase1_tool_schema_mode,
                     phase1_chunk_calls=phase1_chunk_calls,
                     phase1_truncated_retries=phase1_truncated_retries,
+                    phase1_envelope_repairs=phase1_counters["envelope_repairs"],
                 )
         except Exception:
             pass
@@ -1024,6 +1094,7 @@ def _write_extraction_stats(
     phase1_tool_schema: str,
     phase1_chunk_calls: int,
     phase1_truncated_retries: int,
+    phase1_envelope_repairs: int,
 ) -> None:
     """Write ``extraction_stats.json`` into the file's marker directory.
 
@@ -1046,6 +1117,9 @@ def _write_extraction_stats(
                 # times phase 1 was restarted with the explicit chunking
                 # directive after a finish_reason='length' truncation.
                 "truncated_retries": phase1_truncated_retries,
+                # submit_values calls whose envelope had to be repaired before
+                # the tree could be read (see _repair_submit_values_args).
+                "envelope_repairs": phase1_envelope_repairs,
                 **phase1_totals,
             },
             "phase2": {"duration_s": phase2_duration},
@@ -1740,6 +1814,158 @@ def _append_entries_tool() -> dict[str, Any]:
     }
 
 
+_ENVELOPE_KEYS = frozenset({"values", "layout", "done"})
+
+
+def _repair_submit_values_args(
+    args: dict[str, Any], vocab: Vocabulary, *, chunked: bool = False
+) -> tuple[dict[str, Any], str | None]:
+    """Undo the ways a model mis-shapes a ``submit_values`` call, or leave it alone.
+
+    Three shapes have been captured in the wild, all from Anthropic models on
+    ordinary one-page invoices (dgml-io/dgml#154, #150). The tree inside each
+    is complete and correct; only the envelope around it is wrong:
+
+    * ``{"values": {"values": {...}, "layout": {...}}}`` -- the tool's own
+      parameter envelope repeated one level down, with ``values`` the only
+      top-level key.
+    * ``{"values": {"values": {...}}, "layout": {...}}`` -- the same, with
+      ``layout`` left at the top.
+    * ``{"values": "{\"values\": {...}}, \"layout\": {...} }"}`` -- the
+      envelope serialized as a JSON *string*, usually with the outer object
+      closed one brace early so the rest of the envelope trails it as text
+      (see :func:`_decode_string_envelope`).
+
+    Left alone, the first two pass every later phase (the nested leaves ground
+    fine) and then serialize as an empty ``<dg:extraction/>`` reported as a
+    success; the third raises.
+
+    The decision is by shape, not by key name: a candidate tree *fits* when
+    :func:`_prune_to_vocabulary` keeps something of it, the same check that
+    decides what serializes. A ``values`` object that fits is never touched,
+    whatever else it carries, so a well-formed tree always wins; a repair
+    happens only when the object as sent fits nothing and exactly one
+    candidate (one level down, or inside the string) does. When a schema
+    itself names a root ``values`` or ``layout`` the readings can collide: a
+    nested envelope then looks well-formed and is left alone, and a string
+    both readings of which fit is refused rather than guessed; either call
+    behaves as before this repair existed. Fitting is the vocabulary's
+    root-and-shape check, not a leaf check, so a leaf missing its ``text``
+    is the serializer's business as before. One envelope needs no fit: an
+    inner tree that is empty (a legal "nothing found") is recognized when
+    the wrapper around it carries only the envelope's own keys. Returns the
+    repaired ``args`` and a short label of the repair, or ``(args, None)``.
+    """
+
+    def fits(candidate: Any) -> bool:
+        return isinstance(candidate, dict) and bool(_prune_to_vocabulary(candidate, vocab))
+
+    def wraps_an_empty_tree(candidate: dict[str, Any]) -> bool:
+        inner = candidate.get("values")
+        return isinstance(inner, dict) and not inner and set(candidate) <= _ENVELOPE_KEYS
+
+    values = args.get("values")
+    if fits(values):
+        return args, None
+    repaired: dict[str, Any]
+    if isinstance(values, str) and values.lstrip().startswith("{"):
+        envelope = _decode_string_envelope(values)
+        if envelope is None:
+            return args, None
+        inner_fits, outer_fits = fits(envelope.get("values")), fits(envelope)
+        if (inner_fits or wraps_an_empty_tree(envelope)) and not outer_fits:
+            repaired = {"values": envelope["values"]}
+            _carry_envelope_fields(repaired, args, envelope, chunked=chunked)
+        elif outer_fits and not inner_fits:
+            # The string held the tree itself. A layout or done beside its
+            # roots is carried out as an envelope field; in the tree it is
+            # not a root and the serializer ignores it, as before.
+            repaired = {"values": envelope}
+            _carry_envelope_fields(repaired, args, envelope, chunked=chunked)
+        else:
+            return args, None
+        return repaired, "string"
+    if isinstance(values, dict) and (fits(values.get("values")) or wraps_an_empty_tree(values)):
+        repaired = {"values": values["values"]}
+        _carry_envelope_fields(repaired, args, values, chunked=chunked)
+        return repaired, "nested"
+    return args, None
+
+
+def _is_layout(candidate: Any) -> bool:
+    """Whether ``candidate`` is a ``layout`` the loop can use: a dict of
+    per-array descriptors of the shape :func:`_layout_param_schema`
+    declares (a known ``kind``, ``columns`` a list of names when present,
+    nothing else). An empty dict describes no array, so it is not one: a
+    ``layout: {}`` on the call must not shadow a populated layout left
+    inside the mis-shaped ``values``."""
+    if not isinstance(candidate, dict) or not candidate:
+        return False
+    for descriptor in candidate.values():
+        if not isinstance(descriptor, dict) or not set(descriptor) <= {"kind", "columns"}:
+            return False
+        if descriptor.get("kind") not in ("table", "free_form"):
+            return False
+        columns = descriptor.get("columns")
+        if columns is not None and not (
+            isinstance(columns, list) and all(isinstance(c, str) for c in columns)
+        ):
+            return False
+    return True
+
+
+def _carry_envelope_fields(
+    repaired: dict[str, Any],
+    outer: dict[str, Any],
+    inner: dict[str, Any] | None,
+    *,
+    chunked: bool,
+) -> None:
+    """Carry ``layout`` and ``done`` into a repaired call, by validity.
+
+    The call's own field wins when it is valid (a layout of known
+    descriptors, a ``bool`` done); otherwise the copy the model left inside
+    the mis-shaped ``values`` fills in, when it is valid. Anything else is
+    dropped, and the loop's defaults apply. ``done`` is a chunked-protocol
+    field: in single-shot mode it is not carried, so a stray ``done: false``
+    cannot turn one submission into a continuation the model was never
+    offered.
+    """
+    checks: list[tuple[str, Callable[[Any], bool]]] = [("layout", _is_layout)]
+    if chunked:
+        checks.append(("done", lambda v: isinstance(v, bool)))
+    for key, valid in checks:
+        outer_value = outer.get(key)
+        inner_value = inner.get(key) if inner is not None else None
+        if valid(outer_value):
+            repaired[key] = outer_value
+        elif valid(inner_value):
+            repaired[key] = inner_value
+
+
+def _decode_string_envelope(text: str) -> dict[str, Any] | None:
+    """Decode a ``submit_values`` envelope the model serialized as a string.
+
+    The damage seen is the outer object closed one brace early, so the rest
+    of the envelope (``"layout": {...}``, ``"done": false``) trails the first
+    complete object as extra text. Moving that brace to the end turns the
+    whole string back into the object the model meant to send, every field
+    included. Trailing text that does not read that way is not understood,
+    and ``None`` leaves the call to fail loudly as before.
+    """
+    text = text.strip()
+    try:
+        lead, end = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return None
+    if text[end:].strip():
+        try:
+            lead = json.loads(text[: end - 1] + text[end:])
+        except ValueError:
+            return None
+    return lead if isinstance(lead, dict) else None
+
+
 def _run_extract_loop(
     *,
     workspace: Workspace,
@@ -1751,17 +1977,24 @@ def _run_extract_loop(
     api_base: str | None,
     max_tool_iters: int,
     totals: dict[str, Any],
+    vocab: Vocabulary,
+    counters: dict[str, int],
     chunked: bool = False,
+    reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
 ) -> tuple[dict[str, Any], int, int]:
     """Run a multi-turn extraction loop until the model finishes submitting.
 
-    Returns ``(submit_args, tool_calls_run, chunk_calls)`` — ``submit_args``
+    Returns ``(submit_args, tool_calls_run, chunk_calls)``: ``submit_args``
     carries the merged ``values`` tree plus optional sibling fields like
     ``layout``; ``chunk_calls`` counts the submission calls (1 for the
     ordinary single ``submit_values``, more when the model used the chunked
-    protocol). Mutates ``totals`` by adding cost/token deltas from every
-    litellm call so the surrounding ``extract_values`` records a single
-    usage row across both phases.
+    protocol).
+    Mutates ``totals`` by adding cost/token deltas from every litellm call
+    so the surrounding ``extract_values`` records a single usage row across
+    both phases, and ``counters["envelope_repairs"]`` for every submission
+    whose argument envelope had to be unwrapped first (see
+    :func:`_repair_submit_values_args`, which decides against ``vocab``);
+    both survive a loop that fails after the repair.
 
     Two submission protocols:
 
@@ -1789,7 +2022,8 @@ def _run_extract_loop(
     # Anthropic — only forced tool_choice triggers the Anthropic drop. That
     # also makes this the only call site where the reasoning budget has any
     # effect on Claude, which is why :data:`_VALUES_REASONING_EFFORT` applies
-    # here and nowhere else.
+    # here and nowhere else. ``reasoning_effort`` is that constant unless the
+    # workspace set ``grounded.values_reasoning_effort`` (``None`` = send none).
     llm_config = LLMConfig(
         model=model,
         api_key=api_key,
@@ -1798,7 +2032,7 @@ def _run_extract_loop(
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
         timeout=_DEFAULT_TIMEOUT_SECONDS,
-        reasoning_effort=_VALUES_REASONING_EFFORT,
+        reasoning_effort=reasoning_effort,
     )
 
     tool_calls_run = 0
@@ -1863,6 +2097,9 @@ def _run_extract_loop(
                 ) from exc
 
             if name == _TOOL_SUBMIT_VALUES:
+                args, repaired = _repair_submit_values_args(args, vocab, chunked=chunked)
+                if repaired is not None:
+                    counters["envelope_repairs"] += 1
                 values = args.get("values")
                 if not isinstance(values, dict):
                     raise ValuesExtractionFailed(
@@ -2415,6 +2652,8 @@ def _resolve_api_key(literal: str | None, env_name: str | None) -> str | None:
 
 __all__ = [
     "DEFAULT_MAX_TOOL_ITERS",
+    "VALUES_REASONING_EFFORT_CHOICES",
+    "VALUES_REASONING_EFFORT_PROVIDER_DEFAULT",
     "ExtractionResult",
     "GroundedConfig",
     "extract_values",

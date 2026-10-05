@@ -48,7 +48,9 @@ by dotted path::
 
 Override a default only to avoid work the default would waste: ``exists`` fetches a
 whole config to answer a boolean, and ``list_entries`` parses every config to render a
-listing — a backend that can project fields server-side should say so.
+listing — a backend that can project fields server-side should say so. The exception is
+:meth:`~WorkspacesStore.create_config`, whose default is best-effort where an override
+can be atomic — a shared backend should decide the claim with its uniqueness primitive.
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .errors import WorkspacesConfigInvalid
+from .errors import WorkspacesConfigInvalid, WorkspacesWriteConflict
 from .provider import ProviderConfigFields
 from .workspace_config import WorkspaceIdentity, identity_from_text
 
@@ -213,6 +215,27 @@ class WorkspacesStore(ProviderConfigFields, ABC):
         """
 
     # ---------------------------------------------------------------- derived
+
+    def create_config(self, workspace_id: str, text: str) -> None:
+        """Create this workspace's ``config.toml``, **claiming the id** — never replaces.
+
+        Raises :class:`~dgml_core.errors.WorkspacesWriteConflict` when the store already
+        holds ``workspace_id``. This is how ``create_workspace`` claims an id, and the
+        never-replaces half is what its rollback relies on: a row this call could not
+        create is a row it must not delete.
+
+        This default is check-then-write and so only best-effort: two concurrent claims
+        can both pass the check, and the later write wins. A backend with a uniqueness
+        primitive should override it with a real atomic insert — the bundled backends do
+        (``open(…, "x")`` locally, ``insert_one`` on Mongo) — so that exactly one of two
+        racing claims succeeds.
+        """
+        if self.exists(workspace_id):
+            raise WorkspacesWriteConflict(
+                f"cannot create a config for {workspace_id} in {self.label()}: it "
+                f"already holds one, and creating never replaces it."
+            )
+        self.write_config(workspace_id, text)
 
     def exists(self, workspace_id: str) -> bool:
         """Whether this store holds ``workspace_id``.

@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import layout
@@ -48,7 +48,7 @@ from .errors import (
 from .hashing import sha256_file
 from .ids import RECORD_ID_SHAPE, is_record_id, new_id
 from .models import FileRecord
-from .ocr import extract_text_ocr, load_ocr_config
+from .ocr import extract_text_ocr, load_ocr_config, recover_unusable_pages
 from .pages import (
     DEFAULT_DPI,
     PdfConfig,
@@ -462,7 +462,8 @@ class FileStore:
         ``(None, message, converter_name)`` is returned so the file record is
         still created (consistent with the page-render / text soft-fail pattern).
         """
-        if source_key.lower().endswith(".pdf"):
+        pdf_key = layout.file_pdf_key(file_id, PurePosixPath(source_key).name)
+        if pdf_key == source_key:
             return source_key, None, None
 
         converters = load_conversion_config(self.ws)
@@ -484,7 +485,6 @@ class FileStore:
                 )
                 return None, message, converter_name
 
-        pdf_key = Path(source_key).with_suffix(".pdf").as_posix()
         self.ws.blobs.put_blob(pdf_key, pdf_bytes)
         return pdf_key, None, converter_name
 
@@ -599,6 +599,16 @@ class FileStore:
         try:
             with self.ws.blobs.staged_write(text_prefix) as text_dir:
                 result = extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
+                # Scanned pages with little or no text are OCR'd when a
+                # provider is available.
+                result = recover_unusable_pages(
+                    self.ws,
+                    pdf_path,
+                    text_dir,
+                    result,
+                    file_id=file_id,
+                    pages_prefix=layout.file_pages_prefix(file_id),
+                )
         except TextExtractionFailed as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
         return self._classify_and_record(result, file_id, page_count, mode_label="digital")

@@ -44,7 +44,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import layout
-from .errors import CorruptMetadata, WorkspacesConfigInvalid
+from .errors import CorruptMetadata, WorkspacesConfigInvalid, WorkspacesWriteConflict
 from .storage import write_text_atomic
 from .workspace_id import is_workspace_id
 from .workspaces_store import WorkspacesConfig, WorkspacesStore, default_workspaces_root
@@ -144,6 +144,30 @@ class LocalDirWorkspacesStore(WorkspacesStore):
         path = self._config_path(workspace_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, text)
+
+    def create_config(self, workspace_id: str, text: str) -> None:
+        # `open(…, "x")` (O_EXCL) is the claim: of two racing creates exactly one gets
+        # the file, and the loser conflicts instead of overwriting the winner. It is
+        # used over a hard-linked temp file deliberately — O_EXCL works on every
+        # filesystem, hard links do not (FAT, exFAT, many SMB/NFS/FUSE mounts). A
+        # content write that fails unclaims the name again; only a process killed
+        # between the two leaves an empty config, which the addressed re-run repairs
+        # because an empty config counts as none.
+        path = self._config_path(workspace_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fh = path.open("x", encoding="utf-8", newline="")
+        except FileExistsError:
+            raise WorkspacesWriteConflict(
+                f"cannot create a config for {workspace_id} in {self.label()}: it "
+                f"already holds one, and creating never replaces it."
+            ) from None
+        try:
+            with fh:
+                fh.write(text)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
 
     def list_configs(self) -> dict[str, str]:
         configs: dict[str, str] = {}

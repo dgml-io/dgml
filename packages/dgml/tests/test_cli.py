@@ -17,7 +17,9 @@ import os
 import shutil
 import sys
 import threading
+import tomllib
 from collections import Counter
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +38,7 @@ from dgml_core.migrations import (
 from dgml_core.run_clustering import DocPrediction
 from dgml_core.storage import ENV_VAR as WORKSPACE_ENV_VAR
 from dgml_core.storage import Workspace
+from dgml_core.storage_local import LocalStore
 from dgml_core.workspaces_resolve import default_workspaces_store
 
 from .conftest import (
@@ -106,8 +109,8 @@ def test_init_writes_user_config(tmp_path: Path, capsys: pytest.CaptureFixture[s
     payload = _read_stdout(capsys)
     assert payload["config_created"] is True
     assert payload["forced"] is False
-    # Both dummy provider keys are set by the autouse fixture → auto-detect mixed.
-    assert payload["provider"] == "mixed"
+    # Both dummy provider keys set by the autouse fixture → auto-detect the blend.
+    assert payload["provider"] == "anthropic_google"
     assert set(payload["detected_keys"]) == {"ANTHROPIC_API_KEY", "GEMINI_API_KEY"}
     assert "next_action" in payload
     cfg = user_config_path()
@@ -131,7 +134,36 @@ def test_init_provider_flag_forces_table(
     rc = main(_ws_args(tmp_path / "ws") + ["init", "--provider", "google"])
     assert rc == 0
     assert _read_stdout(capsys)["provider"] == "google"
-    assert "gemini/" in user_config_path().read_text(encoding="utf-8")
+    assert _config_family(user_config_path()) == "google"
+
+
+def _config_family(path: Path) -> str:
+    """The `[models] family` the written config names (the file carries no tiers)."""
+    value: str = tomllib.loads(path.read_text(encoding="utf-8"))["models"]["family"]
+    return value
+
+
+def test_init_forced_provider_reports_keys_and_override_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The forced branch gets the same "how to go beyond the family" hint as
+    auto-detect, plus which keys the family needs."""
+    rc = main(_ws_args(tmp_path / "ws") + ["--verbose", "init", "--provider", "anthropic_google"])
+    assert rc == 0
+    report = caplog.text
+    assert "ANTHROPIC_API_KEY and GEMINI_API_KEY" in report
+    assert "override a task" in report
+    assert "--provider <" in report
+
+
+def test_init_rejects_the_old_mixed_provider_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`mixed` was renamed to `anthropic_google` with no alias → argparse error."""
+    with pytest.raises(SystemExit) as exc:
+        main(_ws_args(tmp_path / "ws") + ["init", "--provider", "mixed"])
+    assert exc.value.code == 2
+    assert "anthropic_google" in capsys.readouterr().err
 
 
 def test_init_provider_openai_writes_openai_table(
@@ -142,7 +174,7 @@ def test_init_provider_openai_writes_openai_table(
     rc = main(_ws_args(tmp_path / "ws") + ["init", "--provider", "openai"])
     assert rc == 0
     assert _read_stdout(capsys)["provider"] == "openai"
-    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
+    assert _config_family(user_config_path()) == "openai"
 
 
 def test_init_auto_detects_openai_from_its_key_alone(
@@ -160,7 +192,7 @@ def test_init_auto_detects_openai_from_its_key_alone(
     payload = _read_stdout(capsys)
     assert payload["provider"] == "openai"
     assert payload["detected_keys"] == ["OPENAI_API_KEY"]
-    assert "openai/gpt-" in user_config_path().read_text(encoding="utf-8")
+    assert _config_family(user_config_path()) == "openai"
 
 
 def test_init_provider_without_force_does_not_clobber(
@@ -177,7 +209,7 @@ def test_init_provider_without_force_does_not_clobber(
     payload = _read_stdout(capsys)
     assert payload["config_created"] is False
     assert "--force" in payload["next_action"]
-    assert "anthropic/" in user_config_path().read_text(encoding="utf-8")  # unchanged
+    assert _config_family(user_config_path()) == "anthropic"  # unchanged
 
 
 def test_init_force_overwrites_with_backup(
@@ -193,7 +225,7 @@ def test_init_force_overwrites_with_backup(
     payload = _read_stdout(capsys)
     assert payload["forced"] is True
     cfg = user_config_path()
-    assert "gemini/" in cfg.read_text(encoding="utf-8")
+    assert _config_family(cfg) == "google"
     assert cfg.with_suffix(".toml.bak").exists()
 
 
@@ -420,7 +452,93 @@ def test_create_refuses_an_id_the_store_already_holds(
     error = _read_stderr(capsys)["error"]
     assert error["code"] == "CONFLICT"
     assert "my-workspace" in error["message"]
+    assert "--workspace my-workspace workspace create" in error["message"]
     assert store.read_config("my-workspace") == before
+
+
+def _bad_provider_seed(tmp_path: Path) -> Path:
+    seed = tmp_path / "seed.toml"
+    seed.write_text(
+        '[storage.acme.blobs]\nprovider = "local"\n\n[storage.acme.docs]\nprovider = "local"\n',
+        encoding="utf-8",
+    )
+    return seed
+
+
+def test_create_with_an_unresolvable_provider_leaves_no_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The provider is resolved before anything is built, and the row this run claimed is
+    removed on failure — so fixing the seed and retrying the same id just works."""
+    seed = _bad_provider_seed(tmp_path)
+    args = ["workspace", "create", "--id", "acme-corp", "--organization", "Acme"]
+    args += ["--storage", "acme", "--from-config", str(seed)]
+
+    assert main(args) == 1
+    assert _read_stderr(capsys)["error"]["code"] == "STORAGE_PROVIDER_UNRESOLVABLE"
+    assert not default_workspaces_store().exists("acme-corp")
+
+    seed.write_text(seed.read_text(encoding="utf-8").replace('"local"', f'"{_LOCAL}"'))
+    assert main(args) == 0
+    assert _read_stdout(capsys)["workspace_id"] == "acme-corp"
+
+
+def test_create_without_organization_leaves_no_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Otherwise every retry mints another orphan, since a generated id never repeats."""
+    assert main(["workspace", "create"]) == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+    assert default_workspaces_store().list_ids() == []
+
+
+def test_create_refuses_a_seed_that_would_replace_a_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A seed against a workspace that already has a different config is an error, never
+    silently dropped."""
+    ws = tmp_path / "ws"
+    assert main(["workspace", "create", str(ws), "--organization", "Acme"]) == 0
+    capsys.readouterr()
+    before = (ws / "config.toml").read_text(encoding="utf-8")
+
+    seed = tmp_path / "seed.toml"
+    seed.write_text(f'[storage.acme]\nprovider = "{_LOCAL}"\n', encoding="utf-8")
+    rc = main(["workspace", "create", str(ws), "--storage", "acme", "--from-config", str(seed)])
+    assert rc == 1
+    error = _read_stderr(capsys)["error"]
+    assert error["code"] == "INVALID_ARGUMENT"
+    assert "seed config" in error["message"]
+    assert (ws / "config.toml").read_text(encoding="utf-8") == before
+
+
+def test_create_rerun_with_the_same_seed_is_a_no_op(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = tmp_path / "seed.toml"
+    seed.write_text(f'[storage.acme]\nprovider = "{_LOCAL}"\n', encoding="utf-8")
+    args = ["workspace", "create", str(tmp_path / "ws"), "--organization", "Acme"]
+    args += ["--storage", "acme", "--from-config", str(seed)]
+    assert main(args) == 0
+    first = _read_stdout(capsys)["workspace_id"]
+    assert main(args) == 0
+    assert _read_stdout(capsys)["workspace_id"] == first
+
+
+def test_create_applies_a_seed_to_an_empty_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty config (e.g. a row stranded by an older dgml) is not a config to protect:
+    the seed is applied rather than ignored."""
+    default_workspaces_store().write_config("acme-corp", "")
+    seed = tmp_path / "seed.toml"
+    seed.write_text(f'[storage.acme]\nprovider = "{_LOCAL}"\n', encoding="utf-8")
+
+    args = ["--workspace", "acme-corp", "workspace", "create", "--organization", "Acme"]
+    assert main(args + ["--storage", "acme", "--from-config", str(seed)]) == 0
+    capsys.readouterr()
+    text = default_workspaces_store().read_config("acme-corp")
+    assert text is not None and "[storage.acme]" in text
 
 
 @pytest.mark.parametrize("bad", ["MyWorkspace", "ab", "my/ws", "my.ws", "-ws"])
@@ -617,6 +735,16 @@ def test_a_copied_workspace_directory_still_opens(
 # A named storage service pointing at the bundled local store — a real, working
 # backend exercised through the named-service path (no fake provider needed).
 _LOCAL = "dgml_core.storage_local:LocalStore"
+
+
+class _PrefixedLocalStore(LocalStore):
+    """The local store plus a ``prefix`` option — an identity-bearing option, so a seed
+    naming it seals to something other than the default service."""
+
+    config_fields = LocalStore.config_fields | {"prefix"}
+
+
+_PREFIXED = f"{__name__}:_PrefixedLocalStore"
 
 
 def _repoint_storage(ws_root: Path, service: str, provider: str) -> None:
@@ -2255,6 +2383,18 @@ def test_file_add_auto_classify_before_path_is_rejected(
     assert rc == 0
 
 
+@pytest.fixture
+def no_link_model() -> Iterator[None]:
+    """Run the semantic-link pass without a model: an empty plan per document.
+
+    ``docset generate`` links every document it writes. A test that mocks the
+    conversion but not the link pass sent that pass to the real provider and
+    passed only because the call failed. Tests about the link pass itself mock
+    it explicitly instead."""
+    with patch("dgml_core.generation.links.plan_links", return_value=[]):
+        yield
+
+
 def _init_with_docset(ws: Path, capsys: pytest.CaptureFixture[str], name: str = "X") -> str:
     """Init workspace, create one docset, return its id, drain stdout.
 
@@ -2405,6 +2545,7 @@ def test_docset_generate_skips_already_converted(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_happy_path(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2465,6 +2606,7 @@ def test_docset_generate_happy_path(
     assert opts.label_model == "anthropic/claude-sonnet-4-6"
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_cache_dir_and_debug_threading(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2566,6 +2708,7 @@ def test_docset_generate_missing_config_errors(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_models_from_config(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2611,6 +2754,7 @@ def test_docset_generate_models_from_config(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_model_flags_override_config(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2665,6 +2809,7 @@ def test_docset_generate_model_flags_override_config(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_profile_without_config(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2698,6 +2843,7 @@ def test_docset_generate_profile_without_config(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_schema_path_seeds_roster(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2749,6 +2895,7 @@ def test_docset_generate_schema_path_seeds_roster(
     assert kwargs["options"].parent_map == {"DueDate": "PaymentTerms"}
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_writes_schema_rnc(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2786,6 +2933,7 @@ def test_docset_generate_writes_schema_rnc(
     assert '# Description: "a synthetic role"' in text
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reuses_docset_roster_by_default(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2821,6 +2969,7 @@ def test_docset_generate_reuses_docset_roster_by_default(
     assert mock_batch.call_args.kwargs["options"].roster_seed is None
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reuse_prefers_schema_json(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2905,6 +3054,7 @@ def _docset_with_one_file(ws: Path, text_pdf: Path, capsys: pytest.CaptureFixtur
     return did
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_schema_path_closes_the_vocabulary(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2921,6 +3071,7 @@ def test_docset_generate_schema_path_closes_the_vocabulary(
     assert vocab.closed and vocab.names == {"PaymentTerms", "DueDate"}
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_closes_only_on_an_authored_vocabulary(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2963,6 +3114,7 @@ def test_docset_generate_closes_only_on_an_authored_vocabulary(
     assert options.vocab.closed
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_extend_schema_keeps_the_vocabulary_open(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2999,6 +3151,7 @@ def test_docset_generate_extend_schema_requires_a_schema(
     assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reports_added_concepts_under_extend_schema(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3029,6 +3182,7 @@ def test_docset_generate_reports_added_concepts_under_extend_schema(
         assert len([k for k in entry if k.endswith("_concepts")]) == 1
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_protects_the_authored_schema_from_its_own_output(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3070,6 +3224,7 @@ def test_docset_generate_protects_the_authored_schema_from_its_own_output(
     assert json.loads((docset_dir / "authored-schema.json").read_text(encoding="utf-8")) == authored
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reports_unmatched_concepts_per_file(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3103,6 +3258,7 @@ def test_docset_generate_reports_unmatched_concepts_per_file(
     }
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_omits_unmatched_concepts_when_nothing_was_refused(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3148,6 +3304,7 @@ def test_docset_generate_missing_source_is_per_file_failure(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_mixed_converted_and_failed(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3874,6 +4031,7 @@ def _generate_with_xml(
         return main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage", *extra])
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_grounds_in_place(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3910,6 +4068,7 @@ def test_docset_generate_grounds_in_place(
     assert not ws.blobs.blob_exists(f"{_out_dir}contract.dgml.grounding_stats.json")
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_debug_writes_grounding_stats(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3928,6 +4087,7 @@ def test_docset_generate_debug_writes_grounding_stats(
     )
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_leaves_file_ungrounded_without_page_text(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3952,6 +4112,7 @@ def test_docset_generate_leaves_file_ungrounded_without_page_text(
     assert "dg:origin" not in ws.blobs.get_blob(out_xml_key).decode("utf-8")
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_surfaces_label_error_but_still_converts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -5319,10 +5480,25 @@ def test_extraction_generate_schema_happy_path(
     _write_grounded_config(ws)
     ds_id = _new_docset(ws, capsys)
 
-    # Seed a source PDF where generation expects it (files/<id>/*.pdf), written
-    # through the store's staging bridge (zero-copy on LocalStore).
+    # Seed a file record and its source PDF where generation expects it
+    # (files/<id>/<original_filename>), written through the store's staging
+    # bridge (zero-copy on LocalStore).
+    from dgml_core.models import FileRecord
+
     fid = "filexyz12345"
     _wsx = Workspace(root=ws)
+    _wsx.docs.put_doc(
+        "files",
+        fid,
+        FileRecord(
+            id=fid,
+            original_path="/fake/doc.pdf",
+            original_filename="doc.pdf",
+            sha256="0" * 64,
+            added_at="2026-01-01T00:00:00Z",
+            page_count=1,
+        ).to_json(),
+    )
     with _wsx.blobs.staged_write(layout.file_prefix(fid)) as _stage:
         _write_blank_pdf(_stage / "doc.pdf", 1)
 
@@ -5413,6 +5589,60 @@ def test_extraction_extract_reports_a_failed_conversion(
     assert err["code"] == "CONVERSION_FAILED"
     assert err["message"].startswith(f"file '{fid}' has no source PDF: converting it failed: ")
     assert "openpyxl does not support the old .xls" in err["message"]
+    mock_completion.assert_not_called()
+
+
+def test_extraction_extract_values_effort_overrides_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--values-effort` replaces `grounded.values_reasoning_effort` for one
+    call: a named effort is sent as given, `default` sends none, and without
+    the flag the request carries the module default."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    schema_file = tmp_path / "schema.rnc"
+    schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
+    main(_ws_args(ws) + ["extraction", "set-schema", ds_id, "--schema-file", str(schema_file)])
+    capsys.readouterr()
+    fid = "fileeffort001"
+    _seed_file_dir(ws, fid, pages=1)
+    values = {"VendorName": {"text": "Acme", "locations": []}}  # empty locs → no phase 3
+    response = _tool_response("submit_values", {"values": values})
+    wsx = Workspace(root=ws)
+
+    def _extract(*flags: str) -> dict[str, Any]:
+        if wsx.blobs.blob_exists(layout.dgml_xml_key(ds_id, fid, "doc")):
+            wsx.blobs.delete_blob(layout.dgml_xml_key(ds_id, fid, "doc"))
+        with patch("litellm.completion", return_value=response) as m:
+            assert main(_ws_args(ws) + ["extraction", "extract", ds_id, fid, *flags]) == 0
+        capsys.readouterr()
+        return dict(m.call_args_list[0].kwargs)
+
+    assert _extract()["reasoning_effort"] == "medium"
+    assert _extract("--values-effort", "low")["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in _extract("--values-effort", "default")
+
+
+def test_extraction_extract_refuses_unknown_values_effort(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An effort the pipeline does not know is refused before the model is called."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    with patch("litellm.completion") as mock_completion:
+        rc = main(
+            _ws_args(ws) + ["extraction", "extract", ds_id, "somefile", "--values-effort", "turbo"]
+        )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "GROUNDED_CONFIG_INVALID"
+    assert "--values-effort" in err["message"]
     mock_completion.assert_not_called()
 
 
@@ -6132,7 +6362,7 @@ def test_from_config_binds_to_the_named_service(
 
     seed = tmp_path / "cfg" / "acme.toml"
     seed.parent.mkdir(parents=True)
-    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_LOCAL}"\nprefix = "acme"\n')
+    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_PREFIXED}"\nprefix = "acme"\n')
 
     ws = tmp_path / "ws"
     rc = main(
@@ -6168,7 +6398,7 @@ def test_create_seals_the_service_it_actually_bound_to(
     been created successfully.
     """
     seed = tmp_path / "acme.toml"
-    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_LOCAL}"\nprefix = "acme"\n')
+    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_PREFIXED}"\nprefix = "acme"\n')
 
     ws = tmp_path / "ws"
     main(
@@ -6494,7 +6724,7 @@ def test_re_running_create_keeps_the_recorded_storage_service(
     from dgml_core import workspace_config
 
     seed = tmp_path / "seed.toml"
-    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_LOCAL}"\nprefix = "acme"\n')
+    seed.write_text(f'[storage.acme.blobs]\nprovider = "{_PREFIXED}"\nprefix = "acme"\n')
     ws = tmp_path / "ws"
     main(
         [

@@ -23,9 +23,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
-from dgml_core.errors import CorruptMetadata, StorageProviderUnresolvable, WorkspacesConfigInvalid
+from dgml_core.errors import (
+    CorruptMetadata,
+    StorageProviderUnresolvable,
+    WorkspacesConfigInvalid,
+    WorkspacesWriteConflict,
+)
 from dgml_core.provider import import_provider_class
 from dgml_core.storage_local import LocalStore
 from dgml_core.workspace_id import generate_unique_workspace_id, new_workspace_id
@@ -67,6 +73,7 @@ class DerivedOnlyStore(LocalDirWorkspacesStore):
     exists = WorkspacesStore.exists
     list_ids = WorkspacesStore.list_ids
     list_entries = WorkspacesStore.list_entries
+    create_config = WorkspacesStore.create_config
 
 
 StoreFactory = Callable[[Path], WorkspacesStore]
@@ -114,6 +121,61 @@ def test_write_replaces(store: WorkspacesStore) -> None:
     assert found is not None
     assert "Renamed" in found
     assert "Acme Contracts" not in found
+
+
+def test_create_config_claims_a_fresh_id(store: WorkspacesStore) -> None:
+    wid = new_workspace_id()
+    store.create_config(wid, CONFIG)
+    assert store.read_config(wid) == CONFIG
+
+
+def test_create_config_never_replaces(store: WorkspacesStore) -> None:
+    wid = new_workspace_id()
+    store.create_config(wid, CONFIG)
+    with pytest.raises(WorkspacesWriteConflict):
+        store.create_config(wid, "[workspace]\nname = 'Usurper'\n")
+    assert store.read_config(wid) == CONFIG
+
+
+def test_create_config_that_cannot_write_leaves_the_id_unclaimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed content write must not strand a half-claimed file: the O_EXCL claim
+    alone would leave a partial config behind, turning every retry of the same id into a
+    conflict until someone hand-deleted it. The failure is injected on the handle the
+    claim returns, so the test holds however the text reaches it."""
+    local = _local(tmp_path / "workspaces")
+    wid = new_workspace_id()
+    real_open = Path.open
+
+    def open_without_space(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        fh: Any = real_open(self, mode, *args, **kwargs)
+        if "x" in mode:
+
+            def no_space(_: str) -> int:
+                raise OSError(28, "No space left on device")
+
+            fh.write = no_space
+        return fh
+
+    monkeypatch.setattr(Path, "open", open_without_space)
+    with pytest.raises(OSError):
+        local.create_config(wid, CONFIG)
+    monkeypatch.undo()
+
+    assert not local.exists(wid)
+    local.create_config(wid, CONFIG)  # the retry, not a conflict
+    assert local.read_config(wid) == CONFIG
+
+
+def test_create_config_leaves_only_the_config_behind(tmp_path: Path) -> None:
+    """No temp-file litter, after a win or a loss."""
+    local = _local(tmp_path / "workspaces")
+    wid = new_workspace_id()
+    local.create_config(wid, CONFIG)
+    with pytest.raises(WorkspacesWriteConflict):
+        local.create_config(wid, "[workspace]\nname = 'Usurper'\n")
+    assert [p.name for p in (tmp_path / "workspaces" / wid).iterdir()] == ["config.toml"]
 
 
 def test_exists_tracks_write_and_delete(store: WorkspacesStore) -> None:

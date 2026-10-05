@@ -49,7 +49,7 @@ from typing import Any
 
 from lxml import etree  # type: ignore[import-untyped]
 
-from .extraction_schema import Tag, Vocabulary, parse_invariant
+from .extraction_schema import Tag, Vocabulary, parse_invariant, resolve_invariant_path
 from .generation.semantic_transform import _detect_value_type
 from .matching import (
     LeafPath,
@@ -306,8 +306,9 @@ def check_invariants(values: dict[str, Any], vocab: Vocabulary) -> tuple[int, li
         if actual is None:
             return  # field present but not numeric — nothing to compare
         # Invariants are evaluated against the whole submission, so a path is
-        # resolved from the root regardless of where the annotated field sits.
-        collection = _resolve_collection(values, path)
+        # resolved from the root regardless of where the annotated field sits;
+        # an unqualified path is read under the schema's one root, as at load.
+        collection = _resolve_collection(values, resolve_invariant_path(vocab, path) or path)
         if collection is None:
             return
         if kind == "count":
