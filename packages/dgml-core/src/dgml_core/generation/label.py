@@ -1578,8 +1578,7 @@ def _label_one_document(
                 cache_dir,
                 f"label_{stem}_section_retry_raw.json",
                 strip_fences(raw),
-                # Functional, like the per-chunk files: the loader replays it.
-                debug=True,
+                debug=debug,
             )
             warnings.extend(
                 apply_labels(

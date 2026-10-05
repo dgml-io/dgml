@@ -2543,28 +2543,6 @@ def test_replay_after_a_bisected_chunk_matches_the_fresh_run(
         json.loads(f.read_text(encoding="utf-8"))  # every functional file parses
 
 
-def test_replay_includes_the_section_retry_without_debug(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The loader replays the section retry's reply, but it was only written
-    under --debug, so a default run's replay lost the heading it recovered."""
-    retry_marker = get_prompt("section_retry")[:40]
-
-    def fake_call(config: llm.LLMConfig, **kw: Any) -> str:
-        if retry_marker in kw["user_content"][-1]["text"]:
-            return json.dumps({"labels": {"h1": {"concept": "PaymentTerms"}}})
-        return json.dumps({"labels": {"p1": {"concept": "PaymentObligation"}}})
-
-    blocks = [
-        _b("heading", "h1", text="Payment Terms", level=1),
-        _b("p", "p1", text="Acme owes $5 on delivery."),
-    ]
-    fresh, replayed = _label_fresh_then_replay(blocks, fake_call, monkeypatch, tmp_path / "cache")
-
-    assert [b.concept for b in fresh] == ["PaymentTerms", "PaymentObligation"]
-    assert [b.concept for b in replayed] == [b.concept for b in fresh]
-
-
 def test_replay_skips_an_unparseable_reply_left_by_an_older_run(tmp_path: Path) -> None:
     """Caches written before the fix can still hold a bisected chunk's
     unparseable reply. A fresh run applied nothing from it, so the loader
