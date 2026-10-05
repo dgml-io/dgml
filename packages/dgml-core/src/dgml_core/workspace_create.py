@@ -353,9 +353,18 @@ def _build(
                 f"or the workspace would be created on the bundled local-disk store instead "
                 f"of the backend this config names."
             )
+    # Reuse the id the config already carries; generate only for a genuinely new
+    # workspace. Minting unconditionally forked the id on a re-run, and on a second
+    # machine sharing a config it changed the workspace's identity outright.
+    resolved_id = (
+        ws.workspaces_id or recorded.workspace_id or workspace_id or generate_unique_workspace_id()
+    )
+
     # Validate the named service — shape *and* provider classes — before anything is
     # built, so a bad service or `provider =` fails without a half-built workspace.
-    check_store_configs(*resolve_service_configs(ws, service))
+    # Under the id about to be written: a store that namespaces by workspace id needs
+    # one to accept its config, and the config does not carry it yet.
+    check_store_configs(*resolve_service_configs(ws, service, workspace_id=resolved_id))
 
     # Write the whole binding — the [storage.<service>] table *and* the
     # `storage_service` pointer — before anything resolves a store. Resolution reads
@@ -366,12 +375,6 @@ def _build(
     ws.root.mkdir(parents=True, exist_ok=True)
     _materialize_storage_table(ws, service, seeded=seeded)
 
-    # Reuse the id the config already carries; generate only for a genuinely new
-    # workspace. Minting unconditionally forked the id on a re-run, and on a second
-    # machine sharing a config it changed the workspace's identity outright.
-    resolved_id = (
-        ws.workspaces_id or recorded.workspace_id or workspace_id or generate_unique_workspace_id()
-    )
     wsconfig.write_identity(
         ws,
         workspace_id=resolved_id,
