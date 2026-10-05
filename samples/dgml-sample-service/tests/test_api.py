@@ -217,7 +217,7 @@ def test_classify_assigns_and_extracts(
     monkeypatch.setattr(operations, "classify_file", fake_classify)
     monkeypatch.setattr("dgml_core.extraction.extract_file", fake_extract)
     monkeypatch.setattr(
-        "dgml_core.extraction._auto_extract",
+        "dgml_core.extraction.auto_extract",
         lambda ws, d, f, **kw: {
             "performed": True,
             "error": None,

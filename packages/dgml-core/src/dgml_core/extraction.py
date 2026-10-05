@@ -38,10 +38,10 @@ from .errors import DgmlError, ValuesNotFound
 from .storage import Workspace
 
 if TYPE_CHECKING:
-    from .grounded import ExtractionResult
+    from .grounded import ExtractionResult, GroundedConfig
 
 
-def _auto_extract(
+def auto_extract(
     ws: Workspace,
     docset_id: str,
     file_id: str,
@@ -116,7 +116,7 @@ def add_file_and_extract(
 ) -> dict[str, Any] | None:
     """Assign ``file_id`` to ``docset_id``; auto-extract if the DocSet has a schema.
 
-    Returns the extraction block (same shape :func:`_auto_extract` produces)
+    Returns the extraction block (same shape :func:`auto_extract` produces)
     when the DocSet has a schema set, else ``None`` — the omit-when-no-schema
     policy matches the existing ``dgml docset add-file`` contract.
 
@@ -130,7 +130,7 @@ def add_file_and_extract(
     store.add_file(docset_id, file_id)
     if not store.has_schema(docset_id):
         return None
-    return _auto_extract(ws, docset_id, file_id, write_stats=write_stats, record_usage=record_usage)
+    return auto_extract(ws, docset_id, file_id, write_stats=write_stats, record_usage=record_usage)
 
 
 def extract_file(
@@ -167,7 +167,37 @@ def extract_file(
     to :func:`~dgml_core.grounded.extract_values`; the result's ``usage`` and
     ``stats`` carry the same numbers either way.
     """
-    from .grounded import extract_values, load_grounded_config, parse_reasoning_effort
+    from .grounded import extract_values
+
+    config = extraction_config(
+        ws,
+        values_model=values_model,
+        values_effort=values_effort,
+        locations_effort=locations_effort,
+    )
+    return extract_values(
+        ws,
+        docset_id,
+        file_id,
+        config=config,
+        write_stats=write_stats,
+        record_usage=record_usage,
+    )
+
+
+def extraction_config(
+    ws: Workspace,
+    *,
+    values_model: str | None = None,
+    values_effort: str | None = None,
+    locations_effort: str | None = None,
+) -> GroundedConfig:
+    """The workspace's grounded config with :func:`extract_file`'s per-call
+    overrides applied — the config every ``dgml extraction extract`` form
+    (one file, several, ``--batch``) extracts with. See :func:`extract_file`
+    for what each override means and how ``values_model`` resolves its
+    credentials."""
+    from .grounded import load_grounded_config, parse_reasoning_effort
 
     config = load_grounded_config(ws, values_model=values_model)
     if values_effort is not None:
@@ -182,14 +212,7 @@ def extract_file(
                 locations_effort, source="locations_effort"
             ),
         )
-    return extract_values(
-        ws,
-        docset_id,
-        file_id,
-        config=config,
-        write_stats=write_stats,
-        record_usage=record_usage,
-    )
+    return config
 
 
 def get_extracted_values(workspace: Workspace, docset_id: str, file_id: str) -> dict[str, Any]:
