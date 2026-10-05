@@ -779,16 +779,19 @@ class _StdoutToLog(io.TextIOBase):
     """File-like sink turning a dependency's stray stdout into WARNING records.
 
     ``write`` buffers until a newline so one log record is one printed line,
-    however the writes were chunked; the last guard out empties the buffer via
-    :meth:`drain`. ``flush`` is deliberately the inherited no-op — flushing
-    means "push to the OS" and there is no OS buffer here, so a dependency's
-    mid-line ``flush()`` must not split its line into two records.
+    however the writes were chunked; the guard that created it empties the
+    buffer via :meth:`drain` on exit. ``flush`` is deliberately the inherited
+    no-op — flushing means "push to the OS" and there is no OS buffer here, so
+    a dependency's mid-line ``flush()`` must not split its line into two
+    records.
 
-    One instance is shared by every concurrently active guard, so buffer
-    updates take a lock. It is a *leaf* lock — records are emitted only after
-    it is released — and lines carrying :data:`_CAPTURE_MARKER` are dropped,
-    so a handler that itself writes to the live ``sys.stdout`` can neither
-    deadlock against the sink nor echo through it unboundedly."""
+    Each thread inside :func:`_quiet_stdout` gets its own sink, so partial
+    lines from different threads never splice together. Buffer updates still
+    take a lock because a handler may write back into the sink. It is a
+    *leaf* lock — records are emitted only after it is released — and lines
+    carrying :data:`_CAPTURE_MARKER` are dropped, so a handler that itself
+    writes to the live ``sys.stdout`` can neither deadlock against the sink
+    nor echo through it unboundedly."""
 
     # TextIOBase declares no codec; a dependency probing ``sys.stdout.encoding``
     # before printing non-ASCII expects a real name (the old target, a stream,
@@ -817,28 +820,58 @@ class _StdoutToLog(io.TextIOBase):
         return len(s)
 
     def drain(self) -> None:
-        """Emit any trailing partial line; the last guard out calls this."""
+        """Emit any trailing partial line; the owning guard calls this on exit."""
         with self._lock:
             tail, self._buf = self._buf, ""
         if tail.strip() and _CAPTURE_MARKER not in tail:
             logger.warning("%s %s", _CAPTURE_MARKER, tail)
 
 
-# State for _quiet_stdout: overlapping guards (LLM calls run in thread pools,
-# and sys.stdout is process-global) share ONE sink, refcounted — the first
-# guard in saves the real stdout, the last one out restores it. A per-call
-# ``redirect_stdout`` breaks under non-LIFO exits: A enters (saves real), B
-# enters (saves A's sink), A exits (restores real), B exits (re-installs A's
-# dead sink) — leaving every later print swallowed for the rest of the process.
-_stdout_guard_lock = threading.Lock()
-_stdout_guard_depth = 0
-_stdout_guard_saved: Any = None
-_stdout_guard_sink: _StdoutToLog | None = None
+class _ThreadAwareStdout:
+    """A ``sys.stdout`` stand-in that routes writes per thread.
+
+    Writes from a thread inside :func:`_quiet_stdout` go to that thread's
+    :class:`_StdoutToLog` sink; every other thread's writes go to the stream
+    this proxy wraps. Everything else (``fileno``, ``encoding``, ``isatty`` …)
+    delegates to whichever of the two the calling thread would write to, so a
+    guarded thread cannot reach the real fd."""
+
+    def __init__(self, target: Any) -> None:
+        self._target = target
+
+    def _stream(self) -> Any:
+        sink = getattr(_QUIET, "sink", None)
+        return sink if sink is not None else self._target
+
+    def write(self, s: str) -> int:
+        return cast(int, self._stream().write(s))
+
+    def writelines(self, lines: Any) -> None:
+        self._stream().writelines(lines)
+
+    def flush(self) -> None:
+        self._stream().flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream(), name)
+
+
+# State for _quiet_stdout. ``sys.stdout`` is process-global but LLM calls run
+# in thread pools, so overlapping guards share ONE proxy, refcounted: the first
+# guard in installs it over the real stdout, the last one out restores it. A
+# per-call ``redirect_stdout`` breaks under non-LIFO exits (B re-installs A's
+# dead sink) and, like any process-wide sink, also captures the main thread's
+# CLI JSON while a worker is mid-call. Per-thread depth and sink live in
+# ``_QUIET``.
+_QUIET = threading.local()
+_QUIET_LOCK = threading.Lock()
+_QUIET_USERS = 0
+_QUIET_PROXY: _ThreadAwareStdout | None = None
 
 
 @contextmanager
 def _quiet_stdout() -> Iterator[None]:
-    """Capture anything written to stdout and re-log it at WARNING.
+    """Capture whatever *this thread* writes to stdout and re-log it at WARNING.
 
     Guards the JSON-on-stdout CLI contract against dependencies (LiteLLM in
     particular) that ``print`` directly to stdout — raw prints bypass
@@ -848,31 +881,38 @@ def _quiet_stdout() -> Iterator[None]:
     WARNING: visible by default in the CLI, and routed — or silenced — by a
     library caller like any other ``dgml_core`` record. dgml's own output is
     unaffected — ``_emit`` writes the JSON payload after the completion call
-    returns, outside this block.
+    returns, outside this block, and other threads' writes are never captured.
 
-    Safe for overlapping calls across threads (see the guard-state comment
-    above); the swap itself remains process-global, as ``sys.stdout`` is.
+    A single thread-aware proxy is installed while any thread is inside the
+    block, and only the entering thread's writes are diverted. It is removed
+    when the last one leaves, unless something else replaced ``sys.stdout``
+    meanwhile, in which case that replacement is left alone.
     """
-    global _stdout_guard_depth, _stdout_guard_saved, _stdout_guard_sink
-    with _stdout_guard_lock:
-        if _stdout_guard_depth == 0:
-            _stdout_guard_saved = sys.stdout
-            _stdout_guard_sink = _StdoutToLog()
-            sys.stdout = _stdout_guard_sink
-        _stdout_guard_depth += 1
+    global _QUIET_USERS, _QUIET_PROXY
+    with _QUIET_LOCK:
+        if _QUIET_USERS == 0:
+            _QUIET_PROXY = _ThreadAwareStdout(sys.stdout)
+            sys.stdout = cast(Any, _QUIET_PROXY)
+        _QUIET_USERS += 1
+    depth = getattr(_QUIET, "depth", 0)
+    if depth == 0:
+        _QUIET.sink = _StdoutToLog()
+    _QUIET.depth = depth + 1
     try:
         yield
     finally:
-        last_sink: _StdoutToLog | None = None
-        with _stdout_guard_lock:
-            _stdout_guard_depth -= 1
-            if _stdout_guard_depth == 0:
-                last_sink = _stdout_guard_sink
-                sys.stdout = _stdout_guard_saved
-                _stdout_guard_saved = None
-                _stdout_guard_sink = None
-        if last_sink is not None:
-            last_sink.drain()
+        _QUIET.depth -= 1
+        own_sink: _StdoutToLog | None = None
+        if _QUIET.depth == 0:
+            own_sink, _QUIET.sink = _QUIET.sink, None
+        with _QUIET_LOCK:
+            _QUIET_USERS -= 1
+            if _QUIET_USERS == 0:
+                if sys.stdout is _QUIET_PROXY and _QUIET_PROXY is not None:
+                    sys.stdout = _QUIET_PROXY._target
+                _QUIET_PROXY = None
+        if own_sink is not None:
+            own_sink.drain()
 
 
 def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
