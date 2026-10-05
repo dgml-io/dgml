@@ -116,7 +116,9 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
     to ``0`` rather than ``None``: a provider reporting no cache activity
     genuinely used zero cache, and the values are summed across calls. A
     fallback also checks ``_hidden_params`` in case a litellm version
-    relocates them there.
+    relocates them there. OpenAI and Gemini responses carry their cache hits
+    only as ``usage.prompt_tokens_details.cached_tokens``, which fills
+    ``cache_read_tokens`` when no explicit ``cache_read_input_tokens`` exists.
     """
     out: dict[str, Any] = {
         "cost_usd": None,
@@ -132,6 +134,7 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
         ("cache_read_input_tokens", "cache_read_tokens"),
         ("cache_creation_input_tokens", "cache_creation_tokens"),
     )
+    explicit_read = False
     hidden = getattr(response, "_hidden_params", None)
     if isinstance(hidden, dict):
         cost = hidden.get("response_cost")
@@ -143,6 +146,7 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
             val = hidden.get(src)
             if isinstance(val, int) and not isinstance(val, bool):
                 out[dst] = val
+                explicit_read = explicit_read or dst == "cache_read_tokens"
     usage = getattr(response, "usage", None)
     if usage is not None:
         for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -154,6 +158,14 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
             val = getattr(usage, src, None)
             if isinstance(val, int) and not isinstance(val, bool):
                 out[dst] = val
+                explicit_read = explicit_read or dst == "cache_read_tokens"
+        # OpenAI and Gemini report cache hits only here; litellm does not copy
+        # them to ``cache_read_input_tokens``. An explicit counter wins.
+        if not explicit_read:
+            details = getattr(usage, "prompt_tokens_details", None)
+            val = getattr(details, "cached_tokens", None)
+            if isinstance(val, int) and not isinstance(val, bool):
+                out["cache_read_tokens"] = val
     return out
 
 

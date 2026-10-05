@@ -102,6 +102,53 @@ def test_quiet_stdout_non_lifo_exits_restore_stdout(
     assert any("captured while both guards active" in r.getMessage() for r in caplog.records)
 
 
+def test_quiet_stdout_only_captures_the_calling_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Concurrent completions never capture another thread's stdout.
+
+    ``sys.stdout`` is process-global. While any pool thread sat inside a
+    completion, a process-wide swap also captured the main thread, so the
+    CLI's final JSON could become a WARNING record instead of reaching stdout.
+    Only the calling thread's writes may be diverted."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = 4
+    inside = threading.Barrier(workers + 1)
+    printed = threading.Event()
+
+    def chatty_completion(**kwargs: Any) -> dict[str, Any]:
+        print("worker noise")
+        inside.wait(timeout=5)  # every worker is mid-call ...
+        printed.wait(timeout=5)  # ... while the main thread writes
+        print("more worker noise")
+        return _resp("OK")
+
+    monkeypatch.setattr("litellm.completion", chatty_completion)
+    original = sys.stdout
+
+    with caplog.at_level(logging.WARNING, logger="dgml_core.llm"):
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(llm._completion_with_retry, {"model": "gpt-4o", "messages": []})
+                for _ in range(workers)
+            ]
+            inside.wait(timeout=5)
+            print('{"ok": true}')
+            printed.set()
+            results = [f.result(timeout=5) for f in futures]
+        print("after")
+
+    assert results == [_resp("OK")] * workers
+    assert capsys.readouterr().out == '{"ok": true}\nafter\n'
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("worker noise" in m for m in messages) == 2 * workers
+    assert not any('{"ok": true}' in m for m in messages)
+    assert sys.stdout is original
+
+
 def test_quiet_stdout_survives_a_handler_that_writes_to_stdout(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
