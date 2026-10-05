@@ -129,7 +129,7 @@ def test_phase1_and_phase3_share_one_usage_row(workspace: Workspace, capture_kwa
         DEFAULT_VALUES_MODEL,
     )
     (row,) = read_events(workspace)
-    assert (row["operation"], row["outcome"]) == ("extract_values", "ok")
+    assert (row["operation"], row["outcome"], row["tier"]) == ("extract_values", "ok", "standard")
     assert (row["cost_usd"], row["prompt_tokens"]) == (0.01 + 0.02, 300)
 
 

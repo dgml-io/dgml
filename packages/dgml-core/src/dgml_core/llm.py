@@ -75,10 +75,13 @@ from .storage import Workspace
 from .usage import (
     OUTCOME_ERROR,
     OUTCOME_OK,
+    TIER_STANDARD,
     UsageEvent,
     add_partial,
     extract_cost_and_tokens,
     record_usage,
+    scope_events,
+    with_tier,
 )
 
 logger = logging.getLogger(__name__)
@@ -358,6 +361,10 @@ class LLMConfig:
     debug: bool = False
     operation: str | None = None
     context: dict[str, Any] | None = None
+    # Pricing tier recorded on the usage row (``usage.TIER_STANDARD`` /
+    # ``usage.TIER_BATCH``). A batch driver sets ``TIER_BATCH`` on the configs
+    # it drives; every synchronous call records standard.
+    tier: str = TIER_STANDARD
     # Internal: set by an active :func:`record_usage_for` scope. While set,
     # the call functions fold their usage into it (one aggregated row for the
     # whole scope) instead of each writing its own row. Never set by callers.
@@ -989,7 +996,9 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
       :func:`record_usage_for`), fold the totals into it and write nothing —
       the scope emits one combined row.
     - Otherwise, append one :class:`UsageEvent` (gated on ``--debug`` +
-      workspace). A single call therefore yields a single row.
+      workspace). A single call therefore yields a single row — or one row
+      per tier when its responses were served by more than one (see
+      :func:`dgml_core.usage.scope_events`).
 
     Exceptions propagate after the totals are recorded, so a failed call
     still leaves a row (or contributes its partial usage to the scope).
@@ -1009,24 +1018,25 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
         if config._usage_sink is not None:
             add_partial(config._usage_sink, totals)
         elif config.debug and config.workspace is not None:
-            record_usage(
-                config.workspace,
-                UsageEvent(
-                    at=now_iso(),
-                    operation=config.operation or "llm_call",
-                    model=config.model,
-                    cost_usd=totals["cost_usd"],
-                    prompt_tokens=totals["prompt_tokens"],
-                    completion_tokens=totals["completion_tokens"],
-                    total_tokens=totals["total_tokens"],
-                    cache_read_tokens=totals["cache_read_tokens"],
-                    cache_creation_tokens=totals["cache_creation_tokens"],
-                    duration_s=round(time.monotonic() - started, 3),
-                    outcome=outcome,
-                    context=config.context or {},
-                    error=error_msg,
-                ),
+            event = UsageEvent(
+                at=now_iso(),
+                operation=config.operation or "llm_call",
+                model=config.model,
+                cost_usd=totals["cost_usd"],
+                prompt_tokens=totals["prompt_tokens"],
+                completion_tokens=totals["completion_tokens"],
+                total_tokens=totals["total_tokens"],
+                cache_read_tokens=totals["cache_read_tokens"],
+                cache_creation_tokens=totals["cache_creation_tokens"],
+                duration_s=round(time.monotonic() - started, 3),
+                outcome=outcome,
+                context=config.context or {},
+                error=error_msg,
+                tier=config.tier,
             )
+            # One row, or one per tier when the responses span tiers.
+            for part in scope_events(event, totals):
+                record_usage(config.workspace, part)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1239,7 @@ def drive(
                     except StopIteration as done:
                         return cast(T, done.value)
                     continue
-                fold.add(step, extract_cost_and_tokens(response))
+                fold.add(step, with_tier(extract_cost_and_tokens(response), response, config.tier))
                 try:
                     step = steps.send(response)
                 except StopIteration as done:
@@ -1586,7 +1596,11 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
 
     While the scope is open, the entry functions fold their per-call usage into
     a shared accumulator rather than each writing a row; on exit — success or
-    exception — one combined :class:`UsageEvent` is appended. Nesting is safe:
+    exception — one combined :class:`UsageEvent` is appended. Its ``tier`` is
+    the one that served the scope's responses (each response's tier marker,
+    else the driving config's tier), or the scope config's own when it saw no
+    response; a scope whose responses span tiers appends one row per tier
+    instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
     an inner scope defers to the outer one. The write can never break the
     caller (see :func:`record_usage`); exceptions propagate after the row.
     """
@@ -1610,24 +1624,25 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
         config._usage_sink = None
         workspace = config.workspace
         if workspace is not None:
-            record_usage(
-                workspace,
-                UsageEvent(
-                    at=now_iso(),
-                    operation=config.operation or "llm_call",
-                    model=config.model,
-                    cost_usd=totals["cost_usd"],
-                    prompt_tokens=totals["prompt_tokens"],
-                    completion_tokens=totals["completion_tokens"],
-                    total_tokens=totals["total_tokens"],
-                    cache_read_tokens=totals["cache_read_tokens"],
-                    cache_creation_tokens=totals["cache_creation_tokens"],
-                    duration_s=round(time.monotonic() - started, 3),
-                    outcome=outcome,
-                    context=config.context or {},
-                    error=error_msg,
-                ),
+            event = UsageEvent(
+                at=now_iso(),
+                operation=config.operation or "llm_call",
+                model=config.model,
+                cost_usd=totals["cost_usd"],
+                prompt_tokens=totals["prompt_tokens"],
+                completion_tokens=totals["completion_tokens"],
+                total_tokens=totals["total_tokens"],
+                cache_read_tokens=totals["cache_read_tokens"],
+                cache_creation_tokens=totals["cache_creation_tokens"],
+                duration_s=round(time.monotonic() - started, 3),
+                outcome=outcome,
+                context=config.context or {},
+                error=error_msg,
+                tier=config.tier,
             )
+            # One row, or one per tier when the responses span tiers.
+            for part in scope_events(event, totals):
+                record_usage(workspace, part)
 
 
 __all__ = [

@@ -237,6 +237,7 @@ def test_a_continued_call_writes_one_row_for_all_its_rounds(
         "outcome": "ok",
         "context": {"doc": "a.pdf"},
         "error": None,
+        "tier": "standard",
     }
 
 

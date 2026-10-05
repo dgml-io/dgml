@@ -87,6 +87,7 @@ def test_schema_provider_failure_keeps_its_message_and_error_row(
     assert str(failed.value) == "schema generation call failed: RuntimeError: provider exploded"
     (row,) = read_events(workspace)
     assert (row["outcome"], row["error"]) == ("error", "RuntimeError: provider exploded")
+    assert row["tier"] == "standard"
 
 
 # -- classification ------------------------------------------------------------
