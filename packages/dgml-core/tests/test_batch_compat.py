@@ -29,9 +29,9 @@ from dgml_core.batch import (
     assert_batchable,
     register_backend,
     resolve_backend,
-    unregister_backend,
 )
 from dgml_core.batch import compat as compat_mod
+from dgml_core.batch import registry as batch_registry
 from dgml_core.batch.compat import IncompatibleDependency, require_supported_litellm
 from dgml_core.errors import BatchUnavailable
 
@@ -46,9 +46,11 @@ def gated_backend() -> Iterator[None]:
     def factory(cfg: BackendConfig) -> FakeBackend:
         return FakeBackend({}, provider="anthropic")
 
+    saved = dict(batch_registry._REGISTRY)
     register_backend("anthropic", factory, available=require_supported_litellm)
     yield
-    unregister_backend("anthropic")
+    batch_registry._REGISTRY.clear()
+    batch_registry._REGISTRY.update(saved)
 
 
 @pytest.mark.parametrize("version", ["1.85.0", "1.85.1", "1.85.99", "1.85.2rc1", "1.85.3.post1"])
@@ -90,3 +92,13 @@ def test_a_gated_backend_rejects_an_unsupported_litellm(
 
 def test_a_gated_backend_resolves_on_the_supported_litellm(gated_backend: None) -> None:
     assert resolve_backend(_MODEL).provider == "anthropic"
+
+
+def test_the_builtin_anthropic_backend_rejects_an_unsupported_litellm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(compat_mod, "litellm_version", lambda: "1.99.0")
+    with pytest.raises(BatchUnavailable, match=r"litellm 1\.99\.0 is installed"):
+        assert_batchable({"transcribe": _MODEL})
+    with pytest.raises(BatchUnavailable, match=r"litellm 1\.99\.0 is installed"):
+        resolve_backend(_MODEL, api_key="k")
