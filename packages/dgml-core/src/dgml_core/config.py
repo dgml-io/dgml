@@ -56,7 +56,7 @@ from pydantic_settings import (
 )
 
 from .errors import CorruptMetadata, LegacyConfigPresent
-from .models_config import ConfigSection
+from .models_config import ConfigSection, expand_family
 from .storage import user_config_path
 
 if TYPE_CHECKING:
@@ -115,14 +115,24 @@ def _build_settings_class(user_path: Path, ws_config: dict[str, Any] | None) -> 
             # workspace config > user file. (TomlConfigSettingsSource returns an
             # empty mapping for a missing file; the workspace layer gets an empty
             # mapping when the workspace has no config, which is the same thing.)
-            return (
-                init_settings,
-                env_settings,
-                InitSettingsSource(settings_cls, ws_config or {}),
-                TomlConfigSettingsSource(settings_cls, toml_file=user_path),
+            # Each layer is read up front so its `models.family` expands before the
+            # merge, overriding lower-layer tiers.
+            layers = (
+                init_settings(),
+                env_settings(),
+                ws_config or {},
+                TomlConfigSettingsSource(settings_cls, toml_file=user_path)(),
             )
+            return tuple(InitSettingsSource(settings_cls, _expand_layer(lyr)) for lyr in layers)
 
     return _DgmlSettings
+
+
+def _expand_layer(layer: dict[str, Any]) -> dict[str, Any]:
+    models = layer.get(ConfigSection.MODELS)
+    if not isinstance(models, dict):
+        return layer
+    return {**layer, ConfigSection.MODELS.value: expand_family(models)}
 
 
 def load_merged_config(

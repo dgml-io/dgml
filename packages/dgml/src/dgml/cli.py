@@ -42,7 +42,7 @@ from dgml_core.classification import (
 )
 from dgml_core.consistency import check_workspace
 from dgml_core.conversion import FAMILY_BY_SUFFIX, load_conversion_config
-from dgml_core.default_config import PROVIDER_MODELS
+from dgml_core.default_config import PROVIDER_API_KEYS, PROVIDER_MODELS
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     ConflictError,
@@ -292,8 +292,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=sorted(PROVIDER_MODELS),
         default=None,
         help=(
-            "Force a provider's default [models] block. Omit to auto-detect from the "
-            f"API-key env vars that are set ({', '.join(API_KEY_ENV_VARS)})."
+            "Force a provider family's default models ([models] family = ...). Omit to "
+            f"auto-detect from the API-key env vars that are set ({', '.join(API_KEY_ENV_VARS)})."
         ),
     )
     init_p.add_argument(
@@ -1379,26 +1379,24 @@ _TIER_CAPABILITIES = {
     "expert": "schema generation",
 }
 
-# Provider → the API-key env var(s) it needs at runtime (for the advisory shown
-# when a provider is forced with --provider).
-_PROVIDER_KEYS = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "google": "GEMINI_API_KEY",
-    "mixed": "ANTHROPIC_API_KEY and GEMINI_API_KEY",
-    "openai": "OPENAI_API_KEY",
-}
-
 # Rendered into the `dgml init` advisories as `--provider <a|b|c>`. Derived from
 # PROVIDER_MODELS so a provider added there shows up in the help text too.
 _PROVIDER_CHOICES = "|".join(sorted(PROVIDER_MODELS))
 
+# How to go beyond the family-only config `dgml init` writes.
+_INIT_OVERRIDE_HINT = (
+    '[dgml init] override a task with its own field (e.g. [generation] label_model = "..."); '
+    f"switch families with dgml init --provider <{_PROVIDER_CHOICES}>."
+)
+
 
 def _init_models_report(provider: str) -> str:
-    """The ``[models]`` block for *provider* with tier→capability comments —
-    for the stderr advisory only (never written into the file)."""
+    """What ``[models] family = "<provider>"`` expands to, with tier→capability
+    comments — for the stderr advisory only. The config file names just the
+    family, so this report is the user's view of the expansion."""
     tiers = PROVIDER_MODELS[provider]
     width = max(len(t) for t in _TIER_CAPABILITIES)
-    lines = ["  [models]"]
+    lines = [f'  [models] family = "{provider}" expands to:']
     for tier in ("light", "standard", "advanced", "expert"):
         lines.append(f'  {tier.ljust(width)} = "{tiers[tier]}"    # {_TIER_CAPABILITIES[tier]}')
     return "\n".join(lines)
@@ -1459,11 +1457,12 @@ def _init_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
     payload["next_action"] = "dgml workspace create --organization <org>"
     if args.provider is not None:
+        keys = " and ".join(PROVIDER_API_KEYS[canonical])
         _log.info(
             f"[dgml init] wrote {path} (provider: {canonical}).\n"
             f"{_init_models_report(canonical)}\n"
-            f"[dgml init] make sure {_PROVIDER_KEYS[canonical]} is set before running "
-            "dgml commands."
+            f"[dgml init] make sure {keys} is set before running dgml commands.\n"
+            f"{_INIT_OVERRIDE_HINT}"
         )
     else:
         keys_line = "  ".join(f"[x] {k}" for k in detected) if detected else "(none)"
@@ -1471,9 +1470,7 @@ def _init_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             f"[dgml init] detected API keys: {keys_line}\n"
             f"[dgml init] wrote {path} (provider: {canonical}).\n"
             f"{_init_models_report(canonical)}\n"
-            "[dgml init] override any task with its own field (e.g. [generation] "
-            'label_model = "..."); switch providers with '
-            f"dgml init --provider <{_PROVIDER_CHOICES}>."
+            f"{_INIT_OVERRIDE_HINT}"
         )
     _emit(payload, fmt)
     return 0

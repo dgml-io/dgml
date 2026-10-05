@@ -61,17 +61,25 @@ from ._client import (
     IDENTITY_FIELDS,
     MONGO_URI_ENV,
     connect,
+    prefixed,
+    require_workspace_id,
     validate_identity,
+    validate_prefix,
+    workspace_namespace,
 )
 
 __all__ = ["MONGO_URI_ENV", "MongoDocStore"]
 
 
 class MongoDocStore(DocStore):
-    """DGML documents in MongoDB collections."""
+    """DGML documents in MongoDB collections.
+
+    Every collection is ``<prefix>_<workspace id>_<name>`` — ``dgml_ws_7qx…_files``
+    rather than ``files`` — with ``prefix`` defaulting to ``dgml``, so any number of
+    workspaces, and other applications, can share one database."""
 
     name = "mongo"
-    config_fields = IDENTITY_FIELDS
+    config_fields = IDENTITY_FIELDS | {"prefix"}
 
     # ---- configuration ----
 
@@ -79,6 +87,8 @@ class MongoDocStore(DocStore):
     def parse_config(cls, config: StorageConfig) -> StorageConfig:
         cls._check_no_extra_fields(config.options)
         validate_identity(cls.name, config.options)
+        validate_prefix(config.options)
+        require_workspace_id(cls.name, config)
         return config
 
     def __init__(self, config: StorageConfig) -> None:
@@ -87,9 +97,9 @@ class MongoDocStore(DocStore):
         # config key: a half-credential in config builds a URI pymongo rejects,
         # and adding the password key is exactly the plaintext-registry leak
         # this design avoids.
-        self._bind_docs(connect(config.options))
+        self._bind_docs(connect(config.options), workspace_namespace(config))
 
-    def _bind_docs(self, db: Any) -> None:
+    def _bind_docs(self, db: Any, namespace: str) -> None:
         """Attach the document collections to an open database.
 
         Split out of ``__init__`` so the combined stores can bind both roles to
@@ -98,6 +108,11 @@ class MongoDocStore(DocStore):
         to the same config also shares one instance between them, so the flat
         form holds a single client either way."""
         self._db: Any = db
+        self._namespace = namespace
+
+    def _coll(self, collection: str) -> Any:
+        """The Mongo collection holding ``collection``, in this store's namespace."""
+        return self._db[prefixed(self._namespace, collection)]
 
     # ---- Documents (MongoDB) ----
     #
@@ -107,21 +122,21 @@ class MongoDocStore(DocStore):
     # expect an extra field.
 
     def put_doc(self, collection: str, doc_id: str, doc: dict[str, Any]) -> None:
-        self._db[collection].replace_one({"_id": doc_id}, {**doc, "_id": doc_id}, upsert=True)
+        self._coll(collection).replace_one({"_id": doc_id}, {**doc, "_id": doc_id}, upsert=True)
 
     def get_doc(self, collection: str, doc_id: str) -> dict[str, Any] | None:
-        found = self._db[collection].find_one({"_id": doc_id})
+        found = self._coll(collection).find_one({"_id": doc_id})
         return _strip_id(found) if found is not None else None
 
     def find_docs(self, collection: str, query: Mapping[str, Any]) -> list[dict[str, Any]]:
         # An empty query means the whole collection, not "no results".
-        return [_strip_id(doc) for doc in self._db[collection].find(dict(query))]
+        return [_strip_id(doc) for doc in self._coll(collection).find(dict(query))]
 
     def delete_doc(self, collection: str, doc_id: str) -> None:
-        self._db[collection].delete_one({"_id": doc_id})
+        self._coll(collection).delete_one({"_id": doc_id})
 
     def delete_docs(self, collection: str, query: Mapping[str, Any]) -> int:
-        return int(self._db[collection].delete_many(dict(query)).deleted_count)
+        return int(self._coll(collection).delete_many(dict(query)).deleted_count)
 
     def append_doc(self, collection: str, doc: dict[str, Any]) -> None:
         # Append-only (the usage log): no id, never fetched or replaced
@@ -137,7 +152,7 @@ class MongoDocStore(DocStore):
                 f"{collection!r} is not an append-only collection; use put_doc "
                 f"(append-only: {Collection.USAGE.value!r})"
             )
-        self._db[collection].insert_one(dict(doc))
+        self._coll(collection).insert_one(dict(doc))
 
 
 def _strip_id(doc: Mapping[str, Any]) -> dict[str, Any]:
