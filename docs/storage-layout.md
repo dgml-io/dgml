@@ -476,6 +476,24 @@ mongo_database = "dgml"
   not define the service itself resolves it from here, so an edit takes effect after
   `dgml workspace reseal <path>` accepts it. A workspace that *does* define
   `[storage.<name>]` in its own config is unaffected — storage does not layer.
+- **Each workspace gets its own namespace in a shared backend.** A bucket or database
+  named in a template is usually shared — by every workspace created from it, and
+  often by other applications. So the S3 and MongoDB stores always put a workspace's
+  data under its **workspace id**, after an optional `prefix` you choose:
+
+  | Backend | `prefix` | Data lands in |
+  |---|---|---|
+  | S3 | not set | `s3://<bucket>/dgml/<id>/files/…` |
+  | S3 | `"contracts"` | `s3://<bucket>/contracts/<id>/files/…` |
+  | MongoDB | not set | collections `dgml_<id>_files`, …, GridFS bucket `dgml_<id>_blobs` |
+  | MongoDB | `"contracts"` | collections `contracts_<id>_files`, …, GridFS bucket `contracts_<id>_blobs` |
+
+  The id is added when the store is opened, not written into config, so `config.toml`
+  holds only the `prefix` you wrote — and a template can be shared by any number of
+  workspaces as it is. It comes from the `workspace_id` in `config.toml`'s
+  `[workspace]` block, which `workspace create` writes and which never changes, so a
+  workspace's data never moves. Local-disk storage is already per-workspace and has no
+  prefix.
 
 ### The `[models]` tiers
 
