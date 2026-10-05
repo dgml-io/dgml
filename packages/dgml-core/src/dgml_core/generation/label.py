@@ -1377,6 +1377,50 @@ def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
     return roster
 
 
+def vocab_batch_blocker(vocab: TagVocab) -> str | None:
+    """Why *vocab* alone rules out labeling documents independently, or
+    ``None`` when it does not.
+
+    The vocabulary half of :func:`is_batchable_vocab`, and the ONE place that
+    rule is written, so every caller agrees on whether a vocabulary batches.
+    ``None`` means the vocabulary is closed with nothing planned; whether the
+    run then batches also depends on the roster (see :func:`is_batchable_vocab`).
+    """
+    if vocab.extends:
+        return "vocabulary extends an authored schema, so labeling may coin concepts"
+    if vocab.added:
+        return "vocabulary includes planned concepts the run can still refine"
+    if not vocab.closed:
+        return "open vocabulary: each document's labels extend the shared roster"
+    return None
+
+
+def is_batchable_vocab(vocab: TagVocab, roster: Mapping[str, RosterEntry]) -> bool:
+    """Can every document of this run be labeled independently of the others?
+
+    Labeling is serial by design: each document's labels enrich the shared
+    roster (``_update_roster``), and the next document is prompted with the
+    enriched rendering. That hand-off is what keeps an open vocabulary
+    consistent, and labeling documents together would cut it.
+
+    The hand-off carries nothing when the roster cannot change, which is true
+    exactly when the vocabulary is CLOSED (nothing outside it can be emitted),
+    every roster entry is ``frozen`` (an observation never mutates a frozen
+    entry), and every legal tag already has an entry (so an observation never
+    ``setdefault``-s a new, unfrozen one). Then :func:`_roster_content_blocks`
+    renders the same bytes for every document and each document's requests
+    depend only on that document — the precondition for submitting them
+    together as one batch wave. A strict ``--schema-path`` seed satisfies it;
+    open, extend, and bounded (``supplied + planned``) vocabularies do not,
+    because planned entries are not frozen.
+    """
+    if vocab_batch_blocker(vocab) is not None:
+        return False
+    if not all(entry.frozen for entry in roster.values()):
+        return False
+    return vocab.names <= set(roster)
+
+
 def _label_chunk_steps(
     doc_name: str,
     chunk: list[Block],
@@ -1693,8 +1737,22 @@ def label_documents(
     vocab: TagVocab | None = None,
     on_label_error: Callable[[str, dict[str, str]], None] | None = None,
     on_off_schema: Callable[[str, Counter[str]], None] | None = None,
+    batch_label: Callable[
+        [list[str], dict[str, RosterEntry], TagVocab],
+        Mapping[str, tuple[list[str], dict[str, str] | None, list[str]]] | None,
+    ]
+    | None = None,
 ) -> list[str]:
     """Label every document, chunked, carrying the roster between calls.
+
+    *batch_label* (batch mode; see ``pipeline.BatchOptions``) is offered the
+    labeling order, the built roster, and the vocabulary once, before the
+    per-document loop. It may label every document at once and return
+    ``{doc_name: (warnings, label_error, off_schema)}`` — the same triple the
+    serial loop gets per document, consumed below in the same order — or
+    return ``None`` to decline, in which case the serial loop runs exactly as
+    without it. It is never offered a staged (pilot) run: that path mutates
+    the roster between the two stages by design.
 
     Best-effort per chunk: a failed call leaves that chunk unlabeled (still a
     valid, renderable document) and is reported as a warning; later chunks
@@ -1821,17 +1879,21 @@ def label_documents(
         order = pilot + [name for name in docs if name not in chosen]
         log(f"Pass B: pilot stage — labeling the {len(pilot)} largest doc(s) first")
 
+    batched = batch_label(order, roster, vocab) if (batch_label and not pilot) else None
     for idx, doc_name in enumerate(order):
-        warns, label_err, off_schema = _label_one_document(
-            doc_name,
-            docs[doc_name],
-            roster,
-            config=config,
-            cache_dir=cache_dir,
-            debug=debug,
-            log=log,
-            vocab=vocab,
-        )
+        if batched is not None:
+            warns, label_err, off_schema = batched[doc_name]
+        else:
+            warns, label_err, off_schema = _label_one_document(
+                doc_name,
+                docs[doc_name],
+                roster,
+                config=config,
+                cache_dir=cache_dir,
+                debug=debug,
+                log=log,
+                vocab=vocab,
+            )
         warnings.extend(warns)
         if label_err is not None and on_label_error is not None:
             on_label_error(doc_name, label_err)
