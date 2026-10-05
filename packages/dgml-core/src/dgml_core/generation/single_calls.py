@@ -10,12 +10,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The labeling pass's docset-wide calls, with a pluggable driver.
+"""The labeling pass's docset-wide calls, routable through a batch stage.
 
 Pass B makes three calls that are not per document: roster planning (a draft,
 then a grounded refine turn), gap planning for an extendable authored
 vocabulary (one call), and concept descriptions for the roles coined during
-labeling (one call). Each is one request chain per docset.
+labeling (one call). Each is one request chain per docset, so it cannot share
+a wave with anything else, but it still bills at half price as a one-unit batch
+stage — one round trip per request in the chain.
 
 The call sites (:func:`dgml_core.generation.label.plan_concept_roster`,
 :func:`~dgml_core.generation.label.describe_concepts`) go through
@@ -24,8 +26,10 @@ these are exactly ``llm.call`` / ``llm.call_with_refinement`` (a test that
 patches either still intercepts every request). Inside
 :func:`single_calls_through` they build the very same request with the step
 form (``llm.steps_call`` / ``llm.steps_with_refinement``) and hand it to the
-runner, which drives it. Either way the request bytes, the result and the
-usage accounting are the synchronous call's.
+runner, which drives it — in batch mode, as a one-unit batch stage (see
+:func:`dgml_core.generation.pipeline.batch_single_call_runner`). Either way the
+request bytes, the result and the usage accounting are the synchronous call's;
+only the tier differs.
 
 A runner returns the generator's result or raises what the synchronous call
 would have raised, so each call site's own failure handling (planning and

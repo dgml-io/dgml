@@ -39,6 +39,11 @@ will work too.)
 
 See [CLAUDE.md](CLAUDE.md) for the full workspace/package layout and contributor conventions.
 
+For bulk and overnight runs, `docset generate --batch` sends model calls
+through the provider's batch API at half price, with results within 24 hours
+(Anthropic). See [`docs/batch-mode.md`](docs/batch-mode.md) for what batches,
+what doesn't, and when to use it.
+
 ## Repository layout
 
 | Path | What's there |

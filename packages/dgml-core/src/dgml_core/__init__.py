@@ -184,6 +184,7 @@ if TYPE_CHECKING:
         load_classification_config,
     )
     from .consistency import CheckReport, Issue, check_workspace
+    from .generation.link_stage import LinkOutcome, LinkStage, StagedDocument
     from .grounded import ExtractionResult
 
 __version__ = "0.1.0"
@@ -203,6 +204,8 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 #: session (bill extraction) spend that entire budget on an unused client.
 #: Importing a submodule directly, or touching any name below, still loads it
 #: exactly as before. ``tests/test_public_api.py`` pins the invariant.
+#: The semantic-link stage is lazy for the same reason, and so that
+#: ``dgml_core.batch`` is never on the default import path.
 _LAZY_SUBMODULES = {
     "CheckReport": ".consistency",
     "ClassificationConfig": ".classification",
@@ -210,6 +213,9 @@ _LAZY_SUBMODULES = {
     "ClassifyMode": ".classification",
     "ExtractionResult": ".grounded",
     "Issue": ".consistency",
+    "LinkOutcome": ".generation.link_stage",
+    "LinkStage": ".generation.link_stage",
+    "StagedDocument": ".generation.link_stage",
     "check_workspace": ".consistency",
     "classify_file": ".classification",
     "load_classification_config": ".classification",
@@ -301,7 +307,9 @@ __all__ = [
     "Issue",
     "LabelModelUnreachable",
     "LegacyConfigPresent",
+    "LinkOutcome",
     "LinkPlanFailed",
+    "LinkStage",
     "LocalDirWorkspacesStore",
     "LocalStore",
     "Migration",
@@ -328,6 +336,7 @@ __all__ = [
     "SchemaGenerationFailed",
     "SchemaInvalid",
     "SchemaNotFound",
+    "StagedDocument",
     "Storage",
     "StorageBackendMismatch",
     "StorageConfig",

@@ -579,9 +579,10 @@ def transcribe_steps(
     """Pass A for one document as a state machine: yields each window request in
     order, receives its response, and returns the flat block list.
 
-    This is the single copy of the transcription logic; :func:`transcribe_document`
-    drives it synchronously. The requests, gate decisions, cache artifacts, and
-    blocks are all decided here, so any driver gets the same ones. The generator is pure
+    This is the single copy of the transcription logic. :func:`transcribe_document`
+    drives it synchronously; a batch driver advances many documents' generators a
+    wave at a time. Either way the requests, gate decisions, cache artifacts, and
+    blocks are the same, because they are all decided here. The generator is pure
     in the :data:`dgml_core.llm.LLMSteps` sense: every model request is a yield of
     litellm kwargs (composed from :func:`dgml_core.llm.steps_continued`) and it
     does no usage accounting; the driver owns that.
@@ -781,8 +782,11 @@ def transcribe_document(
     """
     # Short-circuit before opening the usage scope, exactly as before: a cached
     # document makes no call and leaves no usage row. transcribe_steps repeats
-    # the (cheap) check and returns without yielding; llm.drive would still
-    # write an empty row for such a generator, which is why this checks first.
+    # the (cheap) check and returns without yielding, and the batch driver
+    # (dgml_core.batch.run_stage) opens a unit's usage scope only once its
+    # generator has yielded a request — so a cached document leaves no row
+    # there either. (llm.drive would write an empty row for such a generator,
+    # which is why this sync path checks the cache before calling it.)
     cached = _load_cached_blocks(cache_dir, doc_name)
     if cached is not None:
         log(f"{doc_name}: reusing cached transcription ({len(cached)} block(s))")

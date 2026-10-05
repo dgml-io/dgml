@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import layout, llm
 from .concurrency import map_concurrent
@@ -43,6 +44,11 @@ from .storage import Workspace
 from .storage_service import BlobStore
 from .style import ALLOWED, merge_styles, validate_style
 from .usage import OPERATION_STYLE_ANNOTATE
+
+if TYPE_CHECKING:
+    from .batch import BatchExecutor
+    from .style_config import StyleConfig
+    from .xml_grounding import PendingStyle
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +155,28 @@ def annotate_style_from_image(
     function in :func:`dgml_core.llm.record_usage_for`: ``replace`` would hand
     every page config the same ``_usage_sink`` dict and the concurrent
     ``add_partial`` accumulations would race."""
+    jobs = prepare_style_jobs(
+        workspace, file_id, root, config=config, origin_attr=origin_attr, debug=debug
+    )
+    results = map_concurrent(_styles_for_page, jobs, max_workers=max_concurrency)
+    return apply_style_results(jobs, results, style_attr=style_attr)
+
+
+def prepare_style_jobs(
+    workspace: Workspace,
+    file_id: str,
+    root: Any,
+    *,
+    config: llm.LLMConfig,
+    origin_attr: str,
+    debug: bool = False,
+) -> list[_PageJob]:
+    """Every page's vision request for *root*, prepared on this thread: the
+    grounded snippets of each page that has a rendered image, and the page's
+    own config (its usage row's recording context). The first half of
+    :func:`annotate_style_from_image`; :func:`apply_style_results` is the
+    second, and a batch run sends the requests in between
+    (:func:`style_pages_batch`)."""
     by_page: dict[int, list[tuple[Any, str]]] = {}
     for el in root.iter():
         if not isinstance(el.tag, str):
@@ -162,7 +190,7 @@ def annotate_style_from_image(
 
     # Prepare every request up front, on this thread: snippet text comes out of
     # the tree here, and pages with no rendered image drop out here, so the
-    # fan-out below is over nothing but self-contained work items.
+    # fan-out that follows is over nothing but self-contained work items.
     jobs: list[_PageJob] = []
     for page, pairs in by_page.items():
         image_key = layout.file_page_image_key(file_id, page)
@@ -189,9 +217,14 @@ def annotate_style_from_image(
                 ),
             )
         )
+    return jobs
 
-    results = map_concurrent(_styles_for_page, jobs, max_workers=max_concurrency)
 
+def apply_style_results(
+    jobs: Sequence[_PageJob], results: Sequence[_PageResult], *, style_attr: str
+) -> int:
+    """Merge each page's reported styles into its elements, in page order, and
+    report the pages that failed. Returns the number of elements styled."""
     styled = 0
     failures: list[tuple[int, Exception]] = []
     unreachable: Exception | None = None
@@ -216,6 +249,106 @@ def annotate_style_from_image(
     if failures:
         _report_failures(failures, unreachable, total_pages=len(jobs))
     return styled
+
+
+def page_style_steps(job: _PageJob) -> llm.LLMSteps[dict[int, str]]:
+    """Step form of one page's request (:func:`_request_styles` on its page
+    image): the same request, for a batch driver to send.
+
+    The image is read when the generator is first advanced, so an unreadable
+    one fails the page before any request exists, as it does synchronously."""
+    image_bytes = job.blobs.get_blob(job.image_key)
+    user_content = llm.build_user_content(
+        instruction_text=_build_prompt(job.snippets), images=[image_bytes]
+    )
+    raw = yield from llm.steps_call(
+        job.config, system_prompt=_SYSTEM_PROMPT, user_content=user_content
+    )
+    return _parse_styles(raw)
+
+
+def style_batch_executor(
+    config: StyleConfig,
+    *,
+    poll_interval_s: float = 30.0,
+    max_poll_s: float | None = None,
+    min_wave_size: int = 1,
+    log: Callable[[str], None] = lambda _m: None,
+) -> BatchExecutor:
+    """:func:`dgml_core.batch.make_executor` for the workspace's ``style``
+    model, with its credential resolved the way the synchronous pass resolves
+    it. Raises :class:`~dgml_core.errors.BatchUnavailable` when the provider
+    has no batch backend. Imports the batch package lazily."""
+    from .batch import make_executor
+    from .style_config import resolve_api_key
+
+    return make_executor(
+        config.model,
+        api_key=resolve_api_key(config),
+        api_base=config.api_base,
+        poll_interval_s=poll_interval_s,
+        max_poll_s=max_poll_s,
+        min_wave_size=min_wave_size,
+        log=log,
+    )
+
+
+def style_documents_batch(
+    pending: Mapping[str, PendingStyle],
+    executor: BatchExecutor,
+    *,
+    log: Callable[[str], None] = lambda _m: None,
+) -> dict[str, bytes]:
+    """Finish every deferred image-style pass in *pending* (document name →
+    :class:`~dgml_core.xml_grounding.PendingStyle`) with ONE batch stage over
+    all their pages, and return each document's final grounded XML — the bytes
+    a synchronous grounding run writes for it."""
+    from .xml_grounding import finish_deferred_style
+
+    results = style_pages_batch({name: p.jobs for name, p in pending.items()}, executor, log=log)
+    return {name: finish_deferred_style(p, results[name]) for name, p in pending.items()}
+
+
+def style_pages_batch(
+    documents: Mapping[str, Sequence[_PageJob]],
+    executor: BatchExecutor,
+    *,
+    log: Callable[[str], None] = lambda _m: None,
+) -> dict[str, list[_PageResult]]:
+    """Every document's page requests as ONE batch stage (one wave: pages are
+    independent of each other and of every other document), keyed by document
+    like *documents*, each list in its jobs' order — what
+    :func:`_styles_for_page` returns per page, so :func:`apply_style_results`
+    takes it unchanged.
+
+    Each page writes the usage row its synchronous call would (its own
+    config), tagged with the tier that served it. A page that fails — its
+    image, its request, or the stage as a whole — gets that error as its
+    result, so one page never affects another."""
+    from .batch import Unit, run_stage
+
+    units: list[Unit] = []
+    names: dict[str, list[str]] = {}
+    for doc, jobs in documents.items():
+        names[doc] = []
+        for n, job in enumerate(jobs):
+            name = f"{doc}#{n}"
+            names[doc].append(name)
+            units.append(Unit(name=name, config=job.config, steps=page_style_steps(job)))
+    outcomes = run_stage(units, executor, log=log, stage="style") if units else {}
+    out: dict[str, list[_PageResult]] = {}
+    for doc, unit_names in names.items():
+        results: list[_PageResult] = []
+        for name in unit_names:
+            outcome = outcomes[name]
+            if outcome.error is None:
+                results.append(_PageResult(outcome.result, None, False))
+                continue
+            error = outcome.error
+            assert isinstance(error, Exception)  # run_stage captures only Exception per unit
+            results.append(_PageResult(None, error, llm.is_model_reachability_error(error)))
+        out[doc] = results
+    return out
 
 
 def _report_failures(

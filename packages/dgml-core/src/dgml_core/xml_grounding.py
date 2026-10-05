@@ -101,7 +101,7 @@ import difflib
 import re
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -232,6 +232,26 @@ class _OTok:
     word: Word
 
 
+@dataclass
+class PendingStyle:
+    """An OCR file's image-based ``dg:style`` pass, prepared by
+    ``ground_dgml_xml(..., defer_style=True)`` but not run.
+
+    ``root`` is the grounded tree as it stood when the synchronous pass would
+    have started; ``jobs`` are its page requests
+    (:func:`dgml_core.style_llm.prepare_style_jobs`), which a batch run sends
+    together with every other document's
+    (:func:`dgml_core.style_llm.style_pages_batch`); ``config`` is the
+    workspace's ``style`` section (whose model serves them).
+    :func:`finish_deferred_style` then applies the results and returns the
+    document's final grounded XML — the bytes the synchronous run writes."""
+
+    root: Any
+    jobs: list[Any]
+    style_attr: str
+    config: StyleConfig
+
+
 @dataclass(frozen=True)
 class GroundingResult:
     output_path: Path
@@ -239,6 +259,10 @@ class GroundingResult:
     # dict is still returned in-memory regardless.
     stats_path: Path | None
     stats: dict[str, Any]
+    # Set only by ``defer_style=True`` when the file has an image-style pass to
+    # run: ``output_path`` then holds the tree without it, and
+    # :func:`finish_deferred_style` produces the final bytes.
+    pending_style: PendingStyle | None = None
 
 
 # ---- XML side --------------------------------------------------------------
@@ -462,6 +486,7 @@ def ground_dgml_xml(
     force: bool = False,
     write_stats: bool = True,
     debug: bool = False,
+    defer_style: bool = False,
 ) -> GroundingResult:
     """Annotate the DGML XML at ``xml_path`` with ``dg:origin`` boxes,
     grounding against ``file_id``'s page OCR, and write the result.
@@ -483,6 +508,13 @@ def ground_dgml_xml(
     ``dg:style`` pass (OCR files with a ``style`` config) — like every other
     LLM path, no ``--debug`` means no usage rows. Deterministic grounding does
     no LLM work, so this is a no-op otherwise.
+
+    ``defer_style=True`` (batch mode) prepares that image-style pass instead of
+    running it: when there is one, the result's ``pending_style`` carries it,
+    ``output_path`` holds the tree without it, and
+    :func:`finish_deferred_style` — once the pages' replies are in — returns
+    the bytes the synchronous run would have written. Stats are unaffected
+    (none depends on ``dg:style``).
 
     Raises :class:`FileNotFound` if the workspace has no ``page_text``
     for the file, :class:`GroundingFailed` if the XML cannot be parsed,
@@ -572,16 +604,24 @@ def ground_dgml_xml(
         root, segs, page_dims, page_baselines, emit_style=emit_style
     )
 
-    # For opted-in OCR files, fill dg:style from the page images via an LLM
-    # (best-effort). A no-op for digital/hybrid files and unconfigured workspaces.
-    _maybe_style_from_image(
-        workspace, file_id, root, config=style_config, is_ocr=is_ocr, debug=debug
-    )
+    pending: PendingStyle | None = None
+    if defer_style:
+        pending = _prepare_deferred_style(
+            workspace, file_id, root, config=style_config, is_ocr=is_ocr, debug=debug
+        )
+    if pending is None:
+        # For opted-in OCR files, fill dg:style from the page images via an LLM
+        # (best-effort). A no-op for digital/hybrid files and unconfigured
+        # workspaces.
+        _maybe_style_from_image(
+            workspace, file_id, root, config=style_config, is_ocr=is_ocr, debug=debug
+        )
 
-    # Drop dg:style declarations a child merely inherits from an ancestor, so an
-    # inheriting property (color, font-*, …) lands only where it first appears —
-    # the most specific element that introduces it — not restated down the tree.
-    _suppress_inherited_style(root, _dg_attr_name(root, "style"))
+        # Drop dg:style declarations a child merely inherits from an ancestor, so
+        # an inheriting property (color, font-*, …) lands only where it first
+        # appears — the most specific element that introduces it — not restated
+        # down the tree.
+        _suppress_inherited_style(root, _dg_attr_name(root, "style"))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(etree.tostring(root, encoding="utf-8", xml_declaration=True))
@@ -653,7 +693,29 @@ def ground_dgml_xml(
         output_path=out_path,
         stats_path=stats_path if write_stats else None,
         stats=stats,
+        pending_style=pending,
     )
+
+
+def finish_deferred_style(pending: PendingStyle, results: Sequence[Any]) -> bytes:
+    """The grounded XML of a document whose image-style pass was deferred,
+    once its pages' *results* are in (one
+    :class:`~dgml_core.style_llm._PageResult` per ``pending.jobs`` entry, as
+    :func:`dgml_core.style_llm.style_pages_batch` returns them): the styles
+    applied exactly as the synchronous pass applies them, inherited
+    declarations suppressed, serialized as :func:`ground_dgml_xml` writes it —
+    the same bytes. Best-effort like the synchronous pass: a failure applying
+    styles leaves the tree as grounded."""
+    from lxml import etree
+
+    try:
+        from .style_llm import apply_style_results
+
+        apply_style_results(pending.jobs, results, style_attr=pending.style_attr)
+    except Exception:
+        pass  # best-effort enhancement — never let it discard the grounding
+    _suppress_inherited_style(pending.root, pending.style_attr)
+    return bytes(etree.tostring(pending.root, encoding="utf-8", xml_declaration=True))
 
 
 def grounded_output_path(xml_path: Path) -> Path:
@@ -2063,6 +2125,51 @@ def _maybe_style_from_image(
         return
 
 
+def _prepare_deferred_style(
+    workspace: Workspace,
+    file_id: str,
+    root: Any,
+    *,
+    config: StyleConfig | None,
+    is_ocr: bool,
+    debug: bool = False,
+) -> PendingStyle | None:
+    """:func:`_maybe_style_from_image` up to its requests: the pass's page
+    jobs, or ``None`` when there is nothing to send (no ``style`` config, not
+    an OCR file, no page with both a snippet and an image) or preparing it
+    failed — the synchronous pass then runs (and, best-effort, does nothing)."""
+    if config is None or not is_ocr:
+        return None
+
+    from .style_config import resolve_api_key
+
+    try:
+        from .llm import LLMConfig
+        from .style_llm import prepare_style_jobs
+
+        llm_config = LLMConfig(
+            model=config.model,
+            api_base=config.api_base,
+            api_key=resolve_api_key(config),
+            max_tokens=config.max_tokens,
+        )
+        jobs = prepare_style_jobs(
+            workspace,
+            file_id,
+            root,
+            config=llm_config,
+            origin_attr=_dg_attr_name(root, "origin"),
+            debug=debug,
+        )
+    except Exception:
+        return None
+    if not jobs:
+        return None
+    return PendingStyle(
+        root=root, jobs=list(jobs), style_attr=_dg_attr_name(root, "style"), config=config
+    )
+
+
 def _suppress_inherited_style(root: Any, style_attr: str) -> None:
     """Remove ``dg:style`` declarations a descendant only inherits from an
     ancestor, in place. Walks top-down carrying the inherited value of each
@@ -2304,6 +2411,8 @@ def _top_ungrounded(root: Any, segs: list[_TextSeg], limit: int = 20) -> list[di
 __all__ = [
     "DG_NAMESPACE",
     "GroundingResult",
+    "PendingStyle",
+    "finish_deferred_style",
     "ground_dgml_xml",
     "grounded_output_path",
 ]
