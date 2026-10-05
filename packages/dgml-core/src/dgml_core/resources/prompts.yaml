@@ -38,6 +38,17 @@ extraction_schema_user_intro_single: |-
 extraction_schema_user_intro_multi: |-
   Given the {n_files} attached PDFs (all of the same kind), propose an extraction schema that captures the structured information someone would want to extract from documents of this kind. The schema you return must fit ALL of the attached files — favor what generalizes across instances over fields that only appear in one.
 
+# Added after the intro only when the provider refused the request as too
+# large and some samples are sent as their leading pages. .format()'d with
+# {excerpts}, one "- Sample N (pages 1-K of M)" line per partial sample.
+extraction_schema_user_excerpts: |-
+  Some of the samples were too large to send whole, so only their leading
+  pages are attached:
+  {excerpts}
+  Fields that appear only later in those documents may be missing from what
+  you can see. Do not conclude a field is absent from this kind of document
+  just because an excerpt ends before it.
+
 extraction_schema_user_body: |-
   Return the schema by calling ``submit_schema`` with ``fields`` — the list
   of top-level field nodes. Each node is an object:
