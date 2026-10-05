@@ -38,8 +38,8 @@ Both keep the model choice visible/recorded: a profile/file is a checked-in,
 named artifact, and the effective models (plus a ``source`` label recording
 where they came from) are echoed into the ``docset generate`` JSON output.
 
-The two models can name different providers (e.g. the default ``mixed`` config
-uses Anthropic for transcription and Gemini for labeling), so each carries its
+The two models can name different providers (e.g. the ``anthropic_google``
+family blends Gemini and Anthropic models), so each carries its
 own credentials: ``api_key`` / ``api_key_env`` / ``api_base`` for transcription
 and ``label_api_key`` / ``label_api_key_env`` / ``label_api_base`` for labeling.
 These apply whether the models are set here or come from their tiers; the tiers
