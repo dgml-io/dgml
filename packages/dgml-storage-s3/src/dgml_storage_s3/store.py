@@ -62,10 +62,17 @@ from dgml_core.storage_service import BlobStore, StorageConfig
 #: S3 caps a single ``delete_objects`` call at 1000 keys.
 _DELETE_BATCH = 1000
 
+#: Where workspaces live in the bucket when the config sets no ``prefix``.
+DEFAULT_PREFIX = "dgml"
+
 
 class S3BlobStore(BlobStore):
     """Blobs in an S3-compatible bucket. Inherits the path bridge and
-    ``sha256_blob`` from :class:`~dgml_core.storage_service.BlobStore`."""
+    ``sha256_blob`` from :class:`~dgml_core.storage_service.BlobStore`.
+
+    Every object goes under ``<prefix>/<workspace id>/``, with ``prefix`` defaulting to
+    ``dgml``. The id is always appended, so any number of workspaces — and other
+    applications — can share one bucket without their keys meeting."""
 
     name = "s3"
     config_fields = frozenset({"bucket", "region", "endpoint_url", "prefix"})
@@ -81,6 +88,13 @@ class S3BlobStore(BlobStore):
         prefix = config.options.get("prefix")
         if prefix is not None and not isinstance(prefix, str):
             raise StorageConfigInvalid("'prefix' must be a string")
+        if not config.workspace_id:
+            # Refused rather than defaulted: keys without the id would sit where every
+            # other id-less workspace's do, and move the moment this one gets an id.
+            raise StorageConfigInvalid(
+                f"provider {cls.name!r} needs the workspace's id to place its data in the "
+                f"bucket, and this workspace records none"
+            )
         return config
 
     def __init__(self, config: StorageConfig) -> None:
@@ -93,10 +107,10 @@ class S3BlobStore(BlobStore):
 
         opts = config.options
         self._bucket = str(opts["bucket"])
-        # An optional key prefix lets several workspaces share one bucket. Kept
-        # normalized to "" or "…/" so key joins never double or drop a slash.
-        raw_prefix = str(opts.get("prefix") or "").strip("/")
-        self._prefix = f"{raw_prefix}/" if raw_prefix else ""
+        # `<prefix>/<workspace id>/`, normalized so key joins never double or drop a
+        # slash. An explicit empty prefix puts the workspace directly at `<id>/`.
+        root = str(DEFAULT_PREFIX if opts.get("prefix") is None else opts["prefix"]).strip("/")
+        self._prefix = "/".join(part for part in (root, str(config.workspace_id)) if part) + "/"
 
         client_kwargs: dict[str, Any] = {}
         if opts.get("region"):
@@ -117,7 +131,7 @@ class S3BlobStore(BlobStore):
 
     def _key(self, obj: str) -> str:
         """The store key for an S3 object key (strips the configured prefix)."""
-        return obj[len(self._prefix) :] if self._prefix else obj
+        return obj[len(self._prefix) :]
 
     # ---- Blobs (S3) ----
 

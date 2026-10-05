@@ -589,6 +589,26 @@ def test_store_configs_default_to_local_with_no_config(tmp_path: Path) -> None:
     assert blob_cfg.root == doc_cfg.root == ws.root
 
 
+def test_store_configs_carry_the_workspace_id_from_config_toml(tmp_path: Path) -> None:
+    """A store sharing its backend between workspaces names its data by workspace id,
+    so both roles must receive it — read from ``config.toml``'s ``[workspace]`` block,
+    since ``workspace.json`` lives inside the document store being built."""
+    from dgml_core import workspace_config as wsconfig
+    from dgml_core.storage_resolve import load_store_configs, resolve_store_configs
+
+    ws = Workspace.resolve(tmp_path)
+    wsconfig.write_identity(ws, workspace_id="ws-abc")
+    blob_cfg, doc_cfg = resolve_store_configs(ws)
+    assert blob_cfg.workspace_id == doc_cfg.workspace_id == "ws-abc"
+    # The exported entry point too — a library caller building a store from it must
+    # get a config a shared backend can open.
+    assert all(cfg.workspace_id == "ws-abc" for cfg in load_store_configs(ws))
+    # And it stays out of the seal: the id is constant per workspace, not a store identity.
+    assert storage_fingerprint(blob_cfg) == storage_fingerprint(
+        StorageConfig(provider=blob_cfg.provider, root=blob_cfg.root)
+    )
+
+
 def _same_instance(blobs: object, docs: object) -> bool:
     """Whether the two roles are the same object. Takes ``object`` because
     ``BlobStore`` and ``DocStore`` are unrelated ABCs, so a direct ``is`` reads to
