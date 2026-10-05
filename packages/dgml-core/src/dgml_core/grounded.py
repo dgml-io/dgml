@@ -52,8 +52,9 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,7 @@ from .llm import (
     _mark_document_cacheable,
     call_with_tools,
     is_anthropic_model,
+    is_request_too_large,
     model_max_output_tokens,
 )
 from .matching import (
@@ -110,6 +112,7 @@ from .matching import (
 )
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .ocr import _image_dimensions as _png_dimensions
+from .pages import load_pdf_config, pdf_page_count_bytes, slice_pages
 from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
@@ -123,6 +126,8 @@ from .usage import (
     add_partial,
     record_usage,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---- Constants ------------------------------------------------------------
 
@@ -738,6 +743,7 @@ def extract_values(
     phase1_tool_schema_mode = "inlined"
     phase1_chunk_calls = 0
     phase1_truncated_retries = 0
+    phase1_pdf_parts: list[tuple[int, int]] = []
 
     try:
         # --- Phase 1: text + page numbers, no bboxes (LLM) ----------
@@ -755,7 +761,9 @@ def extract_values(
         # after, so the cached prefix is unchanged between the two attempts.
         schema_text = _values_phase1_user_prompt(phase1_schema, guidance)
 
-        def _phase1_messages(*, chunked: bool) -> list[dict[str, Any]]:
+        def _phase1_messages(
+            *, chunked: bool, pdf: bytes, part: _PdfPart | None
+        ) -> list[dict[str, Any]]:
             # Rebuilt per attempt — _run_extract_loop mutates its message list.
             anthropic = is_anthropic_model(config.values_model)
             schema_block: dict[str, Any] = {"type": "text", "text": schema_text}
@@ -770,7 +778,11 @@ def extract_values(
                 user_content.append(
                     {"type": "text", "text": prompt(PromptKey.VALUES_PHASE1_RETRY_CHUNKED)}
                 )
-            user_content.append(_pdf_content_block(pdf_bytes))
+            if part is not None:
+                # Only when the whole document was refused as too large. After
+                # the schema block, so its cache entry still serves every part.
+                user_content.append({"type": "text", "text": part.prompt_text()})
+            user_content.append(_pdf_content_block(pdf))
             if anthropic and chunked:
                 # The per-file PDF earns a breakpoint only here. Chunked mode
                 # is several turns over one unchanged prefix, so turns after
@@ -793,42 +805,66 @@ def extract_values(
         # re-raises once its own latch is set, the loop runs at most three
         # attempts (initial + one per latch) before terminating.
         chunked = False
-        while True:
-            tool_schema = (
-                _PERMISSIVE_VALUES_PARAM
-                if phase1_tool_schema_mode == "permissive"
-                else phase1_tool_schema
-            )
-            try:
-                phase1_args, phase1_tool_calls, phase1_chunk_calls = _run_extract_loop(
-                    workspace=workspace,
-                    file_id=file_id,
-                    messages=_phase1_messages(chunked=chunked),
-                    tools=_phase1_tools(tool_schema, chunked=chunked),
-                    chunked=chunked,
-                    model=config.values_model,
-                    api_key=api_key,
-                    api_base=api_base,
-                    max_tool_iters=config.max_tool_iters,
-                    totals=phase1_totals,
-                    reasoning_effort=config.values_reasoning_effort,
+
+        def _phase1_run(pdf: bytes, part: _PdfPart | None) -> tuple[dict[str, Any], int, int]:
+            nonlocal chunked, phase1_tool_schema_mode, phase1_truncated_retries
+            while True:
+                tool_schema = (
+                    _PERMISSIVE_VALUES_PARAM
+                    if phase1_tool_schema_mode == "permissive"
+                    else phase1_tool_schema
                 )
-                break
-            except _OutputTruncated as exc:
-                if chunked:
-                    raise ValuesExtractionFailed(
-                        f"{exc} The chunked-submission retry was truncated too; "
-                        "consider a model with a higher output ceiling or "
-                        "splitting the document."
-                    ) from exc
-                chunked = True
-                phase1_truncated_retries += 1
-            except ValuesExtractionFailed as exc:
-                if phase1_tool_schema_mode == "permissive" or not _is_tool_schema_too_large(exc):
-                    raise
-                # Gemini's constrained decoder rejected the inlined schema;
-                # the model still sees the full schema in the user prompt.
-                phase1_tool_schema_mode = "permissive"
+                try:
+                    return _run_extract_loop(
+                        workspace=workspace,
+                        file_id=file_id,
+                        messages=_phase1_messages(chunked=chunked, pdf=pdf, part=part),
+                        tools=_phase1_tools(tool_schema, chunked=chunked),
+                        chunked=chunked,
+                        model=config.values_model,
+                        api_key=api_key,
+                        api_base=api_base,
+                        max_tool_iters=config.max_tool_iters,
+                        totals=phase1_totals,
+                        reasoning_effort=config.values_reasoning_effort,
+                        page_offset=part.first_page - 1 if part is not None else 0,
+                    )
+                except _OutputTruncated as exc:
+                    if chunked:
+                        raise ValuesExtractionFailed(
+                            f"{exc} The chunked-submission retry was truncated too; "
+                            "consider a model with a higher output ceiling or "
+                            "splitting the document."
+                        ) from exc
+                    chunked = True
+                    phase1_truncated_retries += 1
+                except ValuesExtractionFailed as exc:
+                    if phase1_tool_schema_mode == "permissive" or not _is_tool_schema_too_large(
+                        exc
+                    ):
+                        raise
+                    # Gemini's constrained decoder rejected the inlined schema;
+                    # the model still sees the full schema in the user prompt.
+                    phase1_tool_schema_mode = "permissive"
+
+        # The whole PDF goes in one request, as it always has. Only when the
+        # provider refuses that request as too large is the document split
+        # into page ranges, halving until each part is accepted.
+        try:
+            phase1_args, phase1_tool_calls, phase1_chunk_calls = _phase1_run(pdf_bytes, None)
+        except ValuesExtractionFailed as exc:
+            if not is_request_too_large(exc):
+                raise
+            parts = _phase1_in_parts(
+                workspace,
+                file_id,
+                pdf_bytes,
+                model=config.values_model,
+                run=_phase1_run,
+                refused=exc,
+            )
+            phase1_args, phase1_tool_calls, phase1_chunk_calls = _merge_parts(parts)
+            phase1_pdf_parts = [(p.first_page, p.last_page) for p, _ in parts]
         # Enforce the vocabulary code-side on exactly the paths whose payload
         # never met a provider-side shape check: permissive mode (the values
         # parameter was a bare object) and chunked mode (append_entries
@@ -1002,6 +1038,7 @@ def extract_values(
                     phase1_tool_schema=phase1_tool_schema_mode,
                     phase1_chunk_calls=phase1_chunk_calls,
                     phase1_truncated_retries=phase1_truncated_retries,
+                    phase1_pdf_parts=phase1_pdf_parts,
                 )
         except Exception:
             pass
@@ -1069,6 +1106,7 @@ def _write_extraction_stats(
     phase1_tool_schema: str,
     phase1_chunk_calls: int,
     phase1_truncated_retries: int,
+    phase1_pdf_parts: list[tuple[int, int]] | None = None,
 ) -> None:
     """Write ``extraction_stats.json`` into the file's marker directory.
 
@@ -1091,6 +1129,10 @@ def _write_extraction_stats(
                 # times phase 1 was restarted with the explicit chunking
                 # directive after a finish_reason='length' truncation.
                 "truncated_retries": phase1_truncated_retries,
+                # [first_page, last_page] of each page-range part, present only
+                # when the provider refused the whole document as too large and
+                # phase 1 ran once per part.
+                **({"pdf_parts": [list(p) for p in phase1_pdf_parts]} if phase1_pdf_parts else {}),
                 **phase1_totals,
             },
             "phase2": {"duration_s": phase2_duration},
@@ -1704,6 +1746,215 @@ def _merge_values(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]
     return base
 
 
+# ---- Phase 1 over page-range parts (a document refused as too large) ------
+
+
+@dataclass(frozen=True)
+class _PdfPart:
+    """One page range of a document, sent to phase 1 as its own PDF."""
+
+    first_page: int
+    last_page: int
+    total_pages: int
+
+    def prompt_text(self) -> str:
+        return prompt(PromptKey.VALUES_PHASE1_PART).format(
+            first_page=self.first_page,
+            last_page=self.last_page,
+            total_pages=self.total_pages,
+        )
+
+
+_Phase1Run = tuple[dict[str, Any], int, int]
+
+
+def _phase1_in_parts(
+    workspace: Workspace,
+    file_id: str,
+    pdf_bytes: bytes,
+    *,
+    model: str,
+    run: Callable[[bytes, _PdfPart | None], _Phase1Run],
+    refused: ValuesExtractionFailed,
+) -> list[tuple[_PdfPart, _Phase1Run]]:
+    """Run phase 1 over page ranges of a document whose whole-PDF request the
+    provider refused as too large (*refused*).
+
+    The document is cut in half, and any half the provider refuses too is cut
+    again, until each part is accepted. Parts are sliced with the workspace's
+    PDF engine, the same one generation's windows use. Returns each part with
+    its phase-1 result, in document order. A single page that is still too
+    large fails the file.
+    """
+    record_count = FileStore(workspace).get(file_id).page_count
+    try:
+        page_count = (
+            record_count
+            if isinstance(record_count, int) and record_count > 0
+            else pdf_page_count_bytes(pdf_bytes)
+        )
+        pdf_config = load_pdf_config(workspace)
+    except Exception as exc:
+        raise ValuesExtractionFailed(
+            f"{refused} The document could not be split into page ranges: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if page_count <= 1:
+        raise ValuesExtractionFailed(
+            f"page 1 alone is too large for one extraction request to {model!r}: {refused}"
+        ) from refused
+    logger.info(
+        "extraction: %s refused file %s (%d pages, %d bytes) as too large for one "
+        "request; sending it in page ranges",
+        model,
+        file_id,
+        page_count,
+        len(pdf_bytes),
+    )
+
+    def attempt(first: int, last: int) -> list[tuple[_PdfPart, _Phase1Run]]:
+        try:
+            sliced = slice_pages(
+                pdf_bytes, range(first, last + 1), config=pdf_config, total_pages=page_count
+            )
+        except Exception as exc:
+            raise ValuesExtractionFailed(
+                f"{refused} Slicing pages {first}-{last} out of it failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        part = _PdfPart(first_page=first, last_page=last, total_pages=page_count)
+        try:
+            return [(part, run(sliced, part))]
+        except ValuesExtractionFailed as exc:
+            if not is_request_too_large(exc):
+                raise
+            if first == last:
+                raise ValuesExtractionFailed(
+                    f"page {first} alone is too large for one extraction request "
+                    f"to {model!r}: {exc}"
+                ) from exc
+            mid = (first + last) // 2
+            return attempt(first, mid) + attempt(mid + 1, last)
+
+    mid = (1 + page_count) // 2
+    return attempt(1, mid) + attempt(mid + 1, page_count)
+
+
+def _merge_parts(parts: list[tuple[_PdfPart, _Phase1Run]]) -> _Phase1Run:
+    """Combine the phase-1 results of a document's parts into one, as if the
+    whole document had been read at once: page numbers go back to the
+    document's, values merge in document order (see :func:`_merge_part_values`),
+    the first part to describe an array's layout wins, and the counts add up."""
+    values: dict[str, Any] = {}
+    merged_layout: dict[str, Any] = {}
+    tool_calls = chunk_calls = 0
+    for part, (args, part_tool_calls, part_chunk_calls) in parts:
+        part_values = args["values"]
+        _offset_page_numbers(part_values, part.first_page - 1)
+        _merge_part_values(values, part_values)
+        part_layout = args.get("layout")
+        if isinstance(part_layout, dict):
+            for key, value in part_layout.items():
+                merged_layout.setdefault(key, value)
+        tool_calls += part_tool_calls
+        chunk_calls += part_chunk_calls
+    merged: dict[str, Any] = {"values": values}
+    if merged_layout:
+        merged["layout"] = merged_layout
+    return merged, tool_calls, chunk_calls
+
+
+def _offset_page_numbers(values: Any, offset: int) -> None:
+    """Shift every location's ``page_number`` by *offset*, in place: a part's
+    values number its own PDF's pages from 1."""
+    if not offset:
+        return
+    if isinstance(values, dict):
+        locations = values.get("locations")
+        if "text" in values and isinstance(locations, list):
+            for loc in locations:
+                page = loc.get("page_number") if isinstance(loc, dict) else None
+                if isinstance(page, int) and not isinstance(page, bool):
+                    loc["page_number"] = page + offset
+            return
+        for value in values.values():
+            _offset_page_numbers(value, offset)
+    elif isinstance(values, list):
+        for value in values:
+            _offset_page_numbers(value, offset)
+
+
+def _renumber_page_words(result: dict[str, Any], page: int) -> None:
+    """Show a ``get_page_words`` result under the page number the model asked
+    for (its part's numbering), in place."""
+    result["page"] = page
+    for word in result.get("words", []):
+        location = word.get("location")
+        if isinstance(location, dict):
+            location["page_number"] = page
+
+
+def _is_empty_leaf(value: Any) -> bool:
+    """A leaf or scalar that carries no value."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, dict) and "text" in value:
+        text = value.get("text")
+        return text is None or (isinstance(text, str) and not text.strip())
+    return False
+
+
+def _rebase_ref(ref: str, base: dict[str, Any]) -> str:
+    """Rewrite a later part's ``derived_from`` path for the merged tree: an
+    index into an array the merge appends to *base*'s copy of it moves past
+    *base*'s entries."""
+    path = parse_path(ref)
+    if path is None:
+        return ref
+    cur: Any = base
+    for i, seg in enumerate(path):
+        if isinstance(seg, int):
+            if isinstance(cur, list):
+                return path_to_str((*path[:i], seg + len(cur), *path[i + 1 :]))
+            return ref
+        if not isinstance(cur, dict):
+            return ref
+        cur = cur.get(seg)
+    return ref
+
+
+def _merge_tree(base: dict[str, Any], extra: dict[str, Any]) -> None:
+    for key, value in extra.items():
+        current = base.get(key)
+        if isinstance(current, list) and isinstance(value, list):
+            current.extend(value)
+        elif (
+            isinstance(current, dict)
+            and isinstance(value, dict)
+            and "text" not in current
+            and "text" not in value
+        ):
+            _merge_tree(current, value)
+        elif key not in base or _is_empty_leaf(current):
+            base[key] = value
+
+
+def _merge_part_values(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """Merge one part's values into those of the parts before it, in place on
+    *base*: arrays concatenate (each part submits only its own pages' entries,
+    in document order), objects merge recursively, and a leaf keeps the
+    earliest part's value unless that one is empty. *extra*'s ``derived_from``
+    paths are first rebased onto the concatenated arrays. Returns *base*."""
+    for _path, leaf in walk_computed_leaves(extra):
+        refs = leaf.get("derived_from")
+        if isinstance(refs, list):
+            leaf["derived_from"] = [_rebase_ref(r, base) if isinstance(r, str) else r for r in refs]
+    _merge_tree(base, extra)
+    return base
+
+
 def _apply_append_entries(acc_args: dict[str, Any] | None, args: dict[str, Any]) -> dict[str, Any]:
     """Apply one ``append_entries`` call to the accumulated values; the
     returned dict is the tool result (an ``error`` key means the call was
@@ -1798,6 +2049,7 @@ def _run_extract_loop(
     totals: dict[str, Any],
     chunked: bool = False,
     reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+    page_offset: int = 0,
 ) -> tuple[dict[str, Any], int, int]:
     """Run a multi-turn extraction loop until the model finishes submitting.
 
@@ -1828,6 +2080,12 @@ def _run_extract_loop(
     A turn that stops with ``finish_reason == "length"`` raises
     :class:`_OutputTruncated` so the caller can retry with an explicit
     chunking directive.
+
+    *page_offset* is non-zero when the PDF sent is a page range of the file
+    that starts after page *page_offset*. The model numbers that PDF's pages
+    from 1, so a ``get_page_words`` lookup reads page ``page + page_offset``
+    and the result is shown under the model's own number. The values it
+    submits keep the PDF's numbering; the caller shifts them.
     """
     # Phase 1 uses tool_choice="auto" (the default in call_with_tools) so
     # the model can call get_page_words between turns. With auto choice
@@ -1962,10 +2220,12 @@ def _run_extract_loop(
                     tool_result: dict[str, Any] = get_page_words(
                         workspace,
                         file_id,
-                        page,
+                        page + page_offset if page >= 1 else page,
                         start_idx if isinstance(start_idx, int) else None,
                         end_idx if isinstance(end_idx, int) else None,
                     )
+                    if page_offset:
+                        _renumber_page_words(tool_result, page)
                 except Exception as exc:
                     # Bubble tool errors back to the model as a tool result;
                     # don't fail the whole extraction on a bad lookup.
