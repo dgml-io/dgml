@@ -203,6 +203,59 @@ def test_extract_cache_tokens_from_hidden_params_fallback() -> None:
     assert out["cache_creation_tokens"] == 128
 
 
+def test_extract_openai_cached_tokens_from_prompt_tokens_details() -> None:
+    """OpenAI and Gemini report cache hits only as
+    ``prompt_tokens_details.cached_tokens``; litellm leaves
+    ``cache_read_input_tokens`` unset for them, so the row said 0 cache reads
+    while the cost priced them at the cache rate."""
+    import litellm
+    from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import (
+        convert_to_model_response_object,
+    )
+
+    response = convert_to_model_response_object(
+        response_object={
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-5-mini-2025-08-07",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 6258,
+                "completion_tokens": 86,
+                "total_tokens": 6344,
+                "prompt_tokens_details": {"cached_tokens": 6144, "audio_tokens": 0},
+            },
+        },
+        model_response_object=litellm.ModelResponse(),
+    )
+    out = extract_cost_and_tokens(response)
+    assert out["cache_read_tokens"] == 6144
+    assert out["cache_creation_tokens"] == 0
+
+
+def test_explicit_cache_read_counter_wins_over_prompt_tokens_details() -> None:
+    """An explicit ``cache_read_input_tokens`` (Anthropic) is authoritative,
+    even when it is 0."""
+    response = SimpleNamespace(
+        _hidden_params={},
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=1,
+            total_tokens=11,
+            cache_read_input_tokens=0,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=7),
+        ),
+    )
+    assert extract_cost_and_tokens(response)["cache_read_tokens"] == 0
+
+
 def test_extract_cache_tokens_default_zero_when_absent() -> None:
     """A provider that reports no cache activity leaves the 0 defaults."""
     response = SimpleNamespace(
