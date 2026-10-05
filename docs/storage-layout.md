@@ -930,7 +930,9 @@ governs the generated full-document tree; the extraction schema governs the
 (`full-extraction`). The body is the planner's `Schema` document
 (canonical tag names plus per-tag metadata). Generation also writes a
 `cache/` at the docset root. It holds **functional** files the next
-`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`,
+`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json` (one per
+chunk whose reply parsed; a bisected chunk's halves are `cNNa`/`cNNb`),
+`label_*_section_retry_raw.json`,
 `concept_roster.json` (the flat legacy vocabulary; incremental reuse prefers
 the docset's `authored-schema.json`, then its `schema.json`, and falls back to
 this file), and
