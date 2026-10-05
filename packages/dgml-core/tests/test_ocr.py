@@ -365,7 +365,7 @@ def test_make_provider_returns_azure_for_azure_config(monkeypatch: pytest.Monkey
     assert provider.name == OcrProviderName.AZURE
 
 
-def test_make_provider_returns_aws_for_aws_config() -> None:
+def test_make_provider_returns_aws_for_aws_config(offline_aws: None) -> None:
     cfg = OcrConfig(provider=OcrProviderName.AWS, options={"region": "us-east-1"})
     provider = make_ocr_provider(cfg)
     assert isinstance(provider, AwsProvider)
@@ -373,7 +373,7 @@ def test_make_provider_returns_aws_for_aws_config() -> None:
     assert provider.name == OcrProviderName.AWS
 
 
-def test_make_provider_accepts_a_dotted_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_make_provider_accepts_a_dotted_path(offline_aws: None) -> None:
     """The built-in short names are aliases, not the namespace: naming the same
     class by its dotted path is equivalent."""
     cfg = OcrConfig(provider="dgml_core.ocr_aws:AwsProvider", options={"region": "us-east-1"})
