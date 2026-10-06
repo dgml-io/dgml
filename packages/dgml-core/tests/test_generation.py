@@ -3411,3 +3411,31 @@ def test_loads_tolerant_still_rejects_genuine_garbage() -> None:
 
     with _pytest.raises(json.JSONDecodeError):
         loads_tolerant('{"labels": [{"concept": "Buyer", "quote": "trunc')
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Year-last numeric dates are read month-first: the common US form.
+        ("11/1/2024", "2024-11-01"),
+        ("12/1/2024", "2024-12-01"),
+        ("1/11/2024", "2024-01-11"),
+        # A day above 12 cannot be a month, so month-first fails and day-first wins.
+        ("31/10/2024", "2024-10-31"),
+        # Day above 12 in the month-first slot used to yield no typed value at all.
+        ("10/31/2024", "2024-10-31"),
+        # Year-first and spelled-out forms are unaffected.
+        ("2024-11-01", "2024-11-01"),
+        ("December 1, 2017", "2017-12-01"),
+        ("21 October 2024", "2024-10-21"),
+    ],
+)
+def test_detect_value_type_year_last_dates_prefer_month_first(text: str, expected: str) -> None:
+    """Regression: `_detect_year_position` only reports where the year sits, but its
+    "DMY" result was fed to `_normalize_date` as *prefer day first*, so every
+    `M/D/YYYY` date was parsed as `D/M/YYYY` (11/1/2024 -> 2024-01-11) and dates
+    with a day above 12 (10/31/2024) produced no typed value."""
+    from dgml_core.generation.semantic_transform import _detect_value_type
+
+    xsi_type, value, _fmt = _detect_value_type(text, extra_formats=False)
+    assert (xsi_type, value) == ("date", expected)
