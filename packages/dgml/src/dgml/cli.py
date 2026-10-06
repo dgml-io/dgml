@@ -22,29 +22,41 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
-import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
+import tempfile
 import tomllib
 from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
 from dgml_core import layout
+from dgml_core.auto_classification import (
+    BulkClassifyBatch,
+    classify_bulk_batch,
+    prepare_bulk_classify,
+)
+from dgml_core.auto_classification import auto_classify as run_auto_classify
 from dgml_core.classification import (
     ClassificationConfig,
     ClassifyMode,
-    classify_file,
     load_classification_config,
 )
+from dgml_core.concurrency import map_concurrent
 from dgml_core.consistency import check_workspace
 from dgml_core.conversion import FAMILY_BY_SUFFIX, load_conversion_config
 from dgml_core.default_config import PROVIDER_API_KEYS, PROVIDER_MODELS
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
+    BatchJobInvalid,
+    BatchJobLeaseLost,
+    BatchJobNondeterministic,
+    BatchPending,
     ConflictError,
     DgmlError,
     GenerationFailed,
@@ -85,6 +97,37 @@ from dgml_core.workspaces_store import WorkspacesStore
 
 if TYPE_CHECKING:
     from dgml_core.generation.schema import Schema
+    from dgml_core.grounded import GroundedConfig
+
+
+class _Capture:
+    """What a run emitted, held back instead of printed (see
+    :func:`_begin_job_capture`), or what one ``docset run`` step emitted (see
+    :func:`_capturing`)."""
+
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, Any]] = []
+        self.errors: list[dict[str, Any]] = []
+
+
+#: Set while a batch-job run holds its output back until its session is
+#: closed; its stdout payloads / stderr error envelopes land here. None
+#: otherwise.
+_CAPTURE: _Capture | None = None
+
+
+@contextlib.contextmanager
+def _capturing() -> Iterator[_Capture]:
+    """Hold what is emitted inside the block in a fresh :class:`_Capture`
+    (``docset run`` drives each step's handler unchanged and nests its
+    payload), restoring the previous capture after."""
+    global _CAPTURE
+    prev, _CAPTURE = _CAPTURE, _Capture()
+    try:
+        yield _CAPTURE
+    finally:
+        _CAPTURE = prev
+
 
 # The CLI's own logger (``dgml.cli``); routed to stderr with the library's by
 # `_configure_logging`. Diagnostics only — the JSON payload and the error
@@ -93,6 +136,9 @@ _log = logging.getLogger(__name__)
 
 
 def _emit(payload: dict[str, Any], fmt: str, stream: IO[str] | None = None) -> None:
+    if _CAPTURE is not None:
+        (_CAPTURE.errors if stream is sys.stderr else _CAPTURE.payloads).append(payload)
+        return
     out = stream or sys.stdout
     if fmt == "json":
         # A stream on another encoding (a terminal on a code page) gets ASCII
@@ -144,6 +190,12 @@ def _format_scalar(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def _error_details(exc: BaseException) -> dict[str, Any] | None:
+    """The ``error.details`` an error carries itself, if any."""
+    details = getattr(exc, "details", None)
+    return dict(details) if isinstance(details, Mapping) and details else None
 
 
 def _emit_error(
@@ -547,6 +599,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="docset_command", required=True
     )
     _add_generate_subparser(docset, common)
+    _add_run_subparser(docset, common)
     ds_create = docset.add_parser("create", parents=[common], help="Create a new DocSet.")
     ds_create.add_argument("--name", required=True)
     ds_create.add_argument("--description", default="")
@@ -701,6 +754,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "the file add."
         ),
     )
+    _add_batch_arguments(
+        fl_add,
+        what="the classification (and auto-extraction) of a directory add",
+        extra=(
+            " Requires PATH to be a directory and --auto-classify. In 'existing' mode "
+            "every file is classified in one wave; in the default mode the files are "
+            "classified in order, one wave per file, because a DocSet created for one "
+            "file must be visible to the next."
+        ),
+    )
     files.add_parser("list", parents=[common], help="List Files.")
     fl_show = files.add_parser("show", parents=[common], help="Show one File.")
     fl_show.add_argument("file_id")
@@ -713,6 +776,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_node_subparser(sub, common)
     _add_discover_subparser(sub, common)
     _add_chain_subparsers(sub, common)
+    _add_batch_subparser(sub, common)
 
     return parser
 
@@ -730,6 +794,121 @@ def _positive_int(raw: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
     return value
+
+
+# ---- batch mode: shared by every command that takes --batch -----------------
+#
+# A batch-capable command (1) adds its flags with _add_batch_arguments, (2)
+# rejects, before any work, a stage whose model has no batch backend with
+# _batch_preflight (BATCH_UNAVAILABLE, naming the stage and model), and (3)
+# reports what its batch stages did as the payload's `batch` block, built by
+# _batch_block from each stage's WaveStats.to_json() (or a {"skipped": ...}
+# entry). Without --batch none of this runs and the payload has no `batch` key.
+
+
+def _positive_float(raw: str) -> float:
+    """argparse type: a strictly-positive number of seconds."""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a number") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {value}")
+    return value
+
+
+def _add_batch_arguments(
+    parser: argparse.ArgumentParser, *, what: str, extra: str = "", optional: bool = False
+) -> None:
+    """``--batch`` and ``--batch-poll-interval`` for a command that can send its
+    *what* requests through a provider's batch API.
+
+    ``optional=True`` makes ``--batch`` a ``--batch/--no-batch`` pair whose
+    unset value is ``None``, for a command with a config key that turns batch
+    mode on (the flag then overrides it either way)."""
+    help_text = (
+        f"Send {what} requests through the provider's batch API (half price; "
+        "results usually within an hour, at most 24h) instead of one call at a "
+        "time. A model whose provider has no batch backend is rejected before any "
+        "work starts (BATCH_UNAVAILABLE), never silently run at full price. Adds "
+        "a 'batch' block to the payload; without --batch the output is unchanged." + extra
+    )
+    if optional:
+        parser.add_argument(
+            "--batch", action=argparse.BooleanOptionalAction, default=None, help=help_text
+        )
+    else:
+        parser.add_argument("--batch", action="store_true", help=help_text)
+    parser.add_argument(
+        "--batch-poll-interval",
+        type=_positive_float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Seconds between batch status polls under --batch (default: 30).",
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help=(
+            "Batch job mode: submit the batch wave and exit instead of waiting for "
+            "it. Prints a 'batch_job' payload (exit 0) naming the job; continue it "
+            "with `dgml batch resume <job_id>` (from a cron entry or an agent). "
+            "Requires batch mode."
+        ),
+    )
+    parser.add_argument(
+        "--job",
+        default=None,
+        metavar="JOB_ID",
+        help=(
+            "Continue an existing batch job (what `dgml batch resume` passes): "
+            "responses already received are replayed, batches still open are "
+            "collected rather than resubmitted. Requires batch mode."
+        ),
+    )
+    parser.add_argument(
+        "--batch-deadline",
+        default=None,
+        metavar="DURATION",
+        help=(
+            "Stop waiting on the provider's batches this long after the run (or job) "
+            "starts: 90m, 6h, 1d, or plain seconds. Once it passes, open batches are "
+            "canceled, results the provider already produced are kept (batch price), "
+            "and every remaining request of the run runs synchronously at standard "
+            "price. A job stores it as an absolute UTC time on its first run; every "
+            "resume honors it. Default: none (wait up to the provider's own limit). "
+            "Requires batch mode."
+        ),
+    )
+
+
+def _batch_preflight(stages: Mapping[str, Any]) -> None:
+    """Reject batch mode before any work when a stage cannot batch.
+
+    *stages* maps a stage name to its model id (or a representative request,
+    see :func:`dgml_core.batch.assert_batchable`). Raises
+    :class:`~dgml_core.errors.BatchUnavailable` naming the first stage whose
+    provider has no batch backend. Imports the batch package lazily, so a
+    command without ``--batch`` never loads it."""
+    from dgml_core.batch import assert_batchable
+
+    assert_batchable(stages)
+    _log.info(f"[batch] batch mode on ({', '.join(stages)})")
+
+
+def _batch_block(stages: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """A command payload's ``batch`` block: ``enabled`` plus one entry per
+    stage — a batched stage's ``WaveStats.to_json()`` (counters and the cost
+    fields ``cost_usd`` / ``standard_cost_usd`` / ``saved_usd``), or
+    ``{"skipped": "<reason>"}`` for one that ran synchronously."""
+    return {"enabled": True, "stages": {name: dict(stats) for name, stats in stages.items()}}
+
+
+def _batch_log(args: argparse.Namespace) -> Callable[[str], None]:
+    """Batch-executor progress lines: INFO on the CLI logger — stderr under
+    --verbose (see `_configure_logging`), else dropped (stdout carries only
+    the JSON payload)."""
+    return _log.info
 
 
 def _parse_child_path(raw: str) -> list[int]:
@@ -912,6 +1091,72 @@ def _add_discover_subparser(
         metavar="TERM",
         help="Case-insensitive substring filter on sample XML text content.",
     )
+
+
+def _add_batch_subparser(
+    sub: argparse._SubParsersAction,  # type: ignore[type-arg]
+    common: argparse.ArgumentParser,
+) -> None:
+    """Register `dgml batch status|resume|list|cancel|delete|prune|unlock`."""
+    batch_group = sub.add_parser(
+        "batch",
+        parents=[common],
+        help="Batch jobs: inspect, resume, or cancel a --batch run.",
+    ).add_subparsers(dest="batch_command", required=True)
+    bj_status = batch_group.add_parser(
+        "status",
+        parents=[common],
+        help="Poll a job's provider batches once and report their state (read-only).",
+    )
+    bj_status.add_argument("job_id")
+    bj_resume = batch_group.add_parser(
+        "resume",
+        parents=[common],
+        help=(
+            "Re-run a job's command: received responses are replayed, open batches "
+            "collected, and it stops again (or finishes) exactly as the original run would."
+        ),
+    )
+    bj_resume.add_argument("job_id")
+    batch_group.add_parser("list", parents=[common], help="List batch jobs, newest first.")
+    bj_cancel = batch_group.add_parser(
+        "cancel",
+        parents=[common],
+        help=(
+            "Cancel a job's open provider batches (and acknowledge any uncertain batch "
+            "create); a later resume resubmits them."
+        ),
+    )
+    bj_cancel.add_argument("job_id")
+    bj_delete = batch_group.add_parser(
+        "delete",
+        parents=[common],
+        help="Delete a job's stored state (refused while it has open provider batches).",
+    )
+    bj_delete.add_argument("job_id")
+    bj_delete.add_argument(
+        "--force",
+        action="store_true",
+        help="Cancel the job's open provider batches first, then delete it.",
+    )
+    bj_prune = batch_group.add_parser(
+        "prune",
+        parents=[common],
+        help="Delete finished jobs (completed, or failed with no open provider batch).",
+    )
+    bj_prune.add_argument(
+        "--older-than",
+        type=float,
+        default=0.0,
+        metavar="DAYS",
+        help="Only jobs last updated more than DAYS days ago (default: 0, every finished job).",
+    )
+    bj_unlock = batch_group.add_parser(
+        "unlock",
+        parents=[common],
+        help="Break a job's lease left behind by a process that died.",
+    )
+    bj_unlock.add_argument("job_id")
 
 
 def _add_dgmlx_subparser(
@@ -1328,7 +1573,10 @@ def _configure_stream_encodings() -> None:
 def main(argv: list[str] | None = None) -> int:
     _configure_stream_encodings()
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+    # What a batch job replays on `dgml batch resume` (see _start_batch_job).
+    args.raw_argv = raw_argv
     fmt: str = args.format
     _configure_logging(args)
 
@@ -1354,7 +1602,7 @@ def main(argv: list[str] | None = None) -> int:
                     workspace=exc.workspace,
                 ) from exc
             _warn_if_config_declares_workspaces(ws)
-        return _dispatch(args, ws, fmt)
+        return _dispatch_with_job(args, ws, fmt)
     except DgmlError as exc:
         return _emit_error(exc.code, str(exc), fmt)
     except Exception as exc:
@@ -2147,6 +2395,485 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     raise AssertionError(f"unhandled workspace subcommand: {sub}")  # unreachable (required=True)
 
 
+# ---- batch jobs: one session per --batch run --------------------------------
+#
+# Every --batch run opens a batch job session (_start_batch_job): a plain
+# blocking run silently, for crash recovery; --no-wait / --job explicitly.
+# _dispatch_with_job closes it exactly once with how the run ended, and only
+# then emits what the run printed (one outcome per run).
+
+
+def _active_batch_job() -> Any:
+    """The running batch job session, if any — without importing the batch
+    package (litellm stays off the default import path): no session can exist
+    unless ``dgml_core.batch.jobs`` was already imported."""
+    jobs = sys.modules.get("dgml_core.batch.jobs")
+    return None if jobs is None else jobs.active_session()
+
+
+def _begin_job_capture() -> None:
+    """Hold back what this run emits until its batch job session is closed.
+
+    How a job run ends is only known once :func:`_dispatch_with_job` closes the
+    session, after the command has built its payload: the nondeterminism guard
+    may still have to replace a success payload with its error envelope (one
+    outcome per run), and a job left behind is reported inside the payload's
+    ``batch`` block."""
+    global _CAPTURE
+    if _CAPTURE is None:
+        _CAPTURE = _Capture()
+
+
+def _end_job_capture() -> _Capture | None:
+    """Stop holding back output; the held output, or None if nothing was held."""
+    global _CAPTURE
+    capture, _CAPTURE = _CAPTURE, None
+    return capture
+
+
+def _flush_job_capture(
+    capture: _Capture | None,
+    fmt: str,
+    *,
+    job: dict[str, Any] | None,
+    payloads: bool = True,
+    deadline: dict[str, Any] | None = None,
+) -> None:
+    """Emit the output a job run held back. *job* (a job the run left behind)
+    goes into the last payload's ``batch.job`` — or, when the run emitted no
+    payload, into its last error envelope's ``details.batch.job``. *deadline*
+    (the job's batch deadline, when it has one) goes into the last payload's
+    ``batch.deadline``."""
+    if capture is None:
+        return
+    if deadline is not None and payloads and capture.payloads:
+        _attach_batch_field(capture.payloads[-1], "deadline", deadline)
+    if job is not None:
+        if payloads and capture.payloads:
+            _attach_batch_field(capture.payloads[-1], "job", job)
+        elif capture.errors:
+            error = capture.errors[-1].get("error")
+            if isinstance(error, dict):
+                error.setdefault("details", {})["batch"] = {"job": job}
+    if payloads:
+        for payload in capture.payloads:
+            _emit(payload, fmt)
+    for envelope in capture.errors:
+        _emit(envelope, fmt, stream=sys.stderr)
+
+
+def _attach_batch_field(payload: dict[str, Any], name: str, value: dict[str, Any]) -> None:
+    """Set *payload*'s ``batch.<name>`` (the block created if absent)."""
+    block = payload.setdefault("batch", {})
+    if isinstance(block, dict):
+        block[name] = value
+
+
+def _deadline_block(session: Any) -> dict[str, Any] | None:
+    """The just-closed *session*'s ``batch.deadline`` block, if it had one."""
+    if session is None:
+        return None
+    try:
+        block = session.deadline_json()
+    except Exception:
+        return None
+    return block if isinstance(block, dict) else None
+
+
+def _left_behind(session: Any) -> dict[str, Any] | None:
+    """The resumable job the just-closed *session* left in the workspace, as
+    a payload block — or None when the run finished its job (completed, or a
+    silent job deleted with the run)."""
+    if session is None or session.manifest.status != "failed":
+        return None
+    try:
+        if not session.store.exists():
+            return None
+    except Exception:
+        return None
+    return {
+        "job_id": session.job_id,
+        "status": session.manifest.status,
+        "resume": f"dgml batch resume {session.job_id}",
+    }
+
+
+def _emit_nondeterministic(guard: BatchJobNondeterministic, session: Any, fmt: str) -> int:
+    """The nondeterminism guard's error envelope, naming the job it left
+    (failed, its in-flight batches kept) and, in `docset run`, the step."""
+    details: dict[str, Any] = {}
+    if session is not None:
+        from dgml_core.batch.jobs import RUN_STEP_STATE
+
+        step = session.state.get(RUN_STEP_STATE)
+        if step is not None:
+            details["step"] = step
+        job = _left_behind(session)
+        if job is not None:
+            details["batch"] = {"job": job}
+    return _emit_error(guard.code, str(guard), fmt, details=details or None)
+
+
+def _emit_lease_lost(lost: BatchJobLeaseLost, session: Any, fmt: str) -> int:
+    """The error envelope of a run that lost its job's lease mid-run
+    (``BATCH_JOB_BUSY``): the run's one outcome, whatever it emitted before —
+    the job now belongs to the lease's holder, so this run's output is void."""
+    details: dict[str, Any] = {"lease_lost": True}
+    if session is not None:
+        details["batch"] = {
+            "job": {"job_id": session.job_id, "resume": f"dgml batch resume {session.job_id}"}
+        }
+    return _emit_error(lost.code, str(lost), fmt, details=details)
+
+
+def _fenced(session: Any) -> BatchJobLeaseLost | None:
+    """The lease loss that fenced *session* (after its close), if any."""
+    return getattr(session, "lease_lost", None) if session is not None else None
+
+
+def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
+    """:func:`_dispatch`, closing the batch job session a command opened.
+
+    A command that runs in batch job mode opens its session itself (see
+    :func:`_start_batch_job`); this is the one place every exit path passes, so
+    the session is closed exactly once with how the run ended, and the output
+    the run held back is emitted only then. A run that paused
+    (:class:`BatchPending`, ``--no-wait``) is not an error: it prints the job's
+    ``batch_job`` payload on stdout and exits 0. A run the nondeterminism guard
+    stopped (:class:`BatchJobNondeterministic`) or that lost its lease has
+    exactly one outcome — its error envelope, exit 1 — whatever the command
+    emitted before. A run that leaves a failed, resumable job behind names it
+    in its payload's ``batch.job`` (``error.details.batch.job`` of an error
+    envelope)."""
+    try:
+        rc = _dispatch(args, ws, fmt)
+    except BatchPending as pending:
+        session = _active_batch_job()
+        command = session.manifest.command if session is not None else None
+        if session is not None:
+            session.close(pending)
+        if (fenced := _fenced(session)) is not None:
+            _end_job_capture()
+            return _emit_lease_lost(fenced, session, fmt)
+        # A paused run's one result is the job to resume.
+        _flush_job_capture(_end_job_capture(), fmt, job=None, payloads=False)
+        from dgml_core.batch.jobs import deadline_summary, pending_job_payload
+
+        block = pending_job_payload(
+            pending.job_id,
+            command=command,
+            submitted_batches=pending.submitted_batches,
+            requests_in_flight=pending.requests_in_flight,
+            deadline=deadline_summary(session.manifest) if session is not None else None,
+        )
+        _emit({"batch_job": block}, fmt)
+        return 0
+    except BatchJobNondeterministic as guard:
+        session = _active_batch_job()
+        if session is not None:
+            session.close(guard)
+        _end_job_capture()  # whatever the run emitted before is void
+        return _emit_nondeterministic(guard, session, fmt)
+    except BatchJobLeaseLost as lost:
+        # Another process drives the job now: this run stopped, fenced.
+        session = _active_batch_job()
+        if session is not None:
+            session.close(lost)
+        _end_job_capture()
+        return _emit_lease_lost(lost, session, fmt)
+    except BaseException as exc:
+        session = _active_batch_job()
+        if session is not None:
+            session.close(exc)
+        if (fenced := _fenced(session)) is not None:
+            _end_job_capture()
+            return _emit_lease_lost(fenced, session, fmt)
+        job = _left_behind(session)
+        _flush_job_capture(_end_job_capture(), fmt, job=None, deadline=_deadline_block(session))
+        if job is not None and isinstance(exc, DgmlError):
+            return _emit_error(exc.code, str(exc), fmt, details={"batch": {"job": job}})
+        raise
+    session = _active_batch_job()
+    job = None
+    if session is not None:
+        drift = session.nondeterministic
+        session.close(None, ok=rc == 0)
+        if (fenced := _fenced(session)) is not None and drift is None:
+            _end_job_capture()
+            return _emit_lease_lost(fenced, session, fmt)
+        if drift is not None:
+            # Backstop: the guard is a BaseException, so this is reached only
+            # if something caught it on the way up. Still one outcome.
+            _end_job_capture()
+            return _emit_nondeterministic(drift, session, fmt)
+        job = _left_behind(session)
+    _flush_job_capture(_end_job_capture(), fmt, job=job, deadline=_deadline_block(session))
+    return rc
+
+
+def _start_batch_job(
+    args: argparse.Namespace,
+    ws: Workspace,
+    *,
+    command: str,
+    pinned: Mapping[str, str | bool] | None = None,
+) -> Any:
+    """Open this run's batch job session (every ``--batch`` run has one).
+
+    A plain blocking ``--batch`` run gets a fresh job too, silently: it records
+    every response, so a run that crashes mid-way can be resumed with ``dgml
+    batch resume`` instead of paying again — and its payload is unchanged.
+    ``--no-wait`` makes the run stop once a wave is submitted; ``--job``
+    continues an existing job. Closed by :func:`_dispatch_with_job`."""
+    if getattr(args, "run_step", False):
+        # A step of `docset run`: the run opened the job (one job spans every
+        # step, so `dgml batch resume` replays the whole pipeline).
+        session = _active_batch_job()
+        if session is not None:
+            return session
+    from dgml_core.batch import start_session
+
+    # Stored canonical (abbreviated flags spelled in full): resume and the
+    # `--no-wait` short-circuit inspect it token by token.
+    argv = _canonical_argv(list(getattr(args, "raw_argv", [])))
+    # Batch mode may have come from config ([generation] batch = true); record
+    # it explicitly so a resume replays in batch mode whatever the config says.
+    if "--batch" not in argv:
+        argv.append("--batch")
+    # Likewise every *pinned* option the run resolved from config (flag →
+    # value), unless the command line already gave it. A bool value pins a
+    # ``--flag/--no-flag`` pair: ``--flag`` for True, ``--no-flag`` for False.
+    for flag, value in (pinned or {}).items():
+        negated = f"--no-{flag[2:]}"
+        if any(t in (flag, negated) or t.startswith(f"{flag}=") for t in argv):
+            continue
+        if isinstance(value, bool):
+            argv.append(flag if value else negated)
+        else:
+            argv += [flag, value]
+    log = _batch_log(args)
+    session = start_session(
+        ws,
+        command=command,
+        argv=argv,
+        job_id=getattr(args, "job", None),
+        wait=not getattr(args, "no_wait", False),
+        cwd=os.getcwd(),
+        log=log,
+        deadline_s=_batch_deadline_seconds(args),
+    )
+    # From here the run's output waits for the session's close (one outcome
+    # per run; a job left behind is named in the payload).
+    _begin_job_capture()
+    if not session.resumed:
+        # Name the job up front: if this run is interrupted (crash, kill,
+        # reboot, lost network), this id is what picks it up again. A run that
+        # finishes cleanly deletes its job, so the id only matters on failure.
+        log(
+            f"[batch-job] job {session.job_id}: if this run is interrupted, "
+            f"continue it with `dgml batch resume {session.job_id}` "
+            "(`dgml batch list` also shows it)"
+        )
+    return session
+
+
+def _reject_job_flags_without_batch(args: argparse.Namespace) -> None:
+    if getattr(args, "no_wait", False) or getattr(args, "job", None):
+        raise BatchJobInvalid("--no-wait and --job are batch job options; they need --batch")
+    if getattr(args, "batch_label", None) is not None:
+        raise BatchJobInvalid("--no-batch-label is a batch option; it needs --batch")
+    if getattr(args, "batch_deadline", None) is not None:
+        raise BatchJobInvalid("--batch-deadline is a batch option; it needs --batch")
+
+
+def _batch_deadline_seconds(args: argparse.Namespace) -> float | None:
+    """``--batch-deadline`` in seconds, or None when not given
+    (INVALID_ARGUMENT for a value that is not a positive duration)."""
+    spec = getattr(args, "batch_deadline", None)
+    if spec is None:
+        return None
+    from dgml_core.batch import parse_duration
+
+    try:
+        return parse_duration(spec)
+    except ValueError as exc:
+        raise InvalidArgument(f"--batch-deadline: {exc}") from None
+
+
+def _subcommands(parser: argparse.ArgumentParser) -> Mapping[str, argparse.ArgumentParser]:
+    """*parser*'s subcommand parsers by name (empty for a leaf command)."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices
+    return {}
+
+
+def _canonical_argv(argv: list[str]) -> list[str]:
+    """*argv* with every abbreviated long option spelled in full.
+
+    argparse accepts any unambiguous prefix (``--form`` for ``--format``,
+    ``--no-w`` for ``--no-wait``), so the command line a batch job stores may
+    carry one; anything that inspects the stored argv by token (resume's
+    stripping of ``--workspace`` / ``--format`` / ``--job``, the ``--no-wait``
+    short-circuit) must see the canonical flag. Each option is resolved
+    against the parser of the (sub)command it follows, as argparse does;
+    option values and positionals are kept as they are, and an unknown or
+    ambiguous prefix is left for argparse to judge."""
+    current = _build_parser()
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        i += 1
+        if token == "--":
+            out.extend(argv[i - 1 :])
+            break
+        if not token.startswith("-") or token == "-":
+            # A positional: a subcommand word descends into its parser.
+            current = _subcommands(current).get(token, current)
+            out.append(token)
+            continue
+        name, eq, value = token.partition("=")
+        options = current._option_string_actions
+        action = options.get(name)
+        if action is None and name.startswith("--"):
+            matches = {options[o] for o in options if o.startswith(name) and o.startswith("--")}
+            if len(matches) == 1:
+                (action,) = matches
+                name = next(o for o in action.option_strings if o.startswith(name))
+        out.append(f"{name}{eq}{value}" if action is not None else token)
+        if action is None or eq or action.nargs == 0:
+            continue
+        # Its value(s): one, or (for ?, *, +) what argparse would consume.
+        if action.nargs in (None, 1) or isinstance(action.nargs, int):
+            count = action.nargs if isinstance(action.nargs, int) else 1
+            out.extend(argv[i : i + count])
+            i += count
+        else:
+            while i < len(argv) and not argv[i].startswith("-"):
+                out.append(argv[i])
+                i += 1
+                if action.nargs == "?":
+                    break
+    return out
+
+
+def _strip_flag(argv: list[str], flag: str) -> list[str]:
+    """*argv* without ``flag VALUE`` / ``flag=VALUE``."""
+    out: list[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+            continue
+        if token == flag:
+            skip = True
+            continue
+        if token.startswith(f"{flag}="):
+            continue
+        out.append(token)
+    return out
+
+
+class _ArgvRejected(Exception):
+    """:func:`_parse_quietly`'s failure: argparse's one-line reason."""
+
+
+def _parse_quietly(argv: list[str]) -> argparse.Namespace:
+    """Parse *argv* with the real parser, raising :class:`_ArgvRejected` (the
+    reason argparse gave) instead of printing usage text and exiting 2."""
+    import io
+
+    usage = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(usage), contextlib.redirect_stdout(io.StringIO()):
+            return _build_parser().parse_args(argv)
+    except SystemExit:
+        lines = [line for line in usage.getvalue().splitlines() if line.strip()]
+        reason = lines[-1] if lines else "invalid arguments"
+        _prog, sep, rest = reason.partition(": error: ")
+        raise _ArgvRejected(rest if sep else reason) from None
+
+
+def _batch_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
+    """``dgml batch status|resume|list|cancel|delete|prune|unlock``: each is one
+    call into :mod:`dgml_core.batch.jobs`, whose return value is the payload."""
+    from dgml_core.batch import jobs
+
+    sub = args.batch_command
+    if sub == "list":
+        _emit({"jobs": jobs.list_job_summaries(ws)}, fmt)
+    elif sub == "prune":
+        _emit(jobs.prune_jobs(ws, older_than_days=args.older_than), fmt)
+    elif sub == "unlock":
+        _emit(jobs.unlock_job(ws, args.job_id), fmt)
+    elif sub == "resume":
+        return _batch_resume(args, ws, fmt)
+    elif sub == "status":
+        _emit(jobs.job_status(ws, args.job_id), fmt)
+    elif sub == "delete":
+        _emit(jobs.delete_job(ws, args.job_id, force=args.force), fmt)
+    elif sub == "cancel":
+        _emit(jobs.cancel_job(ws, args.job_id), fmt)
+    else:  # unreachable — argparse `required=True` rejects unknown subcommands
+        raise AssertionError(f"unhandled batch subcommand: {sub}")
+    return 0
+
+
+def _batch_resume(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
+    """Re-run the job's command from the directory it was first run in (so
+    relative paths in its argv resolve as they did), continuing the job.
+
+    Short-circuited when re-running could only pause again: a ``--no-wait``
+    job whose open provider batches are all still running (polled read-only,
+    as ``batch status`` does) reports the same pending payload a pausing run
+    prints, without re-running anything (see
+    :func:`dgml_core.batch.jobs.resume_would_wait`)."""
+    from dgml_core.batch import jobs
+
+    waiting = jobs.resume_would_wait(ws, args.job_id)  # BATCH_JOB_NOT_FOUND
+    if waiting is not None:
+        _emit({"batch_job": waiting}, fmt)
+        return 0
+    manifest = jobs.BatchJobStore(ws, args.job_id).load()
+    root = str(Path(ws.root).resolve())
+    # Canonical first (a job stored by a library caller may carry
+    # abbreviations), so the stripping below sees every spelling.
+    argv = _canonical_argv(manifest.argv)
+    argv = _strip_flag(_strip_flag(argv, "--job"), "--workspace")
+    argv = _strip_flag(argv, "--format")
+    prefix = ["--workspace", root, "--format", fmt]
+    if getattr(args, "verbose", False) and "--verbose" not in argv:
+        prefix.append("--verbose")
+    replay = [*prefix, *argv, "--job", manifest.job_id]
+    try:
+        # A stored command line that no longer parses (a job created by a
+        # library caller, or by a dgml version whose flags since changed) is
+        # the job's problem, not a usage error: one structured envelope.
+        _parse_quietly(replay)
+    except _ArgvRejected as exc:
+        raise BatchJobInvalid(
+            f"batch job {manifest.job_id} cannot be resumed: its stored command line "
+            f"no longer parses ({exc}): {shlex.join(manifest.argv)}"
+        ) from None
+    if manifest.cwd and not Path(manifest.cwd).is_dir():
+        # Relative paths in the stored command line resolve against it; running
+        # from here instead could read (or write) the wrong files.
+        raise BatchJobInvalid(
+            f"batch job {manifest.job_id} cannot be resumed: the directory it was first "
+            f"run in ({manifest.cwd}) no longer exists, and relative paths in its command "
+            "line resolve against it. Recreate that directory and resume again, or "
+            f"`dgml batch cancel {manifest.job_id}` to give it up"
+        )
+    here = os.getcwd()
+    if manifest.cwd:
+        os.chdir(manifest.cwd)
+    try:
+        return main(replay)
+    finally:
+        os.chdir(here)
+
+
 def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     cmd = args.command
 
@@ -2222,6 +2949,8 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         return _node_cmd(args, ws, fmt)
     if cmd == "discover":
         return _discover_cmd(args, ws, fmt)
+    if cmd == "batch":
+        return _batch_cmd(args, ws, fmt)
     if cmd in ("chain", "wallet", "registry", "stake", "prove"):
         return _chain_cmd(args, ws, fmt)
 
@@ -2586,6 +3315,11 @@ def _add_extraction_subparsers(
         default=None,
         help="Override grounded.schema_model for this call (LiteLLM model string).",
     )
+    _add_batch_arguments(
+        ex_gen,
+        what="the schema-generation",
+        extra=" Schema generation is one request, so batch mode is one round trip.",
+    )
 
     ex_set = extraction.add_parser(
         "set-schema",
@@ -2639,7 +3373,22 @@ def _add_extraction_subparsers(
         help="Extract grounded values from a file against its DocSet schema.",
     )
     ex_extract.add_argument("docset_id")
-    ex_extract.add_argument("file_id")
+    ex_extract.add_argument(
+        "file_ids",
+        nargs="*",
+        metavar="file_id",
+        help=(
+            "File(s) to extract. One id alone (no --all) keeps the single-file "
+            "output (plus a `batch` block under --batch). Several ids, or --all, "
+            "return one result per file and a failed file is reported in its entry "
+            "instead of aborting the run."
+        ),
+    )
+    ex_extract.add_argument(
+        "--all",
+        action="store_true",
+        help="Extract every file in the DocSet (instead of naming file ids).",
+    )
     ex_extract.add_argument(
         "--values-model",
         default=None,
@@ -2653,6 +3402,7 @@ def _add_extraction_subparsers(
             "low, medium, high, xhigh, or 'default' to send no reasoning effort."
         ),
     )
+    _add_batch_arguments(ex_extract, what="extraction")
 
     ex_get_values = extraction.add_parser(
         "get-values",
@@ -2695,6 +3445,115 @@ def _coerce_schema_to_rnc(raw: str, path: Path, workspace_name: str, docset_name
     return raw
 
 
+def _error_block(exc: BaseException) -> dict[str, str]:
+    """A per-item ``{code, message}`` block: a DgmlError keeps its code, anything
+    else is an INTERNAL_ERROR with the same one-line message the top-level
+    envelope would carry."""
+    if isinstance(exc, DgmlError):
+        return {"code": exc.code, "message": str(exc)}
+    return {"code": "INTERNAL_ERROR", "message": short_error_message(exc)}
+
+
+def _extract_many(
+    args: argparse.Namespace,
+    ws: Workspace,
+    fmt: str,
+    *,
+    config: GroundedConfig,
+    file_ids: list[str],
+    single: bool = False,
+) -> int:
+    """``extraction extract`` over several files (ids, or ``--all``), or over
+    one file id under ``--batch`` (*single*: the single-file payload plus a
+    ``batch`` block, and the single-file form's errors).
+
+    Each file is extracted independently and reported in its own ``results``
+    entry — a failure is that entry's ``error``, never the run's. Under
+    ``--batch`` both LLM phases go through the provider's batch API
+    (:func:`dgml_core.grounded.extract_values_many`) and the payload gains a
+    ``batch`` block; the per-file entries are the same either way.
+    """
+    from dgml_core.grounded import extract_values_many, values_batch_stages
+
+    store = DocSetStore(ws)
+    store.get(args.docset_id)  # raises DocSetNotFound
+    if args.all:
+        file_ids = store.list_files(args.docset_id)
+    if len(set(file_ids)) != len(file_ids):
+        raise InvalidArgument("file ids must be unique")
+
+    if args.batch:
+        # Checked before any file is read, and before the job opens, so a
+        # rejected run leaves no job behind.
+        _batch_preflight(values_batch_stages(config.values_model, config.values_reasoning_effort))
+        _start_batch_job(args, ws, command="extraction extract")
+    many = extract_values_many(
+        ws,
+        args.docset_id,
+        file_ids,
+        config=config,
+        batch=args.batch,
+        poll_interval_s=args.batch_poll_interval,
+        log=_batch_log(args),
+        write_stats=args.debug,
+        debug=args.debug,
+    )
+    outcomes = many.outcomes
+    batch_block = many.batch
+
+    if single:
+        # One file id under --batch: the single-file form's payload and errors,
+        # plus the run's `batch` block.
+        (fid,) = file_ids
+        outcome = outcomes[fid]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        one: dict[str, Any] = {
+            "docset_id": args.docset_id,
+            "file_id": fid,
+            "model": config.values_model,
+            "mode": outcome.mode,
+            "tool_calls": outcome.tool_calls,
+            "field_count": len(outcome.values),
+            "xml_key": outcome.xml_key,
+        }
+        if batch_block is not None:
+            one["batch"] = batch_block
+        _emit(one, fmt)
+        return 0
+
+    results: list[dict[str, Any]] = []
+    for fid in file_ids:
+        outcome = outcomes[fid]
+        if isinstance(outcome, BaseException):
+            results.append({"file_id": fid, "status": "failed", "error": _error_block(outcome)})
+        else:
+            results.append(
+                {
+                    "file_id": fid,
+                    "status": "ok",
+                    "mode": outcome.mode,
+                    "tool_calls": outcome.tool_calls,
+                    "field_count": len(outcome.values),
+                    "xml_key": outcome.xml_key,
+                }
+            )
+    payload: dict[str, Any] = {
+        "docset_id": args.docset_id,
+        "model": config.values_model,
+        "summary": {
+            "total": len(results),
+            "ok": sum(r["status"] == "ok" for r in results),
+            "failed": sum(r["status"] == "failed" for r in results),
+        },
+        "results": results,
+    }
+    if batch_block is not None:
+        payload["batch"] = batch_block
+    _emit(payload, fmt)
+    return 0
+
+
 def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Dispatch the `extraction` command group."""
     from dataclasses import replace
@@ -2706,6 +3565,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         generate_schema,
         load_grounded_config,
         parse_values_reasoning_effort,
+        schema_batch_request,
     )
 
     store = DocSetStore(ws)
@@ -2716,6 +3576,12 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         config = load_grounded_config(ws)
         if args.schema_model:
             config = replace(config, schema_model=args.schema_model)
+        if args.batch:
+            # Before any PDF is read: an unsupported provider is BATCH_UNAVAILABLE,
+            # never a silent full-price call.
+            _batch_preflight({"schema": schema_batch_request(config.schema_model)})
+        else:
+            _reject_job_flags_without_batch(args)
         file_ids = args.from_files or store.list_files(args.docset_id)
         if not file_ids:
             return _emit_error(
@@ -2723,18 +3589,39 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 f"docset '{args.docset_id}' has no files; pass --from-file or add files first",
                 fmt,
             )
-        rnc = generate_schema(ws, file_ids, config=config, docset_name=ds.name, debug=args.debug)
+        batch_block: dict[str, Any] | None = None
+        if args.batch:
+            from dgml_core.grounded import generate_schema_batch, schema_batch_executor
+
+            # Replay-safe for job mode: nothing is written before the one request.
+            _start_batch_job(args, ws, command="extraction generate-schema")
+            executor = schema_batch_executor(
+                config, poll_interval_s=args.batch_poll_interval, log=_batch_log(args)
+            )
+            rnc = generate_schema_batch(
+                ws,
+                file_ids,
+                config=config,
+                docset_name=ds.name,
+                executor=executor,
+                debug=args.debug,
+            )
+            batch_block = {"provider": executor.backend.provider, **executor.stats.to_json()}
+        else:
+            rnc = generate_schema(
+                ws, file_ids, config=config, docset_name=ds.name, debug=args.debug
+            )
         store.set_schema(args.docset_id, rnc)
-        _emit(
-            {
-                "docset_id": args.docset_id,
-                "schema_format": "rnc",
-                "schema": rnc,
-                "from_file_ids": list(file_ids),
-                "model": config.schema_model,
-            },
-            fmt,
-        )
+        payload: dict[str, Any] = {
+            "docset_id": args.docset_id,
+            "schema_format": "rnc",
+            "schema": rnc,
+            "from_file_ids": list(file_ids),
+            "model": config.schema_model,
+        }
+        if batch_block is not None:
+            payload["batch"] = batch_block
+        _emit(payload, fmt)
         return 0
 
     if sub == "set-schema":
@@ -2773,6 +3660,13 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         return 0
 
     if sub == "extract":
+        extract_ids: list[str] = list(args.file_ids)
+        if args.all and extract_ids:
+            raise InvalidArgument("pass file ids or --all, not both")
+        if not args.all and not extract_ids:
+            raise InvalidArgument("name at least one file id, or pass --all")
+        if not args.batch:
+            _reject_job_flags_without_batch(args)
         config = load_grounded_config(ws)
         if args.values_model:
             config = replace(config, values_model=args.values_model)
@@ -2783,27 +3677,37 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     args.values_effort, source="--values-effort"
                 ),
             )
-        result = extract_values(
+        if len(extract_ids) == 1 and not args.all and not args.batch:
+            # The original single-file form: output and errors unchanged.
+            result = extract_values(
+                ws,
+                args.docset_id,
+                extract_ids[0],
+                config=config,
+                write_stats=args.debug,
+                debug=args.debug,
+            )
+            _emit(
+                {
+                    "docset_id": args.docset_id,
+                    "file_id": extract_ids[0],
+                    "model": config.values_model,
+                    "mode": result.mode,
+                    "tool_calls": result.tool_calls,
+                    "field_count": len(result.values),
+                    "xml_key": result.xml_key,
+                },
+                fmt,
+            )
+            return 0
+        return _extract_many(
+            args,
             ws,
-            args.docset_id,
-            args.file_id,
-            config=config,
-            write_stats=args.debug,
-            debug=args.debug,
-        )
-        _emit(
-            {
-                "docset_id": args.docset_id,
-                "file_id": args.file_id,
-                "model": config.values_model,
-                "mode": result.mode,
-                "tool_calls": result.tool_calls,
-                "field_count": len(result.values),
-                "xml_key": result.xml_key,
-            },
             fmt,
+            config=config,
+            file_ids=extract_ids,
+            single=len(extract_ids) == 1 and not args.all,
         )
-        return 0
 
     if sub == "get-values":
         from dgml_core.extraction_xml import has_extraction
@@ -3013,6 +3917,129 @@ def _add_generate_subparser(
             "the weaker ones the review would have dropped."
         ),
     )
+    _add_batch_arguments(
+        gen,
+        what="the generation pipeline's model",
+        optional=True,
+        extra=(
+            " Batches transcription, roster planning, concept descriptions, the "
+            "semantic-link pass and (OCR files) the image-style pass. Labeling "
+            "batches every document at once under a closed --schema-path vocabulary, "
+            "otherwise one document at a time in the synchronous order (identical "
+            "output; --no-batch-label labels synchronously instead). Overrides "
+            "[generation] batch in the config; --no-batch forces synchronous."
+        ),
+    )
+    gen.add_argument(
+        "--batch-label",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "--no-batch-label: under --batch, label with ordinary synchronous calls "
+            "(everything else still batches). Batch labeling is the default: all "
+            "documents at once under a closed --schema-path vocabulary, otherwise "
+            "one document at a time in the synchronous order (identical output at "
+            "batch price, about one batch round trip per document — pair it with "
+            "--no-wait and `dgml batch resume`); --no-batch-label trades that price "
+            "for latency. Overrides [generation] batch_label (default true). "
+            "Requires batch mode."
+        ),
+    )
+
+
+#: `docset run` options handed through, verbatim, to the step that owns them:
+#: (flag, argparse dest, takes a value, step). Declared once so the run parser
+#: and the argv each step is parsed from cannot drift apart (a test pins this
+#: table to the step parsers); every value is re-parsed by the step's own
+#: parser, so types and defaults stay the step's. A valueless flag is a
+#: ``store_true`` switch, unless it is in :data:`_RUN_BOOLEAN_OPTIONAL` (a
+#: ``--flag/--no-flag`` pair whose unset value is None and is not passed on).
+_RUN_PASSTHROUGH: tuple[tuple[str, str, bool, str], ...] = (
+    ("--generation-config", "generation_config", True, "generate"),
+    ("--model", "model", True, "generate"),
+    ("--label-model", "label_model", True, "generate"),
+    ("--window-size", "window_size", True, "generate"),
+    ("--temperature", "temperature", True, "generate"),
+    ("--max-tokens", "max_tokens", True, "generate"),
+    ("--thinking", "thinking", True, "generate"),
+    ("--no-coverage", "no_coverage", False, "generate"),
+    ("--cache-dir", "cache_dir", True, "generate"),
+    ("--max-parallel-calls", "max_parallel_calls", True, "generate"),
+    ("--schema-path", "schema_path", True, "generate"),
+    ("--extend-schema", "extend_schema", False, "generate"),
+    ("--no-roster", "no_roster", False, "generate"),
+    ("--no-semlinks", "no_semlinks", False, "generate"),
+    ("--no-semlink-cache", "no_semlink_cache", False, "generate"),
+    ("--no-semlink-verify", "no_semlink_verify", False, "generate"),
+    ("--batch-label", "batch_label", False, "generate"),
+    ("--schema-model", "schema_model", True, "schema"),
+    ("--values-model", "values_model", True, "extract"),
+    ("--values-effort", "values_effort", True, "extract"),
+)
+_RUN_BOOLEAN_OPTIONAL: frozenset[str] = frozenset({"--batch-label"})
+
+_RUN_STEP_COMMANDS = {
+    "generate": "`docset generate`",
+    "schema": "`extraction generate-schema`",
+    "extract": "`extraction extract`",
+}
+
+
+def _add_run_subparser(
+    docset_subparsers: argparse._SubParsersAction,  # type: ignore[type-arg]
+    common: argparse.ArgumentParser,
+) -> None:
+    """Register `docset run`: the whole docset pipeline in one command."""
+    run = docset_subparsers.add_parser(
+        "run",
+        parents=[common],
+        help=(
+            "Run the whole docset pipeline: generate the extraction schema (when "
+            "--schema-from is given and the docset has none), `docset generate`, "
+            "then `extraction extract --all`. With --batch every step uses the "
+            "provider's batch API under one batch job."
+        ),
+    )
+    run.add_argument("docset_id", help="ID of the DocSet to run the pipeline over.")
+    run.add_argument(
+        "--schema-from",
+        dest="schema_from",
+        action="append",
+        default=None,
+        metavar="FILE_ID",
+        help=(
+            "Sample file for generating the extraction schema, repeatable. Used only "
+            "when the docset has no extraction schema yet; without it, and with no "
+            "schema, extraction is skipped (the payload says why)."
+        ),
+    )
+    run.add_argument("--no-generate", action="store_true", help="Skip the `docset generate` step.")
+    run.add_argument(
+        "--no-extract",
+        action="store_true",
+        help="Skip extraction (and so schema generation).",
+    )
+    for flag, dest, takes_value, step in _RUN_PASSTHROUGH:
+        what = f"Passed to {_RUN_STEP_COMMANDS[step]}."
+        if takes_value:
+            run.add_argument(flag, dest=dest, default=None, help=what)
+        elif flag in _RUN_BOOLEAN_OPTIONAL:
+            run.add_argument(
+                flag, dest=dest, action=argparse.BooleanOptionalAction, default=None, help=what
+            )
+        else:
+            run.add_argument(flag, dest=dest, action="store_true", help=what)
+    _add_batch_arguments(
+        run,
+        what="every step's model",
+        optional=True,
+        extra=(
+            " The whole pipeline is ONE batch job: with --no-wait, `dgml batch resume "
+            "<job_id>` advances it step by step. A model with no batch backend is "
+            "rejected before any step runs (BATCH_UNAVAILABLE, naming the stage). "
+            "Defaults to [generation] batch; --no-batch forces synchronous."
+        ),
+    )
 
 
 #: Distinct rejected concept names reported per file in `unmatched_concepts`.
@@ -3192,6 +4219,80 @@ def _generate_payload(
     }
 
 
+def _rewind_generate_inputs(
+    job: Any,
+    *,
+    cache_dir: Path,
+    seed_files: Mapping[str, Path],
+    doc_names: list[str],
+) -> None:
+    """Put back, on a resumed job run, what ``docset generate`` wrote to its
+    own inputs during earlier runs of the job.
+
+    Two kinds of input feed back into generate's requests: the roster seeds
+    (``schema.json``, ``concept_roster.json`` — labeling rewrites both, and the
+    next run would seed from them) and each document's transcription cache
+    (``<stem>_blocks.json`` — a cached document makes no transcription request,
+    so its responses would never be replayed and never billed). On the job's
+    first run their state is recorded; on every later run it is restored, so
+    the run makes exactly the requests the job started with and replays them.
+    Everything else generate writes is output, written only once the job's
+    last wave has come back."""
+    from dgml_core.generation.transcribe import blocks_cache_path
+
+    for name, path in seed_files.items():
+        data = job.rewind_input(
+            f"generate/{name}", lambda p=path: p.read_bytes() if p.exists() else None
+        )
+        if job.resumed:
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+    for doc_name in doc_names:
+        blocks = blocks_cache_path(cache_dir, doc_name)
+        cached_at_start = job.rewind_presence(f"generate/blocks/{doc_name}", blocks.exists())
+        if job.resumed and not cached_at_start:
+            blocks.unlink(missing_ok=True)
+    job.persist()  # once for every input recorded above
+
+
+#: ``batch.stages.style`` when the workspace enables image style but no document
+#: of the run had a page to style (none is an OCR file, say).
+_STYLE_NOTHING_TO_STYLE = "no OCR document with a page to style"
+
+
+def _style_staged(staged: dict[str, dict[str, Any]], style_config: Any, batch_opts: Any) -> None:
+    """Run the image-style passes ``docset generate --batch`` deferred while
+    grounding (OCR files under an enabled ``style`` section) as one batch
+    stage, and put each styled document's final grounded XML in its held-back
+    writes. Documents are taken in name order (the staging pool fills
+    *staged* in completion order); the stage's stats land in
+    ``batch_opts.stats["style"]``."""
+    pending = {
+        name: item["pending_style"]
+        for name, item in sorted(staged.items())
+        if item.get("pending_style") is not None
+    }
+    if not pending:
+        if style_config is not None:
+            batch_opts.stats["style"] = {"skipped": _STYLE_NOTHING_TO_STYLE}
+        return
+    from dgml_core.style_llm import style_batch_executor, style_documents_batch
+
+    executor = style_batch_executor(
+        style_config, poll_interval_s=batch_opts.poll_interval_s, log=_log.info
+    )
+    try:
+        finished = style_documents_batch(pending, executor, log=_log.info)
+    finally:
+        batch_opts.stats["style"] = executor.stats.to_json()
+    for name, data in finished.items():
+        item = staged[name]
+        item["deferred"][item["xml_key"]] = data
+
+
 def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Convert every file in a DocSet to DGML XML via the typed-block pipeline.
 
@@ -3206,26 +4307,26 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     left ungrounded with a warning rather than failing the run. ``--debug``
     additionally writes the per-file ``<stem>.dgml.grounding_stats.json``.
     """
-    from dgml_core import llm
     from dgml_core.errors import InvalidArgument
     from dgml_core.extraction_xml import carry_extraction_over, has_extraction
     from dgml_core.generation import (
+        BatchOptions,
         ConvertOptions,
         convert_batch,
+        load_generation_batch,
+        load_generation_batch_label,
         resolve_generation_api_key,
         resolve_generation_config,
         resolve_generation_label_api_key,
         validate_generation_models,
     )
     from dgml_core.generation import coverage as cov_mod
-    from dgml_core.generation import links as links_mod
     from dgml_core.generation.blocks import Block, block_concept_labels
-    from dgml_core.generation.links import apply_plan, plan_links
+    from dgml_core.generation.link_stage import LinkOutcome, LinkStage, StagedDocument
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
     from dgml_core.generation.rnc import write_docset_rnc
     from dgml_core.generation.to_semantic import build_header
     from dgml_core.generation.vocab import TagVocab
-    from dgml_core.usage import OPERATION_LINKS
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ds_store = DocSetStore(ws)
@@ -3290,25 +4391,68 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     except DgmlError as exc:
         return _emit_error(exc.code, str(exc), fmt)
 
+    # Batch mode (--batch / --no-batch, else [generation] batch). Rejected here,
+    # before any work, when a stage it would batch names a model whose provider
+    # has no batch backend — never a silent full-price fallback. Transcription
+    # always batches, and the labeling model always serves a batch stage too:
+    # roster/gap planning and concept descriptions batch under every
+    # vocabulary, the link pass uses it, and labeling itself batches under a
+    # closed one, or per document under any other (unless --no-batch-label).
+    batch_opts: BatchOptions | None = None
+    try:
+        batch_enabled = args.batch if args.batch is not None else load_generation_batch(ws)
+        if batch_enabled:
+            batch_stages = {"transcribe": gen_model, "label": label_model}
+            if style_config is not None:
+                batch_stages["style"] = style_config.model  # OCR files' image style
+            if not args.no_semlinks:
+                batch_stages["links"] = label_model
+            batch_label = (
+                args.batch_label
+                if args.batch_label is not None
+                else load_generation_batch_label(ws)
+            )
+            _batch_preflight(batch_stages)
+            from dgml_core.batch.jobs import credential_ref
+
+            batch_opts = BatchOptions(
+                poll_interval_s=args.batch_poll_interval,
+                label=batch_label,
+                log=_batch_log(args),
+                credentials={
+                    "transcribe": credential_ref("generation", "transcribe", gen_cfg.api_key_env),
+                    "label": credential_ref("generation", "label", gen_cfg.label_api_key_env),
+                },
+            )
+            batch_job = _start_batch_job(
+                args, ws, command="docset generate", pinned={"--batch-label": batch_label}
+            )
+            if batch_job.resumed:
+                _log.info(
+                    f"[batch-job] resuming {batch_job.job_id} (run {batch_job.manifest.runs})"
+                )
+        else:
+            _reject_job_flags_without_batch(args)
+            batch_job = None
+    except DgmlError as exc:
+        return _emit_error(exc.code, str(exc), fmt)
+
     # The semantic-link pass runs on the labeling model (and its credentials).
-    # One config per DOCUMENT, never one shared by all of them. Documents are
-    # linked concurrently on the emit pool, and `llm.record_usage_for` marks the
-    # open aggregation scope on the config object itself — so a shared config
-    # means the second document to start folds its tokens into whichever scope
-    # opened first, and the row that lands names one document while covering
-    # several. Per-document configs also give each row a `doc` context, so the
-    # pass can be read per file rather than only in aggregate.
-    def _link_config(doc_name: str) -> llm.LLMConfig:
-        config = llm.LLMConfig(
-            model=label_model,
-            api_key=label_api_key,
-            api_base=label_api_base,
-            workspace=ws,
-            debug=args.debug,
-            operation=OPERATION_LINKS,
-        )
-        config.context = {"doc": doc_name}
-        return config
+    # It is the library's LinkStage: its sync driver runs per document in the
+    # sink below, its batch driver over every staged document at once.
+    link_stage = LinkStage(
+        workspace=ws,
+        docset_id=args.docset_id,
+        model=label_model,
+        api_key=label_api_key,
+        api_base=label_api_base,
+        enabled=not args.no_semlinks,
+        verify=not args.no_semlink_verify,
+        use_cache=not args.no_semlink_cache,
+        debug=args.debug,
+        job=batch_job,
+        log=_log.info,
+    )
 
     # The docset prefix is always the output base — schema.json,
     # coverage_report.json, cache/, and semantic/ live under it. Each file's
@@ -3366,9 +4510,16 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             _log.info(f"Source missing for {name} (file '{fid}') — reported as failed")
             continue
         out_xml_key = layout.dgml_xml_key(args.docset_id, fid, stem)
-        if ws.blobs.blob_exists(out_xml_key) and _has_generated_tree(
+        generated = ws.blobs.blob_exists(out_xml_key) and _has_generated_tree(
             ws.blobs.get_blob(out_xml_key).decode("utf-8")
-        ):
+        )
+        if batch_job is not None:
+            # A job run decides what to convert from the state the job STARTED
+            # in: a file an earlier run of this job converted is converted
+            # again, replaying the job's stored responses (billed once, when
+            # the job completes), rather than skipped as already done.
+            generated = batch_job.rewind_presence(f"generate/output/{fid}", generated)
+        if generated:
             # Skip only when a generated document tree is present. An
             # extraction-only file (`extraction extract` ran before
             # `generate`) falls through and gets its tree built; _on_output
@@ -3383,6 +4534,9 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         candidates.setdefault(name, []).append(
             (fid, out_xml_key, pt_prefix if ws.blobs.list_blobs(pt_prefix) else None)
         )
+
+    if batch_job is not None:
+        batch_job.persist()  # the output presences recorded above, once
 
     # Same-basename collision: the typed-block pipeline keys documents by
     # filename, so it can't tell two same-named files apart in one batch.
@@ -3486,30 +4640,14 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             "examples": [concept for concept, _n in tally.most_common(_UNMATCHED_EXAMPLES)],
         }
 
-    def _semlink_cache_key(xml_text: str) -> str:
-        """Cache address for one document's semantic links.
+    def _ground_output(name: str, xml: str) -> dict[str, Any]:
+        """First half of a document's sink: write the render and ground it.
 
-        Keyed on what the plan depends on — the document's text and shape, via
-        links.listing_digest — plus the labeling model, both link prompts, and
-        whether the review pass runs. Attributes and tag names are deliberately
-        not part of it (see links.listing_digest), so grounding a document or
-        renaming its concepts hits rather than paying for the pass again. Parts
-        are length-prefixed so two different inputs cannot concatenate to the
-        same key.
+        Returns what the rest of the sink needs. Split from the link pass and
+        the reporting so batch mode can ground every document, run all their
+        link plans as one batch stage, then finish each; the sync sink below
+        runs the three halves back to back, exactly as before the split.
         """
-        digest = hashlib.sha256()
-        for part in (
-            links_mod.listing_digest(xml_text).encode("utf-8"),
-            label_model.encode("utf-8"),
-            links_mod.SYSTEM_PROMPT.encode("utf-8"),
-            b"" if args.no_semlink_verify else links_mod.VERIFY_SYSTEM_PROMPT.encode("utf-8"),
-        ):
-            digest.update(len(part).to_bytes(8, "big"))
-            digest.update(part)
-        prefix = layout.generation_cache_prefix(args.docset_id)
-        return f"{prefix}semlinks/{digest.hexdigest()}"
-
-    def _on_output(name: str, xml: str) -> None:
         xml_key = dgml_xml_keys[name]
         # A blob already at this key may carry extracted values — an
         # extraction-only file getting its tree now, or a full-extraction
@@ -3523,7 +4661,14 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     prior_with_extraction = prior_text
             except Exception:
                 prior_with_extraction = None  # unparseable prior — nothing to carry
-        ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
+        # Under --batch nothing is written yet: the link pass runs after every
+        # document is grounded, so the grounded tree is held and written only
+        # once that pass is past its last wave (see LinkStage.link_documents).
+        # A run interrupted while it waits on the provider therefore leaves
+        # every output exactly as it found it.
+        deferred: dict[str, bytes] = {}
+        if batch_opts is None:
+            ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
         # Ground in place: re-parse the just-written tree, align it against the
         # file's page OCR, and rewrite <stem>.dgml.xml with dg:origin boxes.
         # Deterministic and free; a file with no page_text is left ungrounded.
@@ -3532,8 +4677,15 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         # (lxml); materialize the blob to a working copy, ground in place, then
         # persist the result (and its stats sidecar) back through the store.
         grounding: dict[str, Any]
+        pending_style: Any = None
         try:
-            with ws.blobs.materialize(xml_key) as gpath:
+            with contextlib.ExitStack() as gstack:
+                if batch_opts is None:
+                    gpath = gstack.enter_context(ws.blobs.materialize(xml_key))
+                else:
+                    gdir = Path(gstack.enter_context(tempfile.TemporaryDirectory()))
+                    gpath = gdir / xml_key.rsplit("/", 1)[-1]
+                    gpath.write_bytes(xml.encode("utf-8"))
                 res = ground_dgml_xml(
                     ws,
                     name_to_fid[name],
@@ -3542,15 +4694,23 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     force=True,
                     write_stats=args.debug,
                     debug=args.debug,
+                    # Under --batch an OCR file's image-style pass joins one
+                    # batch stage with every other document's (see below).
+                    defer_style=batch_opts is not None,
                 )
-                ws.blobs.put_blob(xml_key, gpath.read_bytes())
+                pending_style = res.pending_style
+                writes = {xml_key: gpath.read_bytes()}
                 if res.stats_path is not None and res.stats_path.exists():
-                    ws.blobs.put_blob(
+                    writes[
                         layout.pair_artifact_key(
                             args.docset_id, name_to_fid[name], res.stats_path.name
-                        ),
-                        res.stats_path.read_bytes(),
-                    )
+                        )
+                    ] = res.stats_path.read_bytes()
+                if batch_opts is None:
+                    for key, data in writes.items():
+                        ws.blobs.put_blob(key, data)
+                else:
+                    deferred.update(writes)
         except DgmlError as exc:
             grounding = {
                 "grounded": False,
@@ -3567,49 +4727,24 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 f"[ground] {name}: {res.stats['elements_annotated']} element(s), "
                 f"{res.stats['matched_token_pct']}% tokens matched"
             )
-        # Final step: add semantic links in place (dg:itemprop/dg:href). Runs on
-        # re-rendered priors too — their fresh XML would otherwise lose the links.
-        # The pass is a pure function of (grounded XML, labeling model, link
-        # prompts), so it is content-addressed: a hit replays the exact bytes the
-        # model call would have written, making a repeat run free rather than
-        # merely cheaper. The applied-link count is cached alongside so the
-        # reported `links` is identical on both paths.
-        links_added = 0
-        if not args.no_semlinks:
-            source = ws.blobs.get_blob(xml_key).decode("utf-8")
-            plan_key = f"{_semlink_cache_key(source)}.json"
-            try:
-                cached = (
-                    ws.blobs.get_blob(plan_key)
-                    if not args.no_semlink_cache and ws.blobs.blob_exists(plan_key)
-                    else None
-                )
-                if cached is not None:
-                    plan = json.loads(cached)
-                    hit = " (cached)"
-                else:
-                    plan = plan_links(source, _link_config(name), verify=not args.no_semlink_verify)
-                    ws.blobs.put_blob(plan_key, json.dumps(plan).encode("utf-8"))
-                    hit = ""
-                # The plan is applied to the CURRENT tree either way, so a cache
-                # hit and a fresh call write the same links onto whatever the
-                # render and grounding just produced.
-                linked, applied = apply_plan(source, plan)
-                ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
-                # `applied` is what the XML actually carries, so the reported
-                # count matches the document. What the plan asked for and did
-                # not get is diagnosed separately — chiefly links discarded
-                # because dg:itemprop/dg:href are attributes on the subject, so
-                # a second link on one subject overwrites the first.
-                links_added = len(applied)
-                losses = links_mod.plan_losses(source, plan)
-                folded = f", {losses.merged} merged" if losses.merged else ""
-                lost = f", {losses.displaced} displaced" if losses.displaced else ""
-                nested = f", {losses.nested} nested dropped" if losses.nested else ""
-                _log.info(f"[semlinks] {name}: {links_added} link(s){folded}{lost}{nested}{hit}")
-            except Exception as exc:  # a link-pass failure must not lose the DGML
-                link_errors[name] = short_error_message(exc)
-                _log.info(f"[semlinks] {name}: skipped ({exc})")
+        if batch_opts is not None and xml_key not in deferred:
+            # Not grounded: the sync path leaves the plain render in the blob.
+            deferred[xml_key] = xml.encode("utf-8")
+        return {
+            "xml": xml,
+            "xml_key": xml_key,
+            "prior_with_extraction": prior_with_extraction,
+            "grounding": grounding,
+            "deferred": deferred,
+            "pending_style": pending_style,
+        }
+
+    def _finish_output(name: str, staged: dict[str, Any], links_added: int) -> None:
+        """Last half of a document's sink: re-embed extraction, then report."""
+        xml = staged["xml"]
+        xml_key = staged["xml_key"]
+        prior_with_extraction = staged["prior_with_extraction"]
+        grounding = staged["grounding"]
         # Re-embed the prior dg:extraction last, after grounding + semlinks
         # have finished rewriting the tree, so the extraction subtree is
         # spliced in verbatim and never run through those passes.
@@ -3670,6 +4805,26 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             **extra,
         )
 
+    def _links_added(name: str, outcome: LinkOutcome) -> int:
+        if outcome.error is not None:
+            link_errors[name] = outcome.error
+        return outcome.links
+
+    def _on_output(name: str, xml: str) -> None:
+        # The synchronous sink: ground, link, finish — one document at a time.
+        staged = _ground_output(name, xml)
+        outcome = link_stage.link_document(name, staged["xml_key"])
+        _finish_output(name, staged, _links_added(name, outcome))
+
+    # Batch mode grounds each document as it is rendered and holds it here;
+    # the link pass then runs over all of them as one batch stage, and each is
+    # finished after (see LinkStage.link_documents). Distinct keys per
+    # document, so the render pool's concurrent writes never collide.
+    staged_outputs: dict[str, dict[str, Any]] = {}
+
+    def _stage_output(name: str, xml: str) -> None:
+        staged_outputs[name] = _ground_output(name, xml)
+
     if convert_names:
         # The cache always exists — it holds functional files the next run
         # reloads (blocks, per-chunk labels, concept_roster.json). --debug only
@@ -3697,6 +4852,16 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     if not dest.exists() and ws.blobs.blob_exists(key):
                         ws.blobs.download_blob(key, dest)
             roster_path = Path(cache_dir) / "concept_roster.json"
+            if batch_job is not None:
+                # A resumed job run must read the inputs the job STARTED from:
+                # this command writes its own seeds and transcription caches
+                # mid-run, and reading them back would change its requests.
+                _rewind_generate_inputs(
+                    batch_job,
+                    cache_dir=Path(cache_dir),
+                    seed_files={"schema.json": schema_json_local, "roster": roster_path},
+                    doc_names=convert_names,
+                )
             schema_seed = None
             roster_seed: dict[str, str] | None = None
             parent_map_seed: dict[str, str] = {}
@@ -3853,17 +5018,41 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     parent_map=parent_map_seed or None,
                     vocab=vocab,
                     progress=_log.info,
+                    batch=batch_opts,
                 )
                 convert_batch(
                     pdf_paths,
                     options=options,
-                    on_output=_on_output,
+                    on_output=_on_output if batch_opts is None else _stage_output,
                     on_error=_on_error,
                     on_label_error=_on_label_error,
                     on_off_schema=_on_off_schema,
                     prior_docs=prior_docs,
                     prior_outputs=prior_outputs,
                 )
+                if batch_opts is not None:
+                    # OCR files' image-style passes, deferred by grounding: ONE
+                    # batch stage over every document's pages, before the link
+                    # pass (which reads the styled tree, as in the sync run).
+                    _style_staged(staged_outputs, style_config, batch_opts)
+                    # Still inside the page_text materialization: finishing a
+                    # document computes its coverage against those pages.
+                    link_outcomes = link_stage.link_documents(
+                        {
+                            name: StagedDocument(item["xml_key"], item["deferred"])
+                            for name, item in staged_outputs.items()
+                        },
+                        batch=batch_opts,
+                        max_workers=args.max_parallel_calls,
+                    )
+                    batch_links = {n: _links_added(n, o) for n, o in link_outcomes.items()}
+                    # On the document pool, like the sync sink; the results are
+                    # folded in queued order below, so the payload order holds.
+                    map_concurrent(
+                        lambda item: _finish_output(item[0], item[1], batch_links[item[0]]),
+                        list(staged_outputs.items()),
+                        max_workers=args.max_parallel_calls,
+                    )
             # Documents were converted on a pool, so fold the per-document
             # results back in a fixed order — queued order for converted files,
             # docset order for re-rendered priors — and the payload stays
@@ -3951,6 +5140,318 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         {"model": gen_model, "label_model": label_model, "source": gen_model_source},
     )
     payload["rerendered"] = rerendered
+    if batch_opts is not None:
+        # Additive, and present only under batch mode: without it the payload
+        # is exactly what a synchronous run has always emitted.
+        stages = dict(batch_opts.stats)
+        if args.no_semlinks:
+            stages["links"] = {"skipped": "--no-semlinks"}
+        payload["batch"] = _batch_block(stages)
+    _emit(payload, fmt)
+    return 0
+
+
+#: Job state recording whether a `docset run` job had to generate the
+#: extraction schema when it STARTED (the schema step writes the schema, so a
+#: resumed run must not re-decide from the store — it replays the step instead).
+_RUN_SCHEMA_NEEDED_STATE = "run.schema_needed"
+
+#: Counters summed across steps for `docset run`'s aggregate `batch` block.
+_RUN_BATCH_COUNTERS = (
+    "waves",
+    "batches",
+    "requests",
+    "batch_ok",
+    "sync_fallbacks",
+    "resubmitted",
+    "failed",
+)
+
+
+def _run_step_argv(args: argparse.Namespace, step: str) -> list[str]:
+    """The options `docset run` hands to *step*, as command-line tokens."""
+    out: list[str] = []
+    for flag, dest, takes_value, owner in _RUN_PASSTHROUGH:
+        if owner != step:
+            continue
+        value = getattr(args, dest)
+        if takes_value and value is not None:
+            out += [flag, str(value)]
+        elif flag in _RUN_BOOLEAN_OPTIONAL and value is not None:
+            out.append(flag if value else f"--no-{flag[2:]}")
+        elif not takes_value and value:
+            out.append(flag)
+    return out
+
+
+def _run_step_argvs(args: argparse.Namespace, *, batch: bool) -> dict[str, list[str]]:
+    """Every step's command line, as `docset run` runs it (the schema step's
+    only when there are ``--schema-from`` files to generate it from)."""
+    batch_tokens = ["--batch", "--batch-poll-interval", str(args.batch_poll_interval)]
+    argvs: dict[str, list[str]] = {}
+    if args.schema_from:
+        argv = ["extraction", "generate-schema", args.docset_id]
+        for fid in args.schema_from:
+            argv += ["--from-file", fid]
+        argv += _run_step_argv(args, "schema")
+        argvs["schema"] = argv + (batch_tokens if batch else [])
+    argv = ["docset", "generate", args.docset_id, *_run_step_argv(args, "generate")]
+    # --no-batch: a sync run stays sync whatever [generation] batch says.
+    argvs["generate"] = argv + (batch_tokens if batch else ["--no-batch"])
+    argv = ["extraction", "extract", args.docset_id, "--all", *_run_step_argv(args, "extract")]
+    argvs["extract"] = argv + (batch_tokens if batch else [])
+    return argvs
+
+
+def _parse_run_step(step: str, argv: list[str]) -> argparse.Namespace:
+    """Parse one `docset run` step's command line with the step's own parser.
+
+    A bad pass-through value (``--window-size abc``) raises INVALID_ARGUMENT
+    naming the step and the flag, instead of argparse's usage text and exit 2."""
+    try:
+        return _parse_quietly(argv)
+    except _ArgvRejected as exc:
+        raise InvalidArgument(f"docset run: invalid option for step '{step}': {exc}") from None
+
+
+def _sum_cost_fields(parts: Iterable[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Add up blocks' cost fields; ``null`` if any block's is unknown."""
+    blocks = list(parts)
+    if any(b.get("cost_usd") is None for b in blocks):
+        return {"cost_usd": None, "standard_cost_usd": None, "saved_usd": None}
+    cost = sum(float(b["cost_usd"]) for b in blocks)
+    standard = sum(float(b["standard_cost_usd"]) for b in blocks)
+    return {
+        "cost_usd": round(cost, 6),
+        "standard_cost_usd": round(standard, 6),
+        "saved_usd": round(standard - cost, 6),
+    }
+
+
+def _run_step_batch_stats(step: str, payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One step's batch counters (``generate`` sums its stages), or None when
+    the step ran no batch."""
+    block = payload.get("batch")
+    if not isinstance(block, Mapping):
+        return None
+    parts: list[Mapping[str, Any]]
+    if step == "generate":
+        stages = block.get("stages") or {}
+        parts = [v for v in stages.values() if isinstance(v, Mapping) and "waves" in v]
+    else:
+        parts = [block]
+    out: dict[str, Any] = {
+        k: sum(int(p.get(k, 0) or 0) for p in parts) for k in _RUN_BATCH_COUNTERS
+    }
+    out.update(_sum_cost_fields(parts))
+    return out
+
+
+def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
+    """``docset run``: extraction schema (if needed), ``docset generate``, then
+    ``extraction extract --all`` — each step is the standalone command's own
+    handler, run unchanged, its payload nested under ``steps``.
+
+    Under ``--batch`` the whole run is ONE batch job: every step's executor
+    replays from and records into it, so ``--no-wait`` pauses at whichever
+    step first has a wave in flight and ``dgml batch resume`` re-runs the
+    pipeline, replaying completed steps' responses from the job at no cost.
+    Which steps a job runs is decided when it starts and replayed after, so a
+    step's own writes (the schema it stores, the DGML generate writes) never
+    turn a resumed run into a different one."""
+    from dgml_core.generation import load_generation_batch, resolve_generation_config
+    from dgml_core.grounded import (
+        load_grounded_config,
+        parse_values_reasoning_effort,
+        schema_batch_request,
+        values_batch_stages,
+    )
+
+    ds_store = DocSetStore(ws)
+    ds_store.get(args.docset_id)  # raises DocSetNotFound
+    batch = args.batch if args.batch is not None else load_generation_batch(ws)
+    if not batch:
+        _reject_job_flags_without_batch(args)
+
+    want_extract = not args.no_extract
+    has_schema = ds_store.has_schema(args.docset_id)
+    schema_needed = want_extract and not has_schema
+
+    prefix = ["--format", "json"]
+    if args.verbose:
+        prefix.append("--verbose")
+    if args.debug:
+        prefix.append("--debug")
+    # Every step that may run is parsed now, before any step (or batch job)
+    # starts: a bad pass-through value fails the run up front as
+    # INVALID_ARGUMENT, not after an earlier step already paid.
+    step_argvs = _run_step_argvs(args, batch=batch)
+    may_run = {"schema": want_extract, "generate": not args.no_generate, "extract": want_extract}
+    for name, argv in step_argvs.items():
+        if may_run[name]:
+            _parse_run_step(name, prefix + argv)
+    # Its value is only checked by the extract step's handler, which runs last:
+    # refuse a bad one (GROUNDED_CONFIG_INVALID) before generate pays.
+    values_effort = (
+        parse_values_reasoning_effort(args.values_effort, source="--values-effort")
+        if want_extract and args.values_effort is not None
+        else None
+    )
+
+    session = None
+    if batch:
+        # Every model a planned step will send to a batch, checked before any
+        # work: the first offending stage is named (BATCH_UNAVAILABLE).
+        from dataclasses import replace
+
+        stages: dict[str, Any] = {}
+        pinned: dict[str, str | bool] = {}  # resolved from config, recorded with the job
+        # Only an extraction that will actually run needs the grounded config.
+        extracting = want_extract and (has_schema or bool(args.schema_from))
+        grounded = load_grounded_config(ws) if extracting else None
+        if grounded is not None and args.schema_model:
+            grounded = replace(grounded, schema_model=args.schema_model)
+        if grounded is not None and args.values_model:
+            grounded = replace(grounded, values_model=args.values_model)
+        if grounded is not None and args.values_effort is not None:
+            grounded = replace(grounded, values_reasoning_effort=values_effort)
+        # A resumed job may already have written the schema it set out to
+        # generate, so check the schema model whenever the run could make one.
+        if grounded is not None and args.schema_from and (schema_needed or args.job):
+            stages["schema"] = schema_batch_request(grounded.schema_model)
+        if not args.no_generate:
+            gen_cfg, _source = resolve_generation_config(
+                ws, config=args.generation_config, model=args.model, label_model=args.label_model
+            )
+            # As `docset generate` checks: transcription, and the labeling model
+            # (planning and descriptions batch; labeling too unless --no-batch-label).
+            stages["generate.transcribe"] = gen_cfg.model
+            stages["generate.label"] = gen_cfg.label_model
+            from dgml_core.style_config import load_style_config
+
+            style_section = load_style_config(ws)
+            if style_section is not None:
+                stages["generate.style"] = style_section.model  # OCR files' image style
+            if not args.no_semlinks:
+                stages["generate.links"] = gen_cfg.label_model
+            from dgml_core.generation import load_generation_batch_label
+
+            # As `docset generate` pins it: a resume labels the same way
+            # whatever [generation] batch_label says by then.
+            pinned["--batch-label"] = (
+                args.batch_label
+                if args.batch_label is not None
+                else load_generation_batch_label(ws)
+            )
+        if grounded is not None and (has_schema or args.schema_from):
+            stages.update(
+                values_batch_stages(
+                    grounded.values_model, grounded.values_reasoning_effort, stage="extract"
+                )
+            )
+        _batch_preflight(stages)
+        session = _start_batch_job(args, ws, command="docset run", pinned=pinned)
+        schema_needed = bool(session.state.setdefault(_RUN_SCHEMA_NEEDED_STATE, schema_needed))
+        session.persist()
+
+    steps: dict[str, Any] = {}
+
+    def run_step(
+        name: str, argv: list[str], handler: Callable[[argparse.Namespace, Workspace, str], int]
+    ) -> int:
+        """Run one step's command handler; 0 with its payload recorded under
+        ``steps[name]``, else the step's error re-emitted naming the step."""
+        if session is not None:
+            from dgml_core.batch.jobs import RUN_STEP_STATE
+
+            session.state[RUN_STEP_STATE] = name
+            session.persist()
+        sub_args = _parse_run_step(name, prefix + argv)
+        sub_args.raw_argv = []
+        sub_args.run_step = True  # reuse this run's batch job (see _start_batch_job)
+        error: dict[str, Any] | None = None
+        own: dict[str, Any] = {}  # details the raised error carries itself
+        with _capturing() as captured:
+            try:
+                rc = handler(sub_args, ws, "json")
+            except DgmlError as exc:
+                rc, error = 1, {"code": exc.code, "message": str(exc)}
+                own = _error_details(exc) or {}
+            except Exception as exc:
+                # Not a DgmlError (a bug, an unexpected provider error): still
+                # INTERNAL_ERROR, but naming the step like any step failure.
+                if _verbose_enabled(args):
+                    import traceback
+
+                    traceback.print_exc()
+                rc, error = 1, {"code": "INTERNAL_ERROR", "message": short_error_message(exc)}
+        if rc == 0 and captured.payloads:
+            steps[name] = captured.payloads[-1]
+            return 0
+        if error is None:
+            envelope = captured.errors[-1] if captured.errors else {}
+            error = envelope.get("error") or {
+                "code": "INTERNAL_ERROR",
+                "message": f"step '{name}' produced no result",
+            }
+        return _emit_error(
+            str(error["code"]),
+            f"docset run: step '{name}' failed: {error['message']}",
+            fmt,
+            details={**own, "step": name, "completed_steps": sorted(steps)},
+        )
+
+    # 1. Extraction schema.
+    if not want_extract:
+        steps["schema"] = {"skipped": "--no-extract"}
+    elif schema_needed and not args.schema_from:
+        steps["schema"] = {
+            "skipped": (
+                "the docset has no extraction schema and no --schema-from sample files were given"
+            )
+        }
+    elif schema_needed:
+        rc = run_step("schema", step_argvs["schema"], _extraction_cmd)
+        if rc != 0:
+            return rc
+    else:
+        steps["schema"] = {"skipped": "the docset already has an extraction schema"}
+
+    # 2. DGML generation.
+    if args.no_generate:
+        steps["generate"] = {"skipped": "--no-generate"}
+    else:
+        rc = run_step("generate", step_argvs["generate"], _docset_cmd)
+        if rc != 0:
+            return rc
+
+    # 3. Extraction.
+    if not want_extract:
+        steps["extract"] = {"skipped": "--no-extract"}
+    elif schema_needed and "skipped" in steps["schema"]:
+        steps["extract"] = {"skipped": "the docset has no extraction schema"}
+    else:
+        rc = run_step("extract", step_argvs["extract"], _extraction_cmd)
+        if rc != 0:
+            return rc
+
+    payload: dict[str, Any] = {"docset_id": args.docset_id, "steps": steps}
+    if batch:
+        per_step: dict[str, Any] = {}
+        for name, step_payload in steps.items():
+            stats = _run_step_batch_stats(name, step_payload)
+            if stats is None:
+                # A string reason, as every other `skipped` in a batch block.
+                reason = step_payload.get("skipped")
+                stats = {"skipped": str(reason) if reason else "the step ran no batch"}
+            per_step[name] = stats
+        ran = [v for v in per_step.values() if "skipped" not in v]
+        totals = {k: sum(int(v.get(k, 0)) for v in ran) for k in _RUN_BATCH_COUNTERS}
+        payload["batch"] = {"enabled": True, **totals, **_sum_cost_fields(ran), "steps": per_step}
+        if session is not None:
+            from dgml_core.batch.jobs import RUN_STEP_STATE
+
+            session.state[RUN_STEP_STATE] = "completed"
     _emit(payload, fmt)
     return 0
 
@@ -3960,6 +5461,8 @@ def _docset_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     sub = args.docset_command
     if sub == "generate":
         return _docset_generate_cmd(args, ws, fmt)
+    if sub == "run":
+        return _docset_run_cmd(args, ws, fmt)
     if sub == "create":
         ds = store.create(
             name=args.name,
@@ -4094,7 +5597,7 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         # config is a hard failure that aborts the run before any file is
         # added, rather than recording the same error on every file.
         config = load_classification_config(ws)
-        # Read existing DocSets once; _auto_classify appends newly-created
+        # Read existing DocSets once; auto_classify appends newly-created
         # ones so similar PDFs cluster within the run without re-scanning.
         docsets = DocSetStore(ws).list_all()
         if not allow_new:
@@ -4102,12 +5605,61 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
             # than on the first one.
             _require_existing_docsets(docsets)
 
+    # --batch is validated (mode, batch backends) before any file is added.
+    batch: BulkClassifyBatch | None = None
+    job: Any = None
+    if getattr(args, "batch", False):
+        if classify_mode is None:
+            # Classification (and the auto-extraction after it) is all a
+            # directory add sends to a model that a batch can serve.
+            raise InvalidArgument(
+                "--batch on a directory add batches its classification: pass "
+                "--auto-classify (default mode or 'existing')"
+            )
+        assert config is not None and docsets is not None
+        # The session first: the executors prepare_bulk_classify builds are
+        # bound to it. A run rejected there leaves no job behind (a fresh job
+        # that failed before any request removes itself on close).
+        job = _start_batch_job(args, ws, command="file add")
+        batch = prepare_bulk_classify(
+            ws,
+            config=config,
+            docsets=docsets,
+            poll_interval_s=args.batch_poll_interval,
+            log=_batch_log(args),
+        )
+    else:
+        _reject_job_flags_without_batch(args)
+
     on_conflict = ConflictPolicy(args.on_conflict)
     text_mode = TextMode(args.text_mode)
 
     counts = {"added": 0, "skipped": 0, "soft_failed": 0, "hard_failed": 0}
     entries: list[dict[str, Any]] = []
-    for pdf in pdfs:
+    # A resumed job never ingests again: every file is already in, and adding
+    # it a second time would report it "skipped" and skip its classification.
+    # The first run's ingest results are restored from the job instead.
+    restored = job.state.get("file_add") if job is not None and job.resumed else None
+    if restored is not None:
+        assert batch is not None
+        counts = dict(restored["counts"])
+        entries = [dict(e) for e in restored["entries"]]
+        store_files = FileStore(ws)
+        for index, file_id, created in restored["pending"]:
+            batch.pending.append(
+                (
+                    entries[index],
+                    AddFileResult(record=store_files.get(file_id), created=bool(created)),
+                )
+            )
+        pdfs = [Path(p) for p in restored["pdfs"]]
+        if docsets is not None:
+            # Classify against the DocSets the job started with: those its
+            # earlier runs created for earlier files are added back, in order,
+            # as their replayed decisions are applied (see classify_bulk_batch).
+            ds_store = DocSetStore(ws)
+            docsets[:] = [ds_store.get(docset_id) for docset_id in restored["docset_ids"]]
+    for pdf in pdfs if restored is None else []:
         try:
             result = store.add(
                 pdf,
@@ -4141,8 +5693,11 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         counts[status] += 1
 
         entry: dict[str, Any] = {"status": status, "path": str(pdf), **_file_add_payload(result)}
-        if auto_classify:
-            entry["classification"] = _auto_classify(
+        if batch is not None:
+            # Classified together once every file is in (see classify_bulk_batch).
+            batch.pending.append((entry, result))
+        elif auto_classify:
+            entry["classification"] = run_auto_classify(
                 ws,
                 result,
                 config=config,
@@ -4152,12 +5707,34 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
             )
         entries.append(entry)
 
+    if job is not None and restored is None:
+        # Everything before the first LLM call, kept so a resume skips it.
+        assert batch is not None
+        by_id = {id(entry): i for i, entry in enumerate(entries)}
+        job.state["file_add"] = {
+            "pdfs": [str(p) for p in pdfs],
+            "counts": dict(counts),
+            "entries": json.loads(json.dumps(entries)),
+            "pending": [
+                [by_id[id(entry)], res.record.id, res.created] for entry, res in batch.pending
+            ],
+            # The DocSets the classifications start from (their ids are in the
+            # requests): a resume must not see the ones this job creates.
+            "docset_ids": [ds.id for ds in docsets or []],
+        }
+        job.persist()
+
     payload: dict[str, Any] = {
         "directory": str(directory),
         "recursive": recursive,
         "summary": {"total": len(pdfs), **counts},
         "results": entries,
     }
+    if batch is not None:
+        assert config is not None and docsets is not None
+        payload["batch"] = classify_bulk_batch(
+            ws, batch, config=config, docsets=docsets, debug=args.debug, allow_new=allow_new
+        )
     _emit(payload, fmt)
     return 0
 
@@ -4177,6 +5754,12 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     f"to choose each id."
                 )
             return _file_add_bulk(args, ws, store, fmt)
+        if getattr(args, "batch", False):
+            raise InvalidArgument(
+                "--batch applies to a directory add (PATH is a directory): one file "
+                "is one request, which a batch cannot make cheaper to wait for"
+            )
+        _reject_job_flags_without_batch(args)
         classify_mode = getattr(args, "auto_classify", None)
         allow_new = classify_mode != ClassifyMode.EXISTING
         config: ClassificationConfig | None = None
@@ -4199,10 +5782,10 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         )
         payload: dict[str, Any] = _file_add_payload(result)
         if classify_mode is not None:
-            # In the default mode _auto_classify loads the classification
+            # In the default mode auto_classify loads the classification
             # config itself; a missing/invalid one raises straight through to
             # an error envelope.
-            payload["classification"] = _auto_classify(
+            payload["classification"] = run_auto_classify(
                 ws,
                 result,
                 config=config,
@@ -4221,125 +5804,6 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     else:  # unreachable — argparse `required=True` rejects unknown subcommands
         raise AssertionError(f"unhandled file subcommand: {sub}")
     return 0
-
-
-def _auto_classify(
-    ws: Workspace,
-    result: AddFileResult,
-    *,
-    config: ClassificationConfig | None = None,
-    docsets: list[DocSet] | None = None,
-    allow_new: bool = True,
-    debug: bool = False,
-) -> dict[str, Any]:
-    """Run LLM auto-classification on a freshly added File and assign it.
-
-    Returns the ``classification`` block embedded in ``dgml file add`` output.
-
-    ``allow_new=False`` (``--auto-classify existing``) forbids creating a
-    DocSet and always assigns: the LLM is given only the assign tool and must
-    return the best-fitting DocSet even when the fit is poor. With no DocSets
-    to choose from the mode has no possible outcome, so it is a **hard** error
-    (``NO_EXISTING_DOCSETS``) — a precondition on the request rather than a
-    failure of the classification call. Callers check it via
-    :func:`_require_existing_docsets` before adding any file; the re-raise
-    below keeps it hard if one ever doesn't.
-
-    A missing or invalid classification config is a **hard** failure: when
-    ``config`` is not supplied it is loaded here via
-    :func:`load_classification_config`, whose error propagates straight to the
-    CLI error envelope (exit 1) rather than soft-failing per file. Bulk callers
-    load the config once up front and pass it in, so the run aborts before any
-    file is processed when it's missing. Failures *after* config is in hand —
-    the LLM/classify call, auth — stay soft: the File record is already on
-    disk, so they land in ``classification.error`` with exit 0.
-
-    ``docsets``, when supplied, is a mutable list the caller maintains across
-    a bulk run: it is forwarded to :func:`classify_file` so the LLM sees
-    DocSets created earlier in the same run, and any freshly-created DocSet
-    is appended to it here so later files can be assigned to it.
-
-    Skipped (and reported as ``performed: false``) when the add returned an
-    existing record rather than creating a new one — re-runs stay idempotent,
-    and we neither require config nor burn an LLM call on a duplicate.
-    """
-    if not result.created:
-        return {
-            "performed": False,
-            "reason": "file already existed; classification skipped",
-        }
-
-    if config is None:
-        config = load_classification_config(ws)
-
-    file_id = result.record.id
-    block: dict[str, Any] = {
-        "performed": True,
-        "model": config.model,
-        "decision": None,
-        "docset_id": None,
-        "docset_created": False,
-        "docset_name": None,
-        "docset_key_questions": [],
-        "error": None,
-    }
-
-    try:
-        decision = classify_file(
-            ws, file_id, config=config, docsets=docsets, allow_new=allow_new, debug=debug
-        )
-    except NoExistingDocSets:
-        # A precondition on the request, not a failure of the call — callers
-        # check it before ingesting anything. Kept hard even if one didn't:
-        # soft-failing would leave the unassigned file this mode prevents.
-        raise
-    except DgmlError as exc:
-        block["error"] = f"{exc.code}: {exc}"
-        return block
-
-    docset_store = DocSetStore(ws)
-    try:
-        if decision.decision == "existing":
-            assert decision.existing_docset_id is not None
-            # Assign, and auto-extract when the target DocSet has an
-            # extraction schema set (soft-fail — the extraction block
-            # carries any error; the assignment itself stands).
-            from dgml_core.extraction import add_file_and_extract
-
-            extraction_block = add_file_and_extract(
-                ws, decision.existing_docset_id, file_id, write_stats=debug, debug=debug
-            )
-            existing = docset_store.get(decision.existing_docset_id)
-            block.update(
-                decision="existing",
-                docset_id=existing.id,
-                docset_name=existing.name,
-                docset_key_questions=list(existing.key_questions),
-            )
-            if extraction_block is not None:
-                block["extraction"] = extraction_block
-        elif decision.decision == "new":
-            assert decision.new_name is not None and decision.new_description is not None
-            created = docset_store.create(
-                name=decision.new_name,
-                description=decision.new_description,
-                key_questions=list(decision.new_key_questions),
-            )
-            docset_store.add_file(created.id, file_id)
-            if docsets is not None:
-                docsets.append(created)
-            block.update(
-                decision="new",
-                docset_id=created.id,
-                docset_created=True,
-                docset_name=created.name,
-                docset_key_questions=list(created.key_questions),
-            )
-        else:  # unreachable — classify_file returns only these three
-            raise AssertionError(f"unhandled classification decision: {decision.decision}")
-    except DgmlError as exc:
-        block["error"] = f"{exc.code}: {exc}"
-    return block
 
 
 if __name__ == "__main__":

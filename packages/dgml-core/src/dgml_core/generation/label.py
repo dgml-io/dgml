@@ -41,6 +41,7 @@ from typing import Any
 
 from dgml_core import llm
 from dgml_core.errors import LabelModelUnreachable, short_error_message
+from dgml_core.generation import single_calls
 from dgml_core.generation.blocks import Block, Node, Span, build_tree, sanitize_concept
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.generation.schema import VALID_KINDS, Schema, SchemaTag, sanitize_tag_name
@@ -53,7 +54,7 @@ _SNIPPET_CHARS = 160
 # Bounds on one labeling call, whichever hits first: a block count and a
 # text-size budget on the rendered listing (a dense chunk's JSON reply would
 # otherwise grow too large to come back valid). Overflow past both is split on a
-# parse failure — see _label_chunk.
+# parse failure — see _label_chunk_steps.
 _MAX_BLOCKS_PER_CALL = 1200
 _MAX_CHUNK_CHARS = 20000
 _ROSTER_MAX_ENTRIES = 400
@@ -1014,7 +1015,8 @@ def plan_concept_roster(
             # Two-turn grounded build: draft the roster, then have the model
             # ADD recurring roles it missed, grounded on the same skeletons.
             # Add-only — no synonym merging — so it can only raise recall.
-            draft_raw, raw = llm.call_with_refinement(
+            draft_raw, raw = single_calls.call_with_refinement(
+                single_calls.STAGE_PLAN_GAPS if gap_mode else single_calls.STAGE_PLAN,
                 config,
                 system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
@@ -1026,7 +1028,8 @@ def plan_concept_roster(
             )
         else:
             # Single-call roster: the draft only, without the add-only completion turn.
-            raw = llm.call(
+            raw = single_calls.call(
+                single_calls.STAGE_PLAN_GAPS if gap_mode else single_calls.STAGE_PLAN,
                 config,
                 system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
@@ -1178,7 +1181,8 @@ def describe_concepts(
         ex = str(example).strip()[:80]
         lines.append(f"- {name}" + (f' — "{ex}"' if ex else ""))
     try:
-        raw = llm.call(
+        raw = single_calls.call(
+            single_calls.STAGE_DESCRIBE,
             config,
             system_prompt=prompt("describe_concepts"),
             user_content=[{"type": "text", "text": "\n".join(lines)}],
@@ -1373,10 +1377,68 @@ def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
     return roster
 
 
-def _label_chunk(
+def vocab_batch_blocker(vocab: TagVocab) -> str | None:
+    """Why *vocab* alone rules out labeling documents independently, or
+    ``None`` when it does not.
+
+    The vocabulary half of :func:`is_batchable_vocab`, and the ONE place that
+    rule is written: the CLI's pre-flight (which runs before any roster
+    exists) and the pipeline's decision both read it, so the two cannot
+    disagree about whether a vocabulary batches. ``None`` means the
+    vocabulary is closed with nothing planned; whether the run then batches
+    also depends on the roster (see :func:`is_batchable_vocab`).
+    """
+    if vocab.extends:
+        return "vocabulary extends an authored schema, so labeling may coin concepts"
+    if vocab.added:
+        return "vocabulary includes planned concepts the run can still refine"
+    if not vocab.closed:
+        return "open vocabulary: each document's labels extend the shared roster"
+    return None
+
+
+def is_batchable_vocab(vocab: TagVocab, roster: Mapping[str, RosterEntry]) -> bool:
+    """Can every document of this run be labeled independently of the others?
+
+    Labeling is serial by design: each document's labels enrich the shared
+    roster (``_update_roster``), and the next document is prompted with the
+    enriched rendering. That hand-off is what keeps an open vocabulary
+    consistent, and labeling documents together would cut it.
+
+    The hand-off carries nothing when the roster cannot change, which is true
+    exactly when the vocabulary is CLOSED (nothing outside it can be emitted),
+    every roster entry is ``frozen`` (an observation never mutates a frozen
+    entry), and every legal tag already has an entry (so an observation never
+    ``setdefault``-s a new, unfrozen one). Then :func:`_roster_content_blocks`
+    renders the same bytes for every document and each document's requests
+    depend only on that document — the precondition for submitting them
+    together as one batch wave. A strict ``--schema-path`` seed satisfies it;
+    open, extend, and bounded (``supplied + planned``) vocabularies do not,
+    because planned entries are not frozen.
+    """
+    if vocab_batch_blocker(vocab) is not None:
+        return False
+    if not all(entry.frozen for entry in roster.values()):
+        return False
+    return vocab.names <= set(roster)
+
+
+@dataclass
+class _ChunkEffects:
+    """What labeling one chunk produced besides its blocks' labels, held until
+    the document's chunks have all returned and then applied in chunk order
+    (see :func:`label_document_steps`): its warnings, its off-schema concepts,
+    and the block lists whose observations enrich the roster (one per
+    labeled sub-chunk, in the order the serial code observed them)."""
+
+    warnings: list[str] = field(default_factory=list)
+    off_schema: list[str] = field(default_factory=list)
+    observed: list[list[Block]] = field(default_factory=list)
+
+
+def _label_chunk_steps(
     doc_name: str,
     chunk: list[Block],
-    roster: dict[str, RosterEntry],
     roster_blocks: list[dict[str, Any]],
     *,
     config: llm.LLMConfig,
@@ -1385,17 +1447,28 @@ def _label_chunk(
     log: Callable[[str], None],
     stem: str,
     label_tag: str,
-    warnings: list[str],
+    effects: _ChunkEffects,
     vocab: TagVocab,
-    off_schema: list[str],
-) -> dict[str, str] | None:
+) -> llm.LLMSteps[dict[str, str] | None]:
     """Label one chunk in place; bisect and recurse on an unparseable reply.
 
     A malformed JSON reply (output too large to come back valid) halves the
     chunk and relabels each half — Pass A's window split — rather than retrying
     the same overflow. Call errors never split (they fail at any size); a
     reachability error returns its dict, else ``None``.
+
+    A generator over labeling requests (see :func:`label_document_steps` for
+    the driver contract): a request the driver could not complete arrives as
+    ``throw(exc)`` at the pending ``yield`` and is handled by the same
+    ``except`` the inline call had.
+
+    It touches nothing shared: it mutates only *chunk*'s blocks and records
+    everything else — warnings, off-schema concepts, the roster observations —
+    on *effects* for the caller to apply, so a document's chunks can be
+    labeled side by side (a :class:`~dgml_core.llm.FanOut`).
     """
+    warnings = effects.warnings
+    off_schema = effects.off_schema
     listing = render_block_listing(doc_name, chunk)
     user_content = [*roster_blocks, {"type": "text", "text": listing}]
     user_text = "\n\n".join(str(part["text"]) for part in user_content)
@@ -1403,7 +1476,7 @@ def _label_chunk(
     for attempt in range(2):
         msg = f"labeling failed for {doc_name} {label_tag}"
         try:
-            raw = llm.call(
+            raw = yield from llm.steps_call(
                 config, system_prompt=SYSTEM_PROMPT, user_content=user_content, cache=True
             )
         except Exception as exc:  # call-level failure (network / provider / auth)
@@ -1439,10 +1512,9 @@ def _label_chunk(
             if len(chunk) > 1:
                 mid = len(chunk) // 2
                 log(f"[label] {doc_name} {label_tag}: reply unparseable; splitting {len(chunk)}")
-                err_a = _label_chunk(
+                err_a = yield from _label_chunk_steps(
                     doc_name,
                     chunk[:mid],
-                    roster,
                     roster_blocks,
                     config=config,
                     cache_dir=cache_dir,
@@ -1450,14 +1522,12 @@ def _label_chunk(
                     log=log,
                     stem=stem,
                     label_tag=f"{label_tag}a",
-                    warnings=warnings,
+                    effects=effects,
                     vocab=vocab,
-                    off_schema=off_schema,
                 )
-                err_b = _label_chunk(
+                err_b = yield from _label_chunk_steps(
                     doc_name,
                     chunk[mid:],
-                    roster,
                     roster_blocks,
                     config=config,
                     cache_dir=cache_dir,
@@ -1465,9 +1535,8 @@ def _label_chunk(
                     log=log,
                     stem=stem,
                     label_tag=f"{label_tag}b",
-                    warnings=warnings,
+                    effects=effects,
                     vocab=vocab,
-                    off_schema=off_schema,
                 )
                 return err_a or err_b
             if attempt:
@@ -1496,7 +1565,7 @@ def _label_chunk(
         if attempt or labeled >= len(chunk) * _MIN_LABELED_FRACTION:
             break
         log(f"[label] {doc_name} {label_tag} under-labeled ({labeled}/{len(chunk)}); retrying")
-    _update_roster(roster, chunk)
+    effects.observed.append(chunk)  # → _update_roster, in chunk order, by the caller
     return None
 
 
@@ -1511,7 +1580,59 @@ def _label_one_document(
     log: Callable[[str], None],
     vocab: TagVocab,
 ) -> tuple[list[str], dict[str, str] | None, list[str]]:
+    """Synchronous driver over :func:`label_document_steps` (same arguments)."""
+    return llm.drive(
+        label_document_steps(
+            doc_name,
+            blocks,
+            roster,
+            config=config,
+            cache_dir=cache_dir,
+            debug=debug,
+            log=log,
+            vocab=vocab,
+        ),
+        config,
+    )
+
+
+def label_document_steps(
+    doc_name: str,
+    blocks: list[Block],
+    roster: dict[str, RosterEntry],
+    *,
+    config: llm.LLMConfig,
+    cache_dir: Path | str | None,
+    debug: bool,
+    log: Callable[[str], None],
+    vocab: TagVocab,
+) -> llm.LLMFlow[tuple[list[str], dict[str, str] | None, list[str]]]:
     """Label one document's blocks against (and into) the shared roster.
+
+    A generator over every labeling request the document needs, in order: each
+    chunk's attempts (including the bisect recursion on an unparseable reply),
+    then the section retry when headings were left untagged. It follows the
+    :data:`dgml_core.llm.LLMSteps` contract — yields completion kwargs, is sent
+    the response for each, does no usage accounting — plus one rule every
+    driver must honour: a request that could not be completed is delivered
+    with ``throw(exc)`` at the pending ``yield``. There the same ``except`` the
+    inline call had makes the decision (reachability short-circuit, retry once,
+    never split on a call error), so no driver needs to know labeling policy.
+
+    The document's chunks share one roster snapshot and are independent of
+    one another, so they are yielded as one :class:`~dgml_core.llm.FanOut`
+    (a single chunk is simply ``yield from``-ed): the sync driver runs them
+    one after another, exactly the serial loop's requests, while a batch
+    driver submits them in one wave. Their roster observations, warnings and
+    off-schema concepts are applied after the join, in chunk order, so the
+    roster the next document sees is byte-identical either way. The section
+    retry, which depends on the chunks' labels, follows the join.
+
+    The roster block is rendered when the generator first runs and the roster
+    is mutated once its chunks have labeled, so two documents' generators are
+    independent (drivable together) only when :func:`is_batchable_vocab`
+    holds; otherwise each document must finish before the next one starts
+    (see ``pipeline.BatchOptions.label``).
 
     Returns ``(warnings, label_error, off_schema)``, where *off_schema* lists
     every concept that fell outside an authored vocabulary — refused under
@@ -1524,8 +1645,8 @@ def _label_one_document(
     """
     warnings: list[str] = []
     # Concepts that fell outside an authored vocabulary, in encounter order
-    # (duplicates kept — the caller tallies them). Filled serially: every chunk
-    # of this document is labeled in sequence.
+    # (duplicates kept — the caller tallies them). Filled in chunk order after
+    # the chunks join, then by the section retry.
     off_schema: list[str] = []
     # Populated on the first model-reachability failure (see is_model_reachability_error);
     # recorded once because such failures (e.g. a bad key) recur on every chunk.
@@ -1535,11 +1656,23 @@ def _label_one_document(
     # same rendered block, so it stays byte-stable (and cacheable) across the
     # document's chunks and its section retry.
     roster_blocks = _roster_content_blocks(roster, model=config.model, vocab=vocab)
-    for chunk_idx, chunk in enumerate(_chunks(blocks)):
-        err = _label_chunk(
+    # The chunks are independent: each request is built from the shared
+    # ``roster_blocks`` snapshot (rendered above, before any chunk labels) and
+    # the chunk's own blocks, and nothing a chunk's reply changes reaches
+    # another chunk's request — apply_labels touches only the chunk's blocks,
+    # and the listing never shows a label. So they run as one FanOut: the sync
+    # driver labels them one after another (the requests of the serial loop,
+    # byte for byte, in order); a batch driver puts them in the same wave.
+    # What IS order-sensitive — the roster the next document is prompted with,
+    # the warnings, the off-schema tally, the first label_error — is collected
+    # per chunk and applied below, after the join, in chunk order, which is
+    # exactly the serial loop's order.
+    chunks = _chunks(blocks)
+    effects = [_ChunkEffects() for _ in chunks]
+    children = [
+        _label_chunk_steps(
             doc_name,
             chunk,
-            roster,
             roster_blocks,
             config=config,
             cache_dir=cache_dir,
@@ -1547,10 +1680,22 @@ def _label_one_document(
             log=log,
             stem=stem,
             label_tag=f"c{chunk_idx + 1:02d}",
-            warnings=warnings,
+            effects=effects[chunk_idx],
             vocab=vocab,
-            off_schema=off_schema,
         )
+        for chunk_idx, chunk in enumerate(chunks)
+    ]
+    errors: list[dict[str, str] | None]
+    if len(children) == 1:
+        # Nothing to fan out; a hand-driven generator still sees the request.
+        errors = [(yield from children[0])]
+    else:
+        errors = yield llm.FanOut(children)
+    for effect, err in zip(effects, errors, strict=True):
+        warnings.extend(effect.warnings)
+        off_schema.extend(effect.off_schema)
+        for observed in effect.observed:
+            _update_roster(roster, observed)
         if label_error is None and err is not None:
             label_error = err
     # Force coverage of untagged sections: an unlabeled heading drops a
@@ -1568,7 +1713,7 @@ def _label_one_document(
         user_text = "\n\n".join(str(part["text"]) for part in user_content)
         cache_write(cache_dir, f"label_{stem}_section_retry_input.txt", user_text, debug=debug)
         try:
-            raw = llm.call(
+            raw = yield from llm.steps_call(
                 config,
                 system_prompt=SYSTEM_PROMPT,
                 user_content=user_content,
@@ -1647,8 +1792,35 @@ def label_documents(
     vocab: TagVocab | None = None,
     on_label_error: Callable[[str, dict[str, str]], None] | None = None,
     on_off_schema: Callable[[str, Counter[str]], None] | None = None,
+    batch_label: Callable[
+        [list[str], dict[str, RosterEntry], TagVocab],
+        Mapping[str, tuple[list[str], dict[str, str] | None, list[str]]] | None,
+    ]
+    | None = None,
+    label_document: Callable[
+        [str, list[Block], dict[str, RosterEntry], TagVocab],
+        tuple[list[str], dict[str, str] | None, list[str]],
+    ]
+    | None = None,
 ) -> list[str]:
     """Label every document, chunked, carrying the roster between calls.
+
+    *batch_label* (batch mode; see ``pipeline.BatchOptions``) is offered the
+    labeling order, the built roster, and the vocabulary once, before the
+    per-document loop. It may label every document at once and return
+    ``{doc_name: (warnings, label_error, off_schema)}`` — the same triple the
+    serial loop gets per document, consumed below in the same order — or
+    return ``None`` to decline, in which case the serial loop runs exactly as
+    without it. It is never offered a staged (pilot) run: that path mutates
+    the roster between the two stages by design.
+
+    *label_document* (per-document batch labeling; see
+    ``pipeline.BatchOptions.label``) replaces the per-document driver of
+    the serial loop: called ``(doc_name, blocks, roster, vocab)`` for each
+    document in turn — same order, pilot stage and ``_promote_pilot`` included
+    — it must label that one document into *roster* and return the same
+    triple :func:`label_document_steps` does, before the next one starts. The
+    default drives :func:`label_document_steps` synchronously.
 
     Best-effort per chunk: a failed call leaves that chunk unlabeled (still a
     valid, renderable document) and is reported as a warning; later chunks
@@ -1775,17 +1947,23 @@ def label_documents(
         order = pilot + [name for name in docs if name not in chosen]
         log(f"Pass B: pilot stage — labeling the {len(pilot)} largest doc(s) first")
 
+    batched = batch_label(order, roster, vocab) if (batch_label and not pilot) else None
     for idx, doc_name in enumerate(order):
-        warns, label_err, off_schema = _label_one_document(
-            doc_name,
-            docs[doc_name],
-            roster,
-            config=config,
-            cache_dir=cache_dir,
-            debug=debug,
-            log=log,
-            vocab=vocab,
-        )
+        if batched is not None:
+            warns, label_err, off_schema = batched[doc_name]
+        elif label_document is not None:
+            warns, label_err, off_schema = label_document(doc_name, docs[doc_name], roster, vocab)
+        else:
+            warns, label_err, off_schema = _label_one_document(
+                doc_name,
+                docs[doc_name],
+                roster,
+                config=config,
+                cache_dir=cache_dir,
+                debug=debug,
+                log=log,
+                vocab=vocab,
+            )
         warnings.extend(warns)
         if label_err is not None and on_label_error is not None:
             on_label_error(doc_name, label_err)
