@@ -19,6 +19,7 @@ import pytest
 from dgml_core import layout
 from dgml_core.matching import (
     _array_layout_key,
+    _field_name_tokens,
     _walk_leaves,
     parse_path,
     path_to_str,
@@ -1155,3 +1156,381 @@ def test_parse_path(text: str, expected: tuple[object, ...] | None) -> None:
     assert parse_path(text) == expected
     if expected is not None:
         assert parse_path(path_to_str(expected)) == expected
+
+
+# ---------------------------------------------------------------------------
+# repeated top-level values (running headers, fax banners, labels)
+
+
+def _box(result: Any, *path: Any) -> list[int]:
+    leaf = result.values
+    for seg in path:
+        leaf = leaf[seg]
+    locs = leaf["locations"]
+    assert len(locs) == 1 and "bounding_box" in locs[0], locs
+    return list(locs[0]["bounding_box"])
+
+
+def test_repeated_scalar_prefers_body_over_running_header(workspace: Workspace) -> None:
+    """A top-level value printed in the page's header band (a running
+    header, a fax banner) and once in the body resolves to the body
+    occurrence in phase 2, with no phase-3 item."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "A1234", "l": [800, 20, 880, 40]},  # header band (y≈30/1000)
+            {"t": "A1234", "l": [300, 400, 380, 420]},  # body
+        ],
+    )
+    phase1 = {"case_id": {"text": "A1234", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.unmatched == []
+    assert _box(result, "case_id") == [300, 400, 380, 420]
+    assert result.stats.repeated_value_picks == 1
+
+
+def test_repeated_scalar_prefers_footer_free_body_label(workspace: Workspace) -> None:
+    """A footer copy that carries its own label does not win over the
+    body: header/footer copies are dropped before the label vote."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Patient:", "l": [100, 970, 180, 990]},
+            {"t": "Jane", "l": [190, 970, 240, 990]},  # footer band, labelled
+            {"t": "Jane", "l": [300, 300, 350, 320]},  # body, no label
+        ],
+    )
+    phase1 = {"patient": {"text": "Jane", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "patient") == [300, 300, 350, 320]
+
+
+def test_repeated_scalar_picks_the_labelled_occurrence(workspace: Workspace) -> None:
+    """Two body occurrences: the one with the field name printed as its
+    label (left on the same line) wins."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Printed", "l": [100, 200, 180, 220]},
+            {"t": "01/02/1980", "l": [190, 200, 300, 220]},
+            {"t": "DOB:", "l": [100, 500, 150, 520]},
+            {"t": "01/02/1980", "l": [160, 500, 270, 520]},
+        ],
+    )
+    phase1 = {"PatientDOB": {"text": "01/02/1980", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "PatientDOB") == [160, 500, 270, 520]
+    assert result.stats.repeated_value_picks == 1
+
+
+def test_repeated_scalar_label_above_the_value(workspace: Workspace) -> None:
+    """A label printed over its box counts too (form cells), also when the
+    OCR box of the label slightly overlaps the value's box."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Order", "l": [500, 180, 560, 202]},
+            {"t": "No.", "l": [565, 180, 600, 202]},
+            {"t": "7781", "l": [500, 200, 560, 222]},
+            {"t": "7781", "l": [100, 600, 160, 622]},
+        ],
+    )
+    phase1 = {"order_number": {"text": "7781", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "order_number") == [500, 200, 560, 222]
+
+
+def test_repeated_scalar_defers_when_two_occurrences_are_labelled(
+    workspace: Workspace,
+) -> None:
+    """A form with repeated record blocks (two vehicles, each with its own
+    "LIC STATE" cell) gives the same label to two occurrences. That is
+    no evidence for either, so the value stays for phase 3."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "LIC", "l": [100, 300, 140, 318]},
+            {"t": "STATE", "l": [100, 318, 160, 336]},
+            {"t": "CA", "l": [105, 338, 140, 360]},
+            {"t": "LIC", "l": [100, 600, 140, 618]},
+            {"t": "STATE", "l": [100, 618, 160, 636]},
+            {"t": "CA", "l": [105, 638, 140, 660]},
+        ],
+    )
+    phase1 = {"LICState": {"text": "CA", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.stats.matched_locations == 0
+    assert result.stats.repeated_value_picks == 0
+
+
+def test_repeated_scalar_ignores_occurrence_on_a_matched_table_row(
+    workspace: Workspace,
+) -> None:
+    """An occurrence on the line of a matched array row is another field's
+    cell, even when it has a matching label. It is not a candidate; with
+    only one body occurrence left and no evidence, the matcher defers."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "ROW1", "l": [50, 500, 100, 520]},
+            {"t": "Patient", "l": [150, 500, 220, 520]},
+            {"t": "Smith", "l": [230, 500, 290, 520]},
+            {"t": "Smith", "l": [300, 300, 360, 320]},
+            {"t": "Smith", "l": [300, 400, 360, 420]},
+        ],
+    )
+    phase1 = {
+        "patient_name": {"text": "Smith", "locations": [{"page_number": 1}]},
+        "rows": [{"id": {"text": "ROW1", "locations": [{"page_number": 1}]}}],
+    }
+    layout = {"rows": {"kind": "table", "columns": ["id"]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1, layout=layout)
+
+    assert result.values["patient_name"]["locations"] == [{"page_number": 1}]
+    assert [u.text for u in result.unmatched] == ["Smith"]
+
+
+def test_repeated_scalar_never_picks_among_fuzzy_candidates(workspace: Workspace) -> None:
+    """Only exact renderings of the value are picked from. Two fuzzy
+    (OCR-noisy) occurrences stay for phase 3 even when one is in the
+    header band."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Northwind", "l": [100, 20, 200, 40]},
+            {"t": "Tradors", "l": [210, 20, 290, 40]},
+            {"t": "Northwind", "l": [100, 400, 200, 420]},
+            {"t": "Tradors", "l": [210, 400, 290, 420]},
+        ],
+    )
+    phase1 = {"vendor": {"text": "Northwind Traders", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.stats.matched_locations == 0
+
+
+def test_same_text_scalars_share_the_single_rendering(workspace: Workspace) -> None:
+    """Start date == end date, printed once: the second field adopts the
+    first one's box instead of going to phase 3."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Service", "l": [100, 300, 170, 320]},
+            {"t": "date:", "l": [175, 300, 220, 320]},
+            {"t": "03/04/2024", "l": [230, 300, 330, 320]},
+        ],
+    )
+    phase1 = {
+        "start_date": {"text": "03/04/2024", "locations": [{"page_number": 1}]},
+        "end_date": {"text": "03/04/2024", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.unmatched == []
+    assert _box(result, "start_date") == _box(result, "end_date") == [230, 300, 330, 320]
+    assert result.stats.shared_value_matches == 1
+
+
+def test_scalar_does_not_share_an_array_cell(workspace: Workspace) -> None:
+    """A top-level field does not adopt the span of an array row's cell,
+    even with the same text: the cell is that row's value, not proof of
+    where the top-level field is printed."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "ROW1", "l": [50, 500, 100, 520]},
+            {"t": "450.00", "l": [300, 500, 360, 520]},
+        ],
+    )
+    # The row is listed first, so its cell claims the lone span first.
+    phase1 = {
+        "rows": [
+            {
+                "id": {"text": "ROW1", "locations": [{"page_number": 1}]},
+                "amount": {"text": "450.00", "locations": [{"page_number": 1}]},
+            }
+        ],
+        "total": {"text": "450.00", "locations": [{"page_number": 1}]},
+    }
+    layout = {"rows": {"kind": "table", "columns": ["id", "amount"]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1, layout=layout)
+
+    assert _box(result, "rows", 0, "amount") == [300, 500, 360, 520]
+    assert result.values["total"]["locations"] == [{"page_number": 1}]
+    assert result.stats.shared_value_matches == 0
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        (("PatientDOB",), [{"patient"}, {"dob", "birth", "born", "birthdate"}]),
+        (("date_of_service",), [{"date", "dt"}, {"service"}]),
+        (("rows", 0, "InvoiceNumber"), [{"invoice"}, {"number", "no", "num", "nbr", "#"}]),
+        ((), []),
+    ],
+)
+def test_field_name_tokens(path: tuple[Any, ...], expected: list[set[str]]) -> None:
+    assert [set(t) for t in _field_name_tokens(path)] == expected
+
+
+def test_repeated_scalar_header_band_is_the_top_six_percent(workspace: Workspace) -> None:
+    """A copy whose centre sits at 5.5% of the page height is in the header
+    band (top 6%) and is dropped for the body copy. The footer band is the
+    bottom 5%, so the two bands are not interchangeable."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "A1234", "l": [800, 45, 880, 65]},  # centre y=55/1000
+            {"t": "A1234", "l": [300, 400, 380, 420]},
+        ],
+    )
+    phase1 = {"case_id": {"text": "A1234", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "case_id") == [300, 400, 380, 420]
+
+
+def test_repeated_scalar_label_to_the_right_does_not_count(workspace: Workspace) -> None:
+    """Only a label to the left on the same line (or above) counts. A field
+    name printed to the right of an occurrence is not its label."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "01/02/1980", "l": [100, 200, 210, 220]},
+            {"t": "DOB", "l": [400, 200, 450, 220]},  # right of the first copy
+            {"t": "DOB:", "l": [100, 500, 150, 520]},
+            {"t": "01/02/1980", "l": [160, 500, 270, 520]},
+        ],
+    )
+    phase1 = {"PatientDOB": {"text": "01/02/1980", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "PatientDOB") == [160, 500, 270, 520]
+
+
+def test_repeated_values_in_an_array_are_left_to_phase_3(workspace: Workspace) -> None:
+    """The repeated pick is for top-level fields only. An array cell whose
+    text is printed twice keeps the existing array behaviour."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Code:", "l": [100, 300, 160, 320]},
+            {"t": "X9", "l": [170, 300, 200, 320]},
+            {"t": "X9", "l": [600, 700, 630, 720]},
+        ],
+    )
+    phase1 = {"items": [{"code": {"text": "X9", "locations": [{"page_number": 1}]}}]}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.stats.repeated_value_picks == 0
+
+
+def test_same_text_field_with_its_own_free_occurrence_is_not_shared(
+    workspace: Workspace,
+) -> None:
+    """Start and end dates with the same value, each printed next to its
+    own label: each field gets its own occurrence, not a shared one."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Start:", "l": [100, 300, 160, 320]},
+            {"t": "05/01/2024", "l": [170, 300, 280, 320]},
+            {"t": "End:", "l": [100, 600, 150, 620]},
+            {"t": "05/01/2024", "l": [170, 600, 280, 620]},
+        ],
+    )
+    phase1 = {
+        "StartDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+        "EndDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "StartDate") == [170, 300, 280, 320]
+    assert _box(result, "EndDate") == [170, 600, 280, 620]
+    assert result.stats.shared_value_matches == 0
+
+
+def test_same_text_field_does_not_share_when_owners_disagree(workspace: Workspace) -> None:
+    """Two matched fields hold two different occurrences of the same text.
+    A third field with that text has no single span to share, so it stays
+    for phase 3."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Start:", "l": [100, 300, 160, 320]},
+            {"t": "05/01/2024", "l": [170, 300, 280, 320]},
+            {"t": "End:", "l": [100, 600, 150, 620]},
+            {"t": "05/01/2024", "l": [170, 600, 280, 620]},
+        ],
+    )
+    phase1 = {
+        "StartDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+        "EndDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+        "LossDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.values["LossDate"]["locations"] == [{"page_number": 1}]
+    assert result.stats.shared_value_matches == 0
+
+
+def test_same_text_field_with_free_occurrences_does_not_borrow_a_span(
+    workspace: Workspace,
+) -> None:
+    """A field may share a same-text span only when every occurrence of
+    its own is claimed. Here the second field still has two free,
+    unlabelled occurrences: it stays for phase 3 instead of borrowing the
+    first field's box."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Pages:", "l": [100, 200, 170, 220]},
+            {"t": "12", "l": [180, 200, 210, 220]},
+            {"t": "12", "l": [500, 400, 530, 420]},
+            {"t": "12", "l": [500, 700, 530, 720]},
+        ],
+    )
+    phase1 = {
+        "Pages": {"text": "12", "locations": [{"page_number": 1}]},
+        "Count": {"text": "12", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "Pages") == [180, 200, 210, 220]
+    assert result.values["Count"]["locations"] == [{"page_number": 1}]
+    assert result.stats.shared_value_matches == 0

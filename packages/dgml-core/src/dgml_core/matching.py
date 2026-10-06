@@ -18,6 +18,18 @@ module is the first non-LLM pass at assigning bboxes: for each
 ``(leaf, page)`` pair, find contiguous spans of OCR words on the page whose
 joined text matches the value, and commit the match when it's unambiguous.
 
+**Repeated top-level values.** A field outside any array (a patient
+name, an order number) is often printed several times on its page — in a
+running header, a fax banner, and once in the body. Every occurrence is
+the same text, so the row and column passes (which need array peers)
+cannot choose, and the value used to go to the paid phase-3 LLM call. A
+last-resort pass picks one occurrence when the page gives positive
+evidence: the field-name words printed as a label next to exactly one
+occurrence, or exactly one occurrence outside the page's header/footer
+bands. With no such evidence the value still goes to phase 3. A field
+whose only occurrence is already held by another top-level field with
+the same text (start date == end date) shares that occurrence.
+
 **Disambiguation by row context.** When a leaf's text has multiple
 candidate spans on the page (a date that appears in several columns of a
 ledger row, say), look at already-matched siblings in the same direct
@@ -116,6 +128,11 @@ class MatchStats:
     unmatched_locations: int = 0  # entries left for phase 3
     total_locations: int = 0
     duration_s: float = 0.0
+    # Subsets of ``matched_locations`` resolved by the repeated top-level
+    # value passes (see :func:`_disambiguate_repeated_scalar` and
+    # :func:`_share_scalar_same_text`).
+    repeated_value_picks: int = 0
+    shared_value_matches: int = 0
 
 
 @dataclass
@@ -310,6 +327,11 @@ class _Task:
     candidates: list[tuple[int, int]] = field(default_factory=list)
     matched_locations: list[dict[str, Any]] | None = None
     matched_span: tuple[int, int] | None = None
+    # False when ``candidates`` came from the fuzzy fallback. The repeated
+    # top-level value pass only picks among exact renderings of the value.
+    exact_candidates: bool = True
+    # Name of the last-resort pass that resolved the task, for stats.
+    resolved_by: str | None = None
 
 
 def run_phase2_matching(
@@ -372,6 +394,7 @@ def run_phase2_matching(
         t.candidates = _find_spans(t.text, words)
         if not t.candidates:
             t.candidates = _find_fuzzy_spans(t.text, words)
+            t.exact_candidates = False
 
     # Run the disambiguation loop, then a row-coherence audit; if the
     # audit demotes any off-row match, re-run disambiguation with the
@@ -444,6 +467,16 @@ def run_phase2_matching(
             unmatched_locations=len(unmatched),
             total_locations=len(tasks),
             duration_s=round(time.monotonic() - started, 4),
+            repeated_value_picks=sum(
+                1
+                for t in tasks
+                if t.matched_locations is not None and t.resolved_by == _RESOLVED_REPEATED_PICK
+            ),
+            shared_value_matches=sum(
+                1
+                for t in tasks
+                if t.matched_locations is not None and t.resolved_by == _RESOLVED_SHARED_TEXT
+            ),
         ),
     )
 
@@ -1310,6 +1343,266 @@ def _disambiguate_share_duplicate_text(
     return progress
 
 
+# ---- Repeated top-level values --------------------------------------------
+#
+# The row, column, layout and reading-order passes all need array peers. A
+# top-level field (no array index in its path) has none, so when its value
+# is printed more than once on the page — a patient name in a running
+# header and in the body, an order number in a fax banner and in a form box
+# — every pass above declines and the value goes to phase 3, which costs a
+# vision LLM call for the page. The two passes below handle that case in
+# code. Both are conservative: they only run after every other pass has
+# converged, they only consider exact (not fuzzy) renderings of the value,
+# and when the page gives no positive evidence the value still goes to
+# phase 3.
+
+_RESOLVED_REPEATED_PICK = "repeated_pick"
+_RESOLVED_SHARED_TEXT = "shared_text"
+
+# Header/footer bands, in normalized 0-1000 page units. Running headers,
+# fax transmission banners ("FROM ... TO ... PAGE 3/12") and page footers
+# repeat document-level values on every page; the body occurrence is the
+# one a reader would point at. 6% of the page height at the top and 5% at
+# the bottom hold one or two banner lines on letter/A4 scans without
+# reaching the first body line. Chosen from a sweep of 0-10% on a 30-file
+# medical-records set: 5-8% agreed best with the phase-3 boxes, 0% and
+# 10% were worse.
+_PAGE_HEADER_BAND = 60.0
+_PAGE_FOOTER_BAND = 50.0
+
+# Label context of a candidate: the nearest words left of it on the same
+# visual line, and the nearest words in the lines just above it (a label
+# printed over its box). Counts are words; distances are multiples of the
+# candidate's own line height so they scale with font size.
+_LABEL_LEFT_WORDS = 6
+_LABEL_ABOVE_WORDS = 8
+_LABEL_ABOVE_LINE_HEIGHTS = 2.0
+# A word is on the candidate's line when its y-center is within this share
+# of the candidate's height from the candidate's y-center.
+_LABEL_SAME_LINE_TOLERANCE = 0.6
+# A field-name token matches a label word that starts with its first N
+# letters ("remittance" ~ "Remit.", "patient" ~ "Patient's"). Tokens
+# shorter than N must match exactly.
+_LABEL_PREFIX_LEN = 4
+# Field-name parts that say nothing about the label.
+_LABEL_STOPWORDS = frozenset({"of", "the", "a", "an", "and", "or", "to", "for", "in", "on", "by"})
+# Common printed abbreviations of field-name parts. A field-name token
+# matches any of its alternatives.
+_LABEL_SYNONYMS: dict[str, frozenset[str]] = {
+    "number": frozenset({"number", "no", "num", "nbr", "#"}),
+    "date": frozenset({"date", "dt"}),
+    "dob": frozenset({"dob", "birth", "born", "birthdate"}),
+    "birth": frozenset({"birth", "dob", "birthdate"}),
+    "ssn": frozenset({"ssn", "social", "security", "ss"}),
+}
+_FIELD_NAME_PART_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+_LABEL_WORD_SPLIT_RE = re.compile(r"[^0-9A-Za-z#]+")
+
+
+def _field_name_tokens(path: LeafPath) -> list[frozenset[str]]:
+    """The field name (last string segment of ``path``) split into
+    lower-case words, each with its printed alternatives.
+    ``PatientDOB`` → ``[{patient}, {dob, birth, ...}]``;
+    ``date_of_service`` → ``[{date, dt}, {service}]``."""
+    name = next((seg for seg in reversed(path) if isinstance(seg, str)), "")
+    out: list[frozenset[str]] = []
+    for part in _FIELD_NAME_PART_RE.findall(name):
+        low = part.lower()
+        if low in _LABEL_STOPWORDS:
+            continue
+        out.append(_LABEL_SYNONYMS.get(low, frozenset({low})))
+    return out
+
+
+def _label_context_words(span: tuple[int, int], words: list[_Word]) -> list[_Word]:
+    """Words that could be a printed label for the candidate ``span``: the
+    nearest words to its left on the same line, and the nearest words in
+    the lines just above it that overlap it horizontally."""
+    span_words = words[span[0] : span[1]]
+    if not span_words:
+        return []
+    top = min(w.top for w in span_words)
+    bottom = max(w.bottom for w in span_words)
+    left = min(w.left for w in span_words)
+    right = max(w.right for w in span_words)
+    height = max(1, bottom - top)
+    y_center = (top + bottom) / 2
+    in_span = set(range(span[0], span[1]))
+    same_line = [
+        w
+        for i, w in enumerate(words)
+        if i not in in_span
+        and abs(w.y_center - y_center) <= height * _LABEL_SAME_LINE_TOLERANCE
+        and w.right <= left
+    ]
+    same_line.sort(key=lambda w: left - w.right)
+    above = [
+        w
+        for i, w in enumerate(words)
+        if i not in in_span
+        and w.y_center < top
+        and top - w.y_center <= height * _LABEL_ABOVE_LINE_HEIGHTS
+        and w.left < right
+        and w.right > left
+    ]
+    above.sort(key=lambda w: top - w.y_center)
+    return same_line[:_LABEL_LEFT_WORDS] + above[:_LABEL_ABOVE_WORDS]
+
+
+def _label_score(path: LeafPath, span: tuple[int, int], words: list[_Word]) -> int:
+    """Number of field-name tokens of ``path`` printed in the label context
+    of ``span``. ``0`` means no label evidence."""
+    context: set[str] = set()
+    for w in _label_context_words(span, words):
+        context.update(p.lower() for p in _LABEL_WORD_SPLIT_RE.split(w.text) if p)
+    score = 0
+    for alternatives in _field_name_tokens(path):
+        if any(
+            c == a or (len(a) >= _LABEL_PREFIX_LEN and c.startswith(a[:_LABEL_PREFIX_LEN]))
+            for a in alternatives
+            for c in context
+        ):
+            score += 1
+    return score
+
+
+def _in_page_margin(span: tuple[int, int], words: list[_Word], dims: _PageDims) -> bool:
+    """True when the candidate's y-center sits in the header or footer band."""
+    y = _candidate_y_center_norm(span, words, dims)
+    if y is None:
+        return False
+    return y < _PAGE_HEADER_BAND or y > 1000.0 - _PAGE_FOOTER_BAND
+
+
+def _array_row_bands_by_page(
+    tasks: list[_Task],
+    word_cache: dict[int, tuple[list[_Word], _PageDims]],
+) -> dict[int, list[tuple[float, float]]]:
+    """Every matched array row's y-band, grouped by page."""
+    out: dict[int, list[tuple[float, float]]] = {}
+    for (_, page), band in _build_row_bands(tasks, word_cache).items():
+        out.setdefault(page, []).append(band)
+    return out
+
+
+def _disambiguate_repeated_scalar(
+    tasks: list[_Task],
+    word_cache: dict[int, tuple[list[_Word], _PageDims]],
+    claimed_spans: dict[int, set[tuple[int, int]]],
+) -> bool:
+    """Pick one occurrence of a top-level value printed several times on
+    its page. Resolves at most one task per call (the caller loops, so
+    the next call sees the new claim). Returns True iff a task resolved.
+
+    Every candidate is an exact rendering of the value, so any of them
+    is a correct place for the text; the risk is choosing an occurrence
+    that plays another role (the same date printed as a different field).
+    So the pass only uses candidates that are not claimed and not on a
+    line that holds a matched array row (a table cell is another field's
+    value), and it commits only on positive evidence:
+
+    1. Body: candidates in the header/footer bands (running headers, fax
+       banners) are dropped when at least one candidate is outside them.
+       If exactly one candidate remains, it is chosen.
+    2. Label: otherwise, exactly one remaining candidate has the most
+       field-name words in its label context (``PatientDOB`` next to
+       "DOB:"), and it has at least one.
+
+    Otherwise the task stays unmatched for phase 3."""
+    row_bands: dict[int, list[tuple[float, float]]] | None = None
+    for t in tasks:
+        if t.matched_locations is not None or not t.exact_candidates:
+            continue
+        if len(t.candidates) < 2 or _row_path(t.path) is not None:
+            continue
+        if row_bands is None:
+            row_bands = _array_row_bands_by_page(tasks, word_cache)
+        words, dims = word_cache[t.page_number]
+        slack = _row_band_slack_norm(words, dims)
+        page_claimed = claimed_spans.get(t.page_number, set())
+        bands = row_bands.get(t.page_number, [])
+        live = [
+            c
+            for c in t.candidates
+            if c not in page_claimed
+            and not any(_candidate_in_row_band(c, words, dims, b, slack) for b in bands)
+        ]
+        if len(live) < 2:
+            # 0: nothing safe left. 1: the main loop's single-candidate
+            # rule already had its chance; a candidate dropped here only
+            # for sitting on a table row must not be re-admitted.
+            continue
+        # Header/footer copies are dropped first: a running header often
+        # carries its own label ("Patient: ...") and would otherwise win
+        # the label vote over the body occurrence.
+        pool = [c for c in live if not _in_page_margin(c, words, dims)] or live
+        chosen: tuple[int, int] | None = None
+        if len(pool) == 1:
+            chosen = pool[0]
+        else:
+            scores = {c: _label_score(t.path, c, words) for c in pool}
+            best = max(scores.values())
+            top_scored = [c for c in pool if scores[c] == best]
+            if best > 0 and len(top_scored) == 1:
+                chosen = top_scored[0]
+        if chosen is None:
+            continue
+        t.matched_locations = _span_to_locations(chosen, words, dims, t.page_number)
+        t.matched_span = chosen
+        t.resolved_by = _RESOLVED_REPEATED_PICK
+        claimed_spans.setdefault(t.page_number, set()).add(chosen)
+        return True
+    return False
+
+
+def _share_scalar_same_text(
+    tasks: list[_Task],
+    claimed_spans: dict[int, set[tuple[int, int]]],
+) -> bool:
+    """Let two top-level fields with the same text share one rendering.
+
+    A record whose start date equals its end date prints the date once
+    (or prints it once per role, but one rendering went to another
+    field). The first field claims the span and the claimed-span rule
+    leaves the second one unmatched. This pass lets an unmatched
+    top-level task adopt the span of a matched *top-level* task with
+    exactly the same text on the same page, when every one of its own
+    exact candidates is already claimed and all the same-text owners
+    hold one single span (no choice to make). Array tasks are neither
+    adopters nor owners: their row logic is handled by
+    :func:`_disambiguate_share_duplicate_text`. Returns True iff any task
+    resolved."""
+    progress = False
+    for t in tasks:
+        if t.matched_locations is not None or not t.candidates or not t.exact_candidates:
+            continue
+        if _row_path(t.path) is not None:
+            continue
+        page_claimed = claimed_spans.get(t.page_number, set())
+        if any(c not in page_claimed for c in t.candidates):
+            continue
+        owners = [
+            m
+            for m in tasks
+            if m is not t
+            and m.matched_span is not None
+            and m.matched_locations is not None
+            and m.page_number == t.page_number
+            and m.text == t.text
+            and _row_path(m.path) is None
+            and m.matched_span in t.candidates
+        ]
+        if len({m.matched_span for m in owners}) != 1:
+            continue
+        owner = owners[0]
+        assert owner.matched_locations is not None
+        t.matched_locations = [dict(loc) for loc in owner.matched_locations]
+        t.matched_span = owner.matched_span
+        t.resolved_by = _RESOLVED_SHARED_TEXT
+        progress = True
+    return progress
+
+
 # ---- Phase-2 outer loop + row-coherence audit -----------------------------
 #
 # The audit pass catches matches that slipped through the up-front
@@ -1431,6 +1724,17 @@ def _run_disambiguation_loop(
             # rendered once but stored twice in the schema) shares a
             # single page span — both entries ground to the same place.
             if _disambiguate_share_duplicate_text(tasks, word_cache):
+                progress = True
+        if not progress:
+            # Top-level (non-array) fields: a value whose only rendering is
+            # held by another top-level field with the same text.
+            if _share_scalar_same_text(tasks, claimed_spans):
+                progress = True
+        if not progress:
+            # Top-level fields printed several times on the page (running
+            # header, fax banner, body). Picks one task per call so the
+            # next iteration sees the new claim.
+            if _disambiguate_repeated_scalar(tasks, word_cache, claimed_spans):
                 progress = True
 
 
