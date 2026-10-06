@@ -1228,6 +1228,18 @@ def test_max_wait_is_the_completion_window() -> None:
     assert _quiet_backend().max_wait_s == 24 * 3600
 
 
+def test_a_deadline_cancel_waits_two_openai_sweeps_to_settle() -> None:
+    """OpenAI settles a cancel on ~5-minute sweeps and keeps processing while
+    `cancelling`, so the --batch-deadline settle wait covers two sweeps."""
+    from dgml_core.batch.deadline import cancel_settle_s
+    from dgml_core.batch.executor import POLL_MARGIN_S
+
+    assert cancel_settle_s(ob.OpenAIBatchBackend) == 660.0
+    ex = BatchExecutor(_quiet_backend())
+    assert ex.cancel_settle_s == 660.0
+    assert ex.max_poll_s == 24 * 3600 + POLL_MARGIN_S
+
+
 # ---- registry ------------------------------------------------------------------
 
 
