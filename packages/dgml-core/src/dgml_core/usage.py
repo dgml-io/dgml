@@ -31,6 +31,9 @@ file.
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -47,6 +50,10 @@ OPERATION_STYLE_ANNOTATE = "style_annotate"
 OPERATION_TRANSCRIBE = "transcribe"
 OPERATION_LABEL = "label"
 OPERATION_LINKS = "links"
+#: A response a batch job paid for that no run of it ever used (see
+#: :mod:`dgml_core.batch.jobs`): written once, when the job completes, with
+#: ``context`` ``{"unused": true, "batch_job": <job id>}``.
+OPERATION_BATCH_UNUSED = "batch_unused"
 
 OUTCOME_OK = "ok"
 OUTCOME_ERROR = "error"
@@ -57,6 +64,12 @@ OUTCOME_ERROR = "error"
 # batching can be compared from ``usage.jsonl`` alone.
 TIER_STANDARD = "standard"
 TIER_BATCH = "batch"
+
+#: Marker key on a response's ``_hidden_params``: the response was replayed
+#: from a batch job's store and its usage is already on a row an earlier run
+#: wrote, so :func:`extract_cost_and_tokens` reports it as zero. Every response
+#: is billed exactly once (see :mod:`dgml_core.batch.jobs`).
+BILLED_MARKER = "dgml_billed"
 
 
 @dataclass
@@ -102,13 +115,62 @@ def record_usage(workspace: Workspace, event: UsageEvent) -> None:
     line). A write failure here is swallowed: cost telemetry must never break
     the operation it's reporting on. Worst case the row is missing from the log;
     the user's PDF is still ingested / classified / extracted.
+
+    While :func:`buffered_usage` is active the row is held instead of written.
     """
+    with _BUFFER_LOCK:
+        if _BUFFER is not None:
+            _BUFFER.append((workspace, event))
+            return
     try:
         workspace.docs.append_doc(layout.Collection.USAGE, event.to_json())
     except Exception:
         # Intentional broad catch: never let logging take down the
         # caller. The usage log is best-effort telemetry.
         pass
+
+
+# ---- deferred rows (batch job mode) ------------------------------------------
+#
+# A batch job run that ends *pending* must leave no usage rows: the run that
+# completes the job replays every response and writes the rows a blocking run
+# would have. So while a job session is active, rows are held here and then
+# either written (the run finished, or failed like any run) or dropped (it
+# paused). Process-global rather than a context variable on purpose: stages fan
+# work out on thread pools, and a row recorded on a worker must land here too.
+_BUFFER: list[tuple[Workspace, UsageEvent]] | None = None
+_BUFFER_LOCK = threading.Lock()
+
+
+@contextmanager
+def buffered_usage() -> Iterator[list[tuple[Workspace, UsageEvent]]]:
+    """Hold every :func:`record_usage` row until the caller decides.
+
+    Yields the buffer. The caller writes it with :func:`flush_usage`; whatever
+    is still held when the block exits is dropped. Not reentrant.
+    """
+    global _BUFFER
+    with _BUFFER_LOCK:
+        if _BUFFER is not None:
+            raise RuntimeError("usage rows are already being buffered")
+        _BUFFER = []
+        held = _BUFFER
+    try:
+        yield held
+    finally:
+        with _BUFFER_LOCK:
+            _BUFFER = None
+
+
+def flush_usage(held: list[tuple[Workspace, UsageEvent]]) -> None:
+    """Write the *held* rows, in the order they were recorded, and empty it."""
+    rows = list(held)
+    held.clear()
+    for workspace, event in rows:
+        try:
+            workspace.docs.append_doc(layout.Collection.USAGE, event.to_json())
+        except Exception:
+            pass  # best-effort telemetry, as in record_usage
 
 
 def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
@@ -147,6 +209,10 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
     )
     explicit_read = False
     hidden = getattr(response, "_hidden_params", None)
+    if isinstance(hidden, dict) and hidden.get(BILLED_MARKER):
+        # Replayed from a batch job; an earlier run's row already carries it.
+        out.update(cost_usd=0.0, prompt_tokens=0, completion_tokens=0, total_tokens=0)
+        return out
     if isinstance(hidden, dict):
         cost = hidden.get("response_cost")
         if isinstance(cost, int | float) and not isinstance(cost, bool):
@@ -250,11 +316,14 @@ def with_tier(usage: dict[str, Any], response: Any, default: str | None) -> dict
 
     The tier is the response's :data:`TIER_MARKER`, else *default* (the
     driving config's tier); ``None`` leaves the response untiered (resolved to
-    the row's own tier when the row is written). *usage* itself is not
-    modified.
+    the row's own tier when the row is written). A response already billed by
+    an earlier run (:data:`BILLED_MARKER`) contributes zero and no tier, so it
+    never adds a zero-cost part to a scope. *usage* itself is not modified.
     """
     hidden = getattr(response, "_hidden_params", None)
     if isinstance(hidden, dict):
+        if hidden.get(BILLED_MARKER):
+            return usage
         marker = hidden.get(TIER_MARKER)
         if isinstance(marker, str) and marker:
             default = marker

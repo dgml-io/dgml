@@ -31,6 +31,12 @@ backend whose optional dependency is not installed, is an error
 (:class:`dgml_core.errors.BatchUnavailable`) raised when the backend is
 resolved — before any request is sent. It never silently falls back to a
 full-price synchronous call.
+
+Job management — :func:`job_status`, :func:`resume_would_wait`,
+:func:`cancel_job`, :func:`delete_job`, :func:`prune_jobs`,
+:func:`unlock_job` and :func:`list_job_summaries`, the library behind ``dgml
+batch`` — is re-exported lazily from ``dgml_core``; everything else here is
+internal for now.
 """
 
 from __future__ import annotations
@@ -44,6 +50,24 @@ from dgml_core.batch.compat import SUPPORTED_LITELLM, IncompatibleDependency
 from dgml_core.batch.driver import Unit, UnitOutcome, run_stage, run_stage_sync
 from dgml_core.batch.executor import TIER_MARKER, BatchExecutor, WaveStats, make_executor
 from dgml_core.batch.fake import FakeBackend, fake_model_response
+from dgml_core.batch.jobs import (
+    BatchJobStore,
+    JobSession,
+    Manifest,
+    ReplayExecutor,
+    active_session,
+    cancel_job,
+    delete_job,
+    job_status,
+    job_summary,
+    list_job_summaries,
+    list_jobs,
+    prune_jobs,
+    request_digest,
+    resume_would_wait,
+    start_session,
+    unlock_job,
+)
 from dgml_core.batch.registry import (
     AvailabilityProbe,
     BackendConfig,
@@ -83,6 +107,7 @@ __all__ = [
     "BatchExecutor",
     "BatchItemError",
     "BatchJob",
+    "BatchJobStore",
     "BatchNotFound",
     "BatchRejected",
     "BatchRequest",
@@ -93,21 +118,36 @@ __all__ = [
     "FakeBackend",
     "IncompatibleDependency",
     "ItemErrorKind",
+    "JobSession",
+    "Manifest",
+    "ReplayExecutor",
     "RequestProbe",
     "StageRequest",
     "Unit",
     "UnitOutcome",
     "WaveStats",
+    "active_session",
     "assert_batchable",
+    "cancel_job",
+    "delete_job",
     "fake_model_response",
+    "job_status",
+    "job_summary",
+    "list_job_summaries",
+    "list_jobs",
     "make_executor",
     "plan_batches",
     "provider_of",
+    "prune_jobs",
     "register_backend",
     "registered_providers",
+    "request_digest",
     "request_size",
     "resolve_backend",
+    "resume_would_wait",
     "run_stage",
     "run_stage_sync",
+    "start_session",
+    "unlock_job",
     "unregister_backend",
 ]

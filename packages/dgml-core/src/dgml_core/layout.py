@@ -52,6 +52,11 @@ DOCSETS_DIR = "docsets"
 DOCSET_FILES_DIR = "files"  # the per-docset pair dir: docsets/<did>/files/<fid>/
 PAGE_IMAGES_DIR = "page_images"
 PAGE_TEXT_DIR = "page_text"
+# Batch job state (``--batch --no-wait`` / ``dgml batch``): one directory per
+# job holding its manifest, the responses it has received, and the inputs it
+# rewinds on every resumed run. See dgml_core.batch.jobs.
+BATCHES_DIR = "batches"
+BATCH_JOB_MANIFEST = "job.json"
 
 # Workspace-internal scratch, never part of the blob namespace: the clustering
 # embedding cache and ``staged_write``'s staging area both live here.
@@ -258,6 +263,48 @@ def generation_cache_prefix(docset_id: str) -> str:
     return f"{docset_prefix(docset_id)}{GENERATION_CACHE_DIR}/"
 
 
+def batch_jobs_prefix() -> str:
+    """Every batch job in the workspace: ``batches/``."""
+    return f"{BATCHES_DIR}/"
+
+
+def batch_job_prefix(job_id: str) -> str:
+    """One batch job's directory: ``batches/<job_id>/``."""
+    return f"{BATCHES_DIR}/{job_id}/"
+
+
+def batch_job_manifest_key(job_id: str) -> str:
+    """A batch job's manifest: ``batches/<job_id>/job.json``."""
+    return f"{batch_job_prefix(job_id)}{BATCH_JOB_MANIFEST}"
+
+
+def batch_job_lease_key(job_id: str) -> str:
+    """The job's lease (who is running it): ``batches/<job_id>/lease.json``."""
+    return f"{batch_job_prefix(job_id)}lease.json"
+
+
+def batch_responses_prefix(job_id: str) -> str:
+    """Every stored response of a job: ``batches/<job_id>/responses/``."""
+    return f"{batch_job_prefix(job_id)}responses/"
+
+
+def batch_inputs_prefix(job_id: str) -> str:
+    """Every rewound input of a job: ``batches/<job_id>/inputs/``."""
+    return f"{batch_job_prefix(job_id)}inputs/"
+
+
+def batch_response_key(job_id: str, key: str) -> str:
+    """A response the job received: ``batches/<job_id>/responses/<key>.json``,
+    where *key* is ``<request digest>-<occurrence>``."""
+    return f"{batch_job_prefix(job_id)}responses/{key}.json"
+
+
+def batch_input_key(job_id: str, name: str) -> str:
+    """An input a command rewinds on every resumed run of the job:
+    ``batches/<job_id>/inputs/<name>``."""
+    return f"{batch_job_prefix(job_id)}inputs/{name}"
+
+
 # -------------------------------------------------------- document placement
 
 
@@ -324,6 +371,8 @@ _BLOB_RULES: tuple[re.Pattern[str], ...] = (
     re.compile(rf"^{DOCSETS_DIR}/{_SEG}/{re.escape(COVERAGE_REPORT_FILE)}$"),
     re.compile(rf"^{DOCSETS_DIR}/{_SEG}/{GENERATION_CACHE_DIR}/.+$"),
     re.compile(rf"^{DOCSETS_DIR}/{_SEG}/{DOCSET_FILES_DIR}/{_SEG}/{_SEG}$"),
+    # Batch job state: the manifest, received responses, rewound inputs.
+    re.compile(rf"^{BATCHES_DIR}/{_SEG}/.+$"),
     # The stored original / converted PDF sits directly in the file directory,
     # alongside its manifest — hence the reserved-name exclusion.
     re.compile(rf"^{FILES_DIR}/{_SEG}/{_SEG}$"),

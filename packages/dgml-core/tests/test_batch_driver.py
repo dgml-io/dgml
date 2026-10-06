@@ -33,7 +33,7 @@ from dgml_core.batch import (
     run_stage_sync,
 )
 from dgml_core.batch.driver import CUSTOM_ID_PATTERN
-from dgml_core.errors import BatchExecutionFailed, EmptyModelResponse
+from dgml_core.errors import BatchExecutionFailed, BatchPending, EmptyModelResponse
 from dgml_core.storage import Workspace
 from dgml_core.usage import TIER_BATCH, TIER_STANDARD, read_events
 
@@ -643,3 +643,16 @@ def test_unit_failing_before_its_first_request_still_writes_an_error_row(
     assert isinstance(out["broken"].error, ValueError)
     outcomes = sorted(r["outcome"] for r in read_events(ws))
     assert outcomes == ["error", "ok"]
+
+
+def test_a_paused_job_still_propagates_out_of_the_stage() -> None:
+    cfg = _cfg()
+
+    class Pausing(FakeBackend):
+        def poll(self, job: Any) -> Any:
+            raise BatchPending("bj_x", submitted_batches=1, requests_in_flight=2)
+
+    units = [_call_unit("a", cfg), _call_unit("b", cfg)]
+    with pytest.raises(BatchPending):
+        run_stage(units, _executor(Pausing({})))
+    assert all(inspect.getgeneratorstate(u.steps) == inspect.GEN_CLOSED for u in units)

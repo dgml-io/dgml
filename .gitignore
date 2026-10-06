@@ -220,6 +220,10 @@ __marimo__/
 
 # CLI generated test workspace
 **/dgml-workspace/
+# Batch job state (`batches/bj_<id>/`: stored model responses, leases) that
+# `--batch` writes into a workspace. Ignored wherever that workspace lives, so
+# a workspace created inside the checkout can never commit it.
+**/batches/bj_*/
 
 # OS-generated files
 .DS_Store
