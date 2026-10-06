@@ -67,6 +67,7 @@ from .test_cli_batch_schema import _schema_reply
 _FIDS = [f"fgen0000000{i}" for i in range(len(_PAGES))]
 # The last (longest: 3 pages) document is the schema sample.
 _SAMPLE = _FIDS[-1]
+_DOCS = len(_PAGES)  # batch labeling: one wave per document (open vocabulary)
 
 
 def _answer(kwargs: dict[str, Any]) -> Any:
@@ -241,22 +242,24 @@ def test_sync_run_equals_the_three_commands_in_sequence(
     _assert_same_state(_state(ws_r, did_r), _state(ws_c, did_c))
 
 
-@pytest.mark.parametrize("closed", [False, True], ids=["open-vocab", "closed-vocab"])
+@pytest.mark.parametrize("mode", ["per-document", "sync", "all-at-once"])
 def test_batch_run_equals_sync_run_except_tiers(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     provider: _Provider,  # noqa: F811
     pdf_stubs: None,  # noqa: F811
-    closed: bool,
+    mode: str,
 ) -> None:
-    """Open vocabulary: roster planning batches, labeling stays synchronous.
-    A closed vocabulary (`--schema-path`, passed through to `docset generate`)
-    labels every document in one batch wave instead."""
+    """Open vocabulary: labeling batches one document per wave by default;
+    `--no-batch-label` (passed through to `docset generate`) keeps it
+    synchronous. A closed vocabulary (`--schema-path`, passed through too)
+    labels every document in one batch wave."""
     extra: list[str] = []
-    if closed:
+    if mode == "all-at-once":
         vocab = tmp_path / "vocab.json"
         vocab.write_text(json.dumps({"Greeting": "a greeting line"}), encoding="utf-8")
         extra = ["--schema-path", str(vocab)]
+    batch_only = ["--no-batch-label"] if mode == "sync" else []
     ws_s, did_s = _seed(tmp_path / "sync", capsys)
     with patch("litellm.completion", side_effect=_sync):
         assert main(_run_argv(ws_s, did_s, "--schema-from", _SAMPLE, *extra)) == 0
@@ -265,7 +268,9 @@ def test_batch_run_equals_sync_run_except_tiers(
     ws_b, did_b = _seed(tmp_path / "batch", capsys)
     _install(provider, polls=0)
     with patch("litellm.completion", side_effect=_sync):
-        argv = _run_argv(ws_b, did_b, "--schema-from", _SAMPLE, "--batch", *_POLL, *extra)
+        argv = _run_argv(
+            ws_b, did_b, "--schema-from", _SAMPLE, "--batch", *_POLL, *extra, *batch_only
+        )
         assert main(argv) == 0
     batch = _read_stdout(capsys)
 
@@ -277,18 +282,21 @@ def test_batch_run_equals_sync_run_except_tiers(
     for r in _state(ws_b, did_b)["rows"]:
         tiers.setdefault(r["operation"], set()).add(r["tier"])
     assert tiers["schema_generate"] == tiers["transcribe"] == tiers["extract_values"] == {"batch"}
-    assert tiers["label"] == ({"batch"} if closed else {"batch", "standard"})
+    # Roster planning batched; the labeling calls too, unless --no-batch-label.
+    assert tiers["label"] == ({"batch", "standard"} if mode == "sync" else {"batch"})
     label_stage = batch["steps"]["generate"]["batch"]["stages"]["label"]
-    assert label_stage["mode"] == ("all-at-once" if closed else "sync")
+    assert label_stage["mode"] == mode
 
     summary = batch["batch"]
     assert summary["enabled"] is True
     assert list(summary["steps"]) == ["schema", "generate", "extract"]
     assert summary["steps"]["schema"]["waves"] == 1
     # Transcription: one wave per page window of the 3-page document; then
-    # roster planning's draft + refine (open) or one labeling wave (closed);
+    # roster planning's draft + refine and one labeling wave per document
+    # (open; none under --no-batch-label) or one labeling wave (closed);
     # links: propose + verify.
-    generate_waves = 3 + (1 if closed else 2) + 2
+    label_waves = {"per-document": 2 + _DOCS, "sync": 2, "all-at-once": 1}[mode]
+    generate_waves = 3 + label_waves + 2
     assert summary["steps"]["generate"]["waves"] == generate_waves
     assert summary["steps"]["extract"]["waves"] == 1
     assert summary["waves"] == 1 + generate_waves + 1
@@ -328,6 +336,8 @@ def test_no_wait_job_spans_every_step_and_matches_a_blocking_run(
         pending = _read_stdout(capsys)
         assert pending["batch_job"]["command"] == "docset run"
         job_id = pending["batch_job"]["job_id"]
+        # The batch-label choice resolved from config is pinned on the job.
+        assert list_jobs(Workspace(root=ws_j))[0].argv[-1] == "--batch-label"
         # A paused run wrote nothing but job state.
         assert DocSetStore(Workspace(root=ws_j)).has_schema(did_j) is False
         for _ in range(20):
@@ -342,9 +352,10 @@ def test_no_wait_job_spans_every_step_and_matches_a_blocking_run(
             raise AssertionError("the job never completed")
 
     # One pause per wave: schema, 3 transcription windows, roster planning's
-    # draft and refine, 2 link waves, extraction.
-    assert steps_seen == ["schema"] + ["generate"] * 7 + ["extract"]
-    assert len(provider.backends["anthropic"].submitted) == 1 + 3 + 2 + 2  # once each
+    # draft and refine, one labeling wave per document, 2 link waves,
+    # extraction.
+    assert steps_seen == ["schema"] + ["generate"] * (7 + _DOCS) + ["extract"]
+    assert len(provider.backends["anthropic"].submitted) == 1 + 3 + 2 + _DOCS + 2  # once each
     assert len(provider.backends["gemini"].submitted) == 1
 
     for name in ("schema", "generate", "extract"):
@@ -595,8 +606,22 @@ def test_run_pass_through_matches_the_step_parsers() -> None:
             boolean_optional = isinstance(action, argparse.BooleanOptionalAction)
             assert boolean_optional == (flag in _RUN_BOOLEAN_OPTIONAL), (step, flag)
             assert isinstance(run_flags[dest], argparse.BooleanOptionalAction) == boolean_optional
-    # The pairs are a subset of the table (none today; F1 adds --batch-label).
+    assert _RUN_BOOLEAN_OPTIONAL == {"--batch-label"}
     assert _RUN_BOOLEAN_OPTIONAL <= {f for f, _d, _v, _o in _RUN_PASSTHROUGH}
+
+
+def test_run_passes_the_batch_label_choice_through_to_generate() -> None:
+    """`docset run --no-batch-label` reaches `docset generate` as
+    `--no-batch-label`, `--batch-label` as itself, and neither when unset."""
+    root = _build_parser()
+    for extra, expected in (
+        ([], []),
+        (["--no-batch-label"], ["--no-batch-label"]),
+        (["--batch-label"], ["--batch-label"]),
+    ):
+        args = root.parse_args(["docset", "run", "ds", "--batch", *extra])
+        tokens = _run_step_argv(args, "generate")
+        assert [t for t in tokens if "batch-label" in t] == expected
 
 
 def test_run_step_argv_hands_each_step_only_its_own_options() -> None:
