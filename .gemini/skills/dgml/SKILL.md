@@ -150,6 +150,24 @@ payload=$(uv run dgml file add --workspace "$wid" /path/to/docs \
 jq -r '.results[] | "\(.classification.docset_name)\t\(.path)"' <<<"$payload"
 ```
 
+For a large ingest nobody is waiting on, add `--batch`: every file is
+added first, then the classifications go through the provider's batch API
+at about half price, and the auto-extraction of files landing in a DocSet
+with a schema is batched too. With `--auto-classify existing` all files
+classify in ONE wave. In the default mode they classify in order, ONE WAVE
+PER FILE (each file must be offered the DocSets created for the files
+before it), so a directory of N files takes N round trips of minutes to
+hours each — prefer `existing` for a big curated ingest. `--batch` works
+only on a directory with `--auto-classify` and only for Anthropic
+(`anthropic/…`) or OpenAI (`openai/…`) models; otherwise it fails before adding anything
+(`INVALID_ARGUMENT` / `BATCH_UNAVAILABLE`). The entries are the same as
+without it, plus a top-level `batch` block.
+
+```bash
+uv run dgml file add --workspace "$wid" /path/to/docs \
+  --recursive --on-conflict skip --auto-classify existing --batch | jq .batch
+```
+
 ⚠️ **Only use `existing` when you already know every file belongs in one
 of the workspace's DocSets.** The LLM is *required* to return a DocSet —
 it is offered no other action — so an off-type document is filed under
@@ -530,6 +548,120 @@ sees the previous window's tail). The calls are network-bound, so threads
 overlap the latency. Raise it on high-RPM paid tiers; set `1` to serialize
 if you hit 429s.
 
+**Batch mode (half price, slow).** For offline or bulk runs where nobody is
+waiting on the result, add `--batch`. It sends transcription, roster
+planning, concept descriptions, OCR image style (when `[style]` is enabled)
+and the semantic-link pass through the provider's batch API at half the token
+price; results can take up to 24 hours per wave, and a long document needs
+one wave per window. Labeling batches too: under a closed `--schema-path`
+vocabulary every document at once; under an open or `--extend-schema`
+vocabulary one document at a time, in the synchronous order, because each
+document is labeled against the tags the documents before it coined. That
+costs about one queue round trip per document, so pair a bulk open-vocabulary
+run with `--no-wait` (below). The output is the same as a synchronous run.
+Add `--no-batch-label` (or `batch_label = false` under `[generation]`) to
+label with ordinary synchronous calls when latency matters more than the
+labeling half of the bill; the payload's `batch.stages.label.mode` says which
+ran (`all-at-once`, `per-document` or `sync`). Only `anthropic/`, `gemini/`
+and `openai/` models have a batch backend; any other model, and an OpenAI
+model litellm serves through the Responses API (`gpt-5-pro`, `o3-pro`,
+`codex`; gpt-5.4+ for schema generation and extraction), fails fast with
+`BATCH_UNAVAILABLE`, naming the stage, before spending anything. The
+payload's `batch.stages` block reports what each stage did,
+including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report
+the saving without `--debug`.
+
+```bash
+uv run dgml docset generate "$ds" --batch --schema-path ./po-tags.json | jq .batch
+```
+
+Never use `--batch` on an interactive request: use it for nightly or bulk
+ingestion.
+
+**Don't hold a process open for a day: use job mode.** Add `--no-wait` to any
+`--batch` command (`docset generate`, `docset run`, `extraction extract`,
+`extraction generate-schema`, `file add <dir>`): it submits the wave and exits 0 with a
+`batch_job` payload. Check with `dgml batch status <job_id>` (read-only) and
+run `dgml batch resume <job_id>` only when it says `ready`; each resume
+replays what came back at no cost, collects open batches (never resubmits)
+and pauses on the next wave, until the command's normal payload comes back.
+A blocking `--batch` run that crashed is resumable the same way (`dgml batch
+list` shows its job). Stop resuming once status is `completed`.
+
+```bash
+job=$(uv run dgml docset generate "$ds" --batch --no-wait | jq -r .batch_job.job_id)
+uv run dgml batch status "$job" | jq -r .status   # pending | ready | completed | failed
+uv run dgml batch resume "$job"                   # when ready
+uv run dgml batch prune                           # drop finished jobs
+```
+
+`BATCH_JOB_BUSY` means another process holds the job (after a crash,
+`dgml batch unlock <job_id>` once `batch status` shows `lease.stale: true`).
+`BATCH_JOB_NONDETERMINISTIC` means the inputs changed under an open batch:
+`dgml batch cancel <job_id>` then resume.
+
+**Bound the wait with `--batch-deadline`.** A wave usually ends within an
+hour but can take many hours. When the user needs results by a certain time,
+add `--batch-deadline <duration>` (`90m`, `6h`, `1d`; with `--batch`, on any
+batch command). Once it passes, open batches are canceled, results already
+produced are kept at batch price, and the rest of the run finishes
+synchronously at standard price, so the saving shrinks but the run ends. The
+deadline belongs to the job: set it on the first run; every `batch resume`
+honors it (a resume after it finishes the job instead of pausing), and passing
+a different duration on a resume is `BATCH_JOB_INVALID`. The payload's
+`.batch.deadline` reports `at`, `expired`, `canceled_batches`,
+`collected_after_cancel`, `sync_after_deadline` and `possibly_double_billed`;
+`dgml batch status` shows `deadline: {at, expired}`, and so does a paused
+run's `batch_job` block. Canceling can take minutes: the run waits a
+per-provider time for each cancel to settle (Anthropic 450 s, Gemini 60 s, OpenAI 660 s). A batch still
+canceling after that wait has its requests run synchronously; a provider that
+keeps processing while canceling (OpenAI does) may bill those twice.
+`possibly_double_billed` counts them and a WARNING names the batch. The job
+keeps such a batch as `settling`; once it ends, the next resume, `batch
+cancel` or `batch prune` records its real extra cost in `late_billed` /
+`late_billed_usd` (real spend is `cost_usd + late_billed_usd`), and `batch
+prune` keeps the job until then (listed in `settling`).
+
+```bash
+job=$(uv run dgml docset generate "$ds" --batch --no-wait --batch-deadline 6h | jq -r .batch_job.job_id)
+```
+
+**A whole docset, overnight, in one command.** `dgml docset run` chains the
+extraction schema (only when the docset has none, from `--schema-from`
+samples), `docset generate`, and `extraction extract --all`, each exactly as
+the standalone command runs, with the step payloads nested under `.steps`.
+Under `--batch --no-wait` the entire pipeline is **one** job: each
+`batch resume` continues whichever step is waiting (or pauses again if its
+batch is still running), finished steps replay free, and `batch status`
+reports `.step` (`schema`, `generate`, `extract`, or `completed`). Pass-through
+options (`--window-size`, `--thinking`, `--model`, …) are checked for every
+step before the first one runs, so a bad value fails at once with
+`INVALID_ARGUMENT` instead of after the schema step has paid. `--no-batch-label`
+passes through to `docset generate`, and `--batch-deadline` is one deadline for
+the whole run, not one per step. Prefer it to
+chaining the three commands yourself for an unattended run: one job id to
+track, one cron entry.
+
+```bash
+job=$(uv run dgml docset run "$ds" --schema-from "$sample_fid" --batch --no-wait \
+  | jq -r .batch_job.job_id)
+# cron every 15-30 min (one resume at a time per job); remove the entry once
+# status is `completed` — resuming a completed job fails with BATCH_JOB_INVALID:
+[ "$(uv run dgml batch status "$job" | jq -r .status)" = ready ] || exit 0
+out=$(uv run dgml batch resume "$job")
+echo "$out" | jq -e .batch_job >/dev/null \
+  || echo "$out" | jq '{schema: .steps.schema.skipped, generate: .steps.generate.summary, extract: .steps.extract.summary, waves: .batch.waves}'
+```
+
+A step that fails as a whole (for example `EMPTY_DOCSET`) fails the run with
+that step's error code (`INTERNAL_ERROR` for an unexpected error) and
+`error.details.step`; per-file failures stay per file in the step's payload.
+Under `--batch`, a step that ran no batch shows `.batch.steps.<step>.skipped`
+as a string reason. With no schema and no `--schema-from`, extraction
+is skipped (`.steps.extract.skipped`), never guessed. In `docset run`,
+`BATCH_JOB_NONDETERMINISTIC` stops the run at that step (`error.details.step`):
+no later step runs.
+
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
 a `dg:origin` bounding-box attribute (`<page> <x1> <y1> <x2> <y2>`,
@@ -652,6 +784,10 @@ The workflow is generate-schema → extract → get-values:
 #    (xsd:date, xsd:decimal, xsd:integer, …) — dates/amounts/counts come back as
 #    typed dg:value at extraction, not bare text.
 uv run dgml extraction generate-schema "$ds" --from-file "$fid"
+#    Same request at about half price through the provider's batch API when
+#    nobody is waiting on it: one batch round trip (minutes, at most 24h), the
+#    same schema stored, plus a `batch` block in the payload.
+uv run dgml extraction generate-schema "$ds" --batch | jq '{model, batch}'
 
 #    …or set one yourself. set-schema accepts RNC *or* a JSON Schema and
 #    converts JSON to RNC on the way in (RNC is the only on-disk form).
@@ -678,6 +814,21 @@ uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 #    check the payload's `extraction` block; run `extract` manually only for
 #    files assigned before the schema existed or to re-extract.
 uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_key}'
+
+#    Many files at once: name several ids or pass --all. Each file gets its own
+#    `results` entry and a failed file never aborts the others — check
+#    `.summary.failed` and each entry's `status`/`error`.
+#    Add --batch when nobody is waiting on the answer (a backfill, a nightly
+#    re-extract): both LLM phases go through the provider's batch API at about
+#    half price, but results take minutes to hours (up to 24h; 48h on Gemini).
+#    Only Anthropic, Gemini and OpenAI chat-mode models can batch (gpt-5.4+
+#    is refused here: litellm sends its extraction calls to the Responses
+#    API); anything else fails fast
+#    with BATCH_UNAVAILABLE and nothing is sent. One file id with --batch keeps the single-file payload
+#    above (plus a `batch` block), not `summary`/`results`. Every `batch` block
+#    reports `cost_usd`, `standard_cost_usd` and `saved_usd`.
+uv run dgml extraction extract "$ds" --all --batch \
+  | jq '{summary, failed: [.results[] | select(.status == "failed")], batch}'
 
 # 3) Read them back. Default is values-shape JSON (projected from dg:extraction);
 #    --as xml returns the whole core DGML document.

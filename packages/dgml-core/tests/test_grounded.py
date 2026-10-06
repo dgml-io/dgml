@@ -19,7 +19,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from dgml_core import layout
+from dgml_core import layout, llm
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     AuthError,
@@ -43,8 +43,9 @@ from dgml_core.grounded import (
     _empty_totals,
     _field_node_schema,
     _pdf_bytes,
+    _phase1_attempt_steps,
+    _phase1_llm_config,
     _repair_submit_values_args,
-    _run_extract_loop,
     _submit_schema_tool,
     _to_page_pixels,
     extract_values,
@@ -2479,7 +2480,7 @@ def test_chunking_tools_are_offered_only_after_truncation(workspace: Workspace) 
         extract_values(workspace, ds.id, fid, config=config)
     call = mock_completion.call_args_list[0]
     # NOTE: get_page_words is never offered — see the dead-dispatch finding in
-    # _run_extract_loop; phase 1 currently exposes submit_values alone.
+    # _phase1_attempt_steps; phase 1 currently exposes submit_values alone.
     assert tool_names(call) == {"submit_values"}
     assert submit_params(call) == {"values", "layout"}  # no `done`
 
@@ -3186,7 +3187,7 @@ def test_extract_values_records_a_repair_even_when_the_run_fails_later(
     assert stats["phases"]["phase1"]["envelope_repairs"] == 1
 
 
-def test_run_extract_loop_keeps_the_repair_count_when_a_later_turn_fails(
+def test_phase1_attempt_keeps_the_repair_count_when_a_later_turn_fails(
     workspace: Workspace,
 ) -> None:
     """The counter the caller owns survives a loop that fails after the
@@ -3202,19 +3203,22 @@ def test_run_extract_loop_keeps_the_repair_count_when_a_later_turn_fails(
     second = _tool_call_response("not_a_tool", {}, call_id="p2")
     with patch("litellm.completion", side_effect=[first, second]):
         with pytest.raises(ValuesExtractionFailed):
-            _run_extract_loop(
-                workspace=workspace,
-                file_id=fid,
-                messages=[{"role": "user", "content": "extract"}],
-                tools=[],
-                model=DEFAULT_VALUES_MODEL,
-                api_key=None,
-                api_base=None,
-                max_tool_iters=3,
-                totals=_empty_totals(),
-                vocab=_TITLE_VOCAB,
-                counters=counters,
-                chunked=True,
+            llm.drive(
+                _phase1_attempt_steps(
+                    workspace=workspace,
+                    file_id=fid,
+                    messages=[{"role": "user", "content": "extract"}],
+                    tools=[],
+                    model=DEFAULT_VALUES_MODEL,
+                    api_key=None,
+                    api_base=None,
+                    max_tool_iters=3,
+                    totals=_empty_totals(),
+                    vocab=_TITLE_VOCAB,
+                    counters=counters,
+                    chunked=True,
+                ),
+                _phase1_llm_config(DEFAULT_VALUES_MODEL, None, None, None),
             )
     assert counters["envelope_repairs"] == 1
 
