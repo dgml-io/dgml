@@ -21,6 +21,8 @@ from __future__ import annotations
 import base64
 import io
 import re
+import struct
+from dataclasses import dataclass
 
 from . import layout
 from .docsets import DocSetStore
@@ -126,6 +128,16 @@ _JPEG_MAGIC = b"\xff\xd8\xff"
 # fail on Anthropic; callers batching many page images pass this as ``max_edge``.
 MANY_IMAGE_MAX_EDGE = 1568
 
+# Caps for a *single* image sent inline. Anthropic documents 8000 px on the
+# longest edge and refuses an image whose base64 payload passes 10 MiB
+# (``image exceeds 10 MB maximum: 17557836 bytes > 10485760 bytes``), which is
+# 7,864,320 raw bytes. A 300 DPI render of a dense scan or a large-format
+# sheet crosses one or both: a 13 MB PNG of a one-page invoice fails phase 3
+# outright. Gemini and OpenAI limits are looser, so the tighter pair is the one
+# every route can send.
+VISION_MAX_EDGE = 8000
+VISION_MAX_BYTES = 10_485_760 * 3 // 4
+
 
 def _downscale_to_edge(image_bytes: bytes, max_edge: int) -> bytes:
     """Shrink an image so its longest side is ``<= max_edge``; no-op if already under.
@@ -149,6 +161,104 @@ def _downscale_to_edge(image_bytes: bytes, max_edge: int) -> bytes:
         return out.getvalue()
     except Exception:
         return image_bytes  # never let a resize failure break the send path
+
+
+@dataclass(frozen=True)
+class FittedImage:
+    """A page image made to fit a vision request. ``original_size`` and
+    ``sent_size`` are the ``(width, height)`` of the caller's bytes and of
+    ``image``: equal when the bytes came back untouched, ``None`` when
+    nothing decoded them."""
+
+    image: bytes
+    original_size: tuple[int, int] | None
+    sent_size: tuple[int, int] | None
+
+
+def _png_size(image_bytes: bytes) -> tuple[int, int] | None:
+    """A PNG's ``(width, height)`` from its IHDR chunk, without a decoder."""
+    if image_bytes.startswith(_PNG_MAGIC) and len(image_bytes) >= 24:
+        width, height = struct.unpack(">II", image_bytes[16:24])
+        return width, height
+    return None
+
+
+def fit_image_for_vision(
+    image_bytes: bytes, *, max_edge: int | None = None, max_bytes: int | None = None
+) -> FittedImage:
+    """Shrink a page image until a single-image vision request accepts it.
+
+    The longest edge is capped at ``max_edge`` (:data:`VISION_MAX_EDGE`) first;
+    then, while the encoded image is still over ``max_bytes``
+    (:data:`VISION_MAX_BYTES`), the edge is cut by a fifth at a time. A PNG
+    stays a PNG and anything else is re-encoded as JPEG, as
+    :func:`_downscale_to_edge` does, so the bytes fall with the pixel count
+    rather than with a quality setting.
+
+    Returns the image to send with the original and the sent size, so a
+    caller that puts pixel coordinates next to the image can move them into
+    the sent image on the way in and the model's boxes back on the way out.
+
+    Bytes that already fit come back untouched, and so do bytes under the
+    byte cap that Pillow cannot decode (the send path never broke on them
+    before). An image that cannot be brought under a cap raises
+    :class:`ValueError` with the numbers rather than being sent to a certain
+    rejection: one Pillow refuses to decode as too large, one over the byte
+    cap that does not decode, one still over a cap after a dozen steps (a
+    tiny picture carrying megabytes of metadata), and, without Pillow (a
+    dependency of the ``pdfium``, ``aws`` and ``azure`` extras rather than of
+    the base package), any image over the byte cap or any PNG over the edge
+    cap, since nothing here can shrink it. PNG is the format both page
+    renderers write; another format's dimensions are not read without
+    Pillow, so only its byte length is checked.
+    """
+    max_edge = VISION_MAX_EDGE if max_edge is None else max_edge
+    max_bytes = VISION_MAX_BYTES if max_bytes is None else max_bytes
+    try:
+        from PIL import Image
+    except ImportError:
+        png_size = _png_size(image_bytes)
+        if len(image_bytes) > max_bytes or (png_size is not None and max(png_size) > max_edge):
+            raise ValueError(
+                f"page image is over the provider limit ({len(image_bytes)} bytes"
+                + (f", {png_size[0]}x{png_size[1]} px" if png_size else "")
+                + f"; caps {max_bytes} bytes, {max_edge} px) and Pillow is not installed "
+                "to shrink it: install Pillow (dgml-core[pdfium] brings it)"
+            ) from None
+        return FittedImage(image_bytes, png_size, png_size)
+
+    try:
+        original_size = Image.open(io.BytesIO(image_bytes)).size
+    except Image.DecompressionBombError as exc:
+        raise ValueError(f"page image is too large to decode: {exc}") from exc
+    except Exception:
+        if len(image_bytes) > max_bytes:
+            raise ValueError(
+                f"page image is over the provider limit ({len(image_bytes)} bytes; cap "
+                f"{max_bytes} bytes) and does not decode, so it cannot be shrunk"
+            ) from None
+        return FittedImage(image_bytes, None, None)
+    out = _downscale_to_edge(image_bytes, max_edge)
+    # Each step resizes the original, not the previous step's output, to 0.8
+    # of the last edge (a third fewer pixels); a dozen steps take an 8000 px
+    # edge under 600 px, far past anything a real page needs.
+    edge = min(max(original_size), max_edge)
+    for _ in range(12):
+        if len(out) <= max_bytes:
+            break
+        edge = max(1, int(edge * 0.8))
+        smaller = _downscale_to_edge(image_bytes, edge)
+        if smaller == out:
+            break
+        out = smaller
+    sent_size = original_size if out is image_bytes else Image.open(io.BytesIO(out)).size
+    if len(out) > max_bytes or max(sent_size) > max_edge:
+        raise ValueError(
+            f"page image cannot be brought under the provider limit "
+            f"({len(out)} bytes, {sent_size[0]}x{sent_size[1]} px after fitting; "
+            f"caps {max_bytes} bytes, {max_edge} px)"
+        )
+    return FittedImage(out, original_size, sent_size)
 
 
 def image_to_data_url(image_bytes: bytes, *, max_edge: int | None = None) -> str:
