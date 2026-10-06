@@ -23,8 +23,10 @@ is appended to the previous window's last text block.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import re
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Callable
@@ -92,6 +94,12 @@ def blocks_to_json(blocks: list[Block]) -> str:
     return json.dumps([dataclasses.asdict(b) for b in blocks], indent=2, ensure_ascii=False)
 
 
+def blocks_cache_path(cache_dir: Path | str, doc_name: str) -> Path:
+    """Where *doc_name*'s transcription cache (``<stem>_blocks.json``) lives in
+    *cache_dir* — present means the next run skips transcribing it."""
+    return Path(cache_dir) / _UNSAFE_FNAME_RE.sub("_", f"{Path(doc_name).stem}_blocks.json")
+
+
 def _load_cached_blocks(cache_dir: Path | str | None, doc_name: str) -> list[Block] | None:
     """Reload a document's transcription from ``<stem>_blocks.json`` if present.
 
@@ -103,8 +111,7 @@ def _load_cached_blocks(cache_dir: Path | str | None, doc_name: str) -> list[Blo
     """
     if cache_dir is None:
         return None
-    stem = _UNSAFE_FNAME_RE.sub("_", f"{Path(doc_name).stem}_blocks.json")
-    blocks_file = Path(cache_dir) / stem
+    blocks_file = blocks_cache_path(cache_dir, doc_name)
     if not blocks_file.exists():
         return None
     try:
@@ -564,6 +571,224 @@ def _merge_payloads(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     return {"continues": str(a.get("continues", "") or ""), "blocks": blocks_a + blocks_b}
 
 
+def _active_batch_job() -> Any:
+    """The running batch job session, if any, without importing the batch
+    package (no session can exist unless ``dgml_core.batch.jobs`` is loaded)."""
+    jobs = sys.modules.get("dgml_core.batch.jobs")
+    return None if jobs is None else jobs.active_session()
+
+
+def _window_slice(
+    pdf_bytes: bytes, pages: list[int], *, pdf_config: PdfConfig | None, total: int
+) -> bytes:
+    """The PDF slice a window (or a split half) sends to the model.
+
+    Slicing is not byte-reproducible across processes: ghostscript's
+    ``pdfwrite`` stamps a random trailer ``/ID`` and an XMP creation date, and
+    PDFium's output differs run to run too. A batch job replays a resumed run's
+    requests by their digest, so a fresh slice on resume would look like a
+    changed input and be paid for again. Under a batch job the first slice of
+    each (document content, engine, page list) is therefore recorded in the
+    job's input store and every later run of the job reuses those exact bytes.
+    Outside a job this is exactly ``document.slice_pdf``."""
+    job = _active_batch_job()
+    if job is None:
+        return document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total)
+    engine = pdf_config.provider if pdf_config is not None else "default"
+    source = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+    span = hashlib.sha256(",".join(map(str, pages)).encode()).hexdigest()[:16]
+    name = f"slices/{source}/{engine}/{pages[0]}-{pages[-1]}-{span}.pdf"
+    data = job.rewind_input(
+        name,
+        lambda: document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total),
+    )
+    assert data is not None  # slicing always produces bytes
+    return bytes(data)
+
+
+def transcribe_steps(
+    pdf_bytes: bytes,
+    *,
+    doc_name: str,
+    config: llm.LLMConfig,
+    window_size: int = 10,
+    cache_dir: Path | str | None = None,
+    debug: bool = False,
+    log: Callable[[str], None] = lambda _m: None,
+    page_text_dir: Path | str | None = None,
+    pdf_config: PdfConfig | None = None,
+) -> llm.LLMSteps[list[Block]]:
+    """Pass A for one document as a state machine: yields each window request in
+    order, receives its response, and returns the flat block list.
+
+    This is the single copy of the transcription logic. :func:`transcribe_document`
+    drives it synchronously; a batch driver advances many documents' generators a
+    wave at a time. Either way the requests, gate decisions, cache artifacts, and
+    blocks are the same, because they are all decided here. The generator is pure
+    in the :data:`dgml_core.llm.LLMSteps` sense: every model request is a yield of
+    litellm kwargs (composed from :func:`dgml_core.llm.steps_continued`) and it
+    does no usage accounting; the driver owns that.
+
+    Windows are strictly sequential within a document: window N+1's instruction
+    carries window N's structural tail (:func:`_window_context`), so the next
+    window is never yielded before the previous one's response has been sent in.
+    The gate retry, the stage-2 split, and a length continuation are further
+    yields of the same generator.
+
+    Cache behavior matches :func:`transcribe_document`: a cached
+    ``<stem>_blocks.json`` returns immediately without yielding; raw window
+    artifacts are written as each response lands (``debug``-gated); the blocks
+    cache is written only once the whole document is assembled, so a generator
+    closed mid-document leaves no partial functional cache behind.
+    """
+    cached = _load_cached_blocks(cache_dir, doc_name)
+    if cached is not None:
+        log(f"{doc_name}: reusing cached transcription ({len(cached)} block(s))")
+        return cached
+    total = _count_pages(pdf_bytes)
+    windows = document.iter_windows(total, window_size, overlap=0)
+    log(f"{doc_name}: {total} pages → {len(windows)} window(s)")
+    page_tokens = _page_token_lists(page_text_dir)
+
+    # One usage row per document, aggregating every window's call (gated on
+    # --debug via the config): the driver opens a ``record_usage_for`` scope on
+    # this config and the row it writes carries this context. ``config`` is
+    # fresh per document in the pipeline, so setting it here is thread-local.
+    config.context = {"doc": doc_name}
+    blocks: list[Block] = []
+    counter = 0
+    stem = Path(doc_name).stem
+
+    def run_attempts(
+        pages: list[int], context: str, wlog: str, wfile: str
+    ) -> llm.LLMSteps[tuple[float, str, dict[str, Any]] | None]:
+        """Gated attempt loop for one page range; best (recall, raw, payload)."""
+        # `total` was counted once for this document above; passing it keeps
+        # each window from re-walking the whole page tree.
+        pdf_slice = _window_slice(pdf_bytes, pages, pdf_config=pdf_config, total=total)
+        instr = _window_instruction(pages[0], pages[-1], total, context)
+        exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
+        n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)
+        found: tuple[float, str, dict[str, Any]] | None = None
+        for attempt in range(n_attempts):
+            # Retry-nudge: at temperature 0 an identical retry tends to
+            # reproduce the same early stop, so tell the model what its
+            # previous attempt missed instead of re-rolling the same call.
+            attempt_instr = instr
+            if attempt > 0:
+                attempt_instr = (
+                    instr
+                    + "\n\n"
+                    + prompt("transcribe_window_retry").format(
+                        pct=round(100 * (found[0] if found else 0.0)),
+                        first=pages[0] + 1,
+                        last=pages[-1] + 1,
+                    )
+                )
+            raw = yield from llm.steps_continued(
+                config,
+                system_prompt=SYSTEM_PROMPT,
+                user_content=llm.build_user_content(
+                    instruction_text=attempt_instr, pdf_bytes=pdf_slice
+                ),
+                cache=True,  # cache the static system prefix across windows (Anthropic)
+            )
+            suffix = "" if attempt == 0 else f"_retry{attempt}"
+            cache_write(
+                cache_dir,
+                f"{stem}_{wfile}{suffix}_raw.json",
+                strip_fences(raw),
+                debug=debug,
+            )
+            try:
+                payload = parse_window_any(raw, log=lambda m: log(f"{doc_name} {wlog}: {m}"))
+            except json.JSONDecodeError as exc:
+                # Continuation should normally close the JSON; if a window
+                # still arrives truncated (e.g. a stream cut the provider
+                # didn't flag as length), salvage the complete blocks
+                # instead of dropping it all.
+                salvaged = _salvage_window_json(raw)
+                if salvaged is None:
+                    log(f"{doc_name} {wlog}: unparseable JSON ({exc})")
+                    continue
+                payload = salvaged
+                log(
+                    f"{doc_name} {wlog}: truncated JSON; "
+                    f"salvaged {len(payload.get('blocks', []))} block(s)"
+                )
+            recall = _window_recall(payload, exp)
+            if found is None or recall > found[0]:
+                found = (recall, raw, payload)
+            if recall >= _GATE_RECALL:
+                break
+            log(
+                f"{doc_name} {wlog}: transcription covers only "
+                f"{recall:.0%} of the pages' words"
+                + ("; retrying window" if attempt + 1 < n_attempts else "")
+            )
+        return found
+
+    for w_idx, page_indices in enumerate(windows):
+        context = _window_context(blocks)
+        wlog, wfile = f"w{w_idx + 1}", f"w{w_idx + 1:02d}"
+        expected = [t for p in page_indices if p < len(page_tokens) for t in page_tokens[p]]
+        gate_on = len(expected) >= _GATE_MIN_TOKENS
+        best = yield from run_attempts(page_indices, context, wlog, wfile)
+        if best is None:
+            log(f"{doc_name} {wlog}: window skipped")
+            continue
+        # Stage-2 fallback: a retry that reproduces the same early stop is
+        # anchored in the window's CONTENT, so change the INPUT — split
+        # the page range and transcribe the halves.
+        if gate_on and best[0] < _GATE_RECALL and len(page_indices) >= 2:
+            log(f"{doc_name} {wlog}: still short after retry; splitting the window")
+            mid = (len(page_indices) + 1) // 2
+            half_a = yield from run_attempts(page_indices[:mid], context, f"{wlog}a", f"{wfile}a")
+            context_b = _payload_tail(half_a[2]) if half_a else context
+            half_b = yield from run_attempts(page_indices[mid:], context_b, f"{wlog}b", f"{wfile}b")
+            if half_a and half_b:
+                merged = _merge_payloads(half_a[2], half_b[2])
+                merged_recall = _window_recall(merged, expected)
+                if merged_recall > best[0]:
+                    best = (merged_recall, json.dumps(merged, ensure_ascii=False), merged)
+                    log(
+                        f"{doc_name} {wlog}: split halves cover "
+                        f"{merged_recall:.0%} — keeping the split"
+                    )
+        recall, raw, payload = best
+        if gate_on and recall < _GATE_RECALL:
+            log(f"{doc_name} {wlog}: keeping best attempt at {recall:.0%} page-word coverage")
+        # The kept content always lives at the unsuffixed name the caches
+        # and debug tooling expect (a no-retry run writes it exactly once;
+        # a kept split writes the merged payload).
+        cache_write(
+            cache_dir,
+            f"{stem}_{wfile}_raw.json",
+            strip_fences(raw),
+            debug=debug,
+        )
+        _append_continuation(blocks, str(payload.get("continues", "") or ""))
+        kept = 0
+        for raw_block in payload.get("blocks", []) or []:
+            if not isinstance(raw_block, dict):
+                continue
+            counter += 1
+            block = parse_block(raw_block, block_id=f"b{counter:04d}")
+            if block is not None:
+                blocks.append(block)
+                kept += 1
+        log(f"{doc_name} {wlog}: {kept} block(s)")
+    # Deterministic normalization: printed enumerators already encode the
+    # answer, so remove the model's per-run degrees of freedom (p-vs-item on
+    # sequential "(a)…" runs; heading depth of dotted numbering) before the
+    # blocks become the document of record.
+    normalize_enumerated_paragraphs(blocks)
+    anchor_heading_levels(blocks)
+    # Functional file the next run reloads — written regardless of --debug.
+    cache_write(cache_dir, f"{Path(doc_name).stem}_blocks.json", blocks_to_json(blocks), debug=True)
+    return blocks
+
+
 def transcribe_document(
     pdf_bytes: bytes,
     *,
@@ -576,7 +801,10 @@ def transcribe_document(
     page_text_dir: Path | str | None = None,
     pdf_config: PdfConfig | None = None,
 ) -> list[Block]:
-    """Transcribe one document into a flat block list (Pass A).
+    """Transcribe one document into a flat block list (Pass A), synchronously.
+
+    The sync driver over :func:`transcribe_steps`: each window request the
+    generator yields is executed immediately, in order.
 
     With *cache_dir* set, the assembled flat blocks are written as
     ``<stem>_blocks.json`` (a functional file the next run reloads). With
@@ -594,149 +822,29 @@ def transcribe_document(
     are reloaded verbatim and no LLM call is made — so a re-run only pays for
     labeling and rendering. Delete the cache file to force re-transcription.
     """
+    # Short-circuit before opening the usage scope, exactly as before: a cached
+    # document makes no call and leaves no usage row. transcribe_steps repeats
+    # the (cheap) check and returns without yielding, and the batch driver
+    # (dgml_core.batch.run_stage) opens a unit's usage scope only once its
+    # generator has yielded a request — so a cached document leaves no row
+    # there either. (llm.drive would write an empty row for such a generator,
+    # which is why this sync path checks the cache before calling it.)
     cached = _load_cached_blocks(cache_dir, doc_name)
     if cached is not None:
         log(f"{doc_name}: reusing cached transcription ({len(cached)} block(s))")
         return cached
-    total = _count_pages(pdf_bytes)
-    windows = document.iter_windows(total, window_size, overlap=0)
-    log(f"{doc_name}: {total} pages → {len(windows)} window(s)")
-    page_tokens = _page_token_lists(page_text_dir)
-
-    # One usage row per document, aggregating every window's call (gated on
-    # --debug via the config). ``config`` is fresh per document in the pipeline,
-    # so setting the context here is safe and thread-local.
-    config.context = {"doc": doc_name}
-    blocks: list[Block] = []
-    counter = 0
-    stem = Path(doc_name).stem
+    steps = transcribe_steps(
+        pdf_bytes,
+        doc_name=doc_name,
+        config=config,
+        window_size=window_size,
+        cache_dir=cache_dir,
+        debug=debug,
+        log=log,
+        page_text_dir=page_text_dir,
+        pdf_config=pdf_config,
+    )
+    # One usage row per document: drive() records every request into this
+    # scope, which writes the single aggregated row on exit.
     with llm.record_usage_for(config):
-
-        def run_attempts(
-            pages: list[int], context: str, wlog: str, wfile: str
-        ) -> tuple[float, str, dict[str, Any]] | None:
-            """Gated attempt loop for one page range; best (recall, raw, payload)."""
-            # `total` was counted once for this document above; passing it keeps
-            # each window from re-walking the whole page tree.
-            pdf_slice = document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total)
-            instr = _window_instruction(pages[0], pages[-1], total, context)
-            exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
-            n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)
-            found: tuple[float, str, dict[str, Any]] | None = None
-            for attempt in range(n_attempts):
-                # Retry-nudge: at temperature 0 an identical retry tends to
-                # reproduce the same early stop, so tell the model what its
-                # previous attempt missed instead of re-rolling the same call.
-                attempt_instr = instr
-                if attempt > 0:
-                    attempt_instr = (
-                        instr
-                        + "\n\n"
-                        + prompt("transcribe_window_retry").format(
-                            pct=round(100 * (found[0] if found else 0.0)),
-                            first=pages[0] + 1,
-                            last=pages[-1] + 1,
-                        )
-                    )
-                raw = llm.call_continued(
-                    config,
-                    system_prompt=SYSTEM_PROMPT,
-                    user_content=llm.build_user_content(
-                        instruction_text=attempt_instr, pdf_bytes=pdf_slice
-                    ),
-                    cache=True,  # cache the static system prefix across windows (Anthropic)
-                )
-                suffix = "" if attempt == 0 else f"_retry{attempt}"
-                cache_write(
-                    cache_dir,
-                    f"{stem}_{wfile}{suffix}_raw.json",
-                    strip_fences(raw),
-                    debug=debug,
-                )
-                try:
-                    payload = parse_window_any(raw, log=lambda m: log(f"{doc_name} {wlog}: {m}"))
-                except json.JSONDecodeError as exc:
-                    # Continuation should normally close the JSON; if a window
-                    # still arrives truncated (e.g. a stream cut the provider
-                    # didn't flag as length), salvage the complete blocks
-                    # instead of dropping it all.
-                    salvaged = _salvage_window_json(raw)
-                    if salvaged is None:
-                        log(f"{doc_name} {wlog}: unparseable JSON ({exc})")
-                        continue
-                    payload = salvaged
-                    log(
-                        f"{doc_name} {wlog}: truncated JSON; "
-                        f"salvaged {len(payload.get('blocks', []))} block(s)"
-                    )
-                recall = _window_recall(payload, exp)
-                if found is None or recall > found[0]:
-                    found = (recall, raw, payload)
-                if recall >= _GATE_RECALL:
-                    break
-                log(
-                    f"{doc_name} {wlog}: transcription covers only "
-                    f"{recall:.0%} of the pages' words"
-                    + ("; retrying window" if attempt + 1 < n_attempts else "")
-                )
-            return found
-
-        for w_idx, page_indices in enumerate(windows):
-            context = _window_context(blocks)
-            wlog, wfile = f"w{w_idx + 1}", f"w{w_idx + 1:02d}"
-            expected = [t for p in page_indices if p < len(page_tokens) for t in page_tokens[p]]
-            gate_on = len(expected) >= _GATE_MIN_TOKENS
-            best = run_attempts(page_indices, context, wlog, wfile)
-            if best is None:
-                log(f"{doc_name} {wlog}: window skipped")
-                continue
-            # Stage-2 fallback: a retry that reproduces the same early stop is
-            # anchored in the window's CONTENT, so change the INPUT — split
-            # the page range and transcribe the halves.
-            if gate_on and best[0] < _GATE_RECALL and len(page_indices) >= 2:
-                log(f"{doc_name} {wlog}: still short after retry; splitting the window")
-                mid = (len(page_indices) + 1) // 2
-                half_a = run_attempts(page_indices[:mid], context, f"{wlog}a", f"{wfile}a")
-                context_b = _payload_tail(half_a[2]) if half_a else context
-                half_b = run_attempts(page_indices[mid:], context_b, f"{wlog}b", f"{wfile}b")
-                if half_a and half_b:
-                    merged = _merge_payloads(half_a[2], half_b[2])
-                    merged_recall = _window_recall(merged, expected)
-                    if merged_recall > best[0]:
-                        best = (merged_recall, json.dumps(merged, ensure_ascii=False), merged)
-                        log(
-                            f"{doc_name} {wlog}: split halves cover "
-                            f"{merged_recall:.0%} — keeping the split"
-                        )
-            recall, raw, payload = best
-            if gate_on and recall < _GATE_RECALL:
-                log(f"{doc_name} {wlog}: keeping best attempt at {recall:.0%} page-word coverage")
-            # The kept content always lives at the unsuffixed name the caches
-            # and debug tooling expect (a no-retry run writes it exactly once;
-            # a kept split writes the merged payload).
-            cache_write(
-                cache_dir,
-                f"{stem}_{wfile}_raw.json",
-                strip_fences(raw),
-                debug=debug,
-            )
-            _append_continuation(blocks, str(payload.get("continues", "") or ""))
-            kept = 0
-            for raw_block in payload.get("blocks", []) or []:
-                if not isinstance(raw_block, dict):
-                    continue
-                counter += 1
-                block = parse_block(raw_block, block_id=f"b{counter:04d}")
-                if block is not None:
-                    blocks.append(block)
-                    kept += 1
-            log(f"{doc_name} {wlog}: {kept} block(s)")
-    # Deterministic normalization: printed enumerators already encode the
-    # answer, so remove the model's per-run degrees of freedom (p-vs-item on
-    # sequential "(a)…" runs; heading depth of dotted numbering) before the
-    # blocks become the document of record.
-    normalize_enumerated_paragraphs(blocks)
-    anchor_heading_levels(blocks)
-    # Functional file the next run reloads — written regardless of --debug.
-    cache_write(cache_dir, f"{Path(doc_name).stem}_blocks.json", blocks_to_json(blocks), debug=True)
-    return blocks
+        return llm.drive(steps, config)

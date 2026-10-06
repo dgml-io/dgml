@@ -66,11 +66,19 @@ def _documented_codes() -> set[str]:
     return set(_ROW.findall(text[start : end if end != -1 else len(text)]))
 
 
+#: Error classes that are deliberately NOT a `DgmlError` (a `BaseException`, so
+#: per-file `except Exception` soft-fail handlers cannot swallow them) yet still
+#: reach the CLI as an error envelope, so their code is documented like any
+#: other. (`BatchPending` is the other such signal, but a pause is reported as
+#: a success payload, never an error code.)
+_CONTROL_FLOW_ERRORS = (errors_module.BatchJobNondeterministic,)
+
+
 def _class_codes() -> dict[str, str]:
     """``code -> class name`` for every error class in ``dgml_core.errors``."""
     found: dict[str, str] = {}
     for name, obj in vars(errors_module).items():
-        if inspect.isclass(obj) and issubclass(obj, DgmlError):
+        if inspect.isclass(obj) and (issubclass(obj, DgmlError) or obj in _CONTROL_FLOW_ERRORS):
             found.setdefault(obj.code, name)
     return found
 

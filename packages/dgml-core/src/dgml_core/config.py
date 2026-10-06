@@ -67,6 +67,31 @@ if TYPE_CHECKING:
 ENV_PREFIX = "DGML_"
 ENV_NESTED_DELIMITER = "__"
 
+_TRUE_STRINGS = frozenset({"true", "1", "yes"})
+_FALSE_STRINGS = frozenset({"false", "0", "no"})
+
+
+def config_bool(value: object) -> bool | None:
+    """Read a boolean config value from any layer, or ``None`` if it is not one.
+
+    TOML layers deliver a real ``bool``. The ``DGML_`` env-var layer delivers
+    every value as a string (``DGML_GENERATION__BATCH=true`` → ``"true"``), so a
+    string is accepted when it is one of ``true/false/1/0/yes/no``, compared
+    case-insensitively with surrounding whitespace ignored. Anything else —
+    another string, a number, a list — is not a boolean: the caller raises its
+    own section's invalid-config error rather than guessing, because a typo
+    silently read as either value would do the opposite of what was asked.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    return None
+
 
 def _build_settings_class(user_path: Path, ws_config: dict[str, Any] | None) -> type[BaseSettings]:
     """A ``BaseSettings`` subclass sourcing layer 2 from the TOML file at *user_path*

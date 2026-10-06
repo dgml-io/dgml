@@ -150,6 +150,24 @@ payload=$(uv run dgml file add --workspace "$wid" /path/to/docs \
 jq -r '.results[] | "\(.classification.docset_name)\t\(.path)"' <<<"$payload"
 ```
 
+For a large ingest nobody is waiting on, add `--batch`: every file is
+added first, then the classifications go through the provider's batch API
+at about half price, and the auto-extraction of files landing in a DocSet
+with a schema is batched too. With `--auto-classify existing` all files
+classify in ONE wave. In the default mode they classify in order, ONE WAVE
+PER FILE (each file must be offered the DocSets created for the files
+before it), so a directory of N files takes N round trips of minutes to
+hours each — prefer `existing` for a big curated ingest. `--batch` works
+only on a directory with `--auto-classify` and only for Anthropic
+(`anthropic/…`) models; otherwise it fails before adding anything
+(`INVALID_ARGUMENT` / `BATCH_UNAVAILABLE`). The entries are the same as
+without it, plus a top-level `batch` block.
+
+```bash
+uv run dgml file add --workspace "$wid" /path/to/docs \
+  --recursive --on-conflict skip --auto-classify existing --batch | jq .batch
+```
+
 ⚠️ **Only use `existing` when you already know every file belongs in one
 of the workspace's DocSets.** The LLM is *required* to return a DocSet —
 it is offered no other action — so an off-type document is filed under
@@ -530,6 +548,50 @@ sees the previous window's tail). The calls are network-bound, so threads
 overlap the latency. Raise it on high-RPM paid tiers; set `1` to serialize
 if you hit 429s.
 
+**Batch mode (half price, slow).** For offline or bulk runs where nobody is
+waiting on the result, add `--batch`. It sends transcription, roster
+planning, concept descriptions, OCR image style (when `[style]` is enabled)
+and the semantic-link pass through the provider's batch API at half the token
+price; results can take up to 24 hours per wave, and a long document needs
+one wave per window. Labeling batches too under a closed `--schema-path`
+vocabulary (every document at once); under an open or `--extend-schema`
+vocabulary it stays synchronous, because each document is labeled against
+the tags the documents before it coined. The output is the same as a
+synchronous run. Only `anthropic/` models have a batch backend; any other
+model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
+anything. The payload's `batch.stages` block reports what each stage did,
+including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report
+the saving without `--debug`.
+
+```bash
+uv run dgml docset generate "$ds" --batch --schema-path ./po-tags.json | jq .batch
+```
+
+Never use `--batch` on an interactive request: use it for nightly or bulk
+ingestion.
+
+**Don't hold a process open for a day: use job mode.** Add `--no-wait` to any
+`--batch` command (`docset generate`, `extraction extract`, `extraction
+generate-schema`, `file add <dir>`): it submits the wave and exits 0 with a
+`batch_job` payload. Check with `dgml batch status <job_id>` (read-only) and
+run `dgml batch resume <job_id>` only when it says `ready`; each resume
+replays what came back at no cost, collects open batches (never resubmits)
+and pauses on the next wave, until the command's normal payload comes back.
+A blocking `--batch` run that crashed is resumable the same way (`dgml batch
+list` shows its job). Stop resuming once status is `completed`.
+
+```bash
+job=$(uv run dgml docset generate "$ds" --batch --no-wait | jq -r .batch_job.job_id)
+uv run dgml batch status "$job" | jq -r .status   # pending | ready | completed | failed
+uv run dgml batch resume "$job"                   # when ready
+uv run dgml batch prune                           # drop finished jobs
+```
+
+`BATCH_JOB_BUSY` means another process holds the job (after a crash,
+`dgml batch unlock <job_id>` once `batch status` shows `lease.stale: true`).
+`BATCH_JOB_NONDETERMINISTIC` means the inputs changed under an open batch:
+`dgml batch cancel <job_id>` then resume.
+
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
 a `dg:origin` bounding-box attribute (`<page> <x1> <y1> <x2> <y2>`,
@@ -652,6 +714,10 @@ The workflow is generate-schema → extract → get-values:
 #    (xsd:date, xsd:decimal, xsd:integer, …) — dates/amounts/counts come back as
 #    typed dg:value at extraction, not bare text.
 uv run dgml extraction generate-schema "$ds" --from-file "$fid"
+#    Same request at about half price through the provider's batch API when
+#    nobody is waiting on it: one batch round trip (minutes, at most 24h), the
+#    same schema stored, plus a `batch` block in the payload.
+uv run dgml extraction generate-schema "$ds" --batch | jq '{model, batch}'
 
 #    …or set one yourself. set-schema accepts RNC *or* a JSON Schema and
 #    converts JSON to RNC on the way in (RNC is the only on-disk form).
@@ -678,6 +744,19 @@ uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 #    check the payload's `extraction` block; run `extract` manually only for
 #    files assigned before the schema existed or to re-extract.
 uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_key}'
+
+#    Many files at once: name several ids or pass --all. Each file gets its own
+#    `results` entry and a failed file never aborts the others — check
+#    `.summary.failed` and each entry's `status`/`error`.
+#    Add --batch when nobody is waiting on the answer (a backfill, a nightly
+#    re-extract): both LLM phases go through the provider's batch API at about
+#    half price, but results take minutes to hours (up to 24h). Only Anthropic
+#    models can batch; anything else fails fast with BATCH_UNAVAILABLE and
+#    nothing is sent. One file id with --batch keeps the single-file payload
+#    above (plus a `batch` block), not `summary`/`results`. Every `batch` block
+#    reports `cost_usd`, `standard_cost_usd` and `saved_usd`.
+uv run dgml extraction extract "$ds" --all --batch \
+  | jq '{summary, failed: [.results[] | select(.status == "failed")], batch}'
 
 # 3) Read them back. Default is values-shape JSON (projected from dg:extraction);
 #    --as xml returns the whole core DGML document.
