@@ -12,8 +12,8 @@
 
 """The one failure-classification policy every batch backend applies.
 
-Backends differ in transport (raw ``httpx``, or a provider SDK built on it)
-and in how a provider spells an error, but the questions asked of a failure are
+Backends differ in transport (raw ``httpx``, the OpenAI SDK under litellm) and
+in how a provider spells an error, but the questions asked of a failure are
 the same everywhere, so they are answered here once:
 
 * **Did a create call reach the provider?** A batch create is not idempotent

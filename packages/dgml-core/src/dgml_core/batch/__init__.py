@@ -22,8 +22,9 @@ response each, with resubmission and synchronous fallback) and
 wave).
 
 Registered backends: ``anthropic`` (Message Batches,
-:mod:`dgml_core.batch.anthropic`) and ``gemini`` (Gemini Developer API,
-:mod:`dgml_core.batch.gemini`). Nothing in the package is reachable from
+:mod:`dgml_core.batch.anthropic`), ``gemini`` (Gemini Developer API,
+:mod:`dgml_core.batch.gemini`) and ``openai`` (Batch API,
+:mod:`dgml_core.batch.openai`). Nothing in the package is reachable from
 the CLI or imported by the rest of ``dgml_core``: importing ``dgml_core``
 never imports this package.
 
@@ -71,6 +72,7 @@ from dgml_core.batch.jobs import (
     start_session,
     unlock_job,
 )
+from dgml_core.batch.openai import OpenAIBatchBackend
 from dgml_core.batch.registry import (
     AvailabilityProbe,
     BackendConfig,
@@ -126,6 +128,7 @@ __all__ = [
     "ItemErrorKind",
     "JobSession",
     "Manifest",
+    "OpenAIBatchBackend",
     "ReplayExecutor",
     "RequestProbe",
     "StageRequest",
