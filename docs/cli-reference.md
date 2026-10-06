@@ -694,6 +694,7 @@ dgml docset add-file <file_id> --docset <docset_id>   # auto-extracts when the
 dgml docset remove-file <file_id> --docset <docset_id>
 dgml docset list-files <docset_id>
 dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <id>] [--label-model <id>] [--window-size <n>] [--max-tokens <n>] [...]
+dgml docset run <docset_id> [--schema-from <file_id> ...] [--no-generate] [--no-extract] [generate flags] [--batch] [--no-wait]
 ```
 
 `docset delete` removes the DocSet and its file-assignment markers, but
@@ -1287,6 +1288,105 @@ a supplied schema behaves exactly as before.
 > on already-generated XML without regenerating (a maintenance/debug
 > operation outside the public CLI), use `scripts/ground.py`:
 > `uv run python scripts/ground.py --docset <id> [--file <id>] [--debug]`.
+
+### `dgml docset run <docset_id> [flags]`
+
+The whole docset pipeline in one command. It runs three steps in order, each
+exactly as its standalone command would:
+
+1. **Extraction schema** — `extraction generate-schema <docset_id>
+   --from-file ...` from the `--schema-from` samples, but only when the docset
+   has no extraction schema yet. A docset that already has one reuses it. With
+   no schema and no `--schema-from`, schema generation and extraction are both
+   skipped (the payload says why; the samples are never guessed).
+2. **DGML** — `docset generate <docset_id>`.
+3. **Values** — `extraction extract <docset_id> --all`.
+
+| Flag | Meaning |
+|---|---|
+| `--schema-from FILE_ID` | Sample file for the schema step. Repeatable. Used only when the docset has no extraction schema. |
+| `--no-generate` | Skip step 2. |
+| `--no-extract` | Skip steps 1 and 3. |
+| `--generation-config`, `--model`, `--label-model`, `--window-size`, `--temperature`, `--max-tokens`, `--thinking`, `--no-coverage`, `--cache-dir`, `--max-parallel-calls`, `--schema-path`, `--extend-schema`, `--no-roster`, `--no-semlinks`, `--no-semlink-cache`, `--no-semlink-verify` | Passed to `docset generate` unchanged. |
+| `--schema-model M` | Passed to `extraction generate-schema`. |
+| `--values-model M`, `--values-effort E` | Passed to `extraction extract`. |
+| `--batch` / `--no-batch` | Every step through the provider's batch API, under **one** batch job. Defaults to `[generation] batch`. |
+| `--batch-poll-interval S` | Seconds between batch status polls (default 30). |
+| `--no-wait`, `--job ID` | Batch job mode for the whole run (see [Batch jobs](#batch-jobs---no-wait-and-dgml-batch)). |
+
+Payload: each step's normal payload, or a `skipped` reason, under `steps`:
+
+```json
+{
+  "docset_id": "o8vr8rs488vg",
+  "steps": {
+    "schema":   {"docset_id": "o8vr8rs488vg", "schema_format": "rnc", "schema": "...", "from_file_ids": ["..."], "model": "anthropic/claude-opus-5"},
+    "generate": {"docset_id": "o8vr8rs488vg", "summary": {"total": 12, "converted": 12, "skipped": 0, "failed": 0}, "...": "the docset generate payload"},
+    "extract":  {"docset_id": "o8vr8rs488vg", "summary": {"total": 12, "ok": 12, "failed": 0}, "...": "the multi-file extraction payload"}
+  }
+}
+```
+
+A skipped step is `{"skipped": "<reason>"}` — for example `"--no-extract"`,
+`"--no-generate"`, `"the docset already has an extraction schema"`, or `"the
+docset has no extraction schema and no --schema-from sample files were given"`.
+
+Under `--batch` every step keeps its own `batch` block, and the run adds a
+top-level summary summed across steps (a skipped or unbatched step appears as
+`{"skipped": "<reason>"}`: the step's own skip reason, such as `"--no-generate"`,
+or `"the step ran no batch"`):
+
+```json
+"batch": {
+  "enabled": true, "waves": 9, "batches": 9, "requests": 21, "batch_ok": 21,
+  "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+  "cost_usd": 0.19, "standard_cost_usd": 0.38, "saved_usd": 0.19,
+  "steps": {"schema": {"waves": 1, "...": "..."}, "generate": {"waves": 7, "...": "..."}, "extract": {"waves": 1, "...": "..."}}
+}
+```
+
+**Exit code.** `0` when every step completed; per-file failures stay per file,
+as in the standalone commands. A step that fails as a whole (an empty docset, a
+missing configuration) fails the run: the step's own error code (or
+`INTERNAL_ERROR` for an unexpected error), with `details` naming it either way:
+
+```json
+{"error": {"code": "EMPTY_DOCSET", "message": "docset run: step 'generate' failed: ...",
+           "details": {"step": "generate", "completed_steps": ["schema"]}}}
+```
+
+**Pass-through options are checked up front.** Every step that may run is
+parsed with its own command's parser before the first step starts (and before
+any batch job is created), so a bad value — `--window-size abc`,
+`--thinking sometimes` — fails the run at once with `INVALID_ARGUMENT` naming
+the step and the flag, instead of argparse usage text (exit 2) from the
+generate step after the schema step has already paid. A bad `--values-effort`
+is refused up front too (`GROUNDED_CONFIG_INVALID`).
+
+```json
+{"error": {"code": "INVALID_ARGUMENT",
+           "message": "docset run: invalid option for step 'generate': argument --window-size: invalid int value: 'abc'"}}
+```
+
+**Batch pre-flight.** Under `--batch`, every model a planned step will send to
+a batch is checked before any work: the schema model (when a schema will be
+generated), the transcription, labeling, link and (OCR files) style models, and
+the values model. A model with no batch backend fails with `BATCH_UNAVAILABLE`
+naming the stage (`stage 'extract' (model '...')`, `stage 'generate.transcribe'
+...`), and no job is created.
+
+**One job for the whole run.** With `--batch --no-wait`, the run pauses at
+whichever step first has a wave in flight, and `dgml batch resume <job_id>`
+continues the pipeline from there. A resume re-runs every step: steps that
+already finished replay their responses from the job at no cost, so each
+response is billed exactly once. What a job works on is fixed when it starts —
+whether it generates the schema, which files it converts, which semantic-link
+plans count as cached — so a step's own writes never change a later run.
+`dgml batch status` shows the step the job is on. A resume that trips the drift
+guard (`BATCH_JOB_NONDETERMINISTIC`, see
+[Batch jobs](#batch-jobs---no-wait-and-dgml-batch)) stops the run at that
+step: no later step runs or submits anything, and the error's `details.step`
+names the step.
 
 ## Extraction commands
 
@@ -2551,9 +2651,9 @@ filter was requested, `dgml discover` warns on stderr and falls back to
 A `--batch` run blocks until every wave has come back, and a wave can take up
 to 24 hours. A **batch job** lets the command stop as soon as a wave is
 submitted, and be continued later: by hand, from a cron entry, or by an agent.
-Every command that takes `--batch` (`dgml docset generate`, `dgml extraction
-generate-schema`, `dgml extraction extract` and `dgml file add <dir>
---auto-classify`) also takes:
+Every command that takes `--batch` (`dgml docset generate`, `dgml docset run`
+(one job for all its steps), `dgml extraction generate-schema`, `dgml
+extraction extract` and `dgml file add <dir> --auto-classify`) also takes:
 
 | Flag | Meaning |
 |---|---|
@@ -2823,6 +2923,10 @@ Jobs without one have no `deadline` field. A job with a `settling` batch adds
 `settling_batches`, `late_billed` and `late_billed_usd` to it, computed
 read-only (nothing is written until a later run, `cancel` or `prune`).
 
+A `docset run` job also reports `step` (here and in `dgml batch list`): the
+step the job is on (`schema`, `generate` or `extract`), or `completed` once the
+run has finished. Jobs of other commands have no `step` field.
+
 ### `dgml batch list`
 
 Every job in the workspace, newest first: `{"jobs": [...]}`, each entry the
@@ -3053,7 +3157,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `BATCH_EXECUTION_FAILED` | hard | A submitted batch could not be brought to completion: the provider accepted none of a wave's batches, a batch create was refused at the account's rate limit or quota, a batch create's outcome was unknown (the batch may exist; it is never resubmitted), or a batch was still unfinished at the polling deadline (it is cancelled first). Per-request failures inside a delivered batch are retried or run synchronously instead. Within a `docset generate` stage, only the documents still in flight are affected (a document still transcribing is dropped, one still labeling gets a `label_error`, a failed link stage gives each document a `link_error`); the command still exits 0. |
 | `BATCH_JOB_NOT_FOUND` | hard | `--job` or a `dgml batch` subcommand named a job id with no job in this workspace. |
 | `BATCH_JOB_BUSY` | hard | Another process holds the batch job's lease (it is running, polling or canceling that job). Retry when it finishes, or once the lease expires 10 minutes after its last renewal; `dgml batch unlock <job_id>` breaks a lease left by a process that died. Also the outcome of a run that lost its lease mid-run (broken by `unlock`, or taken over): it stops before submitting anything more, with `details.lease_lost: true`. |
-| `BATCH_JOB_NONDETERMINISTIC` | hard | A resumed batch job's requests for a stage matched nothing it stored or has in flight while open provider batches still cover those positions: an input was rebuilt differently, and submitting would pay for the same wave again. Nothing was submitted and the open batches were kept. Fatal to the run: it is the run's only output (no success payload, exit 1) and nothing further is sent to the provider; `details.batch.job` names the job, left `failed`. If an input changed on purpose, `dgml batch cancel <job_id>` then `dgml batch resume <job_id>`. |
+| `BATCH_JOB_NONDETERMINISTIC` | hard | A resumed batch job's requests for a stage matched nothing it stored or has in flight while open provider batches still cover those positions: an input was rebuilt differently, and submitting would pay for the same wave again. Nothing was submitted and the open batches were kept. Fatal to the run: it is the run's only output (no success payload, exit 1), nothing further is sent to the provider, and `docset run` stops at that step (`details.step`); `details.batch.job` names the job, left `failed`. If an input changed on purpose, `dgml batch cancel <job_id>` then `dgml batch resume <job_id>`. |
 | `BATCH_JOB_INVALID` | hard | A batch job cannot be used as asked: `--no-wait`/`--job`/`--batch-deadline` without batch mode, a resume passing a `--batch-deadline` different from the job's, resuming a job that already completed, continuing a job with a different command than the one that created it, running a job again while it has an unacknowledged `uncertain` batch create (check the provider's console, then `dgml batch cancel <job_id>`), or resuming a job whose stored command line no longer parses or whose original working directory no longer exists. |
 | `INCREMENTAL_WITHOUT_CLUSTERS` | hard | `cluster --skip-existing` in a workspace that has no existing clusters to build on. |
 | `LINK_PLAN_FAILED` | soft | The semantic-link pass failed for a document during `docset generate`; the document still converts, unlinked. |

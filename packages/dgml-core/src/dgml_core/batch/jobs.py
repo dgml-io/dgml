@@ -889,7 +889,8 @@ class BatchJobStore:
         ]
         manifest.billed = []
         manifest.inputs = {}
-        manifest.state = {}
+        # Only the step a `docset run` job ended on (`completed`) outlives it.
+        manifest.state = {k: v for k, v in manifest.state.items() if k == RUN_STEP_STATE}
         self.save(manifest, merge=False)
 
 
@@ -2378,6 +2379,11 @@ class ReplayExecutor(BatchExecutor):
 # part of the CLI's JSON contract.
 
 
+#: Job state key holding the step a ``docset run`` job is on (written by the
+#: CLI's ``docset run``; reported by :func:`job_summary` as ``step``).
+RUN_STEP_STATE = "run.step"
+
+
 def job_summary(manifest: Manifest) -> dict[str, Any]:
     """One job as ``dgml batch list`` (and every other ``batch`` payload)
     reports it: the stored status, never a derived one."""
@@ -2391,6 +2397,8 @@ def job_summary(manifest: Manifest) -> dict[str, Any]:
         "requests_in_flight": manifest.requests_in_flight(),
         "error": manifest.error,
     }
+    if RUN_STEP_STATE in manifest.state:  # a `docset run` job: which step it is on
+        summary["step"] = manifest.state[RUN_STEP_STATE]
     return summary
 
 

@@ -173,6 +173,47 @@ OCR words while the file is ingested. Those calls run inside ingest, page by
 page, with a heuristic fallback per request, and the merge model is typically
 a local one with no batch API. It runs at standard price.
 
+## `dgml docset run <docset_id> --batch`: a whole docset in one command
+
+`dgml docset run` chains the three batchable steps (extraction schema, DGML
+generation, value extraction), each exactly as its standalone command runs:
+
+```bash
+dgml docset run <docset_id> --schema-from <sample_file_id> --batch
+```
+
+- The schema step runs only when the docset has no extraction schema yet, from
+  the `--schema-from` samples (one round trip). Without a schema and without
+  samples, extraction is skipped and the payload says why.
+- `docset generate` takes the waves listed above.
+- Extraction is one phase-1 wave for every file, then one phase-3 wave.
+
+Round trips for the whole run are the sum of the steps'. The docset's size
+changes how large the batches are, not how many there are.
+
+The whole run is **one batch job**, so an overnight run is:
+
+```bash
+dgml docset run <docset_id> --schema-from <sample_file_id> --batch --no-wait   # prints a job id
+# then, from cron every 15–30 minutes: check first, resume only when it will progress
+dgml batch status <job_id>    # status (ready / pending / completed / failed) and step
+dgml batch resume <job_id>    # only when status is `ready`
+```
+
+`batch status` reports the step the job is on. Steps that already finished
+replay their responses from the job at no cost, so every response is billed
+once. A preflight checks every model the planned steps will batch before any
+work and names the stage whose model has no batch backend; the steps'
+pass-through options (`--window-size`, `--thinking`, …) are validated up front
+too, so a bad value fails at once with `INVALID_ARGUMENT` rather than after a
+step has paid.
+
+If a resume finds that a step's inputs were rebuilt differently from the run
+that submitted its open batches, it stops with `BATCH_JOB_NONDETERMINISTIC`
+before submitting anything, and the run ends there: no later step runs, no
+success payload is printed, and the job stays `failed` with its in-flight
+batches kept (see the [CLI reference](cli-reference.md#batch-jobs---no-wait-and-dgml-batch)).
+
 ## How ordering works
 
 Providers process a batch's requests concurrently and return results in any
@@ -384,8 +425,8 @@ tier, marked `context.tier_split: true`.
 | Setting | Effect |
 |---|---|
 | `--batch` | Turn batch mode on for this run. |
-| `--no-batch` (`docset generate`) | Force synchronous, overriding the config. |
-| `[generation] batch = true` | Make batch mode the default for `docset generate` in this workspace. Anything but a boolean is `GENERATION_CONFIG_INVALID`. |
+| `--no-batch` (`docset generate`, `docset run`) | Force synchronous, overriding the config. |
+| `[generation] batch = true` | Make batch mode the default for `docset generate` and `docset run` in this workspace. Anything but a boolean is `GENERATION_CONFIG_INVALID`. |
 | `DGML_GENERATION__BATCH=true` | The same, from the environment (`true`/`false`, `1`/`0`, `yes`/`no`). |
 | `--no-batch-label` (`docset generate`) | Label with ordinary synchronous calls under `--batch` (everything else still batches). `--batch-label` forces batch labeling over a `false` config. Needs `--batch`. |
 | `[generation] batch_label = false` | Make synchronous labeling the default under batch mode (default `true`; `DGML_GENERATION__BATCH_LABEL`). Anything but a boolean is `GENERATION_CONFIG_INVALID`. |

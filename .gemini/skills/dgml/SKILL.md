@@ -576,8 +576,8 @@ Never use `--batch` on an interactive request: use it for nightly or bulk
 ingestion.
 
 **Don't hold a process open for a day: use job mode.** Add `--no-wait` to any
-`--batch` command (`docset generate`, `extraction extract`, `extraction
-generate-schema`, `file add <dir>`): it submits the wave and exits 0 with a
+`--batch` command (`docset generate`, `docset run`, `extraction extract`,
+`extraction generate-schema`, `file add <dir>`): it submits the wave and exits 0 with a
 `batch_job` payload. Check with `dgml batch status <job_id>` (read-only) and
 run `dgml batch resume <job_id>` only when it says `ready`; each resume
 replays what came back at no cost, collects open batches (never resubmits)
@@ -622,6 +622,40 @@ prune` keeps the job until then (listed in `settling`).
 ```bash
 job=$(uv run dgml docset generate "$ds" --batch --no-wait --batch-deadline 6h | jq -r .batch_job.job_id)
 ```
+
+**A whole docset, overnight, in one command.** `dgml docset run` chains the
+extraction schema (only when the docset has none, from `--schema-from`
+samples), `docset generate`, and `extraction extract --all`, each exactly as
+the standalone command runs, with the step payloads nested under `.steps`.
+Under `--batch --no-wait` the entire pipeline is **one** job: each
+`batch resume` continues whichever step is waiting (or pauses again if its
+batch is still running), finished steps replay free, and `batch status`
+reports `.step` (`schema`, `generate`, `extract`, or `completed`). Pass-through
+options (`--window-size`, `--thinking`, `--model`, …) are checked for every
+step before the first one runs, so a bad value fails at once with
+`INVALID_ARGUMENT` instead of after the schema step has paid. Prefer it to
+chaining the three commands yourself for an unattended run: one job id to
+track, one cron entry.
+
+```bash
+job=$(uv run dgml docset run "$ds" --schema-from "$sample_fid" --batch --no-wait \
+  | jq -r .batch_job.job_id)
+# cron every 15-30 min (one resume at a time per job); remove the entry once
+# status is `completed` — resuming a completed job fails with BATCH_JOB_INVALID:
+[ "$(uv run dgml batch status "$job" | jq -r .status)" = ready ] || exit 0
+out=$(uv run dgml batch resume "$job")
+echo "$out" | jq -e .batch_job >/dev/null \
+  || echo "$out" | jq '{schema: .steps.schema.skipped, generate: .steps.generate.summary, extract: .steps.extract.summary, waves: .batch.waves}'
+```
+
+A step that fails as a whole (for example `EMPTY_DOCSET`) fails the run with
+that step's error code (`INTERNAL_ERROR` for an unexpected error) and
+`error.details.step`; per-file failures stay per file in the step's payload.
+Under `--batch`, a step that ran no batch shows `.batch.steps.<step>.skipped`
+as a string reason. With no schema and no `--schema-from`, extraction
+is skipped (`.steps.extract.skipped`), never guessed. In `docset run`,
+`BATCH_JOB_NONDETERMINISTIC` stops the run at that step (`error.details.step`):
+no later step runs.
 
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding

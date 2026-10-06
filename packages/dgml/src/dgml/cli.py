@@ -31,7 +31,7 @@ import sys
 import tempfile
 import tomllib
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -102,7 +102,8 @@ if TYPE_CHECKING:
 
 class _Capture:
     """What a run emitted, held back instead of printed (see
-    :func:`_begin_job_capture`)."""
+    :func:`_begin_job_capture`), or what one ``docset run`` step emitted (see
+    :func:`_capturing`)."""
 
     def __init__(self) -> None:
         self.payloads: list[dict[str, Any]] = []
@@ -113,6 +114,19 @@ class _Capture:
 #: closed; its stdout payloads / stderr error envelopes land here. None
 #: otherwise.
 _CAPTURE: _Capture | None = None
+
+
+@contextlib.contextmanager
+def _capturing() -> Iterator[_Capture]:
+    """Hold what is emitted inside the block in a fresh :class:`_Capture`
+    (``docset run`` drives each step's handler unchanged and nests its
+    payload), restoring the previous capture after."""
+    global _CAPTURE
+    prev, _CAPTURE = _CAPTURE, _Capture()
+    try:
+        yield _CAPTURE
+    finally:
+        _CAPTURE = prev
 
 
 # The CLI's own logger (``dgml.cli``); routed to stderr with the library's by
@@ -176,6 +190,12 @@ def _format_scalar(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def _error_details(exc: BaseException) -> dict[str, Any] | None:
+    """The ``error.details`` an error carries itself, if any."""
+    details = getattr(exc, "details", None)
+    return dict(details) if isinstance(details, Mapping) and details else None
 
 
 def _emit_error(
@@ -579,6 +599,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="docset_command", required=True
     )
     _add_generate_subparser(docset, common)
+    _add_run_subparser(docset, common)
     ds_create = docset.add_parser("create", parents=[common], help="Create a new DocSet.")
     ds_create.add_argument("--name", required=True)
     ds_create.add_argument("--description", default="")
@@ -2479,10 +2500,18 @@ def _left_behind(session: Any) -> dict[str, Any] | None:
 
 def _emit_nondeterministic(guard: BatchJobNondeterministic, session: Any, fmt: str) -> int:
     """The nondeterminism guard's error envelope, naming the job it left
-    (failed, its in-flight batches kept)."""
-    job = _left_behind(session)
-    details = {"batch": {"job": job}} if job is not None else None
-    return _emit_error(guard.code, str(guard), fmt, details=details)
+    (failed, its in-flight batches kept) and, in `docset run`, the step."""
+    details: dict[str, Any] = {}
+    if session is not None:
+        from dgml_core.batch.jobs import RUN_STEP_STATE
+
+        step = session.state.get(RUN_STEP_STATE)
+        if step is not None:
+            details["step"] = step
+        job = _left_behind(session)
+        if job is not None:
+            details["batch"] = {"job": job}
+    return _emit_error(guard.code, str(guard), fmt, details=details or None)
 
 
 def _emit_lease_lost(lost: BatchJobLeaseLost, session: Any, fmt: str) -> int:
@@ -2596,6 +2625,12 @@ def _start_batch_job(
     batch resume`` instead of paying again — and its payload is unchanged.
     ``--no-wait`` makes the run stop once a wave is submitted; ``--job``
     continues an existing job. Closed by :func:`_dispatch_with_job`."""
+    if getattr(args, "run_step", False):
+        # A step of `docset run`: the run opened the job (one job spans every
+        # step, so `dgml batch resume` replays the whole pipeline).
+        session = _active_batch_job()
+        if session is not None:
+            return session
     from dgml_core.batch import start_session
 
     # Stored canonical (abbreviated flags spelled in full): resume and the
@@ -3912,6 +3947,100 @@ def _add_generate_subparser(
     )
 
 
+#: `docset run` options handed through, verbatim, to the step that owns them:
+#: (flag, argparse dest, takes a value, step). Declared once so the run parser
+#: and the argv each step is parsed from cannot drift apart (a test pins this
+#: table to the step parsers); every value is re-parsed by the step's own
+#: parser, so types and defaults stay the step's. A valueless flag is a
+#: ``store_true`` switch, unless it is in :data:`_RUN_BOOLEAN_OPTIONAL` (a
+#: ``--flag/--no-flag`` pair whose unset value is None and is not passed on).
+_RUN_PASSTHROUGH: tuple[tuple[str, str, bool, str], ...] = (
+    ("--generation-config", "generation_config", True, "generate"),
+    ("--model", "model", True, "generate"),
+    ("--label-model", "label_model", True, "generate"),
+    ("--window-size", "window_size", True, "generate"),
+    ("--temperature", "temperature", True, "generate"),
+    ("--max-tokens", "max_tokens", True, "generate"),
+    ("--thinking", "thinking", True, "generate"),
+    ("--no-coverage", "no_coverage", False, "generate"),
+    ("--cache-dir", "cache_dir", True, "generate"),
+    ("--max-parallel-calls", "max_parallel_calls", True, "generate"),
+    ("--schema-path", "schema_path", True, "generate"),
+    ("--extend-schema", "extend_schema", False, "generate"),
+    ("--no-roster", "no_roster", False, "generate"),
+    ("--no-semlinks", "no_semlinks", False, "generate"),
+    ("--no-semlink-cache", "no_semlink_cache", False, "generate"),
+    ("--no-semlink-verify", "no_semlink_verify", False, "generate"),
+    ("--schema-model", "schema_model", True, "schema"),
+    ("--values-model", "values_model", True, "extract"),
+    ("--values-effort", "values_effort", True, "extract"),
+)
+_RUN_BOOLEAN_OPTIONAL: frozenset[str] = frozenset()
+
+_RUN_STEP_COMMANDS = {
+    "generate": "`docset generate`",
+    "schema": "`extraction generate-schema`",
+    "extract": "`extraction extract`",
+}
+
+
+def _add_run_subparser(
+    docset_subparsers: argparse._SubParsersAction,  # type: ignore[type-arg]
+    common: argparse.ArgumentParser,
+) -> None:
+    """Register `docset run`: the whole docset pipeline in one command."""
+    run = docset_subparsers.add_parser(
+        "run",
+        parents=[common],
+        help=(
+            "Run the whole docset pipeline: generate the extraction schema (when "
+            "--schema-from is given and the docset has none), `docset generate`, "
+            "then `extraction extract --all`. With --batch every step uses the "
+            "provider's batch API under one batch job."
+        ),
+    )
+    run.add_argument("docset_id", help="ID of the DocSet to run the pipeline over.")
+    run.add_argument(
+        "--schema-from",
+        dest="schema_from",
+        action="append",
+        default=None,
+        metavar="FILE_ID",
+        help=(
+            "Sample file for generating the extraction schema, repeatable. Used only "
+            "when the docset has no extraction schema yet; without it, and with no "
+            "schema, extraction is skipped (the payload says why)."
+        ),
+    )
+    run.add_argument("--no-generate", action="store_true", help="Skip the `docset generate` step.")
+    run.add_argument(
+        "--no-extract",
+        action="store_true",
+        help="Skip extraction (and so schema generation).",
+    )
+    for flag, dest, takes_value, step in _RUN_PASSTHROUGH:
+        what = f"Passed to {_RUN_STEP_COMMANDS[step]}."
+        if takes_value:
+            run.add_argument(flag, dest=dest, default=None, help=what)
+        elif flag in _RUN_BOOLEAN_OPTIONAL:
+            run.add_argument(
+                flag, dest=dest, action=argparse.BooleanOptionalAction, default=None, help=what
+            )
+        else:
+            run.add_argument(flag, dest=dest, action="store_true", help=what)
+    _add_batch_arguments(
+        run,
+        what="every step's model",
+        optional=True,
+        extra=(
+            " The whole pipeline is ONE batch job: with --no-wait, `dgml batch resume "
+            "<job_id>` advances it step by step. A model with no batch backend is "
+            "rejected before any step runs (BATCH_UNAVAILABLE, naming the stage). "
+            "Defaults to [generation] batch; --no-batch forces synchronous."
+        ),
+    )
+
+
 #: Distinct rejected concept names reported per file in `unmatched_concepts`.
 #: Enough to recognize the pattern (aliases? new roles? junk?) without turning
 #: a JSON payload into a log.
@@ -5021,11 +5150,308 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     return 0
 
 
+#: Job state recording whether a `docset run` job had to generate the
+#: extraction schema when it STARTED (the schema step writes the schema, so a
+#: resumed run must not re-decide from the store — it replays the step instead).
+_RUN_SCHEMA_NEEDED_STATE = "run.schema_needed"
+
+#: Counters summed across steps for `docset run`'s aggregate `batch` block.
+_RUN_BATCH_COUNTERS = (
+    "waves",
+    "batches",
+    "requests",
+    "batch_ok",
+    "sync_fallbacks",
+    "resubmitted",
+    "failed",
+)
+
+
+def _run_step_argv(args: argparse.Namespace, step: str) -> list[str]:
+    """The options `docset run` hands to *step*, as command-line tokens."""
+    out: list[str] = []
+    for flag, dest, takes_value, owner in _RUN_PASSTHROUGH:
+        if owner != step:
+            continue
+        value = getattr(args, dest)
+        if takes_value and value is not None:
+            out += [flag, str(value)]
+        elif flag in _RUN_BOOLEAN_OPTIONAL and value is not None:
+            out.append(flag if value else f"--no-{flag[2:]}")
+        elif not takes_value and value:
+            out.append(flag)
+    return out
+
+
+def _run_step_argvs(args: argparse.Namespace, *, batch: bool) -> dict[str, list[str]]:
+    """Every step's command line, as `docset run` runs it (the schema step's
+    only when there are ``--schema-from`` files to generate it from)."""
+    batch_tokens = ["--batch", "--batch-poll-interval", str(args.batch_poll_interval)]
+    argvs: dict[str, list[str]] = {}
+    if args.schema_from:
+        argv = ["extraction", "generate-schema", args.docset_id]
+        for fid in args.schema_from:
+            argv += ["--from-file", fid]
+        argv += _run_step_argv(args, "schema")
+        argvs["schema"] = argv + (batch_tokens if batch else [])
+    argv = ["docset", "generate", args.docset_id, *_run_step_argv(args, "generate")]
+    # --no-batch: a sync run stays sync whatever [generation] batch says.
+    argvs["generate"] = argv + (batch_tokens if batch else ["--no-batch"])
+    argv = ["extraction", "extract", args.docset_id, "--all", *_run_step_argv(args, "extract")]
+    argvs["extract"] = argv + (batch_tokens if batch else [])
+    return argvs
+
+
+def _parse_run_step(step: str, argv: list[str]) -> argparse.Namespace:
+    """Parse one `docset run` step's command line with the step's own parser.
+
+    A bad pass-through value (``--window-size abc``) raises INVALID_ARGUMENT
+    naming the step and the flag, instead of argparse's usage text and exit 2."""
+    try:
+        return _parse_quietly(argv)
+    except _ArgvRejected as exc:
+        raise InvalidArgument(f"docset run: invalid option for step '{step}': {exc}") from None
+
+
+def _sum_cost_fields(parts: Iterable[Mapping[str, Any]]) -> dict[str, float | None]:
+    """Add up blocks' cost fields; ``null`` if any block's is unknown."""
+    blocks = list(parts)
+    if any(b.get("cost_usd") is None for b in blocks):
+        return {"cost_usd": None, "standard_cost_usd": None, "saved_usd": None}
+    cost = sum(float(b["cost_usd"]) for b in blocks)
+    standard = sum(float(b["standard_cost_usd"]) for b in blocks)
+    return {
+        "cost_usd": round(cost, 6),
+        "standard_cost_usd": round(standard, 6),
+        "saved_usd": round(standard - cost, 6),
+    }
+
+
+def _run_step_batch_stats(step: str, payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One step's batch counters (``generate`` sums its stages), or None when
+    the step ran no batch."""
+    block = payload.get("batch")
+    if not isinstance(block, Mapping):
+        return None
+    parts: list[Mapping[str, Any]]
+    if step == "generate":
+        stages = block.get("stages") or {}
+        parts = [v for v in stages.values() if isinstance(v, Mapping) and "waves" in v]
+    else:
+        parts = [block]
+    out: dict[str, Any] = {
+        k: sum(int(p.get(k, 0) or 0) for p in parts) for k in _RUN_BATCH_COUNTERS
+    }
+    out.update(_sum_cost_fields(parts))
+    return out
+
+
+def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
+    """``docset run``: extraction schema (if needed), ``docset generate``, then
+    ``extraction extract --all`` — each step is the standalone command's own
+    handler, run unchanged, its payload nested under ``steps``.
+
+    Under ``--batch`` the whole run is ONE batch job: every step's executor
+    replays from and records into it, so ``--no-wait`` pauses at whichever
+    step first has a wave in flight and ``dgml batch resume`` re-runs the
+    pipeline, replaying completed steps' responses from the job at no cost.
+    Which steps a job runs is decided when it starts and replayed after, so a
+    step's own writes (the schema it stores, the DGML generate writes) never
+    turn a resumed run into a different one."""
+    from dgml_core.generation import load_generation_batch, resolve_generation_config
+    from dgml_core.grounded import (
+        load_grounded_config,
+        parse_values_reasoning_effort,
+        schema_batch_request,
+        values_batch_stages,
+    )
+
+    ds_store = DocSetStore(ws)
+    ds_store.get(args.docset_id)  # raises DocSetNotFound
+    batch = args.batch if args.batch is not None else load_generation_batch(ws)
+    if not batch:
+        _reject_job_flags_without_batch(args)
+
+    want_extract = not args.no_extract
+    has_schema = ds_store.has_schema(args.docset_id)
+    schema_needed = want_extract and not has_schema
+
+    prefix = ["--format", "json"]
+    if args.verbose:
+        prefix.append("--verbose")
+    if args.debug:
+        prefix.append("--debug")
+    # Every step that may run is parsed now, before any step (or batch job)
+    # starts: a bad pass-through value fails the run up front as
+    # INVALID_ARGUMENT, not after an earlier step already paid.
+    step_argvs = _run_step_argvs(args, batch=batch)
+    may_run = {"schema": want_extract, "generate": not args.no_generate, "extract": want_extract}
+    for name, argv in step_argvs.items():
+        if may_run[name]:
+            _parse_run_step(name, prefix + argv)
+    # Its value is only checked by the extract step's handler, which runs last:
+    # refuse a bad one (GROUNDED_CONFIG_INVALID) before generate pays.
+    values_effort = (
+        parse_values_reasoning_effort(args.values_effort, source="--values-effort")
+        if want_extract and args.values_effort is not None
+        else None
+    )
+
+    session = None
+    if batch:
+        # Every model a planned step will send to a batch, checked before any
+        # work: the first offending stage is named (BATCH_UNAVAILABLE).
+        from dataclasses import replace
+
+        stages: dict[str, Any] = {}
+        # Only an extraction that will actually run needs the grounded config.
+        extracting = want_extract and (has_schema or bool(args.schema_from))
+        grounded = load_grounded_config(ws) if extracting else None
+        if grounded is not None and args.schema_model:
+            grounded = replace(grounded, schema_model=args.schema_model)
+        if grounded is not None and args.values_model:
+            grounded = replace(grounded, values_model=args.values_model)
+        if grounded is not None and args.values_effort is not None:
+            grounded = replace(grounded, values_reasoning_effort=values_effort)
+        # A resumed job may already have written the schema it set out to
+        # generate, so check the schema model whenever the run could make one.
+        if grounded is not None and args.schema_from and (schema_needed or args.job):
+            stages["schema"] = schema_batch_request(grounded.schema_model)
+        if not args.no_generate:
+            gen_cfg, _source = resolve_generation_config(
+                ws, config=args.generation_config, model=args.model, label_model=args.label_model
+            )
+            # As `docset generate` checks: transcription, and the labeling model
+            # (planning, descriptions and closed-vocabulary labeling batch).
+            stages["generate.transcribe"] = gen_cfg.model
+            stages["generate.label"] = gen_cfg.label_model
+            from dgml_core.style_config import load_style_config
+
+            style_section = load_style_config(ws)
+            if style_section is not None:
+                stages["generate.style"] = style_section.model  # OCR files' image style
+            if not args.no_semlinks:
+                stages["generate.links"] = gen_cfg.label_model
+        if grounded is not None and (has_schema or args.schema_from):
+            stages.update(
+                values_batch_stages(
+                    grounded.values_model, grounded.values_reasoning_effort, stage="extract"
+                )
+            )
+        _batch_preflight(stages)
+        session = _start_batch_job(args, ws, command="docset run")
+        schema_needed = bool(session.state.setdefault(_RUN_SCHEMA_NEEDED_STATE, schema_needed))
+        session.persist()
+
+    steps: dict[str, Any] = {}
+
+    def run_step(
+        name: str, argv: list[str], handler: Callable[[argparse.Namespace, Workspace, str], int]
+    ) -> int:
+        """Run one step's command handler; 0 with its payload recorded under
+        ``steps[name]``, else the step's error re-emitted naming the step."""
+        if session is not None:
+            from dgml_core.batch.jobs import RUN_STEP_STATE
+
+            session.state[RUN_STEP_STATE] = name
+            session.persist()
+        sub_args = _parse_run_step(name, prefix + argv)
+        sub_args.raw_argv = []
+        sub_args.run_step = True  # reuse this run's batch job (see _start_batch_job)
+        error: dict[str, Any] | None = None
+        own: dict[str, Any] = {}  # details the raised error carries itself
+        with _capturing() as captured:
+            try:
+                rc = handler(sub_args, ws, "json")
+            except DgmlError as exc:
+                rc, error = 1, {"code": exc.code, "message": str(exc)}
+                own = _error_details(exc) or {}
+            except Exception as exc:
+                # Not a DgmlError (a bug, an unexpected provider error): still
+                # INTERNAL_ERROR, but naming the step like any step failure.
+                if _verbose_enabled(args):
+                    import traceback
+
+                    traceback.print_exc()
+                rc, error = 1, {"code": "INTERNAL_ERROR", "message": short_error_message(exc)}
+        if rc == 0 and captured.payloads:
+            steps[name] = captured.payloads[-1]
+            return 0
+        if error is None:
+            envelope = captured.errors[-1] if captured.errors else {}
+            error = envelope.get("error") or {
+                "code": "INTERNAL_ERROR",
+                "message": f"step '{name}' produced no result",
+            }
+        return _emit_error(
+            str(error["code"]),
+            f"docset run: step '{name}' failed: {error['message']}",
+            fmt,
+            details={**own, "step": name, "completed_steps": sorted(steps)},
+        )
+
+    # 1. Extraction schema.
+    if not want_extract:
+        steps["schema"] = {"skipped": "--no-extract"}
+    elif schema_needed and not args.schema_from:
+        steps["schema"] = {
+            "skipped": (
+                "the docset has no extraction schema and no --schema-from sample files were given"
+            )
+        }
+    elif schema_needed:
+        rc = run_step("schema", step_argvs["schema"], _extraction_cmd)
+        if rc != 0:
+            return rc
+    else:
+        steps["schema"] = {"skipped": "the docset already has an extraction schema"}
+
+    # 2. DGML generation.
+    if args.no_generate:
+        steps["generate"] = {"skipped": "--no-generate"}
+    else:
+        rc = run_step("generate", step_argvs["generate"], _docset_cmd)
+        if rc != 0:
+            return rc
+
+    # 3. Extraction.
+    if not want_extract:
+        steps["extract"] = {"skipped": "--no-extract"}
+    elif schema_needed and "skipped" in steps["schema"]:
+        steps["extract"] = {"skipped": "the docset has no extraction schema"}
+    else:
+        rc = run_step("extract", step_argvs["extract"], _extraction_cmd)
+        if rc != 0:
+            return rc
+
+    payload: dict[str, Any] = {"docset_id": args.docset_id, "steps": steps}
+    if batch:
+        per_step: dict[str, Any] = {}
+        for name, step_payload in steps.items():
+            stats = _run_step_batch_stats(name, step_payload)
+            if stats is None:
+                # A string reason, as every other `skipped` in a batch block.
+                reason = step_payload.get("skipped")
+                stats = {"skipped": str(reason) if reason else "the step ran no batch"}
+            per_step[name] = stats
+        ran = [v for v in per_step.values() if "skipped" not in v]
+        totals = {k: sum(int(v.get(k, 0)) for v in ran) for k in _RUN_BATCH_COUNTERS}
+        payload["batch"] = {"enabled": True, **totals, **_sum_cost_fields(ran), "steps": per_step}
+        if session is not None:
+            from dgml_core.batch.jobs import RUN_STEP_STATE
+
+            session.state[RUN_STEP_STATE] = "completed"
+    _emit(payload, fmt)
+    return 0
+
+
 def _docset_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     store = DocSetStore(ws)
     sub = args.docset_command
     if sub == "generate":
         return _docset_generate_cmd(args, ws, fmt)
+    if sub == "run":
+        return _docset_run_cmd(args, ws, fmt)
     if sub == "create":
         ds = store.create(
             name=args.name,
