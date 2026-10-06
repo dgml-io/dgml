@@ -2802,7 +2802,7 @@ passed:
 
 - every open provider batch of the current wave is canceled; the run waits a
   bounded, per-provider time for each cancel to settle (the backend's
-  `cancel_settle_s`: Anthropic 450 s, Gemini 60 s; 180 s for a backend that declares none;
+  `cancel_settle_s`: Anthropic 450 s, Gemini 60 s, OpenAI 660 s; 180 s for a backend that declares none;
   polled every 10 s; see [Batch mode](batch-mode.md#batch-deadline)) and
   collects the results the provider had already produced. Those requests keep
   their batch result, at batch price;

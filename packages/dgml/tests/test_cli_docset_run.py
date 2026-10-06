@@ -431,6 +431,56 @@ def test_batch_unavailable_names_the_offending_step(
     assert list_jobs(Workspace(root=ws)) == []  # rejected before any job existed
 
 
+def test_batch_refuses_responses_api_routing_before_any_step(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """X2: a model (or an extraction request shape) litellm routes to the
+    OpenAI Responses API cannot batch; the run is refused before any step
+    pays, not when the step's first request is encoded."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    cases = (
+        ("--values-model", "openai/gpt-5.4", "extract"),  # tools + reasoning_effort bridge
+        ("--model", "openai/gpt-5-pro", "generate.transcribe"),  # responses-only model
+    )
+    for flag, model, step in cases:
+        with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+            rc = main(_run_argv(ws, did, flag, model, "--batch"))
+        assert rc == 1
+        err = _read_stderr(capsys)["error"]
+        assert err["code"] == "BATCH_UNAVAILABLE", err
+        assert f"stage '{step}'" in err["message"]
+        assert "Responses API" in err["message"]
+    assert list_jobs(Workspace(root=ws)) == []  # rejected before any job existed
+
+
+def test_batch_preflight_uses_the_values_effort(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The extract pre-flight is fed `--values-effort`: a named effort routes
+    gpt-5.4's value-extraction request (stage `extract`); `default` sends none
+    there, but location grounding still sends its own, so the refusal names
+    `extract.locations`. Both before any step or job."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    for effort, stage in (("low", "extract"), ("default", "extract.locations")):
+        with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+            rc = main(
+                _run_argv(
+                    ws,
+                    did,
+                    "--values-model",
+                    "openai/gpt-5.4",
+                    "--values-effort",
+                    effort,
+                    "--batch",
+                )
+            )
+        assert rc == 1
+        err = _read_stderr(capsys)["error"]
+        assert err["code"] == "BATCH_UNAVAILABLE", err
+        assert f"stage '{stage}' " in err["message"]
+    assert list_jobs(Workspace(root=ws)) == []
+
+
 def test_unknown_values_effort_fails_the_run_before_any_step(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

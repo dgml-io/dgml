@@ -505,12 +505,16 @@ def test_each_backend_declares_its_measured_cancel_settle_wait() -> None:
     from dgml_core.batch.anthropic import AnthropicBatchBackend
     from dgml_core.batch.deadline import CANCEL_SETTLE_S, cancel_settle_s
     from dgml_core.batch.gemini import GeminiBatchBackend
+    from dgml_core.batch.openai import OpenAIBatchBackend
 
     assert AnthropicBatchBackend.cancel_settle_s == 450.0
     assert cancel_settle_s(AnthropicBatchBackend) == 450.0
     # Gemini ends a canceled job within seconds (measured 3-7 s): wait 60 s.
     assert GeminiBatchBackend.cancel_settle_s == 60.0
     assert cancel_settle_s(GeminiBatchBackend) == 60.0
+    # OpenAI settles on ~5-minute sweeps and keeps processing meanwhile: two sweeps.
+    assert OpenAIBatchBackend.cancel_settle_s == 660.0
+    assert cancel_settle_s(OpenAIBatchBackend) == 660.0
     # A backend without one (or with a nonsense value) keeps the old default.
     assert cancel_settle_s(object()) == CANCEL_SETTLE_S == 180.0
     backend = FakeBackend(_answer)

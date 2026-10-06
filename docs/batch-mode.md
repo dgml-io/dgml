@@ -72,8 +72,12 @@ stage sends both): litellm serves it through the OpenAI Responses API
 cancel on sweeps of about five minutes (measured at about 5 and 10 minutes, and
 up to about 25 minutes in a larger run), and it *keeps processing* the batch
 while it is `cancelling`: in one measured batch, 2 of 20 requests were done at
-cancel and 19 of 20 by the time it ended, all of them billed. Until the cancel
-settles, `dgml batch status` reports the batch's cleanup as `pending`.
+cancel and 19 of 20 by the time it ended, all of them billed. Under
+`--batch-deadline` the run waits 660 s (two sweeps) for the cancel to settle
+and collects what the batch produced; a cancel still unsettled after that keeps
+its batch record as `settling`, its requests run synchronously and count in
+`possibly_double_billed` (see [`--batch-deadline`](#batch-deadline)). Until the
+cancel settles, `dgml batch status` reports the batch's cleanup as `pending`.
 
 Batch mode **never falls back to a full-price synchronous run** because a
 provider is unsupported. You get an error naming the stage and model instead,
@@ -331,7 +335,7 @@ settling cancel every 10 s. Live measurements (2026-09-30):
 | provider | measured cancel → ended |
 |---|---|
 | Anthropic (wait 450 s) | bimodal: ≤ 50 s, or 280–385 s; no work done while `canceling` |
-| OpenAI | ~306 s or ~606 s (one or two ~5-minute sweeps); up to ~25 min in a later scale run |
+| OpenAI (wait 660 s) | ~306 s or ~606 s (one or two ~5-minute sweeps); up to ~25 min in a later scale run |
 | Gemini (wait 60 s) | 3–7 s |
 
 **The wait is not an upper bound.** An OpenAI cancel took up to about 25

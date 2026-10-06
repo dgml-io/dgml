@@ -613,7 +613,7 @@ a different duration on a resume is `BATCH_JOB_INVALID`. The payload's
 `collected_after_cancel`, `sync_after_deadline` and `possibly_double_billed`;
 `dgml batch status` shows `deadline: {at, expired}`, and so does a paused
 run's `batch_job` block. Canceling can take minutes: the run waits a
-per-provider time for each cancel to settle (Anthropic 450 s, Gemini 60 s). A batch still
+per-provider time for each cancel to settle (Anthropic 450 s, Gemini 60 s, OpenAI 660 s). A batch still
 canceling after that wait has its requests run synchronously; a provider that
 keeps processing while canceling (OpenAI does) may bill those twice.
 `possibly_double_billed` counts them and a WARNING names the batch. The job
