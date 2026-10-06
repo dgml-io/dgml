@@ -135,6 +135,10 @@ class BatchOptions:
     min_wave_size: int = 1
     log: Callable[[str], None] | None = None
     stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: role ("transcribe" / "label") → the non-secret credential reference a
+    #: batch job records with each provider batch (see
+    #: :func:`dgml_core.batch.jobs.credential_ref`). Empty = none recorded.
+    credentials: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def make_batch_executor(
@@ -144,6 +148,7 @@ def make_batch_executor(
     api_key: str | None,
     api_base: str | None,
     log: Callable[[str], None] = lambda _m: None,
+    role: str = "transcribe",
 ) -> BatchExecutor:
     """A :class:`~dgml_core.batch.BatchExecutor` over *model*'s batch backend.
 
@@ -162,6 +167,7 @@ def make_batch_executor(
         max_poll_s=batch.max_poll_s,
         min_wave_size=batch.min_wave_size,
         log=batch.log or log,
+        credential=batch.credentials.get(role),
     )
 
 
@@ -192,7 +198,7 @@ def batch_single_call_runner(
 
         try:
             executor = make_batch_executor(
-                batch, model=config.model, api_key=api_key, api_base=api_base, log=log
+                batch, model=config.model, api_key=api_key, api_base=api_base, log=log, role="label"
             )
         except BaseException:
             steps.close()
@@ -640,10 +646,27 @@ def _transcribe_batched(
         log(f"[transcribe] {path.name} FAILED: {exc}; skipping")
         transcribe_errors[path.name] = short_error_message(exc)
 
+    from dgml_core.batch.jobs import active_session
+
+    job = active_session()
+
+    def load(path: Path) -> bytes:
+        def convert() -> bytes:
+            return document.load_document_as_pdf(path, converters=opts.converters or {})
+
+        on_demand = path.suffix.lower() != ".pdf" and not path.with_suffix(".pdf").exists()
+        if job is None or not on_demand:
+            return convert()
+        # A document converted on demand (no PDF persisted at ingest) is not
+        # byte-reproducible either; pin it to the job so its slices are.
+        data = job.rewind_input(f"generate/converted/{path.name}.pdf", convert)
+        assert data is not None
+        return bytes(data)
+
     units: list[Unit] = []
     for path in paths:
         try:
-            pdf_bytes = document.load_document_as_pdf(path, converters=opts.converters or {})
+            pdf_bytes = load(path)
         except Exception as exc:
             failed(path, exc)
             continue
@@ -747,6 +770,7 @@ def _batch_labeler(
             api_key=opts.label_api_key,
             api_base=opts.label_api_base,
             log=log,
+            role="label",
         )
         log(f"Pass B: labeling {len(units)} doc(s) as one batch stage (the roster is fixed)")
         outcomes = run_stage(units, executor, log=log, stage="label")

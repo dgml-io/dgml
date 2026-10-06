@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 from dgml_core import auto_classify, classify_bulk_batch, prepare_bulk_classify
 from dgml_core.auto_classification import classification_block, soft_error
-from dgml_core.batch import FakeBackend, provider_of, register_backend
+from dgml_core.batch import FakeBackend, fake_model_response, provider_of, register_backend
 from dgml_core.batch import registry as batch_registry
 from dgml_core.classification import ClassificationConfig
 from dgml_core.docsets import DocSetStore
@@ -127,3 +127,71 @@ def test_soft_errors_keep_the_sync_format() -> None:
     assert soft_error(RuntimeError("boom")) == "RuntimeError: boom"
     block = classification_block(ClassificationConfig(model=DEFAULT_TEST_MODEL))
     assert block["performed"] is True and block["error"] is None
+
+
+def test_a_resumed_job_reuses_the_docsets_it_created(tmp_path: Path) -> None:
+    """A ``--no-wait`` job pauses after each file's wave; every resume replays
+    the earlier files' replies and must re-use the DocSets they created (their
+    ids are in later requests) instead of creating them again, and must not
+    submit any request twice."""
+    from dgml_core.auto_classification import CREATED_DOCSETS_STATE
+    from dgml_core.batch.jobs import BatchJobStore, start_session
+    from dgml_core.errors import BatchPending
+
+    from .test_classification import _create_new_args
+
+    ws = _ws(tmp_path / "ws")
+    _invoices, fids = _seed_many(ws, 2)
+    cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
+    names = iter(["Purchase Orders", "Packing Slips"])
+    replies: dict[str, Any] = {}
+
+    def script(request: Any) -> Any:
+        # One fixed reply per distinct request: a replayed request is never
+        # asked twice, and a new one gets a new DocSet name.
+        # A real ModelResponse: a job stores (and later replays) only those.
+        key = json.dumps(request.kwargs["messages"], sort_keys=True, default=str)
+        if key not in replies:
+            args = json.dumps(_create_new_args(name=next(names)))
+            call = {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "create_new_docset", "arguments": args},
+            }
+            replies[key] = fake_model_response("", tool_calls=[call])
+        return replies[key]
+
+    provider = provider_of(DEFAULT_TEST_MODEL)
+    backend = FakeBackend(script, provider=provider, polls_until_ended=1)
+    register_backend(provider, lambda _cfg: backend)
+    initial = [ds.id for ds in DocSetStore(ws).list_all()]
+    job_id: str | None = None
+    entries: list[dict[str, Any]] = []
+    pauses = 0
+    for _ in range(10):
+        session = start_session(ws, command="file add", argv=["t"], job_id=job_id, wait=False)
+        job_id = session.job_id
+        store = DocSetStore(ws)
+        docsets = [store.get(i) for i in initial]  # what the job started with
+        state = prepare_bulk_classify(ws, config=cfg, docsets=docsets, poll_interval_s=0)
+        entries = [{} for _ in fids]
+        state.pending.extend(zip(entries, _added(ws, fids), strict=True))
+        try:
+            classify_bulk_batch(ws, state, config=cfg, docsets=docsets, allow_new=True)
+        except BatchPending as exc:
+            pauses += 1
+            session.close(exc)
+            continue
+        session.close(None)
+        break
+    assert pauses == 2  # one wave per file
+    submitted = [
+        json.dumps(r.kwargs, sort_keys=True, default=str) for w in backend.submitted for r in w
+    ]
+    assert len(submitted) == len(set(submitted)) == 2  # each request submitted once
+    made = [ds.name for ds in DocSetStore(ws).list_all() if ds.id not in initial]
+    assert sorted(made) == ["Packing Slips", "Purchase Orders"]  # none created twice
+    assert [e["classification"]["decision"] for e in entries] == ["new", "new"]
+    assert job_id is not None
+    assert BatchJobStore(ws, job_id).load().status == "completed"
+    assert CREATED_DOCSETS_STATE == "classify_created_docsets"

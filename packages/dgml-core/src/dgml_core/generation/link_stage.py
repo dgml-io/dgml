@@ -48,6 +48,7 @@ from dgml_core.storage import Workspace
 from dgml_core.usage import OPERATION_LINKS
 
 if TYPE_CHECKING:
+    from dgml_core.batch.jobs import JobSession
     from dgml_core.generation.pipeline import BatchOptions
 
 
@@ -87,7 +88,9 @@ class LinkStage:
     runs on it). ``enabled=False`` (``--no-semlinks``) links nothing;
     ``verify=False`` (``--no-semlink-verify``) skips the review requests;
     ``use_cache=False`` (``--no-semlink-cache``) never replays a cached plan
-    (a fresh plan is still stored). ``log`` receives progress lines.
+    (a fresh plan is still stored). ``job`` is the batch job session the run
+    is under, if any: a plan the job cached itself is replayed from the job
+    rather than treated as a hit. ``log`` receives progress lines.
     """
 
     workspace: Workspace
@@ -99,6 +102,7 @@ class LinkStage:
     verify: bool = True
     use_cache: bool = True
     debug: bool = False
+    job: JobSession | None = None
     log: Callable[[str], None] = _no_log
 
     # -- shared by both drivers ------------------------------------------------
@@ -150,6 +154,11 @@ class LinkStage:
         """The plan's cache blob key and, on a hit, its cached bytes."""
         plan_key = f"{self.cache_key(source)}.json"
         hit = self.use_cache and self.workspace.blobs.blob_exists(plan_key)
+        if self.job is not None:
+            # A plan this job cached itself (an earlier run of it got this far
+            # before a later wave paused) is not a hit: the link requests replay
+            # from the job instead, so they are billed, once, when it completes.
+            hit = self.job.rewind_presence(f"generate/semlink/{plan_key}", hit)
         return plan_key, (self.workspace.blobs.get_blob(plan_key) if hit else None)
 
     def _apply(
@@ -294,6 +303,7 @@ class LinkStage:
                     api_key=self.api_key,
                     api_base=self.api_base,
                     log=self.log,
+                    role="label",
                 )
                 try:
                     results = run_stage(units, executor, log=self.log, stage="links")

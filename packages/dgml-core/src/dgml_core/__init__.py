@@ -31,6 +31,11 @@ from .errors import (
     AttestationInvalid,
     AuthError,
     BatchExecutionFailed,
+    BatchJobBusy,
+    BatchJobInvalid,
+    BatchJobLeaseLost,
+    BatchJobNondeterministic,
+    BatchJobNotFound,
     BatchUnavailable,
     ChainConfigError,
     ChainRpcFailed,
@@ -177,6 +182,15 @@ if TYPE_CHECKING:
         classify_bulk_batch,
         prepare_bulk_classify,
     )
+    from .batch.jobs import (
+        cancel_job,
+        delete_job,
+        job_status,
+        list_job_summaries,
+        prune_jobs,
+        resume_would_wait,
+        unlock_job,
+    )
     from .consistency import CheckReport, Issue, check_workspace
     from .generation.link_stage import LinkOutcome, LinkStage, StagedDocument
     from .grounded import ManyExtraction, extract_values_many
@@ -198,8 +212,8 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 #: client. Importing ``dgml_core.consistency`` directly, or touching any name
 #: below, still loads it exactly as before.
 #: The orchestration API below (auto-classification, multi-file extraction,
-#: the semantic-link stage) is lazy for the same reason, and so that
-#: ``dgml_core.batch`` is never on the default import path.
+#: the semantic-link stage, batch job management) is lazy for the same reason,
+#: and so that ``dgml_core.batch`` is never on the default import path.
 _LAZY_SUBMODULES = {
     "CheckReport": ".consistency",
     "Issue": ".consistency",
@@ -213,6 +227,13 @@ _LAZY_SUBMODULES = {
     "LinkOutcome": ".generation.link_stage",
     "LinkStage": ".generation.link_stage",
     "StagedDocument": ".generation.link_stage",
+    "cancel_job": ".batch.jobs",
+    "delete_job": ".batch.jobs",
+    "job_status": ".batch.jobs",
+    "list_job_summaries": ".batch.jobs",
+    "prune_jobs": ".batch.jobs",
+    "resume_would_wait": ".batch.jobs",
+    "unlock_job": ".batch.jobs",
 }
 
 
@@ -248,6 +269,11 @@ __all__ = [
     "AttestationInventory",
     "AuthError",
     "BatchExecutionFailed",
+    "BatchJobBusy",
+    "BatchJobInvalid",
+    "BatchJobLeaseLost",
+    "BatchJobNondeterministic",
+    "BatchJobNotFound",
     "BatchUnavailable",
     "BlobStore",
     "BulkClassifyBatch",
@@ -352,6 +378,7 @@ __all__ = [
     "attest_file",
     "attest_file_version",
     "auto_classify",
+    "cancel_job",
     "check_workspace",
     "classify_bulk_batch",
     "collect_file_version",
@@ -359,12 +386,15 @@ __all__ = [
     "create_workspace",
     "default_workspaces_root",
     "default_workspaces_store",
+    "delete_job",
     "export_attestation",
     "extract_values_many",
     "generate_unique_workspace_id",
     "is_record_id",
     "is_workspace_id",
+    "job_status",
     "layout",
+    "list_job_summaries",
     "load_conversion_config",
     "load_ocr_config",
     "load_pdf_config",
@@ -379,11 +409,14 @@ __all__ = [
     "new_workspace_id",
     "pending_migrations",
     "prepare_bulk_classify",
+    "prune_jobs",
     "read_attestation",
     "resolve_store_configs",
+    "resume_would_wait",
     "slice_pages",
     "stamp_schema_version",
     "storage_fingerprint",
+    "unlock_job",
     "verify_attestation_dir",
     "verify_bundle",
     "verify_file_version",

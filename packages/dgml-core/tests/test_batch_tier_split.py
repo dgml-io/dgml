@@ -31,8 +31,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from dgml_core import llm
+from dgml_core import llm, usage
 from dgml_core.batch import (
+    TIER_MARKER,
     BatchExecutor,
     BatchItemError,
     BatchRequest,
@@ -41,7 +42,7 @@ from dgml_core.batch import (
     run_stage,
 )
 from dgml_core.storage import Workspace
-from dgml_core.usage import TIER_BATCH, TIER_STANDARD, read_events
+from dgml_core.usage import BILLED_MARKER, TIER_BATCH, TIER_STANDARD, read_events
 
 from .conftest import FakeLLMResponse
 
@@ -293,4 +294,50 @@ def test_pooled_fallbacks_fold_identically_whatever_finishes_first(tmp_path: Pat
     assert [(r["tier"], r["cost_usd"]) for r in pooled_rows][:2] == [
         (TIER_BATCH, 0.1),
         (TIER_STANDARD, 0.1),
+    ]
+
+
+# ---- job mode: billed replays and buffered rows ----------------------------------
+
+
+def test_billed_replays_do_not_add_a_tier(tmp_path: Path) -> None:
+    """A replayed response an earlier run already billed contributes zero and
+    no tier: a scope of billed batch replies plus fresh standard ones is one
+    standard row, not a zero batch part."""
+    ws = Workspace(root=tmp_path)
+    cfg = _cfg(ws)
+    billed = FakeLLMResponse("x", cost=0.01, prompt_tokens=1)
+    billed._hidden_params.update({TIER_MARKER: TIER_BATCH, BILLED_MARKER: True})
+    fresh = FakeLLMResponse("y", cost=0.02, prompt_tokens=2)
+    fresh._hidden_params[TIER_MARKER] = TIER_STANDARD
+    replies = iter([billed, fresh])
+    with llm.record_usage_for(cfg):
+        for text in ("a", "b"):
+            llm.drive(
+                llm.steps_call(cfg, system_prompt="S", user_content=_text(text)),
+                cfg,
+                lambda _s: next(replies),
+            )
+    rows = read_events(ws)
+    assert len(rows) == 1
+    assert rows[0]["tier"] == TIER_STANDARD and rows[0]["context"] == {}
+    assert rows[0]["cost_usd"] == 0.02
+
+
+def test_buffered_rows_hold_every_part_until_flushed(tmp_path: Path) -> None:
+    ws = Workspace(root=tmp_path)
+    cfg = _cfg(ws)
+    ex = _executor(
+        {"a#1": FakeLLMResponse("x", cost=0.01), "a#2": "fallback"},
+        sync={"a2": FakeLLMResponse("y", cost=0.04)},
+    )
+    with usage.buffered_usage() as held:
+        run_stage([_two_calls(cfg, "a")], ex)
+        assert read_events(ws) == []
+        assert [event.tier for _ws, event in held] == [TIER_BATCH, TIER_STANDARD]
+        usage.flush_usage(held)
+    rows = read_events(ws)
+    assert [(r["tier"], r["cost_usd"]) for r in rows] == [
+        (TIER_BATCH, 0.01),
+        (TIER_STANDARD, 0.04),
     ]

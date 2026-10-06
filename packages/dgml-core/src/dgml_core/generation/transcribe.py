@@ -23,8 +23,10 @@ is appended to the previous window's last text block.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import re
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Callable
@@ -92,6 +94,12 @@ def blocks_to_json(blocks: list[Block]) -> str:
     return json.dumps([dataclasses.asdict(b) for b in blocks], indent=2, ensure_ascii=False)
 
 
+def blocks_cache_path(cache_dir: Path | str, doc_name: str) -> Path:
+    """Where *doc_name*'s transcription cache (``<stem>_blocks.json``) lives in
+    *cache_dir* — present means the next run skips transcribing it."""
+    return Path(cache_dir) / _UNSAFE_FNAME_RE.sub("_", f"{Path(doc_name).stem}_blocks.json")
+
+
 def _load_cached_blocks(cache_dir: Path | str | None, doc_name: str) -> list[Block] | None:
     """Reload a document's transcription from ``<stem>_blocks.json`` if present.
 
@@ -103,8 +111,7 @@ def _load_cached_blocks(cache_dir: Path | str | None, doc_name: str) -> list[Blo
     """
     if cache_dir is None:
         return None
-    stem = _UNSAFE_FNAME_RE.sub("_", f"{Path(doc_name).stem}_blocks.json")
-    blocks_file = Path(cache_dir) / stem
+    blocks_file = blocks_cache_path(cache_dir, doc_name)
     if not blocks_file.exists():
         return None
     try:
@@ -564,6 +571,41 @@ def _merge_payloads(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     return {"continues": str(a.get("continues", "") or ""), "blocks": blocks_a + blocks_b}
 
 
+def _active_batch_job() -> Any:
+    """The running batch job session, if any, without importing the batch
+    package (no session can exist unless ``dgml_core.batch.jobs`` is loaded)."""
+    jobs = sys.modules.get("dgml_core.batch.jobs")
+    return None if jobs is None else jobs.active_session()
+
+
+def _window_slice(
+    pdf_bytes: bytes, pages: list[int], *, pdf_config: PdfConfig | None, total: int
+) -> bytes:
+    """The PDF slice a window (or a split half) sends to the model.
+
+    Slicing is not byte-reproducible across processes: ghostscript's
+    ``pdfwrite`` stamps a random trailer ``/ID`` and an XMP creation date, and
+    PDFium's output differs run to run too. A batch job replays a resumed run's
+    requests by their digest, so a fresh slice on resume would look like a
+    changed input and be paid for again. Under a batch job the first slice of
+    each (document content, engine, page list) is therefore recorded in the
+    job's input store and every later run of the job reuses those exact bytes.
+    Outside a job this is exactly ``document.slice_pdf``."""
+    job = _active_batch_job()
+    if job is None:
+        return document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total)
+    engine = pdf_config.provider if pdf_config is not None else "default"
+    source = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+    span = hashlib.sha256(",".join(map(str, pages)).encode()).hexdigest()[:16]
+    name = f"slices/{source}/{engine}/{pages[0]}-{pages[-1]}-{span}.pdf"
+    data = job.rewind_input(
+        name,
+        lambda: document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total),
+    )
+    assert data is not None  # slicing always produces bytes
+    return bytes(data)
+
+
 def transcribe_steps(
     pdf_bytes: bytes,
     *,
@@ -623,7 +665,7 @@ def transcribe_steps(
         """Gated attempt loop for one page range; best (recall, raw, payload)."""
         # `total` was counted once for this document above; passing it keeps
         # each window from re-walking the whole page tree.
-        pdf_slice = document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total)
+        pdf_slice = _window_slice(pdf_bytes, pages, pdf_config=pdf_config, total=total)
         instr = _window_instruction(pages[0], pages[-1], total, context)
         exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
         n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)

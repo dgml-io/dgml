@@ -175,3 +175,20 @@ def test_steps_yield_one_request_and_return_the_call_result(workspace: Workspace
     rnc = schema_rnc_from_result(done.value.value, workspace=workspace, docset_name="Inv")
     assert "element docset:DueDate" in rnc
     assert config.model == _config().schema_model
+
+
+def test_a_schema_credential_reference_resolves_to_the_schema_key(workspace: Workspace) -> None:
+    """``dgml batch status``/``cancel`` re-resolve a job's key from its
+    reference; a schema request's key is the schema one, not the values one."""
+    from dgml_core.batch.jobs import credential_ref, resolve_credential
+
+    workspace.config_path.write_text(
+        "[grounded]\n"
+        'schema_model = "anthropic/claude-opus-4-7"\n'
+        'values_model = "anthropic/claude-sonnet-4-6"\n'
+        'schema_api_key = "sk-schema"\n'
+        'values_api_key = "sk-values"\n',
+        encoding="utf-8",
+    )
+    assert resolve_credential(workspace, credential_ref("grounded", "schema", None)) == "sk-schema"
+    assert resolve_credential(workspace, credential_ref("grounded", "values", None)) == "sk-values"

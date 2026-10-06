@@ -623,11 +623,13 @@ def schema_batch_executor(
     ``schema_api_key_env`` and :class:`~dgml_core.errors.BatchUnavailable` when
     the provider has no batch backend. Imports the batch package lazily."""
     from .batch import make_executor
+    from .batch.jobs import credential_ref
 
     return make_executor(
         config.schema_model,
         api_key=_resolve_api_key(config.schema_api_key, config.schema_api_key_env),
         api_base=config.schema_api_base,
+        credential=credential_ref("grounded", "schema", config.schema_api_key_env),
         poll_interval_s=poll_interval_s,
         max_poll_s=max_poll_s,
         min_wave_size=min_wave_size,
@@ -1496,10 +1498,17 @@ def extract_values_batch_pairs(
                 continue
             _succeed(pair, result)
     except BaseException as exc:
-        # Only an interrupt gets here: every Exception above is caught per
-        # pair. It records every open pair before propagating.
+        # Only an interrupt — or a paused batch job — gets here: every
+        # Exception above is caught per pair. An interrupt records every open
+        # pair before propagating. A paused job records nothing: the run that
+        # completes the job replays these pairs and writes their rows and stats.
+        from .errors import BatchPending
+
+        paused = isinstance(exc, BatchPending)
         for pair in list(runs):
             run = runs.pop(pair)
+            if paused:
+                continue
             run.fail(exc)
             with contextlib.suppress(Exception):
                 run.record()
@@ -1532,11 +1541,13 @@ def values_batch_executor(
     extraction raises) and :class:`~dgml_core.errors.BatchUnavailable` when the
     provider has no batch backend. Imports the batch package lazily."""
     from .batch import make_executor
+    from .batch.jobs import credential_ref
 
     return make_executor(
         config.values_model,
         api_key=_resolve_api_key(config.values_api_key, config.values_api_key_env),
         api_base=config.values_api_base,
+        credential=credential_ref("grounded", "values", config.values_api_key_env),
         poll_interval_s=poll_interval_s,
         max_poll_s=max_poll_s,
         min_wave_size=min_wave_size,

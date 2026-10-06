@@ -913,6 +913,14 @@ def _quiet_stdout() -> Iterator[None]:
             own_sink.drain()
 
 
+#: Optional seam over every synchronous completion: ``recorder(kwargs, call)``
+#: returns the response, where ``call(kwargs)`` performs the real request. Set
+#: only while a batch job session is active (:mod:`dgml_core.batch.jobs`), which
+#: uses it to record synchronous responses and replay them on a resumed run;
+#: ``None`` — the default — leaves every call exactly as it was.
+_SYNC_RECORDER: Callable[[dict[str, Any], Callable[[dict[str, Any]], Any]], Any] | None = None
+
+
 def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
     """Call litellm.completion with exponential-backoff retries for transient
     failures — both raised errors and *empty* responses.
@@ -925,6 +933,16 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
     retried like any other transient failure, and only raises
     :class:`EmptyModelResponse` once it persists across every attempt.
     """
+    recorder = _SYNC_RECORDER
+    if recorder is not None:
+        return recorder(kwargs, lambda kw: _completion_attempts(kw, max_retries=max_retries))
+    return _completion_attempts(kwargs, max_retries=max_retries)
+
+
+def _completion_attempts(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
+    """The retry loop behind :func:`_completion_with_retry`, without the
+    recorder seam (a batch job's own synchronous fallback calls this directly,
+    having already accounted for the request)."""
     import litellm
 
     delay = 2.0
@@ -1002,6 +1020,8 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
 
     Exceptions propagate after the totals are recorded, so a failed call
     still leaves a row (or contributes its partial usage to the scope).
+    ``BaseException`` is classified, not just ``Exception``, so an interrupted
+    call (``KeyboardInterrupt``, ``SystemExit``) never leaves an ``ok`` row.
     The write itself can never break the caller (see :func:`record_usage`).
     """
     totals = empty_usage_totals()

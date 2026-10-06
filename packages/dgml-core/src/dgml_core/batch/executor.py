@@ -129,6 +129,9 @@ class WaveStats:
     resubmitted: int = 0
     failed: int = 0
     batch_ids: list[str] = field(default_factory=list)
+    #: Requests served from a batch job's store instead of the provider (a
+    #: resumed ``--job`` run replaying what an earlier run received).
+    replayed: int = 0
     #: Batches split in half after a batch-level rejection (see the module
     #: docstring); reported only when non-zero, so other payloads keep shape.
     bisections: int = 0
@@ -154,6 +157,12 @@ class WaveStats:
     def cost_json(self) -> dict[str, float | None]:
         return cost_fields(self.cost_usd, self.standard_cost_usd, self.unpriced)
 
+    def run_json(self) -> dict[str, Any]:
+        """This object's own counters (what a job records per run)."""
+        out = self.to_json()
+        out["unpriced"] = self.unpriced
+        return out
+
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "waves": self.waves,
@@ -165,6 +174,9 @@ class WaveStats:
             "failed": self.failed,
             "batch_ids": list(self.batch_ids),
         }
+        # Only a resumed job run replays; every other payload keeps its shape.
+        if self.replayed:
+            out["replayed"] = self.replayed
         if self.bisections:
             out["bisections"] = self.bisections
         out.update(self.cost_json())
@@ -719,6 +731,13 @@ class BatchExecutor:
                     request.custom_id, "errored", "no result returned for this request"
                 )
 
+    def _fallback(self, kwargs: dict[str, Any]) -> Any:
+        """Run one request synchronously; its response, or the ``Exception`` it
+        raised (returned, not raised)."""
+        outcome = self._sync_call(kwargs)
+        self._account_sync(outcome)
+        return outcome
+
     def _account_sync(self, outcome: Any) -> None:
         """Add a synchronous fallback's cost (standard tier) — on the thread
         that folds the wave, never on a pool worker (see :meth:`_run_sync`)."""
@@ -756,6 +775,7 @@ def make_executor(
     max_poll_s: float | None = None,
     min_wave_size: int = 1,
     log: Callable[[str], None] = lambda _m: None,
+    credential: Mapping[str, Any] | None = None,
 ) -> BatchExecutor:
     """The one way to build a :class:`BatchExecutor` for *model*.
 
@@ -766,10 +786,31 @@ def make_executor(
     so the knobs mean the same thing everywhere. ``max_poll_s=None`` derives
     the polling deadline from the backend's ``max_wait_s`` (see
     :func:`default_max_poll_s`).
+
+    While a batch job session is active (:mod:`dgml_core.batch.jobs`) the
+    executor is a :class:`~dgml_core.batch.jobs.ReplayExecutor` bound to it,
+    so every caller records and replays through the job without knowing.
+    *credential* is the non-secret pointer to where *api_key* came from
+    (:func:`dgml_core.batch.jobs.credential_ref`); a job records it with each
+    provider batch so ``dgml batch status``/``cancel`` can re-resolve the key.
     """
+    from dgml_core.batch.jobs import ReplayExecutor, active_session
     from dgml_core.batch.registry import resolve_backend
 
     backend = resolve_backend(model, api_key=api_key, api_base=api_base)
+    session = active_session()
+    if session is not None:
+        return ReplayExecutor(
+            backend,
+            session=session,
+            model=model,
+            api_base=api_base,
+            credential=credential,
+            poll_interval_s=poll_interval_s,
+            max_poll_s=max_poll_s,
+            min_wave_size=min_wave_size,
+            log=log,
+        )
     return BatchExecutor(
         backend,
         poll_interval_s=poll_interval_s,

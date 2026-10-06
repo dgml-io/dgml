@@ -565,11 +565,13 @@ def classification_batch_executor(
     :class:`~dgml_core.errors.BatchUnavailable` when the provider has no batch
     backend. Imports the batch package lazily."""
     from .batch import make_executor
+    from .batch.jobs import credential_ref
 
     return make_executor(
         config.model,
         api_key=_resolve_api_key(config),
         api_base=config.api_base,
+        credential=credential_ref("classification", "model", config.api_key_env),
         poll_interval_s=poll_interval_s,
         max_poll_s=max_poll_s,
         min_wave_size=min_wave_size,

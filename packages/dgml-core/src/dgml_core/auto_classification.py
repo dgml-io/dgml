@@ -89,6 +89,7 @@ def apply_classification(
     decision: ClassificationDecision,
     docsets: list[DocSet] | None,
     assign: Callable[[str], dict[str, Any] | None],
+    create: Callable[[ClassificationDecision], DocSet] | None = None,
 ) -> None:
     """Act on a file's classification *decision*, filling *block* in place.
 
@@ -98,6 +99,10 @@ def apply_classification(
     ``block["extraction"]`` once the directory's extraction wave is back — the
     key lands last either way, so the block has the same shape. A DocSet
     created for a ``new`` decision is appended to *docsets* when given.
+
+    *create* makes the DocSet a ``new`` decision names (default: create it in
+    the store). A resumed batch job passes one that returns the DocSet its
+    first run already created for this file instead of creating it twice.
     """
     docset_store = DocSetStore(ws)
     try:
@@ -115,11 +120,14 @@ def apply_classification(
                 block["extraction"] = extraction_block
         elif decision.decision == "new":
             assert decision.new_name is not None and decision.new_description is not None
-            created = docset_store.create(
-                name=decision.new_name,
-                description=decision.new_description,
-                key_questions=list(decision.new_key_questions),
-            )
+            if create is not None:
+                created = create(decision)
+            else:
+                created = docset_store.create(
+                    name=decision.new_name,
+                    description=decision.new_description,
+                    key_questions=list(decision.new_key_questions),
+                )
             docset_store.add_file(created.id, file_id)
             if docsets is not None:
                 docsets.append(created)
@@ -255,6 +263,9 @@ def prepare_bulk_classify(
     (an unset ``api_key_env``) is *not* fatal: the synchronous run soft-fails
     each file on it, so it is kept and each file later gets exactly the
     classification/extraction error the synchronous run would record.
+
+    A batch job session, when used, must already be active: the executors
+    are bound to it.
     """
     from dgml_core.batch import StageRequest, assert_batchable
     from dgml_core.classification import classification_batch_executor
@@ -296,6 +307,12 @@ def prepare_bulk_classify(
         except DgmlError as exc:
             state.extractor_error = exc
     return state
+
+
+#: Job state key: file id → the DocSet a ``new`` decision created for it, so a
+#: resumed job re-uses that DocSet (and its id, which later files' requests
+#: name) instead of creating a second one when it replays the decision.
+CREATED_DOCSETS_STATE = "classify_created_docsets"
 
 
 def classify_bulk_batch(
@@ -440,8 +457,44 @@ def _classify_in_order(
 ) -> None:
     """The default mode's classification: file by file, one wave each, every
     decision applied (its DocSet created and appended to *docsets*) before the
-    next file's request is built — the synchronous loop's order exactly."""
+    next file's request is built — the synchronous loop's order exactly.
+
+    Under a batch job, each DocSet a ``new`` decision creates is recorded in
+    the job's state (:data:`CREATED_DOCSETS_STATE`) the moment it exists, so a
+    resumed run — which replays every earlier file's reply from the job —
+    re-uses it rather than creating it again. Later files' requests name it by
+    id, so a second DocSet would change them and the job would pay for them
+    twice."""
+    from dgml_core.batch.jobs import active_session
     from dgml_core.classification import classify_file_batch
+    from dgml_core.errors import DocSetNotFound
+
+    session = active_session()
+    made: dict[str, str] = (
+        session.state.setdefault(CREATED_DOCSETS_STATE, {}) if session is not None else {}
+    )
+
+    def creator(file_id: str) -> Callable[[ClassificationDecision], DocSet]:
+        def create(decision: ClassificationDecision) -> DocSet:
+            store = DocSetStore(ws)
+            prior = made.get(file_id)
+            if prior is not None:
+                try:
+                    return store.get(prior)
+                except DocSetNotFound:
+                    pass  # deleted since that run: create it afresh
+            assert decision.new_name is not None and decision.new_description is not None
+            docset = store.create(
+                name=decision.new_name,
+                description=decision.new_description,
+                key_questions=list(decision.new_key_questions),
+            )
+            if session is not None:
+                made[file_id] = docset.id
+                session.persist()
+            return docset
+
+        return create
 
     for entry, res in created:
         file_id = res.record.id
@@ -467,6 +520,7 @@ def _classify_in_order(
             decision,
             docsets,
             _returning_none(assigner(file_id, block)),
+            creator(file_id),
         )
 
 
