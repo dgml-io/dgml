@@ -50,15 +50,16 @@ Coordinate space contract:
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import json
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from . import layout
+from . import layout, llm
 from .config import load_merged_config
 from .docsets import DocSetStore
 from .errors import (
@@ -94,11 +95,13 @@ from .extraction_xml import (
 )
 from .files import FileStore
 from .llm import (
+    CallResult,
     LLMConfig,
+    LLMSteps,
     _mark_document_cacheable,
-    call_with_tools,
     is_anthropic_model,
     model_max_output_tokens,
+    steps_with_tools,
 )
 from .matching import (
     UnmatchedItem,
@@ -119,10 +122,20 @@ from .usage import (
     OPERATION_SCHEMA_GENERATE,
     OUTCOME_ERROR,
     OUTCOME_OK,
+    TIER_STANDARD,
+    TIERS_KEY,
     UsageEvent,
     add_partial,
+    public_totals,
     record_usage,
+    scope_events,
+    with_tier,
 )
+
+if TYPE_CHECKING:
+    # Type-only: the batch package imports litellm, which upstream keeps off
+    # the deterministic import path; it is imported lazily where it is used.
+    from .batch import BatchExecutor
 
 # ---- Constants ------------------------------------------------------------
 
@@ -466,7 +479,59 @@ def generate_schema(
 
     Raises :class:`SchemaGenerationFailed` on any non-config failure
     (no files, missing PDF, malformed LLM response, network error).
+    :func:`generate_schema_batch` is the same request through a provider's
+    batch API.
     """
+    llm_config, steps = generate_schema_steps(workspace, file_ids, config=config, debug=debug)
+    try:
+        result = llm.drive(steps, llm_config)
+    except Exception as exc:
+        raise _schema_call_failed(exc) from exc
+    return schema_rnc_from_result(result, workspace=workspace, docset_name=docset_name)
+
+
+def generate_schema_batch(
+    workspace: Workspace,
+    file_ids: list[str],
+    *,
+    config: GroundedConfig,
+    docset_name: str,
+    executor: BatchExecutor,
+    debug: bool = False,
+) -> str:
+    """:func:`generate_schema` with its one request sent through *executor*'s
+    batch API (one wave, one round trip).
+
+    Same preparation, same RNC, same errors and messages; the usage row is the
+    synchronous one tagged ``tier="batch"``. Build *executor* with
+    :func:`schema_batch_executor`."""
+    from .batch import Unit, run_stage
+
+    llm_config, steps = generate_schema_steps(workspace, file_ids, config=config, debug=debug)
+    outcome = run_stage(
+        [Unit(name="schema", config=llm_config, steps=steps)], executor, stage="schema"
+    )["schema"]
+    if outcome.error is not None:
+        raise _schema_call_failed(outcome.error) from outcome.error
+    return schema_rnc_from_result(outcome.result, workspace=workspace, docset_name=docset_name)
+
+
+def generate_schema_steps(
+    workspace: Workspace,
+    file_ids: list[str],
+    *,
+    config: GroundedConfig,
+    debug: bool = False,
+) -> tuple[LLMConfig, LLMSteps[CallResult]]:
+    """The schema-generation request as ``(config, steps)``.
+
+    Everything that can fail before a request exists — no files, an unreadable
+    PDF, an unset key env var — fails HERE, eagerly, so neither a synchronous
+    nor a batch driver ever sends (or pays for) a request that could not
+    succeed. *steps* yields the single forced ``submit_schema`` call and
+    returns its :class:`~dgml_core.llm.CallResult`; turn that into RNC with
+    :func:`schema_rnc_from_result`. Drive it with :func:`dgml_core.llm.drive`
+    (which writes the one usage row from *config*) or a batch stage."""
     if not file_ids:
         raise SchemaGenerationFailed(
             "schema generation requires at least one example file_id; got an empty list"
@@ -492,7 +557,7 @@ def generate_schema(
     # max_tokens=None so the wrapper doesn't add the max_tokens alias alongside
     # max_completion_tokens. reasoning_effort is set unconditionally; the
     # wrapper drops it for Anthropic + forced tool_choice.
-    # Single call → records its own usage row (gated on --debug) from the
+    # Single call → the driver records its usage row (gated on --debug) from the
     # context carried on the config.
     llm_config = LLMConfig(
         model=config.schema_model,
@@ -507,23 +572,32 @@ def generate_schema(
         operation=OPERATION_SCHEMA_GENERATE,
         context={"from_file_ids": list(file_ids)},
     )
+    steps = steps_with_tools(
+        llm_config,
+        messages=messages,
+        tools=tools,
+        tool_choice={"type": "function", "function": {"name": _TOOL_SUBMIT_SCHEMA}},
+        # Deliberately NOT cached: the cacheable prefix is tools + system,
+        # and this system prompt is well short of the provider's minimum
+        # cacheable prefix, so a breakpoint would create no entry. Schema
+        # generation also runs once per docset, so there is no reuse to
+        # capture even if it did.
+    )
+    return llm_config, steps
 
-    try:
-        result = call_with_tools(
-            llm_config,
-            messages=messages,
-            tools=tools,
-            tool_choice={"type": "function", "function": {"name": _TOOL_SUBMIT_SCHEMA}},
-            # Deliberately NOT cached: the cacheable prefix is tools + system,
-            # and this system prompt is well short of the provider's minimum
-            # cacheable prefix, so a breakpoint would create no entry. Schema
-            # generation also runs once per docset, so there is no reuse to
-            # capture even if it did.
-        )
-    except Exception as exc:
-        raise SchemaGenerationFailed(
-            f"schema generation call failed: {type(exc).__name__}: {exc}"
-        ) from exc
+
+def _schema_call_failed(exc: BaseException) -> SchemaGenerationFailed:
+    """The error a failed schema request surfaces as (sync and batch alike)."""
+    return SchemaGenerationFailed(f"schema generation call failed: {type(exc).__name__}: {exc}")
+
+
+def schema_rnc_from_result(result: CallResult, *, workspace: Workspace, docset_name: str) -> str:
+    """Render the ``submit_schema`` reply in *result* to at-rest RNC.
+
+    Parsing happens after the request's usage row is written (a reply that
+    parses badly was still a successful, billed call), exactly as the inline
+    call site did. Raises :class:`SchemaGenerationFailed` on a missing or wrong
+    tool call, a non-list field tree, or an invalid one."""
     fields = _parse_submit_call(result.response, expected_tool=_TOOL_SUBMIT_SCHEMA, field="fields")
 
     if not isinstance(fields, list):
@@ -532,6 +606,35 @@ def generate_schema(
         return field_tree_to_rnc(fields, workspace=workspace.organization, docset_name=docset_name)
     except SchemaInvalid as exc:
         raise SchemaGenerationFailed(f"LLM returned an invalid field tree: {exc}") from exc
+
+
+def schema_batch_executor(
+    config: GroundedConfig,
+    *,
+    poll_interval_s: float = 30.0,
+    max_poll_s: float | None = None,
+    min_wave_size: int = 1,
+    log: Callable[[str], None] = lambda _m: None,
+) -> BatchExecutor:
+    """:func:`dgml_core.batch.make_executor` for *config*'s schema model, with
+    its credentials resolved the way :func:`generate_schema` resolves them.
+
+    Raises :class:`~dgml_core.errors.AuthError` for an unset
+    ``schema_api_key_env`` and :class:`~dgml_core.errors.BatchUnavailable` when
+    the provider has no batch backend. Imports the batch package lazily."""
+    from .batch import make_executor
+    from .batch.jobs import credential_ref
+
+    return make_executor(
+        config.schema_model,
+        api_key=_resolve_api_key(config.schema_api_key, config.schema_api_key_env),
+        api_base=config.schema_api_base,
+        credential=credential_ref("grounded", "schema", config.schema_api_key_env),
+        poll_interval_s=poll_interval_s,
+        max_poll_s=max_poll_s,
+        min_wave_size=min_wave_size,
+        log=log,
+    )
 
 
 def _schema_user_prompt(n_files: int) -> str:
@@ -696,54 +799,148 @@ def extract_values(
     written to ``extraction_stats.json`` (unless ``write_stats=False``, which
     the CLI sets unless ``--debug``) so the UX can render them without
     re-deriving anything from the usage log.
+
+    :func:`extract_values_batch` runs the same per-file steps for many files,
+    with each LLM phase submitted as one batch wave.
     """
-    store = DocSetStore(workspace)
-    rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
-    # A stored schema is not re-checked on read; here it is about to be used.
-    vocab = check_invariant_paths(parse_rnc(rnc_schema))
-    schema = rnc_to_json_schema(rnc_schema)
-    guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
-    pdf_bytes = _pdf_bytes(workspace, file_id)
-    api_key = _resolve_api_key(config.values_api_key, config.values_api_key_env)
-    api_base = config.values_api_base
-
-    phase1_totals: dict[str, Any] = _empty_totals()
-    phase3_totals: dict[str, Any] = _empty_totals()
-    tool_calls_total = 0
-    outcome = OUTCOME_ERROR
-    error_msg: str | None = None
-    started = time.monotonic()
-
-    # Per-phase timings are filled as each phase finishes so a failure
-    # midway still surfaces what we got done.
-    phase1_duration = 0.0
-    phase2_duration = 0.0
-    phase3_duration = 0.0
-    phase3_page_calls = 0
-    phase3_grid_pages = 0
-    phase3_boxes_dropped = 0
-    phase3_pages_out_of_range = 0
-    phase2_matched = 0
-    phase3_matched = 0
-    unmatched_count = 0
-    total_locations = 0
-    computed_fields = 0
-    dropped_refs = 0
-    unnormalized_enums = 0
-    derivations_checked = 0
-    derivations_mismatched = 0
-    invariants_checked = 0
-    invariant_violations: list[str] = []
-    phase1_layout: dict[str, Any] | None = None
-    phase1_tool_schema_mode = "inlined"
-    phase1_chunk_calls = 0
-    phase1_truncated_retries = 0
-    phase1_counters = {"envelope_repairs": 0}
-
+    run = _FileExtraction(
+        workspace, docset_id, file_id, config=config, write_stats=write_stats, debug=debug
+    )
     try:
-        # --- Phase 1: text + page numbers, no bboxes (LLM) ----------
-        phase1_started = time.monotonic()
-        phase1_schema = _drop_bboxes_from_schema(schema)
+        steps = run.phase1_steps()
+        try:
+            llm.drive(steps, run.phase1_config())
+        finally:
+            # Mirror the latches into the stats on every exit, so a failure
+            # midway still reports how far phase 1 got.
+            run.mirror_phase1()
+        pages = run.after_phase1()
+        per_page: list[_PageOutcome] = []
+        if pages:
+            per_page = _run_phase3_pages(run, pages)
+        return run.finish(per_page)
+    except BaseException as exc:
+        run.fail(exc)
+        raise
+    finally:
+        run.record()
+
+
+@dataclass(frozen=True)
+class _Phase3PageResult:
+    """One page's phase-3 answer: ``{id -> locations}`` in page pixels, whether
+    the page went through the 0-1000 grid, and how many boxes were dropped."""
+
+    locations: dict[str, list[dict[str, Any]]]
+    grid: bool
+    boxes_dropped: int
+
+
+#: One phase-3 page's result, as :meth:`_FileExtraction.finish` folds it:
+#: ``(page_number, items, the page's answer, that page's usage totals)``.
+_PageOutcome = tuple[int, list[UnmatchedItem], _Phase3PageResult, dict[str, Any]]
+
+
+class _FileExtraction:
+    """Every non-LLM step of extracting one file, shared by the sync
+    :func:`extract_values` and the batch :func:`extract_values_batch`.
+
+    The two drivers differ only in how the phase-1 and phase-3 generators are
+    executed; everything else — schema load, the phase-1 request, post-phase-1
+    normalization and checks, phase-2 matching, patching the phase-3 boxes in,
+    the XML write, the usage row and ``extraction_stats`` — lives here once, so
+    the two paths cannot drift. Construction does the setup that
+    :func:`extract_values` always did *before* it started recording (schema,
+    guidance, PDF, credentials), so a setup failure raises from the constructor
+    and leaves no usage row or stats, exactly as before.
+
+    Call order: :meth:`phase1_steps` → drive → :meth:`mirror_phase1` (always) →
+    :meth:`after_phase1` → drive each page from :meth:`phase3_steps` →
+    :meth:`finish`; :meth:`fail` on an exception; :meth:`record` last, always.
+    """
+
+    def __init__(
+        self,
+        workspace: Workspace,
+        docset_id: str,
+        file_id: str,
+        *,
+        config: GroundedConfig,
+        write_stats: bool,
+        debug: bool,
+        tier: str = TIER_STANDARD,
+    ) -> None:
+        self.workspace = workspace
+        self.docset_id = docset_id
+        self.file_id = file_id
+        self.config = config
+        self.write_stats = write_stats
+        self.debug = debug
+        self.tier = tier
+
+        store = DocSetStore(workspace)
+        rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
+        # A stored schema is not re-checked on read; here it is about to be used.
+        self.vocab = check_invariant_paths(parse_rnc(rnc_schema))
+        self.schema = rnc_to_json_schema(rnc_schema)
+        self.guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
+        self.pdf_bytes = _pdf_bytes(workspace, file_id)
+        self.api_key = _resolve_api_key(config.values_api_key, config.values_api_key_env)
+        self.api_base = config.values_api_base
+
+        self.phase1_totals: dict[str, Any] = _empty_totals()
+        self.phase3_totals: dict[str, Any] = _empty_totals()
+        self.tool_calls_total = 0
+        self.outcome = OUTCOME_ERROR
+        self.error_msg: str | None = None
+        self.started = time.monotonic()
+
+        # Per-phase timings are filled as each phase finishes so a failure
+        # midway still surfaces what we got done.
+        self.phase1_started = 0.0
+        self.phase3_started = 0.0
+        self.phase1_duration = 0.0
+        self.phase2_duration = 0.0
+        self.phase3_duration = 0.0
+        self.phase3_page_calls = 0
+        self.phase3_grid_pages = 0
+        self.phase3_boxes_dropped = 0
+        self.phase3_pages_out_of_range = 0
+        self.phase2_matched = 0
+        self.phase3_matched = 0
+        self.unmatched_count = 0
+        self.total_locations = 0
+        self.computed_fields = 0
+        self.dropped_refs = 0
+        self.unnormalized_enums = 0
+        self.derivations_checked = 0
+        self.derivations_mismatched = 0
+        self.invariants_checked = 0
+        self.invariant_violations: list[str] = []
+        self.phase1_layout: dict[str, Any] | None = None
+        self.phase1_tool_schema_mode = "inlined"
+        self.phase1_chunk_calls = 0
+        self.phase1_truncated_retries = 0
+        self.phase1_envelope_repairs = 0
+        self.phase1 = Phase1Result(totals=self.phase1_totals)
+        self._phase2_values: dict[str, Any] = {}
+        self._phase2_unmatched_locations = 0
+
+    # ---- phase 1 ------------------------------------------------------
+
+    def phase1_config(self) -> LLMConfig:
+        return _phase1_llm_config(
+            self.config.values_model,
+            self.api_key,
+            self.api_base,
+            self.config.values_reasoning_effort,
+        )
+
+    def phase1_steps(self) -> LLMSteps[Phase1Result]:
+        """Build the phase-1 request and return its generator (text + page
+        numbers, no bboxes)."""
+        self.phase1_started = time.monotonic()
+        phase1_schema = _drop_bboxes_from_schema(self.schema)
         # The tool parameter gets the expanded schema with prose annotations
         # stripped — the identical keys remain in the user-prompt copy
         # (phase1_schema), so no guidance is lost, and the smaller schema
@@ -754,11 +951,13 @@ def extract_values(
         # across files. Keeping the chunking directive OUT of this block is what
         # lets the retry still read it: the directive goes in its own block
         # after, so the cached prefix is unchanged between the two attempts.
-        schema_text = _values_phase1_user_prompt(phase1_schema, guidance)
+        schema_text = _values_phase1_user_prompt(phase1_schema, self.guidance)
+        values_model = self.config.values_model
+        pdf_bytes = self.pdf_bytes
 
         def _phase1_messages(*, chunked: bool) -> list[dict[str, Any]]:
-            # Rebuilt per attempt — _run_extract_loop mutates its message list.
-            anthropic = is_anthropic_model(config.values_model)
+            # Rebuilt per attempt — each phase-1 attempt appends to its message list.
+            anthropic = is_anthropic_model(values_model)
             schema_block: dict[str, Any] = {"type": "text", "text": schema_text}
             # ``cache_control`` is Anthropic-specific, so gate on the provider
             # the same way ``call_with_tools`` gates its own marker — otherwise
@@ -784,91 +983,42 @@ def extract_values(
                 {"role": "user", "content": user_content},
             ]
 
-        # Two independent fallbacks compose around phase 1, each a one-way
-        # latch enabled by the failure it answers:
-        # * provider rejects the inlined tool schema ("too many states")
-        #   → permissive object parameter + code-side vocabulary pruning;
-        # * output truncated (finish_reason='length')
-        #   → chunked submission (see _phase1_tools) with a mandatory directive.
-        # Because a latch is only ever flipped from off to on, and each handler
-        # re-raises once its own latch is set, the loop runs at most three
-        # attempts (initial + one per latch) before terminating.
-        chunked = False
-        while True:
-            tool_schema = (
-                _PERMISSIVE_VALUES_PARAM
-                if phase1_tool_schema_mode == "permissive"
-                else phase1_tool_schema
-            )
-            try:
-                phase1_args, phase1_tool_calls, phase1_chunk_calls = _run_extract_loop(
-                    workspace=workspace,
-                    file_id=file_id,
-                    vocab=vocab,
-                    counters=phase1_counters,
-                    messages=_phase1_messages(chunked=chunked),
-                    tools=_phase1_tools(tool_schema, chunked=chunked),
-                    chunked=chunked,
-                    model=config.values_model,
-                    api_key=api_key,
-                    api_base=api_base,
-                    max_tool_iters=config.max_tool_iters,
-                    totals=phase1_totals,
-                    reasoning_effort=config.values_reasoning_effort,
-                )
-                break
-            except _OutputTruncated as exc:
-                if chunked:
-                    raise ValuesExtractionFailed(
-                        f"{exc} The chunked-submission retry was truncated too; "
-                        "consider a model with a higher output ceiling or "
-                        "splitting the document."
-                    ) from exc
-                chunked = True
-                phase1_truncated_retries += 1
-            except ValuesExtractionFailed as exc:
-                if phase1_tool_schema_mode == "permissive" or not _is_tool_schema_too_large(exc):
-                    raise
-                # Gemini's constrained decoder rejected the inlined schema;
-                # the model still sees the full schema in the user prompt.
-                phase1_tool_schema_mode = "permissive"
-        phase1_duration = round(time.monotonic() - phase1_started, 3)
-        # Keys that name no schema root, and roots whose value has the wrong
-        # shape, are dropped at serialization (the writer walks vocab.roots).
-        # A tree that had keys but keeps nothing would land as an empty
-        # <dg:extraction/> reported as success: refuse it here so the failure
-        # is visible. An empty tree, or one whose roots are all null, stays a
-        # legal "nothing found" outcome (the serializer reads null as "not
-        # extracted"), and leaf internals (a leaf without text, a collection
-        # of malformed entries) stay the serializer's business, as before.
-        # Recorded before the refusal below can raise, so a refused run's
+        # Both phase-1 fallbacks (chunked retry on truncation, permissive
+        # schema on a "too many states" refusal) are latches inside
+        # phase1_steps, so every driver — sync or batch — just runs it.
+        return phase1_steps(
+            workspace=self.workspace,
+            file_id=self.file_id,
+            run=self.phase1,
+            messages_factory=_phase1_messages,
+            tool_schema=phase1_tool_schema,
+            vocab=self.vocab,
+            model=values_model,
+            api_key=self.api_key,
+            api_base=self.api_base,
+            max_tool_iters=self.config.max_tool_iters,
+            reasoning_effort=self.config.values_reasoning_effort,
+        )
+
+    def mirror_phase1(self) -> None:
+        """Copy phase 1's latches into the stats (call on every exit)."""
+        self.phase1_tool_schema_mode = self.phase1.tool_schema_mode
+        self.phase1_truncated_retries = self.phase1.truncated_retries
+        self.phase1_envelope_repairs = self.phase1.counters["envelope_repairs"]
+        self.phase1_chunk_calls = self.phase1.chunk_calls
+
+    def after_phase1(self) -> list[tuple[int, list[UnmatchedItem]]]:
+        """Post-process phase 1, run phase 2, and return the phase-3 work as
+        ``[(page_number, items)]`` in page order (empty when phase 2 matched
+        everything)."""
+        phase1_values = self.phase1.values
+        self.phase1_layout = self.phase1.layout
+        self.tool_calls_total += self.phase1.tool_calls
+        self.phase1_duration = round(time.monotonic() - self.phase1_started, 3)
+        # Recorded above, before this refusal raises, so a refused run's
         # --debug usage row and stats sidecar still carry what phase 1 did.
-        tool_calls_total += phase1_tool_calls
-        phase1_layout = phase1_args.get("layout") or None
-        if not isinstance(phase1_layout, dict):
-            phase1_layout = None
-        submitted_keys = sorted(k for k, v in phase1_args["values"].items() if v is not None)
-        kept = _prune_to_vocabulary(phase1_args["values"], vocab)
-        if submitted_keys and not kept:
-            shown = ", ".join(repr(k) for k in submitted_keys[:6])
-            if len(submitted_keys) > 6:
-                shown += f" and {len(submitted_keys) - 6} more"
-            raise ValuesExtractionFailed(
-                f"{_TOOL_SUBMIT_VALUES!r} returned nothing that fits the schema: got keys "
-                f"{shown}, expected roots {sorted(tag.name for tag in vocab.roots)} "
-                "shaped as the schema defines; refusing to write an empty extraction"
-            )
-        # Enforce the vocabulary code-side on exactly the paths whose payload
-        # never met a provider-side shape check: permissive mode (the values
-        # parameter was a bare object) and chunked mode (append_entries
-        # batches are validated only as generic objects). The inlined
-        # single-shot path already got additionalProperties:false at the API
-        # layer, and pruning it too would discard off-schema values *before*
-        # phases 2/3 rather than at serialization — a behavior change beyond
-        # what these fallbacks need.
-        if phase1_tool_schema_mode == "permissive" or chunked:
-            phase1_args["values"] = kept
-        phase1_values = phase1_args["values"]
+        if self.phase1.refusal is not None:
+            raise ValuesExtractionFailed(self.phase1.refusal)
         # The merged extracted_value leaf shape lets a sloppy model blur the
         # grounded/computed boundary; normalize before phases 2/3 (and the
         # serializer) so their invariants hold regardless.
@@ -878,54 +1028,79 @@ def extract_values(
         # were deliberate, not dropped. dropped_refs counts derived_from
         # entries that won't resolve to a dg:href target — incomplete
         # provenance that would otherwise vanish silently at serialization.
-        computed_fields = sum(1 for _ in walk_computed_leaves(phase1_values))
-        dropped_refs = count_dropped_refs(phase1_values)
+        self.computed_fields = sum(1 for _ in walk_computed_leaves(phase1_values))
+        self.dropped_refs = count_dropped_refs(phase1_values)
         # Enum leaves whose normalized value isn't one of the schema's tokens
         # serialize text-only; count them so misses are visible in stats.
-        unnormalized_enums = count_unnormalized_enum_values(phase1_values, vocab)
+        self.unnormalized_enums = count_unnormalized_enum_values(phase1_values, self.vocab)
         # Recompute checkable derivations (report-only): a mismatch means a
         # computed leaf's value agrees with neither the sum, the count, nor
         # any single one of its derived_from inputs.
-        derivations_checked, derivations_mismatched = check_derivations(phase1_values)
+        self.derivations_checked, self.derivations_mismatched = check_derivations(phase1_values)
         # Schema-declared `## Invariant:` relations (count/sum across the
         # submission). Report-only, like the derivation recompute above.
-        invariants_checked, invariant_violations = check_invariants(phase1_values, vocab)
+        self.invariants_checked, self.invariant_violations = check_invariants(
+            phase1_values, self.vocab
+        )
 
         # --- Phase 2: code-side OCR matching ------------------------
-        phase2_result = run_phase2_matching(workspace, file_id, phase1_values, layout=phase1_layout)
-        phase2_duration = phase2_result.stats.duration_s
-        phase2_matched = phase2_result.stats.matched_locations
-        total_locations = phase2_result.stats.total_locations
-
-        # --- Phase 3: per-page LLM for remaining unmatched ----------
-        phase3_started = time.monotonic()
-        final_values = phase2_result.values
-        unmatched, phase3_pages_out_of_range = _drop_out_of_range_pages(
-            workspace,
-            file_id,
-            phase2_result.unmatched,
-            page_count=FileStore(workspace).get(file_id).page_count,
+        phase2_result = run_phase2_matching(
+            self.workspace, self.file_id, phase1_values, layout=self.phase1_layout
         )
-        if unmatched:
+        self.phase2_duration = phase2_result.stats.duration_s
+        self.phase2_matched = phase2_result.stats.matched_locations
+        self.total_locations = phase2_result.stats.total_locations
+        self._phase2_unmatched_locations = phase2_result.stats.unmatched_locations
+
+        # --- Phase 3 starts here: per-page LLM for remaining unmatched ---
+        self.phase3_started = time.monotonic()
+        self._phase2_values = phase2_result.values
+        # Items on pages the file does not have are dropped before any call and
+        # stay unmatched (#155); the count goes to the stats sidecar.
+        unmatched, self.phase3_pages_out_of_range = _drop_out_of_range_pages(
+            self.workspace,
+            self.file_id,
+            phase2_result.unmatched,
+            page_count=FileStore(self.workspace).get(self.file_id).page_count,
+        )
+        return sorted(_group_by_page(unmatched).items())
+
+    # ---- phase 3 ------------------------------------------------------
+
+    def phase3_config(self) -> LLMConfig:
+        return _phase3_llm_config(self.config.values_model, self.api_key, self.api_base)
+
+    def phase3_steps(
+        self, page: int, items: list[UnmatchedItem], totals: dict[str, Any]
+    ) -> LLMSteps[_Phase3PageResult]:
+        """The phase-3 generator for one page, folding its usage into *totals*."""
+        return phase3_page_steps(
+            workspace=self.workspace,
+            file_id=self.file_id,
+            page_number=page,
+            items=items,
+            values=self._phase2_values,
+            model=self.config.values_model,
+            api_key=self.api_key,
+            api_base=self.api_base,
+            max_tool_iters=self.config.max_tool_iters,
+            totals=totals,
+        )
+
+    # ---- finish -------------------------------------------------------
+
+    def finish(self, per_page: list[_PageOutcome]) -> ExtractionResult:
+        """Patch the phase-3 boxes in, write the XML, and mark the run ok."""
+        final_values = self._phase2_values
+        if per_page:
             (
-                final_values,
-                phase3_matched,
-                phase3_page_calls,
-                phase3_grid_pages,
-                phase3_boxes_dropped,
-            ) = _run_phase3(
-                workspace=workspace,
-                file_id=file_id,
-                values=final_values,
-                unmatched=unmatched,
-                model=config.values_model,
-                api_key=api_key,
-                api_base=api_base,
-                max_tool_iters=config.max_tool_iters,
-                totals=phase3_totals,
-            )
-        unmatched_count = phase2_result.stats.unmatched_locations - phase3_matched
-        phase3_duration = round(time.monotonic() - phase3_started, 3)
+                self.phase3_matched,
+                self.phase3_page_calls,
+                self.phase3_grid_pages,
+                self.phase3_boxes_dropped,
+            ) = _fold_phase3(final_values, per_page, self.phase3_totals)
+        self.unmatched_count = self._phase2_unmatched_locations - self.phase3_matched
+        self.phase3_duration = round(time.monotonic() - self.phase3_started, 3)
 
         # Extracted values live as a dg:extraction element in the file's core
         # <stem>.dgml.xml (spec §13): added as a sibling of an existing document
@@ -933,8 +1108,9 @@ def extract_values(
         # tree exists yet (extraction).
         # Read again after phase 3, as before: a file deleted meanwhile
         # raises here rather than getting an orphan XML written for it.
-        stem = Path(FileStore(workspace).get(file_id).original_filename).stem
-        xml_key = layout.dgml_xml_key(docset_id, file_id, stem)
+        workspace = self.workspace
+        stem = Path(FileStore(workspace).get(self.file_id).original_filename).stem
+        xml_key = layout.dgml_xml_key(self.docset_id, self.file_id, stem)
         existing = (
             workspace.blobs.get_blob(xml_key).decode("utf-8")
             if workspace.blobs.blob_exists(xml_key)
@@ -943,93 +1119,440 @@ def extract_values(
         if existing is not None and has_document_tree(existing):
             # A generated document tree is present — add extraction alongside it.
             mode = "full-extraction"
-            doc = embed_extraction_into(existing, final_values, vocab=vocab)
+            doc = embed_extraction_into(existing, final_values, vocab=self.vocab)
         else:
             # No tree (fresh, or a prior extraction-only file) — (re)write standalone.
             mode = "extraction"
-            doc = standalone_extraction_doc(final_values, vocab=vocab)
+            doc = standalone_extraction_doc(final_values, vocab=self.vocab)
         workspace.blobs.put_blob(xml_key, doc.encode("utf-8"))
-        outcome = OUTCOME_OK
+        self.outcome = OUTCOME_OK
         return ExtractionResult(
-            values=final_values, tool_calls=tool_calls_total, xml_key=xml_key, mode=mode
+            values=final_values, tool_calls=self.tool_calls_total, xml_key=xml_key, mode=mode
         )
-    except ValuesExtractionFailed as exc:
-        error_msg = str(exc)
-        raise
-    except Exception as exc:
-        # Non-ValuesExtractionFailed errors (programmer bug) — still
-        # record what we can before letting them propagate.
-        error_msg = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
+
+    def fail(self, exc: BaseException) -> None:
+        """Note why the run failed, for the usage row and the stats."""
+        if isinstance(exc, ValuesExtractionFailed):
+            self.error_msg = str(exc)
+        elif isinstance(exc, Exception):
+            # Non-ValuesExtractionFailed errors (programmer bug) — still
+            # record what we can before letting them propagate.
+            self.error_msg = f"{type(exc).__name__}: {exc}"
+        # An interrupt records the error outcome with no message, as before.
+
+    def record(self) -> None:
+        """Write the usage row (``--debug``) and the stats (when opted in)."""
         # Usage recording is gated on --debug (like every other LLM path).
         # This aggregates phase 1 + 3 into one row; the internal per-call
         # configs carry no workspace, so they don't each auto-record.
-        if debug:
-            merged_totals = _merge_totals(phase1_totals, phase3_totals)
-            record_usage(
-                workspace,
-                UsageEvent(
-                    at=now_iso(),
-                    operation=OPERATION_EXTRACT_VALUES,
-                    model=config.values_model,
-                    cost_usd=merged_totals["cost_usd"],
-                    prompt_tokens=merged_totals["prompt_tokens"],
-                    completion_tokens=merged_totals["completion_tokens"],
-                    total_tokens=merged_totals["total_tokens"],
-                    cache_read_tokens=merged_totals["cache_read_tokens"],
-                    cache_creation_tokens=merged_totals["cache_creation_tokens"],
-                    duration_s=round(time.monotonic() - started, 3),
-                    outcome=outcome,
-                    context={
-                        "file_id": file_id,
-                        "docset_id": docset_id,
-                        "tool_calls": tool_calls_total,
-                    },
-                    error=error_msg,
-                ),
+        if self.debug:
+            merged_totals = _merge_totals(self.phase1_totals, self.phase3_totals)
+            event = UsageEvent(
+                at=now_iso(),
+                operation=OPERATION_EXTRACT_VALUES,
+                model=self.config.values_model,
+                cost_usd=merged_totals["cost_usd"],
+                prompt_tokens=merged_totals["prompt_tokens"],
+                completion_tokens=merged_totals["completion_tokens"],
+                total_tokens=merged_totals["total_tokens"],
+                cache_read_tokens=merged_totals["cache_read_tokens"],
+                cache_creation_tokens=merged_totals["cache_creation_tokens"],
+                duration_s=round(time.monotonic() - self.started, 3),
+                outcome=self.outcome,
+                context={
+                    "file_id": self.file_id,
+                    "docset_id": self.docset_id,
+                    "tool_calls": self.tool_calls_total,
+                },
+                error=self.error_msg,
+                tier=self.tier,
             )
+            # One row, or one per tier when phase 1 and phase 3 responses
+            # were served by different tiers (a batch plus sync fallbacks).
+            for part in scope_events(event, merged_totals):
+                record_usage(self.workspace, part)
         # Even on failure, partial numbers help diagnose where we
         # stalled. Wrapped in try/except so telemetry can never break
         # the caller. Suppressed entirely unless the caller opted in
         # (the CLI does so only under --debug).
         try:
-            if write_stats:
+            if self.write_stats:
                 _write_extraction_stats(
-                    workspace=workspace,
-                    docset_id=docset_id,
-                    file_id=file_id,
-                    model=config.values_model,
-                    outcome=outcome,
-                    error_msg=error_msg,
-                    phase1_totals=phase1_totals,
-                    phase3_totals=phase3_totals,
-                    phase1_duration=phase1_duration,
-                    phase2_duration=phase2_duration,
-                    phase3_duration=phase3_duration,
-                    phase3_page_calls=phase3_page_calls,
-                    phase3_grid_pages=phase3_grid_pages,
-                    phase3_boxes_dropped=phase3_boxes_dropped,
-                    phase3_pages_out_of_range=phase3_pages_out_of_range,
-                    phase2_matched=phase2_matched,
-                    phase3_matched=phase3_matched,
-                    unmatched=unmatched_count,
-                    total_locations=total_locations,
-                    computed_fields=computed_fields,
-                    dropped_refs=dropped_refs,
-                    unnormalized_enums=unnormalized_enums,
-                    derivations_checked=derivations_checked,
-                    derivations_mismatched=derivations_mismatched,
-                    invariants_checked=invariants_checked,
-                    invariant_violations=invariant_violations,
-                    phase1_layout=phase1_layout,
-                    phase1_tool_schema=phase1_tool_schema_mode,
-                    phase1_chunk_calls=phase1_chunk_calls,
-                    phase1_truncated_retries=phase1_truncated_retries,
-                    phase1_envelope_repairs=phase1_counters["envelope_repairs"],
+                    workspace=self.workspace,
+                    docset_id=self.docset_id,
+                    file_id=self.file_id,
+                    model=self.config.values_model,
+                    outcome=self.outcome,
+                    error_msg=self.error_msg,
+                    phase1_totals=self.phase1_totals,
+                    phase3_totals=self.phase3_totals,
+                    phase1_duration=self.phase1_duration,
+                    phase2_duration=self.phase2_duration,
+                    phase3_duration=self.phase3_duration,
+                    phase3_page_calls=self.phase3_page_calls,
+                    phase3_grid_pages=self.phase3_grid_pages,
+                    phase3_boxes_dropped=self.phase3_boxes_dropped,
+                    phase3_pages_out_of_range=self.phase3_pages_out_of_range,
+                    phase2_matched=self.phase2_matched,
+                    phase3_matched=self.phase3_matched,
+                    unmatched=self.unmatched_count,
+                    total_locations=self.total_locations,
+                    computed_fields=self.computed_fields,
+                    dropped_refs=self.dropped_refs,
+                    unnormalized_enums=self.unnormalized_enums,
+                    derivations_checked=self.derivations_checked,
+                    derivations_mismatched=self.derivations_mismatched,
+                    invariants_checked=self.invariants_checked,
+                    invariant_violations=self.invariant_violations,
+                    phase1_layout=self.phase1_layout,
+                    phase1_tool_schema=self.phase1_tool_schema_mode,
+                    phase1_chunk_calls=self.phase1_chunk_calls,
+                    phase1_truncated_retries=self.phase1_truncated_retries,
+                    phase1_envelope_repairs=self.phase1_envelope_repairs,
                 )
         except Exception:
             pass
+
+
+def _run_phase3_pages(
+    run: _FileExtraction, pages: list[tuple[int, list[UnmatchedItem]]]
+) -> list[_PageOutcome]:
+    """Drive one file's phase-3 pages synchronously, concurrently across pages.
+
+    Page calls are independent — each looks only at its own page's OCR, image,
+    and items — so they run on a :class:`ThreadPoolExecutor` (litellm's HTTP
+    call releases the GIL). Each page accumulates into its own totals, merged
+    by :meth:`_FileExtraction.finish` after every call returns. A failed page
+    raises out of the pool's ordered ``map``, so the first failing page (in
+    page order) is the one reported, as before.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _do_page(page: int, items: list[UnmatchedItem]) -> _PageOutcome:
+        local_totals = _empty_totals()
+        page_result = llm.drive(run.phase3_steps(page, items, local_totals), run.phase3_config())
+        return page, items, page_result, local_totals
+
+    workers = min(_PHASE3_MAX_PARALLEL, max(1, len(pages)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(lambda kv: _do_page(*kv), pages))
+
+
+def extract_values_batch(
+    workspace: Workspace,
+    docset_id: str,
+    file_ids: list[str],
+    *,
+    config: GroundedConfig,
+    executor: BatchExecutor,
+    write_stats: bool = False,
+    debug: bool = False,
+) -> dict[str, ExtractionResult | Exception]:
+    """:func:`extract_values` for many files of one DocSet, each LLM phase one
+    batch wave. A thin wrapper over :func:`extract_values_batch_pairs`; returns
+    ``{file_id: ExtractionResult | Exception}`` in *file_ids* order. Duplicate
+    *file_ids* raise :class:`ValueError`."""
+    results = extract_values_batch_pairs(
+        workspace,
+        [(docset_id, fid) for fid in file_ids],
+        config=config,
+        executor=executor,
+        write_stats=write_stats,
+        debug=debug,
+    )
+    return {fid: results[(docset_id, fid)] for fid in file_ids}
+
+
+@dataclass
+class ManyExtraction:
+    """What :func:`extract_values_many` did: one outcome per file, in the
+    order asked (an :class:`ExtractionResult`, or the ``Exception`` that file
+    failed with), and — when the batch API ran — ``batch``, the run's
+    ``{"provider", **WaveStats}`` block (else ``None``)."""
+
+    outcomes: dict[str, ExtractionResult | Exception]
+    batch: dict[str, Any] | None = None
+
+
+def extract_values_many(
+    workspace: Workspace,
+    docset_id: str,
+    file_ids: list[str],
+    *,
+    config: GroundedConfig,
+    batch: bool = False,
+    poll_interval_s: float = 30.0,
+    log: Callable[[str], None] = lambda _m: None,
+    write_stats: bool = False,
+    debug: bool = False,
+) -> ManyExtraction:
+    """:func:`extract_values` over several files of one DocSet, each extracted
+    independently: a failure is that file's outcome, never the run's.
+
+    With *batch*, both LLM phases go through the provider's batch API
+    (:func:`extract_values_batch`); a values model with no batch backend is
+    :class:`~dgml_core.errors.BatchUnavailable`, raised before any request. An
+    unset ``values_api_key_env`` is not fatal there: the synchronous run fails
+    each file on it at setup, before any request, so the files are run
+    synchronously and each reports that error (no LLM call is made, and
+    ``batch`` stays ``None``).
+    """
+    if batch:
+        from .batch import assert_batchable
+
+        assert_batchable(values_batch_stages(config.values_model, config.values_reasoning_effort))
+        try:
+            executor = values_batch_executor(config, poll_interval_s=poll_interval_s, log=log)
+        except AuthError:
+            pass
+        else:
+            outcomes = extract_values_batch(
+                workspace,
+                docset_id,
+                file_ids,
+                config=config,
+                executor=executor,
+                write_stats=write_stats,
+                debug=debug,
+            )
+            return ManyExtraction(
+                dict(outcomes),
+                {"provider": executor.backend.provider, **executor.stats.to_json()},
+            )
+    sync: dict[str, ExtractionResult | Exception] = {}
+    for fid in file_ids:
+        try:
+            sync[fid] = extract_values(
+                workspace, docset_id, fid, config=config, write_stats=write_stats, debug=debug
+            )
+        except Exception as exc:
+            sync[fid] = exc
+    return ManyExtraction(sync)
+
+
+#: One extraction job: ``(docset_id, file_id)``.
+ExtractionPair = tuple[str, str]
+
+
+def extract_values_batch_pairs(
+    workspace: Workspace,
+    pairs: list[ExtractionPair],
+    *,
+    config: GroundedConfig,
+    executor: BatchExecutor,
+    write_stats: bool = False,
+    debug: bool = False,
+) -> dict[ExtractionPair, ExtractionResult | Exception]:
+    """:func:`extract_values` for many ``(docset_id, file_id)`` pairs — across
+    any number of DocSets — with each LLM phase submitted as ONE batch wave.
+
+    Phase 1 for every pair is one :func:`dgml_core.batch.run_stage` (a pair
+    whose phase 1 takes several turns — the chunked protocol, the truncation
+    retry, the permissive-schema fallback — simply rides extra waves); phase 2
+    runs locally per pair; then phase 3 for every ``(pair, page)`` is one more
+    stage. So a run is two batch round-trips however many DocSets it spans.
+    Everything else is the per-file code :func:`extract_values` runs, so
+    values, the XML written, ``extraction_stats`` and the usage row match the
+    synchronous result — the row differs only in ``tier="batch"`` (or, when
+    some of a file's requests fell back to the synchronous tier, it is split
+    into one row per tier; see :func:`dgml_core.usage.scope_events`).
+
+    Returns ``{pair: ExtractionResult | Exception}`` in *pairs* order. Pairs
+    are isolated: any ``Exception`` raised for one pair — its setup, a phase,
+    phase 2, the XML write, even writing its usage row or stats — becomes that
+    pair's entry (the same exception :func:`extract_values` would raise for it)
+    and never affects another. A failure of the batch machinery itself
+    (:class:`~dgml_core.errors.BatchExecutionFailed`) is the entry of every
+    pair still in flight (a pair with any page unfinished is in flight); pairs
+    that finished keep their results. Only interrupts (non-``Exception``) propagate, after
+    every open pair's row and stats are written.
+
+    Duplicate *pairs* raise :class:`ValueError`.
+    """
+    from .batch import Unit, UnitOutcome, run_stage
+    from .usage import TIER_BATCH
+
+    if len(set(pairs)) != len(pairs):
+        dupes = sorted({p for p in pairs if pairs.count(p) > 1})
+        raise ValueError(f"(docset_id, file_id) pairs must be unique; duplicated: {dupes}")
+
+    results: dict[ExtractionPair, ExtractionResult | Exception] = {}
+    runs: dict[ExtractionPair, _FileExtraction] = {}
+
+    def _name(pair: ExtractionPair) -> str:
+        return f"{pair[0]}/{pair[1]}"
+
+    def _fail(pair: ExtractionPair, exc: Exception) -> None:
+        """Close *pair* as failed: record its row and stats, as the sync
+        path's ``finally`` does. A failure writing them replaces the original
+        error, exactly as an exception raised in that ``finally`` would."""
+        run = runs.pop(pair)
+        run.fail(exc)
+        try:
+            run.record()
+        except Exception as record_exc:
+            exc = record_exc
+        results[pair] = exc
+
+    def _succeed(pair: ExtractionPair, result: ExtractionResult) -> None:
+        run = runs.pop(pair)
+        try:
+            run.record()
+        except Exception as record_exc:
+            # Sync: an exception from the ``finally`` replaces the return value.
+            results[pair] = record_exc
+            return
+        results[pair] = result
+
+    for pair in pairs:
+        docset_id, fid = pair
+        try:
+            runs[pair] = _FileExtraction(
+                workspace,
+                docset_id,
+                fid,
+                config=config,
+                write_stats=write_stats,
+                debug=debug,
+                tier=TIER_BATCH,
+            )
+        except Exception as exc:
+            # Setup failure (no schema, no PDF, unset key env, …): raised before
+            # any recording in the sync path too, so no row and no stats here.
+            results[pair] = exc
+
+    try:
+        # --- Phase 1: one stage over every pair ------------------------
+        units: list[Unit] = []
+        unit_pairs: dict[str, ExtractionPair] = {}
+        for pair, run in list(runs.items()):
+            try:
+                units.append(Unit(_name(pair), run.phase1_config(), run.phase1_steps()))
+                unit_pairs[_name(pair)] = pair
+            except Exception as exc:
+                _fail(pair, exc)
+        # A stage-wide failure is the outcome of every unit still in flight
+        # (``stage_error``); units that finished keep their results.
+        outcomes: dict[str, UnitOutcome] = {}
+        if units:
+            outcomes = run_stage(units, executor, stage="extraction phase 1")
+
+        pages_by_pair: dict[ExtractionPair, list[tuple[int, list[UnmatchedItem]]]] = {}
+        for name, outcome in outcomes.items():
+            pair = unit_pairs[name]
+            run = runs[pair]
+            try:
+                run.mirror_phase1()
+                if outcome.error is not None:
+                    raise _as_exception(outcome.error)
+                pages_by_pair[pair] = run.after_phase1()
+            except Exception as exc:
+                _fail(pair, exc)
+
+        # --- Phase 3: one stage over every (pair, page) ----------------
+        page_units: list[Unit] = []
+        page_totals: dict[str, dict[str, Any]] = {}
+        for pair in list(pages_by_pair):
+            run = runs[pair]
+            built: list[Unit] = []
+            try:
+                for page, items in pages_by_pair[pair]:
+                    name = f"{_name(pair)}/p{page}"
+                    page_totals[name] = _empty_totals()
+                    built.append(
+                        Unit(
+                            name,
+                            run.phase3_config(),
+                            run.phase3_steps(page, items, page_totals[name]),
+                        )
+                    )
+            except Exception as exc:
+                for unit in built:
+                    unit.steps.close()
+                del pages_by_pair[pair]
+                _fail(pair, exc)
+                continue
+            page_units.extend(built)
+        page_outcomes: dict[str, UnitOutcome] = {}
+        if page_units:
+            page_outcomes = run_stage(page_units, executor, stage="extraction phase 3")
+
+        # --- Finish each surviving pair, in input order ----------------
+        for pair in pairs:
+            maybe_run = runs.get(pair)
+            if maybe_run is None:
+                continue
+            try:
+                per_page: list[_PageOutcome] = []
+                for page, items in pages_by_pair.get(pair, []):
+                    name = f"{_name(pair)}/p{page}"
+                    page_outcome = page_outcomes[name]
+                    if page_outcome.error is not None:
+                        # Mirrors the sync pool: the first failing page in page
+                        # order is reported, and no page's usage is folded in.
+                        raise _as_exception(page_outcome.error)
+                    per_page.append((page, items, page_outcome.result, page_totals[name]))
+                result = maybe_run.finish(per_page)
+            except Exception as exc:
+                _fail(pair, exc)
+                continue
+            _succeed(pair, result)
+    except BaseException as exc:
+        # Only an interrupt — or a paused batch job — gets here: every
+        # Exception above is caught per pair. An interrupt records every open
+        # pair before propagating. A paused job records nothing: the run that
+        # completes the job replays these pairs and writes their rows and stats.
+        from .errors import BatchPending
+
+        paused = isinstance(exc, BatchPending)
+        for pair in list(runs):
+            run = runs.pop(pair)
+            if paused:
+                continue
+            run.fail(exc)
+            with contextlib.suppress(Exception):
+                run.record()
+        raise
+    return {pair: results[pair] for pair in pairs}
+
+
+def _as_exception(error: BaseException) -> Exception:
+    """A unit outcome's error as the ``Exception`` a file result carries.
+
+    :func:`dgml_core.batch.run_stage` captures only ``Exception`` per unit
+    (interrupts propagate), so this is a narrowing, not a conversion."""
+    assert isinstance(error, Exception)
+    return error
+
+
+def values_batch_executor(
+    config: GroundedConfig,
+    *,
+    poll_interval_s: float = 30.0,
+    max_poll_s: float | None = None,
+    min_wave_size: int = 1,
+    log: Callable[[str], None] = lambda _m: None,
+) -> BatchExecutor:
+    """:func:`dgml_core.batch.make_executor` for *config*'s values model, with
+    its credentials resolved the way :func:`extract_values` resolves them.
+
+    Raises :class:`~dgml_core.errors.AuthError` for an unset
+    ``values_api_key_env`` (the same error, same message, the synchronous
+    extraction raises) and :class:`~dgml_core.errors.BatchUnavailable` when the
+    provider has no batch backend. Imports the batch package lazily."""
+    from .batch import make_executor
+    from .batch.jobs import credential_ref
+
+    return make_executor(
+        config.values_model,
+        api_key=_resolve_api_key(config.values_api_key, config.values_api_key_env),
+        api_base=config.values_api_base,
+        credential=credential_ref("grounded", "values", config.values_api_key_env),
+        poll_interval_s=poll_interval_s,
+        max_poll_s=max_poll_s,
+        min_wave_size=min_wave_size,
+        log=log,
+    )
 
 
 def _empty_totals() -> dict[str, Any]:
@@ -1059,6 +1582,13 @@ def _merge_totals(*partials: dict[str, Any]) -> dict[str, Any]:
         observations = [p[key] for p in partials if p[key] is not None]
         if observations:
             merged[key] = sum(observations)
+    # The per-tier breakdowns merge alongside (``add_partial`` carries them),
+    # without touching the aggregate sums above.
+    tiers: dict[str, Any] = {}
+    for p in partials:
+        add_partial(tiers, {TIERS_KEY: p.get(TIERS_KEY) or {}})
+    if TIERS_KEY in tiers:
+        merged[TIERS_KEY] = tiers[TIERS_KEY]
     return merged
 
 
@@ -1120,7 +1650,7 @@ def _write_extraction_stats(
                 # submit_values calls whose envelope had to be repaired before
                 # the tree could be read (see _repair_submit_values_args).
                 "envelope_repairs": phase1_envelope_repairs,
-                **phase1_totals,
+                **public_totals(phase1_totals),
             },
             "phase2": {"duration_s": phase2_duration},
             "phase3": {
@@ -1135,7 +1665,7 @@ def _write_extraction_stats(
                 # 1..page_count, no page image); their items stay unmatched
                 # and no call is made for them.
                 "pages_out_of_range": phase3_pages_out_of_range,
-                **phase3_totals,
+                **public_totals(phase3_totals),
             },
         },
         "matching": {
@@ -1169,6 +1699,165 @@ def _write_extraction_stats(
     workspace.docs.put_doc(
         layout.Collection.EXTRACTION_STATS, layout.pair_id(docset_id, file_id), stats
     )
+
+
+# ---- Step plumbing shared by phase 1 and phase 3 --------------------------
+
+#: Message prefix for a phase-1 request that could not be completed.
+_PHASE1_CALL_FAILED = "extraction call failed"
+
+
+def _phase3_call_failed(page_number: int) -> str:
+    """Message prefix for a phase-3 request on *page_number* that failed."""
+    return f"phase 3 page {page_number} call failed"
+
+
+def _tool_call_step(
+    config: LLMConfig,
+    *,
+    failure: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_choice: str | dict[str, Any] | None = None,
+    cache: bool = False,
+) -> LLMSteps[CallResult]:
+    """:func:`~dgml_core.llm.steps_with_tools`, with any error it raises while
+    building the request or reading the response reported as
+    :class:`ValuesExtractionFailed` ``"<failure>: <Type>: <message>"`` — the
+    same wrapping the inline call site applied to the whole ``call_with_tools``
+    call.
+
+    Drivers deliver a failed request by throwing its exception in at the pending
+    ``yield`` (see :data:`~dgml_core.llm.LLMSteps`), so executor failures land
+    here too and get the same single prefix — the message is identical under
+    the sync driver and a batch driver. Only ``Exception`` is wrapped;
+    ``KeyboardInterrupt`` and ``GeneratorExit`` pass through untouched.
+    """
+    try:
+        return (
+            yield from steps_with_tools(
+                config, messages=messages, tools=tools, tool_choice=tool_choice, cache=cache
+            )
+        )
+    except Exception as exc:
+        raise ValuesExtractionFailed(f"{failure}: {type(exc).__name__}: {exc}") from exc
+
+
+def _phase1_llm_config(
+    model: str,
+    api_key: str | None,
+    api_base: str | None,
+    reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+) -> LLMConfig:
+    """The request config for every phase-1 turn.
+
+    Phase 1 uses tool_choice="auto" (the default in call_with_tools) so the
+    wrapper keeps reasoning_effort for every provider, including Anthropic —
+    only forced tool_choice triggers the Anthropic drop. That also makes this
+    the only call site where the reasoning budget has any effect on Claude,
+    which is why the values reasoning effort applies here and nowhere else:
+    *reasoning_effort* is :data:`_VALUES_REASONING_EFFORT` unless the
+    workspace set ``grounded.values_reasoning_effort`` (``None`` sends no
+    ``reasoning_effort``). It carries no workspace, so driving with it writes no usage row:
+    :func:`extract_values` records one row for the whole extraction.
+    """
+    return LLMConfig(
+        model=model,
+        api_key=api_key,
+        api_base=api_base,
+        max_tokens=None,
+        max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
+        temperature=_DEFAULT_VALUES_TEMPERATURE,
+        timeout=_DEFAULT_TIMEOUT_SECONDS,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def _phase3_llm_config(
+    model: str,
+    api_key: str | None,
+    api_base: str | None,
+    *,
+    reasoning_effort: str | None = None,
+) -> LLMConfig:
+    """The request config for a phase-3 page call.
+
+    reasoning_effort is set unconditionally — the wrapper drops it for
+    Anthropic-routed models because tool_choice forces a function call, and
+    Anthropic rejects extended thinking with forced tools. It is
+    :data:`_DEFAULT_REASONING_EFFORT` unless *reasoning_effort* says otherwise
+    (a page on the 0-1000 grid runs at :data:`_PHASE3_GRID_REASONING_EFFORT`).
+    No workspace, so driving with it writes no usage row.
+    """
+    return LLMConfig(
+        model=model,
+        api_key=api_key,
+        api_base=api_base,
+        max_tokens=None,
+        max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
+        temperature=_DEFAULT_VALUES_TEMPERATURE,
+        timeout=_DEFAULT_TIMEOUT_SECONDS,
+        reasoning_effort=reasoning_effort or _DEFAULT_REASONING_EFFORT,
+    )
+
+
+# ---- Batch pre-flight: the request shapes these stages send -----------------
+#
+# ``assert_batchable`` refuses a stage whose requests a batch backend could
+# never serve, and for some models that depends on the request's shape, not
+# just its model: litellm bridges an OpenAI gpt-5.4+ call carrying tools AND
+# reasoning_effort to the Responses API, which batch mode cannot encode. Both
+# stages below always send both, so the pre-flight is given that shape (from
+# the same configs and tools the stages use) rather than a bare model id.
+
+
+def schema_batch_request(model: str) -> dict[str, Any]:
+    """A representative schema-generation request for ``assert_batchable``."""
+    return {
+        "model": model,
+        "tools": [_submit_schema_tool()],
+        "reasoning_effort": _DEFAULT_REASONING_EFFORT,
+    }
+
+
+def values_batch_request(
+    model: str, reasoning_effort: str | None = _VALUES_REASONING_EFFORT
+) -> dict[str, Any]:
+    """A representative value-extraction request for ``assert_batchable``:
+    phase 1's shape, with the CONFIGURED values reasoning effort
+    (``grounded.values_reasoning_effort``; ``None`` = none sent, so the key is
+    absent), so ``responses_routed`` judges the request the run will send."""
+    config = _phase1_llm_config(model, None, None, reasoning_effort)
+    request: dict[str, Any] = {
+        "model": model,
+        "tools": _phase1_tools({"type": "object", "properties": {}}, chunked=False),
+    }
+    if config.reasoning_effort is not None:
+        request["reasoning_effort"] = config.reasoning_effort
+    return request
+
+
+def values_batch_stages(
+    model: str,
+    reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+    *,
+    stage: str = "extraction",
+) -> dict[str, dict[str, Any]]:
+    """Both value-extraction request shapes for ``assert_batchable``, keyed by
+    stage name: *stage* is phase 1 (:func:`values_batch_request`, with the
+    configured effort) and ``"<stage>.locations"`` is phase 3, which always
+    sends ``submit_locations`` and its own fixed reasoning effort whatever
+    ``grounded.values_reasoning_effort`` says. Both are checked because a
+    configured ``"default"`` takes phase 1 off the Responses-API bridge but
+    not phase 3, which would otherwise fail at encode after phase 1 had paid."""
+    return {
+        stage: values_batch_request(model, reasoning_effort),
+        f"{stage}.locations": {
+            "model": model,
+            "tools": [_submit_locations_tool(["a"])],
+            "reasoning_effort": _phase3_llm_config(model, None, None).reasoning_effort,
+        },
+    }
 
 
 # ---- Phase 3: per-page LLM for unmatched items ----------------------------
@@ -1208,67 +1897,21 @@ def _drop_out_of_range_pages(
     return kept, len(missing)
 
 
-def _run_phase3(
-    *,
-    workspace: Workspace,
-    file_id: str,
-    values: dict[str, Any],
-    unmatched: list[UnmatchedItem],
-    model: str,
-    api_key: str | None,
-    api_base: str | None,
-    max_tool_iters: int,
-    totals: dict[str, Any],
-) -> tuple[dict[str, Any], int, int, int, int]:
-    """Resolve ``unmatched`` items via one LLM call per page, run in
-    parallel across pages.
-
-    Each page-call sends the page image, OCR words, already-matched
-    context for that page (anchors), and the list of ``(id, path, text)``
-    items to locate. The model returns ``{id → [bbox, ...]}`` which we
-    patch back into ``values`` in code. Phase-3 ids are short and unique
-    per page (assigned in :mod:`dgml.matching`), so the model only echoes
-    them — never the path or text.
-
-    Page calls are independent — each looks only at its own page's
-    OCR, image, and items — so they run concurrently via a
-    :class:`ThreadPoolExecutor` (litellm's HTTP call releases the
-    GIL). Each thread accumulates into its own ``totals`` dict and we
-    merge them after all calls return, keeping the cost telemetry
-    accurate without needing a lock on the hot path.
-
-    Returns ``(values, matched_count, page_calls, grid_pages, boxes_dropped)``:
-    ``grid_pages`` counts pages located on the 0-1000 grid (no OCR words), and
-    ``boxes_dropped`` the returned boxes discarded as off the page or empty.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
+def _group_by_page(unmatched: list[UnmatchedItem]) -> dict[int, list[UnmatchedItem]]:
+    """Phase-3 work items grouped by page, in encounter order within a page."""
     by_page: dict[int, list[UnmatchedItem]] = {}
     for item in unmatched:
         by_page.setdefault(item.page_number, []).append(item)
+    return by_page
 
-    def _do_page(
-        page: int, items: list[UnmatchedItem]
-    ) -> tuple[int, list[UnmatchedItem], _Phase3PageResult, dict[str, Any]]:
-        local_totals = _empty_totals()
-        page_result = _phase3_call_for_page(
-            workspace=workspace,
-            file_id=file_id,
-            page_number=page,
-            items=items,
-            values=values,
-            model=model,
-            api_key=api_key,
-            api_base=api_base,
-            max_tool_iters=max_tool_iters,
-            totals=local_totals,
-        )
-        return page, items, page_result, local_totals
 
-    workers = min(_PHASE3_MAX_PARALLEL, max(1, len(by_page)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        per_page = list(ex.map(lambda kv: _do_page(*kv), sorted(by_page.items())))
-
+def _fold_phase3(
+    values: dict[str, Any], per_page: list[_PageOutcome], totals: dict[str, Any]
+) -> tuple[int, int, int, int]:
+    """Patch each page's located boxes into *values* and fold its usage into
+    *totals*. Returns ``(matched_count, page_calls, grid_pages, boxes_dropped)``:
+    ``grid_pages`` counts pages located on the 0-1000 grid (no OCR words), and
+    ``boxes_dropped`` the returned boxes discarded as off the page or empty."""
     matched_count = 0
     page_calls = 0
     grid_pages = 0
@@ -1284,20 +1927,10 @@ def _run_phase3(
                 continue
             if _patch_value_with_locations(values, item, model_locs):
                 matched_count += 1
-    return values, matched_count, page_calls, grid_pages, boxes_dropped
+    return matched_count, page_calls, grid_pages, boxes_dropped
 
 
-@dataclass(frozen=True)
-class _Phase3PageResult:
-    """One page's phase-3 answer: ``{id -> locations}`` in page pixels, whether
-    the page went through the 0-1000 grid, and how many boxes were dropped."""
-
-    locations: dict[str, list[dict[str, Any]]]
-    grid: bool
-    boxes_dropped: int
-
-
-def _phase3_call_for_page(
+def phase3_page_steps(
     *,
     workspace: Workspace,
     file_id: str,
@@ -1308,11 +1941,24 @@ def _phase3_call_for_page(
     api_key: str | None,
     api_base: str | None,
     max_tool_iters: int,
-    totals: dict[str, Any],
-) -> _Phase3PageResult:
-    """One litellm call: send the page + ids that need locating, return
-    ``{id: [{page_number, bounding_box}, ...]}`` parsed from the model's
-    ``submit_locations`` tool call, with the page's grid/dropped counts.
+    totals: dict[str, Any] | None = None,
+) -> LLMSteps[_Phase3PageResult]:
+    """Phase 3 for ONE page, as an :data:`~dgml_core.llm.LLMSteps` generator.
+
+    Yields the forced ``submit_locations`` request, receives the response, and
+    returns a :class:`_Phase3PageResult`: ``{id: [{page_number, bounding_box},
+    ...]}`` parsed from the model's tool call, with the page's grid/dropped
+    counts. A page with no OCR words is asked for boxes on a 0-1000 grid (at
+    :data:`_PHASE3_GRID_REASONING_EFFORT`), scaled to pixels when parsed. One
+    generator per page, so a driver can fan a file's pages out concurrently
+    (the sync :func:`_run_phase3_pages` does so on a thread pool; a batch
+    driver puts them in one wave). Drive it with the config from
+    :func:`_phase3_llm_config`; a failed request thrown in at the pending
+    ``yield`` surfaces as :class:`ValuesExtractionFailed` ``"phase 3 page <n>
+    call failed: <Type>: <message>"``. Each response's usage is folded into
+    *totals* when given, so phase-3 cost survives in the caller's accounting.
+    The page image and OCR words are read from *workspace* before the request
+    is yielded.
 
     Deliberately uncached, for three independent reasons: the cacheable prefix
     is tools + system and ``_submit_locations_tool`` is built from *this page's*
@@ -1364,18 +2010,12 @@ def _phase3_call_for_page(
     ]
     tools = [_submit_locations_tool([it.id for it in items])]
 
-    # reasoning_effort is set unconditionally — the wrapper drops it for
-    # Anthropic-routed models because tool_choice forces a function call
-    # below, and Anthropic rejects extended thinking with forced tools.
-    llm_config = LLMConfig(
-        model=model,
-        api_key=api_key,
-        api_base=api_base,
-        max_tokens=None,
-        max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
-        temperature=_DEFAULT_VALUES_TEMPERATURE,
-        timeout=_DEFAULT_TIMEOUT_SECONDS,
-        reasoning_effort=_PHASE3_GRID_REASONING_EFFORT if normalized else _DEFAULT_REASONING_EFFORT,
+    # A page on the 0-1000 grid (no OCR words) runs at its own reasoning effort.
+    llm_config = _phase3_llm_config(
+        model,
+        api_key,
+        api_base,
+        reasoning_effort=_PHASE3_GRID_REASONING_EFFORT if normalized else None,
     )
     forced_tool_choice = {
         "type": "function",
@@ -1383,18 +2023,15 @@ def _phase3_call_for_page(
     }
 
     for _ in range(max_tool_iters):
-        try:
-            result = call_with_tools(
-                llm_config,
-                messages=messages,
-                tools=tools,
-                tool_choice=forced_tool_choice,
-            )
-        except Exception as exc:
-            raise ValuesExtractionFailed(
-                f"phase 3 page {page_number} call failed: {type(exc).__name__}: {exc}"
-            ) from exc
-        add_partial(totals, result.usage)
+        result = yield from _tool_call_step(
+            llm_config,
+            failure=_phase3_call_failed(page_number),
+            messages=messages,
+            tools=tools,
+            tool_choice=forced_tool_choice,
+        )
+        if totals is not None:
+            add_partial(totals, with_tier(result.usage, result.response, None))
 
         if not result.tool_calls:
             raise ValuesExtractionFailed(f"phase 3 page {page_number}: model returned no tool call")
@@ -1814,6 +2451,158 @@ def _append_entries_tool() -> dict[str, Any]:
     }
 
 
+@dataclass
+class Phase1Result:
+    """Phase-1 progress and outcome for one file.
+
+    Passed INTO :func:`phase1_steps` and returned by it, because it is also the
+    state that must survive a re-run: the permissive-schema fallback restarts
+    the generator after a refused request, and the truncation latch
+    (``chunked`` / ``truncated_retries``) has to carry across that restart.
+
+    ``chunk_calls`` and ``tool_calls`` describe the attempt that SUCCEEDED
+    (0 until one does); ``values`` / ``layout`` are that attempt's merged,
+    vocabulary-pruned payload. ``totals`` accumulates cost/token usage across
+    every attempt, including failed ones, and ``counters["envelope_repairs"]``
+    the ``submit_values`` envelopes repaired in any attempt (see
+    :func:`_repair_submit_values_args`).
+
+    ``refusal`` is set when the successful attempt submitted keys of which
+    nothing fits the schema. :func:`phase1_steps` does not raise it: the caller
+    first records what phase 1 did (tool calls, layout, duration), then raises
+    it as :class:`ValuesExtractionFailed`.
+    """
+
+    tool_schema_mode: str = "inlined"
+    chunked: bool = False
+    truncated_retries: int = 0
+    chunk_calls: int = 0
+    tool_calls: int = 0
+    values: dict[str, Any] = field(default_factory=dict)
+    layout: dict[str, Any] | None = None
+    totals: dict[str, Any] = field(default_factory=lambda: _empty_totals())
+    counters: dict[str, int] = field(default_factory=lambda: {"envelope_repairs": 0})
+    refusal: str | None = None
+
+
+def phase1_steps(
+    *,
+    workspace: Workspace,
+    file_id: str,
+    run: Phase1Result,
+    messages_factory: Callable[..., list[dict[str, Any]]],
+    tool_schema: dict[str, Any],
+    vocab: Vocabulary,
+    model: str,
+    api_key: str | None,
+    api_base: str | None,
+    max_tool_iters: int,
+    reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+) -> LLMSteps[Phase1Result]:
+    """Phase 1 for ONE file, as an :data:`~dgml_core.llm.LLMSteps` generator.
+
+    Yields every phase-1 request in order and returns *run* filled in. The
+    chunked protocol (``submit_values`` with ``done: false`` then
+    ``append_entries``) and the truncation retry (a ``finish_reason='length'``
+    turn restarts the attempt in chunked mode with the mandatory directive) are
+    simply more steps, so a batch driver runs them as more waves.
+
+    Two one-way latches, each enabled by the failure it answers, restart the
+    attempt; since a latch only ever flips off → on and its handler re-raises
+    once set, at most three attempts run:
+
+    * a ``finish_reason='length'`` turn → chunked submission with the mandatory
+      directive (``run.chunked``); a second truncation fails the file;
+    * the provider refusing the inlined tool schema ("too many states",
+      Gemini's constrained decoder) → the permissive object parameter plus
+      code-side vocabulary pruning (``run.tool_schema_mode``). That refusal is
+      an executor failure the driver throws in at the pending ``yield``, so a
+      batch driver gets the fallback without doing anything.
+
+    *messages_factory* is called as ``messages_factory(chunked=...)`` for each
+    attempt and must return a fresh list (the attempt appends to it).
+    *tool_schema* is the inlined ``submit_values`` parameter; the permissive
+    one replaces it once that latch is set. *reasoning_effort* is the
+    configured ``grounded.values_reasoning_effort`` (``None`` sends none).
+    Drive it with the config from :func:`_phase1_llm_config` (same effort);
+    any failure it does not recover from surfaces as
+    :class:`ValuesExtractionFailed` (``"extraction call failed: <Type>:
+    <message>"`` for a failed request). *run* may already carry latches from an
+    earlier run and they are honored.
+    """
+    while True:
+        values_param = (
+            _PERMISSIVE_VALUES_PARAM if run.tool_schema_mode == "permissive" else tool_schema
+        )
+        try:
+            args, tool_calls, chunk_calls = yield from _phase1_attempt_steps(
+                workspace=workspace,
+                file_id=file_id,
+                messages=messages_factory(chunked=run.chunked),
+                tools=_phase1_tools(values_param, chunked=run.chunked),
+                chunked=run.chunked,
+                model=model,
+                api_key=api_key,
+                api_base=api_base,
+                max_tool_iters=max_tool_iters,
+                totals=run.totals,
+                vocab=vocab,
+                counters=run.counters,
+                reasoning_effort=reasoning_effort,
+            )
+            break
+        except _OutputTruncated as exc:
+            if run.chunked:
+                raise ValuesExtractionFailed(
+                    f"{exc} The chunked-submission retry was truncated too; "
+                    "consider a model with a higher output ceiling or "
+                    "splitting the document."
+                ) from exc
+            run.chunked = True
+            run.truncated_retries += 1
+        except ValuesExtractionFailed as exc:
+            if run.tool_schema_mode == "permissive" or not _is_tool_schema_too_large(exc):
+                raise
+            # Gemini's constrained decoder rejected the inlined schema; the
+            # model still sees the full schema in the user prompt.
+            run.tool_schema_mode = "permissive"
+    run.chunk_calls = chunk_calls
+    run.tool_calls = tool_calls
+    layout_ = args.get("layout") or None
+    run.layout = layout_ if isinstance(layout_, dict) else None
+    # Keys that name no schema root, and roots whose value has the wrong
+    # shape, are dropped at serialization (the writer walks vocab.roots).
+    # A tree that had keys but keeps nothing would land as an empty
+    # <dg:extraction/> reported as success: flag it so the caller refuses it
+    # and the failure is visible. An empty tree, or one whose roots are all
+    # null, stays a legal "nothing found" outcome (the serializer reads null as
+    # "not extracted"), and leaf internals (a leaf without text, a collection
+    # of malformed entries) stay the serializer's business, as before.
+    submitted_keys = sorted(k for k, v in args["values"].items() if v is not None)
+    kept = _prune_to_vocabulary(args["values"], vocab)
+    if submitted_keys and not kept:
+        shown = ", ".join(repr(k) for k in submitted_keys[:6])
+        if len(submitted_keys) > 6:
+            shown += f" and {len(submitted_keys) - 6} more"
+        run.refusal = (
+            f"{_TOOL_SUBMIT_VALUES!r} returned nothing that fits the schema: got keys "
+            f"{shown}, expected roots {sorted(tag.name for tag in vocab.roots)} "
+            "shaped as the schema defines; refusing to write an empty extraction"
+        )
+    # Enforce the vocabulary code-side on exactly the paths whose payload
+    # never met a provider-side shape check: permissive mode (the values
+    # parameter was a bare object) and chunked mode (append_entries
+    # batches are validated only as generic objects). The inlined
+    # single-shot path already got additionalProperties:false at the API
+    # layer, and pruning it too would discard off-schema values *before*
+    # phases 2/3 rather than at serialization — a behavior change beyond
+    # what these fallbacks need.
+    if run.tool_schema_mode == "permissive" or run.chunked:
+        args["values"] = kept
+    run.values = args["values"]
+    return run
+
+
 _ENVELOPE_KEYS = frozenset({"values", "layout", "done"})
 
 
@@ -1966,7 +2755,7 @@ def _decode_string_envelope(text: str) -> dict[str, Any] | None:
     return lead if isinstance(lead, dict) else None
 
 
-def _run_extract_loop(
+def _phase1_attempt_steps(
     *,
     workspace: Workspace,
     file_id: str,
@@ -1981,8 +2770,8 @@ def _run_extract_loop(
     counters: dict[str, int],
     chunked: bool = False,
     reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
-) -> tuple[dict[str, Any], int, int]:
-    """Run a multi-turn extraction loop until the model finishes submitting.
+) -> LLMSteps[tuple[dict[str, Any], int, int]]:
+    """One phase-1 attempt: a multi-turn loop until the model finishes submitting.
 
     Returns ``(submit_args, tool_calls_run, chunk_calls)``: ``submit_args``
     carries the merged ``values`` tree plus optional sibling fields like
@@ -2013,27 +2802,10 @@ def _run_extract_loop(
     if appends ran, chunked mode was on, so the payload gets pruned.
 
     A turn that stops with ``finish_reason == "length"`` raises
-    :class:`_OutputTruncated` so the caller can retry with an explicit
+    :class:`_OutputTruncated` so :func:`phase1_steps` can retry with an explicit
     chunking directive.
     """
-    # Phase 1 uses tool_choice="auto" (the default in call_with_tools) so
-    # the model can call get_page_words between turns. With auto choice
-    # the wrapper keeps reasoning_effort for every provider, including
-    # Anthropic — only forced tool_choice triggers the Anthropic drop. That
-    # also makes this the only call site where the reasoning budget has any
-    # effect on Claude, which is why :data:`_VALUES_REASONING_EFFORT` applies
-    # here and nowhere else. ``reasoning_effort`` is that constant unless the
-    # workspace set ``grounded.values_reasoning_effort`` (``None`` = send none).
-    llm_config = LLMConfig(
-        model=model,
-        api_key=api_key,
-        api_base=api_base,
-        max_tokens=None,
-        max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
-        temperature=_DEFAULT_VALUES_TEMPERATURE,
-        timeout=_DEFAULT_TIMEOUT_SECONDS,
-        reasoning_effort=reasoning_effort,
-    )
+    llm_config = _phase1_llm_config(model, api_key, api_base, reasoning_effort)
 
     tool_calls_run = 0
     chunk_calls = 0
@@ -2050,18 +2822,15 @@ def _run_extract_loop(
         )
 
     for _ in range(max_tool_iters):
-        try:
-            # Always cached: the system prompt and the schema block ahead of the
-            # per-file PDF are byte-identical for every file in the docset, so
-            # each file after the first reads that prefix instead of re-sending
-            # it. ``call_with_tools`` no-ops the marker for non-Anthropic models.
-            result = call_with_tools(llm_config, messages=messages, tools=tools, cache=True)
-        except Exception as exc:
-            raise ValuesExtractionFailed(
-                f"extraction call failed: {type(exc).__name__}: {exc}"
-            ) from exc
+        # Always cached: the system prompt and the schema block ahead of the
+        # per-file PDF are byte-identical for every file in the docset, so
+        # each file after the first reads that prefix instead of re-sending
+        # it. ``steps_with_tools`` no-ops the marker for non-Anthropic models.
+        result = yield from _tool_call_step(
+            llm_config, failure=_PHASE1_CALL_FAILED, messages=messages, tools=tools, cache=True
+        )
 
-        add_partial(totals, result.usage)
+        add_partial(totals, with_tier(result.usage, result.response, None))
 
         if result.finish_reason == "length":
             # Without this check a clipped submit_values surfaces as an

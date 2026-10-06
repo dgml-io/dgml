@@ -39,6 +39,13 @@ consistent:
   per call. :func:`record_usage_for` is an optional scope that aggregates the
   calls inside it into a single row for multi-call operations. All recording is
   gated on ``--debug``.
+- **One request protocol, two drivers.** Each wrapper is defined once as a
+  pure ``steps_*`` generator (yields the completion kwargs for a request,
+  receives the response, decides whether another request follows) and the
+  ``call*`` function is its synchronous driver via :func:`drive`, which owns
+  the usage accounting. An executor that defers requests — a provider batch
+  endpoint — runs the same generators, so request shaping and continuation
+  logic exist in exactly one place.
 
 Lives at the package root (:mod:`dgml_core.llm`) so generation and the
 non-generation call sites share one implementation.
@@ -48,15 +55,16 @@ from __future__ import annotations
 
 import base64
 import io
+import itertools
 import logging
 import re
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import litellm
 
@@ -67,10 +75,13 @@ from .storage import Workspace
 from .usage import (
     OUTCOME_ERROR,
     OUTCOME_OK,
+    TIER_STANDARD,
     UsageEvent,
     add_partial,
     extract_cost_and_tokens,
     record_usage,
+    scope_events,
+    with_tier,
 )
 
 logger = logging.getLogger(__name__)
@@ -350,6 +361,10 @@ class LLMConfig:
     debug: bool = False
     operation: str | None = None
     context: dict[str, Any] | None = None
+    # Pricing tier recorded on the usage row (``usage.TIER_STANDARD`` /
+    # ``usage.TIER_BATCH``). The batch executor sets ``TIER_BATCH`` on the
+    # configs it drives; every synchronous call records standard.
+    tier: str = TIER_STANDARD
     # Internal: set by an active :func:`record_usage_for` scope. While set,
     # the call functions fold their usage into it (one aggregated row for the
     # whole scope) instead of each writing its own row. Never set by callers.
@@ -563,36 +578,19 @@ def call_with_refinement(
     With ``cache=True`` on Anthropic, the system prefix and the last block of
     ``user_content`` are marked cacheable, so request 2 replays the shared
     prefix at ~10% token cost (within the 5-min TTL).
+
+    Sync driver over :func:`steps_with_refinement`.
     """
-    is_anthropic = is_anthropic_model(config.model)
-    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
-    user_blocks = (
-        _mark_last_block_cacheable(user_content) if (cache and is_anthropic) else user_content
+    return drive(
+        steps_with_refinement(
+            config,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            refine_instruction=refine_instruction,
+            cache=cache,
+        ),
+        config,
     )
-    user_msg = {"role": "user", "content": user_blocks}
-
-    # Both requests fold into one aggregated row. Route through
-    # _completion_with_retry so an empty/transient response is retried rather
-    # than crashing on choices[0] (same guard as every other call site).
-    with _record_call(config) as totals:
-        draft_resp = _completion_with_retry(
-            _build_completion_kwargs(config, messages=[sys_msg, user_msg])
-        )
-        add_partial(totals, extract_cost_and_tokens(draft_resp))
-        draft = cast(str, draft_resp["choices"][0]["message"]["content"])
-
-        refine_msgs: list[dict[str, Any]] = [
-            sys_msg,
-            user_msg,
-            {"role": "assistant", "content": draft},
-            {"role": "user", "content": refine_instruction},
-        ]
-        refined_resp = _completion_with_retry(
-            _build_completion_kwargs(config, messages=refine_msgs)
-        )
-        add_partial(totals, extract_cost_and_tokens(refined_resp))
-        refined = cast(str, refined_resp["choices"][0]["message"]["content"])
-    return draft, refined
 
 
 def _is_tool_choice_forced(tool_choice: Any) -> bool:
@@ -915,6 +913,14 @@ def _quiet_stdout() -> Iterator[None]:
             own_sink.drain()
 
 
+#: Optional seam over every synchronous completion: ``recorder(kwargs, call)``
+#: returns the response, where ``call(kwargs)`` performs the real request. Set
+#: only while a batch job session is active (:mod:`dgml_core.batch.jobs`), which
+#: uses it to record synchronous responses and replay them on a resumed run;
+#: ``None`` — the default — leaves every call exactly as it was.
+_SYNC_RECORDER: Callable[[dict[str, Any], Callable[[dict[str, Any]], Any]], Any] | None = None
+
+
 def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
     """Call litellm.completion with exponential-backoff retries for transient
     failures — both raised errors and *empty* responses.
@@ -927,6 +933,16 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
     retried like any other transient failure, and only raises
     :class:`EmptyModelResponse` once it persists across every attempt.
     """
+    recorder = _SYNC_RECORDER
+    if recorder is not None:
+        return recorder(kwargs, lambda kw: _completion_attempts(kw, max_retries=max_retries))
+    return _completion_attempts(kwargs, max_retries=max_retries)
+
+
+def _completion_attempts(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
+    """The retry loop behind :func:`_completion_with_retry`, without the
+    recorder seam (a batch job's own synchronous fallback calls this directly,
+    having already accounted for the request)."""
     import litellm
 
     delay = 2.0
@@ -998,10 +1014,14 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
       :func:`record_usage_for`), fold the totals into it and write nothing —
       the scope emits one combined row.
     - Otherwise, append one :class:`UsageEvent` (gated on ``--debug`` +
-      workspace). A single call therefore yields a single row.
+      workspace). A single call therefore yields a single row — or one row
+      per tier when its responses were served by more than one (see
+      :func:`dgml_core.usage.scope_events`).
 
     Exceptions propagate after the totals are recorded, so a failed call
     still leaves a row (or contributes its partial usage to the scope).
+    ``BaseException`` is classified, not just ``Exception``, so an interrupted
+    call (``KeyboardInterrupt``, ``SystemExit``) never leaves an ``ok`` row.
     The write itself can never break the caller (see :func:`record_usage`).
     """
     totals = empty_usage_totals()
@@ -1018,24 +1038,541 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
         if config._usage_sink is not None:
             add_partial(config._usage_sink, totals)
         elif config.debug and config.workspace is not None:
-            record_usage(
-                config.workspace,
-                UsageEvent(
-                    at=now_iso(),
-                    operation=config.operation or "llm_call",
-                    model=config.model,
-                    cost_usd=totals["cost_usd"],
-                    prompt_tokens=totals["prompt_tokens"],
-                    completion_tokens=totals["completion_tokens"],
-                    total_tokens=totals["total_tokens"],
-                    cache_read_tokens=totals["cache_read_tokens"],
-                    cache_creation_tokens=totals["cache_creation_tokens"],
-                    duration_s=round(time.monotonic() - started, 3),
-                    outcome=outcome,
-                    context=config.context or {},
-                    error=error_msg,
-                ),
+            event = UsageEvent(
+                at=now_iso(),
+                operation=config.operation or "llm_call",
+                model=config.model,
+                cost_usd=totals["cost_usd"],
+                prompt_tokens=totals["prompt_tokens"],
+                completion_tokens=totals["completion_tokens"],
+                total_tokens=totals["total_tokens"],
+                cache_read_tokens=totals["cache_read_tokens"],
+                cache_creation_tokens=totals["cache_creation_tokens"],
+                duration_s=round(time.monotonic() - started, 3),
+                outcome=outcome,
+                context=config.context or {},
+                error=error_msg,
+                tier=config.tier,
             )
+            # One row, or one per tier when the responses span tiers.
+            for part in scope_events(event, totals):
+                record_usage(config.workspace, part)
+
+
+# ---------------------------------------------------------------------------
+# Step forms: the request/response protocol behind every wrapper
+# ---------------------------------------------------------------------------
+#
+# Each wrapper below exists in two shapes. The ``steps_*`` generator is the
+# protocol: it yields the completion kwargs for one request (exactly the dict
+# :func:`_build_completion_kwargs` produces), receives the litellm response the
+# caller obtained for it, and either yields the next request or returns the
+# wrapper's result. The ``call*`` function is the sync driver: it hands each
+# yielded step to :func:`_completion_with_retry` and sends the response back.
+#
+# The split lets a different executor — one that submits a whole wave of
+# requests to a provider's batch endpoint and delivers the responses later —
+# run the very same request-shaping and continuation logic without a second
+# copy of it. Everything a step contains is decided inside the generator, so
+# the wire request is identical whichever driver runs it.
+#
+# The generators are PURE: they build requests and parse responses, nothing
+# else. Usage accounting belongs to the driver — ``drive`` opens the
+# ``_record_call`` scope, folds each response's usage in before handing it to
+# the generator, and closes the generator when it stops driving it. A sync
+# call therefore still yields exactly one usage row with the same fields, and
+# any other driver gets the same row by following the same three rules.
+
+T = TypeVar("T")
+
+#: One request: the kwargs dict for ``litellm.completion`` as built by
+#: :func:`_build_completion_kwargs`.
+LLMStep = dict[str, Any]
+
+
+class FanOut:
+    """Fork independent child step generators and join on their results.
+
+    Yielded by an :data:`LLMSteps` generator in place of a request (structured
+    concurrency: the children cannot outlive the yield). The yield evaluates to
+    ``[result_0, result_1, ...]`` — each child's return value, in *child*
+    order, whatever order they finished in. The contract every driver honours:
+
+    - **The children must be independent**: no child's requests may depend on
+      another child's responses or side effects. The parent applies any
+      order-sensitive side effects itself, after the join, in child order —
+      that is what keeps the outcome identical whichever driver runs it.
+    - **Sync** (:func:`drive`): the children run one after another, to
+      completion, in child order — so the request sequence and every request
+      byte are exactly those of ``yield from child_0; yield from child_1; ...``.
+    - **Batch** (:func:`dgml_core.batch.run_stage`): the children's pending
+      requests are extra in-flight requests of the same unit, sharing each wave
+      with every other unit's; the parent resumes once every child has
+      returned. Within one child, requests stay strictly ordered.
+    - **Failures, per child as for a unit**: a request a driver could not serve
+      is thrown into *that child* at its pending ``yield``; only an exception
+      escaping the child fails it. Every child runs to the end even when an
+      earlier one failed (both drivers), and then the first failed child's
+      exception, in child order, is thrown into the parent at the ``FanOut``
+      yield instead of sending the results. An interrupt (a non-``Exception``
+      ``BaseException``) closes every child and propagates.
+    - **Usage folds in child order**: each child's per-wrapper subtotals are
+      folded, after the parent's preceding ones, in child order — exactly the
+      sequence the sync driver produces — so sums associate bit for bit across
+      drivers (see :class:`_UsageFold`).
+    - **Determinism**: children are primed in child order and a batch driver
+      assigns request ids in that order, so a job's replay (keyed by request
+      occurrence) meets the same requests in the same order on every run.
+
+    Children may yield ``FanOut`` themselves (nesting). An empty ``FanOut``
+    joins at once with ``[]`` and makes no request.
+    """
+
+    __slots__ = ("children",)
+
+    def __init__(self, children: Iterable[Generator[Any, Any, Any]]) -> None:
+        self.children: tuple[Generator[Any, Any, Any], ...] = tuple(children)
+
+    def __repr__(self) -> str:
+        return f"FanOut({len(self.children)} children)"
+
+
+#: A wrapper's request/response protocol. Contract:
+#:
+#: - The generator is **pure**: it yields :data:`LLMStep` values, receives the
+#:   litellm ``ModelResponse`` obtained for each one (what
+#:   :func:`_completion_with_retry` returns), validates it with
+#:   :func:`_require_choices`, parses it, and returns the wrapper's result. It
+#:   performs no usage accounting and no I/O.
+#: - The **driver owns accounting**: it runs the generator inside one
+#:   :func:`_record_call` scope and folds every response's usage in *before*
+#:   sending the response in, through a :class:`_UsageFold` so the sums
+#:   associate per wrapper call exactly as the inline wrappers' did (see
+#:   :func:`drive`).
+#: - The driver **must close** the generator when it stops driving it for any
+#:   reason (``steps.close()``), so an abandoned request never leaves a
+#:   suspended generator behind.
+#: - A driver **delivers request failures with** ``throw()``: when a request
+#:   cannot be served, the driver throws the ``Exception`` into the generator
+#:   at the pending ``yield``. Generators that want retry semantics catch
+#:   around ``yield from llm.steps_*(...)`` exactly as sync code catches
+#:   around ``llm.call(...)`` — and may yield a new step (retry), return, or
+#:   re-raise. Only an exception escaping ``throw()`` fails the run. A
+#:   ``BaseException`` that is not an ``Exception`` (an interrupt) is never
+#:   thrown in; it propagates straight out of the driver.
+LLMSteps = Generator[LLMStep, Any, T]
+
+#: An :data:`LLMSteps` generator that may also yield a :class:`FanOut` of
+#: child generators (each an ``LLMSteps`` or ``LLMFlow`` itself) in place of a
+#: request: the driver runs the children and sends their return values back as
+#: a list in child order (see :class:`FanOut` for the join contract). Every
+#: driver — :func:`drive` and :func:`dgml_core.batch.run_stage` — accepts
+#: either; the ``steps_*`` primitives are plain ``LLMSteps``. Kept a separate
+#: alias so code that hand-drives a primitive still sees only requests.
+LLMFlow = Generator[LLMStep | FanOut, Any, T]
+
+
+def _require_choices(response: Any) -> None:
+    """Reject a response with no ``choices`` (missing or empty).
+
+    Mirrors the guard in :func:`_completion_with_retry`, which retries such
+    responses from the default executor. A custom executor — or a batch result
+    that arrived empty — reaches the generators without that retry, so the
+    generators check every response themselves and fail with a clear
+    :class:`EmptyModelResponse` instead of an ``IndexError`` on ``choices[0]``.
+    """
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
+    if not choices:
+        raise EmptyModelResponse("model response carries no choices")
+
+
+# ---------------------------------------------------------------------------
+# Wrapper-ordered usage folding
+# ---------------------------------------------------------------------------
+#
+# Before the step split, every wrapper call (``call``, ``call_continued``, ...)
+# opened its own ``_record_call`` scope: its responses summed into that call's
+# subtotal, and on exit the subtotal folded into the enclosing
+# ``record_usage_for`` sink — or became the row. A driver that summed a whole
+# multi-wrapper generator into one scope total first and folded *that* into the
+# sink would compute ``sink + (w1 + w2)`` where the inline code computed
+# ``(sink + w1) + w2``: the same number except in the last float digit. Rows
+# are compared bit for bit (and against rows recorded before the split), so
+# every driver folds through :class:`_UsageFold`, which reproduces the inline
+# association exactly. The primitives tag each step they yield with the id of
+# their invocation (:class:`_WrapperStep`) so a driver can see where one
+# wrapper call ends and the next begins without any change to the request.
+
+_wrapper_ids = itertools.count(1)
+
+
+def _next_wrapper_id() -> int:
+    """A fresh id for one ``steps_*`` primitive invocation."""
+    return next(_wrapper_ids)
+
+
+class _WrapperStep(dict[str, Any]):
+    """An :data:`LLMStep` carrying the id of the primitive invocation that
+    built it (``wrapper_id``).
+
+    It *is* the completion-kwargs dict — equal to, unpacked and serialized
+    exactly as the plain dict — so the tag never reaches the wire; drivers
+    read it off the step object they were handed.
+    """
+
+    wrapper_id: int
+
+
+def _wrapper_step(wrapper_id: int, kwargs: dict[str, Any]) -> LLMStep:
+    step = _WrapperStep(kwargs)
+    step.wrapper_id = wrapper_id
+    return step
+
+
+def _fold_target(config: LLMConfig, totals: dict[str, Any]) -> dict[str, Any]:
+    """Where a finished wrapper subtotal goes: the enclosing
+    :func:`record_usage_for` sink when one is open (as the inline wrappers'
+    ``_record_call`` exit did), else the driving scope's own row totals."""
+    return config._usage_sink if config._usage_sink is not None else totals
+
+
+class _UsageFold:
+    """Sum responses into per-wrapper-call subtotals and hand each finished
+    subtotal to *fold*, in the order the inline wrappers folded them.
+
+    :meth:`add` takes each response's usage together with the step it
+    answered; a step from a different primitive invocation than the previous
+    one (or an untagged step, which counts as its own call) closes the
+    running subtotal first. :meth:`flush` closes the last one; drivers call
+    it before their accounting scope exits.
+    """
+
+    def __init__(self, fold: Callable[[dict[str, Any]], None]) -> None:
+        self._fold = fold
+        self._wrapper: int | None = None
+        self._sub: dict[str, Any] | None = None
+
+    def add(self, step: Any, usage: dict[str, Any]) -> None:
+        wrapper = getattr(step, "wrapper_id", None)
+        if self._sub is not None and (wrapper is None or wrapper != self._wrapper):
+            self.flush()
+        if self._sub is None:
+            self._sub = empty_usage_totals()
+            self._wrapper = wrapper
+        add_partial(self._sub, usage)
+
+    def flush(self) -> None:
+        if self._sub is not None:
+            sub, self._sub, self._wrapper = self._sub, None, None
+            self._fold(sub)
+
+    def emit(self, sub: dict[str, Any]) -> None:
+        """Hand an already-finished subtotal on, after the running one: how a
+        batch driver folds a :class:`FanOut` child's subtotals into its
+        parent's at the join, in the sequence the sync driver produces."""
+        self.flush()
+        self._fold(sub)
+
+
+def drive(
+    steps: LLMFlow[T],
+    config: LLMConfig,
+    execute: Callable[[LLMStep], Any] | None = None,
+) -> T:
+    """Run a ``steps_*`` generator to completion and return its result.
+
+    The sync driver, and the reference for any other: it owns the usage
+    accounting the generators deliberately do not do. One :func:`_record_call`
+    scope on *config* wraps the whole run; each response's usage is folded in
+    *before* the response is sent into the generator — summed per wrapper call
+    and each call's subtotal folded into the enclosing :func:`record_usage_for`
+    sink (else the scope's row) in order, the inline wrappers' exact float
+    association (see :class:`_UsageFold`) — so a failure
+    while parsing still leaves the row carrying what was spent; an
+    ``Exception`` from ``execute`` is thrown into the generator at its pending
+    ``yield`` (see :data:`LLMSteps`) — a generator that catches it and yields
+    again keeps the run going, one that does not re-raises it out of the
+    scope, which records the error row exactly as the inline wrappers did;
+    and the generator is closed on every exit. A failed request contributes
+    no usage (there was no response). A :class:`FanOut` runs its children
+    here one after another, in child order, under the same scope and fold.
+
+    ``execute`` turns one step into a response; it defaults to
+    :func:`_completion_with_retry` (resolved at call time, so a test that
+    patches the module attribute still intercepts every request).
+    """
+    run = execute if execute is not None else _completion_with_retry
+    with _record_call(config) as totals:
+        fold = _UsageFold(lambda sub: add_partial(_fold_target(config, totals), sub))
+        try:
+            return cast(T, _drive_steps(steps, config, run, fold))
+        finally:
+            # Before the scope exits, so its row (or its fold into an
+            # enclosing sink) sees the last wrapper's subtotal.
+            fold.flush()
+
+
+def _drive_steps(
+    steps: LLMFlow[Any],
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> Any:
+    """:func:`drive`'s loop over one generator (a whole run, or one
+    :class:`FanOut` child): every response folded into *fold* before it is
+    sent in, every request failure thrown in, the generator closed on exit.
+
+    A ``FanOut`` runs its children here, one after another in child order,
+    through the same *fold* — so the request sequence and the usage folding
+    are exactly those of ``yield from`` over each child in turn."""
+    try:
+        try:
+            step = next(steps)
+        except StopIteration as done:
+            return done.value
+        while True:
+            if isinstance(step, FanOut):
+                results, failure = _drive_fanout(step, config, run, fold)
+                try:
+                    step = steps.send(results) if failure is None else steps.throw(failure)
+                except StopIteration as done:
+                    return done.value
+                continue
+            try:
+                response = run(step)
+            except Exception as exc:
+                # Deliver the failure at the pending yield. An uncaught
+                # exception re-raises out of throw() and leaves the scope
+                # as the error row; a caught one may yield a retry step.
+                try:
+                    step = steps.throw(exc)
+                except StopIteration as done:
+                    return done.value
+                continue
+            fold.add(step, with_tier(extract_cost_and_tokens(response), response, config.tier))
+            try:
+                step = steps.send(response)
+            except StopIteration as done:
+                return done.value
+    finally:
+        steps.close()
+
+
+def _drive_fanout(
+    fan: FanOut,
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> tuple[list[Any], Exception | None]:
+    """Run every child of *fan* to the end, in child order (the sync side of
+    the :class:`FanOut` contract). Returns the results in child order and the
+    first child's ``Exception`` (or ``None``); an interrupt closes the
+    children not yet run and propagates."""
+    results: list[Any] = []
+    failure: Exception | None = None
+    unrun = list(fan.children)
+    try:
+        while unrun:
+            child = unrun.pop(0)
+            try:
+                results.append(_drive_steps(child, config, run, fold))
+            except Exception as exc:
+                results.append(None)
+                if failure is None:
+                    failure = exc
+    finally:
+        for child in unrun:  # only after an interrupt
+            child.close()
+    return results, failure
+
+
+def steps_call(
+    config: LLMConfig,
+    *,
+    system_prompt: str | tuple[str, str],
+    user_content: list[dict[str, Any]],
+    cache: bool = False,
+) -> LLMSteps[str]:
+    """Step form of :func:`call`: one request, returns the assistant text."""
+    is_anthropic = is_anthropic_model(config.model)
+    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
+    user_blocks = (
+        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    )
+    messages: list[dict[str, Any]] = [
+        sys_msg,
+        {"role": "user", "content": user_blocks},
+    ]
+    response = yield _wrapper_step(
+        _next_wrapper_id(), _build_completion_kwargs(config, messages=messages)
+    )
+    _require_choices(response)
+    content = response["choices"][0]["message"]["content"]
+    if content is None:
+        # Casting None to str used to push the failure downstream, where it
+        # surfaced as an unparseable payload with no hint of the cause.
+        raise EmptyModelResponse(
+            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
+        )
+    return cast(str, content)
+
+
+def steps_continued(
+    config: LLMConfig,
+    *,
+    system_prompt: str | tuple[str, str],
+    user_content: list[dict[str, Any]],
+    cache: bool = False,
+    max_rounds: int = 4,
+) -> LLMSteps[str]:
+    """Step form of :func:`call_continued`: one request per round, a further
+    round only while the reply is length-truncated; returns the stitched text."""
+    is_anthropic = is_anthropic_model(config.model)
+    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
+    user_blocks = (
+        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    )
+    base: list[dict[str, Any]] = [sys_msg, {"role": "user", "content": user_blocks}]
+    # Extended thinking and assistant prefill are mutually exclusive on
+    # Anthropic: with reasoning enabled the API rejects a prefilled turn
+    # ("This model does not support assistant message prefill"). That is the
+    # other half of the truncation-path breakage — it cost ~13% of calls on one
+    # model — so gate on the request shape, not just the provider.
+    prefill = (
+        supports_assistant_prefill(config.model)
+        and config.reasoning_effort is None
+        # `thinking="disabled"` is what makes prefill usable again on these
+        # models, so only an ENABLED mode has to suppress it.
+        and config.thinking != "adaptive"
+    )
+    acc = ""
+    # Held for the failure path below, so a caller that set max_rounds=0 gets
+    # the same error as one whose rounds all came back textless.
+    response: Any = None
+    wrapper_id = _next_wrapper_id()
+    for _ in range(max_rounds):
+        # On continuation rounds the accumulated text becomes an assistant
+        # prefill; the provider resumes from its exact end (a length cut lands
+        # mid-token, so there is no trailing whitespace to trip Anthropic).
+        # Where prefill isn't honoured (OpenAI) the partial is still shown as
+        # the assistant turn, but a final user turn has to ask for the
+        # continuation explicitly — otherwise the model restarts the reply.
+        messages = list(base)
+        if acc:
+            messages.append({"role": "assistant", "content": acc})
+            if not prefill:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": prompt(PromptKey.CONTINUE_TRUNCATED),
+                    }
+                )
+        response = yield _wrapper_step(
+            wrapper_id, _build_completion_kwargs(config, messages=messages)
+        )
+        _require_choices(response)
+        choice = response.choices[0]
+        acc += cast(str, choice.message.content or "")
+        if getattr(choice, "finish_reason", None) != "length":
+            break
+    if not acc:
+        # Every round returned reasoning, or nothing at all. Returning "" here
+        # sent an empty transcription window downstream, where it read as a
+        # document the model could not transcribe rather than a call that never
+        # produced text.
+        raise EmptyModelResponse(
+            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
+        )
+    return acc
+
+
+def steps_with_refinement(
+    config: LLMConfig,
+    *,
+    system_prompt: str | tuple[str, str],
+    user_content: list[dict[str, Any]],
+    refine_instruction: list[dict[str, Any]],
+    cache: bool = False,
+) -> LLMSteps[tuple[str, str]]:
+    """Step form of :func:`call_with_refinement`: the draft request, then the
+    grounded refine request; returns ``(draft, refined)``."""
+    is_anthropic = is_anthropic_model(config.model)
+    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
+    user_blocks = (
+        _mark_last_block_cacheable(user_content) if (cache and is_anthropic) else user_content
+    )
+    user_msg = {"role": "user", "content": user_blocks}
+
+    # Both requests fold into one aggregated row (the driver's). The default
+    # executor retries an empty/transient response; _require_choices covers
+    # any other executor so choices[0] never IndexErrors.
+    wrapper_id = _next_wrapper_id()
+    draft_resp = yield _wrapper_step(
+        wrapper_id, _build_completion_kwargs(config, messages=[sys_msg, user_msg])
+    )
+    _require_choices(draft_resp)
+    draft = cast(str, draft_resp["choices"][0]["message"]["content"])
+
+    refine_msgs: list[dict[str, Any]] = [
+        sys_msg,
+        user_msg,
+        {"role": "assistant", "content": draft},
+        {"role": "user", "content": refine_instruction},
+    ]
+    refined_resp = yield _wrapper_step(
+        wrapper_id, _build_completion_kwargs(config, messages=refine_msgs)
+    )
+    _require_choices(refined_resp)
+    refined = cast(str, refined_resp["choices"][0]["message"]["content"])
+    return draft, refined
+
+
+def steps_with_tools(
+    config: LLMConfig,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_choice: str | dict[str, Any] | None = None,
+    cache: bool = False,
+) -> LLMSteps[CallResult]:
+    """Step form of :func:`call_with_tools`: one request, returns the
+    :class:`CallResult`.
+
+    ``duration_s`` is measured from just before the request is yielded to just
+    after the generator resumes with the response. Under the sync driver that
+    is the call's wall time; under a deferred (batch) driver it also includes
+    the time the request waited in the queue, which is acceptable and expected.
+    """
+    if cache and is_anthropic_model(config.model):
+        messages = _mark_system_message_cacheable(messages)
+    kwargs = _build_completion_kwargs(
+        config,
+        messages=messages,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+    started = time.monotonic()
+    response = yield _wrapper_step(_next_wrapper_id(), kwargs)
+    duration_s = round(time.monotonic() - started, 3)
+    _require_choices(response)
+    usage = extract_cost_and_tokens(response)
+
+    message = response.choices[0].message
+    tool_calls = list(getattr(message, "tool_calls", None) or [])
+    content = getattr(message, "content", None)
+    finish_reason = getattr(response.choices[0], "finish_reason", None)
+
+    return CallResult(
+        response=response,
+        message=message,
+        content=content,
+        tool_calls=tool_calls,
+        finish_reason=finish_reason,
+        usage=usage,
+        duration_s=duration_s,
+    )
 
 
 def _no_text_detail(response: Any) -> str:
@@ -1078,29 +1615,13 @@ def call(
     prefix and the last attached document. For other providers caching is
     implicit (Gemini/OpenAI cache stable prefixes automatically) so the flag
     is a no-op there.
+
+    Sync driver over :func:`steps_call`.
     """
-    is_anthropic = is_anthropic_model(config.model)
-    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
-    user_blocks = (
-        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    return drive(
+        steps_call(config, system_prompt=system_prompt, user_content=user_content, cache=cache),
+        config,
     )
-    messages: list[dict[str, Any]] = [
-        sys_msg,
-        {"role": "user", "content": user_blocks},
-    ]
-    kwargs = _build_completion_kwargs(config, messages=messages)
-    with _record_call(config) as totals:
-        response = _completion_with_retry(kwargs)
-        add_partial(totals, extract_cost_and_tokens(response))
-        content = response["choices"][0]["message"]["content"]
-        if content is None:
-            # Casting None to str used to push the failure downstream, where it
-            # surfaced as an unparseable payload with no hint of the cause.
-            raise EmptyModelResponse(
-                f"model returned no message content (model={config.model!r}"
-                f"{_no_text_detail(response)})"
-            )
-        return cast(str, content)
 
 
 def call_continued(
@@ -1119,63 +1640,19 @@ def call_continued(
     the chunks are concatenated into one coherent output. Loops until the reply
     finishes for another reason or ``max_rounds`` is reached. An untruncated
     reply costs exactly one call, identical to :func:`call`.
+
+    Sync driver over :func:`steps_continued`.
     """
-    is_anthropic = is_anthropic_model(config.model)
-    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
-    user_blocks = (
-        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    return drive(
+        steps_continued(
+            config,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            cache=cache,
+            max_rounds=max_rounds,
+        ),
+        config,
     )
-    base: list[dict[str, Any]] = [sys_msg, {"role": "user", "content": user_blocks}]
-    # Extended thinking and assistant prefill are mutually exclusive on
-    # Anthropic: with reasoning enabled the API rejects a prefilled turn
-    # ("This model does not support assistant message prefill"). That is the
-    # other half of the truncation-path breakage — it cost ~13% of calls on one
-    # model — so gate on the request shape, not just the provider.
-    prefill = (
-        supports_assistant_prefill(config.model)
-        and config.reasoning_effort is None
-        # `thinking="disabled"` is what makes prefill usable again on these
-        # models, so only an ENABLED mode has to suppress it.
-        and config.thinking != "adaptive"
-    )
-    acc = ""
-    # Held for the failure path below, so a caller that set max_rounds=0 gets
-    # the same error as one whose rounds all came back textless.
-    response: Any = None
-    # One aggregated row for the whole continuation (all rounds summed).
-    with _record_call(config) as totals:
-        for _ in range(max_rounds):
-            # On continuation rounds the accumulated text becomes an assistant
-            # prefill; the provider resumes from its exact end (a length cut lands
-            # mid-token, so there is no trailing whitespace to trip Anthropic).
-            # Where prefill isn't honoured (OpenAI) the partial is still shown as
-            # the assistant turn, but a final user turn has to ask for the
-            # continuation explicitly — otherwise the model restarts the reply.
-            messages = list(base)
-            if acc:
-                messages.append({"role": "assistant", "content": acc})
-                if not prefill:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": prompt(PromptKey.CONTINUE_TRUNCATED),
-                        }
-                    )
-            response = _completion_with_retry(_build_completion_kwargs(config, messages=messages))
-            add_partial(totals, extract_cost_and_tokens(response))
-            choice = response.choices[0]
-            acc += cast(str, choice.message.content or "")
-            if getattr(choice, "finish_reason", None) != "length":
-                break
-    if not acc:
-        # Every round returned reasoning, or nothing at all. Returning "" here
-        # sent an empty transcription window downstream, where it read as a
-        # document the model could not transcribe rather than a call that never
-        # produced text.
-        raise EmptyModelResponse(
-            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
-        )
-    return acc
 
 
 def call_with_tools(
@@ -1217,35 +1694,14 @@ def call_with_tools(
     latency — the request the model sees, and hence its output, are
     unaffected. For non-Anthropic providers caching is implicit and the flag
     is a no-op.
+
+    Sync driver over :func:`steps_with_tools`.
     """
-    if cache and is_anthropic_model(config.model):
-        messages = _mark_system_message_cacheable(messages)
-    kwargs = _build_completion_kwargs(
+    return drive(
+        steps_with_tools(
+            config, messages=messages, tools=tools, tool_choice=tool_choice, cache=cache
+        ),
         config,
-        messages=messages,
-        tools=tools,
-        tool_choice=tool_choice,
-    )
-    started = time.monotonic()
-    with _record_call(config) as totals:
-        response = _completion_with_retry(kwargs)
-        usage = extract_cost_and_tokens(response)
-        add_partial(totals, usage)
-    duration_s = round(time.monotonic() - started, 3)
-
-    message = response.choices[0].message
-    tool_calls = list(getattr(message, "tool_calls", None) or [])
-    content = getattr(message, "content", None)
-    finish_reason = getattr(response.choices[0], "finish_reason", None)
-
-    return CallResult(
-        response=response,
-        message=message,
-        content=content,
-        tool_calls=tool_calls,
-        finish_reason=finish_reason,
-        usage=usage,
-        duration_s=duration_s,
     )
 
 
@@ -1264,6 +1720,11 @@ def empty_usage_totals() -> dict[str, Any]:
     }
 
 
+#: Key a batch driver sets on an open :func:`record_usage_for` sink to mark the
+#: scope's row with its tier (the scope config's own ``tier`` otherwise).
+SINK_TIER_KEY = "_tier"
+
+
 @contextmanager
 def record_usage_for(config: LLMConfig) -> Iterator[None]:
     """Aggregate every LLM call made with *config* inside this block into ONE
@@ -1277,7 +1738,12 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
 
     While the scope is open, the entry functions fold their per-call usage into
     a shared accumulator rather than each writing a row; on exit — success or
-    exception — one combined :class:`UsageEvent` is appended. Nesting is safe:
+    exception — one combined :class:`UsageEvent` is appended. Its ``tier`` is
+    the one that served the scope's responses (each response's tier marker,
+    else the driving config's tier); a scope with no responses falls back to
+    the scope config's tier, or batch when a batch driver marked the sink via
+    ``totals[SINK_TIER_KEY]``. A scope whose responses span tiers appends one
+    row per tier instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
     an inner scope defers to the outer one. The write can never break the
     caller (see :func:`record_usage`); exceptions propagate after the row.
     """
@@ -1301,42 +1767,55 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
         config._usage_sink = None
         workspace = config.workspace
         if workspace is not None:
-            record_usage(
-                workspace,
-                UsageEvent(
-                    at=now_iso(),
-                    operation=config.operation or "llm_call",
-                    model=config.model,
-                    cost_usd=totals["cost_usd"],
-                    prompt_tokens=totals["prompt_tokens"],
-                    completion_tokens=totals["completion_tokens"],
-                    total_tokens=totals["total_tokens"],
-                    cache_read_tokens=totals["cache_read_tokens"],
-                    cache_creation_tokens=totals["cache_creation_tokens"],
-                    duration_s=round(time.monotonic() - started, 3),
-                    outcome=outcome,
-                    context=config.context or {},
-                    error=error_msg,
-                ),
+            event = UsageEvent(
+                at=now_iso(),
+                operation=config.operation or "llm_call",
+                model=config.model,
+                cost_usd=totals["cost_usd"],
+                prompt_tokens=totals["prompt_tokens"],
+                completion_tokens=totals["completion_tokens"],
+                total_tokens=totals["total_tokens"],
+                cache_read_tokens=totals["cache_read_tokens"],
+                cache_creation_tokens=totals["cache_creation_tokens"],
+                duration_s=round(time.monotonic() - started, 3),
+                outcome=outcome,
+                context=config.context or {},
+                error=error_msg,
+                tier=str(totals.get(SINK_TIER_KEY) or config.tier),
             )
+            # One row, or one per tier when the responses span tiers.
+            for part in scope_events(event, totals):
+                record_usage(workspace, part)
 
 
 __all__ = [
     "ANTHROPIC_MODEL_PATTERNS",
     "OPENAI_MODEL_PATTERNS",
     "PDF_NATIVE_MODEL_PATTERNS",
+    "SINK_TIER_KEY",
     "CallResult",
+    "FanOut",
     "LLMConfig",
+    "LLMFlow",
+    "LLMStep",
+    "LLMSteps",
     "add_partial",
     "build_user_content",
     "call",
+    "call_continued",
+    "call_with_refinement",
     "call_with_tools",
+    "drive",
     "empty_usage_totals",
     "is_anthropic_model",
     "is_gemini_model",
     "is_openai_model",
     "is_openai_reasoning_model",
     "record_usage_for",
+    "steps_call",
+    "steps_continued",
+    "steps_with_refinement",
+    "steps_with_tools",
     "supports_assistant_prefill",
     "supports_native_pdf",
     "supports_vision",
