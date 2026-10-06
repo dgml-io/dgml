@@ -22,24 +22,31 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
-import hashlib
 import json
 import logging
 import os
 import shutil
 import sys
+import tempfile
 import tomllib
 from collections import Counter
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
 from dgml_core import layout
+from dgml_core.auto_classification import (
+    BulkClassifyBatch,
+    classify_bulk_batch,
+    prepare_bulk_classify,
+)
+from dgml_core.auto_classification import auto_classify as run_auto_classify
 from dgml_core.classification import (
     ClassificationConfig,
     ClassifyMode,
-    classify_file,
     load_classification_config,
 )
+from dgml_core.concurrency import map_concurrent
 from dgml_core.consistency import check_workspace
 from dgml_core.conversion import FAMILY_BY_SUFFIX, load_conversion_config
 from dgml_core.default_config import PROVIDER_API_KEYS, PROVIDER_MODELS
@@ -85,6 +92,7 @@ from dgml_core.workspaces_store import WorkspacesStore
 
 if TYPE_CHECKING:
     from dgml_core.generation.schema import Schema
+    from dgml_core.grounded import GroundedConfig
 
 # The CLI's own logger (``dgml.cli``); routed to stderr with the library's by
 # `_configure_logging`. Diagnostics only — the JSON payload and the error
@@ -701,6 +709,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "the file add."
         ),
     )
+    _add_batch_arguments(
+        fl_add,
+        what="the classification (and auto-extraction) of a directory add",
+        extra=(
+            " Requires PATH to be a directory and --auto-classify. In 'existing' mode "
+            "every file is classified in one wave; in the default mode the files are "
+            "classified in order, one wave per file, because a DocSet created for one "
+            "file must be visible to the next."
+        ),
+    )
     files.add_parser("list", parents=[common], help="List Files.")
     fl_show = files.add_parser("show", parents=[common], help="Show one File.")
     fl_show.add_argument("file_id")
@@ -730,6 +748,87 @@ def _positive_int(raw: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
     return value
+
+
+# ---- batch mode: shared by every command that takes --batch -----------------
+#
+# A batch-capable command (1) adds its flags with _add_batch_arguments, (2)
+# rejects, before any work, a stage whose model has no batch backend with
+# _batch_preflight (BATCH_UNAVAILABLE, naming the stage and model), and (3)
+# reports what its batch stages did as the payload's `batch` block, built by
+# _batch_block from each stage's WaveStats.to_json() (or a {"skipped": ...}
+# entry). Without --batch none of this runs and the payload has no `batch` key.
+
+
+def _positive_float(raw: str) -> float:
+    """argparse type: a strictly-positive number of seconds."""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a number") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {value}")
+    return value
+
+
+def _add_batch_arguments(
+    parser: argparse.ArgumentParser, *, what: str, extra: str = "", optional: bool = False
+) -> None:
+    """``--batch`` and ``--batch-poll-interval`` for a command that can send its
+    *what* requests through a provider's batch API.
+
+    ``optional=True`` makes ``--batch`` a ``--batch/--no-batch`` pair whose
+    unset value is ``None``, for a command with a config key that turns batch
+    mode on (the flag then overrides it either way)."""
+    help_text = (
+        f"Send {what} requests through the provider's batch API (half price; "
+        "results usually within an hour, at most 24h) instead of one call at a "
+        "time. A model whose provider has no batch backend is rejected before any "
+        "work starts (BATCH_UNAVAILABLE), never silently run at full price. Adds "
+        "a 'batch' block to the payload; without --batch the output is unchanged." + extra
+    )
+    if optional:
+        parser.add_argument(
+            "--batch", action=argparse.BooleanOptionalAction, default=None, help=help_text
+        )
+    else:
+        parser.add_argument("--batch", action="store_true", help=help_text)
+    parser.add_argument(
+        "--batch-poll-interval",
+        type=_positive_float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Seconds between batch status polls under --batch (default: 30).",
+    )
+
+
+def _batch_preflight(stages: Mapping[str, Any]) -> None:
+    """Reject batch mode before any work when a stage cannot batch.
+
+    *stages* maps a stage name to its model id (or a representative request,
+    see :func:`dgml_core.batch.assert_batchable`). Raises
+    :class:`~dgml_core.errors.BatchUnavailable` naming the first stage whose
+    provider has no batch backend. Imports the batch package lazily, so a
+    command without ``--batch`` never loads it."""
+    from dgml_core.batch import assert_batchable
+
+    assert_batchable(stages)
+    _log.info(f"[batch] batch mode on ({', '.join(stages)})")
+
+
+def _batch_block(stages: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """A command payload's ``batch`` block: ``enabled`` plus one entry per
+    stage — a batched stage's ``WaveStats.to_json()`` (counters and the cost
+    fields ``cost_usd`` / ``standard_cost_usd`` / ``saved_usd``), or
+    ``{"skipped": "<reason>"}`` for one that ran synchronously."""
+    return {"enabled": True, "stages": {name: dict(stats) for name, stats in stages.items()}}
+
+
+def _batch_log(args: argparse.Namespace) -> Callable[[str], None]:
+    """Batch-executor progress lines: INFO on the CLI logger — stderr under
+    --verbose (see `_configure_logging`), else dropped (stdout carries only
+    the JSON payload)."""
+    return _log.info
 
 
 def _parse_child_path(raw: str) -> list[int]:
@@ -2586,6 +2685,11 @@ def _add_extraction_subparsers(
         default=None,
         help="Override grounded.schema_model for this call (LiteLLM model string).",
     )
+    _add_batch_arguments(
+        ex_gen,
+        what="the schema-generation",
+        extra=" Schema generation is one request, so batch mode is one round trip.",
+    )
 
     ex_set = extraction.add_parser(
         "set-schema",
@@ -2639,7 +2743,22 @@ def _add_extraction_subparsers(
         help="Extract grounded values from a file against its DocSet schema.",
     )
     ex_extract.add_argument("docset_id")
-    ex_extract.add_argument("file_id")
+    ex_extract.add_argument(
+        "file_ids",
+        nargs="*",
+        metavar="file_id",
+        help=(
+            "File(s) to extract. One id alone (no --all) keeps the single-file "
+            "output (plus a `batch` block under --batch). Several ids, or --all, "
+            "return one result per file and a failed file is reported in its entry "
+            "instead of aborting the run."
+        ),
+    )
+    ex_extract.add_argument(
+        "--all",
+        action="store_true",
+        help="Extract every file in the DocSet (instead of naming file ids).",
+    )
     ex_extract.add_argument(
         "--values-model",
         default=None,
@@ -2653,6 +2772,7 @@ def _add_extraction_subparsers(
             "low, medium, high, xhigh, or 'default' to send no reasoning effort."
         ),
     )
+    _add_batch_arguments(ex_extract, what="extraction")
 
     ex_get_values = extraction.add_parser(
         "get-values",
@@ -2695,6 +2815,113 @@ def _coerce_schema_to_rnc(raw: str, path: Path, workspace_name: str, docset_name
     return raw
 
 
+def _error_block(exc: BaseException) -> dict[str, str]:
+    """A per-item ``{code, message}`` block: a DgmlError keeps its code, anything
+    else is an INTERNAL_ERROR with the same one-line message the top-level
+    envelope would carry."""
+    if isinstance(exc, DgmlError):
+        return {"code": exc.code, "message": str(exc)}
+    return {"code": "INTERNAL_ERROR", "message": short_error_message(exc)}
+
+
+def _extract_many(
+    args: argparse.Namespace,
+    ws: Workspace,
+    fmt: str,
+    *,
+    config: GroundedConfig,
+    file_ids: list[str],
+    single: bool = False,
+) -> int:
+    """``extraction extract`` over several files (ids, or ``--all``), or over
+    one file id under ``--batch`` (*single*: the single-file payload plus a
+    ``batch`` block, and the single-file form's errors).
+
+    Each file is extracted independently and reported in its own ``results``
+    entry — a failure is that entry's ``error``, never the run's. Under
+    ``--batch`` both LLM phases go through the provider's batch API
+    (:func:`dgml_core.grounded.extract_values_many`) and the payload gains a
+    ``batch`` block; the per-file entries are the same either way.
+    """
+    from dgml_core.grounded import extract_values_many, values_batch_stages
+
+    store = DocSetStore(ws)
+    store.get(args.docset_id)  # raises DocSetNotFound
+    if args.all:
+        file_ids = store.list_files(args.docset_id)
+    if len(set(file_ids)) != len(file_ids):
+        raise InvalidArgument("file ids must be unique")
+
+    if args.batch:
+        # Checked before any file is read.
+        _batch_preflight(values_batch_stages(config.values_model, config.values_reasoning_effort))
+    many = extract_values_many(
+        ws,
+        args.docset_id,
+        file_ids,
+        config=config,
+        batch=args.batch,
+        poll_interval_s=args.batch_poll_interval,
+        log=_batch_log(args),
+        write_stats=args.debug,
+        debug=args.debug,
+    )
+    outcomes = many.outcomes
+    batch_block = many.batch
+
+    if single:
+        # One file id under --batch: the single-file form's payload and errors,
+        # plus the run's `batch` block.
+        (fid,) = file_ids
+        outcome = outcomes[fid]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        one: dict[str, Any] = {
+            "docset_id": args.docset_id,
+            "file_id": fid,
+            "model": config.values_model,
+            "mode": outcome.mode,
+            "tool_calls": outcome.tool_calls,
+            "field_count": len(outcome.values),
+            "xml_key": outcome.xml_key,
+        }
+        if batch_block is not None:
+            one["batch"] = batch_block
+        _emit(one, fmt)
+        return 0
+
+    results: list[dict[str, Any]] = []
+    for fid in file_ids:
+        outcome = outcomes[fid]
+        if isinstance(outcome, BaseException):
+            results.append({"file_id": fid, "status": "failed", "error": _error_block(outcome)})
+        else:
+            results.append(
+                {
+                    "file_id": fid,
+                    "status": "ok",
+                    "mode": outcome.mode,
+                    "tool_calls": outcome.tool_calls,
+                    "field_count": len(outcome.values),
+                    "xml_key": outcome.xml_key,
+                }
+            )
+    payload: dict[str, Any] = {
+        "docset_id": args.docset_id,
+        "model": config.values_model,
+        "summary": {
+            "total": len(results),
+            "ok": sum(r["status"] == "ok" for r in results),
+            "failed": sum(r["status"] == "failed" for r in results),
+        },
+        "results": results,
+    }
+    if batch_block is not None:
+        payload["batch"] = batch_block
+    _emit(payload, fmt)
+    return 0
+
+
 def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Dispatch the `extraction` command group."""
     from dataclasses import replace
@@ -2706,6 +2933,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         generate_schema,
         load_grounded_config,
         parse_values_reasoning_effort,
+        schema_batch_request,
     )
 
     store = DocSetStore(ws)
@@ -2716,6 +2944,10 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         config = load_grounded_config(ws)
         if args.schema_model:
             config = replace(config, schema_model=args.schema_model)
+        if args.batch:
+            # Before any PDF is read: an unsupported provider is BATCH_UNAVAILABLE,
+            # never a silent full-price call.
+            _batch_preflight({"schema": schema_batch_request(config.schema_model)})
         file_ids = args.from_files or store.list_files(args.docset_id)
         if not file_ids:
             return _emit_error(
@@ -2723,18 +2955,37 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 f"docset '{args.docset_id}' has no files; pass --from-file or add files first",
                 fmt,
             )
-        rnc = generate_schema(ws, file_ids, config=config, docset_name=ds.name, debug=args.debug)
+        batch_block: dict[str, Any] | None = None
+        if args.batch:
+            from dgml_core.grounded import generate_schema_batch, schema_batch_executor
+
+            executor = schema_batch_executor(
+                config, poll_interval_s=args.batch_poll_interval, log=_batch_log(args)
+            )
+            rnc = generate_schema_batch(
+                ws,
+                file_ids,
+                config=config,
+                docset_name=ds.name,
+                executor=executor,
+                debug=args.debug,
+            )
+            batch_block = {"provider": executor.backend.provider, **executor.stats.to_json()}
+        else:
+            rnc = generate_schema(
+                ws, file_ids, config=config, docset_name=ds.name, debug=args.debug
+            )
         store.set_schema(args.docset_id, rnc)
-        _emit(
-            {
-                "docset_id": args.docset_id,
-                "schema_format": "rnc",
-                "schema": rnc,
-                "from_file_ids": list(file_ids),
-                "model": config.schema_model,
-            },
-            fmt,
-        )
+        payload: dict[str, Any] = {
+            "docset_id": args.docset_id,
+            "schema_format": "rnc",
+            "schema": rnc,
+            "from_file_ids": list(file_ids),
+            "model": config.schema_model,
+        }
+        if batch_block is not None:
+            payload["batch"] = batch_block
+        _emit(payload, fmt)
         return 0
 
     if sub == "set-schema":
@@ -2773,6 +3024,11 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         return 0
 
     if sub == "extract":
+        extract_ids: list[str] = list(args.file_ids)
+        if args.all and extract_ids:
+            raise InvalidArgument("pass file ids or --all, not both")
+        if not args.all and not extract_ids:
+            raise InvalidArgument("name at least one file id, or pass --all")
         config = load_grounded_config(ws)
         if args.values_model:
             config = replace(config, values_model=args.values_model)
@@ -2783,27 +3039,37 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     args.values_effort, source="--values-effort"
                 ),
             )
-        result = extract_values(
+        if len(extract_ids) == 1 and not args.all and not args.batch:
+            # The original single-file form: output and errors unchanged.
+            result = extract_values(
+                ws,
+                args.docset_id,
+                extract_ids[0],
+                config=config,
+                write_stats=args.debug,
+                debug=args.debug,
+            )
+            _emit(
+                {
+                    "docset_id": args.docset_id,
+                    "file_id": extract_ids[0],
+                    "model": config.values_model,
+                    "mode": result.mode,
+                    "tool_calls": result.tool_calls,
+                    "field_count": len(result.values),
+                    "xml_key": result.xml_key,
+                },
+                fmt,
+            )
+            return 0
+        return _extract_many(
+            args,
             ws,
-            args.docset_id,
-            args.file_id,
-            config=config,
-            write_stats=args.debug,
-            debug=args.debug,
-        )
-        _emit(
-            {
-                "docset_id": args.docset_id,
-                "file_id": args.file_id,
-                "model": config.values_model,
-                "mode": result.mode,
-                "tool_calls": result.tool_calls,
-                "field_count": len(result.values),
-                "xml_key": result.xml_key,
-            },
             fmt,
+            config=config,
+            file_ids=extract_ids,
+            single=len(extract_ids) == 1 and not args.all,
         )
-        return 0
 
     if sub == "get-values":
         from dgml_core.extraction_xml import has_extraction
@@ -3013,6 +3279,18 @@ def _add_generate_subparser(
             "the weaker ones the review would have dropped."
         ),
     )
+    _add_batch_arguments(
+        gen,
+        what="the generation pipeline's model",
+        optional=True,
+        extra=(
+            " Batches transcription, roster planning, concept descriptions, the "
+            "semantic-link pass and (OCR files) the image-style pass. Labeling "
+            "batches every document at once under a closed --schema-path vocabulary "
+            "and stays synchronous under any other. Overrides [generation] batch in "
+            "the config; --no-batch forces synchronous."
+        ),
+    )
 
 
 #: Distinct rejected concept names reported per file in `unmatched_concepts`.
@@ -3192,6 +3470,41 @@ def _generate_payload(
     }
 
 
+#: ``batch.stages.style`` when the workspace enables image style but no document
+#: of the run had a page to style (none is an OCR file, say).
+_STYLE_NOTHING_TO_STYLE = "no OCR document with a page to style"
+
+
+def _style_staged(staged: dict[str, dict[str, Any]], style_config: Any, batch_opts: Any) -> None:
+    """Run the image-style passes ``docset generate --batch`` deferred while
+    grounding (OCR files under an enabled ``style`` section) as one batch
+    stage, and put each styled document's final grounded XML in its held-back
+    writes. Documents are taken in name order (the staging pool fills
+    *staged* in completion order); the stage's stats land in
+    ``batch_opts.stats["style"]``."""
+    pending = {
+        name: item["pending_style"]
+        for name, item in sorted(staged.items())
+        if item.get("pending_style") is not None
+    }
+    if not pending:
+        if style_config is not None:
+            batch_opts.stats["style"] = {"skipped": _STYLE_NOTHING_TO_STYLE}
+        return
+    from dgml_core.style_llm import style_batch_executor, style_documents_batch
+
+    executor = style_batch_executor(
+        style_config, poll_interval_s=batch_opts.poll_interval_s, log=_log.info
+    )
+    try:
+        finished = style_documents_batch(pending, executor, log=_log.info)
+    finally:
+        batch_opts.stats["style"] = executor.stats.to_json()
+    for name, data in finished.items():
+        item = staged[name]
+        item["deferred"][item["xml_key"]] = data
+
+
 def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Convert every file in a DocSet to DGML XML via the typed-block pipeline.
 
@@ -3206,26 +3519,25 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     left ungrounded with a warning rather than failing the run. ``--debug``
     additionally writes the per-file ``<stem>.dgml.grounding_stats.json``.
     """
-    from dgml_core import llm
     from dgml_core.errors import InvalidArgument
     from dgml_core.extraction_xml import carry_extraction_over, has_extraction
     from dgml_core.generation import (
+        BatchOptions,
         ConvertOptions,
         convert_batch,
+        load_generation_batch,
         resolve_generation_api_key,
         resolve_generation_config,
         resolve_generation_label_api_key,
         validate_generation_models,
     )
     from dgml_core.generation import coverage as cov_mod
-    from dgml_core.generation import links as links_mod
     from dgml_core.generation.blocks import Block, block_concept_labels
-    from dgml_core.generation.links import apply_plan, plan_links
+    from dgml_core.generation.link_stage import LinkOutcome, LinkStage, StagedDocument
     from dgml_core.generation.pipeline import load_labeled_docs_from_cache
     from dgml_core.generation.rnc import write_docset_rnc
     from dgml_core.generation.to_semantic import build_header
     from dgml_core.generation.vocab import TagVocab
-    from dgml_core.usage import OPERATION_LINKS
     from dgml_core.xml_grounding import ground_dgml_xml
 
     ds_store = DocSetStore(ws)
@@ -3290,25 +3602,44 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     except DgmlError as exc:
         return _emit_error(exc.code, str(exc), fmt)
 
+    # Batch mode (--batch / --no-batch, else [generation] batch). Rejected here,
+    # before any work, when a stage it would batch names a model whose provider
+    # has no batch backend — never a silent full-price fallback. Transcription
+    # always batches, and the labeling model always serves a batch stage too:
+    # roster/gap planning and concept descriptions batch under every
+    # vocabulary, the link pass uses it, and labeling itself batches under a
+    # closed one.
+    batch_opts: BatchOptions | None = None
+    try:
+        batch_enabled = args.batch if args.batch is not None else load_generation_batch(ws)
+        if batch_enabled:
+            batch_stages = {"transcribe": gen_model, "label": label_model}
+            if style_config is not None:
+                batch_stages["style"] = style_config.model  # OCR files' image style
+            if not args.no_semlinks:
+                batch_stages["links"] = label_model
+            _batch_preflight(batch_stages)
+            batch_opts = BatchOptions(
+                poll_interval_s=args.batch_poll_interval, log=_batch_log(args)
+            )
+    except DgmlError as exc:
+        return _emit_error(exc.code, str(exc), fmt)
+
     # The semantic-link pass runs on the labeling model (and its credentials).
-    # One config per DOCUMENT, never one shared by all of them. Documents are
-    # linked concurrently on the emit pool, and `llm.record_usage_for` marks the
-    # open aggregation scope on the config object itself — so a shared config
-    # means the second document to start folds its tokens into whichever scope
-    # opened first, and the row that lands names one document while covering
-    # several. Per-document configs also give each row a `doc` context, so the
-    # pass can be read per file rather than only in aggregate.
-    def _link_config(doc_name: str) -> llm.LLMConfig:
-        config = llm.LLMConfig(
-            model=label_model,
-            api_key=label_api_key,
-            api_base=label_api_base,
-            workspace=ws,
-            debug=args.debug,
-            operation=OPERATION_LINKS,
-        )
-        config.context = {"doc": doc_name}
-        return config
+    # It is the library's LinkStage: its sync driver runs per document in the
+    # sink below, its batch driver over every staged document at once.
+    link_stage = LinkStage(
+        workspace=ws,
+        docset_id=args.docset_id,
+        model=label_model,
+        api_key=label_api_key,
+        api_base=label_api_base,
+        enabled=not args.no_semlinks,
+        verify=not args.no_semlink_verify,
+        use_cache=not args.no_semlink_cache,
+        debug=args.debug,
+        log=_log.info,
+    )
 
     # The docset prefix is always the output base — schema.json,
     # coverage_report.json, cache/, and semantic/ live under it. Each file's
@@ -3486,30 +3817,14 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             "examples": [concept for concept, _n in tally.most_common(_UNMATCHED_EXAMPLES)],
         }
 
-    def _semlink_cache_key(xml_text: str) -> str:
-        """Cache address for one document's semantic links.
+    def _ground_output(name: str, xml: str) -> dict[str, Any]:
+        """First half of a document's sink: write the render and ground it.
 
-        Keyed on what the plan depends on — the document's text and shape, via
-        links.listing_digest — plus the labeling model, both link prompts, and
-        whether the review pass runs. Attributes and tag names are deliberately
-        not part of it (see links.listing_digest), so grounding a document or
-        renaming its concepts hits rather than paying for the pass again. Parts
-        are length-prefixed so two different inputs cannot concatenate to the
-        same key.
+        Returns what the rest of the sink needs. Split from the link pass and
+        the reporting so batch mode can ground every document, run all their
+        link plans as one batch stage, then finish each; the sync sink below
+        runs the three halves back to back, exactly as before the split.
         """
-        digest = hashlib.sha256()
-        for part in (
-            links_mod.listing_digest(xml_text).encode("utf-8"),
-            label_model.encode("utf-8"),
-            links_mod.SYSTEM_PROMPT.encode("utf-8"),
-            b"" if args.no_semlink_verify else links_mod.VERIFY_SYSTEM_PROMPT.encode("utf-8"),
-        ):
-            digest.update(len(part).to_bytes(8, "big"))
-            digest.update(part)
-        prefix = layout.generation_cache_prefix(args.docset_id)
-        return f"{prefix}semlinks/{digest.hexdigest()}"
-
-    def _on_output(name: str, xml: str) -> None:
         xml_key = dgml_xml_keys[name]
         # A blob already at this key may carry extracted values — an
         # extraction-only file getting its tree now, or a full-extraction
@@ -3523,7 +3838,14 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     prior_with_extraction = prior_text
             except Exception:
                 prior_with_extraction = None  # unparseable prior — nothing to carry
-        ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
+        # Under --batch nothing is written yet: the link pass runs after every
+        # document is grounded, so the grounded tree is held and written only
+        # once that pass is past its last wave (see LinkStage.link_documents).
+        # A run interrupted while it waits on the provider therefore leaves
+        # every output exactly as it found it.
+        deferred: dict[str, bytes] = {}
+        if batch_opts is None:
+            ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
         # Ground in place: re-parse the just-written tree, align it against the
         # file's page OCR, and rewrite <stem>.dgml.xml with dg:origin boxes.
         # Deterministic and free; a file with no page_text is left ungrounded.
@@ -3532,8 +3854,15 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         # (lxml); materialize the blob to a working copy, ground in place, then
         # persist the result (and its stats sidecar) back through the store.
         grounding: dict[str, Any]
+        pending_style: Any = None
         try:
-            with ws.blobs.materialize(xml_key) as gpath:
+            with contextlib.ExitStack() as gstack:
+                if batch_opts is None:
+                    gpath = gstack.enter_context(ws.blobs.materialize(xml_key))
+                else:
+                    gdir = Path(gstack.enter_context(tempfile.TemporaryDirectory()))
+                    gpath = gdir / xml_key.rsplit("/", 1)[-1]
+                    gpath.write_bytes(xml.encode("utf-8"))
                 res = ground_dgml_xml(
                     ws,
                     name_to_fid[name],
@@ -3542,15 +3871,23 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     force=True,
                     write_stats=args.debug,
                     debug=args.debug,
+                    # Under --batch an OCR file's image-style pass joins one
+                    # batch stage with every other document's (see below).
+                    defer_style=batch_opts is not None,
                 )
-                ws.blobs.put_blob(xml_key, gpath.read_bytes())
+                pending_style = res.pending_style
+                writes = {xml_key: gpath.read_bytes()}
                 if res.stats_path is not None and res.stats_path.exists():
-                    ws.blobs.put_blob(
+                    writes[
                         layout.pair_artifact_key(
                             args.docset_id, name_to_fid[name], res.stats_path.name
-                        ),
-                        res.stats_path.read_bytes(),
-                    )
+                        )
+                    ] = res.stats_path.read_bytes()
+                if batch_opts is None:
+                    for key, data in writes.items():
+                        ws.blobs.put_blob(key, data)
+                else:
+                    deferred.update(writes)
         except DgmlError as exc:
             grounding = {
                 "grounded": False,
@@ -3567,49 +3904,24 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 f"[ground] {name}: {res.stats['elements_annotated']} element(s), "
                 f"{res.stats['matched_token_pct']}% tokens matched"
             )
-        # Final step: add semantic links in place (dg:itemprop/dg:href). Runs on
-        # re-rendered priors too — their fresh XML would otherwise lose the links.
-        # The pass is a pure function of (grounded XML, labeling model, link
-        # prompts), so it is content-addressed: a hit replays the exact bytes the
-        # model call would have written, making a repeat run free rather than
-        # merely cheaper. The applied-link count is cached alongside so the
-        # reported `links` is identical on both paths.
-        links_added = 0
-        if not args.no_semlinks:
-            source = ws.blobs.get_blob(xml_key).decode("utf-8")
-            plan_key = f"{_semlink_cache_key(source)}.json"
-            try:
-                cached = (
-                    ws.blobs.get_blob(plan_key)
-                    if not args.no_semlink_cache and ws.blobs.blob_exists(plan_key)
-                    else None
-                )
-                if cached is not None:
-                    plan = json.loads(cached)
-                    hit = " (cached)"
-                else:
-                    plan = plan_links(source, _link_config(name), verify=not args.no_semlink_verify)
-                    ws.blobs.put_blob(plan_key, json.dumps(plan).encode("utf-8"))
-                    hit = ""
-                # The plan is applied to the CURRENT tree either way, so a cache
-                # hit and a fresh call write the same links onto whatever the
-                # render and grounding just produced.
-                linked, applied = apply_plan(source, plan)
-                ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
-                # `applied` is what the XML actually carries, so the reported
-                # count matches the document. What the plan asked for and did
-                # not get is diagnosed separately — chiefly links discarded
-                # because dg:itemprop/dg:href are attributes on the subject, so
-                # a second link on one subject overwrites the first.
-                links_added = len(applied)
-                losses = links_mod.plan_losses(source, plan)
-                folded = f", {losses.merged} merged" if losses.merged else ""
-                lost = f", {losses.displaced} displaced" if losses.displaced else ""
-                nested = f", {losses.nested} nested dropped" if losses.nested else ""
-                _log.info(f"[semlinks] {name}: {links_added} link(s){folded}{lost}{nested}{hit}")
-            except Exception as exc:  # a link-pass failure must not lose the DGML
-                link_errors[name] = short_error_message(exc)
-                _log.info(f"[semlinks] {name}: skipped ({exc})")
+        if batch_opts is not None and xml_key not in deferred:
+            # Not grounded: the sync path leaves the plain render in the blob.
+            deferred[xml_key] = xml.encode("utf-8")
+        return {
+            "xml": xml,
+            "xml_key": xml_key,
+            "prior_with_extraction": prior_with_extraction,
+            "grounding": grounding,
+            "deferred": deferred,
+            "pending_style": pending_style,
+        }
+
+    def _finish_output(name: str, staged: dict[str, Any], links_added: int) -> None:
+        """Last half of a document's sink: re-embed extraction, then report."""
+        xml = staged["xml"]
+        xml_key = staged["xml_key"]
+        prior_with_extraction = staged["prior_with_extraction"]
+        grounding = staged["grounding"]
         # Re-embed the prior dg:extraction last, after grounding + semlinks
         # have finished rewriting the tree, so the extraction subtree is
         # spliced in verbatim and never run through those passes.
@@ -3669,6 +3981,26 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
             **grounding,
             **extra,
         )
+
+    def _links_added(name: str, outcome: LinkOutcome) -> int:
+        if outcome.error is not None:
+            link_errors[name] = outcome.error
+        return outcome.links
+
+    def _on_output(name: str, xml: str) -> None:
+        # The synchronous sink: ground, link, finish — one document at a time.
+        staged = _ground_output(name, xml)
+        outcome = link_stage.link_document(name, staged["xml_key"])
+        _finish_output(name, staged, _links_added(name, outcome))
+
+    # Batch mode grounds each document as it is rendered and holds it here;
+    # the link pass then runs over all of them as one batch stage, and each is
+    # finished after (see LinkStage.link_documents). Distinct keys per
+    # document, so the render pool's concurrent writes never collide.
+    staged_outputs: dict[str, dict[str, Any]] = {}
+
+    def _stage_output(name: str, xml: str) -> None:
+        staged_outputs[name] = _ground_output(name, xml)
 
     if convert_names:
         # The cache always exists — it holds functional files the next run
@@ -3853,17 +4185,41 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     parent_map=parent_map_seed or None,
                     vocab=vocab,
                     progress=_log.info,
+                    batch=batch_opts,
                 )
                 convert_batch(
                     pdf_paths,
                     options=options,
-                    on_output=_on_output,
+                    on_output=_on_output if batch_opts is None else _stage_output,
                     on_error=_on_error,
                     on_label_error=_on_label_error,
                     on_off_schema=_on_off_schema,
                     prior_docs=prior_docs,
                     prior_outputs=prior_outputs,
                 )
+                if batch_opts is not None:
+                    # OCR files' image-style passes, deferred by grounding: ONE
+                    # batch stage over every document's pages, before the link
+                    # pass (which reads the styled tree, as in the sync run).
+                    _style_staged(staged_outputs, style_config, batch_opts)
+                    # Still inside the page_text materialization: finishing a
+                    # document computes its coverage against those pages.
+                    link_outcomes = link_stage.link_documents(
+                        {
+                            name: StagedDocument(item["xml_key"], item["deferred"])
+                            for name, item in staged_outputs.items()
+                        },
+                        batch=batch_opts,
+                        max_workers=args.max_parallel_calls,
+                    )
+                    batch_links = {n: _links_added(n, o) for n, o in link_outcomes.items()}
+                    # On the document pool, like the sync sink; the results are
+                    # folded in queued order below, so the payload order holds.
+                    map_concurrent(
+                        lambda item: _finish_output(item[0], item[1], batch_links[item[0]]),
+                        list(staged_outputs.items()),
+                        max_workers=args.max_parallel_calls,
+                    )
             # Documents were converted on a pool, so fold the per-document
             # results back in a fixed order — queued order for converted files,
             # docset order for re-rendered priors — and the payload stays
@@ -3951,6 +4307,13 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         {"model": gen_model, "label_model": label_model, "source": gen_model_source},
     )
     payload["rerendered"] = rerendered
+    if batch_opts is not None:
+        # Additive, and present only under batch mode: without it the payload
+        # is exactly what a synchronous run has always emitted.
+        stages = dict(batch_opts.stats)
+        if args.no_semlinks:
+            stages["links"] = {"skipped": "--no-semlinks"}
+        payload["batch"] = _batch_block(stages)
     _emit(payload, fmt)
     return 0
 
@@ -4094,13 +4457,32 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         # config is a hard failure that aborts the run before any file is
         # added, rather than recording the same error on every file.
         config = load_classification_config(ws)
-        # Read existing DocSets once; _auto_classify appends newly-created
+        # Read existing DocSets once; auto_classify appends newly-created
         # ones so similar PDFs cluster within the run without re-scanning.
         docsets = DocSetStore(ws).list_all()
         if not allow_new:
             # Checked here so the run aborts before any file is added rather
             # than on the first one.
             _require_existing_docsets(docsets)
+
+    # --batch is validated (mode, batch backends) before any file is added.
+    batch: BulkClassifyBatch | None = None
+    if getattr(args, "batch", False):
+        if classify_mode is None:
+            # Classification (and the auto-extraction after it) is all a
+            # directory add sends to a model that a batch can serve.
+            raise InvalidArgument(
+                "--batch on a directory add batches its classification: pass "
+                "--auto-classify (default mode or 'existing')"
+            )
+        assert config is not None and docsets is not None
+        batch = prepare_bulk_classify(
+            ws,
+            config=config,
+            docsets=docsets,
+            poll_interval_s=args.batch_poll_interval,
+            log=_batch_log(args),
+        )
 
     on_conflict = ConflictPolicy(args.on_conflict)
     text_mode = TextMode(args.text_mode)
@@ -4141,8 +4523,11 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         counts[status] += 1
 
         entry: dict[str, Any] = {"status": status, "path": str(pdf), **_file_add_payload(result)}
-        if auto_classify:
-            entry["classification"] = _auto_classify(
+        if batch is not None:
+            # Classified together once every file is in (see classify_bulk_batch).
+            batch.pending.append((entry, result))
+        elif auto_classify:
+            entry["classification"] = run_auto_classify(
                 ws,
                 result,
                 config=config,
@@ -4158,6 +4543,11 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         "summary": {"total": len(pdfs), **counts},
         "results": entries,
     }
+    if batch is not None:
+        assert config is not None and docsets is not None
+        payload["batch"] = classify_bulk_batch(
+            ws, batch, config=config, docsets=docsets, debug=args.debug, allow_new=allow_new
+        )
     _emit(payload, fmt)
     return 0
 
@@ -4177,6 +4567,11 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     f"to choose each id."
                 )
             return _file_add_bulk(args, ws, store, fmt)
+        if getattr(args, "batch", False):
+            raise InvalidArgument(
+                "--batch applies to a directory add (PATH is a directory): one file "
+                "is one request, which a batch cannot make cheaper to wait for"
+            )
         classify_mode = getattr(args, "auto_classify", None)
         allow_new = classify_mode != ClassifyMode.EXISTING
         config: ClassificationConfig | None = None
@@ -4199,10 +4594,10 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         )
         payload: dict[str, Any] = _file_add_payload(result)
         if classify_mode is not None:
-            # In the default mode _auto_classify loads the classification
+            # In the default mode auto_classify loads the classification
             # config itself; a missing/invalid one raises straight through to
             # an error envelope.
-            payload["classification"] = _auto_classify(
+            payload["classification"] = run_auto_classify(
                 ws,
                 result,
                 config=config,
@@ -4221,125 +4616,6 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     else:  # unreachable — argparse `required=True` rejects unknown subcommands
         raise AssertionError(f"unhandled file subcommand: {sub}")
     return 0
-
-
-def _auto_classify(
-    ws: Workspace,
-    result: AddFileResult,
-    *,
-    config: ClassificationConfig | None = None,
-    docsets: list[DocSet] | None = None,
-    allow_new: bool = True,
-    debug: bool = False,
-) -> dict[str, Any]:
-    """Run LLM auto-classification on a freshly added File and assign it.
-
-    Returns the ``classification`` block embedded in ``dgml file add`` output.
-
-    ``allow_new=False`` (``--auto-classify existing``) forbids creating a
-    DocSet and always assigns: the LLM is given only the assign tool and must
-    return the best-fitting DocSet even when the fit is poor. With no DocSets
-    to choose from the mode has no possible outcome, so it is a **hard** error
-    (``NO_EXISTING_DOCSETS``) — a precondition on the request rather than a
-    failure of the classification call. Callers check it via
-    :func:`_require_existing_docsets` before adding any file; the re-raise
-    below keeps it hard if one ever doesn't.
-
-    A missing or invalid classification config is a **hard** failure: when
-    ``config`` is not supplied it is loaded here via
-    :func:`load_classification_config`, whose error propagates straight to the
-    CLI error envelope (exit 1) rather than soft-failing per file. Bulk callers
-    load the config once up front and pass it in, so the run aborts before any
-    file is processed when it's missing. Failures *after* config is in hand —
-    the LLM/classify call, auth — stay soft: the File record is already on
-    disk, so they land in ``classification.error`` with exit 0.
-
-    ``docsets``, when supplied, is a mutable list the caller maintains across
-    a bulk run: it is forwarded to :func:`classify_file` so the LLM sees
-    DocSets created earlier in the same run, and any freshly-created DocSet
-    is appended to it here so later files can be assigned to it.
-
-    Skipped (and reported as ``performed: false``) when the add returned an
-    existing record rather than creating a new one — re-runs stay idempotent,
-    and we neither require config nor burn an LLM call on a duplicate.
-    """
-    if not result.created:
-        return {
-            "performed": False,
-            "reason": "file already existed; classification skipped",
-        }
-
-    if config is None:
-        config = load_classification_config(ws)
-
-    file_id = result.record.id
-    block: dict[str, Any] = {
-        "performed": True,
-        "model": config.model,
-        "decision": None,
-        "docset_id": None,
-        "docset_created": False,
-        "docset_name": None,
-        "docset_key_questions": [],
-        "error": None,
-    }
-
-    try:
-        decision = classify_file(
-            ws, file_id, config=config, docsets=docsets, allow_new=allow_new, debug=debug
-        )
-    except NoExistingDocSets:
-        # A precondition on the request, not a failure of the call — callers
-        # check it before ingesting anything. Kept hard even if one didn't:
-        # soft-failing would leave the unassigned file this mode prevents.
-        raise
-    except DgmlError as exc:
-        block["error"] = f"{exc.code}: {exc}"
-        return block
-
-    docset_store = DocSetStore(ws)
-    try:
-        if decision.decision == "existing":
-            assert decision.existing_docset_id is not None
-            # Assign, and auto-extract when the target DocSet has an
-            # extraction schema set (soft-fail — the extraction block
-            # carries any error; the assignment itself stands).
-            from dgml_core.extraction import add_file_and_extract
-
-            extraction_block = add_file_and_extract(
-                ws, decision.existing_docset_id, file_id, write_stats=debug, debug=debug
-            )
-            existing = docset_store.get(decision.existing_docset_id)
-            block.update(
-                decision="existing",
-                docset_id=existing.id,
-                docset_name=existing.name,
-                docset_key_questions=list(existing.key_questions),
-            )
-            if extraction_block is not None:
-                block["extraction"] = extraction_block
-        elif decision.decision == "new":
-            assert decision.new_name is not None and decision.new_description is not None
-            created = docset_store.create(
-                name=decision.new_name,
-                description=decision.new_description,
-                key_questions=list(decision.new_key_questions),
-            )
-            docset_store.add_file(created.id, file_id)
-            if docsets is not None:
-                docsets.append(created)
-            block.update(
-                decision="new",
-                docset_id=created.id,
-                docset_created=True,
-                docset_name=created.name,
-                docset_key_questions=list(created.key_questions),
-            )
-        else:  # unreachable — classify_file returns only these three
-            raise AssertionError(f"unhandled classification decision: {decision.decision}")
-    except DgmlError as exc:
-        block["error"] = f"{exc.code}: {exc}"
-    return block
 
 
 if __name__ == "__main__":

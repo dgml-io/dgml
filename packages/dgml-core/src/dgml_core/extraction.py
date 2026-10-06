@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from .grounded import GroundedConfig
 
 
-def _auto_extract(
+def auto_extract(
     ws: Workspace,
     docset_id: str,
     file_id: str,
@@ -105,7 +105,7 @@ def add_file_and_extract(
 ) -> dict[str, Any] | None:
     """Assign ``file_id`` to ``docset_id``; auto-extract if the DocSet has a schema.
 
-    Returns the extraction block (same shape :func:`_auto_extract` produces)
+    Returns the extraction block (same shape :func:`auto_extract` produces)
     when the DocSet has a schema set, else ``None`` — the omit-when-no-schema
     policy matches the existing ``dgml docset add-file`` contract.
 
@@ -118,6 +118,4 @@ def add_file_and_extract(
     store.add_file(docset_id, file_id)
     if not store.has_schema(docset_id):
         return None
-    return _auto_extract(
-        ws, docset_id, file_id, config=config, write_stats=write_stats, debug=debug
-    )
+    return auto_extract(ws, docset_id, file_id, config=config, write_stats=write_stats, debug=debug)
