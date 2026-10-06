@@ -31,7 +31,10 @@ file.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from . import layout
@@ -47,9 +50,26 @@ OPERATION_STYLE_ANNOTATE = "style_annotate"
 OPERATION_TRANSCRIBE = "transcribe"
 OPERATION_LABEL = "label"
 OPERATION_LINKS = "links"
+#: A response a batch job paid for that no run of it ever used (see
+#: :mod:`dgml_core.batch.jobs`): written once, when the job completes, with
+#: ``context`` ``{"unused": true, "batch_job": <job id>}``.
+OPERATION_BATCH_UNUSED = "batch_unused"
 
 OUTCOME_OK = "ok"
 OUTCOME_ERROR = "error"
+
+# Pricing tier the call was billed at. ``standard`` is the synchronous
+# Messages/Chat API; ``batch`` is a provider's asynchronous batch tier
+# (typically 50% of standard). Rows carry it so a run with and without
+# batching can be compared from ``usage.jsonl`` alone.
+TIER_STANDARD = "standard"
+TIER_BATCH = "batch"
+
+#: Marker key on a response's ``_hidden_params``: the response was replayed
+#: from a batch job's store and its usage is already on a row an earlier run
+#: wrote, so :func:`extract_cost_and_tokens` reports it as zero. Every response
+#: is billed exactly once (see :mod:`dgml_core.batch.jobs`).
+BILLED_MARKER = "dgml_billed"
 
 
 @dataclass
@@ -78,6 +98,10 @@ class UsageEvent:
     # ``extract_cost_and_tokens``.
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # Pricing tier (``TIER_STANDARD`` / ``TIER_BATCH``). Defaults to standard so
+    # rows written before the field existed — and events built without it —
+    # stay valid; readers do not backfill a missing key.
+    tier: str = TIER_STANDARD
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -91,13 +115,62 @@ def record_usage(workspace: Workspace, event: UsageEvent) -> None:
     line). A write failure here is swallowed: cost telemetry must never break
     the operation it's reporting on. Worst case the row is missing from the log;
     the user's PDF is still ingested / classified / extracted.
+
+    While :func:`buffered_usage` is active the row is held instead of written.
     """
+    with _BUFFER_LOCK:
+        if _BUFFER is not None:
+            _BUFFER.append((workspace, event))
+            return
     try:
         workspace.docs.append_doc(layout.Collection.USAGE, event.to_json())
     except Exception:
         # Intentional broad catch: never let logging take down the
         # caller. The usage log is best-effort telemetry.
         pass
+
+
+# ---- deferred rows (batch job mode) ------------------------------------------
+#
+# A batch job run that ends *pending* must leave no usage rows: the run that
+# completes the job replays every response and writes the rows a blocking run
+# would have. So while a job session is active, rows are held here and then
+# either written (the run finished, or failed like any run) or dropped (it
+# paused). Process-global rather than a context variable on purpose: stages fan
+# work out on thread pools, and a row recorded on a worker must land here too.
+_BUFFER: list[tuple[Workspace, UsageEvent]] | None = None
+_BUFFER_LOCK = threading.Lock()
+
+
+@contextmanager
+def buffered_usage() -> Iterator[list[tuple[Workspace, UsageEvent]]]:
+    """Hold every :func:`record_usage` row until the caller decides.
+
+    Yields the buffer. The caller writes it with :func:`flush_usage`; whatever
+    is still held when the block exits is dropped. Not reentrant.
+    """
+    global _BUFFER
+    with _BUFFER_LOCK:
+        if _BUFFER is not None:
+            raise RuntimeError("usage rows are already being buffered")
+        _BUFFER = []
+        held = _BUFFER
+    try:
+        yield held
+    finally:
+        with _BUFFER_LOCK:
+            _BUFFER = None
+
+
+def flush_usage(held: list[tuple[Workspace, UsageEvent]]) -> None:
+    """Write the *held* rows, in the order they were recorded, and empty it."""
+    rows = list(held)
+    held.clear()
+    for workspace, event in rows:
+        try:
+            workspace.docs.append_doc(layout.Collection.USAGE, event.to_json())
+        except Exception:
+            pass  # best-effort telemetry, as in record_usage
 
 
 def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
@@ -136,6 +209,10 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
     )
     explicit_read = False
     hidden = getattr(response, "_hidden_params", None)
+    if isinstance(hidden, dict) and hidden.get(BILLED_MARKER):
+        # Replayed from a batch job; an earlier run's row already carries it.
+        out.update(cost_usd=0.0, prompt_tokens=0, completion_tokens=0, total_tokens=0)
+        return out
     if isinstance(hidden, dict):
         cost = hidden.get("response_cost")
         if isinstance(cost, int | float) and not isinstance(cost, bool):
@@ -169,6 +246,16 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
     return out
 
 
+_USAGE_FIELDS = (
+    "cost_usd",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+)
+
+
 def add_partial(acc: dict[str, Any], inc: dict[str, Any]) -> None:
     """Sum cost + token counters across multiple litellm calls.
 
@@ -176,20 +263,125 @@ def add_partial(acc: dict[str, Any], inc: dict[str, Any]) -> None:
     set of priced calls still produces a meaningful total. The
     accumulator's value stays ``None`` only if every contribution is
     ``None`` for that field.
+
+    A per-tier breakdown on *inc* (:data:`TIERS_KEY`, see :func:`with_tier`)
+    is merged into *acc*'s, tier by tier, alongside — never instead of — the
+    aggregate sums, so the aggregate's float association is unchanged.
     """
-    for k in (
-        "cost_usd",
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "cache_read_tokens",
-        "cache_creation_tokens",
-    ):
+    for k in _USAGE_FIELDS:
         a = acc.get(k)
         b = inc.get(k)
         if a is None and b is None:
             continue
         acc[k] = (a or 0) + (b or 0)
+    inc_tiers = inc.get(TIERS_KEY)
+    if inc_tiers:
+        acc_tiers = acc.setdefault(TIERS_KEY, {})
+        for tier, sub in inc_tiers.items():
+            # A fresh part starts as an empty totals dict (None costs, 0 cache
+            # counters), so its None semantics match the aggregate's.
+            part = acc_tiers.setdefault(
+                tier, dict.fromkeys(_USAGE_FIELDS[:4]) | dict.fromkeys(_USAGE_FIELDS[4:], 0)
+            )
+            add_partial(part, sub)
+
+
+# ---- per-tier split ------------------------------------------------------------
+#
+# A usage scope (one call, one ``record_usage_for`` block, one file's
+# extraction) folds many responses into one totals dict. When those responses
+# were served by different pricing tiers — a batch plus synchronous fallbacks
+# for the items it could not serve — one row labeled with one tier would
+# misstate where the money went. So each folded response also records its
+# usage under its own tier in a private breakdown on the totals dict, and the
+# scope's row is written by :func:`scope_events`: one row when the scope saw
+# one tier (exactly the row it always wrote), one row per tier otherwise.
+
+#: Private key on a totals dict: ``{tier: subtotal}`` for every response folded
+#: in that named its tier (:data:`TIER_MARKER` on its ``_hidden_params``) or was
+#: given one by its driver. The key never reaches a usage row or a stats file.
+TIERS_KEY = "_tiers"
+
+#: Per-response marker (``_hidden_params["dgml_tier"]``) naming the tier that
+#: served it. A batch executor stamps it; a plain synchronous response has none.
+TIER_MARKER = "dgml_tier"
+
+#: ``context`` key set to ``True`` on every row of a scope split by tier.
+TIER_SPLIT_CONTEXT_KEY = "tier_split"
+
+
+def with_tier(usage: dict[str, Any], response: Any, default: str | None) -> dict[str, Any]:
+    """*usage* (from :func:`extract_cost_and_tokens` on *response*) with a
+    one-tier breakdown attached, for :func:`add_partial` to carry upward.
+
+    The tier is the response's :data:`TIER_MARKER`, else *default* (the
+    driving config's tier); ``None`` leaves the response untiered (resolved to
+    the row's own tier when the row is written). A response already billed by
+    an earlier run (:data:`BILLED_MARKER`) contributes zero and no tier, so it
+    never adds a zero-cost part to a scope. *usage* itself is not modified.
+    """
+    hidden = getattr(response, "_hidden_params", None)
+    if isinstance(hidden, dict):
+        if hidden.get(BILLED_MARKER):
+            return usage
+        marker = hidden.get(TIER_MARKER)
+        if isinstance(marker, str) and marker:
+            default = marker
+    tier = default or ""
+    out = dict(usage)
+    out[TIERS_KEY] = {tier: {k: usage.get(k) for k in _USAGE_FIELDS}}
+    return out
+
+
+def public_totals(totals: dict[str, Any]) -> dict[str, Any]:
+    """*totals* without its private keys (the per-tier breakdown): what may be
+    spread into a persisted record."""
+    return {k: v for k, v in totals.items() if not k.startswith("_")}
+
+
+def scope_events(event: UsageEvent, totals: dict[str, Any]) -> list[UsageEvent]:
+    """The row(s) a scope writes: *event* (built from the scope's aggregate
+    *totals*, ``tier`` set to the scope's own label) split by tier.
+
+    - The breakdown names at most one tier (untiered responses count as
+      *event*'s tier): one row, *event* itself — its sums are the aggregate,
+      exactly as before — with ``tier`` the one that served the scope.
+    - Several tiers: one row per tier, in tier-name order, each with that
+      tier's sums and every other field of *event*, ``context`` plus
+      ``"tier_split": true``. The scope's ``duration_s`` goes on the first
+      part only (the rest carry ``0.0``), so summing any numeric field over
+      the parts gives the scope's total. ``outcome`` and ``error`` are the
+      scope's, on every part.
+    """
+    breakdown: dict[str, dict[str, Any]] = {}
+    for tier, sub in (totals.get(TIERS_KEY) or {}).items():
+        resolved = tier or event.tier
+        if resolved in breakdown:
+            add_partial(breakdown[resolved], sub)
+        else:
+            breakdown[resolved] = dict(sub)
+    if len(breakdown) <= 1:
+        if breakdown:
+            event.tier = next(iter(breakdown))
+        return [event]
+    events: list[UsageEvent] = []
+    for i, tier in enumerate(sorted(breakdown)):
+        sub = breakdown[tier]
+        events.append(
+            replace(
+                event,
+                tier=tier,
+                duration_s=event.duration_s if i == 0 else 0.0,
+                context={**event.context, TIER_SPLIT_CONTEXT_KEY: True},
+                cost_usd=sub.get("cost_usd"),
+                prompt_tokens=sub.get("prompt_tokens"),
+                completion_tokens=sub.get("completion_tokens"),
+                total_tokens=sub.get("total_tokens"),
+                cache_read_tokens=sub.get("cache_read_tokens") or 0,
+                cache_creation_tokens=sub.get("cache_creation_tokens") or 0,
+            )
+        )
+    return events
 
 
 def read_events(workspace: Workspace) -> list[dict[str, Any]]:

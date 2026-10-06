@@ -890,6 +890,8 @@ into `<stem>.dgml.xml` regardless.
 | `--no-semlinks` | off | Skip the final semantic-link pass. By default each grounded `<stem>.dgml.xml` gets semantic links added in place — relationships the tree's nesting can't capture, written as `dg:itemprop` (predicate) + `dg:href` (`#id`, or space-separated `#id`s) on the subject, with `xml:id`s assigned to both ends. Covers references (`references`, `incorporates`, `signatoryOf`, …), relative dates (`relativeTo`/`effectiveOn`, ISO-8601 offset in `dg:value`), and derived values (`greaterOf`/`lesserOf` formulas, `escalates`, `valueFrom`). The model proposes links on the labeling model (`generation.label_model`), then a skeptical pass verifies them. Each converted file's `results` entry carries a `links` count. |
 | `--no-semlink-cache` | off | Always call the model for the semantic-link pass. By default the pass is cached on what the model actually reads — tag names and text, plus the labeling model, the link prompts, and whether the review pass runs. Attributes are deliberately excluded, because the prompt never shows them: grounding a document or renaming a namespace prefix does not change its links, so those runs replay the cache instead of paying again. The cache stores the links themselves, not a second copy of the XML, and they are written onto whatever the current render produced. This flag forces a fresh call — use it when something the key cannot see has changed, such as a provider-side model update behind a stable model id. |
 | `--no-semlink-verify` | off | Skip the second, skeptical pass that reviews each proposed link. The link pass then makes one model call per document instead of two, which cuts its wall-clock time by about 60%, and keeps roughly twice as many links — including the weaker ones the review would have dropped. Use it when you want breadth and speed over precision. Reviewed and unreviewed results are cached separately. |
+| `--batch` / `--no-batch` | `[generation] batch`, else off | Send the batchable model calls through the provider's batch API: half the price per token, but results can take up to 24 hours. See **Batch mode** below and [batch-mode.md](batch-mode.md). `--no-batch` forces the synchronous pipeline even when the config enables batch mode. |
+| `--batch-poll-interval <seconds>` | `30` | Seconds between batch status checks under `--batch`. Must be positive. |
 
 **Document-level resume.** If a file's per-(docset, file)
 `<stem>.dgml.xml` already holds a generated document tree, that file is
@@ -935,6 +937,85 @@ the run and a `source` recording where they came from — `config` (workspace
 `override` (from `--model`/`--label-model`), or a combination such as
 `profile:fast+override`. This keeps the model choice visible/recorded in the
 run's own output, not just in `config.json`.
+
+**Batch mode.** `--batch` (or `batch = true` under `[generation]` in
+`config.toml`, or `DGML_GENERATION__BATCH=true`; the flag wins, `--no-batch`
+turns it off, and anything but a boolean is `GENERATION_CONFIG_INVALID`) runs
+the batchable stages through the provider's batch endpoint. The requests are
+the same bytes the synchronous run sends, so the output is the same; what
+changes is the price and the wall-clock time.
+
+- **Transcription** batches one wave per window position: window 1 of every
+  document together, then window 2 of the documents that have one, and so on.
+- **Roster planning, gap planning and concept descriptions** batch under every
+  vocabulary, each as its own one-request stage over the labeling model:
+  planning's draft, then its refine turn (`plan`, two waves);
+  `--extend-schema`'s gap planning (`plan_gaps`, one wave); the descriptions of
+  concepts coined during labeling (`describe`, one wave).
+- **Labeling** batches under a closed `--schema-path` vocabulary, where no
+  document's labels can change the next document's prompt: every document at
+  once (`mode: "all-at-once"`). Under an open or `--extend-schema` vocabulary
+  each document is labeled against what earlier documents added, so labeling
+  stays synchronous (`mode: "sync"`, with the reason).
+- **Image style** (OCR files, when the workspace's `style` section is
+  enabled): every OCR page's vision request in one wave (`style`), after
+  grounding and before the link pass.
+- **Semantic links**: every document's propose request in one wave, then the
+  verify requests. The link cache works as usual, and documents that would
+  share a cache entry share one request.
+- Batch backends exist for `anthropic/` models (Message Batches). The
+  transcription, labeling, link and (when enabled) style models are checked
+  before any model call; one with no batch backend fails the command with
+  `BATCH_UNAVAILABLE`, naming the stage and model. The labeling model is
+  checked under every vocabulary, because planning and links batch over it.
+  Batch mode never quietly falls back to full price.
+- The batch backend supports litellm `>=1.85,<1.86` only, because it reuses
+  litellm internals to send exactly the synchronous request. With another
+  version installed, `--batch` fails with `BATCH_UNAVAILABLE`.
+- A request the provider could not serve is retried once in the next wave,
+  then sent synchronously at full price (`sync_fallbacks`). `usage.jsonl` rows
+  record which tier each operation used (`tier`); an operation served by both
+  tiers writes one row per tier, marked `context.tier_split: true`.
+
+Under batch mode the payload gains a `batch` block. It is absent otherwise,
+so a synchronous run's payload is unchanged. Each stage reports its wave
+counters and cost, or why it did not batch:
+
+```json
+"batch": {
+  "enabled": true,
+  "stages": {
+    "transcribe": {"waves": 3, "batches": 3, "requests": 5, "batch_ok": 5, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.021, "standard_cost_usd": 0.042, "saved_usd": 0.021},
+    "plan": {"waves": 2, "batches": 2, "requests": 2, "batch_ok": 2, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.004, "standard_cost_usd": 0.008, "saved_usd": 0.004},
+    "label": {"skipped": "open vocabulary: each document's labels extend the shared roster", "mode": "sync"},
+    "links": {"waves": 2, "batches": 2, "requests": 4, "batch_ok": 4, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.021, "standard_cost_usd": 0.042, "saved_usd": 0.021}
+  }
+}
+```
+
+The counters are `waves` (round trips), `batches`, `requests`, `batch_ok`,
+`sync_fallbacks`, `resubmitted`, `failed` and `batch_ids` (plus `bisections`
+when a batch was split after a batch-level rejection). The cost fields:
+
+| Field | Meaning |
+|---|---|
+| `cost_usd` | What this stage's responses were billed at, at the tier actually used: a batch result at the batch price, a synchronous fallback at the standard price. |
+| `standard_cost_usd` | What the same responses cost at the standard price. |
+| `saved_usd` | `standard_cost_usd − cost_usd`. |
+
+All three are `null` when a response came back without a price. They cover
+the batched stages only; a stage that ran synchronously (open-vocabulary
+labeling) has its cost in `usage.jsonl` under `--debug`.
+
+`label` reads `{"mode": "all-at-once", <counters>, <cost fields>}` under a
+closed vocabulary, otherwise `{"skipped": "<reason>", "mode": "sync"}`.
+`links` reads `{"skipped": "--no-semlinks"}` when the pass is off, and
+`{"skipped": "every link plan was cached"}` when no request was needed.
+`plan`, `plan_gaps`, `describe` and `style` appear only when that call ran
+(planning is skipped under a supplied schema; descriptions when no concept was
+coined), except that `style` reads `{"skipped": "no OCR document with a page
+to style"}` when the `style` section is enabled but nothing needed it.
+Wherever `skipped` appears it is a string reason, never a boolean.
 
 `summary` counts always sum to `total`: every assigned file lands in exactly
 one of `converted` / `skipped` / `failed`. A per-file problem does not abort
@@ -1221,7 +1302,7 @@ The LLM is configurable like every other model-using command — via the
 `values_model`, `values_reasoning_effort`, API keys, `max_tool_iters`), with
 per-call overrides on the commands below.
 
-### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M]`
+### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M] [--batch]`
 
 Ask the configured `schema_model` to propose an extraction schema from one or
 more sample PDFs, then store it as `extraction-schema.rnc`. `--from-file` is repeatable and
@@ -1244,6 +1325,27 @@ to a `dg:value`/`xsi:type`. The output shape is unchanged.
   "model": "anthropic/claude-opus-5"
 }
 ```
+
+`--batch [--batch-poll-interval SECONDS]` sends the one schema request through
+the provider's batch API (about half price; one batch round trip, usually
+minutes, at most 24 hours). The request is identical to the synchronous one and
+so is the stored schema; the payload gains a top-level `batch` block with the
+wave stats (`provider`, `waves`, `batches`, `requests`, `batch_ok`,
+`sync_fallbacks`, `resubmitted`, `failed`, `batch_ids`) and the cost fields
+(`cost_usd` billed, `standard_cost_usd` what the same responses cost
+synchronously, `saved_usd`; `null` when a response carried no price), and the
+usage row carries `tier: "batch"`:
+
+```json
+"batch": {"provider": "anthropic", "waves": 1, "batches": 1, "requests": 1,
+          "batch_ok": 1, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+          "batch_ids": ["msgbatch_..."],
+          "cost_usd": 0.12, "standard_cost_usd": 0.24, "saved_usd": 0.12}
+```
+
+A `schema_model` whose provider has no batch backend fails with
+`BATCH_UNAVAILABLE` before any PDF is read or request sent. See
+[batch-mode.md](batch-mode.md).
 
 ### `dgml extraction set-schema <docset_id> --schema-file PATH`
 
@@ -1301,7 +1403,7 @@ fields, prompts for where to find one value. Returns
 Return the DocSet's extraction guidance as `{docset_id, guidance}`. Errors
 `GUIDANCE_NOT_FOUND` if none is set.
 
-### `dgml extraction extract <docset_id> <file_id> [--values-model M] [--values-effort E]`
+### `dgml extraction extract <docset_id> <file_id>... [--all] [--values-model M] [--values-effort E] [--batch]`
 
 Extract values from a file against the DocSet schema and write a `dg:extraction`
 element into the file's core `<stem>.dgml.xml`. Runs a three-phase pipeline
@@ -1332,6 +1434,53 @@ is refused before the model is called.
 > builds the tree and carries the `dg:extraction` over; generate-then-extract
 > embeds the extraction alongside the existing tree. Both end at
 > `full-extraction`.
+
+#### Several files, and `--batch`
+
+`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--batch] [--batch-poll-interval SECONDS]`
+
+With more than one file id, or `--all` (every file in the DocSet), the command
+extracts each file independently and returns one entry per file. A file that
+fails is reported in its entry (`status: failed` with an `{code, message}`
+error) and the others still run; the command exits `0` once the run completes.
+A single file id keeps the single-file output above, with or without `--batch`:
+under `--batch` it gains only the `batch` block below, and a failure is the
+same top-level error envelope a synchronous single-file run gives. Passing both
+ids and `--all`, or neither, is `INVALID_ARGUMENT`.
+
+`--batch` submits both LLM phases through the values model's batch API — phase
+1 for every file as one wave, phase 3 for every file's unresolved pages as a
+second — at about half price, with results usually within an hour and at most
+24h (`--batch-poll-interval` sets the seconds between status polls, default
+30). A file whose phase 1 takes extra turns (chunked output, a truncation
+retry, the permissive-schema fallback) rides extra waves. A request the batch
+cannot serve is retried or run synchronously for that request only. Values,
+the XML written and `extraction_stats` are the same as a synchronous run; the
+`usage.jsonl` rows (under `--debug`) carry `"tier": "batch"`. A values model
+whose provider has no batch backend (only Anthropic has one) is refused with
+`BATCH_UNAVAILABLE` before any request. Without `--batch` there is no `batch`
+block.
+
+```json
+{
+  "docset_id": "o8vr8rs488vg",
+  "model": "anthropic/claude-sonnet-4-6",
+  "summary": {"total": 2, "ok": 1, "failed": 1},
+  "results": [
+    {"file_id": "5kqt9r5fowno", "status": "ok", "mode": "extraction",
+     "tool_calls": 0, "field_count": 7,
+     "xml_key": "docsets/o8vr8rs488vg/files/5kqt9r5fowno/Invoice 2025.dgml.xml"},
+    {"file_id": "9mzn2c4q1abx", "status": "failed",
+     "error": {"code": "FILE_NOT_FOUND", "message": "..."}}
+  ],
+  "batch": {"provider": "anthropic", "waves": 2, "batches": 2, "requests": 5,
+            "batch_ok": 5, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+            "batch_ids": ["msgbatch_...", "msgbatch_..."],
+            "cost_usd": 0.041, "standard_cost_usd": 0.082, "saved_usd": 0.041}
+}
+```
+
+`batch` totals cover both phases of the run.
 
 ### `dgml extraction get-values <docset_id> <file_id> [--as values|xml]`
 
@@ -1474,7 +1623,7 @@ failed at `file add` (the message repeats the converter's error).
 
 ## File commands
 
-### `dgml file add <path> [--id FILE_ID] [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify [MODE]]`
+### `dgml file add <path> [--id FILE_ID] [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify [MODE]] [--batch]`
 
 Add a File. The source is copied into the workspace, hashed, its pages
 are rendered to PNGs via `gs` (300 dpi by default — see `--dpi`), and
@@ -1626,6 +1775,52 @@ after it, so similar PDFs in the batch cluster into the same DocSet.
 Under `--auto-classify existing` no DocSets are created, so that in-run
 growth doesn't happen: every file is assigned within the same curated set
 the run started with.
+
+`--batch` (with `--batch-poll-interval SECONDS`, default 30) submits the
+directory's classifications through the classification model's batch API once
+every file is added, then runs the auto-extraction of the files assigned to a
+DocSet with a schema as one more batch run (a phase-1 wave and, when needed, a
+phase-3 wave), however many DocSets the files land in. How the classifications
+go out depends on the mode:
+
+- **`--auto-classify existing`**: one wave for every file. No file can create
+  a DocSet, so every request is built from the same DocSet list.
+- **The default mode** (`--auto-classify`, `existing-or-new`): the files are
+  classified **in order, one wave per file**. Any reply may create a DocSet,
+  and each later file's request lists it (by id), exactly as the synchronous
+  run's file-by-file loop does. No two files can share a wave without changing
+  what the later one is offered, so a directory of *N* files takes *N*
+  classification round trips. A file that makes no request (no rendered page)
+  takes none. Use `existing` mode for a large curated ingest where that latency
+  matters.
+
+`--batch` requires `--auto-classify` (refused with `INVALID_ARGUMENT`
+otherwise: classification is what a directory add batches). It is also refused
+for a single-file add, and with `BATCH_UNAVAILABLE` when the classification
+model (or the values model, when a DocSet already has an extraction schema) has
+no batch backend — in every case before any file is added. Ingest itself
+(including `--text-mode hybrid`'s optional LLM merge, see below) stays
+synchronous. Each entry's `classification` block is the one a synchronous run
+writes; the payload gains a top-level `batch` block:
+
+```json
+"batch": {
+  "classification": {"provider": "anthropic", "waves": 1, "batches": 1, "requests": 12,
+                     "batch_ok": 12, "sync_fallbacks": 0, "resubmitted": 0,
+                     "failed": 0, "batch_ids": ["msgbatch_..."],
+                     "cost_usd": 0.006, "standard_cost_usd": 0.012, "saved_usd": 0.006},
+  "extraction": {"provider": "anthropic", "docset_ids": ["o8vr8rs488vg", "k2p0x9w3mm7q"],
+                 "waves": 2, "batches": 2, "requests": 14, "batch_ok": 14,
+                 "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+                 "batch_ids": ["msgbatch_...", "msgbatch_..."],
+                 "cost_usd": 0.11, "standard_cost_usd": 0.22, "saved_usd": 0.11}
+}
+```
+
+`extraction` is present only when a batch auto-extraction ran. A credential
+failure (an unset `api_key_env`) never aborts the command: as in a run without
+`--batch`, each file's `classification.error` / `extraction.error` carries it
+and the command exits `0`. `--verbose` streams batch progress to stderr.
 
 Each file commits independently: a single bad PDF (or a conflict under
 `--on-conflict error`) is recorded in its entry and the run continues.
@@ -2507,6 +2702,12 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `WORKSPACES_UNAVAILABLE` | hard | The store of workspaces could not be reached — it is what *finds* a workspace, so this fails every command, not just the one that touches the backing store. The message names the host, port and driver error. |
 | `WORKSPACE_MIGRATION_FAILED` | hard | An automatic in-place workspace upgrade could not complete; the workspace is left as it was, and the message names the migration that stopped. |
 | `EMPTY_MODEL_RESPONSE` | hard | An LLM call returned no content at all (as distinct from content that failed to parse). |
+| `BATCH_UNAVAILABLE` | hard | Batch mode was requested for a model it cannot serve: the model's provider (as litellm resolves it) has no batch backend, the backend's optional dependency is not installed, or the installed litellm is outside the range the batch backends support. Raised before any request is sent, naming the stage and model; batch mode never falls back to a full-price synchronous run. Every `--batch` command checks every stage it would batch up front. |
+| `BATCH_EXECUTION_FAILED` | hard | A submitted batch could not be brought to completion: the provider accepted none of a wave's batches, a batch create was refused at the account's rate limit or quota, a batch create's outcome was unknown (the batch may exist; it is never resubmitted), or a batch was still unfinished at the polling deadline (it is cancelled first). Per-request failures inside a delivered batch are retried or run synchronously instead. Within a `docset generate` stage, only the documents still in flight are affected (a document still transcribing is dropped, one still labeling gets a `label_error`, a failed link stage gives each document a `link_error`); the command still exits 0. |
+| `BATCH_JOB_NOT_FOUND` | hard | `--job` or a `dgml batch` subcommand named a job id with no job in this workspace. |
+| `BATCH_JOB_BUSY` | hard | Another process holds the batch job's lease (it is running, polling or canceling that job). Retry when it finishes, or once the lease expires 10 minutes after its last renewal; `dgml batch unlock <job_id>` breaks a lease left by a process that died. Also the outcome of a run that lost its lease mid-run (broken by `unlock`, or taken over): it stops before submitting anything more, with `details.lease_lost: true`. |
+| `BATCH_JOB_NONDETERMINISTIC` | hard | A resumed batch job's requests for a stage matched nothing it stored or has in flight while open provider batches still cover those positions: an input was rebuilt differently, and submitting would pay for the same wave again. Nothing was submitted and the open batches were kept. Fatal to the run: it is the run's only output (no success payload, exit 1) and nothing further is sent to the provider; `details.batch.job` names the job, left `failed`. If an input changed on purpose, `dgml batch cancel <job_id>` then `dgml batch resume <job_id>`. |
+| `BATCH_JOB_INVALID` | hard | A batch job cannot be used as asked: `--no-wait`/`--job` without batch mode, resuming a job that already completed, continuing a job with a different command than the one that created it, running a job again while it has an unacknowledged `uncertain` batch create (check the provider's console, then `dgml batch cancel <job_id>`), or resuming a job whose stored command line no longer parses or whose original working directory no longer exists. |
 | `INCREMENTAL_WITHOUT_CLUSTERS` | hard | `cluster --skip-existing` in a workspace that has no existing clusters to build on. |
 | `LINK_PLAN_FAILED` | soft | The semantic-link pass failed for a document during `docset generate`; the document still converts, unlinked. |
 | `GUIDANCE_NOT_FOUND` | hard | An `extraction` command needs DocSet guidance that has not been set. |

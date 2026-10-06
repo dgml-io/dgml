@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from dgml_core.generation.config import (
         GENERATION_PROFILES,
         GenerationConfig,
+        load_generation_batch,
         load_generation_config,
         load_generation_config_file,
         load_generation_profile,
@@ -43,7 +44,8 @@ if TYPE_CHECKING:
         validate_generation_models,
     )
     from dgml_core.generation.label import label_documents
-    from dgml_core.generation.pipeline import ConvertOptions, convert_batch
+    from dgml_core.generation.link_stage import LinkOutcome, LinkStage, StagedDocument
+    from dgml_core.generation.pipeline import BatchOptions, ConvertOptions, convert_batch
     from dgml_core.generation.render import render_xml
     from dgml_core.generation.to_semantic import render_semantic_xml
     from dgml_core.generation.transcribe import transcribe_document
@@ -60,6 +62,7 @@ _EXPORTS = {
     "build_tree": "blocks",
     "GENERATION_PROFILES": "config",
     "GenerationConfig": "config",
+    "load_generation_batch": "config",
     "load_generation_config": "config",
     "load_generation_config_file": "config",
     "load_generation_profile": "config",
@@ -68,6 +71,10 @@ _EXPORTS = {
     "resolve_generation_label_api_key": "config",
     "validate_generation_models": "config",
     "label_documents": "label",
+    "LinkOutcome": "link_stage",
+    "LinkStage": "link_stage",
+    "StagedDocument": "link_stage",
+    "BatchOptions": "pipeline",
     "ConvertOptions": "pipeline",
     "convert_batch": "pipeline",
     "render_xml": "render",
@@ -93,13 +100,18 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "GENERATION_PROFILES",
+    "BatchOptions",
     "Block",
     "ConvertOptions",
     "GenerationConfig",
+    "LinkOutcome",
+    "LinkStage",
     "Span",
+    "StagedDocument",
     "build_tree",
     "convert_batch",
     "label_documents",
+    "load_generation_batch",
     "load_generation_config",
     "load_generation_config_file",
     "load_generation_profile",

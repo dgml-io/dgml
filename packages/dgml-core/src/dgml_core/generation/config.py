@@ -55,7 +55,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from dgml_core.config import load_merged_config
+from dgml_core.config import config_bool, load_merged_config
 from dgml_core.errors import (
     AuthError,
     GenerationConfigInvalid,
@@ -186,6 +186,36 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
         label_api_key_env=label.api_key_env,
         label_api_base=label.api_base,
     )
+
+
+def load_generation_batch(workspace: Workspace) -> bool:
+    """The ``[generation] batch`` switch: run ``docset generate`` in batch mode.
+
+    Absent means ``False`` (the synchronous pipeline). A TOML boolean is read
+    as is, and the env-var layer's strings (``DGML_GENERATION__BATCH=true``)
+    through :func:`~dgml_core.config.config_bool`. Anything else raises
+    :class:`GenerationConfigInvalid` rather than being guessed at: a typo
+    silently read as *on* would be a surprise in the opposite direction from
+    what batch mode is for. The CLI's ``--batch`` / ``--no-batch`` flag
+    overrides it.
+    """
+    section = load_merged_config(workspace).get(ConfigSection.GENERATION) or {}
+    value = section.get("batch", False) if isinstance(section, dict) else False
+    parsed = config_bool(value)
+    if parsed is None:
+        raise GenerationConfigInvalid(
+            f"generation.batch must be true or false, got {value!r} ({type(value).__name__})"
+        )
+    return parsed
+
+
+#: ``batch.stages.label.mode`` in a batch run's payload: how Pass B labeled.
+#: ``all-at-once`` — every document as one batch stage (a closed vocabulary:
+#: the roster cannot change between documents); ``sync`` — ordinary
+#: synchronous calls (any other vocabulary: each document's labels extend the
+#: roster the next one is shown, so documents cannot be labeled together).
+LABEL_MODE_ALL_AT_ONCE = "all-at-once"
+LABEL_MODE_SYNC = "sync"
 
 
 def load_generation_config(workspace: Workspace) -> GenerationConfig:
