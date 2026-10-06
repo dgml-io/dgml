@@ -206,7 +206,11 @@ once. A preflight checks every model the planned steps will batch before any
 work and names the stage whose model has no batch backend; the steps'
 pass-through options (`--window-size`, `--thinking`, …) are validated up front
 too, so a bad value fails at once with `INVALID_ARGUMENT` rather than after a
-step has paid.
+step has paid. `--no-batch-label` passes through to `docset generate`; the job
+pins the labeling choice it resolved, as `docset generate` does.
+`--batch-deadline` is one deadline for the whole run, not one per step: once it
+passes, the step waiting on a batch cancels and collects it, and every later
+step runs synchronously.
 
 If a resume finds that a step's inputs were rebuilt differently from the run
 that submitted its open batches, it stops with `BATCH_JOB_NONDETERMINISTIC`

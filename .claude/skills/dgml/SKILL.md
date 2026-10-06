@@ -633,7 +633,9 @@ batch is still running), finished steps replay free, and `batch status`
 reports `.step` (`schema`, `generate`, `extract`, or `completed`). Pass-through
 options (`--window-size`, `--thinking`, `--model`, …) are checked for every
 step before the first one runs, so a bad value fails at once with
-`INVALID_ARGUMENT` instead of after the schema step has paid. Prefer it to
+`INVALID_ARGUMENT` instead of after the schema step has paid. `--no-batch-label`
+passes through to `docset generate`, and `--batch-deadline` is one deadline for
+the whole run, not one per step. Prefer it to
 chaining the three commands yourself for an unattended run: one job id to
 track, one cron entry.
 

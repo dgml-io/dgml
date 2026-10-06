@@ -3971,11 +3971,12 @@ _RUN_PASSTHROUGH: tuple[tuple[str, str, bool, str], ...] = (
     ("--no-semlinks", "no_semlinks", False, "generate"),
     ("--no-semlink-cache", "no_semlink_cache", False, "generate"),
     ("--no-semlink-verify", "no_semlink_verify", False, "generate"),
+    ("--batch-label", "batch_label", False, "generate"),
     ("--schema-model", "schema_model", True, "schema"),
     ("--values-model", "values_model", True, "extract"),
     ("--values-effort", "values_effort", True, "extract"),
 )
-_RUN_BOOLEAN_OPTIONAL: frozenset[str] = frozenset()
+_RUN_BOOLEAN_OPTIONAL: frozenset[str] = frozenset({"--batch-label"})
 
 _RUN_STEP_COMMANDS = {
     "generate": "`docset generate`",
@@ -5304,6 +5305,7 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         from dataclasses import replace
 
         stages: dict[str, Any] = {}
+        pinned: dict[str, str | bool] = {}  # resolved from config, recorded with the job
         # Only an extraction that will actually run needs the grounded config.
         extracting = want_extract and (has_schema or bool(args.schema_from))
         grounded = load_grounded_config(ws) if extracting else None
@@ -5322,7 +5324,7 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 ws, config=args.generation_config, model=args.model, label_model=args.label_model
             )
             # As `docset generate` checks: transcription, and the labeling model
-            # (planning, descriptions and closed-vocabulary labeling batch).
+            # (planning and descriptions batch; labeling too unless --no-batch-label).
             stages["generate.transcribe"] = gen_cfg.model
             stages["generate.label"] = gen_cfg.label_model
             from dgml_core.style_config import load_style_config
@@ -5332,6 +5334,15 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 stages["generate.style"] = style_section.model  # OCR files' image style
             if not args.no_semlinks:
                 stages["generate.links"] = gen_cfg.label_model
+            from dgml_core.generation import load_generation_batch_label
+
+            # As `docset generate` pins it: a resume labels the same way
+            # whatever [generation] batch_label says by then.
+            pinned["--batch-label"] = (
+                args.batch_label
+                if args.batch_label is not None
+                else load_generation_batch_label(ws)
+            )
         if grounded is not None and (has_schema or args.schema_from):
             stages.update(
                 values_batch_stages(
@@ -5339,7 +5350,7 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 )
             )
         _batch_preflight(stages)
-        session = _start_batch_job(args, ws, command="docset run")
+        session = _start_batch_job(args, ws, command="docset run", pinned=pinned)
         schema_needed = bool(session.state.setdefault(_RUN_SCHEMA_NEEDED_STATE, schema_needed))
         session.persist()
 

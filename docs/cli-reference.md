@@ -694,7 +694,7 @@ dgml docset add-file <file_id> --docset <docset_id>   # auto-extracts when the
 dgml docset remove-file <file_id> --docset <docset_id>
 dgml docset list-files <docset_id>
 dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <id>] [--label-model <id>] [--window-size <n>] [--max-tokens <n>] [...]
-dgml docset run <docset_id> [--schema-from <file_id> ...] [--no-generate] [--no-extract] [generate flags] [--batch] [--no-wait]
+dgml docset run <docset_id> [--schema-from <file_id> ...] [--no-generate] [--no-extract] [generate flags] [--batch] [--no-wait] [--batch-deadline <duration>]
 ```
 
 `docset delete` removes the DocSet and its file-assignment markers, but
@@ -1307,12 +1307,13 @@ exactly as its standalone command would:
 | `--schema-from FILE_ID` | Sample file for the schema step. Repeatable. Used only when the docset has no extraction schema. |
 | `--no-generate` | Skip step 2. |
 | `--no-extract` | Skip steps 1 and 3. |
-| `--generation-config`, `--model`, `--label-model`, `--window-size`, `--temperature`, `--max-tokens`, `--thinking`, `--no-coverage`, `--cache-dir`, `--max-parallel-calls`, `--schema-path`, `--extend-schema`, `--no-roster`, `--no-semlinks`, `--no-semlink-cache`, `--no-semlink-verify` | Passed to `docset generate` unchanged. |
+| `--generation-config`, `--model`, `--label-model`, `--window-size`, `--temperature`, `--max-tokens`, `--thinking`, `--no-coverage`, `--cache-dir`, `--max-parallel-calls`, `--schema-path`, `--extend-schema`, `--no-roster`, `--no-semlinks`, `--no-semlink-cache`, `--no-semlink-verify`, `--batch-label` / `--no-batch-label` | Passed to `docset generate` unchanged. |
 | `--schema-model M` | Passed to `extraction generate-schema`. |
 | `--values-model M`, `--values-effort E` | Passed to `extraction extract`. |
 | `--batch` / `--no-batch` | Every step through the provider's batch API, under **one** batch job. Defaults to `[generation] batch`. |
 | `--batch-poll-interval S` | Seconds between batch status polls (default 30). |
 | `--no-wait`, `--job ID` | Batch job mode for the whole run (see [Batch jobs](#batch-jobs---no-wait-and-dgml-batch)). |
+| `--batch-deadline DURATION` | One deadline for the whole run (and its job), not one per step: once it passes, the step waiting on a batch cancels and collects it, and every later step runs synchronously (see [`--batch-deadline`](#batch-deadline---batch-deadline)). |
 
 Payload: each step's normal payload, or a `skipped` reason, under `steps`:
 

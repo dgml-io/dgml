@@ -11,8 +11,8 @@
 # limitations under the License.
 
 """``--batch-deadline`` through the CLI: flag validation, the ``batch.deadline``
-payload block, the ``--no-wait`` pause payload, and a job resumed after its
-deadline.
+payload block, the ``--no-wait`` pause payload, a job resumed after its
+deadline, and one deadline spanning every step of ``docset run``.
 
 The wall clock the deadline reads (``dgml_core.batch.deadline.wall_clock``)
 is patched to a value the test moves, so "after the deadline" is exact.
@@ -41,6 +41,8 @@ from .test_cli_batch_jobs import (
     pdf_stubs,  # noqa: F401  (fixture)
     provider,  # noqa: F401  (fixture)
 )
+from .test_cli_docset_run import _GEN_FLAGS, _SAMPLE, _answer, _sync
+from .test_cli_docset_run import _seed as _seed_run
 
 _POLL = ["--batch-poll-interval", "0.01"]
 T0 = 1_800_000_000.0  # 2027-01-15T08:00:00Z
@@ -110,6 +112,9 @@ def test_every_batch_command_takes_the_flag_and_rejects_it_without_batch(
     ws, ds_id = _seed_extraction(tmp_path, capsys, _FIDS[:1])
     gen_ws, gen_id = _seed_generate(tmp_path / "gen", capsys)
     assert main(_ws_args(gen_ws) + ["docset", "generate", gen_id, "--batch-deadline", "1h"]) == 1
+    assert _read_stderr(capsys)["error"]["code"] == "BATCH_JOB_INVALID"
+    run_argv = ["docset", "run", gen_id, "--no-batch", "--batch-deadline", "1h"]
+    assert main(_ws_args(gen_ws) + run_argv) == 1
     assert _read_stderr(capsys)["error"]["code"] == "BATCH_JOB_INVALID"
     for argv in (
         ["extraction", "generate-schema", ds_id, "--batch-deadline", "1h"],
@@ -246,5 +251,49 @@ def test_a_job_resumed_after_its_deadline_cancels_collects_and_finishes_sync(
     block = final["batch"]
     assert block["sync_fallbacks"] == 1 and block["batch_ok"] == 1
     assert block["saved_usd"] == pytest.approx(block["standard_cost_usd"] - block["cost_usd"])
+    (manifest,) = list_jobs(Workspace(root=ws))
+    assert manifest.status == "completed"
+
+
+# ---- docset run: one deadline for every step -----------------------------------------------
+
+
+def test_docset_run_carries_one_deadline_across_its_steps(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,  # noqa: F811
+    pdf_stubs: None,  # noqa: F811
+    clock: _Clock,
+) -> None:
+    """`docset run --batch-deadline` is the run's (and its job's) one deadline:
+    once it passes, the step waiting on a batch cancels and collects it, and
+    every later step runs synchronously without submitting anything."""
+    ws, did = _seed_run(tmp_path, capsys)
+    provider.install("anthropic", _answer, polls=10_000)
+    provider.install("gemini", _answer, polls=10_000)
+    run = _ws_args(ws) + ["--debug", "docset", "run", did, *_GEN_FLAGS]
+    argv = run + ["--schema-from", _SAMPLE, "--batch", *_POLL, "--no-wait"]
+    argv += ["--batch-deadline", "2h"]
+    with patch("litellm.completion", side_effect=_sync):
+        assert main(argv) == 0
+        job_id = _read_stdout(capsys)["batch_job"]["job_id"]
+        (manifest,) = list_jobs(Workspace(root=ws))
+        assert manifest.deadline is not None
+        assert manifest.deadline["at"] == "2027-01-15T10:00:00Z"
+
+        clock.now = T0 + 2 * 3600 + 1
+        assert main(_ws_args(ws) + ["batch", "resume", job_id]) == 0
+    out = _read_stdout(capsys)
+    assert "batch_job" not in out  # finished in one resume: no later step waited
+    deadline = out["batch"]["deadline"]
+    assert deadline["at"] == "2027-01-15T10:00:00Z" and deadline["expired"] is True
+    assert deadline["canceled_batches"] == 1  # the schema step's batch
+    assert deadline["sync_after_deadline"] >= 3  # schema + later steps, all sync
+    # The block is the run's alone; the steps' own payloads carry none.
+    for step in out["steps"].values():
+        assert "deadline" not in (step.get("batch") or {})
+    # Only the schema step ever submitted: later steps never reached the provider.
+    assert len(provider.backends["anthropic"].submitted) == 1
+    assert provider.backends["gemini"].submitted == []
     (manifest,) = list_jobs(Workspace(root=ws))
     assert manifest.status == "completed"
