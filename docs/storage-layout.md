@@ -74,6 +74,12 @@ at all — see [storage services](#storage-services-storage).
 ├── workspace.json                    # { name, organization, workspace_id, schema_version } — written by `workspace create`
 ├── config.toml                       # storage binding + settings — REQUIRED
 ├── usage.jsonl                       # LLM call event log (optional)
+├── batches/                          # batch job state (optional; any --batch run; removed once empty)
+│   └── <job_id>/                     #   bj_<12 hex>
+│       ├── job.json                  #   manifest (see "batches/<job_id>/" below)
+│       ├── lease.json                #   which process holds the job right now
+│       ├── responses/<key>.json      #   one received response per request key
+│       └── inputs/<name>             #   inputs a resumed run restores
 ├── docsets/
 │   └── <docset_id>/                  # generated: 12-char base-36 ID
 │       ├── docset.json               # { id, name, description, key_questions }
@@ -1005,7 +1011,7 @@ One record:
 ```jsonc
 {
   "at": "2026-05-15T17:42:00Z",
-  "operation": "extract_values",     // classify | schema_generate | extract_values | transcribe | label | links | hybrid_merge
+  "operation": "extract_values",     // classify | schema_generate | extract_values | transcribe | label | links | hybrid_merge | batch_unused
   "model": "gemini/gemini-3-flash-preview",
   "cost_usd": 0.0123,                // null when litellm doesn't price the model
   "prompt_tokens": 12345,
@@ -1026,6 +1032,91 @@ One record:
 required multiple internal turns; the per-call costs and token counts
 are summed before recording. Partial cost (LLM calls made before a
 later failure) is preserved on `outcome=error` rows.
+
+Under a [batch job](#batchesjob_id-optional) the rows of a run that ends
+paused (`--no-wait`) are not written; the run that completes the job writes
+the rows a blocking run would. A response a later run replays after an
+interrupted run already counted it contributes zero cost and tokens, so every
+response is billed exactly once across the job's rows. A response the job paid
+for that no run of it ever used (a superseded batch's results, a request the
+command stopped asking for, a batch collected only as the run ended) is still
+shown: when the job completes it writes one `batch_unused` row per such
+response, at the tier that served it, with `context`
+`{"unused": true, "batch_job": "<job id>"}`. No command's own row counts it.
+
+## `batches/<job_id>/` (optional)
+
+State of one batch job — see
+[Batch jobs](cli-reference.md#batch-jobs---no-wait-and-dgml-batch). Written by
+any `--batch` run (a plain blocking run keeps one silently, for crash
+recovery, deleted when that run finishes — unless it ends leaving the job
+`failed`, when the payload names it in `batch.job`). A completed job keeps only
+its summarized `job.json`; `dgml batch prune` and `dgml batch delete` remove
+jobs. Deleting the last job also removes the then-empty `batches/` directory
+itself, so a workspace whose batch runs all finished has no `batches/`.
+
+- **`job.json`** — the manifest:
+
+  ```jsonc
+  {
+    "job_id": "bj_3f9a1c07d2e4",
+    "command": "docset generate",          // docset generate | extraction extract |
+                                           // extraction generate-schema | file add
+    "argv": ["docset", "generate", "…", "--batch", "--no-wait"],  // replayed by `batch resume`
+    "cwd": "/home/me/project",              // replayed from here (relative paths)
+    "created_at": "…", "updated_at": "…",
+    "status": "pending",                   // pending | completed | failed (`batch status`
+                                           // derives `ready` when asked; never stored)
+    "error": null,
+    "runs": 3,                             // runs of the command under this job so far
+    "provider_batches": [                  // every provider batch the job submitted
+      {"job": {"provider": "anthropic", "job_id": "msgbatch_…", "custom_ids": ["…"],
+               "submitted_at": "…", "extra": {}},
+       "model": "anthropic/claude-haiku-4-5", "api_base": null,
+       "stage": "transcribe",               // the pipeline stage the batch served
+       "credential": {"section": "generation", "field": "transcribe",
+                      "env": "MY_ANTHROPIC_KEY"},   // where the key comes from; never the key
+       "keys": {"<custom_id>": "<request key>"},
+       "state": "collected",               // open | collected | dropped (canceled) |
+                                           // uncertain (create outcome unknown; has "error"
+                                           // and a placeholder "uncertain_…" job_id)
+       "last_status": {"state": "ended", "succeeded": 12, "errored": 0, "expired": 0,
+                       "canceled": 0, "processing": 0},
+       "cleanup": "done"}                   // dropped batches only: provider-side delete
+                                           // "pending" (cancel not settled) | "done"
+                                           // A record may also carry "gone": true — the
+                                           // provider answered 404 (batch deleted or never
+                                           // existed); closed out as collected (every
+                                           // response stored) or dropped, no cleanup owed
+    ],
+    "billed": ["<request key>", "…"],      // responses already counted on a usage row
+    "inputs": {"generate/schema.json": true, "presence:generate/blocks/a.pdf": false},
+    "state": {},                           // command-specific (file add: its ingest results)
+    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}}
+                                           // per executor, per run: summed for the payload
+  }
+  ```
+
+- **`lease.json`** — `{"owner", "expires"}` (epoch seconds): the process running
+  the job. Renewed every minute, expires 10 minutes after the last renewal;
+  `dgml batch unlock` removes it. A runner never re-creates a lease it finds
+  gone or held by another owner: it stops (`BATCH_JOB_BUSY`).
+- **`responses/<key>.json`** — one received response. The key is
+  `<sha256 of the request>-<occurrence>`: the digest is taken over the litellm
+  request as canonical JSON, leaving out the API key, the timeout and any
+  credential header, and the occurrence number keeps two identical requests in
+  one run apart. The file holds the litellm response and only the hidden fields
+  accounting needs (`response_cost`, `dgml_tier`) — no provider headers and never
+  a credential.
+- **`inputs/slices/<source sha>/<engine>/<first>-<last>-<pages sha>.pdf`** — each
+  transcription window's PDF slice, recorded the first time it is cut and
+  reused by every resume, because slicing is not byte-reproducible; and
+  `inputs/generate/converted/<name>.pdf` for a document converted on demand.
+  Deleted with the responses when the job completes.
+- **`inputs/<name>`** — the content an input had when the job started, restored
+  by every resumed run (`docset generate`'s `schema.json` and
+  `concept_roster.json`). Inputs recorded only by presence (a document's
+  `_blocks.json`) have no file here; their flag is in `job.json` `inputs`.
 
 ## `docsets/<id>/files/<file_id>/<stem>.dgml.xml` (optional)
 
