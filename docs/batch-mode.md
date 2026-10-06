@@ -255,7 +255,7 @@ settling cancel every 10 s. Live measurements (2026-09-30):
 |---|---|
 | Anthropic (wait 450 s) | bimodal: ≤ 50 s, or 280–385 s; no work done while `canceling` |
 | OpenAI | ~306 s or ~606 s (one or two ~5-minute sweeps); up to ~25 min in a later scale run |
-| Gemini | 3–7 s |
+| Gemini (wait 60 s) | 3–7 s |
 
 **The wait is not an upper bound.** An OpenAI cancel took up to about 25
 minutes to settle in one run. The run does not wait that long. A cancel still

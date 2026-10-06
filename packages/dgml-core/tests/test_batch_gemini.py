@@ -946,6 +946,16 @@ def test_max_wait_is_the_48_hour_expiry() -> None:
     assert _backend().max_wait_s == 48 * 3600
 
 
+def test_an_executor_over_gemini_uses_its_expiry_and_settle_wait() -> None:
+    from dgml_core.batch.executor import POLL_MARGIN_S, BatchExecutor
+
+    ex = BatchExecutor(_backend())
+    # Polls up to the 48-hour expiry (plus margin); a --batch-deadline cancel
+    # waits Gemini's 60 s to settle, not the 180 s default or Anthropic's 450 s.
+    assert ex.max_poll_s == 48 * 3600 + POLL_MARGIN_S
+    assert ex.cancel_settle_s == 60.0
+
+
 def test_a_batch_failed_at_a_quota_limit_rejects_every_unserved_item() -> None:
     server = _Server()
     body = {
