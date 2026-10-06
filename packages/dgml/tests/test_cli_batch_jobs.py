@@ -41,6 +41,7 @@ from dgml_core.generation import document as document_mod
 from dgml_core.generation import label as label_mod
 from dgml_core.generation import links as links_mod
 from dgml_core.generation import transcribe as transcribe_mod
+from dgml_core.generation.pipeline import BATCH_LABEL_OFF
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.storage import Workspace
 from dgml_core.usage import read_events
@@ -294,13 +295,14 @@ def test_generate_no_wait_job_matches_a_blocking_batch_run(
     """The headline guarantee: a job paused after every wave and resumed with
     `dgml batch resume` ends exactly where one blocking --batch run ends —
     same DGML, same cache files, same usage rows — and each resume advances
-    exactly one wave. (Labeling under this open vocabulary runs synchronously
-    and is replayed on every resume.)"""
+    exactly one wave. (``--no-batch-label``: labeling runs synchronously and
+    is replayed on every resume; the default per-document batch labeling is
+    covered by the next test.)"""
     # Blocking reference run.
     ws_b, did_b = _seed_generate_ws(tmp_path / "blocking", capsys)
     provider.install("anthropic", _generation_answer, polls=0)
     with patch("litellm.completion", side_effect=lambda **kw: _generation_answer(kw)):
-        assert main(_generate_argv(ws_b, did_b)) == 0
+        assert main(_generate_argv(ws_b, did_b, "--no-batch-label")) == 0
     blocking_payload = _read_stdout(capsys)
     blocking = _generate_state(ws_b, did_b)
 
@@ -314,7 +316,7 @@ def test_generate_no_wait_job_matches_a_blocking_batch_run(
         return _generation_answer(kwargs)
 
     with patch("litellm.completion", side_effect=sync):
-        assert main(_generate_argv(ws_j, did_j, "--no-wait")) == 0
+        assert main(_generate_argv(ws_j, did_j, "--no-wait", "--no-batch-label")) == 0
         first = _read_stdout(capsys)
         assert first["batch_job"]["status"] == "pending"
         assert first["batch_job"]["command"] == "docset generate"
@@ -327,8 +329,8 @@ def test_generate_no_wait_job_matches_a_blocking_batch_run(
 
     # One wave per call: three transcription windows (bravo.pdf), roster
     # planning's draft and refine, then the link pass's propose and verify
-    # waves. Labeling runs synchronously — once, and replayed on every later
-    # resume.
+    # waves. Labeling runs synchronously (--no-batch-label) — once, and
+    # replayed on every later resume.
     assert len(pendings) == 3 + 2 + 2
     labeling_calls = [c for c in sync_calls if _system(c) == label_mod.SYSTEM_PROMPT]
     assert len(labeling_calls) == len(_PAGES)
@@ -349,6 +351,334 @@ def test_generate_no_wait_job_matches_a_blocking_batch_run(
 
 
 # ---- extraction extract ---------------------------------------------------------------
+
+
+def _label_rows_merged(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The labeling pass's usage with tier-split parts summed back together."""
+    out: dict[str, Any] = {}
+    for row in rows:
+        if row["operation"] != "label":
+            continue
+        for key in ("cost_usd", "prompt_tokens", "completion_tokens", "total_tokens"):
+            out[key] = out.get(key, 0) + (row[key] or 0)
+    return {k: pytest.approx(v) for k, v in out.items()}
+
+
+def test_generate_per_document_label_job_matches_a_blocking_batch_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,
+    pdf_stubs: None,
+) -> None:
+    """Batch labeling (the default) under an open vocabulary, as a --no-wait
+    job: labeling goes through the batch API one document per wave — each
+    resume advances one document — and the job ends with exactly the DGML and
+    cache files of a blocking --batch --no-batch-label run that labeled
+    synchronously (which are the synchronous run's)."""
+    ws_b, did_b = _seed_generate_ws(tmp_path / "blocking", capsys)
+    provider.install("anthropic", _generation_answer, polls=0)
+    with patch("litellm.completion", side_effect=lambda **kw: _generation_answer(kw)):
+        assert main(_generate_argv(ws_b, did_b, "--no-batch-label")) == 0
+    blocking_payload = _read_stdout(capsys)
+    blocking = _generate_state(ws_b, did_b)
+    assert blocking_payload["batch"]["stages"]["label"] == {
+        "skipped": BATCH_LABEL_OFF,
+        "mode": "sync",
+    }
+
+    ws_j, did_j = _seed_generate_ws(tmp_path / "job", capsys)
+    backend = provider.install("anthropic", _generation_answer, polls=1)
+    sync_calls: list[dict[str, Any]] = []
+
+    def sync(**kwargs: Any) -> Any:
+        sync_calls.append(kwargs)
+        return _generation_answer(kwargs)
+
+    with patch("litellm.completion", side_effect=sync):
+        argv = _generate_argv(ws_j, did_j, "--no-wait")
+        assert main(argv) == 0
+        first = _read_stdout(capsys)
+        assert first["batch_job"]["status"] == "pending"
+        pendings, final = _drive_job(capsys, ws_j, first)
+    job = _generate_state(ws_j, did_j)
+
+    # Three transcription waves, roster planning's draft and refine, ONE
+    # labeling wave per document (each is a single chunk with nothing to
+    # retry), then the link pass's two waves.
+    assert len(pendings) == 3 + 2 + len(_PAGES) + 2
+    assert len(backend.submitted) == 3 + 2 + len(_PAGES) + 2  # every wave submitted once
+    assert not [c for c in sync_calls if _system(c) == label_mod.SYSTEM_PROMPT]
+    assert not [c for c in sync_calls if _system(c) == label_mod.PLAN_SYSTEM_PROMPT]
+    # Stage order: plan (draft, refine), then labeling document by document.
+    kinds = {label_mod.PLAN_SYSTEM_PROMPT: "plan", label_mod.SYSTEM_PROMPT: "label"}
+    wave_kinds = [{kinds.get(_system(r.kwargs), "other") for r in w} for w in backend.submitted]
+    assert wave_kinds[3 : 5 + len(_PAGES)] == [{"plan"}] * 2 + [{"label"}] * len(_PAGES)
+    labeled = [
+        r
+        for wave in backend.submitted
+        for r in wave
+        if _system(r.kwargs) == label_mod.SYSTEM_PROMPT
+    ]
+    assert len(labeled) == len(_PAGES)
+
+    assert job["outputs"] == blocking["outputs"]
+    assert job["files"] == blocking["files"]
+    assert [r for r in job["rows"] if r["operation"] != "label"] == [
+        r for r in blocking["rows"] if r["operation"] != "label"
+    ]
+    assert _label_rows_merged(job["rows"]) == _label_rows_merged(blocking["rows"])
+    assert "batch" in {r["tier"] for r in job["rows"] if r["operation"] == "label"}
+    label = final["batch"]["stages"]["label"]
+    assert label["mode"] == "per-document" and label["documents"] == len(_PAGES)
+    assert label["requests"] == len(_PAGES) and label["replayed"] >= 1
+    assert _comparable_payload(final) == _comparable_payload(blocking_payload)
+
+
+def _coining_answer(kwargs: dict[str, Any]) -> Any:
+    """:func:`_generation_answer`, except labeling coins ``Salutation`` — a
+    concept planning never named — so the run describes it afterwards."""
+    if _system(kwargs) == label_mod.SYSTEM_PROMPT:
+        ids = sorted(set(_BLOCK_ID_RE.findall(_user(kwargs))))
+        return _reply(json.dumps({"labels": {i: {"concept": "Salutation"} for i in ids}}))
+    if _system(kwargs) == prompt("describe_concepts"):
+        return _reply(json.dumps({"descriptions": {"Salutation": "an opening greeting"}}))
+    return _generation_answer(kwargs)
+
+
+def test_a_per_document_label_job_replays_planning_labeling_and_descriptions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,
+    pdf_stubs: None,
+) -> None:
+    """Every Pass B stage batched in one --no-wait job — planning's two waves,
+    one labeling wave per document, the description wave — then the links.
+    Each resume replays every earlier stage from the job's store (each wave is
+    submitted exactly once), and the job ends with a synchronous run's DGML,
+    cache files (schema.json with the description included) and usage sums."""
+    ws_s, did_s = _seed_generate_ws(tmp_path / "sync", capsys)
+    with patch("litellm.completion", side_effect=lambda **kw: _coining_answer(kw)):
+        sync_argv = [a for a in _generate_argv(ws_s, did_s) if a != "--batch"]
+        assert main([*sync_argv, "--no-batch"]) == 0
+    _read_stdout(capsys)
+    reference = _generate_state(ws_s, did_s)
+
+    ws, did = _seed_generate_ws(tmp_path / "job", capsys)
+    backend = provider.install("anthropic", _coining_answer, polls=1)
+    with patch("litellm.completion", side_effect=AssertionError("no full-price fallback")):
+        argv = _generate_argv(ws, did, "--no-wait")
+        assert main(argv) == 0
+        pendings, final = _drive_job(capsys, ws, _read_stdout(capsys))
+    names = {
+        transcribe_mod.SYSTEM_PROMPT: "transcribe",
+        label_mod.PLAN_SYSTEM_PROMPT: "plan",
+        label_mod.SYSTEM_PROMPT: "label",
+        prompt("describe_concepts"): "describe",
+    }
+    waves = [
+        "+".join(sorted({names.get(_system(r.kwargs), "links") for r in w}))
+        for w in backend.submitted
+    ]
+    expected = ["transcribe"] * 3 + ["plan"] * 2 + ["label"] * len(_PAGES) + ["describe"]
+    assert waves == [*expected, "links", "links"]
+    assert len(pendings) == len(waves)  # one pause per wave, each submitted once
+
+    job = _generate_state(ws, did)
+    assert job["outputs"] == reference["outputs"]
+    assert job["files"] == reference["files"]
+    assert any(
+        b"an opening greeting" in v for k, v in job["files"].items() if k.endswith("schema.json")
+    )
+    assert _label_rows_merged(job["rows"]) == _label_rows_merged(reference["rows"])
+    assert {r["tier"] for r in job["rows"]} == {"batch"}
+    stages = final["batch"]["stages"]
+    assert {"transcribe", "plan", "label", "describe", "links"} <= set(stages)
+    assert stages["label"]["mode"] == "per-document"
+    assert all(v.get("sync_fallbacks", 0) == 0 for v in stages.values())
+
+
+@pytest.mark.parametrize("mode", ["blocking", "no-wait", "no-wait-last-stage"])
+def test_a_per_document_label_stage_failure_resumes_from_the_failed_document(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,
+    pdf_stubs: None,
+    mode: str,
+) -> None:
+    """A stage-wide failure while labeling per document leaves that document
+    and every later one unlabeled (a ``label_error``, no further attempt in
+    that run). Whatever the run does next, the job ends with exactly the DGML
+    and cache files of an uninterrupted synchronous run:
+
+    - ``blocking``: the run finishes, the payload names the failed job (a
+      blocking run's silent job is kept, store and all), and ``dgml batch
+      resume`` relabels from the failed document onward.
+    - ``no-wait`` (links on): the link pass's wave is still in flight when the
+      run pauses, so the job is still pending; its next resume relabels the
+      failed document and the job completes as usual.
+    - ``no-wait-last-stage`` (``--no-semlinks``): labeling was the last stage,
+      so the run ends the job failed; ``batch resume`` relabels from there.
+
+    Every resume replays what was already served — transcription, planning
+    and the documents labeled before the failure are never submitted again."""
+    no_links = ["--no-semlinks"] if mode == "no-wait-last-stage" else []
+    ws_s, did_s = _seed_generate_ws(tmp_path / "sync", capsys)
+    with patch("litellm.completion", side_effect=lambda **kw: _generation_answer(kw)):
+        sync_argv = [a for a in _generate_argv(ws_s, did_s, *no_links) if a != "--batch"]
+        assert main([*sync_argv, "--no-batch"]) == 0
+    _read_stdout(capsys)
+    reference = _generate_state(ws_s, did_s)
+
+    label_waves: list[int] = []
+
+    def outage(batch: list[Any]) -> Exception | None:
+        if not any(_system(r.kwargs) == label_mod.SYSTEM_PROMPT for r in batch):
+            return None
+        label_waves.append(len(batch))
+        # The SECOND document's labeling wave fails as a whole, once.
+        return RuntimeError("503 service unavailable") if len(label_waves) == 2 else None
+
+    ws, did = _seed_generate_ws(tmp_path / "job", capsys)
+    backend = FakeBackend(
+        lambda request: _generation_answer(request.kwargs),
+        provider="anthropic",
+        polls_until_ended=0 if mode == "blocking" else 1,
+        fail_submit=outage,
+    )
+    register_backend("anthropic", lambda _cfg: backend)
+    extra = [*no_links]
+    if mode != "blocking":
+        extra.append("--no-wait")
+
+    def kinds(waves: list[list[Any]]) -> list[str]:
+        names = {
+            transcribe_mod.SYSTEM_PROMPT: "transcribe",
+            label_mod.PLAN_SYSTEM_PROMPT: "plan",
+            label_mod.SYSTEM_PROMPT: "label",
+        }
+        return ["+".join(sorted({names.get(_system(r.kwargs), "links") for r in w})) for w in waves]
+
+    with patch("litellm.completion", side_effect=AssertionError("no full-price fallback")):
+        assert main(_generate_argv(ws, did, *extra)) == 0
+        out = _read_stdout(capsys)
+        # Drive the job until the run that hit the failure has ended (or paused).
+        job_id = out.get("batch_job", {}).get("job_id")
+        while "batch_job" in out and len(label_waves) < 2:
+            assert main(_ws_args(ws) + ["batch", "resume", job_id]) == 0
+            out = _read_stdout(capsys)
+        assert len(label_waves) == 2  # the failure happened
+        before = len(backend.submitted)
+        if mode == "no-wait":
+            assert out["batch_job"]["status"] == "pending"  # links still in flight
+        else:
+            # The run ended: the failed document carries the stage's error, the
+            # job is failed and resumable.
+            errors = [r for r in out["results"] if r.get("label_error")]
+            assert len(errors) == 1 == len(_PAGES) - 1
+            assert out["batch"]["stages"]["label"]["documents"] == 2
+            assert out["batch"]["job"]["status"] == "failed"
+            (job,) = list_jobs(Workspace(root=ws))
+            assert job.status == "failed" and "a batch stage failed" in (job.error or "")
+            job_id = job.job_id
+            assert _generate_state(ws, did)["outputs"] != reference["outputs"]
+        assert main(_ws_args(ws) + ["batch", "resume", job_id]) == 0
+        resumed = _read_stdout(capsys)
+        if "batch_job" in resumed:
+            _pendings, resumed = _drive_job(capsys, ws, resumed)
+
+    assert not [r for r in resumed["results"] if r.get("label_error")]
+    assert "job" not in resumed["batch"]  # completed: nothing left to resume
+    assert resumed["batch"]["stages"]["label"]["mode"] == "per-document"
+    # Only the failed document's labeling and what follows it went out again.
+    again = kinds(backend.submitted[before:])
+    assert again[0] == "label" and set(again) <= {"label", "links"}
+    assert len(label_waves) == 3
+
+    final = _generate_state(ws, did)
+    assert final["outputs"] == reference["outputs"]
+    assert final["files"] == reference["files"]
+
+
+_MODELS = {"model": "anthropic/claude-haiku-4-5", "label_model": "anthropic/claude-sonnet-4-6"}
+
+
+def test_batch_label_config_key_and_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,
+    pdf_stubs: None,
+) -> None:
+    """Batch labeling is on by default; `[generation] batch_label = false` and
+    `--no-batch-label` turn it off; `--batch-label` overrides a false config;
+    `--no-batch-label` is refused without batch mode."""
+    provider.install("anthropic", _generation_answer, polls=0)
+    modes = {}
+    cases: dict[str, tuple[bool | None, list[str]]] = {
+        "default": (None, []),
+        "config-off": (False, []),
+        "flag-off": (None, ["--no-batch-label"]),
+        "flag-on-over-config": (False, ["--batch-label"]),
+    }
+    for name, (config, extra) in cases.items():
+        ws, did = _seed_generate_ws(tmp_path / name, capsys)
+        section: dict[str, Any] = dict(_MODELS)
+        if config is not None:
+            section["batch_label"] = config
+        _write_ws_config(ws, {"generation": section})
+        with patch("litellm.completion", side_effect=lambda **kw: _generation_answer(kw)):
+            if name == "flag-off":
+                no_batch = [a for a in _generate_argv(ws, did) if a != "--batch"]
+                assert main([*no_batch, "--no-batch", "--no-batch-label"]) == 1
+                error = _read_stderr(capsys)["error"]
+                assert error["code"] == "BATCH_JOB_INVALID"
+                assert "--no-batch-label" in error["message"]
+            assert main(_generate_argv(ws, did, *extra)) == 0
+        modes[name] = _read_stdout(capsys)["batch"]["stages"]["label"]["mode"]
+    assert modes == {
+        "default": "per-document",
+        "config-off": "sync",
+        "flag-off": "sync",
+        "flag-on-over-config": "per-document",
+    }
+
+
+@pytest.mark.parametrize("config", [True, False])
+def test_a_job_pins_the_batch_label_choice_it_started_with(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,
+    pdf_stubs: None,
+    config: bool,
+) -> None:
+    """The batch-label choice that came from `[generation] batch_label` is
+    recorded on the job as `--batch-label` / `--no-batch-label`, as `--batch`
+    is, so editing the config between resumes cannot switch a job half-way."""
+    ws, did = _seed_generate_ws(tmp_path, capsys)
+    _write_ws_config(ws, {"generation": {**_MODELS, "batch_label": config}})
+    provider.install("anthropic", _generation_answer, polls=1)
+    with patch("litellm.completion", side_effect=lambda **kw: _generation_answer(kw)):
+        assert main(_generate_argv(ws, did, "--no-wait")) == 0
+        first = _read_stdout(capsys)
+        (manifest,) = list_jobs(Workspace(root=ws))
+        assert manifest.argv[-1] == ("--batch-label" if config else "--no-batch-label")
+        _write_ws_config(ws, {"generation": {**_MODELS, "batch_label": not config}})
+        _pendings, final = _drive_job(capsys, ws, first)
+    assert final["batch"]["stages"]["label"]["mode"] == ("per-document" if config else "sync")
+
+
+def test_batch_label_rejects_an_invalid_config_value(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,
+    pdf_stubs: None,
+) -> None:
+    provider.install("anthropic", _generation_answer, polls=0)
+    for bad in ("parallel", "sequential", 1):
+        ws, did = _seed_generate_ws(tmp_path / str(bad), capsys)
+        _write_ws_config(ws, {"generation": {**_MODELS, "batch_label": bad}})
+        assert main(_generate_argv(ws, did)) == 1
+        error = _read_stderr(capsys)["error"]
+        assert error["code"] == "GENERATION_CONFIG_INVALID" and "batch_label" in error["message"]
 
 
 def _extract_argv(ws: Path, ds_id: str, *extra: str) -> list[str]:

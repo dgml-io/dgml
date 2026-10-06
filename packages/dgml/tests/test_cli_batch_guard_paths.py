@@ -42,6 +42,7 @@ from dgml_core.storage import Workspace
 from .test_cli import _read_stdout
 from .test_cli_batch_extraction import _seed_classify_ws, _seed_extraction, _set_schema
 from .test_cli_batch_jobs import (
+    _PAGES,
     _extract_argv,
     _generate_argv,
     _generation_answer,
@@ -65,7 +66,7 @@ def _generate(
 ) -> tuple[Path, list[str], Any]:
     ws, did = _seed_generate_ws(tmp_path, capsys)
     fake.install("anthropic", _generation_answer, polls=1)
-    # Labeling is open-vocabulary: it stays synchronous (replayed on resume).
+    # Labeling is open-vocabulary: it batches one document per wave.
     return ws, _generate_argv(ws, did, "--no-wait"), lambda **kw: _generation_answer(kw)
 
 
@@ -143,9 +144,11 @@ _Setup = Callable[[Path, pytest.CaptureFixture[str], _Provider], tuple[Path, lis
         # Three transcription waves, then roster planning's draft
         # (dgml_core.generation.single_calls through pipeline's runner).
         (_generate, "docset generate", 3, _is_plan, "plan"),
-        # ... its refine wave (labeling is synchronous under this open
-        # vocabulary), then dgml_core.generation.link_stage's.
-        (_generate, "docset generate", 5, _is_link, "links"),
+        # ... its refine wave, then one labeling wave per document
+        # (pipeline._per_document_labeler) ...
+        (_generate, "docset generate", 5, _is_label, "label"),
+        # ... then dgml_core.generation.link_stage's.
+        (_generate, "docset generate", 5 + len(_PAGES), _is_link, "links"),
         (_file_add, "file add", 0, _always, "classification"),  # dgml_core.auto_classification
         (
             _file_add,
@@ -166,6 +169,7 @@ _Setup = Callable[[Path, pytest.CaptureFixture[str], _Provider], tuple[Path, lis
     ids=[
         "generate-transcribe",
         "generate-plan",
+        "generate-label",
         "generate-links",
         "add-classify",
         "add-extract",

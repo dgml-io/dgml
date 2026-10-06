@@ -42,12 +42,21 @@ a wave to an end (:class:`~dgml_core.errors.BatchExecutionFailed`, or any other
 ``Exception`` escaping ``run_wave``), the units that had already finished keep
 their results; every unit still running gets that error as its outcome,
 flagged ``stage_error``, and :func:`run_stage` returns normally. Only an
-interrupt (a non-``Exception`` ``BaseException``) closes every unit and
-propagates.
+interrupt (a non-``Exception`` ``BaseException``, which includes
+:class:`~dgml_core.errors.BatchPending`) closes every unit and propagates.
 
-Request ids are ``u<index>_<stem>-<n>``: the unit's position, a legible stem
-of its name, and *n* counting the unit's requests. Every unit is admitted up
-front, so a wave holds one request per live unit.
+**Fan-out inside a unit.** A unit's generator may yield an
+:class:`dgml_core.llm.FanOut` of child generators (see its contract). The
+children's requests are extra in-flight requests of the same unit, joining the
+same waves as every other unit's; the parent resumes, with the children's
+results in child order, once every child has returned. Each child is a
+*strand* with its own pending request and its own usage fold; a finished
+child's subtotals are folded into its parent's, after the parent's own
+preceding ones and in child order, so the unit's sums associate exactly as
+the sync driver's one-child-after-another run does. Request ids stay
+``u<index>_<stem>-<n>``, *n* counting the unit's requests in the
+deterministic order its strands become ready. Every unit is admitted up
+front.
 """
 
 from __future__ import annotations
@@ -84,7 +93,7 @@ class Unit:
 
     name: str
     config: llm.LLMConfig
-    steps: llm.LLMSteps[Any]
+    steps: llm.LLMFlow[Any]
 
 
 @dataclass
@@ -110,6 +119,31 @@ class UnitOutcome:
 
 
 @dataclass
+class _Strand:
+    """One generator being driven inside a unit: the unit's own (the root) or a
+    :class:`~dgml_core.llm.FanOut` child.
+
+    A strand is, at any moment, waiting on one request (``pending_step``),
+    suspended at a ``FanOut`` (``children``), or ``done``. Its usage fold sums
+    its own responses per wrapper call and hands each finished subtotal on —
+    to the unit's accounting for the root, to the strand's own ``subs`` for a
+    child (folded into the parent's at the join, :func:`_join_usage`).
+    """
+
+    gen: llm.LLMFlow[Any]
+    parent: _Strand | None
+    index: int = 0
+    fold: llm._UsageFold | None = None
+    subs: list[dict[str, Any]] = field(default_factory=list)
+    pending_id: str = ""
+    pending_step: Any = None
+    children: list[_Strand] | None = None
+    done: bool = False
+    result: Any = None
+    error: Exception | None = None
+
+
+@dataclass
 class _Live:
     """Per-unit driver state while its generator is running."""
 
@@ -125,11 +159,16 @@ class _Live:
     deferred: list[dict[str, Any]] = field(default_factory=list)
     n: int = 0
     closed: bool = False
-    pending_id: str = ""
-    pending_step: Any = None
+    root: _Strand | None = None
+    #: Strands whose request is in the current wave, in wave order.
+    in_flight: list[_Strand] = field(default_factory=list)
+    #: Strands whose next request is ready, in the order they became ready
+    #: (that order assigns their ids and their place in the wave).
+    ready: list[_Strand] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.fold = llm._UsageFold(self._fold_sub)
+        self.root = _Strand(gen=self.unit.steps, parent=None, fold=self.fold)
 
     def next_id(self) -> str:
         self.n += 1
@@ -161,6 +200,41 @@ class _Live:
         self.deferred = []
 
 
+def _child_strand(parent: _Strand, index: int, gen: llm.LLMFlow[Any]) -> _Strand:
+    strand = _Strand(gen=gen, parent=parent, index=index)
+    strand.fold = llm._UsageFold(strand.subs.append)
+    return strand
+
+
+def _join_usage(parent: _Strand) -> None:
+    """Fold every child's subtotals into *parent*, in child order, after the
+    parent's own pending one — the sync driver's sequence."""
+    assert parent.fold is not None and parent.children is not None
+    parent.fold.flush()
+    for child in parent.children:
+        assert child.fold is not None
+        child.fold.flush()
+        for sub in child.subs:
+            parent.fold.emit(sub)
+        child.subs = []
+
+
+def _close_strand(strand: _Strand) -> None:
+    """Close *strand* and everything below it, children first, folding what
+    each had spent into its parent (in child order) on the way up."""
+    if strand.children is not None:
+        for child in strand.children:
+            _close_strand(child)
+        _join_usage(strand)
+        strand.children = None
+    try:
+        strand.gen.close()
+    finally:
+        strand.done = True
+        assert strand.fold is not None
+        strand.fold.flush()
+
+
 def _id_prefix(index: int, name: str) -> str:
     """``u<index>_<readable stem>``: the index guarantees uniqueness, the stem
     (ASCII alphanumerics of the unit name, ``_``-joined) keeps ids legible."""
@@ -179,11 +253,11 @@ def _finish(state: _Live, exc: BaseException | None, *, own: bool = False) -> No
     if state.closed:
         return
     state.closed = True
+    state.ready = []
     try:
-        state.unit.steps.close()
+        assert state.root is not None
+        _close_strand(state.root)
     finally:
-        assert state.fold is not None
-        state.fold.flush()
         state.outcome.error = exc
         if own and exc is not None and state.scope is None:
             # Failed before its first request: sync ``drive`` would already
@@ -204,38 +278,29 @@ def _served_by_batch(response: Any) -> bool:
     return isinstance(hidden, dict) and hidden.get(TIER_MARKER) == TIER_BATCH
 
 
-def _advance(state: _Live, response: Any, *, fresh: bool, log: Callable[[str], None]) -> None:
-    """Move one unit on: prime it (*fresh*), throw an ``Exception`` *response*
-    in at the pending yield, or send the response. Leaves the next request on
-    ``state.pending_step``, or finishes the unit."""
-    gen = state.unit.steps
-    try:
-        if fresh:
-            step = next(gen)
-        elif isinstance(response, Exception):
-            step = gen.throw(response)
-        else:
-            step = gen.send(response)
-    except StopIteration as done:
-        state.outcome.result = done.value
-        _finish(state, None)
-        return
-    except Exception as exc:  # one unit's failure never sinks the stage
-        where = "before its first request" if state.n == 0 else f"after step {state.n}"
-        log(f"[batch] {state.unit.name}: failed {where}: {type(exc).__name__}: {exc}")
-        _finish(state, exc, own=True)
-        return
-    state.open_scope()
-    state.pending_step = step
-    state.pending_id = state.next_id()
-
-
 def run_stage(
     units: Sequence[Unit],
     executor: BatchExecutor,
     *,
     log: Callable[[str], None] = lambda _m: None,
     stage: str | None = None,
+) -> dict[str, UnitOutcome]:
+    """Drive every unit to completion through *executor*, wave by wave.
+
+    *stage* names the pipeline stage these waves serve ("transcribe",
+    "extraction phase 3", ...). It only labels the executor's log lines, as
+    ``[batch <stage> wave <n>]``, so a run's diagnostics say which stage each
+    submitted batch belongs to. See :func:`_run_stage` for the semantics.
+    """
+    with executor.in_stage(stage):
+        return _run_stage(units, executor, log=log)
+
+
+def _run_stage(
+    units: Sequence[Unit],
+    executor: BatchExecutor,
+    *,
+    log: Callable[[str], None] = lambda _m: None,
 ) -> dict[str, UnitOutcome]:
     """Drive every unit to completion through *executor*, wave by wave.
 
@@ -255,27 +320,16 @@ def run_stage(
     restores it afterwards. The tier is read per response from the executor's
     marker, so a unit served wholly by synchronous fallbacks records
     ``"standard"``, and one served by both tiers records one row per tier
-    (:func:`dgml_core.usage.scope_events`). A unit that returns without making
-    a request writes no row. Inside an enclosing
-    :func:`dgml_core.llm.record_usage_for` scope the rows fold into that scope
-    as usual, and the scope's own row is marked batch-tier too.
-
-    *stage* names the pipeline stage these waves serve ("transcribe",
-    "extraction phase 3", ...). It only labels the executor's log lines, as
-    ``[batch <stage> wave <n>]``.
+    (:func:`dgml_core.usage.scope_events`). A unit that returns without making a request
+    writes no row. Inside an enclosing :func:`dgml_core.llm.record_usage_for`
+    scope the rows fold into that scope as usual, and the scope's own row is
+    marked batch-tier too.
     """
     names = [unit.name for unit in units]
     if len(set(names)) != len(names):
         dupes = sorted({n for n in names if names.count(n) > 1})
         raise ValueError(f"unit names must be unique within a stage; duplicated: {dupes}")
 
-    with executor.in_stage(stage):
-        return _run_stage(units, executor, log)
-
-
-def _run_stage(
-    units: Sequence[Unit], executor: BatchExecutor, log: Callable[[str], None]
-) -> dict[str, UnitOutcome]:
     outcomes: dict[str, UnitOutcome] = {}
     live: list[_Live] = []
     for index, unit in enumerate(units):
@@ -295,35 +349,138 @@ def _run_stage(
             if cfg._usage_sink is not None:
                 cfg._usage_sink[SINK_TIER_KEY] = TIER_BATCH
 
-    try:
-        for state in live:
-            _advance(state, None, fresh=True, log=log)
-        active = [state for state in live if not state.closed]
-        while active:
-            wave = {state.pending_id: state.pending_step for state in active}
-            responses = executor.run_wave(wave)
-            for state in active:
-                response = responses[state.pending_id]
-                state.outcome.steps += 1
-                if isinstance(response, Exception):
-                    # The synchronous fallback itself failed: no usage to
-                    # fold in; the generator decides what happens.
-                    state.outcome.sync_steps += 1
-                    state.outcome.failed_steps += 1
+    def resume(state: _Live, strand: _Strand, response: Any | None, *, fresh: bool = False) -> None:
+        """Move one strand on: to its next request (queued on ``state.ready``),
+        into a ``FanOut`` (its children primed in child order), or to its end
+        — which, for the last child of a ``FanOut`` to finish, resumes the
+        parent with the joined results, and for the root finishes the unit.
+
+        *fresh* primes the generator; otherwise *response* is an
+        ``Exception`` to throw in at the pending yield, or the value to send
+        (a response, or a joined ``FanOut``'s result list)."""
+        while True:
+            gen = strand.gen
+            try:
+                if fresh:
+                    step = next(gen)
+                elif isinstance(response, Exception):
+                    step = gen.throw(response)
                 else:
-                    assert state.fold is not None
-                    state.fold.add(
-                        state.pending_step,
-                        with_tier(
-                            extract_cost_and_tokens(response), response, state.unit.config.tier
-                        ),
-                    )
-                    if _served_by_batch(response):
-                        state.outcome.batch_steps += 1
-                    else:
+                    step = gen.send(response)
+            except StopIteration as done:
+                strand.result = done.value
+                error: Exception | None = None
+            except Exception as exc:  # one unit's failure never sinks the stage
+                where = "before its first request" if state.n == 0 else f"after step {state.n}"
+                who = (
+                    state.unit.name
+                    if strand.parent is None
+                    else (f"{state.unit.name} (fan-out child {strand.index})")
+                )
+                log(f"[batch] {who}: failed {where}: {type(exc).__name__}: {exc}")
+                error = exc
+            else:
+                fresh = False
+                if isinstance(step, llm.FanOut):
+                    assert strand.fold is not None
+                    strand.fold.flush()
+                    strand.children = [
+                        _child_strand(strand, i, child) for i, child in enumerate(step.children)
+                    ]
+                    if not strand.children:
+                        strand.children = None
+                        response = []  # an empty FanOut joins at once
+                        continue
+                    for child in list(strand.children):
+                        resume(state, child, None, fresh=True)
+                        if state.closed:
+                            return
+                    return
+                state.open_scope()
+                strand.pending_step = step
+                state.ready.append(strand)
+                return
+            # The strand ended (returned, or raised ``error``).
+            strand.done = True
+            strand.error = error
+            parent = strand.parent
+            if parent is None:
+                if error is None:
+                    state.outcome.result = strand.result
+                    _finish(state, None)
+                else:
+                    _finish(state, error, own=True)
+                return
+            try:
+                strand.gen.close()
+            finally:
+                assert strand.fold is not None
+                strand.fold.flush()
+            assert parent.children is not None
+            if not all(child.done for child in parent.children):
+                return
+            # The join: every child has returned. Fold their usage in child
+            # order, then resume the parent with the results (or the first
+            # child failure, in child order).
+            _join_usage(parent)
+            children, parent.children = parent.children, None
+            failure = next((c.error for c in children if c.error is not None), None)
+            strand, fresh = parent, False
+            response = failure if failure is not None else [c.result for c in children]
+
+    def queue(wave: dict[str, dict[str, Any]], state: _Live) -> None:
+        """Give each of *state*'s ready strands its id and its place in *wave*."""
+        ready, state.ready = state.ready, []
+        for strand in ready:
+            strand.pending_id = state.next_id()
+            wave[strand.pending_id] = strand.pending_step
+            state.in_flight.append(strand)
+
+    try:
+        wave: dict[str, dict[str, Any]] = {}
+        active: list[_Live] = []
+        for state in live:  # primed in units order; each joins the first wave
+            assert state.root is not None
+            resume(state, state.root, None, fresh=True)
+            if not state.closed:
+                queue(wave, state)
+                active.append(state)
+
+        while active:
+            responses = executor.run_wave(wave)
+            wave = {}
+            still_active: list[_Live] = []
+            for state in active:
+                in_flight, state.in_flight = state.in_flight, []
+                for strand in in_flight:
+                    if state.closed:
+                        break
+                    response = responses[strand.pending_id]
+                    state.outcome.steps += 1
+                    if isinstance(response, Exception):
+                        # The synchronous fallback itself failed: no usage to
+                        # fold in; the generator decides what happens.
                         state.outcome.sync_steps += 1
-                _advance(state, response, fresh=False, log=log)
-            active = [state for state in active if not state.closed]
+                        state.outcome.failed_steps += 1
+                    else:
+                        assert strand.fold is not None
+                        strand.fold.add(
+                            strand.pending_step,
+                            with_tier(
+                                extract_cost_and_tokens(response),
+                                response,
+                                state.unit.config.tier,
+                            ),
+                        )
+                        if _served_by_batch(response):
+                            state.outcome.batch_steps += 1
+                        else:
+                            state.outcome.sync_steps += 1
+                    resume(state, strand, response)
+                if not state.closed:
+                    queue(wave, state)
+                    still_active.append(state)
+            active = still_active
     except Exception as exc:
         # The stage failed, not any one unit: finished units keep their
         # results; the rest get the error (and write their partial rows).

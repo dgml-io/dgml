@@ -2572,7 +2572,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 ) -> None:
     """A chunk whose JSON reply is unparseable is bisected until each block is
     labeled, instead of dropping the whole chunk."""
-    from dgml_core.generation.label import _label_chunk_steps
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause number {i}") for i in range(4)]
     calls = {"n": 0}
@@ -2586,13 +2586,13 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
         return json.dumps({"labels": {ids[0]: {"concept": "Revenue"}}})
 
     monkeypatch.setattr(llm, "call", fake_call)
-    warnings: list[str] = []
+    effects = _ChunkEffects()
+    warnings = effects.warnings
     config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
     err = llm.drive(
         _label_chunk_steps(
             "doc.pdf",
             chunk,
-            {},
             [],
             config=config,
             cache_dir=None,
@@ -2600,9 +2600,8 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
             log=lambda *_: None,
             stem="doc",
             label_tag="c01",
-            warnings=warnings,
+            effects=effects,
             vocab=OPEN_VOCAB,
-            off_schema=[],
         ),
         config,
     )
@@ -2615,7 +2614,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A call-level error must not split (it fails at any size) — retry once and
     warn, bounding calls to 2."""
-    from dgml_core.generation.label import _label_chunk_steps
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause {i}") for i in range(8)]
     calls = {"n": 0}
@@ -2625,13 +2624,13 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(llm, "call", boom)
-    warnings: list[str] = []
+    effects = _ChunkEffects()
+    warnings = effects.warnings
     config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
     err = llm.drive(
         _label_chunk_steps(
             "doc.pdf",
             chunk,
-            {},
             [],
             config=config,
             cache_dir=None,
@@ -2639,9 +2638,8 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
             log=lambda *_: None,
             stem="doc",
             label_tag="c01",
-            warnings=warnings,
+            effects=effects,
             vocab=OPEN_VOCAB,
-            off_schema=[],
         ),
         config,
     )
