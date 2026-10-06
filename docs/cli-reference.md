@@ -972,7 +972,8 @@ changes is the price and the wall-clock time.
 - **Semantic links**: every document's propose request in one wave, then the
   verify requests. The link cache works as usual, and documents that would
   share a cache entry share one request.
-- Batch backends exist for `anthropic/` models (Message Batches). The
+- Batch backends exist for `anthropic/` models (Message Batches) and
+  `gemini/` models (Gemini Developer API Batch API). The
   transcription, labeling, link and (when enabled) style models are checked
   before any model call; one with no batch backend fails the command with
   `BATCH_UNAVAILABLE`, naming the stage and model. The labeling model is
@@ -1472,8 +1473,8 @@ retry, the permissive-schema fallback) rides extra waves. A request the batch
 cannot serve is retried or run synchronously for that request only. Values,
 the XML written and `extraction_stats` are the same as a synchronous run; the
 `usage.jsonl` rows (under `--debug`) carry `"tier": "batch"`. A values model
-whose provider has no batch backend (only Anthropic has one) is refused with
-`BATCH_UNAVAILABLE` before any request. Without `--batch` there is no `batch`
+whose provider has no batch backend (only Anthropic and Gemini have one) is
+refused with `BATCH_UNAVAILABLE` before any request. Without `--batch` there is no `batch`
 block.
 
 ```json
@@ -1813,7 +1814,9 @@ go out depends on the mode:
 otherwise: classification is what a directory add batches). It is also refused
 for a single-file add, and with `BATCH_UNAVAILABLE` when the classification
 model (or the values model, when a DocSet already has an extraction schema) has
-no batch backend — in every case before any file is added. Ingest itself
+no batch backend — in every case before any file is added. Anthropic and
+Gemini models have one, so an `anthropic_google` workspace (Gemini light tier)
+classifies in batch too. Ingest itself
 (including `--text-mode hybrid`'s optional LLM merge, see below) stays
 synchronous. Each entry's `classification` block is the one a synchronous run
 writes; the payload gains a top-level `batch` block:

@@ -14,9 +14,10 @@
 
 The backends build and decode batch requests with litellm INTERNALS — the
 ``HTTPHandler.post`` capture seam and each provider's response transformer
-(e.g. ``AnthropicConfig.transform_parsed_response``) — so that a batch request
-is byte-for-byte the request the synchronous path sends. None of that is
-public API.
+(``AnthropicConfig.transform_parsed_response``, and for Gemini
+``GoogleAIStudioGeminiConfig._transform_google_generate_content_to_openai_model_response``)
+— so that a batch request is byte-for-byte the request the synchronous path
+sends. None of that is public API.
 
 That constraint belongs to batch mode alone, so it is enforced here, at
 runtime, rather than as a pin on ``dgml-core``'s litellm requirement (which

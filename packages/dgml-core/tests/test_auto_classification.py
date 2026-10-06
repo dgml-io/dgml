@@ -122,6 +122,26 @@ def test_prepare_rejects_a_model_with_no_batch_backend(tmp_path: Path) -> None:
         )
 
 
+def test_prepare_accepts_the_anthropic_google_light_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anthropic_google family classifies with a Gemini model, which now
+    has a batch backend: ``file add --batch`` is no longer refused for it."""
+    from dgml_core.batch.gemini import GeminiBatchBackend
+    from dgml_core.default_config import PROVIDER_MODELS
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    ws = _ws(tmp_path / "ws")
+    _seed_many(ws, 1)
+    state = prepare_bulk_classify(
+        ws,
+        config=ClassificationConfig(model=PROVIDER_MODELS["anthropic_google"]["light"]),
+        docsets=DocSetStore(ws).list_all(),
+    )
+    assert state.classifier is not None
+    assert isinstance(state.classifier.backend, GeminiBatchBackend)
+
+
 def test_soft_errors_keep_the_sync_format() -> None:
     assert soft_error(ClassificationFailed("no answer")) == "CLASSIFICATION_FAILED: no answer"
     assert soft_error(RuntimeError("boom")) == "RuntimeError: boom"

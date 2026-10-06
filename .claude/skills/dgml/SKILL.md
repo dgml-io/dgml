@@ -562,8 +562,8 @@ run with `--no-wait` (below). The output is the same as a synchronous run.
 Add `--no-batch-label` (or `batch_label = false` under `[generation]`) to
 label with ordinary synchronous calls when latency matters more than the
 labeling half of the bill; the payload's `batch.stages.label.mode` says which
-ran (`all-at-once`, `per-document` or `sync`). Only `anthropic/` models have a batch backend; any other
-model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
+ran (`all-at-once`, `per-document` or `sync`). Only `anthropic/` and `gemini/` models have a batch
+backend; any other model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
 anything. The payload's `batch.stages` block reports what each stage did,
 including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report
 the saving without `--debug`.
@@ -755,9 +755,9 @@ uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count
 #    `.summary.failed` and each entry's `status`/`error`.
 #    Add --batch when nobody is waiting on the answer (a backfill, a nightly
 #    re-extract): both LLM phases go through the provider's batch API at about
-#    half price, but results take minutes to hours (up to 24h). Only Anthropic
-#    models can batch; anything else fails fast with BATCH_UNAVAILABLE and
-#    nothing is sent. One file id with --batch keeps the single-file payload
+#    half price, but results take minutes to hours (up to 24h; 48h on Gemini).
+#    Only Anthropic and Gemini models can batch; anything else fails fast
+#    with BATCH_UNAVAILABLE and nothing is sent. One file id with --batch keeps the single-file payload
 #    above (plus a `batch` block), not `summary`/`results`. Every `batch` block
 #    reports `cost_usd`, `standard_cost_usd` and `saved_usd`.
 uv run dgml extraction extract "$ds" --all --batch \

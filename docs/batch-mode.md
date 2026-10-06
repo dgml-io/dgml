@@ -3,7 +3,8 @@
 `--batch` sends DGML's model calls through a provider's **batch API** instead of
 one call at a time. Batch APIs bill every token at **half the standard price**,
 including prompt-cache reads and writes, in exchange for asynchronous delivery:
-results usually arrive within an hour and are guaranteed within 24 hours.
+results usually arrive within an hour and are guaranteed within 24 hours (48
+on Gemini).
 
 Batch mode is an **offline mode**. It trades wall-clock time for cost, so it
 suits bulk ingestion, backfills and evaluation runs, not a person waiting at a
@@ -20,10 +21,24 @@ fields, see the [CLI reference](cli-reference.md).
 | Provider | Batch backend | Model prefix |
 |---|---|---|
 | Anthropic (first-party API) | Message Batches | `anthropic/…` |
+| Google Gemini (Developer API) | Batch API (`batchGenerateContent`) | `gemini/…` |
+
+**Gemini.** The key comes from the stage's credentials, else `GEMINI_API_KEY`
+or `GOOGLE_API_KEY`. A batch travels inline when its body is at most 20 MB,
+otherwise as a JSONL file uploaded through the File API. The uploaded file and
+the finished batch are deleted once their results are read. A Gemini batch may
+wait up to 48 hours before it expires, so its polling deadline is 49 hours.
+Cost is litellm's standard price for the reply times 0.5, cached and thinking
+tokens included.
+
+On an `anthropic_google` workspace (`[models] family`) the light tier is
+Gemini. `file add --batch` classification and the OCR style pass now batch
+there too; the first batch release (RFC #222) rejected them with
+`BATCH_UNAVAILABLE`.
 
 Any other route has no batch backend and is **rejected before any work starts**
 with `BATCH_UNAVAILABLE`, naming the stage and model. That includes Amazon
-Bedrock, Vertex AI, Azure AI and aggregators such as OpenRouter, even when they
+Bedrock, Vertex AI (`vertex_ai/…`, including Gemini models served there), Azure AI and aggregators such as OpenRouter, even when they
 host a Claude model. The provider is decided by how litellm resolves the model
 string, so `openrouter/anthropic/claude-…` is an OpenRouter model, not an
 Anthropic one.
@@ -185,7 +200,7 @@ two for links (none when every link plan is already cached). The docset's size
 changes how large the batches are, not how many there are.
 
 Each round trip waits in the provider's queue, usually minutes, sometimes
-hours, at most 24 hours. A 100-page document with 10-page windows needs at
+hours, at most 24 hours (48 on Gemini). A 100-page document with 10-page windows needs at
 least ten transcription round trips. That is why batch mode is for work nobody
 is waiting on. Leave it off for interactive runs and for a handful of
 documents, where the savings are cents.
@@ -296,8 +311,8 @@ tier, marked `context.tier_split: true`.
   quota: nothing is resubmitted or run at full price. The wave's other open
   batches are cancelled and the stage fails with `BATCH_EXECUTION_FAILED`.
 - **A stage fails as a whole** (every batch refused, polling failed, or a
-  batch still unfinished at the polling deadline, the provider's 24 hours plus
-  an hour). Open batches are cancelled. Documents that had already finished
+  batch still unfinished at the polling deadline, the provider's expiry (24
+  hours, 48 on Gemini) plus an hour). Open batches are cancelled. Documents that had already finished
   keep their results; one still transcribing is dropped, one still labeling is
   written with a `label_error` (under per-document labeling, so is every later
   document; the resume relabels from the failed one onward), and a failed link stage gives each document a

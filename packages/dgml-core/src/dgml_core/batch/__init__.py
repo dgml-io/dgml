@@ -22,7 +22,8 @@ response each, with resubmission and synchronous fallback) and
 wave).
 
 Registered backends: ``anthropic`` (Message Batches,
-:mod:`dgml_core.batch.anthropic`). Nothing in the package is reachable from
+:mod:`dgml_core.batch.anthropic`) and ``gemini`` (Gemini Developer API,
+:mod:`dgml_core.batch.gemini`). Nothing in the package is reachable from
 the CLI or imported by the rest of ``dgml_core``: importing ``dgml_core``
 never imports this package.
 
@@ -43,6 +44,7 @@ from __future__ import annotations
 
 # Built-in backends register themselves on import. Each needs nothing beyond
 # what dgml-core already depends on, so none carries an install hint.
+from dgml_core.batch import gemini as _gemini
 from dgml_core.batch.anthropic import AnthropicBatchBackend, AnthropicBatchError
 from dgml_core.batch.backend import BatchBackend
 from dgml_core.batch.chunking import DEFAULT_OVERHEAD_BYTES, plan_batches, request_size
@@ -93,6 +95,8 @@ from dgml_core.batch.types import (
     BatchThrottled,
     ItemErrorKind,
 )
+
+_gemini.register()
 
 __all__ = [
     "DEFAULT_OVERHEAD_BYTES",

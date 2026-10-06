@@ -441,6 +441,32 @@ def test_a_stage_without_a_batch_backend_is_rejected_up_front(
     assert not list((ws / layout.DOCSETS_DIR / did).rglob("*.dgml.xml"))
 
 
+def test_the_anthropic_google_style_tier_passes_the_pre_flight(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anthropic_google family styles with its Gemini light tier, which
+    now has a batch backend: the pre-flight accepts every stage."""
+    from dgml.cli import _batch_preflight
+    from dgml_core.default_config import PROVIDER_MODELS
+
+    light = PROVIDER_MODELS["anthropic_google"]["light"]
+    config = {**_STYLE_CONFIG, "style": {"enabled": True, "model": light}}
+    ws, did = _seed(tmp_path, capsys, config)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")  # never used: no call is made
+    checked: list[dict[str, Any]] = []
+
+    def preflight(stages: dict[str, Any]) -> None:
+        _batch_preflight(stages)
+        checked.append(dict(stages))
+        raise RuntimeError("stop after the pre-flight")
+
+    monkeypatch.setattr("dgml.cli._batch_preflight", preflight)
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        assert main(_argv(ws, did, *_BATCH)) == 1
+    assert _read_stderr(capsys)["error"]["message"].endswith("stop after the pre-flight")
+    assert [stages["style"] for stages in checked] == [light]
+
+
 def test_batch_poll_interval_must_be_positive(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
