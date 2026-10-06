@@ -56,8 +56,8 @@ class BatchBackend(Protocol):
     it a batch that has not ended is expired by the provider.
     ``cancel_settle_s`` is how long a canceled batch may take to reach a
     terminal state (providers settle cancels on sweep cycles of minutes); a
-    run that cancels on purpose (a run-level deadline) waits that long before
-    giving up on collecting it. ``cleanup``
+    ``--batch-deadline`` run waits that long before giving up on collecting
+    it. ``cleanup``
     best-effort deletes the provider-side artifacts (uploaded input, result
     files, the batch record where the API allows) of an ended batch whose
     results have been fully collected; it never raises for a failed delete.

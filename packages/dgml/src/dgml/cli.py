@@ -845,6 +845,20 @@ def _add_batch_arguments(
             "collected rather than resubmitted. Requires batch mode."
         ),
     )
+    parser.add_argument(
+        "--batch-deadline",
+        default=None,
+        metavar="DURATION",
+        help=(
+            "Stop waiting on the provider's batches this long after the run (or job) "
+            "starts: 90m, 6h, 1d, or plain seconds. Once it passes, open batches are "
+            "canceled, results the provider already produced are kept (batch price), "
+            "and every remaining request of the run runs synchronously at standard "
+            "price. A job stores it as an absolute UTC time on its first run; every "
+            "resume honors it. Default: none (wait up to the provider's own limit). "
+            "Requires batch mode."
+        ),
+    )
 
 
 def _batch_preflight(stages: Mapping[str, Any]) -> None:
@@ -2397,18 +2411,25 @@ def _end_job_capture() -> _Capture | None:
 
 
 def _flush_job_capture(
-    capture: _Capture | None, fmt: str, *, job: dict[str, Any] | None, payloads: bool = True
+    capture: _Capture | None,
+    fmt: str,
+    *,
+    job: dict[str, Any] | None,
+    payloads: bool = True,
+    deadline: dict[str, Any] | None = None,
 ) -> None:
     """Emit the output a job run held back. *job* (a job the run left behind)
     goes into the last payload's ``batch.job`` — or, when the run emitted no
-    payload, into its last error envelope's ``details.batch.job``."""
+    payload, into its last error envelope's ``details.batch.job``. *deadline*
+    (the job's batch deadline, when it has one) goes into the last payload's
+    ``batch.deadline``."""
     if capture is None:
         return
+    if deadline is not None and payloads and capture.payloads:
+        _attach_batch_field(capture.payloads[-1], "deadline", deadline)
     if job is not None:
         if payloads and capture.payloads:
-            block = capture.payloads[-1].setdefault("batch", {})
-            if isinstance(block, dict):
-                block["job"] = job
+            _attach_batch_field(capture.payloads[-1], "job", job)
         elif capture.errors:
             error = capture.errors[-1].get("error")
             if isinstance(error, dict):
@@ -2418,6 +2439,24 @@ def _flush_job_capture(
             _emit(payload, fmt)
     for envelope in capture.errors:
         _emit(envelope, fmt, stream=sys.stderr)
+
+
+def _attach_batch_field(payload: dict[str, Any], name: str, value: dict[str, Any]) -> None:
+    """Set *payload*'s ``batch.<name>`` (the block created if absent)."""
+    block = payload.setdefault("batch", {})
+    if isinstance(block, dict):
+        block[name] = value
+
+
+def _deadline_block(session: Any) -> dict[str, Any] | None:
+    """The just-closed *session*'s ``batch.deadline`` block, if it had one."""
+    if session is None:
+        return None
+    try:
+        block = session.deadline_json()
+    except Exception:
+        return None
+    return block if isinstance(block, dict) else None
 
 
 def _left_behind(session: Any) -> dict[str, Any] | None:
@@ -2489,13 +2528,14 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             return _emit_lease_lost(fenced, session, fmt)
         # A paused run's one result is the job to resume.
         _flush_job_capture(_end_job_capture(), fmt, job=None, payloads=False)
-        from dgml_core.batch.jobs import pending_job_payload
+        from dgml_core.batch.jobs import deadline_summary, pending_job_payload
 
         block = pending_job_payload(
             pending.job_id,
             command=command,
             submitted_batches=pending.submitted_batches,
             requests_in_flight=pending.requests_in_flight,
+            deadline=deadline_summary(session.manifest) if session is not None else None,
         )
         _emit({"batch_job": block}, fmt)
         return 0
@@ -2520,7 +2560,7 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             _end_job_capture()
             return _emit_lease_lost(fenced, session, fmt)
         job = _left_behind(session)
-        _flush_job_capture(_end_job_capture(), fmt, job=None)
+        _flush_job_capture(_end_job_capture(), fmt, job=None, deadline=_deadline_block(session))
         if job is not None and isinstance(exc, DgmlError):
             return _emit_error(exc.code, str(exc), fmt, details={"batch": {"job": job}})
         raise
@@ -2538,7 +2578,7 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             _end_job_capture()
             return _emit_nondeterministic(drift, session, fmt)
         job = _left_behind(session)
-    _flush_job_capture(_end_job_capture(), fmt, job=job)
+    _flush_job_capture(_end_job_capture(), fmt, job=job, deadline=_deadline_block(session))
     return rc
 
 
@@ -2585,6 +2625,7 @@ def _start_batch_job(
         wait=not getattr(args, "no_wait", False),
         cwd=os.getcwd(),
         log=log,
+        deadline_s=_batch_deadline_seconds(args),
     )
     # From here the run's output waits for the session's close (one outcome
     # per run; a job left behind is named in the payload).
@@ -2606,6 +2647,22 @@ def _reject_job_flags_without_batch(args: argparse.Namespace) -> None:
         raise BatchJobInvalid("--no-wait and --job are batch job options; they need --batch")
     if getattr(args, "batch_label", None) is not None:
         raise BatchJobInvalid("--no-batch-label is a batch option; it needs --batch")
+    if getattr(args, "batch_deadline", None) is not None:
+        raise BatchJobInvalid("--batch-deadline is a batch option; it needs --batch")
+
+
+def _batch_deadline_seconds(args: argparse.Namespace) -> float | None:
+    """``--batch-deadline`` in seconds, or None when not given
+    (INVALID_ARGUMENT for a value that is not a positive duration)."""
+    spec = getattr(args, "batch_deadline", None)
+    if spec is None:
+        return None
+    from dgml_core.batch import parse_duration
+
+    try:
+        return parse_duration(spec)
+    except ValueError as exc:
+        raise InvalidArgument(f"--batch-deadline: {exc}") from None
 
 
 def _subcommands(parser: argparse.ArgumentParser) -> Mapping[str, argparse.ArgumentParser]:

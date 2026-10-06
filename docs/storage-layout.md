@@ -1079,7 +1079,12 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
        "keys": {"<custom_id>": "<request key>"},
        "state": "collected",               // open | collected | dropped (canceled) |
                                            // uncertain (create outcome unknown; has "error"
-                                           // and a placeholder "uncertain_…" job_id)
+                                           // and a placeholder "uncertain_…" job_id) |
+                                           // settling (canceled at --batch-deadline, cancel
+                                           // not settled; has "settling_reason" and
+                                           // "possibly_double_billed"; once it ends it gets
+                                           // "late_billed": {"requests", "cost_usd"},
+                                           // "settled_at", and becomes dropped)
        "last_status": {"state": "ended", "succeeded": 12, "errored": 0, "expired": 0,
                        "canceled": 0, "processing": 0},
        "cleanup": "done"}                   // dropped batches only: provider-side delete
@@ -1092,8 +1097,13 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
     "billed": ["<request key>", "…"],      // responses already counted on a usage row
     "inputs": {"generate/schema.json": true, "presence:generate/blocks/a.pdf": false},
     "state": {},                           // command-specific (file add: its ingest results)
-    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}}
+    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}},
                                            // per executor, per run: summed for the payload
+    "deadline": {"at": "2026-09-30T18:00:00Z", "seconds": 21600.0,
+                 "runs": {"1": {"canceled_batches": 0, "…": 0}}}
+                                           // only with --batch-deadline: the absolute UTC
+                                           // instant every run honors, the duration it was
+                                           // set from, and each run's deadline counters
   }
   ```
 

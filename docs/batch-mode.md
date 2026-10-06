@@ -224,6 +224,56 @@ crashes mid-wave can be resumed instead of paying again. See
 [Batch jobs](cli-reference.md#batch-jobs---no-wait-and-dgml-batch) for every
 `dgml batch` subcommand and payload.
 
+## Batch deadline
+
+A provider batch usually ends within an hour, but live runs have seen waves
+take up to 4 hours and a single-request batch sit unfinished for 14 hours;
+without a bound, one slow wave holds the run until the provider's own
+lifetime runs out. `--batch-deadline <duration>` (`90m`, `6h`, `1d`, or plain
+seconds; every command that takes `--batch`) sets that bound for the whole
+run. Once it passes, every open batch is canceled, the results the provider
+already produced are collected and kept at batch price, and everything else,
+now and in every later wave, runs synchronously at standard price, four
+requests at a time, as the synchronous pipeline runs them. A job stores its
+deadline as an absolute UTC time on its first run and every resume honors it.
+Default: none, and the behavior is exactly as without the flag. Payload and
+job details are in the
+[CLI reference](cli-reference.md#batch-deadline---batch-deadline).
+
+```bash
+dgml docset generate <docset_id> --batch --batch-deadline 6h
+```
+
+**The settle wait is per provider.** A canceled batch does not end at once.
+Providers settle cancels on sweep cycles of several minutes, so after
+canceling, the run waits for each batch to reach a terminal state before it
+collects what the batch already produced. Each backend declares that wait
+(`cancel_settle_s`); one that declares none gets 180 s. The run polls a
+settling cancel every 10 s. Live measurements (2026-09-30):
+
+| provider | measured cancel → ended |
+|---|---|
+| Anthropic (wait 450 s) | bimodal: ≤ 50 s, or 280–385 s; no work done while `canceling` |
+| OpenAI | ~306 s or ~606 s (one or two ~5-minute sweeps); up to ~25 min in a later scale run |
+| Gemini | 3–7 s |
+
+**The wait is not an upper bound.** An OpenAI cancel took up to about 25
+minutes to settle in one run. The run does not wait that long. A cancel still
+unsettled when the wait ends keeps its batch record as `settling`, and a
+later run or `dgml batch` command reconciles it once the provider ends it,
+recording what it billed (`late_billed`, `late_billed_usd`).
+
+**Double billing exposure.** OpenAI *keeps processing* a batch while it is
+`cancelling`: in one measured batch, 2 of 20 requests were done at cancel and
+19 of 20 by the time it ended. When a cancel has not settled at the end of the
+wait, the run runs that batch's requests synchronously, so the provider may
+bill some of them a second time. Each such request counts in the payload's
+`batch.deadline.possibly_double_billed`, and a `WARNING` names the batch. The
+count is an upper bound: Anthropic did no work while canceling. The batch's
+late results are never used, so the output is exactly what the synchronous
+calls produced. A library caller running a `BatchExecutor` without a job can
+only warn and count; its late cost is never reconciled.
+
 ## What the run reports
 
 Without `--batch`, output and JSON payloads are byte-identical to a synchronous
@@ -312,7 +362,8 @@ tier, marked `context.tier_split: true`.
   batches are cancelled and the stage fails with `BATCH_EXECUTION_FAILED`.
 - **A stage fails as a whole** (every batch refused, polling failed, or a
   batch still unfinished at the polling deadline, the provider's expiry (24
-  hours, 48 on Gemini) plus an hour). Open batches are cancelled. Documents that had already finished
+  hours, 48 on Gemini) plus an hour; unlike `--batch-deadline`, passing it is
+  a failure). Open batches are cancelled. Documents that had already finished
   keep their results; one still transcribing is dropped, one still labeling is
   written with a `label_error` (under per-document labeling, so is every later
   document; the resume relabels from the failed one onward), and a failed link stage gives each document a

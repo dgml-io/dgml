@@ -894,6 +894,7 @@ into `<stem>.dgml.xml` regardless.
 | `--no-batch-label` / `--batch-label` | `[generation] batch_label`, else on | Under `--batch`, labeling batches by default: every document at once under a closed vocabulary, otherwise (open or `--extend-schema`) one document at a time in the synchronous order, so the output is byte-identical at batch price but each document waits about one batch round trip (pair it with `--no-wait`). `--no-batch-label` labels with ordinary synchronous calls instead, under every vocabulary; everything else still batches. `--batch-label` forces batch labeling over `batch_label = false`. Requires batch mode (`BATCH_JOB_INVALID` without it). |
 | `--batch-poll-interval <seconds>` | `30` | Seconds between batch status checks under `--batch`. Must be positive. |
 | `--no-wait` / `--job <job_id>` | off | Batch job mode (requires batch mode): `--no-wait` submits a wave and exits with a `batch_job` payload; `--job` continues a job. See [Batch jobs](#batch-jobs---no-wait-and-dgml-batch). |
+| `--batch-deadline <duration>` | none | Stop waiting on the provider's batches this long after the run (or job) starts: `90m`, `6h`, `1d`, or seconds. Past it, open batches are canceled, results already produced are kept, and the rest of the run runs synchronously. Requires batch mode. See [Batch deadline](#batch-deadline---batch-deadline). |
 
 **Document-level resume.** If a file's per-(docset, file)
 `<stem>.dgml.xml` already holds a generated document tree, that file is
@@ -1453,7 +1454,7 @@ is refused before the model is called.
 
 #### Several files, and `--batch`
 
-`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--batch] [--batch-poll-interval SECONDS] [--no-wait] [--job JOB_ID]`
+`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--batch] [--batch-poll-interval SECONDS] [--no-wait] [--job JOB_ID] [--batch-deadline DURATION]`
 
 With more than one file id, or `--all` (every file in the DocSet), the command
 extracts each file independently and returns one entry per file. A file that
@@ -2558,8 +2559,9 @@ generate-schema`, `dgml extraction extract` and `dgml file add <dir>
 |---|---|
 | `--no-wait` | Submit the current wave, check it once, and exit if it is still running. |
 | `--job <job_id>` | Continue an existing job (normally passed by `dgml batch resume`). |
+| `--batch-deadline <duration>` | Stop waiting on the provider this long after the job starts (`90m`, `6h`, `1d`, or plain seconds). See [Batch deadline](#batch-deadline---batch-deadline). Also works on a blocking `--batch` run. |
 
-Both require batch mode; without it they fail with `BATCH_JOB_INVALID`.
+All three require batch mode; without it they fail with `BATCH_JOB_INVALID`.
 
 **A paused run is not an error.** It prints this payload on stdout and exits
 `0`:
@@ -2576,6 +2578,19 @@ Both require batch mode; without it they fail with `BATCH_JOB_INVALID`.
   }
 }
 ```
+
+A job with a `--batch-deadline` also carries `deadline: {at, expired}` as the
+block's last key, the same object `dgml batch status` shows, so a scheduler
+sees when the job stops waiting without a separate status call:
+
+```json
+{"batch_job": {"job_id": "bj_3f9a1c07d2e4", "status": "pending", "...": "as above",
+  "resume": "dgml batch resume bj_3f9a1c07d2e4",
+  "deadline": {"at": "2027-01-15T14:00:00Z", "expired": false}}}
+```
+
+A job without a deadline has no `deadline` key: its payload is exactly the one
+above.
 
 A run that finishes prints the command's normal payload. Its `batch` block
 gains a `replayed` count (requests served from the job's store) when it is not
@@ -2672,6 +2687,82 @@ the same way, so they are paid for once.
   records where its key came from (config section, environment variable name),
   and a stored response keeps no provider headers.
 
+### Batch deadline (`--batch-deadline`)
+
+A provider batch usually ends within an hour but may run for its whole
+lifetime (24 hours), and one slow wave holds the whole run. `--batch-deadline
+<duration>` bounds that; without it nothing changes. Once the deadline has
+passed:
+
+- every open provider batch of the current wave is canceled; the run waits a
+  bounded, per-provider time for each cancel to settle (the backend's
+  `cancel_settle_s`: Anthropic 450 s; 180 s for a backend that declares none;
+  polled every 10 s; see [Batch mode](batch-mode.md#batch-deadline)) and
+  collects the results the provider had already produced. Those requests keep
+  their batch result, at batch price;
+- every other request of that wave, and every request of every later wave of
+  the run, runs synchronously at standard price. Nothing new is submitted;
+- one `WARNING` is logged (the run's cost is degraded).
+
+A request is never answered twice. A batch whose cancel had not settled when
+the wait ended (or whose cancel failed, or whose results could not be read) is
+recorded `settling`: its requests run synchronously, and because the provider
+may still process them (OpenAI does, while `cancelling`), each counts in
+`possibly_double_billed` and a `WARNING` names the batch. A late result never
+replaces the one the run used. Once the batch has ended, the job's next run,
+`dgml batch cancel`, `delete` or `prune` records what it billed (the batch
+entry's `late_billed: {"requests", "cost_usd"}`), cleans it up and marks it
+`dropped`; `dgml batch status` reports that read-only. When both apply, the
+earlier of the deadline and the polling deadline (the provider's batch
+lifetime plus an hour) wins.
+
+The deadline belongs to the **job**: the run that creates it stores it as an
+absolute UTC time (wall clock), and every resume (`dgml batch resume` or
+`--job`) honors that instant. A resume after the deadline cancels and collects
+the open batches and finishes synchronously (the resume short-circuit is off
+once the deadline has passed), and the synchronous responses are recorded like
+any other, so a later replay serves them. Passing `--batch-deadline` on a
+resume is accepted when it is the same duration the job was created with (what
+`dgml batch resume` replays) and changes nothing; a different duration fails
+with `BATCH_JOB_INVALID`, since a job's deadline cannot be moved. On a job
+created without one, the first resume that passes `--batch-deadline` sets it,
+from that moment.
+
+When a deadline is set, the run's payload `batch` block gains `deadline`
+(job-wide counts, over every run of the job):
+
+```json
+"deadline": {"at": "2026-09-30T18:00:00Z", "expired": true,
+             "canceled_batches": 1, "collected_after_cancel": 40,
+             "sync_after_deadline": 12, "possibly_double_billed": 0}
+```
+
+`expired` says whether the deadline has passed; `canceled_batches` counts the
+provider batches canceled because it did, `collected_after_cancel` the
+requests collected from them anyway (batch price), and `sync_after_deadline`
+the requests run synchronously because of it (standard price, counted in the
+block's `sync_fallbacks` and cost fields like any fallback).
+`possibly_double_billed` counts the requests among those whose canceled batch
+had not settled when the wait ended. The provider may still process them, so
+they may be billed twice. It is an upper bound, and `0` whenever every cancel
+settled in time. A payload without a deadline has no `deadline` key.
+
+A job that ever had an unsettled cancel also reports, in the same block:
+
+```json
+"settling_batches": 0, "late_billed": 7, "late_billed_usd": 0.0042
+```
+
+`settling_batches` counts the batches still canceling. `late_billed` counts
+the results canceled batches billed after their requests had already run
+synchronously, recorded once each batch ended. `late_billed_usd` is their
+batch-priced cost, or `null` if any result was unpriced. This cost is **not**
+in the block's `cost_usd`, which covers only the responses the run used: what
+the job actually cost is `cost_usd + late_billed_usd`. These keys are absent
+when no cancel ever failed to settle in time. A blocking run's silent job is
+kept (not deleted when the run finishes) while one of its cancels is still
+settling, so that cost can be recorded.
+
 ### `dgml batch resume <job_id>`
 
 Re-run the job's command, as it was first invoked (abbreviated flags stored in
@@ -2686,7 +2777,8 @@ original directory no longer exists, or when it has an unacknowledged
 provider batches are all still running, `batch resume` does not re-run the
 command: it polls those batches once (read-only, as `batch status` does) and
 returns the same pending `batch_job` payload a pausing run prints, exit 0. Any
-other state re-runs the command.
+other state re-runs the command, as does a job whose `--batch-deadline` has
+passed (the run cancels, collects and finishes synchronously).
 
 ### `dgml batch status <job_id>`
 
@@ -2712,8 +2804,10 @@ ended (a resume will make progress without waiting).
 }
 ```
 
-A batch's `state` is `open`, `collected`, `dropped` (canceled), or `uncertain`:
-a batch create whose outcome is unknown, so the batch may exist and be billing.
+A batch's `state` is `open`, `collected`, `dropped` (canceled), `settling`
+(canceled at the batch deadline, cancel not yet settled; see
+[Batch deadline](#batch-deadline---batch-deadline)), or `uncertain`: a batch
+create whose outcome is unknown, so the batch may exist and be billing.
 An `uncertain` batch has a placeholder `batch_id` (`uncertain_…`) and an
 `error`; the job refuses to run again until `dgml batch cancel` acknowledges
 it. A `dropped` batch reports `cleanup`: `done` once deleted at the provider,
@@ -2721,6 +2815,13 @@ it. A `dropped` batch reports `cleanup`: `done` once deleted at the provider,
 reports an `error`; one the provider no longer knows (404) reports `"done":
 true, "gone": true`. `lease` is `null` when no process holds the job;
 `stale: true` means the holder is gone.
+
+A job created with `--batch-deadline` also reports `deadline`: `{"at":
+"2026-09-30T18:00:00Z", "expired": false}`, when the deadline is and whether it
+has passed (a resume after it cancels, collects and finishes synchronously).
+Jobs without one have no `deadline` field. A job with a `settling` batch adds
+`settling_batches`, `late_billed` and `late_billed_usd` to it, computed
+read-only (nothing is written until a later run, `cancel` or `prune`).
 
 ### `dgml batch list`
 
@@ -2751,7 +2852,8 @@ and no unacknowledged `uncertain` batch. Jobs another process holds are kept.
 `--older-than` keeps jobs updated within the last DAYS days (default `0`).
 Prints `{"deleted": [...], "kept": [...]}`, plus `"cleanup_pending": [...]`
 for a job kept because a canceled batch of it still awaits deletion at the
-provider.
+provider, and `"settling": [...]` for a job kept because a batch canceled at
+its `--batch-deadline` has not settled yet (its late cost is recorded first).
 
 ### `dgml batch unlock <job_id>`
 
@@ -2952,7 +3054,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `BATCH_JOB_NOT_FOUND` | hard | `--job` or a `dgml batch` subcommand named a job id with no job in this workspace. |
 | `BATCH_JOB_BUSY` | hard | Another process holds the batch job's lease (it is running, polling or canceling that job). Retry when it finishes, or once the lease expires 10 minutes after its last renewal; `dgml batch unlock <job_id>` breaks a lease left by a process that died. Also the outcome of a run that lost its lease mid-run (broken by `unlock`, or taken over): it stops before submitting anything more, with `details.lease_lost: true`. |
 | `BATCH_JOB_NONDETERMINISTIC` | hard | A resumed batch job's requests for a stage matched nothing it stored or has in flight while open provider batches still cover those positions: an input was rebuilt differently, and submitting would pay for the same wave again. Nothing was submitted and the open batches were kept. Fatal to the run: it is the run's only output (no success payload, exit 1) and nothing further is sent to the provider; `details.batch.job` names the job, left `failed`. If an input changed on purpose, `dgml batch cancel <job_id>` then `dgml batch resume <job_id>`. |
-| `BATCH_JOB_INVALID` | hard | A batch job cannot be used as asked: `--no-wait`/`--job` without batch mode, resuming a job that already completed, continuing a job with a different command than the one that created it, running a job again while it has an unacknowledged `uncertain` batch create (check the provider's console, then `dgml batch cancel <job_id>`), or resuming a job whose stored command line no longer parses or whose original working directory no longer exists. |
+| `BATCH_JOB_INVALID` | hard | A batch job cannot be used as asked: `--no-wait`/`--job`/`--batch-deadline` without batch mode, a resume passing a `--batch-deadline` different from the job's, resuming a job that already completed, continuing a job with a different command than the one that created it, running a job again while it has an unacknowledged `uncertain` batch create (check the provider's console, then `dgml batch cancel <job_id>`), or resuming a job whose stored command line no longer parses or whose original working directory no longer exists. |
 | `INCREMENTAL_WITHOUT_CLUSTERS` | hard | `cluster --skip-existing` in a workspace that has no existing clusters to build on. |
 | `LINK_PLAN_FAILED` | soft | The semantic-link pass failed for a document during `docset generate`; the document still converts, unlinked. |
 | `GUIDANCE_NOT_FOUND` | hard | An `extraction` command needs DocSet guidance that has not been set. |

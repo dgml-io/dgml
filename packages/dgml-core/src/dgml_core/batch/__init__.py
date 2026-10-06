@@ -49,6 +49,7 @@ from dgml_core.batch.anthropic import AnthropicBatchBackend, AnthropicBatchError
 from dgml_core.batch.backend import BatchBackend
 from dgml_core.batch.chunking import DEFAULT_OVERHEAD_BYTES, plan_batches, request_size
 from dgml_core.batch.compat import SUPPORTED_LITELLM, IncompatibleDependency
+from dgml_core.batch.deadline import BatchDeadline, parse_duration
 from dgml_core.batch.driver import Unit, UnitOutcome, run_stage, run_stage_sync
 from dgml_core.batch.executor import TIER_MARKER, BatchExecutor, WaveStats, make_executor
 from dgml_core.batch.fake import FakeBackend, fake_model_response
@@ -108,6 +109,7 @@ __all__ = [
     "BackendConfig",
     "BackendFactory",
     "BatchBackend",
+    "BatchDeadline",
     "BatchExecutor",
     "BatchItemError",
     "BatchJob",
@@ -140,6 +142,7 @@ __all__ = [
     "list_job_summaries",
     "list_jobs",
     "make_executor",
+    "parse_duration",
     "plan_batches",
     "provider_of",
     "prune_jobs",

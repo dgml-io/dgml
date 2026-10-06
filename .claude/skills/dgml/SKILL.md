@@ -597,6 +597,32 @@ uv run dgml batch prune                           # drop finished jobs
 `BATCH_JOB_NONDETERMINISTIC` means the inputs changed under an open batch:
 `dgml batch cancel <job_id>` then resume.
 
+**Bound the wait with `--batch-deadline`.** A wave usually ends within an
+hour but can take many hours. When the user needs results by a certain time,
+add `--batch-deadline <duration>` (`90m`, `6h`, `1d`; with `--batch`, on any
+batch command). Once it passes, open batches are canceled, results already
+produced are kept at batch price, and the rest of the run finishes
+synchronously at standard price, so the saving shrinks but the run ends. The
+deadline belongs to the job: set it on the first run; every `batch resume`
+honors it (a resume after it finishes the job instead of pausing), and passing
+a different duration on a resume is `BATCH_JOB_INVALID`. The payload's
+`.batch.deadline` reports `at`, `expired`, `canceled_batches`,
+`collected_after_cancel`, `sync_after_deadline` and `possibly_double_billed`;
+`dgml batch status` shows `deadline: {at, expired}`, and so does a paused
+run's `batch_job` block. Canceling can take minutes: the run waits a
+per-provider time for each cancel to settle (Anthropic 450 s). A batch still
+canceling after that wait has its requests run synchronously; a provider that
+keeps processing while canceling (OpenAI does) may bill those twice.
+`possibly_double_billed` counts them and a WARNING names the batch. The job
+keeps such a batch as `settling`; once it ends, the next resume, `batch
+cancel` or `batch prune` records its real extra cost in `late_billed` /
+`late_billed_usd` (real spend is `cost_usd + late_billed_usd`), and `batch
+prune` keeps the job until then (listed in `settling`).
+
+```bash
+job=$(uv run dgml docset generate "$ds" --batch --no-wait --batch-deadline 6h | jq -r .batch_job.job_id)
+```
+
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
 a `dg:origin` bounding-box attribute (`<page> <x1> <y1> <x2> <y2>`,

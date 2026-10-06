@@ -48,6 +48,7 @@ from typing import Any
 
 from litellm import ModelResponse
 
+from dgml_core.batch.deadline import CANCEL_SETTLE_S
 from dgml_core.batch.types import (
     BatchItemError,
     BatchJob,
@@ -121,7 +122,7 @@ class FakeBackend:
         max_requests: int = 100_000,
         max_bytes: int = 256 * 1024**2,
         max_wait_s: float = 24 * 3600.0,
-        cancel_settle_s: float = 180.0,
+        cancel_settle_s: float = CANCEL_SETTLE_S,
         processed_early: Callable[[BatchRequest], bool] | None = None,
         cancel_settle_polls: int = 0,
     ) -> None:

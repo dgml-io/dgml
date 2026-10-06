@@ -182,6 +182,21 @@ def test_resume_would_wait_while_no_batch_has_ended(ws: Workspace) -> None:
     assert len(backend.submitted) == 1
 
 
+def test_resume_would_wait_reports_the_jobs_deadline(ws: Workspace) -> None:
+    backend = _install(FakeBackend(_answer, provider="anthropic", polls_until_ended=50))
+    job_id = _paused(ws, backend)
+    store = BatchJobStore(ws, job_id)
+    manifest = store.load()
+    manifest.deadline = {"at": "2999-01-01T00:00:00Z", "seconds": 3600.0, "runs": {}}
+    store.save(manifest)
+    waiting = resume_would_wait(ws, job_id)
+    assert waiting is not None
+    # Appended after the pre-deadline keys; the same block `batch status` shows.
+    assert list(waiting)[-1] == "deadline"
+    assert waiting["deadline"] == {"at": "2999-01-01T00:00:00Z", "expired": False}
+    assert waiting["deadline"] == job_status(ws, job_id)["deadline"]
+
+
 def test_resume_reruns_a_blocking_job_even_while_its_batch_runs(ws: Workspace) -> None:
     """No --no-wait: the re-run waits on the batch instead of pausing."""
     backend = _install(FakeBackend(_answer, provider="anthropic", polls_until_ended=5))
