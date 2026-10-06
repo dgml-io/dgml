@@ -261,6 +261,7 @@ def _run_both(
     provider: _Provider,
     *extra: str,
     config: dict[str, Any] | None = None,
+    batch_extra: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], list[Any]]:
     """(sync payload, sync state, batch payload, batch state, batch-run sync calls)."""
     ws_s, did_s = _seed(tmp_path / "sync", capsys, config)
@@ -277,7 +278,7 @@ def _run_both(
         return _answer(kwargs)
 
     with patch("litellm.completion", side_effect=record):
-        assert main(_argv(ws_b, did_b, *extra, *_BATCH)) == 0
+        assert main(_argv(ws_b, did_b, *extra, *_BATCH, *batch_extra)) == 0
     batch_payload = _read_stdout(capsys)
     return (
         sync_payload,
@@ -291,10 +292,40 @@ def _run_both(
 _COST_FIELDS = ("cost_usd", "standard_cost_usd", "saved_usd")
 
 
-def test_open_vocab_batches_every_stage_but_labeling_and_matches_sync(
+def test_open_vocab_batches_every_stage_and_labels_per_document(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], provider: _Provider
 ) -> None:
+    """The default under --batch: an open vocabulary labels one document per
+    batch stage, in the sync order, and ends byte-identical to the sync run."""
     sync_payload, sync_state, payload, state, batch_sync = _run_both(tmp_path, capsys, provider)
+
+    assert "batch" not in sync_payload
+    assert state["outputs"] == sync_state["outputs"]
+    assert b"Greeting" in state["outputs"]["bravo.pdf"]
+    assert state["files"] == sync_state["files"]
+    assert state["rows"] == sync_state["rows"]
+    rest = {k: v for k, v in payload.items() if k != "batch"}
+    assert _payload_shape(rest) == _payload_shape(sync_payload)
+
+    stages = payload["batch"]["stages"]
+    assert set(stages) == {"transcribe", "plan", "label", "links"}
+    label = stages["label"]
+    assert label["mode"] == "per-document"
+    assert label["documents"] == len(_PAGES)
+    assert label["waves"] >= len(_PAGES)  # at least one round trip per document
+    assert label["requests"] == label["batch_ok"] > 0
+    assert label["sync_fallbacks"] == 0
+    assert label["cost_usd"] == pytest.approx(label["standard_cost_usd"] / 2)
+    assert batch_sync == []  # every request went through the batch
+
+
+def test_no_batch_label_batches_every_stage_but_labeling_and_matches_sync(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], provider: _Provider
+) -> None:
+    """``--no-batch-label``: today's behavior — labeling stays synchronous."""
+    sync_payload, sync_state, payload, state, batch_sync = _run_both(
+        tmp_path, capsys, provider, batch_extra=("--no-batch-label",)
+    )
 
     assert "batch" not in sync_payload  # no --batch: the payload is unchanged
     assert state["outputs"] == sync_state["outputs"]
@@ -319,7 +350,7 @@ def test_open_vocab_batches_every_stage_but_labeling_and_matches_sync(
     assert stages["plan"]["waves"] == 2  # the draft, then the refine turn
     assert stages["links"]["waves"] == 2  # propose, then verify
     assert stages["label"]["mode"] == "sync"
-    assert "open vocabulary" in stages["label"]["skipped"]
+    assert "batch_label = false" in stages["label"]["skipped"]
     # Only labeling reached the synchronous seam.
     assert batch_sync and {_system(c) for c in batch_sync} == {label_mod.SYSTEM_PROMPT}
 

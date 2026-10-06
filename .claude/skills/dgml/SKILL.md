@@ -553,11 +553,16 @@ waiting on the result, add `--batch`. It sends transcription, roster
 planning, concept descriptions, OCR image style (when `[style]` is enabled)
 and the semantic-link pass through the provider's batch API at half the token
 price; results can take up to 24 hours per wave, and a long document needs
-one wave per window. Labeling batches too under a closed `--schema-path`
-vocabulary (every document at once); under an open or `--extend-schema`
-vocabulary it stays synchronous, because each document is labeled against
-the tags the documents before it coined. The output is the same as a
-synchronous run. Only `anthropic/` models have a batch backend; any other
+one wave per window. Labeling batches too: under a closed `--schema-path`
+vocabulary every document at once; under an open or `--extend-schema`
+vocabulary one document at a time, in the synchronous order, because each
+document is labeled against the tags the documents before it coined. That
+costs about one queue round trip per document, so pair a bulk open-vocabulary
+run with `--no-wait` (below). The output is the same as a synchronous run.
+Add `--no-batch-label` (or `batch_label = false` under `[generation]`) to
+label with ordinary synchronous calls when latency matters more than the
+labeling half of the bill; the payload's `batch.stages.label.mode` says which
+ran (`all-at-once`, `per-document` or `sync`). Only `anthropic/` models have a batch backend; any other
 model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
 anything. The payload's `batch.stages` block reports what each stage did,
 including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report

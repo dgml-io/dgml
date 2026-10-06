@@ -47,8 +47,8 @@ versions. Runs without `--batch` are unaffected by this check.
 | Transcription (Pass A) | Yes | `transcribe` | one per page window of the longest document | Documents are independent; windows of one document are chained. |
 | Roster planning (draft, then refine) | Yes | `plan` | 2 | One request chain per docset, as a one-unit stage. Unseeded runs only. |
 | Gap planning (`--extend-schema`) | Yes | `plan_gaps` | 1 | One request per docset, as a one-unit stage. |
-| Labeling (Pass B), closed vocabulary | Yes | `label` | one per chunk of the longest document (+1 for a section retry) | No document can change the roster the others see. |
-| Labeling (Pass B), open or extending vocabulary | No | `label` (`skipped`) | — | Each document is labeled against the roster the previous ones grew; see below. |
+| Labeling (Pass B), closed vocabulary | Yes (unless `--no-batch-label`) | `label` | one per chunk of the longest document (+1 for a section retry) | No document can change the roster the others see. |
+| Labeling (Pass B), open or extending vocabulary | Yes (unless `--no-batch-label`), one document at a time | `label` | about one per document (+1 for a section retry or a split chunk) | Each document is labeled against the roster the previous ones grew; see below. |
 | Concept descriptions | Yes | `describe` | 1 | One request per docset, after labeling. Skipped when no concept was coined (always under a closed vocabulary). |
 | Image style for OCR files (`[style]` enabled) | Yes | `style` | 1 | Pages are independent: every document's pages in one wave, after grounding and before links. |
 | Semantic links (propose, verify) | Yes | `links` | 2 | Each document's link plan is independent. |
@@ -58,7 +58,7 @@ planning and the descriptions of concepts coined during labeling are each one
 request chain per docset, so nothing can share their waves. They still bill at
 half price as one-unit stages over the labeling model. The requests are the
 synchronous ones, and so are their results and cache files. When labeling
-stays synchronous, the labeling pass's usage row splits into a `batch` part
+stays synchronous (`--no-batch-label`), the labeling pass's usage row splits into a `batch` part
 (planning, descriptions) and a `standard` part (labeling), marked
 `context.tier_split: true`.
 
@@ -69,23 +69,33 @@ wave once all documents are grounded, before the link pass (which reads the
 styled tree, as it does without `--batch`). The styled DGML is the same as the
 synchronous run's.
 
-**Why open-vocabulary labeling stays synchronous.** Without a supplied schema,
-the docset's tag list, the *roster*, grows while documents are labeled. Each
-document is labeled against the roster as the previous documents left it: it
-reuses the names they coined, instead of inventing a synonym for the same
-field. That document-to-document hand-off is how DGML keeps tags consistent
-across a docset. A single batch would send every document's request at once,
-so no document would see what the others coined. That variant was measured to
-lower cross-document tag consistency, so batch mode does not do it: labeling
-runs with ordinary synchronous calls, exactly as without `--batch`, and the
-`label` stage says why. `--extend-schema` keeps the vocabulary open, so it
-labels synchronously too.
+**Labeling batches one document at a time under an open vocabulary.** Without
+a supplied schema, the docset's tag list, the *roster*, grows while documents
+are labeled. Each document is labeled against the roster as the previous
+documents left it: it reuses the names they coined, instead of inventing a
+synonym for the same field. That document-to-document hand-off is how DGML
+keeps tags consistent across a docset. A single batch would send every
+document's request at once, so no document would see what the others coined;
+that was measured to lower cross-document tag consistency, so batch mode never
+does it. Instead each document is its own batch stage, in the synchronous
+order (pilot stage included): its chunks go out together in one wave, a
+section retry or a split chunk in the next, and the roster is updated once the
+document is done. Every request, label and roster is byte-identical to the
+synchronous run, at half price. `--extend-schema` keeps the vocabulary open,
+so it labels this way too.
 
-Labeling batches when the vocabulary is **closed**: a schema you supplied with
-`--schema-path` (or one a previous `--schema-path` run left on the docset),
-without `--extend-schema`. Then no document can change the roster, so every
-document's labeling requests go out together, and the result is the one
-labeling them one by one gives.
+The price is latency: about one queue round trip per document (two when a
+section retry or a split fires). For more than a handful of documents, run
+with `--no-wait` and resume from cron or an agent (see [Job mode](#job-mode)).
+`--no-batch-label` (or `[generation] batch_label = false`) labels with
+ordinary synchronous calls instead, exactly as before batch labeling, when
+latency matters more than the labeling half of the bill.
+
+Labeling batches every document at once when the vocabulary is **closed**: a
+schema you supplied with `--schema-path` (or one a previous `--schema-path`
+run left on the docset), without `--extend-schema`. Then no document can
+change the roster, so every document's labeling requests go out together, and
+the result is the one labeling them one by one gives.
 
 The transcription, labeling, link and (when enabled) style models are checked
 for a batch backend before any work starts. The labeling model is checked
@@ -168,8 +178,9 @@ output is deterministic whichever result arrived first.
 
 A run takes as many batch round trips as its longest chain of dependent
 requests: the transcription windows of its longest document, then two for
-roster planning (unseeded runs), the labeling waves (closed vocabulary), one
-for descriptions when labeling coined a concept, one for image style, and up to
+roster planning (unseeded runs), the labeling waves (about one per document
+under an open vocabulary; one per chunk of the longest document under a closed
+one; none under `--no-batch-label`), one for descriptions when labeling coined a concept, one for image style, and up to
 two for links (none when every link plan is already cached). The docset's size
 changes how large the batches are, not how many there are.
 
@@ -217,8 +228,8 @@ stayed synchronous:
                    "batch_ids": ["msgbatch_…", "…"],
                    "cost_usd": 0.021, "standard_cost_usd": 0.042, "saved_usd": 0.021},
     "plan": {"waves": 2, "batches": 2, "requests": 2, "batch_ok": 2, …},
-    "label": {"skipped": "open vocabulary: each document's labels extend the shared roster",
-              "mode": "sync"},
+    "label": {"mode": "per-document", "documents": 3, "waves": 3, "requests": 5,
+              "batch_ok": 5, …},
     "links": {"waves": 2, "batches": 2, "requests": 4, "batch_ok": 4, …}
   }
 }
@@ -231,8 +242,14 @@ difference. For a stage served entirely by the batch they differ by exactly
 2x; a request that fell back to a synchronous call counts in `sync_fallbacks`
 and narrows the gap. The three are `null` when a response had no price.
 
-The `label` entry carries `"mode"`: `"all-at-once"` (closed vocabulary, the
-usual counters) or `"sync"` (with the `skipped` reason). A stage can also
+The `label` entry carries `"mode"`:
+
+- `"all-at-once"`: closed vocabulary, the usual counters.
+- `"per-document"`: open or extending vocabulary, the usual counters (summed
+  over every document's stage) plus `documents`, how many were labeled.
+- `"sync"`: `--no-batch-label`; the entry is
+  `{"skipped": "batch labeling is off (batch_label = false)", "mode": "sync"}`.
+ A stage can also
 report `{"skipped": "--no-semlinks"}` or
 `{"skipped": "every link plan was cached"}`. `plan`, `plan_gaps`, `describe`
 and `style` appear only when that call ran (`style` reports
@@ -282,7 +299,8 @@ tier, marked `context.tier_split: true`.
   batch still unfinished at the polling deadline, the provider's 24 hours plus
   an hour). Open batches are cancelled. Documents that had already finished
   keep their results; one still transcribing is dropped, one still labeling is
-  written with a `label_error`, and a failed link stage gives each document a
+  written with a `label_error` (under per-document labeling, so is every later
+  document; the resume relabels from the failed one onward), and a failed link stage gives each document a
   `link_error` and still writes it. In `extraction extract` and `file add`, a
   file still in flight gets `BATCH_EXECUTION_FAILED` as its entry. Batch mode
   does not silently rerun the whole wave at full price. The run's job ends
@@ -303,6 +321,8 @@ tier, marked `context.tier_split: true`.
 | `--no-batch` (`docset generate`) | Force synchronous, overriding the config. |
 | `[generation] batch = true` | Make batch mode the default for `docset generate` in this workspace. Anything but a boolean is `GENERATION_CONFIG_INVALID`. |
 | `DGML_GENERATION__BATCH=true` | The same, from the environment (`true`/`false`, `1`/`0`, `yes`/`no`). |
+| `--no-batch-label` (`docset generate`) | Label with ordinary synchronous calls under `--batch` (everything else still batches). `--batch-label` forces batch labeling over a `false` config. Needs `--batch`. |
+| `[generation] batch_label = false` | Make synchronous labeling the default under batch mode (default `true`; `DGML_GENERATION__BATCH_LABEL`). Anything but a boolean is `GENERATION_CONFIG_INVALID`. |
 | `--batch-poll-interval SECONDS` | Seconds between batch status checks (default 30). |
 | `--no-wait` | Submit the wave and exit; continue with `dgml batch resume <job_id>`. |
 | `--job JOB_ID` | Continue an existing job (what `dgml batch resume` passes). |

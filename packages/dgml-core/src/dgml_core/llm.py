@@ -39,13 +39,13 @@ consistent:
   per call. :func:`record_usage_for` is an optional scope that aggregates the
   calls inside it into a single row for multi-call operations. All recording is
   gated on ``--debug``.
-- **One request protocol, one driver.** Each wrapper is defined once as a
+- **One request protocol, two drivers.** Each wrapper is defined once as a
   pure ``steps_*`` generator (yields the completion kwargs for a request,
   receives the response, decides whether another request follows) and the
   ``call*`` function is its synchronous driver via :func:`drive`, which owns
-  the usage accounting. Request shaping and continuation logic exist in
-  exactly one place, so any other driver of the same generators sends the
-  same requests.
+  the usage accounting. An executor that defers requests — a provider batch
+  endpoint — runs the same generators, so request shaping and continuation
+  logic exist in exactly one place.
 
 Lives at the package root (:mod:`dgml_core.llm`) so generation and the
 non-generation call sites share one implementation.
@@ -61,7 +61,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, TypeVar, cast
@@ -362,8 +362,8 @@ class LLMConfig:
     operation: str | None = None
     context: dict[str, Any] | None = None
     # Pricing tier recorded on the usage row (``usage.TIER_STANDARD`` /
-    # ``usage.TIER_BATCH``). A batch driver sets ``TIER_BATCH`` on the configs
-    # it drives; every synchronous call records standard.
+    # ``usage.TIER_BATCH``). The batch executor sets ``TIER_BATCH`` on the
+    # configs it drives; every synchronous call records standard.
     tier: str = TIER_STANDARD
     # Internal: set by an active :func:`record_usage_for` scope. While set,
     # the call functions fold their usage into it (one aggregated row for the
@@ -1090,6 +1090,53 @@ T = TypeVar("T")
 LLMStep = dict[str, Any]
 
 
+class FanOut:
+    """Fork independent child step generators and join on their results.
+
+    Yielded by an :data:`LLMSteps` generator in place of a request (structured
+    concurrency: the children cannot outlive the yield). The yield evaluates to
+    ``[result_0, result_1, ...]`` — each child's return value, in *child*
+    order, whatever order they finished in. The contract every driver honours:
+
+    - **The children must be independent**: no child's requests may depend on
+      another child's responses or side effects. The parent applies any
+      order-sensitive side effects itself, after the join, in child order —
+      that is what keeps the outcome identical whichever driver runs it.
+    - **Sync** (:func:`drive`): the children run one after another, to
+      completion, in child order — so the request sequence and every request
+      byte are exactly those of ``yield from child_0; yield from child_1; ...``.
+    - **Batch** (:func:`dgml_core.batch.run_stage`): the children's pending
+      requests are extra in-flight requests of the same unit, sharing each wave
+      with every other unit's; the parent resumes once every child has
+      returned. Within one child, requests stay strictly ordered.
+    - **Failures, per child as for a unit**: a request a driver could not serve
+      is thrown into *that child* at its pending ``yield``; only an exception
+      escaping the child fails it. Every child runs to the end even when an
+      earlier one failed (both drivers), and then the first failed child's
+      exception, in child order, is thrown into the parent at the ``FanOut``
+      yield instead of sending the results. An interrupt (a non-``Exception``
+      ``BaseException``) closes every child and propagates.
+    - **Usage folds in child order**: each child's per-wrapper subtotals are
+      folded, after the parent's preceding ones, in child order — exactly the
+      sequence the sync driver produces — so sums associate bit for bit across
+      drivers (see :class:`_UsageFold`).
+    - **Determinism**: children are primed in child order and a batch driver
+      assigns request ids in that order, so a job's replay (keyed by request
+      occurrence) meets the same requests in the same order on every run.
+
+    Children may yield ``FanOut`` themselves (nesting). An empty ``FanOut``
+    joins at once with ``[]`` and makes no request.
+    """
+
+    __slots__ = ("children",)
+
+    def __init__(self, children: Iterable[Generator[Any, Any, Any]]) -> None:
+        self.children: tuple[Generator[Any, Any, Any], ...] = tuple(children)
+
+    def __repr__(self) -> str:
+        return f"FanOut({len(self.children)} children)"
+
+
 #: A wrapper's request/response protocol. Contract:
 #:
 #: - The generator is **pure**: it yields :data:`LLMStep` values, receives the
@@ -1114,6 +1161,15 @@ LLMStep = dict[str, Any]
 #:   ``BaseException`` that is not an ``Exception`` (an interrupt) is never
 #:   thrown in; it propagates straight out of the driver.
 LLMSteps = Generator[LLMStep, Any, T]
+
+#: An :data:`LLMSteps` generator that may also yield a :class:`FanOut` of
+#: child generators (each an ``LLMSteps`` or ``LLMFlow`` itself) in place of a
+#: request: the driver runs the children and sends their return values back as
+#: a list in child order (see :class:`FanOut` for the join contract). Every
+#: driver — :func:`drive` and :func:`dgml_core.batch.run_stage` — accepts
+#: either; the ``steps_*`` primitives are plain ``LLMSteps``. Kept a separate
+#: alias so code that hand-drives a primitive still sees only requests.
+LLMFlow = Generator[LLMStep | FanOut, Any, T]
 
 
 def _require_choices(response: Any) -> None:
@@ -1212,9 +1268,16 @@ class _UsageFold:
             sub, self._sub, self._wrapper = self._sub, None, None
             self._fold(sub)
 
+    def emit(self, sub: dict[str, Any]) -> None:
+        """Hand an already-finished subtotal on, after the running one: how a
+        batch driver folds a :class:`FanOut` child's subtotals into its
+        parent's at the join, in the sequence the sync driver produces."""
+        self.flush()
+        self._fold(sub)
+
 
 def drive(
-    steps: LLMSteps[T],
+    steps: LLMFlow[T],
     config: LLMConfig,
     execute: Callable[[LLMStep], Any] | None = None,
 ) -> T:
@@ -1233,7 +1296,8 @@ def drive(
     again keeps the run going, one that does not re-raises it out of the
     scope, which records the error row exactly as the inline wrappers did;
     and the generator is closed on every exit. A failed request contributes
-    no usage (there was no response).
+    no usage (there was no response). A :class:`FanOut` runs its children
+    here one after another, in child order, under the same scope and fold.
 
     ``execute`` turns one step into a response; it defaults to
     :func:`_completion_with_retry` (resolved at call time, so a test that
@@ -1243,32 +1307,85 @@ def drive(
     with _record_call(config) as totals:
         fold = _UsageFold(lambda sub: add_partial(_fold_target(config, totals), sub))
         try:
-            try:
-                step = next(steps)
-            except StopIteration as done:
-                return cast(T, done.value)
-            while True:
-                try:
-                    response = run(step)
-                except Exception as exc:
-                    # Deliver the failure at the pending yield. An uncaught
-                    # exception re-raises out of throw() and leaves the scope
-                    # as the error row; a caught one may yield a retry step.
-                    try:
-                        step = steps.throw(exc)
-                    except StopIteration as done:
-                        return cast(T, done.value)
-                    continue
-                fold.add(step, with_tier(extract_cost_and_tokens(response), response, config.tier))
-                try:
-                    step = steps.send(response)
-                except StopIteration as done:
-                    return cast(T, done.value)
+            return cast(T, _drive_steps(steps, config, run, fold))
         finally:
-            steps.close()
             # Before the scope exits, so its row (or its fold into an
             # enclosing sink) sees the last wrapper's subtotal.
             fold.flush()
+
+
+def _drive_steps(
+    steps: LLMFlow[Any],
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> Any:
+    """:func:`drive`'s loop over one generator (a whole run, or one
+    :class:`FanOut` child): every response folded into *fold* before it is
+    sent in, every request failure thrown in, the generator closed on exit.
+
+    A ``FanOut`` runs its children here, one after another in child order,
+    through the same *fold* — so the request sequence and the usage folding
+    are exactly those of ``yield from`` over each child in turn."""
+    try:
+        try:
+            step = next(steps)
+        except StopIteration as done:
+            return done.value
+        while True:
+            if isinstance(step, FanOut):
+                results, failure = _drive_fanout(step, config, run, fold)
+                try:
+                    step = steps.send(results) if failure is None else steps.throw(failure)
+                except StopIteration as done:
+                    return done.value
+                continue
+            try:
+                response = run(step)
+            except Exception as exc:
+                # Deliver the failure at the pending yield. An uncaught
+                # exception re-raises out of throw() and leaves the scope
+                # as the error row; a caught one may yield a retry step.
+                try:
+                    step = steps.throw(exc)
+                except StopIteration as done:
+                    return done.value
+                continue
+            fold.add(step, with_tier(extract_cost_and_tokens(response), response, config.tier))
+            try:
+                step = steps.send(response)
+            except StopIteration as done:
+                return done.value
+    finally:
+        steps.close()
+
+
+def _drive_fanout(
+    fan: FanOut,
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> tuple[list[Any], Exception | None]:
+    """Run every child of *fan* to the end, in child order (the sync side of
+    the :class:`FanOut` contract). Returns the results in child order and the
+    first child's ``Exception`` (or ``None``); an interrupt closes the
+    children not yet run and propagates."""
+    results: list[Any] = []
+    failure: Exception | None = None
+    unrun = list(fan.children)
+    try:
+        while unrun:
+            child = unrun.pop(0)
+            try:
+                results.append(_drive_steps(child, config, run, fold))
+            except Exception as exc:
+                results.append(None)
+                if failure is None:
+                    failure = exc
+    finally:
+        for child in unrun:  # only after an interrupt
+            child.close()
+    return results, failure
 
 
 def steps_call(
@@ -1625,8 +1742,8 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
     the one that served the scope's responses (each response's tier marker,
     else the driving config's tier); a scope with no responses falls back to
     the scope config's tier, or batch when a batch driver marked the sink via
-    ``totals[SINK_TIER_KEY]``; a scope whose responses span tiers appends one row per tier
-    instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
+    ``totals[SINK_TIER_KEY]``. A scope whose responses span tiers appends one
+    row per tier instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
     an inner scope defers to the outer one. The write can never break the
     caller (see :func:`record_usage`); exceptions propagate after the row.
     """
@@ -1677,7 +1794,9 @@ __all__ = [
     "PDF_NATIVE_MODEL_PATTERNS",
     "SINK_TIER_KEY",
     "CallResult",
+    "FanOut",
     "LLMConfig",
+    "LLMFlow",
     "LLMStep",
     "LLMSteps",
     "add_partial",

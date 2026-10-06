@@ -891,6 +891,7 @@ into `<stem>.dgml.xml` regardless.
 | `--no-semlink-cache` | off | Always call the model for the semantic-link pass. By default the pass is cached on what the model actually reads — tag names and text, plus the labeling model, the link prompts, and whether the review pass runs. Attributes are deliberately excluded, because the prompt never shows them: grounding a document or renaming a namespace prefix does not change its links, so those runs replay the cache instead of paying again. The cache stores the links themselves, not a second copy of the XML, and they are written onto whatever the current render produced. This flag forces a fresh call — use it when something the key cannot see has changed, such as a provider-side model update behind a stable model id. |
 | `--no-semlink-verify` | off | Skip the second, skeptical pass that reviews each proposed link. The link pass then makes one model call per document instead of two, which cuts its wall-clock time by about 60%, and keeps roughly twice as many links — including the weaker ones the review would have dropped. Use it when you want breadth and speed over precision. Reviewed and unreviewed results are cached separately. |
 | `--batch` / `--no-batch` | `[generation] batch`, else off | Send the batchable model calls through the provider's batch API: half the price per token, but results can take up to 24 hours. See **Batch mode** below and [batch-mode.md](batch-mode.md). `--no-batch` forces the synchronous pipeline even when the config enables batch mode. |
+| `--no-batch-label` / `--batch-label` | `[generation] batch_label`, else on | Under `--batch`, labeling batches by default: every document at once under a closed vocabulary, otherwise (open or `--extend-schema`) one document at a time in the synchronous order, so the output is byte-identical at batch price but each document waits about one batch round trip (pair it with `--no-wait`). `--no-batch-label` labels with ordinary synchronous calls instead, under every vocabulary; everything else still batches. `--batch-label` forces batch labeling over `batch_label = false`. Requires batch mode (`BATCH_JOB_INVALID` without it). |
 | `--batch-poll-interval <seconds>` | `30` | Seconds between batch status checks under `--batch`. Must be positive. |
 | `--no-wait` / `--job <job_id>` | off | Batch job mode (requires batch mode): `--no-wait` submits a wave and exits with a `batch_job` payload; `--job` continues a job. See [Batch jobs](#batch-jobs---no-wait-and-dgml-batch). |
 
@@ -953,11 +954,18 @@ changes is the price and the wall-clock time.
   planning's draft, then its refine turn (`plan`, two waves);
   `--extend-schema`'s gap planning (`plan_gaps`, one wave); the descriptions of
   concepts coined during labeling (`describe`, one wave).
-- **Labeling** batches under a closed `--schema-path` vocabulary, where no
-  document's labels can change the next document's prompt: every document at
-  once (`mode: "all-at-once"`). Under an open or `--extend-schema` vocabulary
-  each document is labeled against what earlier documents added, so labeling
-  stays synchronous (`mode: "sync"`, with the reason).
+- **Labeling** batches by default. Under a closed `--schema-path`
+  vocabulary, where no document's labels can change the next document's
+  prompt: every document at once (`mode: "all-at-once"`). Under an open or
+  `--extend-schema` vocabulary each document is labeled against what earlier
+  documents added, so each document is its own batch stage, in the
+  synchronous order (`mode: "per-document"`): its chunks share a wave, the
+  roster is updated once it is done, and every request is the synchronous
+  run's. Latency is about one queue round trip per document; for more than a
+  few documents run with `--no-wait` and `dgml batch resume`.
+  `--no-batch-label` (or `batch_label = false` under `[generation]`; anything
+  but a boolean is `GENERATION_CONFIG_INVALID`) labels synchronously instead
+  (`mode: "sync"`).
 - **Image style** (OCR files, when the workspace's `style` section is
   enabled): every OCR page's vision request in one wave (`style`), after
   grounding and before the link pass.
@@ -988,7 +996,7 @@ counters and cost, or why it did not batch:
   "stages": {
     "transcribe": {"waves": 3, "batches": 3, "requests": 5, "batch_ok": 5, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.021, "standard_cost_usd": 0.042, "saved_usd": 0.021},
     "plan": {"waves": 2, "batches": 2, "requests": 2, "batch_ok": 2, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.004, "standard_cost_usd": 0.008, "saved_usd": 0.004},
-    "label": {"skipped": "open vocabulary: each document's labels extend the shared roster", "mode": "sync"},
+    "label": {"mode": "per-document", "documents": 2, "waves": 2, "batches": 2, "requests": 2, "batch_ok": 2, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.012, "standard_cost_usd": 0.024, "saved_usd": 0.012},
     "links": {"waves": 2, "batches": 2, "requests": 4, "batch_ok": 4, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.021, "standard_cost_usd": 0.042, "saved_usd": 0.021}
   }
 }
@@ -1005,11 +1013,17 @@ when a batch was split after a batch-level rejection). The cost fields:
 | `saved_usd` | `standard_cost_usd − cost_usd`. |
 
 All three are `null` when a response came back without a price. They cover
-the batched stages only; a stage that ran synchronously (open-vocabulary
-labeling) has its cost in `usage.jsonl` under `--debug`.
+the batched stages only; a stage that ran synchronously (labeling under
+`--no-batch-label`) has its cost in `usage.jsonl` under `--debug`.
 
 `label` reads `{"mode": "all-at-once", <counters>, <cost fields>}` under a
-closed vocabulary, otherwise `{"skipped": "<reason>", "mode": "sync"}`.
+closed vocabulary, `{"mode": "per-document", "documents": <n>, <counters>,
+<cost fields>}` under any other (counters summed over every document's
+stage), and `{"skipped": "batch labeling is off (batch_label = false)",
+"mode": "sync"}` under `--no-batch-label`. When a per-document labeling stage
+fails as a whole, that document and every later one get a `label_error`; the
+run's job ends `failed`, and `dgml batch resume` relabels from the failed
+document onward, replaying everything served before it.
 `links` reads `{"skipped": "--no-semlinks"}` when the pass is off, and
 `{"skipped": "every link plan was cached"}` when no request was needed.
 `plan`, `plan_gaps`, `describe` and `style` appear only when that call ran
@@ -2593,7 +2607,7 @@ The pipeline's requests are deterministic, so the re-run reaches exactly where
 the paused run stopped, then polls the open batches once. If they are still
 running, it pauses again with nothing new submitted. Once they have ended, it
 collects them, submits the next wave and pauses on it. Synchronous calls the
-command makes (labeling under an open vocabulary) are recorded and replayed
+command makes (labeling under `--no-batch-label`) are recorded and replayed
 the same way, so they are paid for once.
 
 - **Same result as a blocking run.** A job driven to completion leaves the same
@@ -2635,7 +2649,10 @@ the same way, so they are paid for once.
   interrupt (Ctrl-C, a crash) leaves batches open for the resume to collect.
 - **Relative paths replay from the original directory.** `batch resume` runs
   the command from the directory it was first run in. Batch mode is recorded
-  explicitly (`--batch`), even when it came from `[generation] batch = true`.
+  explicitly (`--batch`), even when it came from `[generation] batch = true`;
+  so is `docset generate`'s labeling choice (`--batch-label` or
+  `--no-batch-label`), so editing `[generation] batch_label` between resumes
+  cannot switch a job half-way.
 - **One process at a time.** Running a job (its command with `--job`, `batch
   resume`, `cancel`, `delete`) takes the job's lease. A second process fails
   fast with `BATCH_JOB_BUSY`. `batch status` and `batch list` are read-only and

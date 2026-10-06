@@ -2542,7 +2542,13 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
     return rc
 
 
-def _start_batch_job(args: argparse.Namespace, ws: Workspace, *, command: str) -> Any:
+def _start_batch_job(
+    args: argparse.Namespace,
+    ws: Workspace,
+    *,
+    command: str,
+    pinned: Mapping[str, str | bool] | None = None,
+) -> Any:
     """Open this run's batch job session (every ``--batch`` run has one).
 
     A plain blocking ``--batch`` run gets a fresh job too, silently: it records
@@ -2559,6 +2565,17 @@ def _start_batch_job(args: argparse.Namespace, ws: Workspace, *, command: str) -
     # it explicitly so a resume replays in batch mode whatever the config says.
     if "--batch" not in argv:
         argv.append("--batch")
+    # Likewise every *pinned* option the run resolved from config (flag →
+    # value), unless the command line already gave it. A bool value pins a
+    # ``--flag/--no-flag`` pair: ``--flag`` for True, ``--no-flag`` for False.
+    for flag, value in (pinned or {}).items():
+        negated = f"--no-{flag[2:]}"
+        if any(t in (flag, negated) or t.startswith(f"{flag}=") for t in argv):
+            continue
+        if isinstance(value, bool):
+            argv.append(flag if value else negated)
+        else:
+            argv += [flag, value]
     log = _batch_log(args)
     session = start_session(
         ws,
@@ -2587,6 +2604,8 @@ def _start_batch_job(args: argparse.Namespace, ws: Workspace, *, command: str) -
 def _reject_job_flags_without_batch(args: argparse.Namespace) -> None:
     if getattr(args, "no_wait", False) or getattr(args, "job", None):
         raise BatchJobInvalid("--no-wait and --job are batch job options; they need --batch")
+    if getattr(args, "batch_label", None) is not None:
+        raise BatchJobInvalid("--no-batch-label is a batch option; it needs --batch")
 
 
 def _subcommands(parser: argparse.ArgumentParser) -> Mapping[str, argparse.ArgumentParser]:
@@ -3813,9 +3832,25 @@ def _add_generate_subparser(
         extra=(
             " Batches transcription, roster planning, concept descriptions, the "
             "semantic-link pass and (OCR files) the image-style pass. Labeling "
-            "batches every document at once under a closed --schema-path vocabulary "
-            "and stays synchronous under any other. Overrides [generation] batch in "
-            "the config; --no-batch forces synchronous."
+            "batches every document at once under a closed --schema-path vocabulary, "
+            "otherwise one document at a time in the synchronous order (identical "
+            "output; --no-batch-label labels synchronously instead). Overrides "
+            "[generation] batch in the config; --no-batch forces synchronous."
+        ),
+    )
+    gen.add_argument(
+        "--batch-label",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "--no-batch-label: under --batch, label with ordinary synchronous calls "
+            "(everything else still batches). Batch labeling is the default: all "
+            "documents at once under a closed --schema-path vocabulary, otherwise "
+            "one document at a time in the synchronous order (identical output at "
+            "batch price, about one batch round trip per document — pair it with "
+            "--no-wait and `dgml batch resume`); --no-batch-label trades that price "
+            "for latency. Overrides [generation] batch_label (default true). "
+            "Requires batch mode."
         ),
     )
 
@@ -4092,6 +4127,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         ConvertOptions,
         convert_batch,
         load_generation_batch,
+        load_generation_batch_label,
         resolve_generation_api_key,
         resolve_generation_config,
         resolve_generation_label_api_key,
@@ -4174,7 +4210,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     # always batches, and the labeling model always serves a batch stage too:
     # roster/gap planning and concept descriptions batch under every
     # vocabulary, the link pass uses it, and labeling itself batches under a
-    # closed one.
+    # closed one, or per document under any other (unless --no-batch-label).
     batch_opts: BatchOptions | None = None
     try:
         batch_enabled = args.batch if args.batch is not None else load_generation_batch(ws)
@@ -4184,18 +4220,26 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 batch_stages["style"] = style_config.model  # OCR files' image style
             if not args.no_semlinks:
                 batch_stages["links"] = label_model
+            batch_label = (
+                args.batch_label
+                if args.batch_label is not None
+                else load_generation_batch_label(ws)
+            )
             _batch_preflight(batch_stages)
             from dgml_core.batch.jobs import credential_ref
 
             batch_opts = BatchOptions(
                 poll_interval_s=args.batch_poll_interval,
+                label=batch_label,
                 log=_batch_log(args),
                 credentials={
                     "transcribe": credential_ref("generation", "transcribe", gen_cfg.api_key_env),
                     "label": credential_ref("generation", "label", gen_cfg.label_api_key_env),
                 },
             )
-            batch_job = _start_batch_job(args, ws, command="docset generate")
+            batch_job = _start_batch_job(
+                args, ws, command="docset generate", pinned={"--batch-label": batch_label}
+            )
             if batch_job.resumed:
                 _log.info(
                     f"[batch-job] resuming {batch_job.job_id} (run {batch_job.manifest.runs})"

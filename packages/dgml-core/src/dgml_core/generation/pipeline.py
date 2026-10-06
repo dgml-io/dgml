@@ -28,15 +28,19 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from dgml_core import llm
 from dgml_core.concurrency import map_concurrent
 from dgml_core.conversion import ConverterConfig
-from dgml_core.errors import short_error_message
+from dgml_core.errors import GenerationConfigInvalid, short_error_message
 from dgml_core.generation import document
 from dgml_core.generation.blocks import Block, Span
-from dgml_core.generation.config import LABEL_MODE_ALL_AT_ONCE, LABEL_MODE_SYNC
+from dgml_core.generation.config import (
+    LABEL_MODE_ALL_AT_ONCE,
+    LABEL_MODE_PER_DOCUMENT,
+    LABEL_MODE_SYNC,
+)
 from dgml_core.generation.label import (
     RosterEntry,
     _parse_labels_json,
@@ -110,21 +114,23 @@ class BatchOptions:
 
     Set :attr:`ConvertOptions.batch` to one of these to enable batch mode;
     ``None`` (the default) is the synchronous pipeline, untouched. Pass A
-    always batches, and so do Pass B's docset-wide calls (roster planning, gap
-    planning, concept descriptions). Labeling itself batches, every document
-    at once, only under a vocabulary the run cannot change (see
-    :func:`dgml_core.generation.label.is_batchable_vocab`); under any other it
-    runs with ordinary synchronous calls, because each document is prompted
-    with the roster the documents before it grew. The ``label`` stage's stats
-    carry ``mode``: ``"all-at-once"`` or ``"sync"`` (``LABEL_MODE_*`` in
-    :mod:`dgml_core.generation.config`). ``poll_interval_s``, ``max_poll_s``
-    and ``min_wave_size`` configure the :class:`dgml_core.batch.BatchExecutor`;
-    ``log`` receives its progress lines (defaults to the run's ``progress``
-    log).
+    always batches. Pass B labeling batches too unless ``label`` is ``False``
+    (then it runs with ordinary synchronous calls, under every vocabulary),
+    and the vocabulary picks how: every document at once under a vocabulary
+    the run cannot change (see
+    :func:`dgml_core.generation.label.is_batchable_vocab`), otherwise one
+    document at a time, in the serial order, with output byte-identical to
+    the synchronous run (see :func:`_per_document_labeler`). The ``label``
+    stage's stats carry ``mode``: ``"all-at-once"``, ``"per-document"`` or
+    ``"sync"`` (``LABEL_MODE_*`` in :mod:`dgml_core.generation.config`).
+    ``poll_interval_s``,
+    ``max_poll_s`` and ``min_wave_size`` configure the
+    :class:`dgml_core.batch.BatchExecutor`; ``log`` receives its progress
+    lines (defaults to the run's ``progress`` log).
 
     ``stats`` is an OUTPUT: :func:`convert_batch` fills it with one entry per
     stage it ran — ``WaveStats.to_json()`` for a batched stage, or
-    ``{"skipped": "<reason>", ...}`` for one that stayed synchronous — so the
+    ``{"skipped": "<reason>"}`` for one that stayed synchronous — so the
     caller can report what the batch path did without a signature change.
     """
 
@@ -139,6 +145,16 @@ class BatchOptions:
     #: batch job records with each provider batch (see
     #: :func:`dgml_core.batch.jobs.credential_ref`). Empty = none recorded.
     credentials: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Batch Pass B labeling (``[generation] batch_label``; the CLI's
+    #: ``--no-batch-label`` turns it off). ``False`` labels synchronously.
+    label: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, bool):
+            raise GenerationConfigInvalid(
+                f"BatchOptions.label must be true or false, got {self.label!r} "
+                f"({type(self.label).__name__})"
+            )
 
 
 def make_batch_executor(
@@ -188,7 +204,7 @@ def batch_single_call_runner(
     tagged with the tier that served it. A request the stage could not serve
     raises what the synchronous call would have (the call sites are
     best-effort and catch it); a stage-wide failure raises its error the same
-    way.
+    way; a paused job propagates.
 
     *api_key* / *api_base* are the labeling model's credentials (the config the
     call carries names the model)."""
@@ -221,22 +237,21 @@ def batch_single_call_runner(
 #: no entry yet).
 ROSTER_NOT_FIXED = "the roster can still change between documents"
 
-#: Reported when a pilot-staged run (unseeded, more documents than the pilot)
-#: labels: its roster changes between the two stages by design.
-PILOT_STAGED = "pilot-staged run: the roster changes between its two stages"
+#: The ``label`` stage's ``skipped`` reason when batch labeling is off.
+BATCH_LABEL_OFF = "batch labeling is off (batch_label = false)"
 
 
 def unbatchable_label_reason(
     vocab: TagVocab, roster: Mapping[str, RosterEntry] | None = None
 ) -> str | None:
-    """Why Pass B labeling stays synchronous under batch mode, or ``None`` when
-    it batches.
+    """Why Pass B stays serial under batch mode, or ``None`` when it batches.
 
-    With no *roster* only the vocabulary is judged; with one, this is exactly
+    With no *roster* (the CLI's pre-flight, before any roster exists) only
+    the vocabulary is judged; with one, this is exactly
     :func:`~dgml_core.generation.label.is_batchable_vocab`, phrased as a
     reason. Both halves come from
-    :func:`~dgml_core.generation.label.vocab_batch_blocker`, so the two
-    answers cannot diverge.
+    :func:`~dgml_core.generation.label.vocab_batch_blocker`, so the
+    pre-flight and the decision cannot diverge.
     """
     from dgml_core.generation.label import is_batchable_vocab, vocab_batch_blocker
 
@@ -535,12 +550,13 @@ def convert_batch(
             log("Pass B.1: no gap concepts planned; labeling may coin unbounded")
 
     batch_label = None
-    if opts.batch is not None and docs:
-        reason = unbatchable_label_reason(vocab)
-        if reason is None:
-            batch_label = _batch_labeler(docs, opts, opts.batch, label_config, log)
-        else:
-            _label_stays_sync(opts.batch, reason, log)
+    label_document = None
+    if opts.batch is not None and opts.batch.label:
+        batch_label = _batch_labeler(docs, opts, opts.batch, label_config, log)
+        label_document = _per_document_labeler(docs, opts, opts.batch, label_config, log)
+    elif opts.batch is not None and docs:
+        log(f"Pass B: labeling stays synchronous under batch mode ({BATCH_LABEL_OFF})")
+        opts.batch.stats["label"] = {"skipped": BATCH_LABEL_OFF, "mode": LABEL_MODE_SYNC}
     with llm.record_usage_for(label_config), single_calls_through(single_runner):
         label_documents(
             docs,
@@ -555,10 +571,8 @@ def convert_batch(
             on_label_error=on_label_error,
             on_off_schema=on_off_schema,
             batch_label=batch_label,
+            label_document=label_document,
         )
-    if batch_label is not None and opts.batch is not None and "label" not in opts.batch.stats:
-        # label_documents never offers a pilot-staged run to the hook.
-        _label_stays_sync(opts.batch, PILOT_STAGED, log)
 
     def _emit(item: tuple[str, list[Block]]) -> tuple[str, str]:
         # With dgml_header set, the product output is the final dg:chunk dgml
@@ -704,12 +718,6 @@ def _transcribe_batched(
 LabelResult = tuple[list[str], dict[str, str] | None, list[str]]
 
 
-def _label_stays_sync(batch: BatchOptions, reason: str, log: Callable[[str], None]) -> None:
-    """Record (and log) that Pass B labels with synchronous calls, and why."""
-    log(f"Pass B: labeling stays synchronous under batch mode ({reason})")
-    batch.stats["label"] = {"skipped": reason, "mode": LABEL_MODE_SYNC}
-
-
 def _batch_labeler(
     docs: Mapping[str, list[Block]],
     opts: ConvertOptions,
@@ -720,7 +728,8 @@ def _batch_labeler(
     """The ``batch_label`` hook :func:`label_documents` calls once its roster is
     built: label every document as one batch stage when the roster cannot
     change between documents (``mode: "all-at-once"``), else return ``None``
-    so the serial loop labels synchronously.
+    — the serial loop then labels one document per batch stage through
+    :func:`_per_document_labeler`.
 
     Every document shares *label_config*, as the serial loop does, so the
     documents' usage folds into the one labeling-pass row that
@@ -740,7 +749,8 @@ def _batch_labeler(
 
         reason = unbatchable_label_reason(vocab, roster)
         if reason is not None:
-            _label_stays_sync(batch, reason, log)
+            # _per_document_labeler takes over, one document per stage.
+            log(f"Pass B: labeling one document per batch stage, in order ({reason})")
             return None
         if not order:
             return {}
@@ -798,3 +808,99 @@ def _stage_failed_label(name: str, error: BaseException) -> LabelResult:
     code = str(getattr(error, "code", type(error).__name__))
     message = short_error_message(error)
     return [f"labeling {name} failed: {message}"], {"code": code, "message": message}, []
+
+
+def _per_document_labeler(
+    docs: Mapping[str, list[Block]],
+    opts: ConvertOptions,
+    batch: BatchOptions,
+    label_config: llm.LLMConfig,
+    log: Callable[[str], None],
+) -> Callable[[str, list[Block], dict[str, RosterEntry], TagVocab], LabelResult]:
+    """The ``label_document`` hook of :func:`label_documents` under batch
+    labeling: label ONE document as one batch stage (``mode: "per-document"``).
+    Only reached when the vocabulary can change between documents (or the run
+    is pilot-staged); otherwise :func:`_batch_labeler` labels them all at once.
+
+    Open-vocabulary labeling is serial because each document is prompted with
+    the roster as the documents before it left it; labeling them all at once
+    against a frozen roster measurably hurts cross-document consistency, so
+    it is never done. Instead :func:`label_documents` keeps its serial loop —
+    same order, pilot stage and ``_promote_pilot`` included — and calls this
+    hook for each document in turn: one :func:`~dgml_core.batch.run_stage`
+    over that document's :func:`label_document_steps`. Its chunks fan out
+    into one wave (they share the document's roster snapshot), the section
+    retry follows in the next, and the roster is updated in chunk order once
+    the document has finished — so every request, every label and the roster
+    handed to the next document are byte-identical to the synchronous run.
+    The price is latency: about one batch round trip per document (two when
+    a section retry or a bisect fires).
+
+    Usage is the synchronous run's: every document shares *label_config*, so
+    it folds, in document order, into ``convert_batch``'s one labeling-pass
+    row, marked ``tier="batch"`` by the driver. One executor serves every
+    document, so ``batch.stats["label"]`` is its cumulative
+    ``WaveStats.to_json()`` plus ``mode`` and ``documents``. A document whose
+    generator raises re-raises here, as the serial loop would. A failure of
+    the batch stage itself (``outcome.stage_error``) leaves that document —
+    and every later one, without another attempt — with a ``label_error``
+    carrying the failure, as the all-at-once labeler does. In job mode
+    (``--no-wait``) a pending wave pauses the whole run; the resume replays
+    every earlier document's stage from the job's store and continues.
+    """
+    executor: BatchExecutor | None = None
+    stage_failure: BaseException | None = None
+    labeled = 0
+
+    def label_one(
+        name: str, blocks: list[Block], roster: dict[str, RosterEntry], vocab: TagVocab
+    ) -> LabelResult:
+        nonlocal executor, stage_failure, labeled
+        from dgml_core.batch import Unit, run_stage
+        from dgml_core.generation.label import label_document_steps
+
+        if stage_failure is not None:
+            return _stage_failed_label(name, stage_failure)
+        if executor is None:
+            executor = make_batch_executor(
+                batch,
+                model=opts.label_model,
+                api_key=opts.label_api_key,
+                api_base=opts.label_api_base,
+                log=log,
+                role="label",
+            )
+        labeled += 1
+        log(f"Pass B: {name}: labeling as batch stage {labeled}/{len(docs)} (per document)")
+        unit = Unit(
+            name=name,
+            config=label_config,
+            steps=label_document_steps(
+                name,
+                blocks,
+                roster,
+                config=label_config,
+                cache_dir=opts.cache_dir,
+                debug=opts.debug,
+                log=log,
+                vocab=vocab,
+            ),
+        )
+        outcome = run_stage([unit], executor, log=log, stage="label")[name]
+        batch.stats["label"] = {
+            **executor.stats.to_json(),
+            "mode": LABEL_MODE_PER_DOCUMENT,
+            "documents": labeled,
+        }
+        if outcome.error is None:
+            return cast(LabelResult, outcome.result)
+        if not outcome.stage_error:
+            raise outcome.error
+        stage_failure = outcome.error
+        log(
+            f"Pass B: batch labeling failed at {name}; it and every later document "
+            f"stay unlabeled: {short_error_message(outcome.error)}"
+        )
+        return _stage_failed_label(name, outcome.error)
+
+    return label_one

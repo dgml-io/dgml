@@ -28,6 +28,7 @@ from dgml_core.generation import document as document_mod
 from dgml_core.storage import Workspace
 
 from .test_cli_batch_jobs import (
+    _PAGES,
     _drive_job,
     _generate_argv,
     _generation_answer,
@@ -63,9 +64,10 @@ def test_resumes_with_a_drifting_slicer_submit_each_wave_once(
         pendings, final = _drive_job(capsys, ws, first)
 
     # 3 transcription waves (the 3-page doc) + roster planning's draft and
-    # refine + the link pass's propose and verify, each once.
-    assert len(backend.submitted) == 3 + 2 + 2
-    assert len(pendings) == 3 + 2 + 2
+    # refine + one labeling wave per document + the link pass's propose and
+    # verify, each once.
+    assert len(backend.submitted) == 3 + 2 + len(_PAGES) + 2
+    assert len(pendings) == 3 + 2 + len(_PAGES) + 2
     records = list_jobs(Workspace(root=ws))[0].provider_batches
     assert all(r["state"] == "collected" for r in records)
 

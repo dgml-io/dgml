@@ -211,11 +211,33 @@ def load_generation_batch(workspace: Workspace) -> bool:
 
 #: ``batch.stages.label.mode`` in a batch run's payload: how Pass B labeled.
 #: ``all-at-once`` — every document as one batch stage (a closed vocabulary:
-#: the roster cannot change between documents); ``sync`` — ordinary
-#: synchronous calls (any other vocabulary: each document's labels extend the
-#: roster the next one is shown, so documents cannot be labeled together).
+#: the roster cannot change between documents); ``per-document`` — one batch
+#: stage per document, in the synchronous order (any other vocabulary: each
+#: document's labels extend the roster the next one is shown, so the output
+#: is byte-identical to a synchronous run); ``sync`` — ordinary synchronous
+#: calls (``[generation] batch_label = false`` / ``--no-batch-label``).
 LABEL_MODE_ALL_AT_ONCE = "all-at-once"
+LABEL_MODE_PER_DOCUMENT = "per-document"
 LABEL_MODE_SYNC = "sync"
+
+
+def load_generation_batch_label(workspace: Workspace) -> bool:
+    """The ``[generation] batch_label`` setting: whether batch mode batches
+    Pass B labeling too (absent means ``True``). The CLI's ``--no-batch-label``
+    overrides it. Only read under batch mode.
+
+    Strict boolean (:func:`~dgml_core.config.config_bool`, as
+    ``generation.batch``): anything else — a word like ``"sequential"``, a
+    number — raises :class:`GenerationConfigInvalid` rather than being guessed
+    at."""
+    section = load_merged_config(workspace).get(ConfigSection.GENERATION) or {}
+    value = section.get("batch_label", True) if isinstance(section, dict) else True
+    parsed = config_bool(value)
+    if parsed is None:
+        raise GenerationConfigInvalid(
+            f"generation.batch_label must be true or false, got {value!r} ({type(value).__name__})"
+        )
+    return parsed
 
 
 def load_generation_config(workspace: Workspace) -> GenerationConfig:

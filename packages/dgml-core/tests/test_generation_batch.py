@@ -40,7 +40,7 @@ from dgml_core.generation import label as label_mod
 from dgml_core.generation import transcribe as transcribe_mod
 from dgml_core.generation.config import load_generation_batch
 from dgml_core.generation.pipeline import (
-    PILOT_STAGED,
+    BATCH_LABEL_OFF,
     BatchOptions,
     ConvertOptions,
     convert_batch,
@@ -177,6 +177,7 @@ def _run(
     vocab: TagVocab | None = None,
     schema_text: str | None = None,
     logs: list[str] | None = None,
+    label: bool = True,
     pages: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Run convert_batch once; return everything observable about the run."""
@@ -188,7 +189,9 @@ def _run(
     if batch is not None:
         batch.answer = answer
     schema = parse_authored_schema(schema_text)[0] if schema_text else None
-    batch_opts = BatchOptions(poll_interval_s=0, min_wave_size=1) if batch is not None else None
+    batch_opts = (
+        BatchOptions(poll_interval_s=0, min_wave_size=1, label=label) if batch is not None else None
+    )
     outputs: dict[str, str] = {}
     errors: dict[str, str] = {}
     convert_batch(
@@ -309,32 +312,25 @@ def test_batch_run_is_indistinguishable_from_sync_under_closed_vocab(
     assert stats["transcribe"]["batch_ok"] == sum(_PAGES.values())
     assert stats["transcribe"]["waves"] == max(_PAGES.values())
     assert stats["label"]["requests"] == len(_PAGES)  # labeling batched: roster fixed
-    assert stats["label"]["mode"] == "all-at-once"
-    assert stats["label"]["batch_ok"] == len(_PAGES)
     assert fake_provider.built and all(b.submitted for b in fake_provider.built)
 
 
-def test_open_vocab_labeling_stays_synchronous_and_says_why(
+def test_no_batch_label_keeps_labeling_synchronous_and_says_why(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
 ) -> None:
-    """Under an open vocabulary each document is labeled against the roster
-    the documents before it grew, so labeling runs with synchronous calls;
-    transcription and roster planning still batch, and the output is the
-    synchronous run's."""
-    from dgml_core.generation.label import vocab_batch_blocker
-    from dgml_core.generation.vocab import OPEN_VOCAB
-
+    """``label=False`` (``--no-batch-label``): open-vocabulary labeling runs with
+    synchronous calls; everything else still batches."""
     answer = make_answer()
     sync = _run(tmp_path / "sync", answer, monkeypatch, batch=None)
     logs: list[str] = []
-    batch = _run(tmp_path / "batch", answer, monkeypatch, batch=fake_provider, logs=logs)
+    batch = _run(
+        tmp_path / "batch", answer, monkeypatch, batch=fake_provider, logs=logs, label=False
+    )
 
     assert batch["outputs"] == sync["outputs"]
     assert batch["files"] == sync["files"]
     assert _comparable(batch["rows"]) == _comparable(sync["rows"])
-    reason = vocab_batch_blocker(OPEN_VOCAB)
-    assert reason is not None
-    assert batch["stats"]["label"] == {"skipped": reason, "mode": "sync"}
+    assert batch["stats"]["label"] == {"skipped": BATCH_LABEL_OFF, "mode": "sync"}
     assert any("labeling stays synchronous under batch mode" in line for line in logs)
     # Transcription and roster planning (draft, then refine) batched; the
     # labeling calls stay standard-tier, so the pass's row splits by tier.
@@ -343,8 +339,6 @@ def test_open_vocab_labeling_stays_synchronous_and_says_why(
     tiers = {(row["operation"], row["tier"]) for row in batch["rows"]}
     assert ("transcribe", "batch") in tiers and ("transcribe", "standard") not in tiers
     assert {t for op, t in tiers if op == "label"} == {"batch", "standard"}
-    batched = [r for b in fake_provider.built for w in b.submitted for r in w]
-    assert not [r for r in batched if _system_text(r.kwargs) == label_mod.SYSTEM_PROMPT]
 
 
 def _coining(answer: Callable[[dict[str, Any]], Any]) -> Callable[[dict[str, Any]], Any]:
@@ -432,24 +426,215 @@ def test_extend_schema_gap_planning_batches_and_matches_sync(
     assert gap_rows  # the gap-planning scope's row, billed at batch price
 
 
-def test_a_pilot_staged_run_labels_synchronously_and_says_why(
+def test_a_pilot_staged_run_labels_per_document(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
 ) -> None:
-    """An unseeded run over more documents than the pilot holds changes its
-    roster between the two stages, so labeling is never batched there, even
-    under a closed vocabulary — and the stage says why."""
+    """An unseeded run over more documents than the pilot holds is never
+    labeled all at once (its roster changes between the two stages), so it
+    labels one document per batch stage — and says so."""
     monkeypatch.setattr(label_mod, "_PILOT_MAX_DOCS", 1)  # two documents: staged
+    logs: list[str] = []
+    batch = _run(tmp_path / "batch", make_answer(), monkeypatch, batch=fake_provider, logs=logs)
+    assert any("pilot stage" in line for line in logs)
+    label = batch["stats"]["label"]
+    assert label["mode"] == "per-document" and label["documents"] == len(_PAGES)
+
+
+@pytest.mark.parametrize("closed", [False, True], ids=["open", "closed"])
+def test_no_batch_label_labels_synchronously_under_every_vocabulary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider, closed: bool
+) -> None:
+    """``label=False`` turns batch labeling off even where it would batch every
+    document at once (a closed vocabulary): no labeling request reaches the
+    batch endpoint, the output is the synchronous run's, and the stage reports
+    ``mode: "sync"``."""
+    kwargs: dict[str, Any] = (
+        {"vocab": _closed_vocab(), "schema_text": _CLOSED_SCHEMA} if closed else {}
+    )
+    sync = _run(tmp_path / "sync", make_answer(), monkeypatch, batch=None, **kwargs)
+    batch = _run(
+        tmp_path / "batch", make_answer(), monkeypatch, batch=fake_provider, label=False, **kwargs
+    )
+    assert batch["outputs"] == sync["outputs"]
+    assert batch["files"] == sync["files"]
+    assert batch["stats"]["label"] == {"skipped": BATCH_LABEL_OFF, "mode": "sync"}
+    batched = [r for b in fake_provider.built for w in b.submitted for r in w]
+    assert not [r for r in batched if _system_text(r.kwargs) == label_mod.SYSTEM_PROMPT]
+    assert batched  # transcription still batched
+
+
+def _rich_answer(kwargs: dict[str, Any]) -> Any:
+    """:func:`make_answer` with every labeling path in play: page 1 of each
+    document opens with a heading the first labeling pass leaves untagged (so
+    the section retry runs), a listing of more than two blocks comes back
+    unparseable (so the chunk bisects), and concepts are coined from the text
+    (so each document's labels change the roster the next one is shown)."""
+    system, user = _system_text(kwargs), _user_text(kwargs)
+    if system == transcribe_mod.SYSTEM_PROMPT:
+        match = _HEADER_RE.search(user)
+        assert match is not None, user
+        first, _last, total = (int(g) for g in match.groups())
+        blocks: list[dict[str, Any]] = [
+            {"structure": "p", "text": f"Fee{total} applies on page {first}."},
+            {"structure": "p", "text": f"Term{first} lasts {total} months."},
+        ]
+        if first == 1:
+            blocks.insert(0, {"structure": "heading", "text": f"Part {total}", "level": 2})
+        return _reply(json.dumps({"continues": "", "blocks": blocks}))
+    if system == label_mod.SYSTEM_PROMPT:
+        lines = _LISTING_RE.findall(user)
+        if "left unlabeled" in user:
+            labels = {i: {"concept": "PartTitle"} for i, _s, _t in lines}
+            return _reply(json.dumps({"labels": labels}))
+        if len(lines) > 2:
+            return _reply("{ not valid json ,,,")
+        labels = {
+            i: {"concept": t.split()[0].rstrip("0123456789")}
+            for i, kind, t in lines
+            if kind != "heading"
+        }
+        return _reply(json.dumps({"labels": labels}))
+    return make_answer()(kwargs)
+
+
+_LISTING_RE = re.compile(r"(?m)^(b\d{4}) (\w+)(?: \[[^]]*\])?: (.*)$")
+
+
+def _label_requests(sent: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """``(document, canonical request)`` for every labeling request, in order."""
+    out = []
+    for kwargs in sent:
+        if _system_text(kwargs) == label_mod.SYSTEM_PROMPT:
+            doc = re.search(r"== (.+?) ==", _user_text(kwargs))
+            assert doc is not None
+            out.append((doc.group(1), json.dumps(kwargs, sort_keys=True, default=repr)))
+    return out
+
+
+def _merged_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Rows per operation with tier-split parts summed back together: what a
+    batch run must agree with the sync run on (the split itself is the tier)."""
+    numeric = ("cost_usd", "prompt_tokens", "completion_tokens", "total_tokens")
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        context = {k: v for k, v in row["context"].items() if k != "tier_split"}
+        key = row["operation"] + json.dumps(context, sort_keys=True)
+        if key not in out:
+            out[key] = dict.fromkeys(numeric, 0)
+        for k in numeric:
+            out[key][k] += row[k] or 0
+    return {k: {f: pytest.approx(v) for f, v in vals.items()} for k, vals in out.items()}
+
+
+def _by_doc(reqs: list[tuple[str, str]]) -> list[tuple[str, list[str]]]:
+    """Requests grouped into consecutive runs per document (each run sorted)."""
+    grouped: list[tuple[str, list[str]]] = []
+    for doc, req in reqs:
+        if not grouped or grouped[-1][0] != doc:
+            grouped.append((doc, []))
+        grouped[-1][1].append(req)
+    return [(doc, sorted(r)) for doc, r in grouped]
+
+
+@pytest.mark.parametrize("pilot", [False, True], ids=["unstaged", "pilot-staged"])
+def test_per_document_batch_labeling_is_indistinguishable_from_sync_under_open_vocab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider, pilot: bool
+) -> None:
+    """Batch labeling (the default) under an open vocabulary: through the batch
+    endpoint, one document per stage, ends byte-identical to the sync run —
+    with several chunks per document, a bisect, a section retry, a growing
+    roster and (parametrized) the pilot stage."""
+    monkeypatch.setattr(label_mod, "_MAX_CHUNK_CHARS", 70)  # several chunks per document
+    pages = {"alpha.pdf": 1, "bravo.pdf": 3, "charlie.pdf": 2}
+    monkeypatch.setattr(sys.modules[__name__], "_PAGES", pages)
+    if pilot:
+        monkeypatch.setattr(label_mod, "_PILOT_MAX_DOCS", 2)
+    sent: list[dict[str, Any]] = []
+
+    def answer(kwargs: dict[str, Any]) -> Any:
+        sent.append(kwargs)
+        return _rich_answer(kwargs)
+
+    sync = _run(tmp_path / "sync", answer, monkeypatch, batch=None)
+    sync_label = _label_requests(sent)
+    sent.clear()
     logs: list[str] = []
     batch = _run(
         tmp_path / "batch",
-        make_answer(),
+        answer,
         monkeypatch,
         batch=fake_provider,
         logs=logs,
-        vocab=_closed_vocab(),
     )
-    assert any("pilot stage" in line for line in logs)
-    assert batch["stats"]["label"] == {"skipped": PILOT_STAGED, "mode": "sync"}
+    batch_requests = [
+        r.kwargs for backend in fake_provider.built for wave in backend.submitted for r in wave
+    ]
+    batch_label = _label_requests(batch_requests)
+
+    # The run exercised what it claims to.
+    assert any("left unlabeled" in req for _doc, req in sync_label)  # section retry
+    assert any(name.endswith("_unparseable.txt") for name in sync["files"])  # bisect
+    assert any("pilot stage" in line for line in logs) is pilot
+
+    # Same documents in the same order, the same requests per document.
+    assert _by_doc(batch_label) == _by_doc(sync_label)
+    assert len(_by_doc(sync_label)) == len(pages)  # each document labeled once, contiguously
+
+    assert batch["outputs"] == sync["outputs"]
+    assert batch["files"] == sync["files"]  # label raws and inputs, roster, blocks
+    assert batch["schema_json"] == sync["schema_json"]
+    assert batch["errors"] == sync["errors"] == {}
+    assert _merged_rows(batch["rows"]) == _merged_rows(sync["rows"])
+    assert "batch" in {r["tier"] for r in batch["rows"] if r["operation"] == "label"}
+
+    stats = batch["stats"]["label"]
+    assert stats["mode"] == "per-document" and stats["documents"] == len(pages)
+    assert stats["requests"] == stats["batch_ok"] == len(batch_label)
+    assert stats["waves"] >= len(pages)  # at least one wave per document
+    assert stats["waves"] < len(batch_label)  # a document's chunks shared a wave
+
+
+def test_per_document_labeling_composes_with_batched_planning_and_descriptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
+) -> None:
+    """Every Pass B call batched at once: roster planning (draft, refine), each
+    document's labeling as its own stage, then the description of the concept
+    labeling coined — in that order, each stage reported, the whole labeling
+    pass one ``batch`` row (no tier split), and every byte the sync run's."""
+    answer = _coining(make_answer())
+    sync = _run(tmp_path / "sync", answer, monkeypatch, batch=None)
+    batch = _run(tmp_path / "batch", answer, monkeypatch, batch=fake_provider)
+    assert batch["outputs"] == sync["outputs"]
+    assert "Salutation" in sync["outputs"]["bravo.pdf"]
+    assert batch["files"] == sync["files"]
+    assert batch["schema_json"] == sync["schema_json"]
+    assert b"an opening greeting" in (batch["schema_json"] or b"")
+    assert _comparable(batch["rows"]) == _comparable(sync["rows"])
+    label_rows = [r for r in batch["rows"] if r["operation"] == "label"]
+    assert len(label_rows) == 1 and label_rows[0]["tier"] == "batch"
+    assert "tier_split" not in label_rows[0]["context"]
+
+    names = {
+        transcribe_mod.SYSTEM_PROMPT: "transcribe",
+        label_mod.PLAN_SYSTEM_PROMPT: "plan",
+        label_mod.SYSTEM_PROMPT: "label",
+        prompt("describe_concepts"): "describe",
+    }
+    waves = [
+        {names[_system_text(r.kwargs)] for r in wave}
+        for backend in fake_provider.built
+        for wave in backend.submitted
+    ]
+    stage_waves = [w for w in waves if w != {"transcribe"}]
+    assert stage_waves == [{"plan"}, {"plan"}, *([{"label"}] * len(_PAGES)), {"describe"}]
+
+    stats = batch["stats"]
+    assert set(stats) >= {"transcribe", "plan", "label", "describe"}
+    assert stats["plan"]["batch_ok"] == stats["plan"]["requests"] == 2
+    assert stats["label"]["mode"] == "per-document"
+    assert stats["label"]["documents"] == len(_PAGES)
+    assert stats["describe"]["batch_ok"] == stats["describe"]["requests"] == 1
+    assert all(s.get("sync_fallbacks", 0) == 0 for s in stats.values())
 
 
 def test_batch_labeling_batches_a_closed_vocab_all_at_once(
@@ -466,6 +651,54 @@ def test_batch_labeling_batches_a_closed_vocab_all_at_once(
     label = batch["stats"]["label"]
     assert label["mode"] == "all-at-once"
     assert label["requests"] == len(_PAGES) and label["waves"] == 1
+
+
+def test_per_document_label_stage_failure_leaves_every_document_unlabeled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
+) -> None:
+    """A batch-level failure on the first document's stage is a label error for
+    it and for every later document (no further attempt), not a lost run."""
+
+    def factory(_cfg: Any) -> FakeBackend:
+        backend = _Outage(fake_provider.script, provider="anthropic")
+        # Executors in creation order: transcription, roster planning, then
+        # labeling — the third and later ones lose the provider.
+        backend.accept = 0 if len(fake_provider.built) >= 2 else 10**6
+        fake_provider.built.append(backend)
+        return backend
+
+    register_backend("anthropic", factory)
+    batch = _run(tmp_path / "batch", make_answer(), monkeypatch, batch=fake_provider)
+    assert set(batch["outputs"]) == set(_PAGES)
+    assert all("Greeting" not in xml for xml in batch["outputs"].values())
+    assert batch["stats"]["label"]["documents"] == 1  # one try, then every doc gives up
+    assert batch["stats"]["plan"]["batch_ok"] == 2  # planning was served; labeling failed
+
+
+def test_batch_options_label_is_a_strict_bool() -> None:
+    assert BatchOptions().label is True
+    for bad in ("sequential", "true", 1, None):
+        with pytest.raises(GenerationConfigInvalid, match=r"BatchOptions\.label must be"):
+            BatchOptions(label=bad)  # type: ignore[arg-type]
+
+
+def test_generation_batch_label_config_key(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dgml_core.generation.config import load_generation_batch_label
+
+    config = workspace.root.joinpath("config.toml")
+    assert load_generation_batch_label(workspace) is True  # absent: batch labeling on
+    for raw, expected in (("false", False), ("true", True), ('"no"', False)):
+        config.write_text(f"[generation]\nbatch_label = {raw}\n")
+        assert load_generation_batch_label(workspace) is expected
+    for bad in ('"sequential"', '"sync"', "1", '"parallel"'):
+        config.write_text(f"[generation]\nbatch_label = {bad}\n")
+        with pytest.raises(GenerationConfigInvalid, match=r"generation\.batch_label must be"):
+            load_generation_batch_label(workspace)
+    config.write_text("")
+    monkeypatch.setenv("DGML_GENERATION__BATCH_LABEL", " False ")
+    assert load_generation_batch_label(workspace) is False
 
 
 def test_failed_transcription_is_dropped_with_the_sync_error(
@@ -597,7 +830,7 @@ def test_generation_batch_env_var_rejects_a_non_boolean(
 
 
 def test_preflight_and_decision_share_one_batchability_rule() -> None:
-    """The vocabulary-only answer (no roster yet) and the pipeline's
+    """The CLI pre-flight (vocabulary only, no roster yet) and the pipeline's
     decision (vocabulary and roster) come from one rule, so a vocabulary the
     pre-flight clears is never refused later for a vocabulary reason, and a
     vocabulary it refuses is never batched."""
