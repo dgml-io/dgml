@@ -30,6 +30,8 @@ from .docsets import DocSetStore
 from .errors import (
     AttestationInvalid,
     AuthError,
+    BatchExecutionFailed,
+    BatchUnavailable,
     ChainConfigError,
     ChainRpcFailed,
     ChainTxReverted,
@@ -170,6 +172,7 @@ from .workspaces_store import WorkspacesConfig, WorkspacesStore, default_workspa
 
 if TYPE_CHECKING:
     from .consistency import CheckReport, Issue, check_workspace
+    from .generation.link_stage import LinkOutcome, LinkStage, StagedDocument
 
 __version__ = "0.1.0"
 
@@ -187,10 +190,15 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 #: times per session (bill extraction) spend that entire budget on an unused
 #: client. Importing ``dgml_core.consistency`` directly, or touching any name
 #: below, still loads it exactly as before.
+#: The semantic-link stage is lazy for the same reason, and so that
+#: ``dgml_core.batch`` is never on the default import path.
 _LAZY_SUBMODULES = {
     "CheckReport": ".consistency",
     "Issue": ".consistency",
     "check_workspace": ".consistency",
+    "LinkOutcome": ".generation.link_stage",
+    "LinkStage": ".generation.link_stage",
+    "StagedDocument": ".generation.link_stage",
 }
 
 
@@ -225,6 +233,8 @@ __all__ = [
     "AttestationInvalid",
     "AttestationInventory",
     "AuthError",
+    "BatchExecutionFailed",
+    "BatchUnavailable",
     "BlobStore",
     "ChainConfigError",
     "ChainRpcFailed",
@@ -270,7 +280,9 @@ __all__ = [
     "Issue",
     "LabelModelUnreachable",
     "LegacyConfigPresent",
+    "LinkOutcome",
     "LinkPlanFailed",
+    "LinkStage",
     "LocalDirWorkspacesStore",
     "LocalStore",
     "Migration",
@@ -296,6 +308,7 @@ __all__ = [
     "SchemaGenerationFailed",
     "SchemaInvalid",
     "SchemaNotFound",
+    "StagedDocument",
     "StorageBackendMismatch",
     "StorageConfig",
     "StorageConfigInvalid",

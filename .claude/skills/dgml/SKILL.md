@@ -530,6 +530,28 @@ sees the previous window's tail). The calls are network-bound, so threads
 overlap the latency. Raise it on high-RPM paid tiers; set `1` to serialize
 if you hit 429s.
 
+**Batch mode (half price, slow).** For offline or bulk runs where nobody is
+waiting on the result, add `--batch`. It sends transcription, roster
+planning, concept descriptions, OCR image style (when `[style]` is enabled)
+and the semantic-link pass through the provider's batch API at half the token
+price; results can take up to 24 hours per wave, and a long document needs
+one wave per window. Labeling batches too under a closed `--schema-path`
+vocabulary (every document at once); under an open or `--extend-schema`
+vocabulary it stays synchronous, because each document is labeled against
+the tags the documents before it coined. The output is the same as a
+synchronous run. Only `anthropic/` models have a batch backend; any other
+model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
+anything. The payload's `batch.stages` block reports what each stage did,
+including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report
+the saving without `--debug`.
+
+```bash
+uv run dgml docset generate "$ds" --batch --schema-path ./po-tags.json | jq .batch
+```
+
+Never use `--batch` on an interactive request: use it for nightly or bulk
+ingestion.
+
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
 a `dg:origin` bounding-box attribute (`<page> <x1> <y1> <x2> <y2>`,

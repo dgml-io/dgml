@@ -413,3 +413,104 @@ def _isolate_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-home"))
     monkeypatch.setenv(WORKSPACES_ENV_VAR, str(tmp_path / "dgml-workspaces"))
     default_workspaces_store.cache_clear()
+
+
+# --- LLM call capture (shared by the llm / generation / grounded suites) ------
+
+
+class FakeLLMResponse(dict):  # type: ignore[type-arg]
+    """A canned completion response usable by every ``dgml_core.llm`` wrapper.
+
+    The wrappers read responses two ways — ``call`` / ``call_with_refinement``
+    subscript (``response["choices"][0]["message"]["content"]``) while
+    ``call_continued`` / ``call_with_tools`` use attributes
+    (``response.choices[0].message.content``, ``.finish_reason``,
+    ``.tool_calls``) — and :func:`dgml_core.usage.extract_cost_and_tokens`
+    reads ``.usage`` / ``._hidden_params``. One object serves all three.
+    """
+
+    def __init__(
+        self,
+        text: str,
+        *,
+        finish_reason: str = "stop",
+        tool_calls: list[Any] | None = None,
+        cost: float | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> None:
+        from types import SimpleNamespace
+
+        super().__init__(choices=[{"message": {"content": text}, "finish_reason": finish_reason}])
+        self.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(content=text, tool_calls=tool_calls),
+                finish_reason=finish_reason,
+            )
+        ]
+        self._hidden_params: dict[str, Any] = {}
+        if cost is not None:
+            self._hidden_params["response_cost"] = cost
+        total = (
+            None
+            if prompt_tokens is None and completion_tokens is None
+            else (prompt_tokens or 0) + (completion_tokens or 0)
+        )
+        self.usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total,
+            cache_read_input_tokens=cache_read_tokens,
+            cache_creation_input_tokens=cache_creation_tokens,
+        )
+
+
+class CapturedLLMCalls:
+    """What :func:`capture_kwargs` recorded: every kwargs dict the call layer
+    handed to ``_completion_with_retry`` (deep-copied at capture time, so later
+    mutation of a reused ``messages`` list cannot rewrite history), in call
+    order."""
+
+    def __init__(self) -> None:
+        self.kwargs: list[dict[str, Any]] = []
+
+
+@pytest.fixture
+def capture_kwargs(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Record the completion kwargs each ``dgml_core.llm`` call site builds.
+
+    Monkeypatches ``dgml_core.llm._completion_with_retry`` — the single seam
+    every wrapper (``call``, ``call_continued``, ``call_with_refinement``,
+    ``call_with_tools``) and every ``steps_*`` driver goes through — so no
+    network call happens and no retry/backoff runs. Usage: install canned
+    responses, run the code under test, then assert on ``captured.kwargs``::
+
+        captured = capture_kwargs([FakeLLMResponse("draft"), FakeLLMResponse("final")])
+        llm.call_with_refinement(cfg, ...)
+        assert captured.kwargs[1]["messages"][2]["content"] == "draft"
+
+    ``responses`` is either a sequence consumed in order (a request beyond the
+    end raises ``AssertionError`` naming the overflow) or a callable receiving
+    the kwargs and returning the response.
+    """
+    import copy
+
+    from dgml_core import llm as llm_mod
+
+    def _install(responses: Any) -> CapturedLLMCalls:
+        captured = CapturedLLMCalls()
+        queue = None if callable(responses) else list(responses)
+
+        def fake_completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
+            captured.kwargs.append(copy.deepcopy(kwargs))
+            if queue is None:
+                return responses(kwargs)
+            assert queue, f"capture_kwargs: request #{len(captured.kwargs)} has no canned response"
+            return queue.pop(0)
+
+        monkeypatch.setattr(llm_mod, "_completion_with_retry", fake_completion_with_retry)
+        return captured
+
+    return _install
