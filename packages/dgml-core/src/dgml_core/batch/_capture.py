@@ -20,20 +20,23 @@ and every litellm-only kwarg (``num_retries``, ``extra_headers``,
 ``metadata``, ``caching``, … anything ``LLMConfig.extra`` passes through) is
 handled by litellm itself rather than by a second, drifting encoder here.
 
-The seam is :data:`HTTPX_HANDLER`: litellm's own ``HTTPHandler``, a real
-subclass whose ``post`` records its arguments, so litellm's
-``isinstance(client, HTTPHandler)`` routing hands it the request exactly as it
-would its module-level client (the route litellm takes for Anthropic). A
-provider whose litellm route goes through another HTTP stack adds its own seam
-here when its backend lands.
+Two seams, because litellm routes providers through two HTTP stacks:
 
-The seam answers with the backend's canned ``reply`` (a minimal,
+* :data:`HTTPX_HANDLER` — litellm's own ``HTTPHandler`` (Anthropic).
+  A real subclass whose ``post`` records its arguments, so litellm's
+  ``isinstance(client, HTTPHandler)`` routing hands it the request exactly as
+  it would its module-level client.
+* :data:`OPENAI_SDK` — an ``openai.OpenAI`` client (OpenAI) whose ``httpx``
+  transport records the serialized request.
+
+Either way the seam answers with the backend's canned ``reply`` (a minimal,
 valid provider response), so litellm finishes on its ordinary success path —
 no failure hooks, no retries — and the result is discarded.
 
 **Nothing reaches the network, whatever route litellm takes.** The seam is
 only where litellm is *expected* to send; some calls it routes elsewhere
-through its own HTTP stack, ignoring the injected client. So for the duration of a capture
+through its own HTTP stack, ignoring the injected client (litellm 1.85 bridges
+some OpenAI chat calls to ``/v1/responses``). So for the duration of a capture
 the capturing thread cannot do network I/O at all: ``httpx``'s real
 transports, socket connects and DNS lookups raise (:func:`_network_blocked`;
 other threads are untouched). Any such attempt fails the capture with
@@ -63,9 +66,11 @@ V = TypeVar("V")
 
 class CaptureSeam(StrEnum):
     HTTPX_HANDLER = "httpx_handler"
+    OPENAI_SDK = "openai_sdk"
 
 
 HTTPX_HANDLER = CaptureSeam.HTTPX_HANDLER
+OPENAI_SDK = CaptureSeam.OPENAI_SDK
 
 
 class CaptureFailed(Exception):
@@ -236,6 +241,29 @@ def _httpx_handler(sink: list[CapturedRequest], reply: Mapping[str, Any]) -> Any
     return _Handler(client=httpx.Client(transport=httpx.MockTransport(refuse)))
 
 
+def _openai_client(
+    sink: list[CapturedRequest], reply: Mapping[str, Any], api_key: str | None
+) -> Any:
+    import httpx
+    import openai
+
+    def record(request: httpx.Request) -> httpx.Response:
+        sink.append(
+            CapturedRequest(
+                url=str(request.url),
+                body=_decode_body(request.read()),
+                headers={str(k): str(v) for k, v in request.headers.items()},
+            )
+        )
+        return httpx.Response(200, json=dict(reply))
+
+    return openai.OpenAI(
+        api_key=api_key or "dry-run",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(record)),
+    )
+
+
 def capture_sync_request(
     kwargs: Mapping[str, Any],
     *,
@@ -253,7 +281,7 @@ def capture_sync_request(
     retried. ``kwargs`` itself is left untouched.
 
     ``expect_path`` is the URL path suffix of the endpoint the backend encodes
-    for (e.g. ``"/v1/messages"``):
+    for (``"/chat/completions"``, ``"/v1/messages"``):
     a request litellm addressed anywhere else raises :class:`CaptureFailed`.
     Any network attempt made while litellm runs is refused and fails the
     capture (see the module docstring).
@@ -266,9 +294,11 @@ def capture_sync_request(
     params["api_key"] = params.get("api_key") or api_key or "dry-run"
     params["num_retries"] = 0
     sink: list[CapturedRequest] = []
-    if seam is not CaptureSeam.HTTPX_HANDLER:  # pragma: no cover - one seam today
-        raise ValueError(f"unknown capture seam {seam!r}")
-    client = _httpx_handler(sink, reply)
+    client = (
+        _openai_client(sink, reply, params["api_key"])
+        if seam is CaptureSeam.OPENAI_SDK
+        else _httpx_handler(sink, reply)
+    )
     params["client"] = client
     error: Exception | None = None
     with _network_blocked() as refused:

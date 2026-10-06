@@ -159,7 +159,7 @@ PER FILE (each file must be offered the DocSets created for the files
 before it), so a directory of N files takes N round trips of minutes to
 hours each — prefer `existing` for a big curated ingest. `--batch` works
 only on a directory with `--auto-classify` and only for Anthropic
-(`anthropic/…`) models; otherwise it fails before adding anything
+(`anthropic/…`) or OpenAI (`openai/…`) models; otherwise it fails before adding anything
 (`INVALID_ARGUMENT` / `BATCH_UNAVAILABLE`). The entries are the same as
 without it, plus a top-level `batch` block.
 
@@ -562,9 +562,12 @@ run with `--no-wait` (below). The output is the same as a synchronous run.
 Add `--no-batch-label` (or `batch_label = false` under `[generation]`) to
 label with ordinary synchronous calls when latency matters more than the
 labeling half of the bill; the payload's `batch.stages.label.mode` says which
-ran (`all-at-once`, `per-document` or `sync`). Only `anthropic/` and `gemini/` models have a batch
-backend; any other model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
-anything. The payload's `batch.stages` block reports what each stage did,
+ran (`all-at-once`, `per-document` or `sync`). Only `anthropic/`, `gemini/`
+and `openai/` models have a batch backend; any other model, and an OpenAI
+model litellm serves through the Responses API (`gpt-5-pro`, `o3-pro`,
+`codex`; gpt-5.4+ for schema generation and extraction), fails fast with
+`BATCH_UNAVAILABLE`, naming the stage, before spending anything. The
+payload's `batch.stages` block reports what each stage did,
 including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report
 the saving without `--debug`.
 
@@ -818,7 +821,9 @@ uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count
 #    Add --batch when nobody is waiting on the answer (a backfill, a nightly
 #    re-extract): both LLM phases go through the provider's batch API at about
 #    half price, but results take minutes to hours (up to 24h; 48h on Gemini).
-#    Only Anthropic and Gemini models can batch; anything else fails fast
+#    Only Anthropic, Gemini and OpenAI chat-mode models can batch (gpt-5.4+
+#    is refused here: litellm sends its extraction calls to the Responses
+#    API); anything else fails fast
 #    with BATCH_UNAVAILABLE and nothing is sent. One file id with --batch keeps the single-file payload
 #    above (plus a `batch` block), not `summary`/`results`. Every `batch` block
 #    reports `cost_usd`, `standard_cost_usd` and `saved_usd`.

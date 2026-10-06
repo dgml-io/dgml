@@ -14,9 +14,9 @@
 
 :func:`call_with_retries` runs one provider call with bounded, backed-off
 retries under the :mod:`dgml_core.batch._policy` rules. The call is any
-zero-argument callable: a raw ``httpx`` request returns a
-:class:`httpx.Response` whose status is checked here; an SDK call returns its
-object or raises, and the status / transport error is
+zero-argument callable: a raw ``httpx`` request (Anthropic) returns a
+:class:`httpx.Response` whose status is checked here; an SDK call (OpenAI via
+litellm) returns its object or raises, and the status / transport error is
 read off the exception. So the create-safety rule — never resend a create
 whose acceptance is not disproved — is one piece of code for all providers.
 

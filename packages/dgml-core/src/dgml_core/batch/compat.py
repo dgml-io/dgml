@@ -13,8 +13,9 @@
 """The litellm versions the built-in batch backends are verified against.
 
 The backends build and decode batch requests with litellm INTERNALS — the
-``HTTPHandler.post`` capture seam and each provider's response transformer
-(``AnthropicConfig.transform_parsed_response``, and for Gemini
+``HTTPHandler.post`` and OpenAI-client capture seams and each provider's
+response transformer (``AnthropicConfig.transform_parsed_response``,
+``convert_to_model_response_object``, and for Gemini
 ``GoogleAIStudioGeminiConfig._transform_google_generate_content_to_openai_model_response``)
 — so that a batch request is byte-for-byte the request the synchronous path
 sends. None of that is public API.
