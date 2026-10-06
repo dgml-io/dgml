@@ -27,6 +27,11 @@ dead:
   ``EMPTY_DOCSET``, ``NO_FILES`` and ``VALUES_NOT_FOUND`` are domain
   preconditions that become classes when their operations move out of
   ``cli.py``.
+
+Three batch-job signals, :class:`BatchPending`,
+:class:`BatchJobNondeterministic` and :class:`BatchJobLeaseLost`, derive from
+``BaseException`` rather than :class:`DgmlError`, so per-item ``except
+Exception`` handlers cannot swallow them; they still carry a ``code``.
 """
 
 from __future__ import annotations
@@ -301,6 +306,118 @@ class EmptyModelResponse(DgmlError):
 
 class OcrFailed(DgmlError):
     code = "OCR_FAILED"
+
+
+class BatchUnavailable(DgmlError):
+    """Batch mode was requested for a model it cannot serve.
+
+    Raised at resolve time — before any request is sent — when the model's
+    provider (as litellm resolves it) has no registered batch backend, or the
+    backend's optional dependency is not installed. The message names the
+    model and the provider; for an unregistered provider it lists the
+    providers that do have a backend, and for a missing dependency it quotes
+    the install hint the backend registered, when it registered one. Batch
+    mode never falls back to a full-price synchronous run.
+    """
+
+    code = "BATCH_UNAVAILABLE"
+
+
+class BatchExecutionFailed(DgmlError):
+    """A submitted batch could not be brought to completion.
+
+    Raised by the batch executor when a batch is still not finished after the
+    executor's polling deadline (it is cancelled first so no further spend
+    accrues), when the provider accepted none of a wave's batches, or when a
+    batch create's outcome is unknown or was refused at the account's rate
+    limit or quota. A per-request failure inside an otherwise delivered batch
+    is NOT this error: those are retried or executed synchronously.
+    """
+
+    code = "BATCH_EXECUTION_FAILED"
+
+
+class BatchJobNotFound(DgmlError):
+    """No batch job with the given id exists in this workspace (``--job`` or a
+    ``dgml batch`` subcommand named one that was never created here)."""
+
+    code = "BATCH_JOB_NOT_FOUND"
+
+
+class BatchJobInvalid(DgmlError):
+    """A batch job cannot be used the way it was asked to be: resuming a job
+    that already completed, continuing it with a different command than the one
+    that created it, running it again while it has an unacknowledged
+    ``uncertain`` batch create (the batch may exist; ``dgml batch cancel``
+    acknowledges it), or ``--job``/``--no-wait`` without batch mode."""
+
+    code = "BATCH_JOB_INVALID"
+
+
+class BatchJobBusy(DgmlError):
+    """Another process holds this batch job's lease (it is resuming, polling or
+    canceling the job right now). Retry once it finishes, or after the lease
+    expires; ``dgml batch unlock <job_id>`` breaks a lease left by a process
+    that died."""
+
+    code = "BATCH_JOB_BUSY"
+
+
+class BatchJobLeaseLost(BaseException):
+    """This run lost its batch job's lease while running: the lease was broken
+    (``dgml batch unlock``) or taken by another process. So that only one
+    runner drives a job at a time, a run that finds its lease gone stops at
+    once — before its next provider submission, synchronous model call or
+    manifest write — and leaves the job to the lease's holder. Nothing it
+    already submitted is lost: every batch it created is recorded in the job.
+
+    Same ``code`` as :class:`BatchJobBusy` (the job is in use by another
+    process). A :class:`BaseException`, like :class:`BatchJobNondeterministic`,
+    so the pipeline's per-item ``except Exception`` catch-alls cannot turn it
+    into a soft failure and let the run carry on."""
+
+    code = "BATCH_JOB_BUSY"
+
+
+class BatchJobNondeterministic(BaseException):
+    """A resumed batch job would pay again for work it already has in flight.
+
+    Raised, before anything is submitted, when a resume's requests for a stage
+    match nothing the job stored or has in flight while the job still has an
+    open provider batch at those very positions — the signature of an input
+    that is rebuilt differently on every run, which would otherwise submit
+    (and bill) the same wave once per resume. The message names the stage and
+    the units. If an input really did change on purpose, cancel the job's open
+    batches (``dgml batch cancel <job_id>``) and resume.
+
+    Not a :class:`DgmlError` (nor an :class:`Exception`), for the same reason
+    as :class:`BatchPending`: the pipeline's per-document catch-alls turn any
+    ``Exception`` into a soft per-file error and the command would carry on.
+    The guard travels past them to the CLI, which reports it as the run's one
+    outcome (an error envelope, exit 1). Once it fires, the job session also
+    refuses every further provider call
+    (:meth:`dgml_core.batch.jobs.JobSession.refuse_if_halted`)."""
+
+    code = "BATCH_JOB_NONDETERMINISTIC"
+
+
+class BatchPending(BaseException):
+    """A ``--no-wait`` batch run submitted its work and stopped to wait.
+
+    Not a :class:`DgmlError` or even an :class:`Exception`: the pipeline has
+    many per-document "a failure must never lose the output" catch-alls that
+    turn any ``Exception`` into a soft per-file error. A paused job is not a
+    failure, so it travels past them like ``KeyboardInterrupt`` does, up to the
+    CLI, which reports the job id as a success payload.
+    """
+
+    code = "BATCH_PENDING"
+
+    def __init__(self, job_id: str, *, submitted_batches: int, requests_in_flight: int) -> None:
+        super().__init__(f"batch job {job_id} is waiting on the provider")
+        self.job_id = job_id
+        self.submitted_batches = submitted_batches
+        self.requests_in_flight = requests_in_flight
 
 
 class ClassificationConfigMissing(DgmlError):
