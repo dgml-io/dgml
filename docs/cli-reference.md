@@ -892,6 +892,7 @@ into `<stem>.dgml.xml` regardless.
 | `--no-semlink-verify` | off | Skip the second, skeptical pass that reviews each proposed link. The link pass then makes one model call per document instead of two, which cuts its wall-clock time by about 60%, and keeps roughly twice as many links — including the weaker ones the review would have dropped. Use it when you want breadth and speed over precision. Reviewed and unreviewed results are cached separately. |
 | `--batch` / `--no-batch` | `[generation] batch`, else off | Send the batchable model calls through the provider's batch API: half the price per token, but results can take up to 24 hours. See **Batch mode** below and [batch-mode.md](batch-mode.md). `--no-batch` forces the synchronous pipeline even when the config enables batch mode. |
 | `--batch-poll-interval <seconds>` | `30` | Seconds between batch status checks under `--batch`. Must be positive. |
+| `--no-wait` / `--job <job_id>` | off | Batch job mode (requires batch mode): `--no-wait` submits a wave and exits with a `batch_job` payload; `--job` continues a job. See [Batch jobs](#batch-jobs---no-wait-and-dgml-batch). |
 
 **Document-level resume.** If a file's per-(docset, file)
 `<stem>.dgml.xml` already holds a generated document tree, that file is
@@ -1437,7 +1438,7 @@ is refused before the model is called.
 
 #### Several files, and `--batch`
 
-`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--batch] [--batch-poll-interval SECONDS]`
+`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--batch] [--batch-poll-interval SECONDS] [--no-wait] [--job JOB_ID]`
 
 With more than one file id, or `--all` (every file in the DocSet), the command
 extracts each file independently and returns one entry per file. A file that
@@ -2526,6 +2527,230 @@ filter was requested, `dgml discover` warns on stderr and falls back to
 
 `FILE_NOT_FOUND`, `DOCSET_NOT_FOUND`, `NOT_FOUND` (no generated DGML XML),
 `INVALID_ARGUMENT` (bad filter name or empty ids).
+
+## Batch jobs (`--no-wait` and `dgml batch`)
+
+A `--batch` run blocks until every wave has come back, and a wave can take up
+to 24 hours. A **batch job** lets the command stop as soon as a wave is
+submitted, and be continued later: by hand, from a cron entry, or by an agent.
+Every command that takes `--batch` (`dgml docset generate`, `dgml extraction
+generate-schema`, `dgml extraction extract` and `dgml file add <dir>
+--auto-classify`) also takes:
+
+| Flag | Meaning |
+|---|---|
+| `--no-wait` | Submit the current wave, check it once, and exit if it is still running. |
+| `--job <job_id>` | Continue an existing job (normally passed by `dgml batch resume`). |
+
+Both require batch mode; without it they fail with `BATCH_JOB_INVALID`.
+
+**A paused run is not an error.** It prints this payload on stdout and exits
+`0`:
+
+```json
+{
+  "batch_job": {
+    "job_id": "bj_3f9a1c07d2e4",
+    "status": "pending",
+    "command": "docset generate",
+    "submitted_batches": 1,
+    "requests_in_flight": 12,
+    "resume": "dgml batch resume bj_3f9a1c07d2e4"
+  }
+}
+```
+
+A run that finishes prints the command's normal payload. Its `batch` block
+gains a `replayed` count (requests served from the job's store) when it is not
+zero.
+
+**A job left behind is named in the payload.** When a run ends but leaves a
+failed, resumable job (a stage outage, a batch it had to cancel, an uncertain
+create), including the silent job of a plain blocking `--batch` run, its
+`batch` block gains a `job` entry (created if the payload has no `batch`
+block):
+
+```json
+"batch": {"...": "the command's counters",
+          "job": {"job_id": "bj_3f9a1c07d2e4", "status": "failed",
+                  "resume": "dgml batch resume bj_3f9a1c07d2e4"}}
+```
+
+A run that fails with an error envelope carries the same object as
+`error.details.batch.job`. The entry is absent whenever the run finished its
+job, so a successful run's payload is unchanged.
+
+**How resuming works.** A job never saves the pipeline's in-flight state. It
+saves every response it receives, keyed by a digest of the request, and a
+resume re-runs the whole command:
+
+- a request already answered is served from the store, with no provider call;
+- a request inside a provider batch that is still open is collected from that
+  batch, never resubmitted;
+- anything else is submitted as a new batch.
+
+The pipeline's requests are deterministic, so the re-run reaches exactly where
+the paused run stopped, then polls the open batches once. If they are still
+running, it pauses again with nothing new submitted. Once they have ended, it
+collects them, submits the next wave and pauses on it. Synchronous calls the
+command makes (labeling under an open vocabulary) are recorded and replayed
+the same way, so they are paid for once.
+
+- **Same result as a blocking run.** A job driven to completion leaves the same
+  DGML, cache files and `usage.jsonl` rows as one blocking `--batch` run. Runs
+  that end paused write no DGML and no usage rows; the run that completes the
+  job writes each document's row once, billing every response exactly once.
+- **Inputs are pinned.** `docset generate` rewrites some of its own inputs
+  mid-run (`schema.json`, `concept_roster.json`, each document's
+  `_blocks.json`); a resumed run restores them to what the job started from.
+  `file add` ingests the directory on the first run only. PDF page slices and
+  documents converted on demand are not byte-reproducible, so a job records
+  each one the first time it is made and replays those exact bytes.
+- **Changed inputs are detected.** A request whose content changed since the
+  job started gets a new digest, so it is submitted afresh rather than served
+  a stale response. Its superseded provider batch, if still open, is canceled.
+- **Never paying twice for drifted inputs.** If a resume's requests for a
+  stage match nothing the job stored or has in flight while open provider
+  batches still cover those positions, the resume stops with
+  `BATCH_JOB_NONDETERMINISTIC` before submitting anything, and the open
+  batches are kept. The run's only output is that error envelope (exit 1);
+  `details.batch.job` names the job, left `failed`. If an input really did
+  change, run `dgml batch cancel <job_id>` and then `dgml batch resume
+  <job_id>`.
+- **Job-wide totals.** The `batch` block of the run that completes a job
+  counts provider work over every run of the job: `batches`, `batch_ids`,
+  `batch_ok`, `sync_fallbacks`, `resubmitted` and `failed` are summed, while
+  `waves`, `requests` and `replayed` are the final run's. A job that took more
+  than one run adds `runs` and `this_run` (that run's counters alone).
+- **Every `--batch` run is a job.** A plain blocking `--batch` run records its
+  responses under a job too, silently: its payload is unchanged, and if it
+  crashes mid-wave, `dgml batch resume` picks up the submitted batches instead
+  of paying again. Under `--verbose` the run names its job on stderr when it
+  starts; otherwise find it with `dgml batch list`. When the blocking run
+  finishes, its job is deleted.
+- **No batch is left running.** When a run ends for any reason other than
+  pausing or an interrupt, every provider batch the job still has open is
+  collected if it has finished, otherwise canceled so it stops billing; the
+  job then ends `failed` and a resume submits those requests again. An
+  interrupt (Ctrl-C, a crash) leaves batches open for the resume to collect.
+- **Relative paths replay from the original directory.** `batch resume` runs
+  the command from the directory it was first run in. Batch mode is recorded
+  explicitly (`--batch`), even when it came from `[generation] batch = true`.
+- **One process at a time.** Running a job (its command with `--job`, `batch
+  resume`, `cancel`, `delete`) takes the job's lease. A second process fails
+  fast with `BATCH_JOB_BUSY`. `batch status` and `batch list` are read-only and
+  take no lease. A running command renews the lease every minute; it expires
+  10 minutes after the last renewal. A live run whose lease is broken (`batch
+  unlock`) or taken over stops at its next submission, model call or manifest
+  write with `BATCH_JOB_BUSY` (`error.details.lease_lost: true`), billing
+  nothing more.
+- **Retention.** A completed job keeps only a small manifest summary. A run
+  that asked the provider for nothing leaves no job. Remove finished jobs with
+  `dgml batch prune`, and one job with `dgml batch delete`.
+- **What is stored**: see `batches/` in [storage-layout.md](storage-layout.md).
+  Never an API key: requests are stored only as digests, a provider batch
+  records where its key came from (config section, environment variable name),
+  and a stored response keeps no provider headers.
+
+### `dgml batch resume <job_id>`
+
+Re-run the job's command, as it was first invoked (abbreviated flags stored in
+full), from the directory it was first run in, continuing the job. Prints the
+command's own output: another `batch_job` payload if it paused again, the
+normal payload if it finished. Fails with `BATCH_JOB_INVALID` when the job
+already completed, when its stored command line no longer parses, when its
+original directory no longer exists, or when it has an unacknowledged
+`uncertain` batch create.
+
+**Short-circuit while nothing has ended.** For a `--no-wait` job whose open
+provider batches are all still running, `batch resume` does not re-run the
+command: it polls those batches once (read-only, as `batch status` does) and
+returns the same pending `batch_job` payload a pausing run prints, exit 0. Any
+other state re-runs the command.
+
+### `dgml batch status <job_id>`
+
+Poll each of the job's open provider batches once and report their state,
+without running the command. **Read-only**: it takes no lease and writes
+nothing, so it works while another process runs the job and right after a
+crash. `status` is `ready` when the job is pending and every open batch has
+ended (a resume will make progress without waiting).
+
+```json
+{
+  "job_id": "bj_3f9a1c07d2e4", "command": "docset generate", "status": "ready",
+  "created_at": "2026-09-25T02:00:00Z", "updated_at": "2026-09-25T03:10:00Z",
+  "runs": 2, "requests_in_flight": 12, "error": null,
+  "lease": {"held_by": "48213-1f0c9a2e", "expires_at": "2026-09-25T03:14:00Z",
+            "stale": true},
+  "batches": [
+    {"batch_id": "msgbatch_01...", "provider": "anthropic", "requests": 12,
+     "state": "open", "done": true,
+     "last_status": {"state": "ended", "succeeded": 12, "errored": 0,
+                     "expired": 0, "canceled": 0, "processing": 0}}
+  ]
+}
+```
+
+A batch's `state` is `open`, `collected`, `dropped` (canceled), or `uncertain`:
+a batch create whose outcome is unknown, so the batch may exist and be billing.
+An `uncertain` batch has a placeholder `batch_id` (`uncertain_…`) and an
+`error`; the job refuses to run again until `dgml batch cancel` acknowledges
+it. A `dropped` batch reports `cleanup`: `done` once deleted at the provider,
+`pending` while its cancel has not settled. A batch that cannot be polled
+reports an `error`; one the provider no longer knows (404) reports `"done":
+true, "gone": true`. `lease` is `null` when no process holds the job;
+`stale: true` means the holder is gone.
+
+### `dgml batch list`
+
+Every job in the workspace, newest first: `{"jobs": [...]}`, each entry the
+fields of `status` above without `batches` and `lease` (with the stored
+`status`: `pending`, never `ready`). Read-only.
+
+### `dgml batch cancel <job_id>`
+
+Cancel the job's open provider batches, acknowledge every `uncertain` batch
+(its entry gets `"acknowledged": true`), and mark the job `failed`. A later
+`batch resume` submits those requests again at batch price. Prints the
+`status` payload plus `"canceled": true|false`; a batch the provider would not
+cancel stays `open` with an `error` and `canceled` is `false`. A batch that
+had already ended is collected instead (its responses kept for a resume).
+
+### `dgml batch delete <job_id> [--force]`
+
+Delete the job's stored state. Refused with `BATCH_JOB_INVALID` while the job
+has open provider batches; `--force` cancels them first, and if any cancel
+fails nothing is deleted (`BATCH_EXECUTION_FAILED`). Prints `{"job_id",
+"deleted": true, "batches": [...]}`.
+
+### `dgml batch prune [--older-than DAYS]`
+
+Delete every finished job: completed, or failed with no open provider batch
+and no unacknowledged `uncertain` batch. Jobs another process holds are kept.
+`--older-than` keeps jobs updated within the last DAYS days (default `0`).
+Prints `{"deleted": [...], "kept": [...]}`, plus `"cleanup_pending": [...]`
+for a job kept because a canceled batch of it still awaits deletion at the
+provider.
+
+### `dgml batch unlock <job_id>`
+
+Break the job's lease, whoever holds it. Use it when the process that held it
+is gone (`batch status` shows `lease.stale: true`). Prints `{"job_id",
+"unlocked": true|false}`.
+
+**Overnight pattern:**
+
+```bash
+job=$(dgml docset generate "$DOCSET" --batch --no-wait | jq -r .batch_job.job_id)
+# cron, every 30 minutes: resume only when it will make progress.
+case "$(dgml batch status "$job" | jq -r .status)" in
+  ready) dgml batch resume "$job" ;;
+  pending) ;;                                     # the provider is still working
+  completed) ;;                                   # done: remove the cron entry
+  failed) dgml batch status "$job" | jq .error ;; # read why before resuming
+esac
+```
 
 ## Chain attestation commands
 

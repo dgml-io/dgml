@@ -570,6 +570,28 @@ uv run dgml docset generate "$ds" --batch --schema-path ./po-tags.json | jq .bat
 Never use `--batch` on an interactive request: use it for nightly or bulk
 ingestion.
 
+**Don't hold a process open for a day: use job mode.** Add `--no-wait` to any
+`--batch` command (`docset generate`, `extraction extract`, `extraction
+generate-schema`, `file add <dir>`): it submits the wave and exits 0 with a
+`batch_job` payload. Check with `dgml batch status <job_id>` (read-only) and
+run `dgml batch resume <job_id>` only when it says `ready`; each resume
+replays what came back at no cost, collects open batches (never resubmits)
+and pauses on the next wave, until the command's normal payload comes back.
+A blocking `--batch` run that crashed is resumable the same way (`dgml batch
+list` shows its job). Stop resuming once status is `completed`.
+
+```bash
+job=$(uv run dgml docset generate "$ds" --batch --no-wait | jq -r .batch_job.job_id)
+uv run dgml batch status "$job" | jq -r .status   # pending | ready | completed | failed
+uv run dgml batch resume "$job"                   # when ready
+uv run dgml batch prune                           # drop finished jobs
+```
+
+`BATCH_JOB_BUSY` means another process holds the job (after a crash,
+`dgml batch unlock <job_id>` once `batch status` shows `lease.stale: true`).
+`BATCH_JOB_NONDETERMINISTIC` means the inputs changed under an open batch:
+`dgml batch cancel <job_id>` then resume.
+
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
 a `dg:origin` bounding-box attribute (`<page> <x1> <y1> <x2> <y2>`,

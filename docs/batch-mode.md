@@ -179,6 +179,25 @@ least ten transcription round trips. That is why batch mode is for work nobody
 is waiting on. Leave it off for interactive runs and for a handful of
 documents, where the savings are cents.
 
+## Job mode
+
+For runs too long to keep a process waiting, add `--no-wait`: the command
+submits its wave and exits with a `batch_job` payload naming a job.
+`dgml batch resume <job_id>` continues it; responses already received are
+replayed at no cost and batches still open are collected, never resubmitted.
+
+```bash
+dgml extraction extract <docset_id> --all --batch --no-wait   # prints a job id
+# then, from cron every 15–30 minutes:
+dgml batch status <job_id>    # read-only: ready / pending / completed / failed
+dgml batch resume <job_id>    # when status is ready
+```
+
+A plain blocking `--batch` run keeps a job too, silently, so a run that
+crashes mid-wave can be resumed instead of paying again. See
+[Batch jobs](cli-reference.md#batch-jobs---no-wait-and-dgml-batch) for every
+`dgml batch` subcommand and payload.
+
 ## What the run reports
 
 Without `--batch`, output and JSON payloads are byte-identical to a synchronous
@@ -266,7 +285,15 @@ tier, marked `context.tier_split: true`.
   written with a `label_error`, and a failed link stage gives each document a
   `link_error` and still writes it. In `extraction extract` and `file add`, a
   file still in flight gets `BATCH_EXECUTION_FAILED` as its entry. Batch mode
-  does not silently rerun the whole wave at full price.
+  does not silently rerun the whole wave at full price. The run's job ends
+  `failed` with every response it received kept, and the payload's `batch`
+  block names it (`"job": {"job_id", "status": "failed", "resume"}`):
+  `dgml batch resume <job_id>` picks the work up once the provider is back.
+- **The process dies mid-wave** (a crash, `kill -9`, a reboot). Its batches
+  stay open at the provider. `dgml batch status <job_id>` shows them and the
+  dead process's lease (`stale` once it expires, 10 minutes after its last
+  renewal; `dgml batch unlock` clears it at once), and `dgml batch resume`
+  collects them without submitting anything twice.
 
 ## Configuration
 
@@ -277,6 +304,8 @@ tier, marked `context.tier_split: true`.
 | `[generation] batch = true` | Make batch mode the default for `docset generate` in this workspace. Anything but a boolean is `GENERATION_CONFIG_INVALID`. |
 | `DGML_GENERATION__BATCH=true` | The same, from the environment (`true`/`false`, `1`/`0`, `yes`/`no`). |
 | `--batch-poll-interval SECONDS` | Seconds between batch status checks (default 30). |
+| `--no-wait` | Submit the wave and exit; continue with `dgml batch resume <job_id>`. |
+| `--job JOB_ID` | Continue an existing job (what `dgml batch resume` passes). |
 
 ## Measuring before and after
 
