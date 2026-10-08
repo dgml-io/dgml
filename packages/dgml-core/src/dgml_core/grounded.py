@@ -52,6 +52,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -98,6 +99,7 @@ from .llm import (
     _mark_document_cacheable,
     call_with_tools,
     is_anthropic_model,
+    is_request_too_large,
     model_max_output_tokens,
 )
 from .matching import (
@@ -110,6 +112,7 @@ from .matching import (
 )
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .ocr import _image_dimensions as _png_dimensions
+from .pages import PdfConfig, load_pdf_config, pdf_page_count_bytes, slice_pages
 from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
@@ -123,6 +126,8 @@ from .usage import (
     add_partial,
     record_usage,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---- Constants ------------------------------------------------------------
 
@@ -464,6 +469,12 @@ def generate_schema(
     to fit *all* of them, not just one. Callers (the CLI) decide how
     to pick the sample.
 
+    If the provider refuses the request as too large, every sample stays in
+    it but the largest are cut to their leading pages (a fair share of half
+    what was just sent), the model is told which samples are partial, and the
+    call is retried. A sample whose first page alone exceeds its share is
+    left out with a warning. A request the provider accepts is unchanged.
+
     Raises :class:`SchemaGenerationFailed` on any non-config failure
     (no files, missing PDF, malformed LLM response, network error).
     """
@@ -474,20 +485,10 @@ def generate_schema(
 
     # Read every PDF up front so a permission/missing-file error fails
     # the call before we burn an LLM API request.
-    pdf_blocks: list[dict[str, Any]] = []
-    for fid in file_ids:
-        pdf_bytes = _pdf_bytes(workspace, fid)
-        pdf_blocks.append(_pdf_content_block(pdf_bytes))
+    originals = [(fid, _pdf_bytes(workspace, fid)) for fid in file_ids]
+    samples = [_SchemaSample(fid, pdf) for fid, pdf in originals]
 
     api_key = _resolve_api_key(config.schema_api_key, config.schema_api_key_env)
-    user_content: list[dict[str, Any]] = [
-        {"type": "text", "text": _schema_user_prompt(len(file_ids))},
-    ]
-    user_content.extend(pdf_blocks)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": prompt(PromptKey.SCHEMA_SYSTEM)},
-        {"role": "user", "content": user_content},
-    ]
     tools = [_submit_schema_tool()]
     # max_tokens=None so the wrapper doesn't add the max_tokens alias alongside
     # max_completion_tokens. reasoning_effort is set unconditionally; the
@@ -508,22 +509,45 @@ def generate_schema(
         context={"from_file_ids": list(file_ids)},
     )
 
-    try:
-        result = call_with_tools(
-            llm_config,
-            messages=messages,
-            tools=tools,
-            tool_choice={"type": "function", "function": {"name": _TOOL_SUBMIT_SCHEMA}},
-            # Deliberately NOT cached: the cacheable prefix is tools + system,
-            # and this system prompt is well short of the provider's minimum
-            # cacheable prefix, so a breakpoint would create no entry. Schema
-            # generation also runs once per docset, so there is no reuse to
-            # capture even if it did.
-        )
-    except Exception as exc:
-        raise SchemaGenerationFailed(
-            f"schema generation call failed: {type(exc).__name__}: {exc}"
-        ) from exc
+    pdf_config: PdfConfig | None = None
+    while True:
+        try:
+            result = call_with_tools(
+                llm_config,
+                messages=_schema_messages(samples),
+                tools=tools,
+                tool_choice={"type": "function", "function": {"name": _TOOL_SUBMIT_SCHEMA}},
+                # Deliberately NOT cached: the cacheable prefix is tools + system,
+                # and this system prompt is well short of the provider's minimum
+                # cacheable prefix, so a breakpoint would create no entry. Schema
+                # generation also runs once per docset, so there is no reuse to
+                # capture even if it did.
+            )
+            break
+        except Exception as exc:
+            if not is_request_too_large(exc):
+                raise SchemaGenerationFailed(
+                    f"schema generation call failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            if pdf_config is None:
+                try:
+                    pdf_config = load_pdf_config(workspace)
+                except Exception as config_exc:
+                    raise SchemaGenerationFailed(
+                        f"schema generation call failed: {type(exc).__name__}: {exc} "
+                        f"The samples could not be trimmed: {config_exc}"
+                    ) from exc
+            # Halve what the refused request carried; samples are cut from the
+            # originals each round, so the budget only ever shrinks.
+            budget = sum(_b64_len(len(sample.pdf)) for sample in samples) // 2
+            samples = _fit_samples(workspace, originals, budget, pdf_config)
+            if not samples:
+                raise SchemaGenerationFailed(
+                    f"the planning documents are too large for one schema request to "
+                    f"{config.schema_model!r}, even trimmed to their first page: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+    _warn_trimmed_samples(file_ids, samples)
     fields = _parse_submit_call(result.response, expected_tool=_TOOL_SUBMIT_SCHEMA, field="fields")
 
     if not isinstance(fields, list):
@@ -532,6 +556,134 @@ def generate_schema(
         return field_tree_to_rnc(fields, workspace=workspace.organization, docset_name=docset_name)
     except SchemaInvalid as exc:
         raise SchemaGenerationFailed(f"LLM returned an invalid field tree: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class _SchemaSample:
+    """A planning document as sent to schema generation: the whole PDF, or
+    (``pages_sent`` set) its first ``pages_sent`` of ``total_pages`` pages."""
+
+    file_id: str
+    pdf: bytes
+    pages_sent: int | None = None
+    total_pages: int | None = None
+
+
+def _schema_messages(samples: list[_SchemaSample]) -> list[dict[str, Any]]:
+    user_content: list[dict[str, Any]] = [
+        {"type": "text", "text": _schema_user_prompt(len(samples))},
+    ]
+    excerpts = [
+        f"- Sample {i} (pages 1-{s.pages_sent} of {s.total_pages})"
+        for i, s in enumerate(samples, start=1)
+        if s.pages_sent is not None
+    ]
+    if excerpts:
+        # Only on a retry after the provider refused the request as too large.
+        user_content.append(
+            {
+                "type": "text",
+                "text": prompt(PromptKey.SCHEMA_USER_EXCERPTS).format(excerpts="\n".join(excerpts)),
+            }
+        )
+    user_content.extend(_pdf_content_block(s.pdf) for s in samples)
+    return [
+        {"role": "system", "content": prompt(PromptKey.SCHEMA_SYSTEM)},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _b64_len(n: int) -> int:
+    """Length of the base64 encoding of *n* bytes."""
+    return 4 * ((n + 2) // 3)
+
+
+def _fit_samples(
+    workspace: Workspace,
+    originals: list[tuple[str, bytes]],
+    budget: int,
+    pdf_config: PdfConfig,
+) -> list[_SchemaSample]:
+    """The planning documents cut to fit *budget* base64 bytes between them.
+
+    The budget is shared max-min fairly: a document within an equal share is
+    sent whole, and the larger ones split what is left and are sent as the
+    leading pages that fit their share (sliced with the workspace's PDF engine
+    and measured, since pages differ in size). A document whose first page
+    alone exceeds its share is left out. Order is kept.
+    """
+    sizes = {fid: _b64_len(len(pdf)) for fid, pdf in originals}
+    shares: dict[str, int] = {}
+    remaining, left = budget, len(originals)
+    for fid, _pdf in sorted(originals, key=lambda item: sizes[item[0]]):
+        share = remaining // left
+        shares[fid] = min(sizes[fid], share)
+        remaining -= shares[fid]
+        left -= 1
+
+    fitted: list[_SchemaSample] = []
+    for fid, pdf in originals:
+        share = shares[fid]
+        if sizes[fid] <= share:
+            fitted.append(_SchemaSample(fid, pdf))
+            continue
+        sample = _leading_pages(workspace, fid, pdf, share, pdf_config)
+        if sample is not None:
+            fitted.append(sample)
+    return fitted
+
+
+def _leading_pages(
+    workspace: Workspace, file_id: str, pdf: bytes, share: int, pdf_config: PdfConfig
+) -> _SchemaSample | None:
+    """The longest leading page range of *pdf* found to fit *share* base64
+    bytes, or ``None`` when even page 1 does not."""
+    count = FileStore(workspace).get(file_id).page_count
+    if not isinstance(count, int) or count <= 0:
+        try:
+            count = pdf_page_count_bytes(pdf)
+        except Exception:
+            return None  # unreadable, so it cannot be cut; it is already too big whole
+    if count <= 1:
+        return None
+    whole = _b64_len(len(pdf))
+    pages = max(1, min(count - 1, count * share // whole))
+    while True:
+        try:
+            sliced = slice_pages(pdf, range(1, pages + 1), config=pdf_config, total_pages=count)
+        except Exception as exc:
+            raise SchemaGenerationFailed(
+                f"could not cut file '{file_id}' to its first {pages} pages to fit the "
+                f"schema request: {type(exc).__name__}: {exc}"
+            ) from exc
+        size = _b64_len(len(sliced))
+        if size <= share:
+            return _SchemaSample(file_id, sliced, pages_sent=pages, total_pages=count)
+        if pages == 1:
+            return None
+        pages = max(1, min(pages - 1, pages * share // size))
+
+
+def _warn_trimmed_samples(file_ids: list[str], samples: list[_SchemaSample]) -> None:
+    """Warn about the samples a too-large request cost: those sent partial and
+    those left out. Silent when every sample went whole."""
+    sent = {s.file_id for s in samples}
+    for fid in file_ids:
+        if fid not in sent:
+            logger.warning(
+                "schema generation: left out file %s; even its first page did not fit "
+                "in the request",
+                fid,
+            )
+    partial = [
+        f"{s.file_id} (pages 1-{s.pages_sent} of {s.total_pages})" for s in samples if s.pages_sent
+    ]
+    if partial:
+        logger.warning(
+            "schema generation: the samples were too large for one request; sent the "
+            "leading pages of %s",
+            ", ".join(partial),
+        )
 
 
 def _schema_user_prompt(n_files: int) -> str:

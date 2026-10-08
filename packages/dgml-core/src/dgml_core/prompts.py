@@ -47,6 +47,7 @@ class PromptKey(StrEnum):
     SCHEMA_USER_INTRO_SINGLE = "extraction_schema_user_intro_single"
     SCHEMA_USER_INTRO_MULTI = "extraction_schema_user_intro_multi"
     SCHEMA_USER_BODY = "extraction_schema_user_body"
+    SCHEMA_USER_EXCERPTS = "extraction_schema_user_excerpts"
 
     # Extraction: value extraction, phase 1 (values + page numbers)
     VALUES_PHASE1_SYSTEM = "extraction_values_phase1_system"
