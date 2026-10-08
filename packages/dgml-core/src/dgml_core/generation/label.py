@@ -41,6 +41,7 @@ from typing import Any
 
 from dgml_core import llm
 from dgml_core.errors import LabelModelUnreachable, short_error_message
+from dgml_core.generation import single_calls
 from dgml_core.generation.blocks import Block, Node, Span, build_tree, sanitize_concept
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.generation.schema import VALID_KINDS, Schema, SchemaTag, sanitize_tag_name
@@ -53,7 +54,7 @@ _SNIPPET_CHARS = 160
 # Bounds on one labeling call, whichever hits first: a block count and a
 # text-size budget on the rendered listing (a dense chunk's JSON reply would
 # otherwise grow too large to come back valid). Overflow past both is split on a
-# parse failure — see _label_chunk.
+# parse failure — see _label_chunk_steps.
 _MAX_BLOCKS_PER_CALL = 1200
 _MAX_CHUNK_CHARS = 20000
 _ROSTER_MAX_ENTRIES = 400
@@ -1014,7 +1015,8 @@ def plan_concept_roster(
             # Two-turn grounded build: draft the roster, then have the model
             # ADD recurring roles it missed, grounded on the same skeletons.
             # Add-only — no synonym merging — so it can only raise recall.
-            draft_raw, raw = llm.call_with_refinement(
+            draft_raw, raw = single_calls.call_with_refinement(
+                single_calls.STAGE_PLAN_GAPS if gap_mode else single_calls.STAGE_PLAN,
                 config,
                 system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
@@ -1026,7 +1028,8 @@ def plan_concept_roster(
             )
         else:
             # Single-call roster: the draft only, without the add-only completion turn.
-            raw = llm.call(
+            raw = single_calls.call(
+                single_calls.STAGE_PLAN_GAPS if gap_mode else single_calls.STAGE_PLAN,
                 config,
                 system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
@@ -1178,7 +1181,8 @@ def describe_concepts(
         ex = str(example).strip()[:80]
         lines.append(f"- {name}" + (f' — "{ex}"' if ex else ""))
     try:
-        raw = llm.call(
+        raw = single_calls.call(
+            single_calls.STAGE_DESCRIBE,
             config,
             system_prompt=prompt("describe_concepts"),
             user_content=[{"type": "text", "text": "\n".join(lines)}],
@@ -1373,7 +1377,7 @@ def _seed_entries_from_schema(schema: Schema) -> dict[str, RosterEntry]:
     return roster
 
 
-def _label_chunk(
+def _label_chunk_steps(
     doc_name: str,
     chunk: list[Block],
     roster: dict[str, RosterEntry],
@@ -1388,13 +1392,18 @@ def _label_chunk(
     warnings: list[str],
     vocab: TagVocab,
     off_schema: list[str],
-) -> dict[str, str] | None:
+) -> llm.LLMSteps[dict[str, str] | None]:
     """Label one chunk in place; bisect and recurse on an unparseable reply.
 
     A malformed JSON reply (output too large to come back valid) halves the
     chunk and relabels each half — Pass A's window split — rather than retrying
     the same overflow. Call errors never split (they fail at any size); a
     reachability error returns its dict, else ``None``.
+
+    A generator over labeling requests (see :func:`label_document_steps` for
+    the driver contract): a request the driver could not complete arrives as
+    ``throw(exc)`` at the pending ``yield`` and is handled by the same
+    ``except`` the inline call had.
     """
     listing = render_block_listing(doc_name, chunk)
     user_content = [*roster_blocks, {"type": "text", "text": listing}]
@@ -1403,7 +1412,7 @@ def _label_chunk(
     for attempt in range(2):
         msg = f"labeling failed for {doc_name} {label_tag}"
         try:
-            raw = llm.call(
+            raw = yield from llm.steps_call(
                 config, system_prompt=SYSTEM_PROMPT, user_content=user_content, cache=True
             )
         except Exception as exc:  # call-level failure (network / provider / auth)
@@ -1439,7 +1448,7 @@ def _label_chunk(
             if len(chunk) > 1:
                 mid = len(chunk) // 2
                 log(f"[label] {doc_name} {label_tag}: reply unparseable; splitting {len(chunk)}")
-                err_a = _label_chunk(
+                err_a = yield from _label_chunk_steps(
                     doc_name,
                     chunk[:mid],
                     roster,
@@ -1454,7 +1463,7 @@ def _label_chunk(
                     vocab=vocab,
                     off_schema=off_schema,
                 )
-                err_b = _label_chunk(
+                err_b = yield from _label_chunk_steps(
                     doc_name,
                     chunk[mid:],
                     roster,
@@ -1511,7 +1520,44 @@ def _label_one_document(
     log: Callable[[str], None],
     vocab: TagVocab,
 ) -> tuple[list[str], dict[str, str] | None, list[str]]:
+    """Synchronous driver over :func:`label_document_steps` (same arguments)."""
+    return llm.drive(
+        label_document_steps(
+            doc_name,
+            blocks,
+            roster,
+            config=config,
+            cache_dir=cache_dir,
+            debug=debug,
+            log=log,
+            vocab=vocab,
+        ),
+        config,
+    )
+
+
+def label_document_steps(
+    doc_name: str,
+    blocks: list[Block],
+    roster: dict[str, RosterEntry],
+    *,
+    config: llm.LLMConfig,
+    cache_dir: Path | str | None,
+    debug: bool,
+    log: Callable[[str], None],
+    vocab: TagVocab,
+) -> llm.LLMSteps[tuple[list[str], dict[str, str] | None, list[str]]]:
     """Label one document's blocks against (and into) the shared roster.
+
+    A generator over every labeling request the document needs, in order: each
+    chunk's attempts (including the bisect recursion on an unparseable reply),
+    then the section retry when headings were left untagged. It follows the
+    :data:`dgml_core.llm.LLMSteps` contract — yields completion kwargs, is sent
+    the response for each, does no usage accounting — plus one rule every
+    driver must honour: a request that could not be completed is delivered
+    with ``throw(exc)`` at the pending ``yield``. There the same ``except`` the
+    inline call had makes the decision (reachability short-circuit, retry once,
+    never split on a call error), so no driver needs to know labeling policy.
 
     Returns ``(warnings, label_error, off_schema)``, where *off_schema* lists
     every concept that fell outside an authored vocabulary — refused under
@@ -1536,7 +1582,7 @@ def _label_one_document(
     # document's chunks and its section retry.
     roster_blocks = _roster_content_blocks(roster, model=config.model, vocab=vocab)
     for chunk_idx, chunk in enumerate(_chunks(blocks)):
-        err = _label_chunk(
+        err = yield from _label_chunk_steps(
             doc_name,
             chunk,
             roster,
@@ -1568,7 +1614,7 @@ def _label_one_document(
         user_text = "\n\n".join(str(part["text"]) for part in user_content)
         cache_write(cache_dir, f"label_{stem}_section_retry_input.txt", user_text, debug=debug)
         try:
-            raw = llm.call(
+            raw = yield from llm.steps_call(
                 config,
                 system_prompt=SYSTEM_PROMPT,
                 user_content=user_content,
