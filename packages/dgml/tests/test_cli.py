@@ -6057,12 +6057,28 @@ def test_link_usage_is_recorded_per_document(
 
     both_proposing = threading.Barrier(2, timeout=10)
 
-    def fake_call(config: Any, **kwargs: Any) -> str:
-        if "reviewer" in str(kwargs["system_prompt"]):
-            return json.dumps({"verdicts": [{"i": 0, "keep": True}]})
-        both_proposing.wait()  # exactly one propose call per document
-        return json.dumps(
-            {"links": [{"subject": "e0001", "object": "e0002", "predicate": "references"}]}
+    from litellm import ModelResponse
+
+    # Mocked at litellm, below every call path the link pass may take (it
+    # drives request steps now, so a mock of llm.call_continued would let the
+    # pass reach the real provider unnoticed).
+    def fake_completion(**kwargs: Any) -> Any:
+        reply: dict[str, Any]
+        if "reviewer" in json.dumps(kwargs["messages"]):
+            reply = {"verdicts": [{"i": 0, "keep": True}]}
+        else:
+            both_proposing.wait()  # exactly one propose call per document
+            reply = {"links": [{"subject": "e0001", "object": "e0002", "predicate": "references"}]}
+        return ModelResponse(
+            choices=[
+                {
+                    "message": {"role": "assistant", "content": json.dumps(reply)},
+                    "finish_reason": "stop",
+                    "index": 0,
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            model="fake/model",
         )
 
     def fake_convert(paths: Any, *, options: Any, on_output: Any, **_kw: Any) -> dict[str, str]:
@@ -6074,7 +6090,7 @@ def test_link_usage_is_recorded_per_document(
 
     with (
         patch("dgml_core.generation.convert_batch", side_effect=fake_convert),
-        patch("dgml_core.llm.call_continued", side_effect=fake_call),
+        patch("litellm.completion", side_effect=fake_completion),
     ):
         rc = main(_ws_args(ws) + ["--debug", "docset", "generate", did, "--no-coverage"])
     assert rc == 0
@@ -6082,6 +6098,9 @@ def test_link_usage_is_recorded_per_document(
     rows = [e for e in read_events(Workspace(root=ws)) if e["operation"] == "links"]
     assert len(rows) == 2  # one per document, not one covering both
     assert {r["context"]["doc"] for r in rows} == {"one.pdf", "two.pdf"}
+    # Each row is its own document's answered pass, not a failed call's row.
+    assert [r["outcome"] for r in rows] == ["ok", "ok"]
+    assert all(r["total_tokens"] > 0 for r in rows)
 
 
 @needs_gs
