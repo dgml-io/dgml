@@ -15,15 +15,24 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import pytest
 from dgml_core import llm
 from dgml_core.errors import LinkPlanFailed
-from dgml_core.generation.links import _parse_items, add_links
+from dgml_core.generation import links as links_mod
+from dgml_core.generation.links import _parse_items, add_links, plan_links
 from lxml import etree  # type: ignore[import-untyped]
+
+from .conftest import FakeLLMResponse
 
 _DG = "http://dgml.io/ns/dg#"
 _XMLID = "{http://www.w3.org/XML/1998/namespace}id"
+# A real model id: requests are built by the real kwargs builder, which
+# validates the model against litellm's registry before the (faked) call.
+_MODEL = "anthropic/claude-haiku-4-5"
 
 # element order under root: e0000=chunk, 1=Commencement, 2=Adjustment, 3=BaseRent, 4=Escalation
 _XML = (
@@ -37,15 +46,38 @@ _XML = (
 )
 
 
+def _system_text(kwargs: dict[str, Any]) -> str:
+    """The system prompt of a captured completion request, whatever its shape
+    (a plain string, or Anthropic's list of cache-marked text blocks)."""
+    return json.dumps(kwargs["messages"][0]["content"])
+
+
+def _fake_model(
+    monkeypatch: pytest.MonkeyPatch, reply: Callable[[dict[str, Any]], str]
+) -> list[dict[str, Any]]:
+    """Answer every completion request with ``reply(kwargs)`` at the one seam
+    every ``dgml_core.llm`` path shares (``_completion_with_retry``), so the
+    tests hold for the sync wrappers and the ``steps_*`` generators alike.
+    Returns the list the requests are recorded into, in call order."""
+    calls: list[dict[str, Any]] = []
+
+    def fake(kwargs: dict[str, Any]) -> FakeLLMResponse:
+        calls.append(kwargs)
+        return FakeLLMResponse(reply(kwargs))
+
+    monkeypatch.setattr(llm, "_completion_with_retry", fake)
+    return calls
+
+
 def _fake_llm(
     monkeypatch: pytest.MonkeyPatch, links: list[dict[str, object]], keep: list[bool]
 ) -> None:
-    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
-        if "reviewer" in str(kwargs["system_prompt"]):
+    def reply(kwargs: dict[str, Any]) -> str:
+        if "reviewer" in _system_text(kwargs):
             return json.dumps({"verdicts": [{"i": i, "keep": k} for i, k in enumerate(keep)]})
         return json.dumps({"links": links})
 
-    monkeypatch.setattr(llm, "call_continued", fake_call)
+    _fake_model(monkeypatch, reply)
 
 
 def test_add_links_applies_relative_and_multi_target_formula(
@@ -59,7 +91,7 @@ def test_add_links_applies_relative_and_multi_target_formula(
         ],
         keep=[True, True],
     )
-    linked, applied = add_links(_XML, llm.LLMConfig(model="x"))
+    linked, applied = add_links(_XML, llm.LLMConfig(model=_MODEL))
     root = etree.fromstring(linked.encode())
     by = {etree.QName(e).localname: e for e in root.iter() if isinstance(e.tag, str)}
     ids = {e.get(_XMLID) for e in root.iter() if e.get(_XMLID)}
@@ -84,7 +116,7 @@ def test_verify_drops_rejected_links(monkeypatch: pytest.MonkeyPatch) -> None:
         ],
         keep=[True, False],
     )
-    linked, applied = add_links(_XML, llm.LLMConfig(model="x"))
+    linked, applied = add_links(_XML, llm.LLMConfig(model=_MODEL))
     assert len(applied) == 1 and applied[0].predicate == "relativeTo"
     root = etree.fromstring(linked.encode())
     esc = next(e for e in root.iter() if etree.QName(e).localname == "Escalation")
@@ -123,7 +155,7 @@ def test_link_value_never_clobbers_a_typed_value(monkeypatch: pytest.MonkeyPatch
         ],
         keep=[True, True],
     )
-    linked, applied = add_links(xml, llm.LLMConfig(model="x"))
+    linked, applied = add_links(xml, llm.LLMConfig(model=_MODEL))
     root = etree.fromstring(linked.encode())
     by = {etree.QName(e).localname: e for e in root.iter() if isinstance(e.tag, str)}
 
@@ -225,10 +257,10 @@ def test_apply_plan_is_deterministic_and_needs_no_model(
     re-grounded copy of the same tree."""
     from dgml_core.generation.links import apply_plan
 
-    def explode(*_a: object, **_k: object) -> str:
+    def explode(_kwargs: dict[str, Any]) -> str:
         raise AssertionError("apply_plan must not call the model")
 
-    monkeypatch.setattr(llm, "call_continued", explode)
+    _fake_model(monkeypatch, explode)
 
     plan = [{"subject": 2, "objects": [1], "predicate": "relativeTo", "value": "P1Y"}]
     first, applied = apply_plan(_XML, plan)
@@ -259,10 +291,8 @@ def test_apply_plan_skips_entries_outside_the_tree() -> None:
 
 def test_verify_false_keeps_every_proposal(monkeypatch: pytest.MonkeyPatch) -> None:
     """--no-semlink-verify path: one model call, nothing filtered."""
-    calls: list[str] = []
 
-    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
-        calls.append(str(kwargs["system_prompt"]))
+    def reply(_kwargs: dict[str, Any]) -> str:
         return json.dumps(
             {
                 "links": [
@@ -272,10 +302,10 @@ def test_verify_false_keeps_every_proposal(monkeypatch: pytest.MonkeyPatch) -> N
             }
         )
 
-    monkeypatch.setattr(llm, "call_continued", fake_call)
-    _, applied = add_links(_XML, llm.LLMConfig(model="x"), verify=False)
+    calls = _fake_model(monkeypatch, reply)
+    _, applied = add_links(_XML, llm.LLMConfig(model=_MODEL), verify=False)
     assert len(applied) == 2
-    assert len(calls) == 1 and "reviewer" not in calls[0]
+    assert len(calls) == 1 and "reviewer" not in _system_text(calls[0])
 
 
 _NESTED = (
@@ -402,9 +432,9 @@ def test_unparseable_proposal_raises_rather_than_planning_no_links(
     """A plan is content-addressed by its document, so "no links" from a
     garbled reply would be cached under that key and never asked again. The
     pass has to fail loudly instead."""
-    monkeypatch.setattr(llm, "call_continued", lambda *_a, **_k: "I could not do that.")
+    _fake_model(monkeypatch, lambda _kwargs: "I could not do that.")
     with pytest.raises(LinkPlanFailed):
-        add_links(_XML, llm.LLMConfig(model="x"))
+        add_links(_XML, llm.LLMConfig(model=_MODEL))
 
 
 def test_reviewer_returning_no_verdicts_raises_rather_than_dropping_everything(
@@ -414,23 +444,23 @@ def test_reviewer_returning_no_verdicts_raises_rather_than_dropping_everything(
     Unparsed verdicts drop every candidate, which used to be indistinguishable
     from a document with nothing to link — and got cached as one."""
 
-    def fake_call(config: llm.LLMConfig, **kwargs: object) -> str:
-        if "reviewer" in str(kwargs["system_prompt"]):
+    def no_verdicts(kwargs: dict[str, Any]) -> str:
+        if "reviewer" in _system_text(kwargs):
             return "The candidates look mostly fine to me."
         return _GOOD_REPLY
 
-    monkeypatch.setattr(llm, "call_continued", fake_call)
+    _fake_model(monkeypatch, no_verdicts)
     with pytest.raises(LinkPlanFailed):
-        add_links(_XML, llm.LLMConfig(model="x"))
+        add_links(_XML, llm.LLMConfig(model=_MODEL))
 
     # An explicit rejection of every candidate is a real answer, and stands.
-    def reject_all(config: llm.LLMConfig, **kwargs: object) -> str:
-        if "reviewer" in str(kwargs["system_prompt"]):
+    def reject_all(kwargs: dict[str, Any]) -> str:
+        if "reviewer" in _system_text(kwargs):
             return json.dumps({"verdicts": [{"i": i, "keep": False} for i in range(3)]})
         return _GOOD_REPLY
 
-    monkeypatch.setattr(llm, "call_continued", reject_all)
-    _, applied = add_links(_XML, llm.LLMConfig(model="x"))
+    _fake_model(monkeypatch, reject_all)
+    _, applied = add_links(_XML, llm.LLMConfig(model=_MODEL))
     assert applied == []
 
 
@@ -609,3 +639,113 @@ def test_merging_stops_at_a_real_disagreement_about_the_value() -> None:
     assert plan_losses(_TREE, plan).merged == 1
     _, applied = apply_plan(_TREE, plan)
     assert applied[0].objects == ["term", "cap"] and applied[0].value == "P1Y"
+
+
+_VERDICTS = json.dumps(
+    {"verdicts": [{"i": 0, "keep": True}, {"i": 1, "keep": False}, {"i": 2, "keep": True}]}
+)
+
+
+# ── plan_links_steps: the request/response protocol a batch driver sees ──────
+
+
+def _hand_drive(
+    steps: llm.LLMSteps[list[dict[str, Any]]], replies: list[str]
+) -> tuple[list[llm.LLMStep], list[dict[str, Any]]]:
+    """Drive a link-pass generator by hand, one reply per yielded request, with
+    no executor and no accounting — the way a wave driver sees it."""
+    yielded: list[llm.LLMStep] = []
+    step = next(steps)
+    for reply in replies:
+        yielded.append(step)
+        try:
+            step = steps.send(FakeLLMResponse(reply))
+        except StopIteration as done:
+            plan: list[dict[str, Any]] = done.value
+            return yielded, plan
+    raise AssertionError(f"generator still wants requests after {len(replies)} replies")
+
+
+def test_steps_yield_verify_only_after_the_proposal_arrives() -> None:
+    steps = links_mod.plan_links_steps(_XML, llm.LLMConfig(model=_MODEL))
+    first = next(steps)
+    assert "reviewer" not in _system_text(first)  # the proposal comes first, alone
+    second = steps.send(FakeLLMResponse(_GOOD_REPLY))
+    assert "reviewer" in _system_text(second)  # verify is built from the proposal
+    assert "L0:" in json.dumps(second["messages"][-1]["content"])
+    with pytest.raises(StopIteration) as done:
+        steps.send(FakeLLMResponse(_VERDICTS))
+    assert [p["predicate"] for p in done.value.value] == ["relativeTo", "valueFrom"]
+
+
+def test_steps_skip_verify_when_nothing_was_proposed() -> None:
+    yielded, plan = _hand_drive(
+        links_mod.plan_links_steps(_XML, llm.LLMConfig(model=_MODEL)), [json.dumps({"links": []})]
+    )
+    assert len(yielded) == 1 and plan == []
+
+
+def test_steps_skip_verify_when_verification_is_off() -> None:
+    yielded, plan = _hand_drive(
+        links_mod.plan_links_steps(_XML, llm.LLMConfig(model=_MODEL), verify=False), [_GOOD_REPLY]
+    )
+    assert len(yielded) == 1 and len(plan) == 3
+
+
+def test_steps_write_no_usage_row(tmp_path: Path) -> None:
+    """The generator is pure: hand-driven to completion, it records nothing —
+    accounting belongs to whoever drives it."""
+    from dgml_core.storage import Workspace
+    from dgml_core.usage import read_events
+
+    ws = Workspace(root=tmp_path)
+    cfg = llm.LLMConfig(model=_MODEL, workspace=ws, debug=True, operation="links")
+    _hand_drive(links_mod.plan_links_steps(_XML, cfg), [_GOOD_REPLY, _VERDICTS])
+    assert read_events(ws) == []
+
+
+def test_steps_raise_when_the_reviewer_returns_no_verdicts() -> None:
+    steps = links_mod.plan_links_steps(_XML, llm.LLMConfig(model=_MODEL))
+    next(steps)
+    steps.send(FakeLLMResponse(_GOOD_REPLY))
+    with pytest.raises(LinkPlanFailed):
+        steps.send(FakeLLMResponse("The candidates look mostly fine to me."))
+
+
+def test_propose_caches_the_system_prompt_and_continues_a_truncated_reply(
+    capture_kwargs: Any,
+) -> None:
+    captured = capture_kwargs(
+        [
+            FakeLLMResponse(_GOOD_REPLY[:40], finish_reason="length"),
+            FakeLLMResponse(_GOOD_REPLY[40:]),
+            FakeLLMResponse(_VERDICTS),
+        ]
+    )
+    plan = plan_links(_XML, llm.LLMConfig(model=_MODEL))
+
+    propose, continued, verify = captured.kwargs
+    assert propose["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in propose["messages"][1]["content"][0]  # the listing
+    assert continued["messages"][2] == {"role": "assistant", "content": _GOOD_REPLY[:40]}
+    assert "reviewer" in _system_text(verify) and len(verify["messages"]) == 2
+    assert [p["predicate"] for p in plan] == ["relativeTo", "valueFrom"]
+
+
+def test_propose_and_verify_write_one_usage_row(capture_kwargs: Any, tmp_path: Path) -> None:
+    from dgml_core.storage import Workspace
+    from dgml_core.usage import read_events
+
+    capture_kwargs(
+        [
+            FakeLLMResponse(_GOOD_REPLY, cost=0.01, prompt_tokens=100, completion_tokens=50),
+            FakeLLMResponse(_VERDICTS, cost=0.02, prompt_tokens=150, completion_tokens=25),
+        ]
+    )
+    ws = Workspace(root=tmp_path)
+    cfg = llm.LLMConfig(model=_MODEL, workspace=ws, debug=True, operation="links")
+    plan_links(_XML, cfg)
+
+    (row,) = read_events(ws)
+    assert (row["operation"], row["outcome"], row["cost_usd"]) == ("links", "ok", 0.01 + 0.02)
+    assert (row["prompt_tokens"], row["completion_tokens"]) == (250, 75)
