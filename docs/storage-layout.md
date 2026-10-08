@@ -652,6 +652,13 @@ Field rules:
   `"default"` to send no reasoning effort and take the provider's own default.
   It is the largest cost and latency dial on extraction, and the right setting
   differs by model. Location grounding is not affected.
+- `locations_reasoning_effort` — optional, default `"high"`. The reasoning
+  budget of the location-grounding call on pages with OCR words, same values as
+  above. Anthropic models never receive it (that call forces its tool, and the
+  wrapper drops the budget); every other provider does, and at the default it is
+  the larger half of a Gemini values model's extraction latency. A page that
+  goes through the no-words grid path (no OCR words and a known image size)
+  keeps its own `"medium"`, which this field does not change.
 
 ### `generation` (required for `dgml docset generate`)
 

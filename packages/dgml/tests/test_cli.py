@@ -5764,6 +5764,53 @@ def test_extraction_extract_values_effort_overrides_config(
     assert "reasoning_effort" not in _extract("--values-effort", "default")
 
 
+def test_extraction_extract_locations_effort_overrides_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--locations-effort` replaces `grounded.locations_reasoning_effort` for
+    one call. The flag reaches the config the extraction runs with; the
+    grounding call itself is pinned in the core tests."""
+    from dgml_core import grounded
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    seen: list[grounded.GroundedConfig] = []
+
+    def fake_extract(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["config"])
+        raise SystemExit(0)
+
+    with patch("dgml_core.grounded.extract_values", side_effect=fake_extract):
+        for flags in ([], ["--locations-effort", "low"], ["--locations-effort", "default"]):
+            with pytest.raises(SystemExit):
+                main(_ws_args(ws) + ["extraction", "extract", ds_id, "somefile", *flags])
+            capsys.readouterr()
+    assert [c.locations_reasoning_effort for c in seen] == ["high", "low", None]
+
+
+def test_extraction_extract_refuses_unknown_locations_effort(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    with patch("litellm.completion") as mock_completion:
+        rc = main(
+            _ws_args(ws)
+            + ["extraction", "extract", ds_id, "somefile", "--locations-effort", "turbo"]
+        )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "GROUNDED_CONFIG_INVALID"
+    assert "--locations-effort" in err["message"]
+    mock_completion.assert_not_called()
+
+
 def test_extraction_extract_refuses_unknown_values_effort(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -1219,7 +1219,8 @@ Two formats are involved:
 
 The LLM is configurable like every other model-using command — via the
 `grounded` section of the workspace `config.toml` (`schema_model`,
-`values_model`, `values_reasoning_effort`, API keys, `max_tool_iters`), with
+`values_model`, `values_reasoning_effort`, `locations_reasoning_effort`, API keys,
+`max_tool_iters`), with
 per-call overrides on the commands below.
 
 ### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M]`
@@ -1302,7 +1303,7 @@ fields, prompts for where to find one value. Returns
 Return the DocSet's extraction guidance as `{docset_id, guidance}`. Errors
 `GUIDANCE_NOT_FOUND` if none is set.
 
-### `dgml extraction extract <docset_id> <file_id> [--values-model M] [--values-effort E]`
+### `dgml extraction extract <docset_id> <file_id> [--values-model M] [--values-effort E] [--locations-effort E]`
 
 Extract values from a file against the DocSet schema and write a `dg:extraction`
 element into the file's core `<stem>.dgml.xml`. Runs a three-phase pipeline
@@ -1315,7 +1316,11 @@ a generated document tree the extraction is added alongside it
 `--values-effort` overrides `grounded.values_reasoning_effort` for this call:
 `none`, `minimal`, `low`, `medium` (the default), `high`, `xhigh`, or `default`
 to send no reasoning effort and take the provider's own default. Any other value
-is refused before the model is called.
+is refused before the model is called. `--locations-effort` does the same for
+`grounded.locations_reasoning_effort`, the budget of the location-grounding call
+on pages with OCR words (default `high`; a page that goes through the no-words
+grid path keeps its own `medium`). Anthropic models never receive it, since that call forces its tool;
+every other provider does.
 
 ```json
 {

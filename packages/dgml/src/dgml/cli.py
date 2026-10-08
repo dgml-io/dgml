@@ -2653,6 +2653,15 @@ def _add_extraction_subparsers(
             "low, medium, high, xhigh, or 'default' to send no reasoning effort."
         ),
     )
+    ex_extract.add_argument(
+        "--locations-effort",
+        default=None,
+        help=(
+            "Override grounded.locations_reasoning_effort (location grounding on pages "
+            "with OCR words) for this call: none, minimal, low, medium, high, xhigh, or "
+            "'default' to send no reasoning effort."
+        ),
+    )
 
     ex_get_values = extraction.add_parser(
         "get-values",
@@ -2781,6 +2790,13 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 config,
                 values_reasoning_effort=parse_values_reasoning_effort(
                     args.values_effort, source="--values-effort"
+                ),
+            )
+        if args.locations_effort is not None:
+            config = replace(
+                config,
+                locations_reasoning_effort=parse_values_reasoning_effort(
+                    args.locations_effort, source="--locations-effort"
                 ),
             )
         result = extract_values(

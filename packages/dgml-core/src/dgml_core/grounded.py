@@ -173,7 +173,8 @@ _DEFAULT_REASONING_EFFORT = "high"
 # keeps the default; see _PHASE3_GRID_REASONING_EFFORT for pages without them.
 _VALUES_REASONING_EFFORT = "medium"
 
-# What ``grounded.values_reasoning_effort`` (and ``--values-effort``) accept: the
+# What ``grounded.values_reasoning_effort`` (``--values-effort``) and
+# ``grounded.locations_reasoning_effort`` (``--locations-effort``) accept: the
 # effort names litellm takes, sent as given, plus ``"default"``, which sends no
 # ``reasoning_effort`` at all and leaves the budget to the provider. ``"none"``
 # is litellm's own value and is sent (it asks the provider to turn thinking
@@ -246,12 +247,19 @@ class GroundedConfig:
     values_api_base: str | None = None
     max_tool_iters: int = DEFAULT_MAX_TOOL_ITERS
     # Reasoning budget of the value-extraction call (phase 1). ``None`` sends no
-    # ``reasoning_effort``; location grounding keeps its own constants.
+    # ``reasoning_effort``.
     values_reasoning_effort: str | None = _VALUES_REASONING_EFFORT
+    # Reasoning budget of location grounding (phase 3) on a page with OCR
+    # words. ``None`` sends no ``reasoning_effort``. Anthropic models drop it
+    # either way (the call forces its tool); every other provider sends it,
+    # and at the default it is the larger half of a Gemini values model's
+    # latency. A page on the no-words grid path keeps _PHASE3_GRID_REASONING_EFFORT.
+    locations_reasoning_effort: str | None = _DEFAULT_REASONING_EFFORT
 
 
 def parse_values_reasoning_effort(raw: Any, *, source: str) -> str | None:
-    """Validate a values reasoning effort from the config file or the CLI.
+    """Validate a reasoning effort (values or locations) from the config file
+    or the CLI.
 
     Returns the effort to send, or ``None`` for ``"default"`` (send nothing).
     ``source`` names where the value came from, for the error message.
@@ -312,6 +320,13 @@ def load_grounded_config(workspace: Workspace) -> GroundedConfig:
         if "values_reasoning_effort" in sec
         else _VALUES_REASONING_EFFORT
     )
+    locations_reasoning_effort = (
+        parse_values_reasoning_effort(
+            sec["locations_reasoning_effort"], source="'grounded.locations_reasoning_effort'"
+        )
+        if "locations_reasoning_effort" in sec
+        else _DEFAULT_REASONING_EFFORT
+    )
 
     return GroundedConfig(
         schema_model=schema.model,
@@ -324,6 +339,7 @@ def load_grounded_config(workspace: Workspace) -> GroundedConfig:
         values_api_base=values.api_base,
         max_tool_iters=max_tool_iters_raw,
         values_reasoning_effort=values_reasoning_effort,
+        locations_reasoning_effort=locations_reasoning_effort,
     )
 
 
@@ -923,6 +939,7 @@ def extract_values(
                 api_base=api_base,
                 max_tool_iters=config.max_tool_iters,
                 totals=phase3_totals,
+                reasoning_effort=config.locations_reasoning_effort,
             )
         unmatched_count = phase2_result.stats.unmatched_locations - phase3_matched
         phase3_duration = round(time.monotonic() - phase3_started, 3)
@@ -1219,6 +1236,7 @@ def _run_phase3(
     api_base: str | None,
     max_tool_iters: int,
     totals: dict[str, Any],
+    reasoning_effort: str | None = _DEFAULT_REASONING_EFFORT,
 ) -> tuple[dict[str, Any], int, int, int, int]:
     """Resolve ``unmatched`` items via one LLM call per page, run in
     parallel across pages.
@@ -1262,6 +1280,7 @@ def _run_phase3(
             api_base=api_base,
             max_tool_iters=max_tool_iters,
             totals=local_totals,
+            reasoning_effort=reasoning_effort,
         )
         return page, items, page_result, local_totals
 
@@ -1309,6 +1328,7 @@ def _phase3_call_for_page(
     api_base: str | None,
     max_tool_iters: int,
     totals: dict[str, Any],
+    reasoning_effort: str | None = _DEFAULT_REASONING_EFFORT,
 ) -> _Phase3PageResult:
     """One litellm call: send the page + ids that need locating, return
     ``{id: [{page_number, bounding_box}, ...]}`` parsed from the model's
@@ -1366,7 +1386,10 @@ def _phase3_call_for_page(
 
     # reasoning_effort is set unconditionally — the wrapper drops it for
     # Anthropic-routed models because tool_choice forces a function call
-    # below, and Anthropic rejects extended thinking with forced tools.
+    # below, and Anthropic rejects extended thinking with forced tools. A
+    # page with OCR words takes the configured locations effort (the module
+    # default unless the workspace set ``grounded.locations_reasoning_effort``,
+    # ``None`` = send none); the no-words grid path keeps its own constant.
     llm_config = LLMConfig(
         model=model,
         api_key=api_key,
@@ -1375,7 +1398,7 @@ def _phase3_call_for_page(
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
         timeout=_DEFAULT_TIMEOUT_SECONDS,
-        reasoning_effort=_PHASE3_GRID_REASONING_EFFORT if normalized else _DEFAULT_REASONING_EFFORT,
+        reasoning_effort=_PHASE3_GRID_REASONING_EFFORT if normalized else reasoning_effort,
     )
     forced_tool_choice = {
         "type": "function",

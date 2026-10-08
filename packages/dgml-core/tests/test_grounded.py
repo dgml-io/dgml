@@ -311,6 +311,7 @@ def test_load_config_defaults(workspace: Workspace) -> None:
     assert config.max_tool_iters == DEFAULT_MAX_TOOL_ITERS
     # Unset, the values reasoning effort is the module's measured default.
     assert config.values_reasoning_effort == "medium"
+    assert config.locations_reasoning_effort == "high"
 
 
 @pytest.mark.parametrize(
@@ -770,6 +771,96 @@ def test_values_effort_default_sends_no_reasoning_effort(workspace: Workspace) -
     phase1, phase3 = _extract_with_grounding_call(workspace, config)
     assert "reasoning_effort" not in phase1.kwargs
     assert phase3.kwargs["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("low", "low"), ("none", "none"), ("default", None)],
+)
+def test_load_config_reads_locations_reasoning_effort(
+    workspace: Workspace, raw: str, expected: str | None
+) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "locations_reasoning_effort": raw,
+        },
+    )
+    assert load_grounded_config(workspace).locations_reasoning_effort == expected
+
+
+def test_load_config_rejects_unknown_locations_reasoning_effort(workspace: Workspace) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "locations_reasoning_effort": "turbo",
+        },
+    )
+    with pytest.raises(GroundedConfigInvalid, match="locations_reasoning_effort"):
+        load_grounded_config(workspace)
+
+
+def test_configured_locations_effort_reaches_location_grounding_only(
+    workspace: Workspace,
+) -> None:
+    """``locations_reasoning_effort`` sets the budget of the location-grounding
+    call and nothing else: value extraction keeps its own setting. A Gemini
+    values model makes both calls observable."""
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        locations_reasoning_effort="low",
+    )
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert phase1.kwargs["reasoning_effort"] == "medium"
+    assert phase3.kwargs["reasoning_effort"] == "low"
+
+
+def test_locations_effort_default_sends_no_reasoning_effort(workspace: Workspace) -> None:
+    """``None`` (the config's ``"default"``) leaves the grounding budget to the
+    provider: the field is absent from that request and still present on value
+    extraction."""
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        locations_reasoning_effort=None,
+    )
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert phase1.kwargs["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in phase3.kwargs
+
+
+@pytest.mark.parametrize("locations_effort", ["low", None])
+def test_locations_effort_does_not_reach_the_grid_path(
+    workspace: Workspace, locations_effort: str | None
+) -> None:
+    """A page on the no-words grid path keeps its own measured budget whatever
+    ``locations_reasoning_effort`` says, "default" (None) included."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300, words=[])
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 50, 200, 60]]}]}
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        locations_reasoning_effort=locations_effort,
+    )
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert m.call_args_list[1].kwargs["reasoning_effort"] == "medium"
 
 
 def test_configured_values_effort_reaches_anthropic_value_extraction(
