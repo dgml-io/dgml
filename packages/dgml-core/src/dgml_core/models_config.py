@@ -19,10 +19,14 @@ Four tiers, cheapest to strongest, each mapped to a set of tasks:
 * ``advanced`` ... labeling, value extraction
 * ``expert`` ..... schema generation
 
-Each tier names only a **model**. Credentials are configured per task, on the
-task's own section (e.g. ``generation.api_key_env``, ``grounded.schema_api_key``);
-a model sourced from a tier uses its task section's credentials, or falls back to
-litellm's per-provider env-var conventions when the section sets none.
+Each tier is a :class:`Model`: a model id plus optional credentials
+(``<tier>_api_key`` / ``<tier>_api_key_env`` / ``<tier>_api_base``). A tier that
+sets none takes its provider's ``<provider>_api_key`` / ``_env`` (``anthropic_``,
+``google_``, ``openai_``), matched on the model id's prefix — so one key per
+provider covers a mixed family such as ``anthropic_google``. A task section's own
+credentials (``generation.api_key_env``, ``grounded.schema_api_key``) win over
+both, and a model with none of those falls back to litellm's per-provider env
+var. See :func:`resolve_tiered_model`.
 
 ``family`` picks a whole provider family's defaults: one of the
 :data:`~dgml_core.default_config.PROVIDER_MODELS` keys. It is shorthand for that
@@ -39,11 +43,12 @@ then higher), emitting a warning — so a minimal config that sets only, say,
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .default_config import PROVIDER_MODELS
+from .default_config import PROVIDER_MODELS, PROVIDERS
 from .errors import DgmlError, ModelsConfigInvalid
 
 logger = logging.getLogger(__name__)
@@ -99,33 +104,80 @@ _WARNED_DISABLED: set[ConfigSection] = set()
 
 
 @dataclass(frozen=True)
+class Model:
+    """A model id with its credentials — the typed form of one ``model`` / ``api_key``
+    / ``api_key_env`` / ``api_base`` key group, wherever it appears: a ``[models]``
+    tier, a task section's model, or a task's resolved model."""
+
+    model: str
+    api_key: str | None = None
+    api_key_env: str | None = None
+    api_base: str | None = None
+
+    def table(self, model_key: str, prefix: str) -> dict[str, Any]:
+        """The flat keys: ``model_key`` for the id, ``{prefix}api_key`` and so on for
+        the rest (``light`` / ``light_``, ``label_model`` / ``label_``)."""
+        out = {model_key: self.model}
+        for name in ("api_key", "api_key_env", "api_base"):
+            value = getattr(self, name)
+            if value is not None:
+                out[f"{prefix}{name}"] = value
+        return out
+
+
+Credentials = tuple[str | None, str | None]
+"""An ``(api_key, api_key_env)`` pair; at most one is set."""
+
+_NO_CREDENTIALS: Credentials = (None, None)
+
+
+def provider_of(model: str) -> str | None:
+    """The :data:`~dgml_core.default_config.PROVIDERS` key serving ``model``'s
+    litellm prefix, or ``None`` for an unprefixed or unlisted one."""
+    prefix, sep, _ = model.partition("/")
+    if not sep:
+        return None
+    return next((p for p, prefixes in PROVIDERS.items() if prefix in prefixes), None)
+
+
+@dataclass(frozen=True)
 class ModelsConfig:
-    """Parsed ``[models]`` block: one model string per tier, all optional."""
+    """Parsed ``[models]`` block: one :class:`Model` per tier, all optional, each with
+    its credentials already settled (its own ``<tier>_*`` keys, else its provider's).
+    ``providers`` keeps the ``<provider>_api_key`` / ``_env`` pairs for
+    :meth:`credentials_for`."""
 
-    light: str | None = None
-    standard: str | None = None
-    advanced: str | None = None
-    expert: str | None = None
+    light: Model | None = None
+    standard: Model | None = None
+    advanced: Model | None = None
+    expert: Model | None = None
+    providers: Mapping[str, Credentials] = field(default_factory=dict)
 
-    def resolve(self, tier: Tier) -> str | None:
-        """Resolve ``tier`` to its model string.
+    def credentials_for(self, model: str) -> Credentials:
+        """The ``<provider>_api_key`` / ``_env`` pair for ``model``'s provider."""
+        provider = provider_of(model)
+        return self.providers.get(provider, _NO_CREDENTIALS) if provider else _NO_CREDENTIALS
+
+    def resolve(self, tier: Tier) -> Model | None:
+        """Resolve ``tier`` to its :class:`Model`.
 
         If ``tier`` has no model, fall back to the nearest set tier — lower
         (cheaper) neighbours first, then higher — and log a WARNING (once per
-        process per fallback). Returns ``None`` when no tier is
-        set at all (the caller then surfaces the appropriate config error)."""
+        process per fallback). The fallback tier's credentials come with its
+        model. Returns ``None`` when no tier is set at all (the caller then
+        surfaces the appropriate config error)."""
         if tier not in TIERS:
             raise ValueError(f"unknown model tier {tier!r}")
         actual = self._nearest_set(tier)
         if actual is None:
             return None
+        model: Model = getattr(self, actual)
         if actual != tier and (tier, actual) not in _WARNED_TIER_FALLBACKS:
             _WARNED_TIER_FALLBACKS.add((tier, actual))
             logger.warning(
                 f"[dgml] model tier '{tier}' is not set; falling back to '{actual}' "
-                f"('{getattr(self, actual)}'). Set [models].{tier} to silence this."
+                f"('{model.model}'). Set [models].{tier} to silence this."
             )
-        model: str | None = getattr(self, actual)
         return model
 
     def _nearest_set(self, tier: Tier) -> Tier | None:
@@ -140,12 +192,25 @@ class ModelsConfig:
         return None
 
 
-def _validate_optional_str(value: Any, field: str) -> str | None:
+def _opt_str(value: Any, label: str, invalid: type[DgmlError]) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
-        raise ModelsConfigInvalid(f"'models.{field}' must be a non-empty string if set")
+        raise invalid(f"'{label}' must be a non-empty string if set")
     return value
+
+
+def _credentials(
+    table: dict[str, Any], prefix: str, section: str, invalid: type[DgmlError]
+) -> Credentials:
+    """``{prefix}api_key`` / ``{prefix}api_key_env`` from ``table``; setting both is an
+    error."""
+    key_label, env_label = f"{section}.{prefix}api_key", f"{section}.{prefix}api_key_env"
+    api_key = _opt_str(table.get(f"{prefix}api_key"), key_label, invalid)
+    api_key_env = _opt_str(table.get(f"{prefix}api_key_env"), env_label, invalid)
+    if api_key is not None and api_key_env is not None:
+        raise invalid(f"set at most one of '{key_label}' / '{env_label}', not both")
+    return api_key, api_key_env
 
 
 def expand_family(models: dict[str, Any]) -> dict[str, Any]:
@@ -163,20 +228,39 @@ def load_models_config(merged: dict[ConfigSection, Any]) -> ModelsConfig:
     ``[models]`` section (an empty section yields an all-``None`` config).
 
     ``family`` is validated here but not expanded — :func:`expand_family` has
-    already done that per layer during the merge."""
+    already done that per layer during the merge. Provider keys are matched to
+    tiers here, on the merged table, so a key and the tier it serves may come from
+    different layers."""
     section = merged.get(ConfigSection.MODELS)
     if section is None:
         return ModelsConfig()
     if not isinstance(section, dict):
         raise ModelsConfigInvalid("'models' must be a table")
-    family = _validate_optional_str(section.get("family"), "family")
+    invalid = ModelsConfigInvalid
+    family = _opt_str(section.get("family"), "models.family", invalid)
     if family is not None and family not in PROVIDER_MODELS:
-        raise ModelsConfigInvalid(
+        raise invalid(
             f"'models.family' must be one of {', '.join(sorted(PROVIDER_MODELS))}; got {family!r}"
         )
-    return ModelsConfig(
-        **{t.value: _validate_optional_str(section.get(t.value), t.value) for t in TIERS}
-    )
+    providers = {
+        p: creds
+        for p in PROVIDERS
+        if (creds := _credentials(section, f"{p}_", "models", invalid)) != _NO_CREDENTIALS
+    }
+    tiers: dict[str, Model] = {}
+    for t in TIERS:
+        model = _opt_str(section.get(t.value), f"models.{t}", invalid)
+        api_key, api_key_env = _credentials(section, f"{t}_", "models", invalid)
+        api_base = _opt_str(section.get(f"{t}_api_base"), f"models.{t}_api_base", invalid)
+        if model is None:
+            if (api_key, api_key_env, api_base) != (None, None, None):
+                raise invalid(f"'models.{t}_api_key' and friends need 'models.{t}' to be set")
+            continue
+        if api_key is None and api_key_env is None:
+            provider = provider_of(model)
+            api_key, api_key_env = providers.get(provider or "", _NO_CREDENTIALS)
+        tiers[t.value] = Model(model, api_key, api_key_env, api_base)
+    return ModelsConfig(**tiers, providers=providers)
 
 
 def section_enabled(
@@ -214,16 +298,6 @@ def section_enabled(
     return enabled
 
 
-@dataclass(frozen=True)
-class ResolvedModel:
-    """A task's resolved model id plus its (name-only) credentials."""
-
-    model: str
-    api_key: str | None
-    api_key_env: str | None
-    api_base: str | None
-
-
 def resolve_tiered_model(
     merged: dict[ConfigSection, Any],
     *,
@@ -231,52 +305,46 @@ def resolve_tiered_model(
     tier: Tier,
     invalid: type[DgmlError],
     missing: type[DgmlError],
-    model_field: str = "model",
-    key_field: str = "api_key",
-    env_field: str = "api_key_env",
-    base_field: str = "api_base",
-) -> ResolvedModel:
-    """Resolve one task's model + credentials from the ``[{section_name}]``
-    section of *merged*, or — when the section names no model — from its
-    ``[models]`` *tier*.
+    prefix: str = "",
+) -> Model:
+    """Resolve one task's :class:`Model` from the ``[{section_name}]`` section of
+    *merged*, or — when the section names no model — from its ``[models]`` *tier*.
 
-    The section's ``model_field`` overrides the tier. Credentials come solely
-    from the section's ``key_field`` / ``env_field`` / ``base_field`` (they vary
-    per task: e.g. ``label_api_key`` for generation labeling, ``schema_api_key``
-    for grounded schema-gen); tiers carry no credentials, so a tier-sourced model
-    with no section credentials falls back to litellm's per-provider env vars.
+    ``prefix`` names the section's key group: ``{prefix}model``, ``{prefix}api_key``,
+    ``{prefix}api_key_env``, ``{prefix}api_base`` (``schema_`` / ``values_`` for
+    grounded, ``label_`` for generation labeling, empty for the rest).
+
+    Credentials, most specific first: the section's own; then the model's — a
+    tier's ``<tier>_api_key`` or its provider's ``<provider>_api_key`` for a
+    tier-sourced model, the provider's key alone for one the section names; else
+    none, and litellm reads its per-provider env var. ``{prefix}api_base`` likewise
+    overrides a tier's ``<tier>_api_base``.
 
     Raises ``invalid`` for a malformed value or a literal+env-name clash, and
-    ``missing`` when neither the field nor the tier resolves a model. Callers
+    ``missing`` when neither the section nor the tier resolves a model. Callers
     that treat a section's mere presence as a feature switch (``style`` /
     ``text_extraction``) check that themselves before calling this.
     """
     section = merged.get(section_name)
     sec: dict[str, Any] = section if isinstance(section, dict) else {}
+    model = _opt_str(sec.get(f"{prefix}model"), f"{section_name}.{prefix}model", invalid)
+    api_key, api_key_env = _credentials(sec, prefix, section_name, invalid)
+    api_base = _opt_str(sec.get(f"{prefix}api_base"), f"{section_name}.{prefix}api_base", invalid)
+    own_credentials = api_key is not None or api_key_env is not None
 
-    def _opt_str(value: Any, field: str) -> str | None:
-        if value is None:
-            return None
-        if not isinstance(value, str) or not value.strip():
-            raise invalid(f"'{section_name}.{field}' must be a non-empty string if set")
-        return value
+    if model is not None:
+        if not own_credentials:
+            api_key, api_key_env = load_models_config(merged).credentials_for(model)
+        return Model(model, api_key, api_key_env, api_base)
 
-    model = _opt_str(sec.get(model_field), model_field)
-    api_key = _opt_str(sec.get(key_field), key_field)
-    api_key_env = _opt_str(sec.get(env_field), env_field)
-    api_base = _opt_str(sec.get(base_field), base_field)
-    if api_key is not None and api_key_env is not None:
-        raise invalid(
-            f"set at most one of '{section_name}.{key_field}' / "
-            f"'{section_name}.{env_field}', not both"
-        )
-
-    if model is None:
-        model = load_models_config(merged).resolve(tier)
-    if not isinstance(model, str) or not model.strip():
+    tiered = load_models_config(merged).resolve(tier)
+    if tiered is None:
         raise missing(
-            f"no {model_field} for {section_name}: set [models].family, [models].{tier}, "
-            f"or '{section_name}.{model_field}' in the config"
+            f"no {prefix}model for {section_name}: set [models].family, [models].{tier}, "
+            f"or '{section_name}.{prefix}model' in the config"
         )
-
-    return ResolvedModel(model=model, api_key=api_key, api_key_env=api_key_env, api_base=api_base)
+    if not own_credentials:
+        api_key, api_key_env = tiered.api_key, tiered.api_key_env
+    return Model(
+        tiered.model, api_key, api_key_env, api_base if api_base is not None else tiered.api_base
+    )

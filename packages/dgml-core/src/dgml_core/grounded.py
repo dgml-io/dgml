@@ -325,10 +325,7 @@ def load_grounded_config(
         tier=Tier.EXPERT,
         invalid=GroundedConfigInvalid,
         missing=GroundedConfigMissing,
-        model_field="schema_model",
-        key_field="schema_api_key",
-        env_field="schema_api_key_env",
-        base_field="schema_api_base",
+        prefix="schema_",
     )
     values = resolve_tiered_model(
         merged,
@@ -336,10 +333,7 @@ def load_grounded_config(
         tier=Tier.ADVANCED,
         invalid=GroundedConfigInvalid,
         missing=GroundedConfigMissing,
-        model_field="values_model",
-        key_field="values_api_key",
-        env_field="values_api_key_env",
-        base_field="values_api_base",
+        prefix="values_",
     )
 
     section = merged.get(ConfigSection.GROUNDED)

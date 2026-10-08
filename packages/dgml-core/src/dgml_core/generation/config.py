@@ -155,10 +155,6 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
         tier=Tier.STANDARD,
         invalid=GenerationConfigInvalid,
         missing=GenerationConfigMissing,
-        model_field="model",
-        key_field="api_key",
-        env_field="api_key_env",
-        base_field="api_base",
     )
     label = resolve_tiered_model(
         merged,
@@ -170,10 +166,7 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
         tier=Tier.STANDARD,
         invalid=GenerationConfigInvalid,
         missing=GenerationConfigMissing,
-        model_field="label_model",
-        key_field="label_api_key",
-        env_field="label_api_key_env",
-        base_field="label_api_base",
+        prefix="label_",
     )
     return GenerationConfig(
         thinking=_resolve_thinking(merged),

@@ -18,8 +18,11 @@ import functools
 import json
 import logging
 import os
+import shutil
 import sys
-from dataclasses import dataclass
+import tempfile
+import weakref
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +31,7 @@ from . import layout
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .configuration import Configuration
     from .migrations import MigrationResult
     from .storage_service import BlobStore, DocStore, StorageConfig
 
@@ -61,11 +65,81 @@ class Workspace:
     **id, not a live store object**, deliberately: this is a frozen dataclass with
     ``eq=True``, and a networked store holds a client that must not end up inside
     ``__eq__`` — nor be constructed once per ``Workspace``.
+
+    ``configuration`` set means the workspace was **configured in memory**
+    (:mod:`dgml_core.configuration`): no ``config.toml`` anywhere, no store of
+    workspaces, nothing written back. It is then the only config source, so it is
+    exclusive with ``workspaces_id`` and ``config_override``. ``root`` is still a
+    directory on this machine — ``Workspace.open(configuration=…)`` makes an empty
+    temp dir when the caller gives none, since a workspace whose stores are both remote
+    has no use for one beyond the few local-only paths (the local store's data *is* the
+    root, so ``open`` refuses to go without one for it). Excluded from ``__eq__`` for the
+    same reason the store is: a workspace's identity is where it is, not who opened it.
+
+    Whichever way it was configured, :attr:`config` is the one
+    :class:`~dgml_core.configuration.Configuration` every reader consults.
     """
 
     root: Path
     config_override: Path | None = None
     workspaces_id: str | None = None
+    configuration: Configuration | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.configuration is not None and (
+            self.workspaces_id is not None or self.config_override is not None
+        ):
+            from .errors import InvalidArgument
+
+            raise InvalidArgument(
+                "a workspace configured in memory takes no workspaces_id or "
+                "config_override: the Configuration is its only config source"
+            )
+
+    @staticmethod
+    def scratch_root() -> Path:
+        """An empty temp dir to serve as ``root`` for a workspace configured in memory
+        whose stores are remote — it holds nothing the caller needs back."""
+        return Path(tempfile.mkdtemp(prefix="dgml-ws-"))
+
+    @property
+    def config(self) -> Configuration:
+        """This workspace's :class:`~dgml_core.configuration.Configuration` — the one
+        read model behind every loader.
+
+        Supplied in memory (``Workspace.open(configuration=…)``), or **derived** here
+        for a workspace addressed by path or id: the usual TOML merge (user config →
+        workspace config → environment) for the sections, the ``[workspace]`` block for
+        identity, the bound ``[storage.<svc>]`` table for storage.
+
+        The derived form is **not memoized**, on purpose: a file-backed config is
+        re-read on every access (see :attr:`config_text` for why always-fresh is the
+        rule there), and the environment layer can change between calls. Deriving it
+        reads ``config.toml`` several times (merge, identity, storage table), so the
+        loaders do not come through here — ``load_merged_config`` takes the merge
+        directly — and only a caller that wants the whole object pays for it. The one
+        memo that does exist, :attr:`store_configs`, keeps its documented
+        write-before-touch rule."""
+        if self.configuration is not None:
+            return self.configuration
+        from . import workspace_config
+        from .config import _merge_toml_layers
+        from .configuration import Configuration, Identity, ProviderSpec, Storage
+        from .storage_resolve import resolve_store_configs
+
+        merged = _merge_toml_layers(self)
+        ident = workspace_config.read_identity(self)
+        blob_cfg, doc_cfg = resolve_store_configs(self, merged=merged)
+        return Configuration.from_merged(
+            identity=Identity(
+                workspace_id=ident.workspace_id, name=ident.name, organization=ident.organization
+            ),
+            storage=Storage(
+                blobs=ProviderSpec(blob_cfg.provider, blob_cfg.options),
+                docs=ProviderSpec(doc_cfg.provider, doc_cfg.options),
+            ),
+            sections=merged,
+        )
 
     @classmethod
     def resolve(
@@ -108,10 +182,22 @@ class Workspace:
         override: Path | str | None = None,
         *,
         config: Path | None = None,
+        configuration: Configuration | None = None,
+        root: Path | None = None,
         on_migration: Callable[[Workspace, MigrationResult], None] | None = None,
     ) -> Workspace:
         """Resolve a workspace **and bring it up to date** — the entry point for
         anything that goes on to read or write one.
+
+        With ``configuration`` the workspace is **configured in memory** (see
+        :mod:`dgml_core.configuration`): nothing is resolved from a path, an id or a
+        file, and there is no separate create step — the first open against a fresh
+        backend writes the workspace's meta document (name, organization, id, schema
+        version) from ``configuration.identity``, and every later open checks that
+        document names the same workspace. ``root`` is optional there when every store
+        is remote — an empty temp dir stands in for the local-only paths — and required
+        for the local store, whose data it is. ``override`` /
+        ``config`` are then not accepted.
 
         :meth:`resolve` only answers "which workspace" and does not touch it, which
         makes it right for the commands that run *before* a workspace is usable
@@ -136,13 +222,23 @@ class Workspace:
         bookkeeping, not an upgrade.
         """
         # Imported here, not at module scope: both modules import this one.
-        from .errors import WorkspaceNotInitialized
+        from .errors import InvalidArgument, WorkspaceNotInitialized
         from .migrations import migrate_workspace, migrate_workspace_config
         from .storage_resolve import verify_storage_fingerprint
 
-        ws = cls.resolve(override, config=config)
-        migrate_workspace_config(ws)
-        verify_storage_fingerprint(ws)
+        if configuration is not None:
+            if override is not None or config is not None:
+                raise InvalidArgument(
+                    "Workspace.open(configuration=...) takes no path, id or config file: "
+                    "the Configuration is the whole workspace"
+                )
+            ws = cls._open_configured(configuration, root=root)
+        else:
+            if root is not None:
+                raise InvalidArgument("root applies only with configuration=")
+            ws = cls.resolve(override, config=config)
+            migrate_workspace_config(ws)
+            verify_storage_fingerprint(ws)
         if not ws.is_initialized():
             where = (
                 f"{ws.config_location} holds no config for {ws.workspaces_id}"
@@ -160,6 +256,69 @@ class Workspace:
             logger.info("[dgml] upgraded workspace at %s — %s", ws.root, result.summary())
             if on_migration is not None:
                 on_migration(ws, result)
+        return ws
+
+    @classmethod
+    def _open_configured(cls, configuration: Configuration, *, root: Path | None) -> Workspace:
+        """The in-memory half of :meth:`open`: build the ``Workspace``, then make sure
+        the backend's meta document is this workspace's — written on first use. The id
+        is never rewritten (``create`` never re-identifies a workspace, and neither
+        does this); a changed ``organization`` re-organizes the workspace with a loud
+        warning, exactly as ``create`` does, and a changed ``name`` is just updated."""
+        from .errors import ConflictError, InvalidArgument
+        from .migrations import stamp_schema_version
+        from .storage_resolve import DEFAULT_STORAGE_PROVIDER
+
+        configuration.identity.require_complete()
+        ident = configuration.identity
+        assert ident.workspace_id and ident.name and ident.organization  # require_complete
+        if root is None:
+            # The local store's data *is* the root; a scratch dir would vanish with
+            # this object. A store told where to live (`workspace_path`) is fine.
+            storage = configuration.storage
+            if any(
+                spec.provider == DEFAULT_STORAGE_PROVIDER and "workspace_path" not in spec.options
+                for spec in (storage.blobs, storage.docs)
+            ):
+                raise InvalidArgument(
+                    "the local store's data is the workspace root: pass root= to "
+                    "Workspace.open(configuration=…), or set 'workspace_path' on the store"
+                )
+            ws = cls(root=cls.scratch_root(), configuration=configuration)
+            # Ours, not the caller's: removed with the workspace, not left per open.
+            weakref.finalize(ws, shutil.rmtree, ws.root, ignore_errors=True)
+        else:
+            ws = cls(root=root, configuration=configuration)
+        meta = ws.read_meta()
+        if not meta:
+            ws.write_meta(
+                name=ident.name, organization=ident.organization, workspace_id=ident.workspace_id
+            )
+            stamp_schema_version(ws)
+            return ws
+        held = meta.get("workspace_id")
+        if held != ident.workspace_id:
+            raise ConflictError(
+                f"the configured storage already holds workspace {held!r}; refusing to open it "
+                f"as {ident.workspace_id!r}. A workspace is never re-identified — point this "
+                f"Configuration at that workspace's own storage.",
+                kind="workspace",
+                existing_id=str(held),
+            )
+        recorded = meta.get("organization")
+        if recorded and recorded != ident.organization:
+            # Loud, and not behind verbose: this rewrites the organization for every
+            # consumer of the workspace, and only affects *newly* generated XML, so the
+            # corpus ends up split across two namespaces with nothing to flag it later.
+            logger.warning(
+                f"[dgml] organization {ident.organization!r} differs from the {recorded!r} "
+                f"recorded for workspace {ident.workspace_id}. The workspace is now "
+                f"organization {ident.organization!r}: docset namespace URIs generated from "
+                f"here on use it, while XML already generated keeps the old namespace. If "
+                f"this was a typo, reopen with organization {recorded!r}."
+            )
+        if recorded != ident.organization or meta.get("name") != ident.name:
+            ws.write_meta(name=ident.name, organization=ident.organization)
         return ws
 
     @classmethod
@@ -320,6 +479,8 @@ class Workspace:
         applies to ``store_configs``."""
         from . import workspace_config
 
+        if self.configuration is not None:
+            return None  # configured in memory: there is no config.toml anywhere
         if self.workspaces_id is None:
             return workspace_config.read_config_state(self)
         # Membership rather than a `.get(...) is None` test: the memoized value is the
@@ -348,6 +509,8 @@ class Workspace:
         workspaces keeps its configs as files; otherwise the store plus the id. Never a
         synthetic path — telling a user to restore a file that does not exist from backup
         is worse than telling them nothing."""
+        if self.configuration is not None:
+            return "in-memory configuration"
         if self.workspaces_id is None:
             return str(self.config_path)
         from .workspaces_resolve import default_workspaces_store
@@ -458,6 +621,8 @@ class Workspace:
         ``workspace.json``; falls back to the workspace **directory name** for
         workspaces created before ``workspace.json`` existed, preserving their
         namespaces."""
+        if self.configuration is not None and self.configuration.identity.organization:
+            return self.configuration.identity.organization
         org = self.read_meta().get("organization")
         return org if isinstance(org, str) and org else self.root.name
 
@@ -465,6 +630,8 @@ class Workspace:
     def display_name(self) -> str:
         """Human-readable workspace name from ``workspace.json``; falls back to
         the workspace directory name when unset."""
+        if self.configuration is not None and self.configuration.identity.name:
+            return self.configuration.identity.name
         name = self.read_meta().get("name")
         return name if isinstance(name, str) and name else self.root.name
 
@@ -487,6 +654,10 @@ class Workspace:
         create their parents — so a workspace becomes usable by being configured,
         not by being pre-built.
         """
+        if self.configuration is not None:
+            # No config to be the marker; the meta document `open` writes is the
+            # evidence this backend has been used as this workspace.
+            return bool(self.read_meta())
         return self.config_present
 
     def has_legacy_json_config(self) -> bool:

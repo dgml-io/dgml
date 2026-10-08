@@ -463,7 +463,7 @@ mongo_database = "dgml"
   *is* the `default` service, and no `[storage]` at all is the zero-config local
   store for both roles.
 - **Secrets vs. identity.** Secret-hinted options (keys containing `key`, `secret`,
-  `token`, `password`, `credential`) are excluded from the
+  `token`, `password`, `credential`, or the word `uri` as in `mongo_uri`) are excluded from the
   [seal fingerprint](#the-storage-seal-storage_fingerprint), so rotating a credential
   never reads as "the store moved". Every in-tree provider takes its credentials from
   the **environment** instead of config — S3 via the boto3 chain, Mongo via
@@ -533,11 +533,35 @@ explicit tiers in the user config, while tiers set in the same layer as the
 family, or a higher one, still override it. To drop a user-level pin in one
 workspace, restate the family there.
 
-Tiers name only models — they carry no credentials. Credentials are configured
-per task on the task's own section (e.g. `generation.api_key_env`,
-`grounded.schema_api_key`); a model sourced from a tier uses its task section's
-credentials, or falls back to litellm's per-provider env var when the section
-sets none.
+Credentials can sit at three levels; the most specific wins:
+
+```toml
+[models]
+family = "anthropic_google"
+anthropic_api_key_env = "ANTHROPIC_API_KEY"   # every anthropic/… model
+google_api_key_env    = "GEMINI_API_KEY"      # every gemini/… model
+expert          = "anthropic/claude-opus-5"
+expert_api_key_env = "OPUS_KEY"               # this tier only
+expert_api_base = "https://proxy.example"
+```
+
+- **Per task**, on the task's own section (`generation.api_key_env`,
+  `grounded.schema_api_key`, `classification.api_base`, …).
+- **Per tier**: `<tier>_api_key` / `<tier>_api_key_env` / `<tier>_api_base` next
+  to the tier, used by every task that takes its model from that tier. A tier's
+  credentials require the tier itself to be set. Like every other key they layer
+  independently of the tier: a workspace `config.toml` that overrides `expert`
+  still inherits a user-level `expert_api_key_env`. For a credential that should
+  follow the model, use the provider key.
+- **Per provider**: `anthropic_api_key`, `google_api_key`, `openai_api_key` (or
+  the `_env` form), matched on the model id's prefix (`anthropic/`, `gemini/`,
+  `openai/`) — for any model that sets nothing more specific, whether it came from
+  a tier or a task names it. One key per provider covers a mixed family such as
+  `anthropic_google`. A model of another provider (`ollama/…`) never receives
+  these keys.
+
+A model with none of these falls back to litellm's per-provider env var. A tier
+that is unset borrows its fallback tier's credentials along with its model.
 
 `dgml init --provider {anthropic,anthropic_google,google,openai}` writes a
 family-only `[models]` block; omit `--provider` to auto-detect from the API-key

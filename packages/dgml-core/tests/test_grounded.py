@@ -354,6 +354,37 @@ def test_load_config_defaults(workspace: Workspace) -> None:
     assert config.values_reasoning_effort == "medium"
 
 
+def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> None:
+    # Tier credentials belong to the tier's model: an override to another
+    # provider takes that provider's key and no api_base, never the tier's.
+    from .conftest import write_config
+
+    write_config(
+        workspace,
+        {
+            "models": {
+                "anthropic_api_key": "sk-ant",
+                "advanced": "azure/gpt-4o",
+                "advanced_api_key": "azure-secret",
+                "advanced_api_base": "https://acme.openai.azure.com",
+                "expert": "azure/gpt-4o",
+                "expert_api_key_env": "AZURE_KEY",
+                "expert_api_base": "https://acme.openai.azure.com",
+            }
+        },
+    )
+    config = load_grounded_config(
+        workspace, values_model="anthropic/claude-sonnet-5", schema_model="openai/gpt-5.4"
+    )
+    assert (config.values_api_key, config.values_api_key_env) == ("sk-ant", None)
+    assert config.values_api_base is None
+    assert (config.schema_api_key, config.schema_api_key_env, config.schema_api_base) == (
+        None,
+        None,
+        None,
+    )
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

@@ -46,7 +46,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .config import load_merged_config
 from .errors import StorageConfigInvalid
 from .models_config import ConfigSection
 from .provider import import_provider_class
@@ -71,6 +70,11 @@ _ROLE_KEYS = ("blobs", "docs")
 # the option so one of these appears in it (see the storage-package READMEs);
 # every in-tree provider takes its credentials from the environment instead.
 _SECRET_HINTS = ("key", "secret", "token", "password", "credential")
+
+# Matched as a whole ``_``-separated word, not a substring: a connection URI
+# (``mongo_uri``) carries credentials inline, but ``security_…`` is not a secret. The
+# identity a URI also names (host, database) is covered by the ``mongo_*`` options.
+_SECRET_WORDS = frozenset({"uri"})
 
 # Option keys that name *where this machine keeps the data* rather than *which store
 # this is*, and so are also outside the identity fingerprint. Same argument as the one
@@ -211,6 +215,7 @@ def load_store_configs(
     service: str = DEFAULT_STORAGE_SERVICE,
     *,
     workspace_id: str | None = None,
+    merged: Mapping[ConfigSection, Any] | None = None,
 ) -> tuple[StorageConfig, StorageConfig]:
     """Resolve a named service into a ``(blob_cfg, doc_cfg)`` pair.
 
@@ -229,8 +234,29 @@ def load_store_configs(
     Validates only the *generic shape* — provider resolution and field validation
     happen lazily in :func:`make_blob_store` / :func:`make_doc_store`. Raises
     :class:`StorageConfigInvalid` for a malformed shape or an unknown named service.
+
+    ``merged`` is the already-merged config to read ``[storage]`` from; passed by
+    ``Workspace.config`` while it is being derived.
+
+    A workspace configured in memory has no ``[storage]`` table: its one binding is the
+    :class:`~dgml_core.configuration.Configuration`'s, served as the ``"default"``
+    service, and any other name is an error.
     """
-    section = load_merged_config(workspace).get(ConfigSection.STORAGE) or {}
+    if merged is None:
+        if workspace.configuration is not None:
+            if service != DEFAULT_STORAGE_SERVICE:
+                raise StorageConfigInvalid(
+                    f"no storage service {service!r}: a workspace configured in memory has "
+                    f"only the binding its Configuration carries"
+                )
+            return _configured_store_configs(workspace, workspace_id)
+        # The TOML merge directly, not ``load_merged_config``: that reads
+        # ``workspace.config``, whose derivation is what calls here. Storage on the
+        # TOML path is TOML-derived by definition, so nothing is bypassed.
+        from .config import _merge_toml_layers
+
+        merged = _merge_toml_layers(workspace)
+    section = merged.get(ConfigSection.STORAGE) or {}
     if not isinstance(section, dict):
         raise StorageConfigInvalid("'storage' must be a table")
     table = _select_service_table(section, service)
@@ -284,7 +310,9 @@ def _reject_mixed_form(table: Mapping[str, Any], service: str) -> None:
 # --------------------------------------------------------- resolving a workspace
 
 
-def resolve_store_configs(workspace: Workspace) -> tuple[StorageConfig, StorageConfig]:
+def resolve_store_configs(
+    workspace: Workspace, *, merged: Mapping[ConfigSection, Any] | None = None
+) -> tuple[StorageConfig, StorageConfig]:
     """The effective ``(blob_cfg, doc_cfg)`` pair ``workspace`` opens with.
 
     The workspace's own ``config.toml`` is authoritative. Its ``[workspace]`` block
@@ -295,15 +323,38 @@ def resolve_store_configs(workspace: Workspace) -> tuple[StorageConfig, StorageC
     a shared ``[storage.<name>]`` template still serves many workspaces.
 
     Reached through :attr:`dgml_core.storage.Workspace.store_configs`, which caches it.
+
+    A workspace configured in memory has its binding on the
+    :class:`~dgml_core.configuration.Configuration` itself: no service name, no
+    fallback to a shared template.
     """
     from . import workspace_config
 
+    if workspace.configuration is not None:
+        return _configured_store_configs(workspace, None)
     service = workspace_config.read_identity(workspace).storage_service or DEFAULT_STORAGE_SERVICE
-    return resolve_service_configs(workspace, service)
+    return resolve_service_configs(workspace, service, merged=merged)
+
+
+def _configured_store_configs(
+    workspace: Workspace, workspace_id: str | None
+) -> tuple[StorageConfig, StorageConfig]:
+    """The pair an in-memory :class:`~dgml_core.configuration.Configuration` binds
+    ``workspace`` to."""
+    cfg = workspace.configuration
+    assert cfg is not None
+    return cfg.storage.store_configs(
+        root=workspace.root,
+        workspace_id=workspace_id or cfg.identity.workspace_id,
+    )
 
 
 def resolve_service_configs(
-    workspace: Workspace, service: str, *, workspace_id: str | None = None
+    workspace: Workspace,
+    service: str,
+    *,
+    workspace_id: str | None = None,
+    merged: Mapping[ConfigSection, Any] | None = None,
 ) -> tuple[StorageConfig, StorageConfig]:
     """The pair ``workspace`` would open with if bound to ``service`` — its own
     ``[storage.<service>]`` whole when it defines one, else the merged config's.
@@ -312,7 +363,7 @@ def resolve_service_configs(
 
     own = workspace_config.read_storage_table(workspace, service)
     if own is None:
-        return load_store_configs(workspace, service, workspace_id=workspace_id)
+        return load_store_configs(workspace, service, workspace_id=workspace_id, merged=merged)
     _reject_mixed_form(own, service)
     return _role_configs(own, workspace, workspace_id)
 
@@ -326,10 +377,13 @@ def verify_storage_fingerprint(workspace: Workspace) -> None:
     open before it has ever been sealed.
 
     Store-free: resolution reads TOML only, so a config naming an unreachable backend
-    is rejected here rather than after a failed connection."""
+    is rejected here rather than after a failed connection. A workspace configured in
+    memory has no stored config to drift from, so it has no seal and passes."""
     from . import workspace_config
     from .errors import StorageBackendMismatch
 
+    if workspace.configuration is not None:
+        return
     recorded = workspace_config.read_identity(workspace).storage_fingerprint
     if not recorded:
         return
@@ -352,7 +406,11 @@ def verify_storage_fingerprint(workspace: Workspace) -> None:
 def _excluded_from_identity(key: str) -> bool:
     """Whether an option key is outside the store-identity hash."""
     lowered = key.lower()
-    return any(hint in lowered for hint in _SECRET_HINTS) or lowered in _LOCATION_HINTS
+    return (
+        any(hint in lowered for hint in _SECRET_HINTS)
+        or not _SECRET_WORDS.isdisjoint(lowered.split("_"))
+        or lowered in _LOCATION_HINTS
+    )
 
 
 def _identity_hash(provider: str, options: Mapping[str, Any]) -> str:
@@ -380,7 +438,8 @@ def storage_fingerprint_pair(blob_cfg: StorageConfig, doc_cfg: StorageConfig) ->
     machine":
 
     - ``root``, so a workspace copied or moved to another path keeps its seal.
-    - Secret-named options (:data:`_SECRET_HINTS`), so rotating a credential never reads
+    - Secret-named options (:data:`_SECRET_HINTS`, :data:`_SECRET_WORDS`), so rotating a
+      credential never reads
       as "the store moved".
     - Location options (:data:`_LOCATION_HINTS`), for exactly the ``root`` argument: an
       option naming where *this machine* keeps the data describes an address, not an

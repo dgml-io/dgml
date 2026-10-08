@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .errors import CorruptMetadata, StorageConfigInvalid
+from .errors import CorruptMetadata, InvalidArgument, StorageConfigInvalid
 from .storage import write_text_atomic
 
 if TYPE_CHECKING:
@@ -140,6 +140,12 @@ def write_config_text(ws: Workspace, text: str) -> None:
     ``ws.config_text`` is both the conditional token and already in hand — the splice
     that produced ``text`` started from it — so detecting a conflict costs no extra
     read."""
+    if ws.configuration is not None:
+        # Reaching this is a bug: an in-memory configuration is the caller's, and the
+        # identity, storage binding and seal this writes exist to describe a stored one.
+        raise InvalidArgument(
+            "this workspace is configured in memory; its configuration is never written"
+        )
     if ws.workspaces_id is None:
         path = ws.config_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,7 +218,18 @@ def identity_from_text(text: str, *, workspace_id: str | None = None) -> Workspa
 
 
 def read_identity(ws: Workspace) -> WorkspaceIdentity:
-    """The workspace's ``[workspace]`` identity block, read store-free and unlayered."""
+    """The workspace's ``[workspace]`` identity block, read store-free and unlayered.
+
+    For a workspace configured in memory, the identity its
+    :class:`~dgml_core.configuration.Configuration` carries — with no storage service
+    or seal, since there is no stored config for either to describe. Branches on the
+    *supplied* configuration rather than ``ws.config`` because ``Workspace.config``
+    derives the TOML case through this very function."""
+    if ws.configuration is not None:
+        ident = ws.configuration.identity
+        return WorkspaceIdentity(
+            workspace_id=ident.workspace_id, name=ident.name, organization=ident.organization
+        )
     return _identity_from_table(_load(ws).get(IDENTITY_TABLE))
 
 

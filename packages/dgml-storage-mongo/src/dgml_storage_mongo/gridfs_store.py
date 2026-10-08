@@ -91,7 +91,7 @@ from dgml_core.hashing import sha256_file
 from dgml_core.storage_service import BlobStore, StorageConfig
 
 from ._client import (
-    IDENTITY_FIELDS,
+    DATA_FIELDS,
     connect,
     prefixed,
     require_workspace_id,
@@ -123,7 +123,7 @@ class MongoGridFSBlobStore(BlobStore):
     a workspace's blobs and documents share one namespace."""
 
     name = "mongo-gridfs"
-    config_fields = IDENTITY_FIELDS | {"mongo_bucket", "prefix"}
+    config_fields = DATA_FIELDS | {"mongo_bucket", "prefix"}
 
     # ---- configuration ----
 

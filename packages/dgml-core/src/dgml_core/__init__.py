@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from . import layout
+from . import configuration, layout
+from .configuration import Configuration, Identity, ProviderSpec, Storage
 from .conversion import (
     ConverterConfig,
     DocConverter,
@@ -257,6 +258,7 @@ __all__ = [
     "ClassifyMode",
     "ClusteringConfigInvalid",
     "Collection",
+    "Configuration",
     "ConflictError",
     "ConflictPolicy",
     "ConversionConfigInvalid",
@@ -288,6 +290,7 @@ __all__ = [
     "GroundedConfigMissing",
     "GroundingFailed",
     "GuidanceNotFound",
+    "Identity",
     "IncrementalWithoutClusters",
     "InvalidArgument",
     "InvalidPDF",
@@ -315,11 +318,13 @@ __all__ = [
     "PdfConfigInvalid",
     "PdfSliceFailed",
     "PdfSlicer",
+    "ProviderSpec",
     "RecordNotFound",
     "RegistryNotFound",
     "SchemaGenerationFailed",
     "SchemaInvalid",
     "SchemaNotFound",
+    "Storage",
     "StorageBackendMismatch",
     "StorageConfig",
     "StorageConfigInvalid",
@@ -351,6 +356,7 @@ __all__ = [
     "classify_file",
     "collect_file_version",
     "collect_from_attestation",
+    "configuration",
     "create_workspace",
     "default_workspaces_root",
     "default_workspaces_store",
