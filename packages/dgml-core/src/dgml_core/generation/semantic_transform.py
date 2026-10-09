@@ -250,8 +250,15 @@ def _detect_value_type(
         if 1900 <= year <= 2100:
             return "gYear", m.group(1), None
 
+    # _detect_year_position only tells us where the year sits ("MDY" = year
+    # first, "DMY" = year last); it says nothing about day/month order. A
+    # year-last numeric date is ambiguous ("11/1/2024"), and business documents
+    # are overwhelmingly month-first, so try MDY first and fall back to DMY
+    # only when MDY cannot parse (e.g. "31/10/2024").
     year_pos = _detect_year_position(s)
-    date_val = _normalize_date(s, prefer_day_first=(year_pos == "DMY"))
+    date_val = _normalize_date(s, prefer_day_first=False)
+    if date_val is None and year_pos == "DMY":
+        date_val = _normalize_date(s, prefer_day_first=True)
     if date_val:
         return "date", date_val, None
 
