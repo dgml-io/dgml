@@ -65,14 +65,19 @@ License: **Apache 2.0**.
 │       │   ├── __init__.py    #   the public library API
 │       │   └── py.typed
 │       └── tests/
+├── samples/                  # Samples built on DGML (not published)
+│   ├── app-sample/           # Single-file web app + stdlib-only server
+│   └── dgml-sample-service/  # FastAPI + Postgres + S3 service embedding
+│                             #   dgml-core; a workspace member
 ├── pyproject.toml            # Workspace root + shared tool config
 ├── LICENSE                   # Apache 2.0
 ├── README.md
 └── CLAUDE.md
 ```
 
-Everything Python-shaped lives under `packages/<name>/`. The repo root holds
-only workspace-wide configuration and meta files.
+Every library and CLI package lives under `packages/<name>/`; samples live under
+`samples/<name>/`. The repo root holds only workspace-wide configuration and
+meta files.
 
 ## Working with the workspace
 

@@ -1,5 +1,5 @@
 [tool.uv.workspace]
-members = ["packages/*"]
+members = ["packages/*", "samples/dgml-sample-service"]
 
 [tool.uv]
 dev-dependencies = [
@@ -92,7 +92,7 @@ namespace_packages = true
 # integration tests lean on untyped `moto`/`mongomock` fakes, so excluding them
 # from mypy loses little. (pytest still runs them.)
 exclude = "packages/dgml-storage-(s3|mongo)/tests/"
-mypy_path = "packages/dgml/src:packages/dgml-core/src:packages/dgml-chain/src:packages/translators-pdf/src:packages/clustering/src:packages/dgml-storage-s3/src:packages/dgml-storage-mongo/src"
+mypy_path = "packages/dgml/src:packages/dgml-core/src:packages/dgml-chain/src:packages/translators-pdf/src:packages/clustering/src:packages/dgml-storage-s3/src:packages/dgml-storage-mongo/src:samples/dgml-sample-service/src"
 
 [[tool.mypy.overrides]]
 module = [
@@ -128,7 +128,7 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["packages/*/tests"]
+testpaths = ["packages/*/tests", "samples/*/tests"]
 # importlib mode derives a unique, rootdir-relative module name per test file
 # (e.g. packages.dgml.tests.test_cli vs packages.dgml-core.tests.test_hybrid),
 # so the CLI (`dgml`) and library (`dgml-core`) test packages can each carry
