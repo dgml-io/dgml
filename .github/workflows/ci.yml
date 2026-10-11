@@ -36,7 +36,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev --locked
-      - run: uv run mypy packages
+      - run: uv run mypy packages samples/dgml-sample-service
 
   test:
     name: Test (Python ${{ matrix.python-version }})

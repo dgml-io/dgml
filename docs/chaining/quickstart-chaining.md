@@ -370,7 +370,7 @@ proving works from it offline.
 You can also anchor just **one element** of the DGML XML — proving that node
 belongs to the document without revealing the rest. Identify the element by
 its `--xpath` — copy it from the DGML viewer's tree (the sample web app in
-[`app-sample/`](../../app-sample/README.md), which renders a workspace
+[`samples/app-sample/`](../../samples/app-sample/README.md), which renders a workspace
 document's element tree and shows the XPath of any element you select for
 anchoring), or read it out of the `<stem>.dgml.xml` file — or by its
 `--leaf <n>` index:
