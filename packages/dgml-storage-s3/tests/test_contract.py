@@ -126,22 +126,54 @@ def test_sha256_blob_is_plain_digest_not_etag(blobs: S3BlobStore) -> None:
     assert blobs.sha256_blob("files/f/x.bin") == hashlib.sha256(data).hexdigest()
 
 
+def _store(options: dict[str, object], workspace_id: str | None, root: Path) -> S3BlobStore:
+    config = StorageConfig(provider=PROVIDER, root=root, options=options, workspace_id=workspace_id)
+    return S3BlobStore(S3BlobStore.parse_config(config))
+
+
 def test_prefix_isolates_tenants_sharing_a_bucket(tmp_path: Path) -> None:
     base, options = make_store_options()
-    a = S3BlobStore(
-        S3BlobStore.parse_config(
-            StorageConfig(
-                provider=PROVIDER, root=tmp_path, options={**options, "prefix": f"{base}/wsA"}
-            )
-        )
-    )
-    b = S3BlobStore(
-        S3BlobStore.parse_config(
-            StorageConfig(
-                provider=PROVIDER, root=tmp_path, options={**options, "prefix": f"{base}/wsB"}
-            )
-        )
-    )
+    a = _store({**options, "prefix": f"{base}/tenantA"}, "ws-test", tmp_path)
+    b = _store({**options, "prefix": f"{base}/tenantB"}, "ws-test", tmp_path)
     a.put_blob("files/f/a.pdf", b"from-A")
     assert b.blob_exists("files/f/a.pdf") is False  # separate namespaces
     assert a.list_blobs("files/") == ["files/f/a.pdf"]  # prefix stripped on return
+
+
+# ----------------------------------------------------- one namespace per workspace
+
+
+def test_keys_go_under_the_prefix_then_the_workspace_id(tmp_path: Path) -> None:
+    """The id is appended at runtime, not stamped into config: the config holds only
+    what the user wrote, and the store works out the rest."""
+    opts = {"bucket": "b"}
+    assert _store(opts, "ws_a", tmp_path)._obj("files/x") == "dgml/ws_a/files/x"
+    assert (
+        _store({**opts, "prefix": "/contracts/"}, "ws_a", tmp_path)._obj("files/x")
+        == "contracts/ws_a/files/x"
+    )
+    # An explicit empty prefix is the bucket root — but the id is still there.
+    assert _store({**opts, "prefix": ""}, "ws_a", tmp_path)._obj("files/x") == "ws_a/files/x"
+
+
+def test_a_workspace_without_an_id_is_refused(tmp_path: Path) -> None:
+    """Keys without the id would be shared by every id-less workspace on the bucket,
+    and would move the moment this one got an id."""
+    from dgml_core.errors import StorageConfigInvalid
+
+    with pytest.raises(StorageConfigInvalid, match="workspace's id"):
+        _store({"bucket": "b"}, None, tmp_path)
+
+
+def test_workspaces_with_one_config_share_a_bucket_without_colliding(tmp_path: Path) -> None:
+    """The case this exists for: two workspaces bound to the same config write the same
+    store keys, and must still see only their own objects."""
+    _base, options = make_store_options()
+    a, b = _store(options, "ws-a", tmp_path), _store(options, "ws-b", tmp_path)
+    a.put_blob("files/f/x.pdf", b"from-a")
+    b.put_blob("files/f/x.pdf", b"from-b")
+    assert a.get_blob("files/f/x.pdf") == b"from-a"
+    assert b.get_blob("files/f/x.pdf") == b"from-b"
+
+    a.delete_blobs("files/")
+    assert b.list_blobs("files/") == ["files/f/x.pdf"]

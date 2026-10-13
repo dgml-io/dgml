@@ -1417,11 +1417,22 @@ def _label_chunk(
             if attempt:
                 warnings.append(f"{msg}: {exc}")
             continue
-        # Functional file the next run reloads — written regardless of --debug.
-        cache_write(cache_dir, f"label_{stem}_{label_tag}_raw.json", strip_fences(raw), debug=True)
+        raw_name = f"label_{stem}_{label_tag}_raw.json"
         try:
             payload = _parse_labels_json(raw)
         except Exception as exc:  # malformed reply — the oversized-output signature
+            # Never leave an unparseable reply (or a stale one from an earlier
+            # run) under the functional name: the next incremental run replays
+            # every ``label_<stem>_*_raw.json`` and would crash on it. Under
+            # --debug the reply is kept under a name the loader never reads.
+            if cache_dir is not None:
+                (Path(cache_dir) / raw_name).unlink(missing_ok=True)
+            cache_write(
+                cache_dir,
+                f"label_{stem}_{label_tag}_unparseable.txt",
+                strip_fences(raw),
+                debug=debug,
+            )
             # Size-driven: halve the chunk and relabel each half instead of
             # retrying the same overflow.
             log(f"[label] {msg}: {exc}")
@@ -1462,6 +1473,9 @@ def _label_chunk(
             if attempt:
                 warnings.append(f"{msg}: {exc}")
             continue
+        # Functional file the next run reloads — written regardless of --debug,
+        # and only once it parses, so a replay applies exactly what this run did.
+        cache_write(cache_dir, raw_name, strip_fences(raw), debug=True)
         warnings.extend(
             apply_labels(
                 chunk,

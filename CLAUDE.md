@@ -65,14 +65,19 @@ License: **Apache 2.0**.
 │       │   ├── __init__.py    #   the public library API
 │       │   └── py.typed
 │       └── tests/
+├── samples/                  # Samples built on DGML (not published)
+│   ├── app-sample/           # Single-file web app + stdlib-only server
+│   └── dgml-sample-service/  # FastAPI + Postgres + S3 service embedding
+│                             #   dgml-core; a workspace member
 ├── pyproject.toml            # Workspace root + shared tool config
 ├── LICENSE                   # Apache 2.0
 ├── README.md
 └── CLAUDE.md
 ```
 
-Everything Python-shaped lives under `packages/<name>/`. The repo root holds
-only workspace-wide configuration and meta files.
+Every library and CLI package lives under `packages/<name>/`; samples live under
+`samples/<name>/`. The repo root holds only workspace-wide configuration and
+meta files.
 
 ## Working with the workspace
 
@@ -148,6 +153,13 @@ only at the leaf (`src/dgml/clustering/__init__.py`).
 - Tests live next to the package they cover (`packages/<name>/tests/`).
   Integration tests that span packages can live in a top-level `tests/` if
   one is later added.
+- Tests run **offline**. The root `conftest.py` refuses every connection and
+  DNS lookup to a non-loopback host and fails the test that tried, even when
+  the code under test swallowed the error. The one exception is litellm's
+  model-cost-map fetch from raw.githubusercontent.com. Mock the model call
+  (`litellm.completion`, `llm.call`, or the stage's own seam) instead of
+  relying on it failing; only opt-in live tests carry
+  `@pytest.mark.allow_network`.
 
 ## Workspaces and the `dgml` CLI
 

@@ -107,8 +107,10 @@ from .rotation import rotate_word_boxes
 from .storage import Workspace
 from .text_extraction import (
     PAGE_TEXT_GLOB,
+    RASTER_PAGE_COVERAGE,
     ExtractDigitalResult,
     extract_text_digital,
+    largest_image_coverage,
 )
 from .text_extraction_config import TextExtractionConfig, resolve_api_key
 from .usage import OPERATION_HYBRID_MERGE
@@ -131,12 +133,8 @@ LEVENSHTEIN_THRESHOLD = 2
 # glyph IDs to Unicode — we treat the page's digital output as unusable
 # and fall back to OCR for that page.
 MAX_CID_WORDS_PER_PAGE = 10
-# A page whose largest placed image covers at least this fraction of the page
-# area is a scan: a picture of a document rather than a document. Scanned
-# pages run 0.8-0.99 here (the margin the scanner trimmed is the difference);
-# a born-digital page's own artwork - a logo, an icon, a masthead - is orders
-# of magnitude below it, in the low percents.
-RASTER_PAGE_COVERAGE = 0.8
+# RASTER_PAGE_COVERAGE (the scan guard's threshold) is shared with the digital
+# path, which OCRs scanned pages with no text layer; it lives in text_extraction.
 # Regions needing an LLM decision go out in batches of this many per request.
 # One call for the whole page can overrun the model's output-token limit (or a
 # local model's num_ctx) on dense pages — the reply is truncated mid-JSON and
@@ -985,19 +983,8 @@ def _raster_page_numbers(pdf_path: Path) -> set[int]:
     """
     try:
         from pdfminer.high_level import extract_pages
-        from pdfminer.layout import LTFigure, LTImage
     except ImportError:
         return set()
-
-    def largest_image_coverage(container: Any, page_area: float) -> float:
-        best = 0.0
-        for item in container:
-            if isinstance(item, LTImage):
-                x0, y0, x1, y1 = item.bbox
-                best = max(best, max(0.0, x1 - x0) * max(0.0, y1 - y0) / page_area)
-            elif isinstance(item, LTFigure):
-                best = max(best, largest_image_coverage(item, page_area))
-        return best
 
     raster: set[int] = set()
     try:

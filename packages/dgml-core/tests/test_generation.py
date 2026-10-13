@@ -362,6 +362,48 @@ def test_parse_window_compact_drops_only_malformed_lines() -> None:
     assert [b["structure"] for b in decoded["blocks"]] == ["p", "heading"]
 
 
+def test_parse_window_compact_repairs_literal_tab_placeholder() -> None:
+    # Models sometimes copy the grammar's "<TAB>" placeholder instead of a real
+    # tab, for a whole window; those lines must decode, not be dropped.
+    text = "\n".join(
+        [
+            "C<TAB>end of the previous item.",
+            "H2<TAB>1.<TAB>Safe Deposit Boxes",
+            "I<TAB><TAB>Customer visits a safe deposit box unusually often.",
+            "P<TAB>Plain paragraph.",
+            "R<TAB>cell a<TAB>cell b",
+            "F<TAB><TAB>Total<TAB>1,000",
+        ]
+    )
+    decoded, dropped = _parse_window_compact(text)
+    assert dropped == 0
+    assert decoded["continues"] == "end of the previous item."
+    assert decoded["blocks"] == [
+        {"structure": "heading", "level": 2, "lim": "1.", "text": "Safe Deposit Boxes"},
+        {
+            "structure": "item",
+            "lim": "",
+            "text": "Customer visits a safe deposit box unusually often.",
+        },
+        {"structure": "p", "text": "Plain paragraph."},
+        {"structure": "row", "cells": ["cell a", "cell b"]},
+        {"structure": "field", "lim": "", "label": "Total", "value": "1,000"},
+    ]
+
+
+def test_parse_window_compact_keeps_literal_placeholder_beside_real_tabs() -> None:
+    # A line with a real tab is well-formed; "<TAB>" in its text is content.
+    decoded, dropped = _parse_window_compact("P\tPress <TAB> to indent.")
+    assert dropped == 0
+    assert decoded["blocks"] == [{"structure": "p", "text": "Press <TAB> to indent."}]
+
+
+def test_parse_window_compact_still_drops_prose_mentioning_placeholder() -> None:
+    # Only a sigil followed by the placeholder is repaired.
+    _decoded, dropped = _parse_window_compact("Press <TAB> to indent.")
+    assert dropped == 1
+
+
 def test_parse_window_any_sniffs_json_and_compact() -> None:
     payload = {"continues": "", "blocks": [{"structure": "p", "text": "plain"}]}
     bare = json.dumps(payload)
@@ -2492,6 +2534,74 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
     assert err is None  # RuntimeError is soft, not a reachability error
     assert calls["n"] == 2  # retried once, never split
     assert sum("labeling failed" in w for w in warnings) == 1
+
+
+def _label_fresh_then_replay(
+    blocks: list[Block], fake_call: Any, monkeypatch: pytest.MonkeyPatch, cache: Path
+) -> tuple[list[Block], list[Block]]:
+    """Label *blocks* as a default (non-debug) run does, then rebuild them from
+    the cache the way the next incremental ``docset generate`` does."""
+    from dgml_core.generation.label import _label_one_document
+    from dgml_core.generation.pipeline import load_labeled_docs_from_cache
+    from dgml_core.generation.transcribe import blocks_to_json
+
+    cache.mkdir()
+    (cache / "doc_blocks.json").write_text(blocks_to_json(blocks), encoding="utf-8")
+    monkeypatch.setattr(llm, "call", fake_call)
+    _label_one_document(
+        "doc.pdf",
+        blocks,
+        {},
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=cache,
+        debug=False,
+        log=lambda *_: None,
+        vocab=OPEN_VOCAB,
+    )
+    return blocks, load_labeled_docs_from_cache(cache, ["doc"])["doc"]
+
+
+def test_replay_after_a_bisected_chunk_matches_the_fresh_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bisected chunk's unparseable reply used to stay in the cache as a
+    functional ``label_<stem>_cNN_raw.json``, so the next incremental run died
+    with JSONDecodeError replaying it. Only parsed replies are kept under that
+    name now."""
+
+    def fake_call(config: llm.LLMConfig, **kw: Any) -> str:
+        ids = re.findall(r"(?m)^(\w+) ", kw["user_content"][-1]["text"])
+        if len(ids) != 1:
+            return "{ not valid json ,,,"
+        return json.dumps({"labels": {ids[0]: {"concept": "Revenue"}}})
+
+    cache = tmp_path / "cache"
+    blocks = [_b("p", f"p{i}", text=f"clause number {i}") for i in range(4)]
+    fresh, replayed = _label_fresh_then_replay(blocks, fake_call, monkeypatch, cache)
+
+    assert [b.concept for b in fresh] == ["Revenue"] * 4
+    assert [b.concept for b in replayed] == [b.concept for b in fresh]
+    for f in cache.glob("label_doc_*_raw.json"):
+        json.loads(f.read_text(encoding="utf-8"))  # every functional file parses
+
+
+def test_replay_skips_an_unparseable_reply_left_by_an_older_run(tmp_path: Path) -> None:
+    """Caches written before the fix can still hold a bisected chunk's
+    unparseable reply. A fresh run applied nothing from it, so the loader
+    skips it instead of crashing."""
+    from dgml_core.generation.pipeline import load_labeled_docs_from_cache
+
+    (tmp_path / "doc_blocks.json").write_text(
+        json.dumps([{"id": "b1", "structure": "p", "text": "Acme owes $5"}]),
+        encoding="utf-8",
+    )
+    (tmp_path / "label_doc_c01_raw.json").write_text("{ not valid json ,,,", encoding="utf-8")
+    (tmp_path / "label_doc_c01a_raw.json").write_text(
+        json.dumps({"labels": {"b1": {"concept": "PaymentObligation"}}}),
+        encoding="utf-8",
+    )
+    docs = load_labeled_docs_from_cache(tmp_path, ["doc"])
+    assert docs["doc"][0].concept == "PaymentObligation"
 
 
 # ---------------------------------------------------------------------------

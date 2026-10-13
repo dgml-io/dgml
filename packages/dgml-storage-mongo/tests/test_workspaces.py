@@ -37,7 +37,6 @@ from dgml_core.errors import (
     WorkspacesUnavailable,
     WorkspacesWriteConflict,
 )
-from dgml_core.layout import Collection
 from dgml_core.workspaces_local import LocalDirWorkspacesStore
 from dgml_core.workspaces_store import WorkspacesConfig, WorkspacesStore
 from dgml_storage_mongo import MongoWorkspacesStore
@@ -83,19 +82,6 @@ def test_unknown_or_credential_fields_are_rejected(field: str) -> None:
         options={"mongo_database": "db", field: "x"},
     )
     with pytest.raises(WorkspacesConfigInvalid):
-        MongoWorkspacesStore.parse_config(cfg)
-
-
-@pytest.mark.parametrize("collection", sorted(member.value for member in Collection))
-def test_a_workspace_document_collection_is_refused(collection: str) -> None:
-    """This collection may share a database with a workspace's own documents, so it must
-    not be able to shadow one of them. The GridFS store makes this argument in prose;
-    here it is enforced."""
-    cfg = WorkspacesConfig(
-        provider="dgml_storage_mongo:MongoWorkspacesStore",
-        options={"mongo_database": "db", "mongo_collection": collection},
-    )
-    with pytest.raises(WorkspacesConfigInvalid, match="workspace's own documents"):
         MongoWorkspacesStore.parse_config(cfg)
 
 

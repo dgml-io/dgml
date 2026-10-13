@@ -125,3 +125,70 @@ def test_workspace_routes_docs_to_mongo_and_blobs_to_local(mongo_docs_workspace:
     assert not (ws.root / "files" / "f1" / "file.json").exists()
     assert (ws.root / "files" / "f1" / "report.pdf").is_file()
     assert ws.docs.get_doc(layout.Collection.FILES, "f1") == {"id": "f1"}
+
+
+# ----------------------------------------------------- one namespace per workspace
+
+
+def _docs_for(
+    mongo_config: StorageConfig, workspace_id: str | None, **options: object
+) -> MongoDocStore:
+    config = StorageConfig(
+        provider=PROVIDER,
+        root=mongo_config.root,
+        options={**mongo_config.options, **options},
+        workspace_id=workspace_id,
+    )
+    return MongoDocStore(MongoDocStore.parse_config(config))
+
+
+def test_prefix_is_validated(tmp_path: Path) -> None:
+    for bad in ("", "a.b", "a$b", "_lead", "a" * 17, 3):
+        with pytest.raises(StorageConfigInvalid):
+            MongoDocStore.parse_config(
+                StorageConfig(
+                    provider=PROVIDER,
+                    root=tmp_path,
+                    options={"mongo_database": "d", "prefix": bad},
+                    workspace_id="ws-test",
+                )
+            )
+
+
+def test_a_workspace_without_an_id_is_refused(mongo_config: StorageConfig) -> None:
+    """Collections without the id would be shared by every id-less workspace on the
+    database, and would move the moment this one got an id."""
+    with pytest.raises(StorageConfigInvalid, match="workspace's id"):
+        _docs_for(mongo_config, None)
+
+
+def test_collections_are_named_for_the_prefix_and_workspace_id(
+    mongo_config: StorageConfig,
+) -> None:
+    """``<prefix>_<id>_<name>``, with the id added at runtime and ``prefix`` defaulting to
+    ``dgml`` — the config holds only what the user wrote."""
+    default = _docs_for(mongo_config, "ws_a")
+    default.put_doc(layout.Collection.FILES, "f1", {"id": "f1"})
+    default.append_doc(layout.Collection.USAGE, {"op": "generate"})
+    assert set(default._db.list_collection_names()) == {"dgml_ws_a_files", "dgml_ws_a_usage"}
+
+    custom = _docs_for(mongo_config, "ws_a", prefix="contracts")
+    custom.put_doc(layout.Collection.FILES, "f1", {"id": "f1"})
+    assert "contracts_ws_a_files" in custom._db.list_collection_names()
+
+
+def test_workspaces_with_one_config_share_a_database_without_colliding(
+    mongo_config: StorageConfig,
+) -> None:
+    """The regression this exists for: ``workspace`` is a singleton collection whose
+    ``_id`` is the literal ``"workspace"``, so without the id in its name the second
+    workspace on a database silently overwrote the first one's identity."""
+    a, b = _docs_for(mongo_config, "ws-a"), _docs_for(mongo_config, "ws-b")
+    ws = layout.Collection.WORKSPACE
+    a.put_doc(ws, ws, {"name": "A"})
+    b.put_doc(ws, ws, {"name": "B"})
+    a.put_doc(layout.Collection.FILES, "f1", {"id": "f1"})
+
+    assert a.get_doc(ws, ws) == {"name": "A"}
+    assert b.get_doc(ws, ws) == {"name": "B"}
+    assert b.find_docs(layout.Collection.FILES, {}) == []

@@ -131,23 +131,30 @@ didn't set up. Configure it now so the later phases run through cleanly.
 
 Run `dgml init` once to write the user-level `~/.config/dgml/config.toml` with a
 `[models]` block — it auto-detects your provider from the API-key env vars that
-are set (or pass `--provider <anthropic|google|mixed>`):
+are set (or pass `--provider <anthropic|anthropic_google|google|openai>`):
 
 ```bash
 uv run dgml init
 ```
 
-That `[models]` block is enough to run every phase — the four tiers back the
-per-task models (transcription/text-extraction ← `standard`, labeling/
+That `[models]` block is enough to run every phase. It names one provider
+**family**, which dgml expands into its recommended four tiers — the tiers back
+the per-task models (transcription/text-extraction ← `standard`, labeling/
 value-extraction ← `advanced`, classification/style ← `light`, schema-generation
 ← `expert`):
 
 ```toml
 [models]
-light    = "gemini/gemini-flash-lite-latest"
-standard = "anthropic/claude-haiku-4-5"
-advanced = "anthropic/claude-sonnet-5"
-expert   = "anthropic/claude-opus-5"
+family = "anthropic_google"
+```
+
+To pin a specific model for a tier, set the tier explicitly — it overrides its
+family default:
+
+```toml
+[models]
+family = "anthropic_google"
+expert = "anthropic/claude-opus-5"
 ```
 
 To pin a specific model for one task, add its per-task section (it overrides the
@@ -335,7 +342,7 @@ Before anchoring anything, it helps to understand the two LLM-backed processing 
 
 **Generation** (`dgml docset generate`, used in Phase 1) transcribes the *whole* document into a semantic XML tree — every clause, table, and value typed, labeled with the DocSet's shared vocabulary, and grounded to its source-page position (`dg:origin`). Use it when the full document needs to stay queryable and verifiable.
 
-**Extraction** (`dgml extraction …`) pulls a *defined set of fields* out of a document against an extraction schema, and grounds each value back to the source page. The schema can be proposed by an LLM (`dgml extraction generate-schema <docset_id>`) or supplied by you (`set-schema`); `dgml extraction extract <docset_id> <file_id>` then writes the values as a `dg:extraction` element **inside the file's core `<stem>.dgml.xml`** — there is no separate values file. It uses the `grounded` config section (§1.4). See the [extraction commands](../docs/cli-reference.md#extraction-commands) for details.
+**Extraction** (`dgml extraction …`) pulls a *defined set of fields* out of a document against an extraction schema, and grounds each value back to the source page. The schema can be proposed by an LLM (`dgml extraction generate-schema <docset_id>`) or supplied by you (`set-schema`); `dgml extraction extract <docset_id> <file_id>` (for a file already assigned to that DocSet) then writes the values as a `dg:extraction` element **inside the file's core `<stem>.dgml.xml`** — there is no separate values file. It uses the `grounded` config section (§1.4). See the [extraction commands](../docs/cli-reference.md#extraction-commands) for details.
 
 When to use which:
 

@@ -94,7 +94,13 @@ def mongo_config(tmp_path: Path) -> StorageConfig:
         provider=PROVIDER,
         root=tmp_path / "ws",
         options={"mongo_database": f"dgml_test_{uuid.uuid4().hex[:12]}"},
+        workspace_id="ws-test",
     )
+
+
+#: The identity block ``workspace create`` writes. A store that shares its database
+#: between workspaces reads the id from here, so a hand-built test workspace needs it.
+WORKSPACE_ID_TABLE = '\n[workspace]\nworkspace_id = "ws-test"\n'
 
 
 @pytest.fixture
@@ -111,7 +117,8 @@ def mongo_docs_workspace(tmp_path: Path) -> Workspace:
     root.mkdir(parents=True, exist_ok=True)
     db = f"dgml_test_{uuid.uuid4().hex[:12]}"
     (root / "config.toml").write_text(
-        f'[storage.default.docs]\nprovider = "{PROVIDER}"\nmongo_database = "{db}"\n',
+        f'[storage.default.docs]\nprovider = "{PROVIDER}"\nmongo_database = "{db}"\n'
+        + WORKSPACE_ID_TABLE,
         encoding="utf-8",
     )
     ws = Workspace(root=root)
@@ -169,7 +176,8 @@ def mongo_gridfs_workspace(tmp_path: Path) -> Workspace:
     root.mkdir(parents=True, exist_ok=True)
     db = f"dgml_test_{uuid.uuid4().hex[:12]}"
     (root / "config.toml").write_text(
-        f'[storage.default]\nprovider = "{BOTH_GRIDFS_PROVIDER}"\nmongo_database = "{db}"\n',
+        f'[storage.default]\nprovider = "{BOTH_GRIDFS_PROVIDER}"\nmongo_database = "{db}"\n'
+        + WORKSPACE_ID_TABLE,
         encoding="utf-8",
     )
     ws = Workspace(root=root)

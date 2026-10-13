@@ -237,11 +237,12 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset the library's ``_WARNED_*`` once-per-process warning dedup (see
     the Logging section of ../CLAUDE.md) so tests stay order-independent —
     any test may trigger these paths, not only the modules that assert on them."""
-    from dgml_core import models_config, ocr, rotation
+    from dgml_core import grounded, models_config, ocr, rotation
 
     models_config._WARNED_TIER_FALLBACKS.clear()
     models_config._WARNED_DISABLED.clear()
     ocr._WARNED_NO_OCR_PROVIDER.clear()
+    grounded._REQUIRED_TOOL_CHOICE_REJECTED.clear()
     monkeypatch.setattr(rotation, "_WARNED_PILLOW_MISSING", False)
 
 
@@ -349,6 +350,22 @@ def azure_config(workspace: Workspace) -> Workspace:
         },
     )
     return workspace
+
+
+@pytest.fixture
+def offline_aws(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Fake static AWS credentials, so building a real boto3 client resolves
+    them from the environment instead of walking the chain out to the EC2
+    instance-metadata endpoint (a network call) or the developer's own
+    ``~/.aws`` files."""
+    empty = tmp_path_factory.mktemp("aws")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(empty / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(empty / "credentials"))
+    for name in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SESSION_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture

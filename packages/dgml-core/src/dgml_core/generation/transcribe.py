@@ -305,6 +305,12 @@ def _salvage_window_json(raw: str) -> dict[str, Any] | None:
 _TL_UNESCAPE_RE = re.compile(r"\\([\\tnr*])")
 _TL_UNESCAPE_MAP = {"\\": "\\", "t": "\t", "n": "\n", "r": "\r", "*": "*"}
 _HEADING_SIGIL_RE = re.compile(r"^H(\d*)$")
+# The grammar in prompts.yaml writes the separator as the placeholder
+# ``<TAB>``, and models sometimes copy the placeholder instead of emitting a
+# real tab, for a whole window at a time. Such a line has no real tab, so
+# splitting it on tabs yields an unknown sigil and the line would be dropped.
+_TL_TAB_PLACEHOLDER = "<TAB>"
+_TL_PLACEHOLDER_LINE_RE = re.compile(r"^(?:H\d*|[PIRFOC])<TAB>")
 
 
 def _tl_unescape(text: str) -> str:
@@ -340,6 +346,10 @@ def _parse_window_compact(text: str) -> tuple[dict[str, Any], int]:
         O<TAB>lim<TAB>label<TAB>value<TAB>opt… — choice group; checked opts
                                                  prefixed "*" (literal "\\*")
 
+    A line that uses the literal placeholder ``<TAB>`` where a real tab
+    belongs (and holds no real tab) is decoded as if the placeholders were
+    tabs.
+
     Per-line tolerant: a malformed line (unknown sigil, a half-written
     truncation tail) is dropped and counted — the natural analogue of
     ``_salvage_window_json``, which likewise keeps the complete blocks and
@@ -354,6 +364,10 @@ def _parse_window_compact(text: str) -> tuple[dict[str, Any], int]:
     for line in text.splitlines():
         if not line.strip():
             continue
+        if "\t" not in line and _TL_PLACEHOLDER_LINE_RE.match(line):
+            # Only a line that would otherwise be dropped is repaired: a line
+            # with a real tab keeps any literal "<TAB>" in its text.
+            line = line.replace(_TL_TAB_PLACEHOLDER, "\t")
         fields = line.split("\t")
         sigil, rest = fields[0], fields[1:]
         heading = _HEADING_SIGIL_RE.match(sigil)

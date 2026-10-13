@@ -463,7 +463,7 @@ mongo_database = "dgml"
   *is* the `default` service, and no `[storage]` at all is the zero-config local
   store for both roles.
 - **Secrets vs. identity.** Secret-hinted options (keys containing `key`, `secret`,
-  `token`, `password`, `credential`) are excluded from the
+  `token`, `password`, `credential`, or the word `uri` as in `mongo_uri`) are excluded from the
   [seal fingerprint](#the-storage-seal-storage_fingerprint), so rotating a credential
   never reads as "the store moved". Every in-tree provider takes its credentials from
   the **environment** instead of config — S3 via the boto3 chain, Mongo via
@@ -476,14 +476,43 @@ mongo_database = "dgml"
   not define the service itself resolves it from here, so an edit takes effect after
   `dgml workspace reseal <path>` accepts it. A workspace that *does* define
   `[storage.<name>]` in its own config is unaffected — storage does not layer.
+- **Each workspace gets its own namespace in a shared backend.** A bucket or database
+  named in a template is usually shared — by every workspace created from it, and
+  often by other applications. So the S3 and MongoDB stores always put a workspace's
+  data under its **workspace id**, after an optional `prefix` you choose:
+
+  | Backend | `prefix` | Data lands in |
+  |---|---|---|
+  | S3 | not set | `s3://<bucket>/dgml/<id>/files/…` |
+  | S3 | `"contracts"` | `s3://<bucket>/contracts/<id>/files/…` |
+  | MongoDB | not set | collections `dgml_<id>_files`, …, GridFS bucket `dgml_<id>_blobs` |
+  | MongoDB | `"contracts"` | collections `contracts_<id>_files`, …, GridFS bucket `contracts_<id>_blobs` |
+
+  The id is added when the store is opened, not written into config, so `config.toml`
+  holds only the `prefix` you wrote — and a template can be shared by any number of
+  workspaces as it is. It comes from the `workspace_id` in `config.toml`'s
+  `[workspace]` block, which `workspace create` writes and which never changes, so a
+  workspace's data never moves. Local-disk storage is already per-workspace and has no
+  prefix.
 
 ### The `[models]` tiers
 
-The simplest way to configure models is the `[models]` block — four tiers that
-back the per-task models:
+The simplest way to configure models is the `[models]` block. One `family` key
+picks a whole provider family's curated defaults for the four tiers that back
+the per-task models:
 
 ```toml
 [models]
+family = "anthropic_google"   # or anthropic / google / openai
+```
+
+A family-based config *tracks* dgml's shipped defaults — an upgrade may move a
+tier to a newer model. To pin models, set explicit tiers, with or without a
+family (an explicit tier always overrides its family default):
+
+```toml
+[models]
+family   = "anthropic_google"
 light    = "gemini/gemini-flash-lite-latest"  # classification, style
 standard = "anthropic/claude-haiku-4-5"    # transcription, text extraction
 advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
@@ -497,17 +526,48 @@ falls back to the nearest set tier (nearest lower first, then higher) with a
 warning — so a minimal config that sets only, say, `standard` still resolves
 every task.
 
-Tiers name only models — they carry no credentials. Credentials are configured
-per task on the task's own section (e.g. `generation.api_key_env`,
-`grounded.schema_api_key`); a model sourced from a tier uses its task section's
-credentials, or falls back to litellm's per-provider env var when the section
-sets none.
+`family` is shorthand for its four tiers *within its config layer*: tiers that
+layer leaves unset are filled from the family before the layers merge. So a
+workspace config (or `DGML_MODELS__FAMILY`) setting `family = "openai"` replaces
+explicit tiers in the user config, while tiers set in the same layer as the
+family, or a higher one, still override it. To drop a user-level pin in one
+workspace, restate the family there.
 
-`dgml init --provider {anthropic,google,mixed,openai}` writes a ready-made
-`[models]` table; omit `--provider` to auto-detect from the API-key env vars
-that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` — checked
-in that order, so an OpenAI key never overrides a provider the other two
-already resolve).
+Credentials can sit at three levels; the most specific wins:
+
+```toml
+[models]
+family = "anthropic_google"
+anthropic_api_key_env = "ANTHROPIC_API_KEY"   # every anthropic/… model
+google_api_key_env    = "GEMINI_API_KEY"      # every gemini/… model
+expert          = "anthropic/claude-opus-5"
+expert_api_key_env = "OPUS_KEY"               # this tier only
+expert_api_base = "https://proxy.example"
+```
+
+- **Per task**, on the task's own section (`generation.api_key_env`,
+  `grounded.schema_api_key`, `classification.api_base`, …).
+- **Per tier**: `<tier>_api_key` / `<tier>_api_key_env` / `<tier>_api_base` next
+  to the tier, used by every task that takes its model from that tier. A tier's
+  credentials require the tier itself to be set. Like every other key they layer
+  independently of the tier: a workspace `config.toml` that overrides `expert`
+  still inherits a user-level `expert_api_key_env`. For a credential that should
+  follow the model, use the provider key.
+- **Per provider**: `anthropic_api_key`, `google_api_key`, `openai_api_key` (or
+  the `_env` form), matched on the model id's prefix (`anthropic/`, `gemini/`,
+  `openai/`) — for any model that sets nothing more specific, whether it came from
+  a tier or a task names it. One key per provider covers a mixed family such as
+  `anthropic_google`. A model of another provider (`ollama/…`) never receives
+  these keys.
+
+A model with none of these falls back to litellm's per-provider env var. A tier
+that is unset borrows its fallback tier's credentials along with its model.
+
+`dgml init --provider {anthropic,anthropic_google,google,openai}` writes a
+family-only `[models]` block; omit `--provider` to auto-detect from the API-key
+env vars that are set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`
+— checked in that order, so an OpenAI key never overrides a provider the other
+two already resolve).
 
 **Secrets policy.** By default config references API keys via `*_api_key_env`
 env-var-name fields (which store the env var name, not the secret). Every
@@ -648,8 +708,8 @@ Field rules:
 - Transcription credentials: `api_key` / `api_key_env` / `api_base`.
 - Labeling credentials: `label_api_key` / `label_api_key_env` /
   `label_api_base`. The two models carry **independent** credentials because
-  they may name different providers (e.g. the default `mixed` config transcribes
-  on Anthropic and labels on Gemini). These apply whether the models are set here
+  they may name different providers (e.g. the `anthropic_google` family blends
+  Gemini and Anthropic models). These apply whether the models are set here
   or come from their tiers; when unset, litellm uses its per-provider env var.
 - `thinking` — optional; `"disabled"` (default) or `"adaptive"`. Anthropic
   extended thinking, applied to **both** passes; ignored for non-Anthropic
@@ -894,7 +954,8 @@ governs the generated full-document tree; the extraction schema governs the
 (`full-extraction`). The body is the planner's `Schema` document
 (canonical tag names plus per-tag metadata). Generation also writes a
 `cache/` at the docset root. It holds **functional** files the next
-`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`,
+`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json` (one per
+chunk whose reply parsed; a bisected chunk's halves are `cNNa`/`cNNb`),
 `concept_roster.json` (the flat legacy vocabulary; incremental reuse prefers
 the docset's `authored-schema.json`, then its `schema.json`, and falls back to
 this file), and
@@ -1160,6 +1221,15 @@ When a File is assigned to a DocSet, an `assignment.json` is written to
 `<workspace>/docsets/<docset_id>/files/<file_id>/`, holding
 `{ docset_id, file_id, assigned_at }`. The pair directory also holds that
 pair's generated artifacts (`<stem>.dgml.xml`, `extraction_stats.json`).
+
+Library callers look assignments up in either direction through `DocSetStore`
+rather than the store directly: `list_files(docset_id)` gives a DocSet's files,
+and `docsets_for_file(file_id)` gives a File's DocSets, each with its
+`assigned_at` (`null` for assignments carried over by a layout migration).
+`docsets_for_file` tolerates a bad manifest the way `list_all()` does: a DocSet
+whose `docset.json` is missing or cannot be parsed is left out (with a warning)
+rather than raised, and only files assigned to that DocSet are affected;
+`dgml check` reports it.
 
 Earlier revisions recorded the assignment as the *bare existence* of that
 directory, with no file inside. That could not survive its own deletion —

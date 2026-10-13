@@ -85,6 +85,37 @@ def test_detached_create_at_a_path(tmp_path: Path) -> None:
     assert default_workspaces_store().list_ids() == []
 
 
+def test_detached_create_validates_under_the_id_it_will_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store that namespaces by workspace id refuses a config without one, and create
+    validates the binding before the config exists — so the check must run under the id
+    about to be written, not under none."""
+    import sys
+
+    from dgml_core import LocalStore, StorageConfig
+
+    seen: list[str | None] = []
+
+    class IdRequiringStore(LocalStore):
+        @classmethod
+        def parse_config(cls, config: StorageConfig) -> StorageConfig:
+            seen.append(config.workspace_id)
+            if not config.workspace_id:
+                raise StorageConfigInvalid("needs the workspace's id")
+            return super().parse_config(config)
+
+    monkeypatch.setattr(sys.modules[__name__], "IdRequiringStore", IdRequiringStore, raising=False)
+    seed = f'[storage.svcb]\nprovider = "{__name__}:IdRequiringStore"\n'
+    result = create_workspace(
+        Workspace(root=tmp_path / "det"),
+        organization="Acme",
+        storage_service="svcb",
+        seed_toml=seed,
+    )
+    assert seen and all(wid == result.identity.workspace_id for wid in seen)
+
+
 def test_rerun_preserves_recorded_identity() -> None:
     first = create_workspace(workspace_id="acme", organization="Acme", name="Prod")
     # Re-run addressed, with nothing but the organization — the documented idempotent path.

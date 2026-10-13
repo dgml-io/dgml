@@ -13,7 +13,7 @@
 """Subtree discovery: classify DGML XML elements by structural role and filter.
 
 Port of the ``computeTagMetrics`` / ``applyAlgoFilter`` logic from
-``app-sample/dgml-app-sample.html`` (JavaScript), producing identical results
+``samples/app-sample/dgml-app-sample.html`` (JavaScript), producing identical results
 for the algorithmic filters.  Semantic filters (``Who``, ``When``,
 ``Amounts``, ``Definitions``, ``Rules``) delegate to an LLM.
 

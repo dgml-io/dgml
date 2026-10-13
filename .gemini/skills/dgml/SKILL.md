@@ -47,7 +47,7 @@ of workspaces (one addressed by id). There is no flag for pointing at one kept e
 
 Setup — the minimum is a **single** command:
 
-1. `dgml init [--provider <anthropic|google|mixed|openai>]` — **run once per machine.** Writes the user-level `~/.config/dgml/config.toml` with a `[models]` block. Omit `--provider` to auto-detect from the API-key env vars that are set (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY`, checked in that order — an OpenAI key never overrides a provider the other two resolve); pass `--force` to overwrite an existing file (backs it up first). There are **no** default models — an unconfigured model is a hard error, never a silent paid call.
+1. `dgml init [--provider <anthropic|anthropic_google|google|openai>]` — **run once per machine.** Writes the user-level `~/.config/dgml/config.toml` with a `[models]` block naming one provider **family** (`family = "anthropic_google"`), which dgml expands into its recommended four tiers at runtime; an explicit tier (`[models] advanced = "..."`) in the same or a higher config layer overrides its family default, and a family overrides tiers set in lower layers. Omit `--provider` to auto-detect from the API-key env vars that are set (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY`, checked in that order — an OpenAI key never overrides a provider the other two resolve); pass `--force` to overwrite an existing file (backs it up first). Without a family or explicit tier there are **no** default models — an unconfigured model is a hard error, never a silent paid call.
 2. `dgml workspace create [path] --organization <org>` — creates the workspace — writing its `config.toml` (the storage binding plus a machine-managed `[workspace]` identity block), records its identity in `workspace.json`, and generates a stable `workspace_id` (echoed in the payload). **Where it goes depends on whether you name a place for it**: with no `path`, no `--workspace` and no `$DGML_HOME`, the workspace is created in the machine's store of workspaces and is listed by `dgml workspace list` (`"listed": true`); give a `path` (`dgml workspace create ./ws …`) and you get a **detached** workspace in that directory, addressed by path and not listed. Prefer the listed form for new work — `--workspace <id>` then opens it from any directory. It does **not** touch the user config; if the config is missing it still creates the workspace and warns on stderr to run `dgml init`. Safe to re-run — an existing `[storage.<name>]` is never overwritten and the recorded id, name and `created_at` are reused. `--organization` is **required for a new workspace** and is embedded in its docset namespace URIs (`http://dgml.io/<org>/<DocSetSlug>`); it becomes **optional** once the config records one (passing a different value re-organizes the workspace and warns on stderr). `--name` is an optional human-readable label. `--id <workspace_id>` sets the stable handle instead of generating one (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit, e.g. `--id my-workspace`) — use it when the id is decided elsewhere or a workspace is being re-created deterministically; an id the store already holds fails with `CONFLICT` (if it *is* the workspace you mean, re-run addressed to it: `dgml --workspace <id> workspace create …`), an `--id` matching the workspace's existing id is a no-op, and one that differs from it fails with `INVALID_ARGUMENT` (`create` never re-identifies a workspace). Use `--storage <name>` to materialize a named service defined as `[storage.<name>]` in the user config into this workspace's own config (omit for the bundled local-disk default); `--from-config <path>` starts from a config you authored, copied in verbatim (a template — the source is not tracked, and later edits to it do nothing). A seed only initializes a workspace with no config; re-running with the same seed is a no-op, and one that differs from the existing config fails with `INVALID_ARGUMENT`. A `create` that fails (bad `provider =`, missing `--organization`, …) leaves no listed row behind, so fix the cause and retry the same command. The two **compose**: `--from-config` supplies the config, `--storage` says which `[storage.<name>]` table in it to bind to — a config declaring `[storage.acme]` needs `--storage acme`, or create fails with `INVALID_ARGUMENT` rather than silently using local disk.
 
 **Per-workspace config overrides need a config that is a file.** `workspace_config_path` (from `workspace create` or `dgml status`) is the path to append a section like `[ocr]` or `[generation]` to — and it is `null` when the store of workspaces does not keep configs as files (the Mongo backend does not; `config_location` names where it is instead). In that case put the section in the user config, which every workspace layers over, or supply it at create time with `--from-config`. Recipes below guard on this rather than appending blindly: `jq -r` renders a JSON null as the string `null`, so an unguarded `cat >> "$cfg"` silently writes a file called `null` and the setting never takes effect.
@@ -62,7 +62,7 @@ Sharing one list across machines: set `[workspaces]` in the user config to `dgml
 
 Changing a workspace's storage: edit `[storage]` in its `config.toml`, then run `dgml workspace reseal [path]` to accept the change (`--check` reports drift and exits 1 without writing). Until you do, commands fail with `STORAGE_BACKEND_MISMATCH` — the guard against silently opening a different backend than the one holding your data. Resealing records the new configuration; it does **not** move data.
 
-Configure once per machine: every workspace inherits `~/.config/dgml/config.toml`. Models are set via the `[models]` tiers (`light`/`standard`/`advanced`/`expert`); per-task sections override a tier. A workspace can override per key via its own `<workspace>/config.toml`, and env vars (`DGML_MODELS__ADVANCED=…`) override on top. **Exception: `[storage]` does not merge** — a service the workspace defines is used whole. Any command other than `init` / `workspace create` on an uninitialized workspace fails with `WORKSPACE_NOT_INITIALIZED`.
+Configure once per machine: every workspace inherits `~/.config/dgml/config.toml`. Models are set via `[models]` — a `family` and/or explicit tiers (`light`/`standard`/`advanced`/`expert`); per-task sections override a tier. A workspace can override per key via its own `<workspace>/config.toml`, and env vars (`DGML_MODELS__ADVANCED=…`) override on top. **Exception: `[storage]` does not merge** — a service the workspace defines is used whole. Any command other than `init` / `workspace create` on an uninitialized workspace fails with `WORKSPACE_NOT_INITIALIZED`.
 
 ## Output contract — parse it with `jq`
 
@@ -142,7 +142,8 @@ uv run dgml docset create --name "Lease Abstract" \
 For that curated case, pass `--auto-classify existing` so the run can
 only *route into* those DocSets, never invent more. Without it, one
 document that matches nothing anchors a brand-new one-file DocSet that
-someone has to notice and clean up:
+someone has to notice and clean up; with it, that document is left
+unassigned (`decision: "none"`, `docset_name: null`):
 
 ```bash
 payload=$(uv run dgml file add --workspace "$wid" /path/to/docs \
@@ -150,14 +151,13 @@ payload=$(uv run dgml file add --workspace "$wid" /path/to/docs \
 jq -r '.results[] | "\(.classification.docset_name)\t\(.path)"' <<<"$payload"
 ```
 
-⚠️ **Only use `existing` when you already know every file belongs in one
-of the workspace's DocSets.** The LLM is *required* to return a DocSet —
-it is offered no other action — so an off-type document is filed under
-the closest DocSet rather than flagged. For a mixed or unknown batch use
-bare `--auto-classify` (which can create DocSets) or `dgml cluster`
-(which groups the batch and names each group from the whole group).
-Silently mis-filed documents are harder to notice later than an extra
-DocSet is.
+Files with `decision: "none"` are added but sit in no DocSet and are not
+extracted. `.summary.unassigned` counts them (plus any file whose
+classification soft-failed); list them, with the LLM's reason, via
+`jq -r '.results[] | select(.classification.decision == "none") | "\(.path)\t\(.classification.decline_reason)"'`
+and route them yourself (or run `dgml cluster` over them). Re-running the
+same command with `--on-conflict skip` does **not** retry them — existing
+files skip classification — so assign them with `docset add-file`.
 
 ⚠️ `--auto-classify` takes an *optional* MODE, so the parser eats the
 next token. Always put PATH **before** the flag (as above), or name the
@@ -168,18 +168,16 @@ mode explicitly (`--auto-classify existing /path/doc.pdf`).
 Key contract points:
 - `--auto-classify` (bare) == `--auto-classify existing-or-new`: assign
   if something fits, else create. `--auto-classify existing` never
-  creates and never declines — `decision` is always `"existing"`, so
-  every file lands in a DocSet whether or not it truly fits.
-- In `existing` mode against a workspace with **no** DocSets, the command
+  creates: assign if something fits, else leave the file unassigned with
+  `decision: "none"` (no auto-extraction). Fit is judged on each DocSet's
+  description (or name, if it has none); key questions only break ties.
+  `--auto-classify existing-forced` is the old `existing`: it always
+  assigns to the closest DocSet — use it only when every file is known to
+  belong in one. With a single DocSet, `existing` still makes one LLM call
+  per file (it may decline); `existing-forced` makes none.
+- In `existing` / `existing-forced` mode against a workspace with **no** DocSets, the command
   is a **hard** error (exit 1, `NO_EXISTING_DOCSETS`) and makes no LLM
   call — there is nothing it could assign to. Seed the DocSets first.
-- In `existing` mode against a workspace with exactly **one** DocSet, the
-  file is assigned to it **without** an LLM call — one answer, no way to
-  decline, nothing to decide. The payload is unchanged
-  (`decision: "existing"`); only the call is skipped. That mode creates
-  no DocSets, so a whole bulk run over a one-DocSet workspace costs
-  nothing in tokens. Bare `--auto-classify` still calls the LLM here,
-  since it could create a second DocSet instead.
 - A missing or invalid `classification` config is a **hard** error
   (exit 1, `CLASSIFICATION_CONFIG_MISSING` / `_INVALID`): config is a
   precondition, so the command aborts rather than recording the same
@@ -236,7 +234,7 @@ summing to `total`) is the quick health read; report it to the user.
 
 Variants:
 - **Add to an existing DocSet:** skip the `docset create` step; pass its known ID as `$ds`. Find it with `uv run dgml docset list | jq -r '.docsets[] | select(.name=="…") | .id'`.
-- **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome. Use `--auto-classify existing` instead when the workspace's DocSets are curated, the run must not create more, and you already know every file belongs in one of them — that mode forces the LLM to pick the closest DocSet for every file, so it mis-files an off-type document rather than flagging it.
+- **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome. Use `--auto-classify existing` instead when the workspace's DocSets are curated and the run must not create more — a file that fits none of them is left unassigned with `decision: "none"` for you to route.
 - **Recurse into subdirectories:** add `--recursive`.
 - **Hidden errors:** a PDF that fails to parse, render, or extract digital text still produces an entry — `soft_failed` (the `page_*`/`text_extraction_error` fields are set on its `file` entry) or `hard_failed` (the entry has an `error` object and no `file`). `dgml check` afterward is the authoritative whole-workspace health signal.
 
@@ -676,7 +674,8 @@ uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 #    NOTE: once the schema is set, assigning a file (docset add-file /
 #    --auto-classify / cluster into an existing docset) auto-extracts it —
 #    check the payload's `extraction` block; run `extract` manually only for
-#    files assigned before the schema existed or to re-extract.
+#    files assigned before the schema existed or to re-extract. The file must
+#    already be assigned to the docset (FILE_NOT_FOUND otherwise).
 uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_key}'
 
 # 3) Read them back. Default is values-shape JSON (projected from dg:extraction);

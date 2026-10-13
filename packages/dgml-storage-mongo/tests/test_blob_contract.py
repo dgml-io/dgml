@@ -60,6 +60,7 @@ def test_bucket_option_accepted_and_validated(tmp_path: Path) -> None:
         provider=GRIDFS_PROVIDER,
         root=tmp_path,
         options={"mongo_database": "d", "mongo_bucket": "custom"},
+        workspace_id="ws-test",
     )
     assert MongoGridFSBlobStore.parse_config(config) is config
     with pytest.raises(StorageConfigInvalid):
@@ -279,3 +280,34 @@ def test_materialize_dir_and_working_dir(blobs: MongoGridFSBlobStore) -> None:
     with blobs.working_dir("docsets/d1/cache") as work:
         (Path(work) / "state.json").unlink()
     assert blobs.list_blobs("docsets/d1/cache/") == []
+
+
+# ----------------------------------------------------- one namespace per workspace
+
+
+def _blobs_for(mongo_config: StorageConfig, workspace_id: str) -> MongoGridFSBlobStore:
+    config = StorageConfig(
+        provider=GRIDFS_PROVIDER,
+        root=mongo_config.root,
+        options=mongo_config.options,
+        workspace_id=workspace_id,
+    )
+    return MongoGridFSBlobStore(MongoGridFSBlobStore.parse_config(config))
+
+
+def test_the_bucket_is_named_for_the_workspace(mongo_config: StorageConfig) -> None:
+    """Blobs land in ``dgml_<id>_blobs``, beside ``MongoDocStore``'s ``dgml_<id>_<name>``
+    collections, so one workspace's data shares a single namespace."""
+    blobs = _blobs_for(mongo_config, "ws_a")
+    blobs.put_blob("files/f/x.pdf", b"x")
+    assert blobs._files.name == "dgml_ws_a_blobs.files"
+
+
+def test_workspaces_with_one_config_share_a_bucket_name_without_colliding(
+    mongo_config: StorageConfig,
+) -> None:
+    a, b = _blobs_for(mongo_config, "ws-a"), _blobs_for(mongo_config, "ws-b")
+    a.put_blob("files/f/x.pdf", b"from-a")
+    b.put_blob("files/f/x.pdf", b"from-b")
+    assert a.get_blob("files/f/x.pdf") == b"from-a"
+    assert b.get_blob("files/f/x.pdf") == b"from-b"

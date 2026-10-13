@@ -28,7 +28,27 @@ not a separate backend — it speaks the S3 API, so it is only a different addre
 Omit the `[storage.default.docs]` table to keep documents on local disk and put
 only blobs in S3.
 
+| option | required | default |
+|---|---|---|
+| `bucket` | yes | — |
+| `region` | no | boto3's default |
+| `endpoint_url` | no | real AWS S3 |
+| `prefix` | no | `dgml` |
+
+**Every object goes under `<prefix>/<workspace id>/`**, so any number of workspaces — and
+other applications — can share one bucket, and one config can serve them all. The id is
+added when the store is opened, from the `workspace_id` in the workspace's `config.toml`;
+it is not written into `prefix`. So with no `prefix` a workspace's objects are under
+`dgml/<id>/`, and with `prefix = "contracts"` under `contracts/<id>/`. An empty
+`prefix = ""` puts them directly under `<id>/`.
+
 ## Credentials
+
+**By value, for an in-memory configuration.** A workspace configured in code
+(`dgml_core.configuration`, nothing written to disk) may pass `aws_access_key_id`,
+`aws_secret_access_key` and `aws_session_token` as options; they go straight to the
+boto3 client and take precedence over its chain. The storage seal ignores them by
+name. Do not put them in a `config.toml`.
 
 **Never put credentials in DGML config.** S3 uses boto3's default chain
 (`AWS_ACCESS_KEY_ID`, `~/.aws/credentials`, IAM role).

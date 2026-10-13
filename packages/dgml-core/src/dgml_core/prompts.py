@@ -54,6 +54,8 @@ class PromptKey(StrEnum):
     VALUES_PHASE1_GUIDANCE = "extraction_values_phase1_guidance"
     VALUES_PHASE1_RETRY_CHUNKED = "extraction_values_phase1_retry_chunked"
     VALUES_PHASE1_PART = "extraction_values_phase1_part"
+    VALUES_PHASE1_NUDGE_SUBMIT = "extraction_values_phase1_nudge_submit"
+    VALUES_PHASE1_NUDGE_CONTINUE = "extraction_values_phase1_nudge_continue"
 
     # Extraction: value extraction, phase 3 (attach bounding boxes)
     VALUES_PHASE3_SYSTEM = "extraction_values_phase3_system"
