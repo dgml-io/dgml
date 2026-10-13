@@ -32,6 +32,7 @@ from unittest.mock import patch
 
 import pytest
 from dgml_core import layout
+from dgml_core.default_config import PROVIDER_MODELS
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import ValuesExtractionFailed
 from dgml_core.grounded import GroundedConfig, extract_values
@@ -41,7 +42,8 @@ from litellm.exceptions import BadRequestError, ContextWindowExceededError
 
 from .conftest import _write_text_pdf, write_config
 
-_MODEL = "anthropic/claude-sonnet-4-5"
+# The shipped value-extraction default, so the test tracks model upgrades.
+_MODEL = PROVIDER_MODELS["anthropic"]["advanced"]
 _PAGES = 8
 # PDFium compresses the slices: a 2-page part is ~40 KB base64, a 4-page one ~80 KB,
 # and the rest of a request a few KB. So quarters fit under this and halves do not.
