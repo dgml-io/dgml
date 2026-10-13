@@ -26,6 +26,7 @@ import dataclasses
 import json
 import re
 import tempfile
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -490,12 +491,19 @@ _GATE_MIN_TOKENS = 50
 _GATE_RETRIES = 1
 
 
+def _tokens(text: str) -> list[str]:
+    """The coverage tokenizer over NFKC-normalised text: PDF text layers carry
+    ligatures ('proﬁt') where a model writes plain letters, and without the
+    normalisation every such word reads as missing."""
+    return coverage._tokenize(unicodedata.normalize("NFKC", text))
+
+
 def _page_token_lists(page_text_dir: Path | str | None) -> list[list[str]]:
     """Per-page token lists from a workspace page_text/ dir ([] without one)."""
     if page_text_dir is None:
         return []
     pages = coverage.read_workspace_page_texts(Path(page_text_dir))
-    return [coverage._tokenize(p) for p in pages]
+    return [_tokens(p) for p in pages]
 
 
 def _payload_text(payload: dict[str, Any]) -> str:
@@ -514,7 +522,7 @@ def _window_recall(payload: dict[str, Any], expected: list[str]) -> float:
     """Multiset recall of the window's page words within the window's output."""
     if not expected:
         return 1.0
-    have = Counter(coverage._tokenize(_payload_text(payload)))
+    have = Counter(_tokens(_payload_text(payload)))
     matched = 0
     for tok in expected:
         if have[tok] > 0:
@@ -575,8 +583,21 @@ def transcribe_document(
     log: Callable[[str], None] = lambda _m: None,
     page_text_dir: Path | str | None = None,
     pdf_config: PdfConfig | None = None,
+    window_overlap: int = 1,
+    complete: bool = True,
 ) -> list[Block]:
     """Transcribe one document into a flat block list (Pass A).
+
+    Windows overlap by *window_overlap* page(s): the page a window skips at
+    its start is then also the previous window's last page, and the
+    completeness pass drops whichever copy the alignment did not claim.
+
+    With *complete* set (and *page_text_dir* available), the assembled blocks
+    are aligned against the page words after the windows, and whatever the
+    model left out is filled from the text layer at its reading-order position
+    -- a whole page is first offered back to the model as a single-page
+    rescue. See :mod:`dgml_core.generation.completeness`; the report is
+    written as ``<stem>_completeness.json`` beside the blocks cache.
 
     With *cache_dir* set, the assembled flat blocks are written as
     ``<stem>_blocks.json`` (a functional file the next run reloads). With
@@ -599,7 +620,8 @@ def transcribe_document(
         log(f"{doc_name}: reusing cached transcription ({len(cached)} block(s))")
         return cached
     total = _count_pages(pdf_bytes)
-    windows = document.iter_windows(total, window_size, overlap=0)
+    overlap = max(0, min(window_overlap, window_size - 1))
+    windows = document.iter_windows(total, window_size, overlap=overlap)
     log(f"{doc_name}: {total} pages → {len(windows)} window(s)")
     page_tokens = _page_token_lists(page_text_dir)
 
@@ -720,7 +742,11 @@ def transcribe_document(
                 strip_fences(raw),
                 debug=debug,
             )
-            _append_continuation(blocks, str(payload.get("continues", "") or ""))
+            # With overlap, a window's first page is also the previous window's
+            # last, so a "continues" tail would complete text that is already
+            # there in full.
+            if not (window_overlap and w_idx):
+                _append_continuation(blocks, str(payload.get("continues", "") or ""))
             kept = 0
             for raw_block in payload.get("blocks", []) or []:
                 if not isinstance(raw_block, dict):
@@ -731,6 +757,33 @@ def transcribe_document(
                     blocks.append(block)
                     kept += 1
             log(f"{doc_name} {wlog}: {kept} block(s)")
+
+        if complete and page_text_dir is not None and blocks:
+            from dgml_core.generation import completeness
+
+            def rescue_page(page_idx: int) -> list[Block] | None:
+                """One-page transcription of a page the model left out entirely."""
+                tag = f"p{page_idx + 1:03d}"
+                got = run_attempts([page_idx], _window_context(blocks), f"p{page_idx + 1}", tag)
+                if got is None:
+                    return None
+                out: list[Block] = []
+                for k, raw_block in enumerate(got[2].get("blocks", []) or []):
+                    if isinstance(raw_block, dict):
+                        b = parse_block(raw_block, block_id=f"r{page_idx + 1:03d}_{k + 1:03d}")
+                        if b is not None:
+                            out.append(b)
+                return out
+
+            blocks, report = completeness.ensure_complete(
+                blocks, page_text_dir, rescue=rescue_page, log=lambda m: log(f"{doc_name}: {m}")
+            )
+            cache_write(
+                cache_dir,
+                f"{stem}_completeness.json",
+                json.dumps(report, ensure_ascii=False, indent=1),
+                debug=True,
+            )
     # Deterministic normalization: printed enumerators already encode the
     # answer, so remove the model's per-run degrees of freedom (p-vs-item on
     # sequential "(a)…" runs; heading depth of dotted numbering) before the
