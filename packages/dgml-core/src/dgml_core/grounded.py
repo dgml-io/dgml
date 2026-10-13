@@ -95,8 +95,10 @@ from .extraction_xml import (
 )
 from .files import FileStore
 from .llm import (
+    CallResult,
     LLMConfig,
     _mark_document_cacheable,
+    _no_text_detail,
     call_with_tools,
     is_anthropic_model,
     is_request_too_large,
@@ -210,11 +212,34 @@ _DEFAULT_TIMEOUT_SECONDS = 1800
 # across instances of the document kind, few enough to keep cost bounded.
 DEFAULT_SCHEMA_SAMPLE_SIZE = 3
 
+logger = logging.getLogger(__name__)
+
 _TOOL_GET_PAGE_WORDS = "get_page_words"
 _TOOL_SUBMIT_SCHEMA = "submit_schema"
 _TOOL_SUBMIT_VALUES = "submit_values"
 _TOOL_APPEND_ENTRIES = "append_entries"
 _TOOL_SUBMIT_LOCATIONS = "submit_locations"
+
+# Phase-1 turns per attempt that may end with plain text (no tool call)
+# before the attempt fails. Reachable only where phase 1 runs on auto tool
+# choice (see _run_extract_loop): on Anthropic, on an endpoint that rejected
+# "required", and where litellm's drop_params removed it. There a model
+# sometimes answers in prose, asks a question, or writes the submission as
+# JSON text instead of calling the tool. Each such turn is answered with a
+# reminder and retried, still on auto. Retries do not spend max_tool_iters.
+_MAX_NO_TOOL_CALL_RETRIES = 2
+
+# How much of a text-only reply the error message quotes.
+_NO_TOOL_CALL_REPLY_PREVIEW_CHARS = 500
+
+# (model, api_base, reasoning_effort) endpoints shown to refuse
+# tool_choice="required": a request sent with it was rejected and the same
+# request on auto then succeeded. The effort is part of the key because a
+# Claude model behind an unrecognised alias rejects "required" only together
+# with thinking. Later
+# attempts against them start on auto instead of re-sending a doomed request,
+# and the warning is emitted once, when an endpoint is added.
+_REQUIRED_TOOL_CHOICE_REJECTED: set[tuple[str, str | None, str | None]] = set()
 
 
 # ---- Config ---------------------------------------------------------------
@@ -272,22 +297,38 @@ def parse_values_reasoning_effort(raw: Any, *, source: str) -> str | None:
     raise GroundedConfigInvalid(f"{source} must be one of {accepted} if set (got {raw!r})")
 
 
-def load_grounded_config(workspace: Workspace) -> GroundedConfig:
+def load_grounded_config(
+    workspace: Workspace,
+    *,
+    schema_model: str | None = None,
+    values_model: str | None = None,
+) -> GroundedConfig:
     """Resolve the two grounded models (schema generation → ``expert`` tier,
     value extraction → ``advanced`` tier) and their credentials from the merged
     config's ``[grounded]`` section and ``[models]`` tiers. A model set on the
-    section overrides its tier."""
+    section overrides its tier.
+
+    ``schema_model`` / ``values_model`` are per-call overrides and resolve
+    exactly as if written in ``[grounded]``: the section's own ``schema_*`` /
+    ``values_*`` credentials still apply, and nothing a tier carries does.
+    """
     merged = load_merged_config(workspace)
+    overrides = {
+        key: model
+        for key, model in (("schema_model", schema_model), ("values_model", values_model))
+        if model is not None
+    }
+    if overrides:
+        section = merged.get(ConfigSection.GROUNDED)
+        base: dict[str, Any] = section if isinstance(section, dict) else {}
+        merged = {**merged, ConfigSection.GROUNDED: {**base, **overrides}}
     schema = resolve_tiered_model(
         merged,
         section_name=ConfigSection.GROUNDED,
         tier=Tier.EXPERT,
         invalid=GroundedConfigInvalid,
         missing=GroundedConfigMissing,
-        model_field="schema_model",
-        key_field="schema_api_key",
-        env_field="schema_api_key_env",
-        base_field="schema_api_base",
+        prefix="schema_",
     )
     values = resolve_tiered_model(
         merged,
@@ -295,10 +336,7 @@ def load_grounded_config(workspace: Workspace) -> GroundedConfig:
         tier=Tier.ADVANCED,
         invalid=GroundedConfigInvalid,
         missing=GroundedConfigMissing,
-        model_field="values_model",
-        key_field="values_api_key",
-        env_field="values_api_key_env",
-        base_field="values_api_base",
+        prefix="values_",
     )
 
     section = merged.get(ConfigSection.GROUNDED)
@@ -799,13 +837,14 @@ class ExtractionResult:
     core file was created with only the ``dg:extraction`` element.
     ``tool_calls`` is the count of ``get_page_words`` grounding lookups the
     model performed before finalizing — a rough proxy for how much grounding it
-    leaned on.
+    leaned on. ``model`` is the values model that produced it.
     """
 
     values: dict[str, Any]
     tool_calls: int
     xml_key: str
     mode: str
+    model: str
 
 
 def extract_values(
@@ -851,6 +890,12 @@ def extract_values(
     """
     store = DocSetStore(workspace)
     rnc_schema = store.get_schema(docset_id)  # RNC text; raises SchemaNotFound
+    # The .dgml.xml is written under the (docset, file) pair's prefix, which only the
+    # docset's file list reaches — so an unassigned file would get an orphan artifact.
+    if not store.is_assigned(docset_id, file_id):
+        raise FileNotFound(
+            f"file '{file_id}' is not assigned to docset '{docset_id}'; assign it first"
+        )
     # A stored schema is not re-checked on read; here it is about to be used.
     vocab = check_invariant_paths(parse_rnc(rnc_schema))
     schema = rnc_to_json_schema(rnc_schema)
@@ -890,7 +935,7 @@ def extract_values(
     phase1_tool_schema_mode = "inlined"
     phase1_chunk_calls = 0
     phase1_truncated_retries = 0
-    phase1_counters = {"envelope_repairs": 0}
+    phase1_counters = {"envelope_repairs": 0, "no_tool_call_retries": 0}
 
     try:
         # --- Phase 1: text + page numbers, no bboxes (LLM) ----------
@@ -1084,8 +1129,15 @@ def extract_values(
         # tree (full-extraction), or written as a standalone dg:chunk when no
         # tree exists yet (extraction).
         # Read again after phase 3, as before: a file deleted meanwhile
-        # raises here rather than getting an orphan XML written for it.
+        # raises here rather than getting an orphan XML written for it. Same
+        # for the assignment: `unassign` during the LLM phases cleared the
+        # pair's prefix, and writing now would recreate an orphan under it.
         stem = Path(FileStore(workspace).get(file_id).original_filename).stem
+        if not store.is_assigned(docset_id, file_id):
+            # `unassign` also deleted the pair's stats doc; the `finally` must not
+            # put it back.
+            write_stats = False
+            raise FileNotFound(f"file '{file_id}' is no longer assigned to docset '{docset_id}'")
         xml_key = layout.dgml_xml_key(docset_id, file_id, stem)
         existing = (
             workspace.blobs.get_blob(xml_key).decode("utf-8")
@@ -1103,7 +1155,11 @@ def extract_values(
         workspace.blobs.put_blob(xml_key, doc.encode("utf-8"))
         outcome = OUTCOME_OK
         return ExtractionResult(
-            values=final_values, tool_calls=tool_calls_total, xml_key=xml_key, mode=mode
+            values=final_values,
+            tool_calls=tool_calls_total,
+            xml_key=xml_key,
+            mode=mode,
+            model=config.values_model,
         )
     except ValuesExtractionFailed as exc:
         error_msg = str(exc)
@@ -1179,6 +1235,7 @@ def extract_values(
                     phase1_chunk_calls=phase1_chunk_calls,
                     phase1_truncated_retries=phase1_truncated_retries,
                     phase1_envelope_repairs=phase1_counters["envelope_repairs"],
+                    phase1_no_tool_call_retries=phase1_counters["no_tool_call_retries"],
                 )
         except Exception:
             pass
@@ -1247,6 +1304,7 @@ def _write_extraction_stats(
     phase1_chunk_calls: int,
     phase1_truncated_retries: int,
     phase1_envelope_repairs: int,
+    phase1_no_tool_call_retries: int,
 ) -> None:
     """Write ``extraction_stats.json`` into the file's marker directory.
 
@@ -1272,6 +1330,10 @@ def _write_extraction_stats(
                 # submit_values calls whose envelope had to be repaired before
                 # the tree could be read (see _repair_submit_values_args).
                 "envelope_repairs": phase1_envelope_repairs,
+                # turns that ended with no tool call and were retried with a
+                # reminder (never forced; reachable only where phase 1 runs on
+                # auto tool choice: Anthropic, or a fallback from "required").
+                "no_tool_call_retries": phase1_no_tool_call_retries,
                 **phase1_totals,
             },
             "phase2": {"duration_s": phase2_duration},
@@ -2145,8 +2207,9 @@ def _run_extract_loop(
     so the surrounding ``extract_values`` records a single usage row across
     both phases, and ``counters["envelope_repairs"]`` for every submission
     whose argument envelope had to be unwrapped first (see
-    :func:`_repair_submit_values_args`, which decides against ``vocab``);
-    both survive a loop that fails after the repair.
+    :func:`_repair_submit_values_args`, which decides against ``vocab``),
+    and ``counters["no_tool_call_retries"]`` for every turn that ended with
+    no tool call and was retried; all survive a loop that fails afterwards.
 
     Two submission protocols:
 
@@ -2167,15 +2230,36 @@ def _run_extract_loop(
     A turn that stops with ``finish_reason == "length"`` raises
     :class:`_OutputTruncated` so the caller can retry with an explicit
     chunking directive.
+
+    Every provider but Anthropic gets ``tool_choice="required"`` on every
+    call, so a text-only turn cannot happen there, unless litellm's global
+    ``drop_params`` silently removes the parameter for a provider it believes
+    lacks it (the call then runs on auto, as it did before "required"). A call that an endpoint
+    rejects as an invalid request is resent once on auto; when that succeeds,
+    the endpoint is remembered as refusing ``"required"`` (warned about once)
+    and this and later attempts against it run on auto. On auto (Anthropic,
+    see below, or such an endpoint) a text-only turn that stopped normally
+    (``finish_reason`` ``"stop"``, or none reported) is retried up to
+    :data:`_MAX_NO_TOOL_CALL_RETRIES` times per attempt, outside the
+    ``max_tool_iters`` budget: the reply is kept in the history and a
+    reminder to call ``submit_values`` follows it (or, for a chunked run that
+    already recorded part of its submission, to continue with
+    ``append_entries``, since a resent full tree would duplicate its entries).
+    A retry is never forced, so the turn that produces the values keeps its
+    thinking budget. A text-only turn that did not stop normally (a content
+    filter, a refusal stop) fails at once. Every failure quotes the reply's
+    ``finish_reason``, whether it was reasoning only, and its opening text.
     """
-    # Phase 1 uses tool_choice="auto" (the default in call_with_tools) so
-    # the model can call get_page_words between turns. With auto choice
-    # the wrapper keeps reasoning_effort for every provider, including
-    # Anthropic — only forced tool_choice triggers the Anthropic drop. That
-    # also makes this the only call site where the reasoning budget has any
-    # effect on Claude, which is why :data:`_VALUES_REASONING_EFFORT` applies
-    # here and nowhere else. ``reasoning_effort`` is that constant unless the
-    # workspace set ``grounded.values_reasoning_effort`` (``None`` = send none).
+    # Phase 1 leaves Anthropic on tool_choice="auto" (omitted on the wire)
+    # because any forced choice, "required" included, makes the wrapper drop
+    # reasoning_effort for Anthropic, which rejects thinking with forced tool
+    # use. Auto keeps extended thinking on for Claude. That also makes this
+    # the only call site where the reasoning budget has any effect on Claude,
+    # which is why :data:`_VALUES_REASONING_EFFORT` applies here and nowhere
+    # else. Other providers keep their reasoning under a forced choice, so
+    # they get "required" and can never end a turn without a tool call.
+    # ``reasoning_effort`` is that constant unless the workspace set
+    # ``grounded.values_reasoning_effort`` (``None`` = send none).
     llm_config = LLMConfig(
         model=model,
         api_key=api_key,
@@ -2190,6 +2274,13 @@ def _run_extract_loop(
     tool_calls_run = 0
     chunk_calls = 0
     acc_args: dict[str, Any] | None = None  # accumulated submit_values args
+    no_tool_call_retries = 0
+    endpoint = (model, api_base, reasoning_effort)
+    tool_choice = (
+        None
+        if is_anthropic_model(model) or endpoint in _REQUIRED_TOOL_CHOICE_REJECTED
+        else "required"
+    )
 
     def _ack(call_id: str, name: str, payload: dict[str, Any]) -> None:
         messages.append(
@@ -2201,13 +2292,39 @@ def _run_extract_loop(
             }
         )
 
-    for _ in range(max_tool_iters):
+    turns = 0
+    while turns < max_tool_iters:
         try:
             # Always cached: the system prompt and the schema block ahead of the
             # per-file PDF are byte-identical for every file in the docset, so
             # each file after the first reads that prefix instead of re-sending
             # it. ``call_with_tools`` no-ops the marker for non-Anthropic models.
-            result = call_with_tools(llm_config, messages=messages, tools=tools, cache=True)
+            try:
+                result = call_with_tools(
+                    llm_config, messages=messages, tools=tools, tool_choice=tool_choice, cache=True
+                )
+            except Exception as exc:
+                # Some endpoints refuse "required" (an OpenAI-compatible server
+                # without forced tool choice, or Claude behind an alias that
+                # is_anthropic_model cannot recognise, which then rejects
+                # thinking under a forced choice). Resend once on auto, which
+                # is what phase 1 sent before "required". Only a request
+                # rejection qualifies: a timeout or rate limit would only be
+                # repeated, and a schema overflow belongs to the caller's
+                # permissive-schema fallback. A failing resend raises its own
+                # error, the one the auto request alone would have produced.
+                if not (
+                    tool_choice == "required"
+                    and is_request_rejection(exc)
+                    and not _is_tool_schema_too_large(exc)
+                ):
+                    raise
+                result = call_with_tools(llm_config, messages=messages, tools=tools, cache=True)
+                # The same request succeeded once tool choice was left to the
+                # model, so "required" was the cause: stay on auto for this
+                # attempt and start later ones there.
+                _remember_required_tool_choice_rejected(endpoint, exc)
+                tool_choice = None
         except Exception as exc:
             raise ValuesExtractionFailed(
                 f"extraction call failed: {type(exc).__name__}: {exc}"
@@ -2232,11 +2349,49 @@ def _run_extract_loop(
             )
 
         if not result.tool_calls:
-            raise ValuesExtractionFailed(
-                "model returned no tool call; the run is required to end "
-                f"with a {_TOOL_SUBMIT_VALUES!r} call carrying the final values"
+            # Only a normal stop is worth a reminder: a content filter or a
+            # refusal stop would end the same way again, and each retry
+            # resends the document.
+            # No finish_reason at all is common on OpenAI-compatible servers
+            # and says nothing abnormal happened, so it is retried too.
+            if (
+                result.finish_reason not in ("stop", None)
+                or no_tool_call_retries >= _MAX_NO_TOOL_CALL_RETRIES
+            ):
+                raise ValuesExtractionFailed(
+                    "model returned no tool call; the run is required to end "
+                    f"with a {_TOOL_SUBMIT_VALUES!r} call carrying the final values "
+                    f"(after {no_tool_call_retries} retries on this attempt; last "
+                    f"reply: {_describe_text_reply(result)})"
+                )
+            no_tool_call_retries += 1
+            counters["no_tool_call_retries"] += 1
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "file %s: phase-1 reply had no tool call (%s); retry %d of %d",
+                    file_id,
+                    _describe_text_reply(result),
+                    no_tool_call_retries,
+                    _MAX_NO_TOOL_CALL_RETRIES,
+                )
+            # Keep the reply so the model sees what it said; an empty assistant
+            # turn is rejected by some providers, so it is dropped instead.
+            if isinstance(result.content, str) and result.content.strip():
+                messages.append({"role": "assistant", "content": result.content})
+            # A chunked run that already recorded a done=false submission is
+            # mid-sequence: lists merge by concatenation, so a resent full tree
+            # would duplicate every entry already recorded.
+            nudge = (
+                PromptKey.VALUES_PHASE1_NUDGE_CONTINUE
+                if chunked and acc_args is not None
+                else PromptKey.VALUES_PHASE1_NUDGE_SUBMIT
             )
+            messages.append({"role": "user", "content": prompt(nudge)})
+            # A retry does not spend the turn budget, so running out of turns
+            # never cuts one short; _MAX_NO_TOOL_CALL_RETRIES bounds them.
+            continue
 
+        turns += 1
         messages.append(_serialize_assistant_message(result.message))
 
         for call in result.tool_calls:
@@ -2321,6 +2476,40 @@ def _run_extract_loop(
         f"extraction exceeded max_tool_iters={max_tool_iters} "
         f"without producing a {_TOOL_SUBMIT_VALUES!r} call"
     )
+
+
+def _remember_required_tool_choice_rejected(
+    endpoint: tuple[str, str | None, str | None], exc: BaseException
+) -> None:
+    """Record that *endpoint* refuses ``tool_choice="required"`` and warn the
+    first time.
+
+    On auto a model may end a turn without a tool call, which the reminder
+    retries cover but cannot rule out, so the fallback is worth surfacing."""
+    if endpoint in _REQUIRED_TOOL_CHOICE_REJECTED:
+        return
+    _REQUIRED_TOOL_CHOICE_REJECTED.add(endpoint)
+    model = endpoint[0]
+    logger.warning(
+        "values model %r rejected tool_choice='required' (%s: %s); phase-1 "
+        "extraction falls back to auto tool choice for it",
+        model,
+        type(exc).__name__,
+        str(exc)[:300],
+    )
+
+
+def _describe_text_reply(result: CallResult) -> str:
+    """Summarize a text-only model reply for an error or log message: the
+    opening of its text (whitespace collapsed), then :func:`_no_text_detail`'s
+    ``finish_reason`` and whether the reply was reasoning only, which is what
+    tells a model that spent its budget thinking apart from an empty reply."""
+    content = result.content
+    text = " ".join(content.split()) if isinstance(content, str) else ""
+    if len(text) > _NO_TOOL_CALL_REPLY_PREVIEW_CHARS:
+        text = text[:_NO_TOOL_CALL_REPLY_PREVIEW_CHARS] + "..."
+    shown = json.dumps(text) if text else "no text"
+    return shown + _no_text_detail(result.response)
 
 
 def _normalize_leaf_provenance(values: Any) -> None:

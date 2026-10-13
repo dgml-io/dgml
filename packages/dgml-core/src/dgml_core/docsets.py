@@ -14,8 +14,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from . import layout
 from .errors import (
+    CorruptMetadata,
     DocSetNotFound,
     FileNotFound,
     GuidanceNotFound,
@@ -25,9 +28,11 @@ from .errors import (
     now_iso,
 )
 from .ids import new_id
-from .models import DocSet
+from .models import DocSet, DocSetAssignment
 from .storage import Workspace
 from .workspace_ops import WorkspaceOps
+
+logger = logging.getLogger(__name__)
 
 
 class DocSetStore:
@@ -121,6 +126,47 @@ class DocSetStore:
         )
         return sorted(str(a["file_id"]) for a in assignments)
 
+    def docsets_for_file(self, file_id: str) -> list[DocSetAssignment]:
+        """Return the DocSets *file_id* is assigned to, each with its ``assigned_at``.
+
+        The inverse of :meth:`list_files`. Sorted by docset id, so the order does
+        not depend on the storage backend. An assignment whose DocSet is gone
+        (e.g. an ``add_file`` racing a docset delete) or whose manifest cannot
+        be parsed is skipped, with the same tolerance :meth:`list_all` has, so
+        one corrupt manifest cannot hide the file's other, healthy DocSets.
+        Each manifest is read on its own rather than through ``list_all`` so a
+        bad manifest only affects the files assigned to that DocSet. ``dgml
+        check`` is where a corrupt manifest gets reported."""
+        if not file_id.strip():
+            raise InvalidArgument("file id must not be empty")
+        if self.ws.docs.get_doc(layout.Collection.FILES, file_id) is None:
+            raise FileNotFound(f"file '{file_id}' not found")
+        result: list[DocSetAssignment] = []
+        for assignment in self.ws.docs.find_docs(
+            layout.Collection.ASSIGNMENTS, {"file_id": file_id}
+        ):
+            docset_id = str(assignment["docset_id"])
+            try:
+                data = self.ws.docs.get_doc(layout.Collection.DOCSETS, docset_id)
+            except CorruptMetadata:
+                logger.warning(
+                    "docset '%s' has a corrupt manifest; left out of the docsets for "
+                    "file '%s' (run `dgml check`)",
+                    docset_id,
+                    file_id,
+                )
+                continue
+            if data is None:
+                continue
+            assigned_at = assignment.get("assigned_at")
+            result.append(
+                DocSetAssignment(
+                    docset=DocSet.from_json(data),
+                    assigned_at=str(assigned_at) if assigned_at else None,
+                )
+            )
+        return sorted(result, key=lambda a: a.docset.id)
+
     def add_file(self, docset_id: str, file_id: str) -> None:
         if not docset_id.strip():
             raise InvalidArgument("docset id must not be empty")
@@ -143,12 +189,15 @@ class DocSetStore:
         if not file_id.strip():
             raise InvalidArgument("file id must not be empty")
         self._require_docset(docset_id)
-        if (
-            self.ws.docs.get_doc(layout.Collection.ASSIGNMENTS, layout.pair_id(docset_id, file_id))
-            is None
-        ):
+        if not self.is_assigned(docset_id, file_id):
             raise FileNotFound(f"file '{file_id}' is not assigned to docset '{docset_id}'")
         WorkspaceOps(self.ws).unassign(docset_id, file_id)
+
+    def is_assigned(self, docset_id: str, file_id: str) -> bool:
+        return (
+            self.ws.docs.get_doc(layout.Collection.ASSIGNMENTS, layout.pair_id(docset_id, file_id))
+            is not None
+        )
 
     # ---- extraction schema (docsets/<id>/extraction-schema.rnc, RELAX NG Compact) --
 

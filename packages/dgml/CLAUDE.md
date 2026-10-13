@@ -45,11 +45,11 @@ command syntax, flags, payload shapes, or stdout/stderr behavior, grep the
 repo for CLI spawns and update any that are affected:
 
 ```bash
-grep -rIl "subprocess" app-sample/ tools/ 2>/dev/null | xargs grep -lI "dgml"
+grep -rIl "subprocess" samples/app-sample/ tools/ 2>/dev/null | xargs grep -lI "dgml"
 ```
 
 Known consumer today:
-[app-sample/dgml-app-sample-server.py](../../app-sample/dgml-app-sample-server.py)
+[samples/app-sample/dgml-app-sample-server.py](../../samples/app-sample/dgml-app-sample-server.py)
 — spawns `dgml` (`init`, `file add`, `cluster [--skip-existing]`, `docset
 list`, `docset generate`, `docset ground`), parses **`docset list`** output,
 and streams the child's stdout **and stderr** into its live log (so a

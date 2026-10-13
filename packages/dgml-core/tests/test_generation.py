@@ -362,6 +362,48 @@ def test_parse_window_compact_drops_only_malformed_lines() -> None:
     assert [b["structure"] for b in decoded["blocks"]] == ["p", "heading"]
 
 
+def test_parse_window_compact_repairs_literal_tab_placeholder() -> None:
+    # Models sometimes copy the grammar's "<TAB>" placeholder instead of a real
+    # tab, for a whole window; those lines must decode, not be dropped.
+    text = "\n".join(
+        [
+            "C<TAB>end of the previous item.",
+            "H2<TAB>1.<TAB>Safe Deposit Boxes",
+            "I<TAB><TAB>Customer visits a safe deposit box unusually often.",
+            "P<TAB>Plain paragraph.",
+            "R<TAB>cell a<TAB>cell b",
+            "F<TAB><TAB>Total<TAB>1,000",
+        ]
+    )
+    decoded, dropped = _parse_window_compact(text)
+    assert dropped == 0
+    assert decoded["continues"] == "end of the previous item."
+    assert decoded["blocks"] == [
+        {"structure": "heading", "level": 2, "lim": "1.", "text": "Safe Deposit Boxes"},
+        {
+            "structure": "item",
+            "lim": "",
+            "text": "Customer visits a safe deposit box unusually often.",
+        },
+        {"structure": "p", "text": "Plain paragraph."},
+        {"structure": "row", "cells": ["cell a", "cell b"]},
+        {"structure": "field", "lim": "", "label": "Total", "value": "1,000"},
+    ]
+
+
+def test_parse_window_compact_keeps_literal_placeholder_beside_real_tabs() -> None:
+    # A line with a real tab is well-formed; "<TAB>" in its text is content.
+    decoded, dropped = _parse_window_compact("P\tPress <TAB> to indent.")
+    assert dropped == 0
+    assert decoded["blocks"] == [{"structure": "p", "text": "Press <TAB> to indent."}]
+
+
+def test_parse_window_compact_still_drops_prose_mentioning_placeholder() -> None:
+    # Only a sigil followed by the placeholder is repaired.
+    _decoded, dropped = _parse_window_compact("Press <TAB> to indent.")
+    assert dropped == 1
+
+
 def test_parse_window_any_sniffs_json_and_compact() -> None:
     payload = {"continues": "", "blocks": [{"structure": "p", "text": "plain"}]}
     bare = json.dumps(payload)

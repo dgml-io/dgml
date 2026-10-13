@@ -30,8 +30,8 @@ import sys
 # lazy litellm import.
 _WARN_SNIPPET = (
     "import dgml_core\n"
-    "from dgml_core.models_config import ModelsConfig, Tier\n"
-    "ModelsConfig(standard='s').resolve(Tier.EXPERT)\n"
+    "from dgml_core.models_config import Model, ModelsConfig, Tier\n"
+    "ModelsConfig(standard=Model('s')).resolve(Tier.EXPERT)\n"
 )
 
 

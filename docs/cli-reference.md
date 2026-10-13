@@ -703,8 +703,9 @@ dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <
 **Auto-extract on assignment.** When the target DocSet has an extraction
 schema set (`extraction-schema.rnc`), every assignment path fires value
 extraction on the newly-assigned file: `docset add-file`, `file add
---auto-classify` (existing-DocSet decisions, which is every decision under
-`--auto-classify existing`), and `cluster` (existing-DocSet
+--auto-classify` (existing-DocSet decisions only — never a `"none"`
+decision under `--auto-classify existing`, which leaves the file
+unassigned), and `cluster` (existing-DocSet
 matches — a DocSet created mid-run can't have a schema yet). The payload
 gains an `extraction` block; extraction failures are **soft** (the error
 lands in `extraction.error`, the assignment stands, exit stays 0). No schema
@@ -1318,7 +1319,16 @@ element into the file's core `<stem>.dgml.xml`. Runs a three-phase pipeline
 a generated document tree the extraction is added alongside it
 (`mode: full-extraction`); otherwise a minimal core file is created
 (`mode: extraction`). `extraction_stats.json` is written only under the global
-`--debug` flag. Errors `SCHEMA_NOT_FOUND` if the DocSet has no schema.
+`--debug` flag. Errors `SCHEMA_NOT_FOUND` if the DocSet has no schema, and
+`FILE_NOT_FOUND` if the file is not assigned to the DocSet — assign it first with
+`docset add-file` (the schema and the assignment can be set in either order; only
+this command needs both in place).
+
+`--values-model` overrides `grounded.values_model` for this call and resolves
+credentials as if the model were set in config: `grounded.values_api_key` /
+`values_api_key_env` / `values_api_base` apply if set, and nothing from the
+`advanced` tier carries over to the new model. `--schema-model` on
+`generate-schema` works the same way.
 
 `--values-effort` overrides `grounded.values_reasoning_effort` for this call:
 `none`, `minimal`, `low`, `medium` (the default), `high`, `xhigh`, or `default`
@@ -1406,9 +1416,33 @@ payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
 `phases.phase1`: `chunk_calls` (1 = ordinary single submission),
-`truncated_retries`, and `envelope_repairs`. The last counts `submit_values`
+`truncated_retries`, `envelope_repairs`, and `no_tool_call_retries`.
+`envelope_repairs` counts `submit_values`
 calls that arrived with the tool's argument envelope repeated one level down,
 or serialized as a JSON string, and were unwrapped before the tree was read.
+`no_tool_call_retries` counts the reminder retries given to phase-1 turns that
+ended with plain text and no tool call (the turn that finally fails a run is
+not counted). Phase 1 sends `tool_choice="required"` to every provider except
+Anthropic, so these occur only where phase 1 runs on auto: on Claude models,
+which stay on auto because a forced tool choice switches off their extended
+thinking; where litellm silently drops the parameter for a provider it
+believes lacks it; and on an endpoint that rejects `"required"` as an invalid
+request (HTTP 400/422). Such a call is resent once on auto; when the resend
+succeeds, the endpoint is remembered for the rest of the process (later
+attempts start on auto) and a warning names the model once. Timeouts, auth,
+rate-limit, context-window and content-policy errors are never resent this way.
+A text-only turn that stopped normally is answered with a reminder to call `submit_values` (or,
+for a chunked run that already recorded part of its submission, to continue
+with `append_entries`, since a resent full tree would duplicate its entries)
+and the model is asked again. Retries are never forced, so the turn that
+produces the values keeps its thinking budget, and they do not count against
+`max_tool_iters`. A third text-only turn in one attempt, or any text-only turn
+that did not stop normally (a content filter or refusal stop; a missing
+`finish_reason` counts as normal), fails the run;
+the error quotes the reply's opening text, its `finish_reason`, and whether it
+was reasoning only. The counter totals every attempt of the run (a truncation
+or schema retry starts a new attempt), so it can exceed the per-attempt limit
+the error reports.
 A submission of which the vocabulary keeps nothing (no key names a schema
 root, or every named root carries a value of the wrong kind) is refused as an
 extraction error rather than written as an empty result; an empty tree, or
@@ -1578,8 +1612,10 @@ The `dgml file add` response also includes:
   File record is still created (with `page_count: null`) and a permanent error
   is recorded. `null` for PDFs and successful conversions.
 - `classification` — present **only** when `--auto-classify` is passed.
-  `decision` is `"existing"` or `"new"` (always `"existing"` under
-  `--auto-classify existing`). See "Auto-classification" below.
+  `decision` is `"existing"` or `"new"`; under `--auto-classify existing` it
+  is `"existing"` or `"none"` (no DocSet fits; file left unassigned); under
+  `--auto-classify existing-forced` it is always `"existing"`. See
+  "Auto-classification" below.
 
 Error codes that can come back on `file add`:
 
@@ -1595,13 +1631,13 @@ Error codes that can come back on `file add`:
 | `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
 | `CLASSIFICATION_CONFIG_INVALID` | The `classification` section exists but a required field is missing or malformed. |
-| `NO_EXISTING_DOCSETS` | `--auto-classify existing` was passed but the workspace has no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | `--auto-classify existing` (or `existing-forced`) was passed but the workspace has no DocSets to assign to. |
 
 The classification config is a precondition for `--auto-classify`, so a
 missing/invalid one is a **hard** error (exit 1) rather than a per-file
 soft error — every file would otherwise report the same thing. Having at
 least one DocSet is the same kind of precondition for `--auto-classify
-existing`, and is treated the same way. For a bulk directory add both are
+existing` and `existing-forced`, and is treated the same way. For a bulk directory add both are
 checked once up front, so the run aborts before any file is added.
 
 Soft-fail codes recorded on the File rather than returned as an envelope (OCR/hybrid-specific):
@@ -1633,8 +1669,9 @@ bulk flag — it makes re-runs idempotent. With `--auto-classify`, a
 DocSet created for one file becomes visible to the files processed
 after it, so similar PDFs in the batch cluster into the same DocSet.
 Under `--auto-classify existing` no DocSets are created, so that in-run
-growth doesn't happen: every file is assigned within the same curated set
-the run started with.
+growth doesn't happen: each file is either assigned within the same curated
+set the run started with or left unassigned (`decision: "none"`).
+`existing-forced` likewise creates nothing, but assigns every file.
 
 Each file commits independently: a single bad PDF (or a conflict under
 `--on-conflict error`) is recorded in its entry and the run continues.
@@ -1686,7 +1723,7 @@ carries the same fields as a single `file add` response (plus `path`, and
 `classification` when `--auto-classify` is set). A hard-failed entry
 has `status`, `path`, and an `error` object instead of a `file` record.
 
-`summary` counts (they sum to `total`):
+`summary` counts (`added` through `hard_failed` sum to `total`):
 
 | Field | Meaning |
 |---|---|
@@ -1695,6 +1732,7 @@ has `status`, `path`, and an `error` object instead of a `file` record.
 | `skipped` | Existing records returned via `--on-conflict skip`/`replace` (`created: false`). |
 | `soft_failed` | Added, but with a `page_render_error`, `page_count_error`, `text_extraction_error`, or `conversion_error` recorded. |
 | `hard_failed` | The add raised (bad PDF, conflict under `--on-conflict error`, …); the entry carries an `error` object. |
+| `unassigned` | Present only with `--auto-classify`. Files this run classified (`classification.performed: true`) that still sit in no DocSet — a `"none"` decision under `existing`, or a soft-failed classification (`classification.error`). An overlay on the counts above, not a bucket of its own: a declined file is still counted as `added`. Non-zero means some files need routing. Files skipped as duplicates are not counted, since they were not classified this run. |
 
 Run `dgml check` afterward as the authoritative health signal for the
 whole workspace.
@@ -1711,19 +1749,35 @@ The flag takes an optional `MODE`:
 |---|---|
 | `--auto-classify` | Same as `existing-or-new` — the historical default. |
 | `--auto-classify existing-or-new` | Assign to an existing DocSet if one fits; otherwise create one. |
-| `--auto-classify existing` | Always assign to an existing DocSet — the best-fitting one. Never creates a DocSet, and never declines. |
+| `--auto-classify existing` | Assign to an existing DocSet if one fits; otherwise leave the file unassigned (`decision: "none"`). Never creates a DocSet. |
+| `--auto-classify existing-forced` | Always assign to the closest existing DocSet, even when the fit is poor. Never creates a DocSet and never declines. |
+
+> **Changed behavior.** Before `existing-forced` existed, `existing` meant
+> what `existing-forced` means now: every file was assigned and `decision`
+> was always `"existing"`. `existing` can now return `decision: "none"` with
+> `docset_id: null`. Callers that relied on forced assignment should switch
+> to `existing-forced`. It also changes cost: `existing` against a
+> one-DocSet workspace used to make no LLM call, and now makes one per file
+> (declining is a possible answer, so the model has to look). A file whose
+> pages failed to render, which used to be assigned there, now gets
+> `classification.error` instead. `existing-forced` keeps the old
+> no-call path for a single DocSet.
 
 Use `existing` when the workspace's DocSets are curated and an ingest run
 must not grow new ones — otherwise one odd file anchors a one-document
 DocSet that someone has to notice and clean up.
 
-> **`existing` assumes the files belong.** The LLM is required to return a
-> DocSet, so a document whose type isn't represented in the workspace is
-> assigned to the closest one anyway rather than flagged. Only pass
-> `existing` when you already know each file fits one of the DocSets; for a
-> mixed or unknown batch use `existing-or-new`, or `dgml cluster`. With no
-> DocSets to choose from the command fails with `NO_EXISTING_DOCSETS`
-> (exit 1) instead of guessing.
+> **`existing` as a fallback router.** A document whose type isn't
+> represented in the workspace comes back with `decision: "none"`: the File
+> is kept but sits in no DocSet and is not extracted, so a caller's own
+> unknown-type handling can take over. With no DocSets to choose from the
+> command fails with `NO_EXISTING_DOCSETS` (exit 1) — there is nothing to
+> route into.
+
+Use `existing-forced` only when every file is known to belong in one of the
+workspace's DocSets: an off-type document is assigned to the closest DocSet
+anyway, not flagged. With exactly one DocSet it makes no LLM call — there is
+only one possible answer.
 
 > **Argument order matters.** `MODE` is optional, so the parser takes the
 > *next* token as its value. Put `<path>` **before** the flag —
@@ -1768,23 +1822,26 @@ The LLM is forced to pick exactly one of two tools:
   document type can answer. The `key_questions` are persisted on the
   new DocSet and shown to future classifications.
 
-`--auto-classify existing` offers only `assign_to_existing_docset`, so
-with `tool_choice="required"` a choice is forced: the LLM is told a
-perfect fit isn't required and to return the closest DocSet. `decision`
-is therefore always `"existing"`. A model that calls `create_new_docset`
-anyway is refused with `CLASSIFICATION_FAILED`.
+`--auto-classify existing` swaps `create_new_docset` for
+`no_matching_docset(reason)`: the LLM assigns when a DocSet is the new
+file's document type, and otherwise declines, giving `decision: "none"` and
+a one-sentence `decline_reason`. Fit is judged by each DocSet's description, or by
+its name alone when it has none. Key questions only break ties between
+DocSets that both fit, so a DocSet created with just a `--name` is still a
+candidate. The model is called even when the workspace holds a single DocSet,
+since declining is a possible answer.
 
-Two cases skip the LLM entirely, since neither leaves anything to decide:
+`--auto-classify existing-forced` offers `assign_to_existing_docset` alone,
+so the LLM must pick the closest DocSet.
 
-- **Exactly one DocSet** — the file is assigned to it, with the same
-  payload the model would have returned. This mode creates no DocSets,
-  so a whole bulk run over a one-DocSet workspace costs no LLM calls.
-  (`existing-or-new` still calls here — it may need a new DocSet.)
-- **No DocSets** — the command fails with `NO_EXISTING_DOCSETS`
-  (exit 1). Both preconditions (config, and at least one DocSet) are
-  checked *before* the file is ingested, single and bulk alike, so a
-  failed run adds nothing — erroring after the add would leave behind
-  the unassigned file this mode exists to avoid.
+A model that calls a tool its mode didn't offer (`create_new_docset`
+outside the default mode, `no_matching_docset` outside `existing`) is
+refused with `CLASSIFICATION_FAILED`.
+
+With **no DocSets** the command fails with `NO_EXISTING_DOCSETS` (exit 1)
+and makes no LLM call. Both preconditions (config, and at least one
+DocSet) are checked *before* the file is ingested, single and bulk alike,
+so a failed run adds nothing.
 
 Classification runs **after** the file is added, and only when `created`
 is `true`. Re-runs on a duplicate (`--on-conflict skip`) skip the LLM
@@ -1806,18 +1863,43 @@ The `classification` payload block:
     "What is the invoice total?",
     "What is the invoice date?"
   ],
+  "decline_reason": null,
   "error": null
 }
 ```
+
+`docset_id` is set only once the file is actually stored in that DocSet, so
+a block with an `error` and a non-null `docset_id` means the assignment
+landed and a later step failed; a `null` one means the file is in no DocSet.
+If a newly created DocSet can't take the file, the DocSet is deleted again
+rather than left behind empty.
 
 `docset_key_questions` echoes the assigned DocSet's `key_questions`
 (empty list for DocSets created without them). When `decision`
 is `"new"`, this is the list the LLM just proposed and that has been
 persisted on the freshly-created DocSet.
 
-Under `--auto-classify existing` the block looks the same as the
-`"existing"` example above; `decision` is never `"new"` and never
-anything else, since the assign tool is the only one offered.
+Under `--auto-classify existing` `decision` is never `"new"`. When no
+DocSet fits it is `"none"`, the File is left unassigned, no `extraction`
+block is added, the DocSet fields stay empty, and `decline_reason` carries
+the LLM's one-sentence explanation. `decline_reason` is present on every
+performed block and `null` unless `decision` is `"none"`; a decline that
+comes back without a reason is treated as a malformed response
+(`CLASSIFICATION_FAILED` in `error`), so a `"none"` always says why:
+
+```json
+"classification": {
+  "performed": true,
+  "model": "gemini/gemini-flash-lite-latest",
+  "decision": "none",
+  "docset_id": null,
+  "docset_created": false,
+  "docset_name": null,
+  "docset_key_questions": [],
+  "decline_reason": "This is a commercial lease, not a vendor invoice or a safety datasheet.",
+  "error": null
+}
+```
 
 When the file already existed (`created: false`):
 
@@ -2457,7 +2539,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 |---|---|---|
 | `WORKSPACE_NOT_INITIALIZED` | hard | A command that needs a workspace ran against a directory that has no workspace **config** — which is what makes a directory a workspace, since the config names the storage backend and cannot be reconstructed. This covers both "never a workspace" and "a workspace whose `config.toml` was deleted"; nothing on disk distinguishes them for a remote-backed workspace, so one error carries all the remedies. The message names the resolved path and offers remedies that work against *that* workspace: `dgml workspace create <path> --organization <org>` to make one there, `dgml workspace list` to find one you already have, or restoring the config from backup. (It deliberately does not say a bare `dgml workspace create`, which would create a workspace elsewhere and leave the command failing identically.) |
 | `LEGACY_CONFIG_PRESENT` | hard | A pre-migration `<workspace>/config.toml` is the only config present; the format is now TOML. Run `dgml init` to write `~/.config/dgml/config.toml`, then migrate any settings. |
-| `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier or `family` set to a non-string or empty value, or `family` naming an unknown provider family). |
+| `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier, `family` or credential set to a non-string or empty value, `family` naming an unknown provider family, both `*_api_key` and `*_api_key_env` set for one tier or provider, or tier credentials without that tier). |
 | `MISSING_EXTRA` | hard | A command needs an optional extra that isn't installed (e.g. `dgml[clustering]`). |
 | `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`, a `file add --id` that is malformed, passed with a directory, or unsatisfiable under the chosen `--on-conflict`). |
 | `INTERNAL_ERROR` | hard | Unexpected exception; the message is a short, single-line `<ExcType>: <msg>` (capped, whitespace collapsed). Pass `--verbose` (or set `DGML_DEBUG=1`) for the full stderr traceback. |
@@ -2479,7 +2561,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CLASSIFICATION_CONFIG_MISSING` | hard | `--auto-classify` with no `classification` config. |
 | `CLASSIFICATION_CONFIG_INVALID` | hard | The `classification` config has a missing/invalid field. |
 | `CLASSIFICATION_FAILED` | soft | The classification LLM call failed; lands in `classification.error`. |
-| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` in a workspace with no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` or `existing-forced` in a workspace with no DocSets to assign to. |
 | `CLUSTERING_CONFIG_INVALID` | hard | The optional `clustering` config section failed validation. |
 | `GROUNDING_FAILED` | soft | Grounding a file failed; surfaces as `grounded: false` with a `grounding_error` on that file's `docset generate` result entry. |
 | `LABEL_MODEL_UNREACHABLE` | soft | A file's labeling could not reach the `label_model` at all (auth / bad model id / network); surfaces as a `label_error` on that file's `docset generate` result entry. The file still converts, unlabeled. |
