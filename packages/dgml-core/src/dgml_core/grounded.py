@@ -101,6 +101,7 @@ from .llm import (
     _no_text_detail,
     call_with_tools,
     is_anthropic_model,
+    is_request_rejection,
     is_request_too_large,
     model_max_output_tokens,
 )
