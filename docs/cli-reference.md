@@ -1236,6 +1236,15 @@ etc.). There is no grounded-field JSON Schema intermediate; datatypes are native
 to the generated schema, and downstream extraction normalizes each typed value
 to a `dg:value`/`xsi:type`. The output shape is unchanged.
 
+All samples go in one request. If the provider refuses it as too large
+(Anthropic's `request_too_large`, an HTTP 413, Gemini's "payload size
+exceeds"), every sample stays in the request but the largest are cut to their
+leading pages, sharing half the bytes of the refused request fairly, and the
+model is told which samples are partial. This repeats until the request is
+accepted. A sample whose first page alone does not fit its share is left out,
+and each cut or left-out sample is logged as a warning. `from_file_ids` still
+lists every requested file.
+
 ```json
 {
   "docset_id": "o8vr8rs488vg",
