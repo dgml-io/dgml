@@ -57,6 +57,37 @@ jobs:
           UV_PYTHON: ${{ matrix.python-version }}
       - run: uv run pytest
 
+  test-windows:
+    # Non-blocking: this is the suite's first run on Windows. The two Windows
+    # fixes merged so far (#176, #178) were only visible from a Windows
+    # machine, so the job exists to make that class of break show up in CI.
+    # Failures here are triaged into issues rather than failing the PR until
+    # the suite is known green on this runner, at which point the
+    # continue-on-error comes off. Ghostscript is installed the way the Linux
+    # job installs it: the first run without it showed seven test_pages cases
+    # that are parametrized over the renderer without the needs_gs marker.
+    name: Test (Windows, Python 3.12, non-blocking)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ghostscript
+        run: choco install ghostscript --no-progress -y
+      - name: Put ghostscript on PATH
+        # The package installs under C:\Program Files\gs\gs<version>\bin and
+        # later steps do not see the installer's PATH change on their own.
+        shell: pwsh
+        run: |
+          $bin = Get-ChildItem 'C:\Program Files\gs' -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          "$($bin.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev --locked
+        env:
+          UV_PYTHON: "3.12"
+      - run: uv run pytest
+
   storage-parity:
     # The sample S3+Mongo store, run against real backing services.
     #
