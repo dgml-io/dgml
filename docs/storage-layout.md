@@ -707,6 +707,8 @@ half as much, so the stronger tier was not earning its price on this task. Set
 label_model = "anthropic/claude-opus-5"
 # Anthropic extended thinking for both passes. Default "disabled".
 thinking = "adaptive"
+# Day/month reading of a year-last numeric date such as 01/11/2024. Default "DMY".
+date_order = "MDY"
 ```
 
 Field rules:
@@ -731,6 +733,16 @@ Field rules:
   exact-match and token-overlap F1, individually and pooled, at roughly 2.7x
   less cost and 4.5x less wall time. Set `"adaptive"` to restore the model
   default. Any other value fails with `GENERATION_CONFIG_INVALID`.
+- `date_order` — optional; `"DMY"` (default) or `"MDY"`. How a year-last
+  numeric date is read when the text alone cannot settle it: `01/11/2024` is
+  1 November under `"DMY"` and 11 January under `"MDY"`. Year-first
+  (`2024-11-01`) and spelled-out dates are unaffected. A date the configured
+  order cannot read (`10/31/2024` under `"DMY"`) is read in the other order,
+  since a day above 12 leaves only one reading, rather than left untyped. The
+  same key governs the typed values `extraction extract` writes, so a
+  document's tree and its extraction agree. Set `"MDY"` for a workspace whose
+  documents are all US-style. Any other value fails with
+  `GENERATION_CONFIG_INVALID`.
 
 A malformed section fails the next `docset generate` with
 `GENERATION_CONFIG_INVALID`.

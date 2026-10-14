@@ -94,6 +94,8 @@ from .extraction_xml import (
     standalone_extraction_doc,
 )
 from .files import FileStore
+from .generation.config import resolve_date_order
+from .generation.semantic_transform import DEFAULT_DATE_ORDER
 from .llm import (
     CallResult,
     LLMConfig,
@@ -302,6 +304,11 @@ class GroundedConfig:
     # Checked by name only: a budget the model refuses fails in phase 3, after
     # the values call has been paid for, on the first page that needs grounding.
     locations_reasoning_effort: str | None = _LOCATIONS_REASONING_EFFORT
+    # Day/month reading of a year-last numeric date in extracted values. Read
+    # from ``[generation] date_order``, not a ``[grounded]`` key: extraction
+    # types values with the same detector the document render uses, and one
+    # document must not get two readings of the same date.
+    date_order: str = DEFAULT_DATE_ORDER
 
 
 def parse_reasoning_effort(raw: Any, *, source: str) -> str | None:
@@ -404,6 +411,7 @@ def load_grounded_config(
         max_tool_iters=max_tool_iters_raw,
         values_reasoning_effort=values_reasoning_effort,
         locations_reasoning_effort=locations_reasoning_effort,
+        date_order=resolve_date_order(merged),
     )
 
 
@@ -1216,11 +1224,13 @@ def extract_values(
         if existing is not None and has_document_tree(existing):
             # A generated document tree is present — add extraction alongside it.
             mode = "full-extraction"
-            doc = embed_extraction_into(existing, final_values, vocab=vocab)
+            doc = embed_extraction_into(
+                existing, final_values, vocab=vocab, date_order=config.date_order
+            )
         else:
             # No tree (fresh, or a prior extraction-only file) — (re)write standalone.
             mode = "extraction"
-            doc = standalone_extraction_doc(final_values, vocab=vocab)
+            doc = standalone_extraction_doc(final_values, vocab=vocab, date_order=config.date_order)
         workspace.blobs.put_blob(xml_key, doc.encode("utf-8"))
         outcome = OUTCOME_OK
         return ExtractionResult(

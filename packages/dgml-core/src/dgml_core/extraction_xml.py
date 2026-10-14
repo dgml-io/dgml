@@ -50,7 +50,7 @@ from typing import Any
 from lxml import etree  # type: ignore[import-untyped]
 
 from .extraction_schema import Tag, Vocabulary, parse_invariant, resolve_invariant_path
-from .generation.semantic_transform import _detect_value_type
+from .generation.semantic_transform import DEFAULT_DATE_ORDER, _detect_value_type
 from .matching import (
     LeafPath,
     get_at_path,
@@ -98,7 +98,9 @@ def _origin_from_locations(locations: Any) -> str | None:
     return "; ".join(boxes) if boxes else None
 
 
-def _typed_value(text: str, value_type: str) -> tuple[str | None, str | None]:
+def _typed_value(
+    text: str, value_type: str, date_order: str = DEFAULT_DATE_ORDER
+) -> tuple[str | None, str | None]:
     """Normalize *text* to (xsi_type, dg_value) for a schema-declared datatype.
 
     The schema's declared type wins over heuristic detection, so
@@ -113,7 +115,7 @@ def _typed_value(text: str, value_type: str) -> tuple[str | None, str | None]:
         m = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
         return ("decimal", m.group()) if m else (None, None)
     # Dates/booleans/etc.: reuse the detector's normalization, keep declared type.
-    _, dg_value, _ = _detect_value_type(text, extra_formats=False)
+    _, dg_value, _ = _detect_value_type(text, extra_formats=False, date_order=date_order)
     return (value_type, dg_value if dg_value is not None else text.strip())
 
 
@@ -405,6 +407,7 @@ def _set_computed_attrs(
     value_type: str | None,
     ids: dict[LeafPath, str],
     enum_values: list[str] | None = None,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> None:
     """Emit the computed-field attribute set (spec §13): ``dg:origin="computed"``,
     a mandatory ``dg:value`` (the model's canonical ``value``, normalized), and
@@ -429,9 +432,11 @@ def _set_computed_attrs(
         xsi_type = value_type
         dg_value = canonical
         if dg_value is None:
-            xsi_type, dg_value = _typed_value(text_str, value_type)
+            xsi_type, dg_value = _typed_value(text_str, value_type, date_order=date_order)
     else:
-        xsi_type, dg_value, _ = _detect_value_type(canonical or text_str, extra_formats=False)
+        xsi_type, dg_value, _ = _detect_value_type(
+            canonical or text_str, extra_formats=False, date_order=date_order
+        )
         if canonical is not None and dg_value is None:
             dg_value = canonical
     if dg_value is None:
@@ -464,6 +469,7 @@ def _add_field(
     enum_values: list[str] | None = None,
     path: LeafPath = (),
     ids: dict[LeafPath, str] | None = None,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> None:
     ids = ids or {}
     el = etree.SubElement(parent, f"{{{docset_ns}}}{tag_name}")
@@ -473,7 +479,7 @@ def _add_field(
     if text_str:
         el.text = text_str
     if is_computed_leaf(value):
-        _set_computed_attrs(el, value, value_type, ids, enum_values)
+        _set_computed_attrs(el, value, value_type, ids, enum_values, date_order=date_order)
         return
     # Grounded leaf: the model-returned normalized `value` wins when it
     # validates (an enum token from the schema's closed set, or a value the
@@ -496,11 +502,13 @@ def _add_field(
     elif text_str or canonical:
         if value_type is not None:
             if canonical:
-                xsi_type, dg_value = _typed_value(canonical, value_type)
+                xsi_type, dg_value = _typed_value(canonical, value_type, date_order=date_order)
             if dg_value is None and text_str:
-                xsi_type, dg_value = _typed_value(text_str, value_type)
+                xsi_type, dg_value = _typed_value(text_str, value_type, date_order=date_order)
         else:
-            xsi_type, dg_value, _ = _detect_value_type(canonical or text_str, extra_formats=False)
+            xsi_type, dg_value, _ = _detect_value_type(
+                canonical or text_str, extra_formats=False, date_order=date_order
+            )
             if canonical and dg_value is None:
                 dg_value = canonical
     if dg_value is not None:
@@ -520,6 +528,7 @@ def _add_tag(
     *,
     path: LeafPath,
     ids: dict[LeafPath, str],
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> None:
     if value is None:
         return  # field not extracted — omit the element entirely
@@ -534,6 +543,7 @@ def _add_tag(
                 enum_values=tag.enum_values,
                 path=path,
                 ids=ids,
+                date_order=date_order,
             )
         return
     if tag.kind == "container":
@@ -541,7 +551,7 @@ def _add_tag(
             return
         el = etree.SubElement(parent, f"{{{docset_ns}}}{tag.name}")
         _maybe_set_id(el, path, ids)
-        _add_children(el, docset_ns, tag.children, value, path=path, ids=ids)
+        _add_children(el, docset_ns, tag.children, value, path=path, ids=ids, date_order=date_order)
         return
     if tag.kind == "choice":
         # Either the typed scalar (a {text, locations} value) or the group of
@@ -552,9 +562,20 @@ def _add_tag(
         if any(k in value for k in child_names):
             el = etree.SubElement(parent, f"{{{docset_ns}}}{tag.name}")
             _maybe_set_id(el, path, ids)
-            _add_children(el, docset_ns, tag.children, value, path=path, ids=ids)
+            _add_children(
+                el, docset_ns, tag.children, value, path=path, ids=ids, date_order=date_order
+            )
         else:
-            _add_field(parent, docset_ns, tag.name, value, tag.value_type, path=path, ids=ids)
+            _add_field(
+                parent,
+                docset_ns,
+                tag.name,
+                value,
+                tag.value_type,
+                path=path,
+                ids=ids,
+                date_order=date_order,
+            )
         return
     if tag.kind == "collection":
         if not isinstance(value, list):
@@ -581,11 +602,20 @@ def _add_tag(
                     enum_values=item_enum,
                     path=item_path,
                     ids=ids,
+                    date_order=date_order,
                 )
             else:
                 item_el = etree.SubElement(el, f"{{{docset_ns}}}{item_name}")
                 _maybe_set_id(item_el, item_path, ids)
-                _add_children(item_el, docset_ns, tag.children, entry, path=item_path, ids=ids)
+                _add_children(
+                    item_el,
+                    docset_ns,
+                    tag.children,
+                    entry,
+                    path=item_path,
+                    ids=ids,
+                    date_order=date_order,
+                )
         return
 
 
@@ -597,12 +627,19 @@ def _add_children(
     *,
     path: LeafPath = (),
     ids: dict[LeafPath, str] | None = None,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> None:
     ids = ids if ids is not None else {}
     for child in children:
         if child.name in value:
             _add_tag(
-                parent, docset_ns, child, value[child.name], path=path + (child.name,), ids=ids
+                parent,
+                docset_ns,
+                child,
+                value[child.name],
+                path=path + (child.name,),
+                ids=ids,
+                date_order=date_order,
             )
 
 
@@ -612,7 +649,11 @@ def _serialize(root: etree._Element) -> str:
 
 
 def _build_extraction(
-    parent: etree._Element, docset_ns: str, vocab: Vocabulary, values: dict[str, Any]
+    parent: etree._Element,
+    docset_ns: str,
+    vocab: Vocabulary,
+    values: dict[str, Any],
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> etree._Element:
     """Append a ``<dg:extraction>`` element (with the field tree) under *parent*.
 
@@ -620,32 +661,47 @@ def _build_extraction(
     computed leaf derives from; pass 2 emits the tree, stamping those ids on
     the source elements and ``dg:href`` on the computed ones."""
     ext = etree.SubElement(parent, EXTRACTION_TAG)
-    _add_children(ext, docset_ns, vocab.roots, values, ids=_collect_ref_ids(values))
+    _add_children(
+        ext, docset_ns, vocab.roots, values, ids=_collect_ref_ids(values), date_order=date_order
+    )
     return ext
 
 
-def standalone_extraction_doc(values: dict[str, Any], *, vocab: Vocabulary) -> str:
+def standalone_extraction_doc(
+    values: dict[str, Any], *, vocab: Vocabulary, date_order: str = DEFAULT_DATE_ORDER
+) -> str:
     """A minimal core DGML file (spec mode ``extraction``): a root ``dg:chunk``
     holding only the ``dg:extraction`` element. Used when no document tree
-    (``docset generate``) exists yet for the file."""
+    (``docset generate``) exists yet for the file.
+
+    *date_order* is the day/month reading of year-last numeric dates
+    (``[generation] date_order``); pass the value the document render uses so
+    the two outputs type the same date the same way."""
     docset_ns = vocab.namespace_uri
     nsmap = {**_NSMAP_BASE, "docset": docset_ns}
     root = etree.Element(CHUNK_TAG, nsmap=nsmap)
-    _build_extraction(root, docset_ns, vocab, values)
+    _build_extraction(root, docset_ns, vocab, values, date_order=date_order)
     return _serialize(root)
 
 
-def embed_extraction_into(core_xml: str, values: dict[str, Any], *, vocab: Vocabulary) -> str:
+def embed_extraction_into(
+    core_xml: str,
+    values: dict[str, Any],
+    *,
+    vocab: Vocabulary,
+    date_order: str = DEFAULT_DATE_ORDER,
+) -> str:
     """Add (or replace) the ``dg:extraction`` element in an existing core DGML
     file (spec mode ``full-extraction``). The document tree is left untouched;
-    any prior ``dg:extraction`` child of the root is replaced."""
+    any prior ``dg:extraction`` child of the root is replaced. *date_order* as
+    for :func:`standalone_extraction_doc`."""
     root = etree.fromstring(core_xml.encode("utf-8"))
     if root.tag != CHUNK_TAG:
         raise ValueError("core DGML file root is not dg:chunk")
     for child in list(root):
         if child.tag == EXTRACTION_TAG:
             root.remove(child)
-    _build_extraction(root, vocab.namespace_uri, vocab, values)
+    _build_extraction(root, vocab.namespace_uri, vocab, values, date_order=date_order)
     return _serialize(root)
 
 

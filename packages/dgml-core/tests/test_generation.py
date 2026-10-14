@@ -3411,3 +3411,77 @@ def test_loads_tolerant_still_rejects_genuine_garbage() -> None:
 
     with _pytest.raises(json.JSONDecodeError):
         loads_tolerant('{"labels": [{"concept": "Buyer", "quote": "trunc')
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Year-last numeric dates read day-first by default: today's behaviour.
+        ("11/1/2024", "2024-01-11"),
+        ("01/11/2024", "2024-11-01"),
+        ("01.11.2024", "2024-11-01"),
+        ("31/10/2024", "2024-10-31"),
+        # A 31st month cannot be read day-first, so the date is read month-first
+        # instead of yielding no typed value at all (the regression).
+        ("10/31/2024", "2024-10-31"),
+        # Year-first and spelled-out forms are unaffected.
+        ("2024-11-01", "2024-11-01"),
+        ("December 1, 2017", "2017-12-01"),
+        ("21 October 2024", "2024-10-21"),
+    ],
+)
+def test_detect_value_type_year_last_dates_default_day_first(text: str, expected: str) -> None:
+    """Default ``date_order`` ("DMY") never changes a date that parsed before;
+    it only fills in the ones that produced nothing. Regression: a year-last
+    date the day-first order rejects (``10/31/2024``) used to get no ``dg:value``
+    because the fallback order was never tried."""
+    from dgml_core.generation.semantic_transform import _detect_value_type
+
+    xsi_type, value, _fmt = _detect_value_type(text, extra_formats=False)
+    assert (xsi_type, value) == ("date", expected)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("11/1/2024", "2024-11-01"),
+        ("01/11/2024", "2024-01-11"),
+        ("01.11.2024", "2024-01-11"),
+        ("10/31/2024", "2024-10-31"),
+        # Month-first cannot read a 31st month, so day-first is the fallback.
+        ("31/10/2024", "2024-10-31"),
+        ("2024-11-01", "2024-11-01"),
+        ("December 1, 2017", "2017-12-01"),
+    ],
+)
+def test_detect_value_type_year_last_dates_month_first(text: str, expected: str) -> None:
+    """``date_order = "MDY"`` reads a year-last numeric date month-first (a US
+    corpus), with the same cross-order fallback."""
+    from dgml_core.generation.semantic_transform import _detect_value_type
+
+    xsi_type, value, _fmt = _detect_value_type(text, extra_formats=False, date_order="MDY")
+    assert (xsi_type, value) == ("date", expected)
+
+
+def test_detect_value_type_impossible_date_stays_untyped() -> None:
+    """Neither order can read ``13/13/2024``; the fallback must not invent one."""
+    from dgml_core.generation.semantic_transform import DATE_ORDERS, _detect_value_type
+
+    for order in DATE_ORDERS:
+        xsi_type, value, _fmt = _detect_value_type(
+            "13/13/2024", extra_formats=False, date_order=order
+        )
+        assert (xsi_type, value) == (None, None)
+
+
+def test_render_dgml_types_dates_in_the_configured_order() -> None:
+    """The render path carries ``date_order`` down to every typed value."""
+    from dgml_core.generation.to_semantic import render_dgml
+
+    block = _b("field", "b1", label="Effective", value="11/1/2024")
+    apply_labels(
+        [block],
+        {"b1": {"entities": [{"quote": "11/1/2024", "concept": "EffectiveDate"}]}},
+    )
+    assert 'dg:value="2024-01-11"' in render_dgml([block], header="<dg:chunk>")
+    assert 'dg:value="2024-11-01"' in render_dgml([block], header="<dg:chunk>", date_order="MDY")

@@ -452,3 +452,29 @@ def test_thinking_survives_a_model_override(workspace: Workspace) -> None:
     _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "adaptive"})
     cfg, _source = resolve_generation_config(workspace, model=MODEL, label_model=LABEL_MODEL)
     assert cfg.thinking == "adaptive"
+
+
+# ── [generation] date_order ─────────────────────────────────────────────────
+
+
+def test_date_order_defaults_to_day_first(workspace: Workspace) -> None:
+    """The default keeps every date that parsed before parsing the same way."""
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    assert load_generation_config(workspace).date_order == "DMY"
+
+
+def test_date_order_can_be_month_first(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "date_order": "MDY"})
+    assert load_generation_config(workspace).date_order == "MDY"
+
+
+def test_invalid_date_order_is_a_config_error(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "date_order": "auto"})
+    with pytest.raises(GenerationConfigInvalid, match=r"generation\.date_order"):
+        load_generation_config(workspace)
+
+
+def test_date_order_survives_a_model_override(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "date_order": "MDY"})
+    cfg, _source = resolve_generation_config(workspace, model=MODEL, label_model=LABEL_MODEL)
+    assert cfg.date_order == "MDY"

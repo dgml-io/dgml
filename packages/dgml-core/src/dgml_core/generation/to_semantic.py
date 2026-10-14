@@ -44,6 +44,7 @@ from lxml import etree  # type: ignore[import-untyped]
 
 from dgml_core.generation.blocks import Block, Node, Span, build_tree, sanitize_concept
 from dgml_core.generation.semantic_transform import (
+    DEFAULT_DATE_ORDER,
     _detect_value_type,
     docset_slug,
     org_ns_segment,
@@ -226,17 +227,25 @@ def _concept_tag(concept: str, vocab: TagVocab) -> str | None:
     return f"docset:{name}"
 
 
-def _apply_typing(el: ET.Element, text: str, extra_formats: bool) -> None:
+def _apply_typing(
+    el: ET.Element, text: str, extra_formats: bool, date_order: str = DEFAULT_DATE_ORDER
+) -> None:
     # dg:format is not part of the DGML spec (typed values carry only xsi:type +
     # dg:value), so the format hint from _detect_value_type is discarded here.
-    xsi, value, _ = _detect_value_type(text, extra_formats)
+    xsi, value, _ = _detect_value_type(text, extra_formats, date_order)
     if xsi:
         el.set("xsi:type", xsi)
     if value is not None:
         el.set("dg:value", value)
 
 
-def _dgml_lim(parent: ET.Element, block: Block, extra_formats: bool, vocab: TagVocab) -> None:
+def _dgml_lim(
+    parent: ET.Element,
+    block: Block,
+    extra_formats: bool,
+    vocab: TagVocab,
+    date_order: str = DEFAULT_DATE_ORDER,
+) -> None:
     if block.lim:
         # A lim carrying a concept (a date/number used as the list marker) is
         # emitted under its concept tag — dg:structure="lim" keeps the layout
@@ -246,12 +255,17 @@ def _dgml_lim(parent: ET.Element, block: Block, extra_formats: bool, vocab: TagV
         lim.set(_ST, "lim")
         lim.text = block.lim
         if tag != _CP:
-            _apply_typing(lim, block.lim, extra_formats)
+            _apply_typing(lim, block.lim, extra_formats, date_order=date_order)
         lim.tail = " "
 
 
 def _dgml_fill(
-    el: ET.Element, text: str, spans: list[Span], extra_formats: bool, vocab: TagVocab
+    el: ET.Element,
+    text: str,
+    spans: list[Span],
+    extra_formats: bool,
+    vocab: TagVocab,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> None:
     """Text after the lim, entity values wrapped in concept elements + typing."""
     children = list(el)
@@ -274,35 +288,46 @@ def _dgml_fill(
         if tag == _CP:
             inline.set(_ST, "span")
         inline.text = value
-        _apply_typing(inline, value, extra_formats)
+        _apply_typing(inline, value, extra_formats, date_order=date_order)
         state["last"] = inline
         cursor = span.end
     write(text[cursor:])
 
 
 def _dgml_leaf(
-    parent: ET.Element, structure: str, block: Block, extra_formats: bool, vocab: TagVocab
+    parent: ET.Element,
+    structure: str,
+    block: Block,
+    extra_formats: bool,
+    vocab: TagVocab,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> None:
     tag = (_concept_tag(block.concept, vocab) if block.concept else None) or _CP
     el = ET.SubElement(parent, tag)
     el.set(_ST, structure)
-    _dgml_lim(el, block, extra_formats, vocab)
-    _dgml_fill(el, block.text, block.entities, extra_formats, vocab)
+    _dgml_lim(el, block, extra_formats, vocab, date_order=date_order)
+    _dgml_fill(el, block.text, block.entities, extra_formats, vocab, date_order=date_order)
 
 
-def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab: TagVocab) -> None:
+def _render_dgml_node(
+    parent: ET.Element,
+    node: Node,
+    extra_formats: bool,
+    vocab: TagVocab,
+    date_order: str = DEFAULT_DATE_ORDER,
+) -> None:
     block = node.block
     if node.kind == "h":
         assert block is not None
         tag = (_concept_tag(block.value_concept, vocab) if block.value_concept else None) or _CP
         el = ET.SubElement(parent, tag)
         el.set(_ST, "header")
-        _dgml_lim(el, block, extra_formats, vocab)
-        _dgml_fill(el, block.text, block.entities, extra_formats, vocab)
+        _dgml_lim(el, block, extra_formats, vocab, date_order=date_order)
+        _dgml_fill(el, block.text, block.entities, extra_formats, vocab, date_order=date_order)
         return
     if node.kind in ("p", "li"):
         assert block is not None
-        _dgml_leaf(parent, node.kind, block, extra_formats, vocab)
+        _dgml_leaf(parent, node.kind, block, extra_formats, vocab, date_order=date_order)
         return
     if node.kind == "tr":
         assert block is not None
@@ -316,7 +341,7 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab
                 th = ET.SubElement(el, _concept_tag("ColumnHeader", vocab) or _CP)
                 th.set(_ST, "td")
                 th.text = cell
-                _apply_typing(th, cell, extra_formats)
+                _apply_typing(th, cell, extra_formats, date_order=date_order)
             return
         if block.kv_table:
             # A key-value run: every cell renders as a UNIFORM generic dg:chunk td
@@ -341,15 +366,15 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab
                 )
                 concept = cc or whole
                 if ents and not whole:
-                    _dgml_fill(td, cell, ents, extra_formats, vocab)
+                    _dgml_fill(td, cell, ents, extra_formats, vocab, date_order=date_order)
                 elif concept:
                     inner = ET.SubElement(td, _concept_tag(concept, vocab) or _CP)
                     inner.set(_ST, "span")
                     inner.text = cell
-                    _apply_typing(inner, cell, extra_formats)
+                    _apply_typing(inner, cell, extra_formats, date_order=date_order)
                 else:
                     td.text = cell
-                    _apply_typing(td, cell, extra_formats)
+                    _apply_typing(td, cell, extra_formats, date_order=date_order)
             return
         for i, cell in enumerate(block.cells):
             ents = block.cell_entities[i] if i < len(block.cell_entities) else []
@@ -372,7 +397,7 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab
                 td_tag = (_concept_tag(cc, vocab) if cc else None) or _CP
                 td = ET.SubElement(el, td_tag)
                 td.set(_ST, "td")
-                _dgml_fill(td, cell, ents, extra_formats, vocab)
+                _dgml_fill(td, cell, ents, extra_formats, vocab, date_order=date_order)
                 continue
             # Positional column concept wins (cross-row consistent); a whole-cell
             # entity concept is the fallback when no column concept aligned.
@@ -385,18 +410,25 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab
             # breaks the HTML-render contract (a <tr> with non-<td> children).
             td.set(_ST, "td")
             td.text = cell
-            _apply_typing(td, cell, extra_formats)
+            _apply_typing(td, cell, extra_formats, date_order=date_order)
         return
     if node.kind == "fld":
         assert block is not None
         el = ET.SubElement(parent, _CP)
         el.set(_ST, "li")
-        _dgml_lim(el, block, extra_formats, vocab)
+        _dgml_lim(el, block, extra_formats, vocab, date_order=date_order)
         if block.label:
             label = ET.SubElement(el, _CP)
             label.set(_ST, "header")
             if block.label_entities:
-                _dgml_fill(label, block.label, block.label_entities, extra_formats, vocab)
+                _dgml_fill(
+                    label,
+                    block.label,
+                    block.label_entities,
+                    extra_formats,
+                    vocab,
+                    date_order=date_order,
+                )
             else:
                 label.text = block.label
         value = ET.SubElement(el, _CP)
@@ -407,11 +439,13 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab
             # Sub-values packed inside the field's value render as inline
             # concept spans within the (concept-wrapped) value — the same
             # compose pattern as a leaf with inline entities.
-            _dgml_fill(target, block.value, block.entities, extra_formats, vocab)
+            _dgml_fill(
+                target, block.value, block.entities, extra_formats, vocab, date_order=date_order
+            )
         else:
             target.text = block.value
             if value_tag:
-                _apply_typing(target, block.value, extra_formats)
+                _apply_typing(target, block.value, extra_formats, date_order=date_order)
         return
 
     if node.kind == "section":
@@ -446,7 +480,7 @@ def _render_dgml_node(parent: ET.Element, node: Node, extra_formats: bool, vocab
         el = ET.SubElement(parent, _CP)
         el.set(_ST, "section")
     for child in node.children:
-        _render_dgml_node(el, child, extra_formats, vocab)
+        _render_dgml_node(el, child, extra_formats, vocab, date_order=date_order)
 
 
 def render_dgml(
@@ -454,6 +488,7 @@ def render_dgml(
     *,
     header: str,
     extra_formats: bool = True,
+    date_order: str = DEFAULT_DATE_ORDER,
     parent_map: Mapping[str, str] | None = None,
     vocab: TagVocab | None = None,
 ) -> str:
@@ -472,12 +507,15 @@ def render_dgml(
     the guarantee the whole feature exists to provide — and it must be the SAME
     vocabulary labeling used, or a replay would diverge from a fresh run.
     Default (``None``) is the open vocabulary: today's behavior exactly.
+
+    *date_order* is the day/month reading of year-last numeric dates in typed
+    values (``[generation] date_order``; see ``semantic_transform.DATE_ORDERS``).
     """
     vocab = vocab or OPEN_VOCAB
     tree = build_tree(blocks, parent_map)
     root = ET.Element("doc")
     for child in tree.children:
-        _render_dgml_node(root, child, extra_formats, vocab)
+        _render_dgml_node(root, child, extra_formats, vocab, date_order=date_order)
     ET.indent(root)  # safe on mixed content: only blank/None whitespace is set
     if len(root) == 0:
         # No renderable content (e.g. a document that transcribed to zero
