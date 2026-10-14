@@ -46,6 +46,18 @@ from dgml_core.usage import extract_cost_and_tokens
 from litellm.types.llms.openai import HttpxBinaryResponseContent, OpenAIFileObject
 from litellm.types.utils import LiteLLMBatch
 
+
+@pytest.fixture(autouse=True)
+def _no_ambient_openai_key(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a real ``OPENAI_API_KEY`` out of the offline tests.
+
+    The backend falls back to that variable, so with it set the fake litellm
+    records the real key in every call, and a failing assertion prints it in
+    full. Only the opt-in live test (``allow_network``) may see it."""
+    if request.node.get_closest_marker("allow_network") is None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 _PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"
 _TOOLS = [
