@@ -58,14 +58,24 @@ Every XML element becomes a JSON object:
 - `nodeType` — `"xast:element"` for elements, `"xast:text"` for text nodes
 - `@type` — the element tag as a CURIE (e.g. `"docset:LiabilityCap"`, `"dg:chunk"`)
 - `@id` — present only if the element has an `id` or `xml:id` attribute; plain local ids are prefixed with `#`
-- `attributes` — all XML attributes except `id`, `xml:id`, `dg:itemprop`, and `dg:href`; omitted if empty
+- `attributes` — all XML attributes except `id`, `xml:id`, `dg:itemprop`, `dg:href`, and `dg:inputs`; omitted if empty
 - `children` — ordered array of child nodes, always present
 
 If an element carries both `dg:itemprop` and `dg:href`, those become a named link
 property on the element: `{ "<itemprop_value>": {"@id": "<href_value>"} }`.
-If `dg:href` holds more than one space-separated id (an aggregating property
-with multiple targets), the property becomes a list of link objects instead:
+If `dg:href` holds more than one id (an aggregating property with multiple
+targets, separated by semicolons or whitespace), the property becomes a list of
+link objects instead:
 `{ "<itemprop_value>": [{"@id": "<id_1>"}, {"@id": "<id_2>"}, ...] }`.
+
+If an element carries `dg:inputs` (DGML 0.71: the elements its `dg:value`
+used), it becomes a list of ids on the element, in order — a list even for one
+input: `{ "dg:inputs": [{"@id": "#ln1-qty"}, {"@id": "#ln1-price"}] }`.
+`dg:method` (`calculated`, `inferred`, `defaulted`) stays a plain attribute.
+
+A DGML 0.7 element with `dg:origin="computed"` is exported in its 0.71 reading:
+the `"computed"` origin is dropped (it is not a location), and its `dg:href`
+targets become its `dg:inputs` rather than a `computedFrom` link.
 
 The `@context` always includes the `xast:` namespace terms inline — no external fetch required.
 All `xmlns:` declarations on the root element are mapped to `@context` prefix entries.

@@ -794,3 +794,17 @@ def line_groups(words: list[Word]) -> list[list[Word]]:
     if current:
         groups.append(current)
     return groups
+
+
+def line_boxes(words: list[Word]) -> list[list[int]]:
+    """One ``[left, top, right, bottom]`` box per visual line of *words* (see
+    :func:`line_groups`), in reading order: the union of that line's words."""
+    return [
+        [
+            min(w.left for w in line),
+            min(w.top for w in line),
+            max(w.right for w in line),
+            max(w.bottom for w in line),
+        ]
+        for line in line_groups(words)
+    ]

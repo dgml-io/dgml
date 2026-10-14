@@ -61,6 +61,7 @@ from typing import Any
 
 from . import layout, llm
 from .config import load_merged_config
+from .dg_refs import METHOD_DEFAULTED, METHOD_INFERRED, METHODS
 from .docsets import DocSetStore
 from .errors import (
     CONVERT_TO_PDF_OPERATION,
@@ -87,11 +88,13 @@ from .extraction_schema import (
 from .extraction_xml import (
     check_derivations,
     check_invariants,
-    count_dropped_refs,
+    count_dropped_inputs,
     count_unnormalized_enum_values,
+    drop_unboxed_values,
     embed_extraction_into,
     has_document_tree,
     standalone_extraction_doc,
+    verify_input_citations,
 )
 from .files import FileStore
 from .llm import (
@@ -109,10 +112,14 @@ from .llm import (
 from .matching import (
     UnmatchedItem,
     get_at_path,
+    locate_pageless_values,
     parse_path,
     path_to_str,
     run_phase2_matching,
-    walk_computed_leaves,
+    verify_boxes,
+    walk_all_leaves,
+    walk_input_leaves,
+    walk_unprinted_leaves,
 )
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .ocr import _image_dimensions as _png_dimensions
@@ -120,6 +127,8 @@ from .pages import PdfConfig, load_pdf_config, pdf_page_count_bytes, slice_pages
 from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
+from .textmatch import Word as TextWord
+from .textmatch import fuzzy_norm, line_boxes
 from .toon import encode_phase3_words
 from .usage import (
     OPERATION_EXTRACT_VALUES,
@@ -1104,8 +1113,17 @@ class _FileExtraction:
         self.phase3_matched = 0
         self.unmatched_count = 0
         self.total_locations = 0
-        self.computed_fields = 0
-        self.dropped_refs = 0
+        self.unprinted_fields = 0
+        self.partly_printed_fields = 0
+        self.dropped_inputs = 0
+        self.citations_dropped = 0
+        self.unsupported_values = 0
+        self.repaired_inputs = 0
+        self.located_pageless = 0
+        self.dropped_unboxed_values = 0
+        self.dropped_unboxed_paths: list[str] = []
+        self.rejected_boxes = 0
+        self.snapped_boxes = 0
         self.unnormalized_enums = 0
         self.derivations_checked = 0
         self.derivations_mismatched = 0
@@ -1225,22 +1243,53 @@ class _FileExtraction:
         if self.phase1.refusal is not None:
             raise ValuesExtractionFailed(self.phase1.refusal)
         # The merged extracted_value leaf shape lets a sloppy model blur the
-        # grounded/computed boundary; normalize before phases 2/3 (and the
+        # printed/unprinted boundary; normalize before phases 2/3 (and the
         # serializer) so their invariants hold regardless.
-        _normalize_leaf_provenance(phase1_values)
-        # Computed (reasoned) leaves carry no locations — phases 2 and 3
-        # never see them; counted here so the stats file can attest they
-        # were deliberate, not dropped. dropped_refs counts derived_from
-        # entries that won't resolve to a dg:href target — incomplete
-        # provenance that would otherwise vanish silently at serialization.
-        self.computed_fields = sum(1 for _ in walk_computed_leaves(phase1_values))
-        self.dropped_refs = count_dropped_refs(phase1_values)
+        demoted_claims = _normalize_leaf_provenance(phase1_values)
+        # Inputs are positional paths the model counts out in its own output;
+        # each cites the text it read there, so a miscounted index is
+        # re-pointed at the one sibling that matches, or dropped — never left
+        # naming a real but wrong element. Then normalize again: a value that
+        # lost every input can no longer claim to be calculated or inferred.
+        citations = verify_input_citations(phase1_values)
+        self.repaired_inputs = citations.repaired
+        self.citations_dropped = citations.dropped
+        demoted_claims += _normalize_leaf_provenance(phase1_values)
+        # A value read off the page but returned without locations would be
+        # dropped as unverifiable; place it on the first page that prints its
+        # exact text so phase 2 can ground it.
+        self.located_pageless = locate_pageless_values(
+            self.workspace,
+            self.file_id,
+            phase1_values,
+            FileStore(self.workspace).get(self.file_id).page_count,
+        )
+        # Provisional: if a later phase fails, the stats still show the
+        # claims phase 1 made with nothing behind them. Replaced in finish()
+        # by the count of values dropped as unsupported.
+        self.unsupported_values = demoted_claims
+        # Unprinted leaves (calculated, inferred, defaulted) carry no
+        # locations — phases 2 and 3 never see them; counted here so the
+        # stats file can attest they were deliberate, not dropped. Partly
+        # printed leaves are grounded as usual and also name their inputs.
+        # dropped_inputs is inputs that won't resolve to a dg:inputs target —
+        # incomplete provenance that would otherwise vanish silently at
+        # serialization. Counted for paths now, so a later phase failing
+        # still leaves it in the stats, and again after grounding to add the
+        # evidence that never got a box.
+        self.dropped_inputs = self.citations_dropped + count_dropped_inputs(
+            phase1_values, evidence=False
+        )
+        self.unprinted_fields = sum(1 for _ in walk_unprinted_leaves(phase1_values))
+        self.partly_printed_fields = sum(
+            1 for _, leaf in walk_input_leaves(phase1_values) if "locations" in leaf
+        )
         # Enum leaves whose normalized value isn't one of the schema's tokens
         # serialize text-only; count them so misses are visible in stats.
         self.unnormalized_enums = count_unnormalized_enum_values(phase1_values, self.vocab)
         # Recompute checkable derivations (report-only): a mismatch means a
-        # computed leaf's value agrees with neither the sum, the count, nor
-        # any single one of its derived_from inputs.
+        # calculated leaf's value agrees with neither the sum, the count, nor
+        # any single one of its inputs.
         self.derivations_checked, self.derivations_mismatched = check_derivations(phase1_values)
         # Schema-declared `## Invariant:` relations (count/sum across the
         # submission). Report-only, like the derivation recompute above.
@@ -1312,6 +1361,30 @@ class _FileExtraction:
             ) = _fold_phase3(final_values, per_page, self.phase3_totals)
         self.unmatched_count = self._phase2_unmatched_locations - self.phase3_matched
         self.phase3_duration = round(time.monotonic() - self.phase3_started, 3)
+        # Phase 3's boxes are drawn by a model; where the page has a text
+        # layer, a box whose words don't read as its value is wrong: it is
+        # moved to the nearest exact match, or stripped before the drop below.
+        self.snapped_boxes, self.rejected_boxes = verify_boxes(
+            self.workspace, self.file_id, final_values
+        )
+        # A printed value grounding couldn't box can't be tied to the page,
+        # and a value with no box, no default and nothing it used can't be
+        # verified: drop them rather than write them with no provenance.
+        unboxed = drop_unboxed_values(final_values)
+        self.dropped_unboxed_values = unboxed.values
+        self.dropped_unboxed_paths = unboxed.paths
+        # After grounding, so evidence that never got a box (and so emits no
+        # dg:chunk) counts as dropped too.
+        self.dropped_inputs = (
+            self.citations_dropped + unboxed.inputs + count_dropped_inputs(final_values)
+        )
+        self.unsupported_values = unboxed.unsupported
+        # Count what is written, not what phase 1 returned: the drop above can
+        # remove unprinted values (unsupported) and partly printed ones (unboxed).
+        self.unprinted_fields = sum(1 for _ in walk_unprinted_leaves(final_values))
+        self.partly_printed_fields = sum(
+            1 for _, leaf in walk_input_leaves(final_values) if "locations" in leaf
+        )
 
         # Extracted values live as a dg:extraction element in the file's core
         # <stem>.dgml.xml (spec §13): added as a sibling of an existing document
@@ -1420,8 +1493,16 @@ class _FileExtraction:
                     phase3_matched=self.phase3_matched,
                     unmatched=self.unmatched_count,
                     total_locations=self.total_locations,
-                    computed_fields=self.computed_fields,
-                    dropped_refs=self.dropped_refs,
+                    unprinted_fields=self.unprinted_fields,
+                    partly_printed_fields=self.partly_printed_fields,
+                    dropped_inputs=self.dropped_inputs,
+                    unsupported_values=self.unsupported_values,
+                    repaired_inputs=self.repaired_inputs,
+                    located_pageless=self.located_pageless,
+                    dropped_unboxed_values=self.dropped_unboxed_values,
+                    dropped_unboxed_paths=self.dropped_unboxed_paths,
+                    rejected_boxes=self.rejected_boxes,
+                    snapped_boxes=self.snapped_boxes,
                     unnormalized_enums=self.unnormalized_enums,
                     derivations_checked=self.derivations_checked,
                     derivations_mismatched=self.derivations_mismatched,
@@ -1521,8 +1602,16 @@ def _write_extraction_stats(
     phase3_matched: int,
     unmatched: int,
     total_locations: int,
-    computed_fields: int,
-    dropped_refs: int,
+    unprinted_fields: int,
+    partly_printed_fields: int,
+    dropped_inputs: int,
+    unsupported_values: int,
+    repaired_inputs: int,
+    located_pageless: int,
+    dropped_unboxed_values: int,
+    dropped_unboxed_paths: list[str],
+    rejected_boxes: int,
+    snapped_boxes: int,
     unnormalized_enums: int,
     derivations_checked: int,
     derivations_mismatched: int,
@@ -1591,8 +1680,29 @@ def _write_extraction_stats(
             "matched_phase2": phase2_matched,
             "matched_phase3": phase3_matched,
             "unmatched": unmatched,
-            "computed_fields": computed_fields,
-            "dropped_refs": dropped_refs,
+            "unprinted_fields": unprinted_fields,
+            "partly_printed_fields": partly_printed_fields,
+            "dropped_inputs": dropped_inputs,
+            # Values claimed as calculated/inferred that named nothing they
+            # used (or whose inputs all dropped): written with no dg:method,
+            # so the XML can't tell them from a value grounding missed.
+            "unsupported_values": unsupported_values,
+            # Inputs whose cited text matched a different entry of the same
+            # array than the index the model gave: re-pointed there.
+            "repaired_inputs": repaired_inputs,
+            # Values phase 1 returned without locations, placed on the first
+            # page printing their exact text.
+            "located_pageless": located_pageless,
+            # Printed values phases 2/3 found no box for: not written.
+            "dropped_unboxed_values": dropped_unboxed_values,
+            # Which ones ("path=text"), so a drop is diagnosable without
+            # re-running the extraction.
+            "dropped_unboxed": dropped_unboxed_paths,
+            # Boxes whose words on the text layer don't read as their value:
+            # moved to the one exact match on their line (snapped), or, with
+            # no single match there, stripped (rejected).
+            "rejected_boxes": rejected_boxes,
+            "snapped_boxes": snapped_boxes,
             "unnormalized_enum_values": unnormalized_enums,
             "derivations_checked": derivations_checked,
             "derivations_mismatched": derivations_mismatched,
@@ -1848,6 +1958,7 @@ def phase3_page_steps(
     # 0-1000 frame, so the boxes land in the page's top-left corner. Ask for
     # that frame outright and scale it to pixels here.
     normalized = image_size is not None and not page_words.get("words")
+    by_words = bool(page_words.get("words"))
     user_text = _phase3_user_prompt(
         page_number=page_number,
         items=items,
@@ -1856,9 +1967,13 @@ def phase3_page_steps(
         image_size=image_size,
         grid=normalized,
     )
-    system_key = (
-        PromptKey.VALUES_PHASE3_SYSTEM_NO_WORDS if normalized else PromptKey.VALUES_PHASE3_SYSTEM
-    )
+    if normalized:
+        system_key = PromptKey.VALUES_PHASE3_SYSTEM_NO_WORDS
+    elif by_words:
+        system_key = PromptKey.VALUES_PHASE3_SYSTEM
+    else:
+        # No words and no known image size: only the pixel contract is left.
+        system_key = PromptKey.VALUES_PHASE3_SYSTEM_PIXELS
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": prompt(system_key)},
         {
@@ -1869,7 +1984,7 @@ def phase3_page_steps(
             ],
         },
     ]
-    tools = [_submit_locations_tool([it.id for it in items])]
+    tools = [_submit_locations_tool([it.id for it in items], by_words=by_words)]
 
     # A page with OCR words takes the configured locations effort
     # (``grounded.locations_reasoning_effort``, ``None`` = send none); the
@@ -1912,12 +2027,109 @@ def phase3_page_steps(
                 f"phase 3 page {page_number}: malformed JSON args: {exc}"
             ) from exc
         locations, dropped = _parse_submit_locations(
-            args, page_number, image_size=image_size, normalized=normalized
+            args,
+            page_number,
+            image_size=image_size,
+            normalized=normalized,
+            words_by_idx=(
+                {w["idx"]: w for w in page_words["words"] if isinstance(w.get("idx"), int)}
+                if by_words
+                else None
+            ),
         )
         return _Phase3PageResult(locations=locations, grid=normalized, boxes_dropped=dropped)
 
     raise ValuesExtractionFailed(
         f"phase 3 page {page_number} exceeded max_tool_iters={max_tool_iters}"
+    )
+
+
+def _submit_word_ranges_tool(ids: list[str]) -> dict[str, Any]:
+    """The ``by_words`` form of :func:`_submit_locations_tool`. Copying four
+    pixel coordinates per box out of a page-long word table is where models
+    slip — mixing one row's x with another's y, miscopying an edge — so the
+    model names words by their ``idx`` and :func:`_boxes_from_word_ranges`
+    does the geometry."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _TOOL_SUBMIT_LOCATIONS,
+            "description": (
+                "Submit the OCR words of each requested id's value, as word index "
+                "ranges. Each id corresponds to a value already extracted from the "
+                "document; you are only locating it, not changing text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "locations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "id": {"type": "string", "enum": ids},
+                                "words": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        # [first_idx, last_idx], inclusive: the
+                                        # value's words on one visual line.
+                                        "type": "array",
+                                        "items": {"type": "integer", "minimum": 0},
+                                        "minItems": 2,
+                                        "maxItems": 2,
+                                    },
+                                },
+                            },
+                            "required": ["id", "words"],
+                        },
+                    }
+                },
+                "required": ["locations"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _boxes_from_word_ranges(
+    ranges: Any, words_by_idx: dict[int, dict[str, Any]]
+) -> list[list[int]] | None:
+    """One ``[left, top, right, bottom]`` box per visual line covering the
+    words named by *ranges* (``[first_idx, last_idx]`` pairs, inclusive), or
+    ``None`` when a range is malformed or names a word the page doesn't have
+    — the value then stays unresolved rather than half-located."""
+    if not isinstance(ranges, list) or not ranges:
+        return None
+    picked: dict[int, dict[str, Any]] = {}
+    for pair in ranges:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(i, int) for i in pair)
+            or pair[0] > pair[1]
+        ):
+            return None
+        for idx in range(pair[0], pair[1] + 1):
+            word = words_by_idx.get(idx)
+            if word is None:
+                return None
+            picked[idx] = word
+    return line_boxes(
+        [
+            TextWord(
+                idx=idx,
+                text=str(w.get("text", "")),
+                text_norm=fuzzy_norm(str(w.get("text", ""))),
+                left=int(w["location"]["bounding_box"][0]),
+                top=int(w["location"]["bounding_box"][1]),
+                right=int(w["location"]["bounding_box"][2]),
+                bottom=int(w["location"]["bounding_box"][3]),
+            )
+            for idx, w in picked.items()
+        ]
     )
 
 
@@ -1927,6 +2139,7 @@ def _parse_submit_locations(
     *,
     image_size: tuple[int, int] | None = None,
     normalized: bool = False,
+    words_by_idx: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], int]:
     """Parse a ``submit_locations`` tool-args payload into
     ``({id → locations}, boxes_dropped)``. Malformed entries are dropped
@@ -1936,7 +2149,12 @@ def _parse_submit_locations(
     scaled to ``image_size`` pixels. A box that is empty or inverted, or (with
     ``image_size`` known) leaves the page, is dropped rather than stored and
     counted in ``boxes_dropped``: the value then stays unresolved instead of
-    pointing at the wrong spot."""
+    pointing at the wrong spot.
+
+    With ``words_by_idx`` (a page with OCR words) an entry's ``words`` ranges
+    are turned into boxes by :func:`_boxes_from_word_ranges`; a malformed or
+    unknown range counts as one dropped box. An entry that answers with
+    ``bounding_boxes`` anyway is still read as pixels."""
     raw = args.get("locations")
     out: dict[str, list[dict[str, Any]]] = {}
     dropped = 0
@@ -1946,8 +2164,17 @@ def _parse_submit_locations(
         if not isinstance(entry, dict):
             continue
         item_id = entry.get("id")
+        if not isinstance(item_id, str):
+            continue
+        if words_by_idx is not None and "words" in entry:
+            boxes = _boxes_from_word_ranges(entry.get("words"), words_by_idx)
+            if boxes is None:
+                dropped += 1
+            else:
+                out[item_id] = [{"page_number": page_number, "bounding_box": b} for b in boxes]
+            continue
         bboxes = entry.get("bounding_boxes")
-        if not isinstance(item_id, str) or not isinstance(bboxes, list):
+        if not isinstance(bboxes, list):
             continue
         locs: list[dict[str, Any]] = []
         for bbox in bboxes:
@@ -2125,7 +2352,12 @@ def _phase3_user_prompt(
         if image_size is not None
         else ""
     )
-    return prompt(PromptKey.VALUES_PHASE3_USER).format(
+    user_key = (
+        PromptKey.VALUES_PHASE3_USER
+        if page_words.get("words")
+        else PromptKey.VALUES_PHASE3_USER_PIXELS
+    )
+    return prompt(user_key).format(
         page_number=page_number,
         image_size=size_line,
         ocr_words=encode_phase3_words(page_words.get("words", [])),
@@ -2134,10 +2366,16 @@ def _phase3_user_prompt(
     )
 
 
-def _submit_locations_tool(ids: list[str]) -> dict[str, Any]:
+def _submit_locations_tool(ids: list[str], *, by_words: bool = False) -> dict[str, Any]:
     """Tool spec for phase 3's submit. ``id`` is constrained to the set
     of ids we're asking about so the model can't invent extras and we
-    don't need to filter on the way back."""
+    don't need to filter on the way back.
+
+    With ``by_words`` (a page with OCR words) each id is answered with word
+    index ranges, one per visual line, and code builds the boxes from those
+    words; otherwise with boxes (the 0-1000 grid on a page without words)."""
+    if by_words:
+        return _submit_word_ranges_tool(ids)
     return {
         "type": "function",
         "function": {
@@ -2164,7 +2402,7 @@ def _submit_locations_tool(ids: list[str]) -> dict[str, Any]:
                                     "items": {
                                         # [left, top, right, bottom]: image pixels,
                                         # or the 0-1000 grid on a page without
-                                        # OCR words (see _phase3_call_for_page).
+                                        # OCR words (see phase3_page_steps).
                                         "type": "array",
                                         "items": {
                                             "type": "integer",
@@ -2355,16 +2593,29 @@ def _merge_parts(parts: list[tuple[_PdfPart, _Phase1Run]]) -> _Phase1Run:
 
 def _offset_page_numbers(values: Any, offset: int) -> None:
     """Shift every location's ``page_number`` by *offset*, in place: a part's
-    values number its own PDF's pages from 1."""
+    values number its own PDF's pages from 1. A leaf's ``evidence`` items
+    (a flat ``page_number``, or ``locations``) shift with it."""
     if not offset:
         return
+
+    def shift(holder: Any) -> None:
+        if not isinstance(holder, dict):
+            return
+        page = holder.get("page_number")
+        if isinstance(page, int) and not isinstance(page, bool):
+            holder["page_number"] = page + offset
+
     if isinstance(values, dict):
-        locations = values.get("locations")
-        if "text" in values and isinstance(locations, list):
-            for loc in locations:
-                page = loc.get("page_number") if isinstance(loc, dict) else None
-                if isinstance(page, int) and not isinstance(page, bool):
-                    loc["page_number"] = page + offset
+        if "text" in values:
+            locations = values.get("locations")
+            for loc in locations if isinstance(locations, list) else []:
+                shift(loc)
+            evidence = values.get("evidence")
+            for item in evidence if isinstance(evidence, list) else []:
+                shift(item)
+                item_locations = item.get("locations") if isinstance(item, dict) else None
+                for loc in item_locations if isinstance(item_locations, list) else []:
+                    shift(loc)
             return
         for value in values.values():
             _offset_page_numbers(value, offset)
@@ -2395,8 +2646,16 @@ def _is_empty_leaf(value: Any) -> bool:
     return False
 
 
+def _rebase_input(raw: str, base: dict[str, Any]) -> str:
+    """:func:`_rebase_ref` for an ``inputs`` entry, which may carry the text
+    it cites after ``=`` (``"LineItems[0].Amount=$12.75"``)."""
+    path_text, sep, cited = raw.partition("=")
+    rebased = _rebase_ref(path_text.strip(), base)
+    return f"{rebased}{sep}{cited}" if sep else rebased
+
+
 def _rebase_ref(ref: str, base: dict[str, Any]) -> str:
-    """Rewrite a later part's ``derived_from`` path for the merged tree: an
+    """Rewrite a later part's input path for the merged tree: an
     index into an array the merge appends to *base*'s copy of it moves past
     *base*'s entries."""
     path = parse_path(ref)
@@ -2434,12 +2693,14 @@ def _merge_part_values(base: dict[str, Any], extra: dict[str, Any]) -> dict[str,
     """Merge one part's values into those of the parts before it, in place on
     *base*: arrays concatenate (each part submits only its own pages' entries,
     in document order), objects merge recursively, and a leaf keeps the
-    earliest part's value unless that one is empty. *extra*'s ``derived_from``
-    paths are first rebased onto the concatenated arrays. Returns *base*."""
-    for _path, leaf in walk_computed_leaves(extra):
-        refs = leaf.get("derived_from")
-        if isinstance(refs, list):
-            leaf["derived_from"] = [_rebase_ref(r, base) if isinstance(r, str) else r for r in refs]
+    earliest part's value unless that one is empty. *extra*'s ``inputs`` paths
+    (and 0.7 ``derived_from``) are first rebased onto the concatenated arrays,
+    keeping any ``=cited text``. Returns *base*."""
+    for _path, leaf in walk_all_leaves(extra):
+        for key in ("inputs", "derived_from"):
+            refs = leaf.get(key)
+            if isinstance(refs, list):
+                leaf[key] = [_rebase_input(r, base) if isinstance(r, str) else r for r in refs]
     _merge_tree(base, extra)
     return base
 
@@ -3195,62 +3456,124 @@ def _describe_text_reply(result: CallResult) -> str:
     return shown + _no_text_detail(result.response)
 
 
-def _normalize_leaf_provenance(values: Any) -> None:
-    """Enforce the grounded-XOR-computed invariant on phase-1 leaves, in place.
+def _normalized_evidence(raw: Any) -> list[dict[str, Any]]:
+    """The usable ``evidence`` items of a phase-1 leaf, as ``{text,
+    locations}``: non-empty verbatim ``text`` and a page to ground it on —
+    the tool's flat ``page_number``, or a ``locations`` list. Anything else
+    can't be grounded, so it can't become a ``dg:chunk`` a verifier could
+    crop."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        locations = item.get("locations")
+        pages = (
+            [
+                loc
+                for loc in locations
+                if isinstance(loc, dict) and isinstance(loc.get("page_number"), int)
+            ]
+            if isinstance(locations, list)
+            else []
+        )
+        if not pages and isinstance(item.get("page_number"), int):
+            # An empty or unusable ``locations`` must not hide the flat page.
+            pages = [{"page_number": item["page_number"]}]
+        if pages:
+            out.append({"text": text, "locations": pages})
+    return out
 
-    The merged ``extracted_value`` leaf shape lets a sloppy model return both
-    ``locations`` and ``computed``/``derived_from`` on one leaf, an empty
-    ``locations`` array on a computed value, or an empty-string ``value``.
-    Phases 2/3 and the XML serializer rely on the invariants the old split
-    shapes guaranteed — a grounded leaf has ``locations`` and no computed
-    keys; a computed leaf has ``computed``/``derived_from`` (a list) and no
-    ``locations`` key — so this pass restores them:
 
-    * a leaf with at least one usable location is grounded → computed keys
-      are dropped;
-    * a leaf with computed markers and no usable location is computed →
-      ``computed`` is forced true, ``derived_from`` to a list of strings,
-      and ``locations`` removed;
-    * an unusable ``locations`` array (empty, or no valid page_number) on a
-      plain leaf is removed;
+def _normalize_leaf_provenance(values: Any) -> int:
+    """Enforce the DGML 0.71 provenance invariants on phase-1 leaves, in place.
+
+    Returns the number of unsupported claims it demoted: values the model
+    marked as calculated or inferred (or 0.7 ``computed``) without naming
+    anything they used.
+
+    The merged ``extracted_value`` leaf shape lets a sloppy model return
+    combinations the format can't express. Phases 2/3 and the XML serializer
+    rely on these invariants, so this pass restores them:
+
+    * the 0.7 keys are read as their 0.71 form — ``derived_from`` becomes
+      ``inputs`` and ``computed`` is dropped;
+    * ``inputs`` is a non-empty list of strings, or absent;
+    * ``evidence`` (printed text the value used that the schema doesn't
+      extract) is a non-empty list of ``{text, locations}`` items, each with
+      a page to ground on, or absent;
+    * ``method`` is one of ``calculated``/``inferred``/``defaulted``, or absent;
+    * a leaf with at least one usable location is printed (in full, or in part
+      when it also has ``inputs``) and never carries a ``method``;
+    * a leaf with no usable location loses its ``locations`` key. A
+      ``defaulted`` one loses its ``inputs`` and ``evidence``; one with
+      either and no method is ``inferred`` (the safe reading);
+      ``calculated``/``inferred`` with neither lose the method, leaving an
+      unsupported value (counted in the return value), which is not written;
     * an empty-string ``value`` is removed.
     """
     if isinstance(values, list):
-        for entry in values:
-            _normalize_leaf_provenance(entry)
-        return
+        return sum(_normalize_leaf_provenance(entry) for entry in values)
     if not isinstance(values, dict):
-        return
+        return 0
     if isinstance(values.get("text"), str):
         # A leaf (only leaves carry a lowercase "text" key — tag names are
         # PascalCase). Normalize in place; never descend further.
         if values.get("value") == "":
             del values["value"]
+        legacy_refs = values.pop("derived_from", None)
+        claimed = bool(values.pop("computed", None))
+        # An empty/null ``inputs`` must not hide 0.7 ``derived_from`` paths.
+        refs = values.get("inputs") or legacy_refs
+        if isinstance(refs, str):
+            # A lone path the model didn't wrap in a list.
+            refs = [refs]
+        inputs = (
+            [r for r in refs if isinstance(r, str) and r.strip()] if isinstance(refs, list) else []
+        )
+        if inputs:
+            values["inputs"] = inputs
+        else:
+            values.pop("inputs", None)
+        evidence = _normalized_evidence(values.get("evidence"))
+        if evidence:
+            values["evidence"] = evidence
+        else:
+            values.pop("evidence", None)
+        if values.get("method") not in METHODS:
+            values.pop("method", None)
         locations = values.get("locations")
         grounded = isinstance(locations, list) and any(
             isinstance(loc, dict) and isinstance(loc.get("page_number"), int) for loc in locations
         )
         if grounded:
-            values.pop("computed", None)
-            values.pop("derived_from", None)
-        elif "computed" in values or "derived_from" in values:
-            values["computed"] = True
-            refs = values.get("derived_from")
-            values["derived_from"] = (
-                [r for r in refs if isinstance(r, str)] if isinstance(refs, list) else []
-            )
-            values.pop("locations", None)
-        else:
-            values.pop("locations", None)
-        return
-    for child in values.values():
-        _normalize_leaf_provenance(child)
+            values.pop("method", None)
+            return 0
+        values.pop("locations", None)
+        method = values.get("method")
+        used = bool(inputs or evidence)
+        if method == METHOD_DEFAULTED:
+            values.pop("inputs", None)
+            values.pop("evidence", None)
+            return 0
+        if used and method is None:
+            values["method"] = METHOD_INFERRED
+        elif not used and method is not None:
+            del values["method"]
+            return 1
+        return 1 if claimed and not used else 0
+    return sum(_normalize_leaf_provenance(child) for child in values.values())
 
 
 def _drop_bboxes_from_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of the schema with ``bounding_box`` stripped from the
     leaf definition's ``locations[]`` (``extracted_value``, plus the legacy
-    ``grounded_field`` for older exported schemas).
+    ``grounded_field`` for older exported schemas). ``evidence`` items carry
+    a bare ``page_number`` already.
 
     Phase-1 extraction shows the model this slimmer shape so it focuses
     on getting the text and page numbers right without the bbox burden.
@@ -3264,15 +3587,21 @@ def _drop_bboxes_from_schema(schema: dict[str, Any]) -> dict[str, Any]:
         leaf_def = defs.get(def_name)
         if not isinstance(leaf_def, dict):
             continue
-        locs = leaf_def.get("properties", {}).get("locations", {})
-        items = locs.get("items", {})
-        props = items.get("properties")
-        if isinstance(props, dict) and "bounding_box" in props:
-            del props["bounding_box"]
-        required = items.get("required")
-        if isinstance(required, list):
-            items["required"] = [r for r in required if r != "bounding_box"]
+        _drop_bbox_from_locations(leaf_def.get("properties", {}).get("locations"))
     return out
+
+
+def _drop_bbox_from_locations(locs: Any) -> None:
+    """Strip ``bounding_box`` from a ``locations`` array schema, in place."""
+    if not isinstance(locs, dict):
+        return
+    items = locs.get("items", {})
+    props = items.get("properties")
+    if isinstance(props, dict) and "bounding_box" in props:
+        del props["bounding_box"]
+    required = items.get("required")
+    if isinstance(required, list):
+        items["required"] = [r for r in required if r != "bounding_box"]
 
 
 def _values_phase1_user_prompt(schema: dict[str, Any], guidance: str | None = None) -> str:

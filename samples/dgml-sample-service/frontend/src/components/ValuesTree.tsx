@@ -70,7 +70,11 @@ function ValueRow({
         <span className="value-text">{node.text || <em className="muted">empty</em>}</span>
         {typed && <span className="value-typed mono">= {typed}</span>}
         <span className="value-meta muted small">
-          {node.computed ? "computed" : pages.length ? `p. ${pages.join(", ")}` : "no location"}
+          {node.method
+            ? node.method
+            : pages.length
+              ? `p. ${pages.join(", ")}${node.inputs?.length ? " + inputs" : ""}`
+              : "no location"}
         </span>
       </button>
     );

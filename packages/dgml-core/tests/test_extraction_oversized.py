@@ -373,3 +373,43 @@ def test_merge_part_values_concatenates_and_rebases_refs() -> None:
     assert bill["Vendor"]["text"] == "Acme"  # first non-empty wins
     assert bill["Note"]["text"] == "late"  # an empty earlier value does not
     assert bill["Count"]["derived_from"] == ["Bill.Items[2].Name"]
+
+
+def test_merge_part_values_rebases_cited_inputs() -> None:
+    """A later part's 0.71 inputs are rebased like 0.7 refs, and the text each
+    one cites after "=" survives the rewrite."""
+    from dgml_core.grounded import _merge_part_values
+
+    base: dict[str, Any] = {"Bill": {"Items": [{"Amount": {"text": "1.00"}}]}}
+    extra: dict[str, Any] = {
+        "Bill": {
+            "Items": [{"Amount": {"text": "2.00"}}],
+            "Total": {
+                "text": "3.00",
+                "method": "calculated",
+                "inputs": ["Bill.Items[0].Amount=2.00", "Bill.Vendor"],
+            },
+        }
+    }
+    _merge_part_values(base, extra)
+    assert base["Bill"]["Total"]["inputs"] == ["Bill.Items[1].Amount=2.00", "Bill.Vendor"]
+
+
+def test_offset_page_numbers_shifts_evidence_with_its_value() -> None:
+    from dgml_core.grounded import _offset_page_numbers
+
+    values: dict[str, Any] = {
+        "End": {
+            "text": "2028-01-14",
+            "method": "calculated",
+            "evidence": [
+                {"text": "a term of 24 months", "page_number": 2},
+                {"text": "January 15, 2026", "locations": [{"page_number": 1}]},
+            ],
+        },
+        "Name": {"text": "Acme", "locations": [{"page_number": 1}]},
+    }
+    _offset_page_numbers(values, 10)
+    assert values["End"]["evidence"][0]["page_number"] == 12
+    assert values["End"]["evidence"][1]["locations"] == [{"page_number": 11}]
+    assert values["Name"]["locations"] == [{"page_number": 11}]

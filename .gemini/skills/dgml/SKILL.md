@@ -693,16 +693,30 @@ grounded value carries a `dg:origin` box back to `page_images/page_N.png`.
 
 A schema field's `## Prompt:` may describe a **derivation rule** instead of a
 place on the page ("Compute as sum of Quantity × UnitPrice for each LineItem").
-Such fields come back *computed* (spec §13): in values JSON as
-`{text, value, computed: true, derived_from: [dotted paths]}` with no
-`locations`; in the XML as `dg:origin="computed"` + `dg:value` +
-`dg:itemprop="computedFrom"`/`dg:href` pointing at the source elements (which
-get `xml:id`s). When writing a derivation `## Prompt:`, make every input it
-mentions an extracted field of its own — `dg:href` can only point at extracted
-elements, so an un-extracted input leaves the computed value unverifiable
-(unresolvable refs are counted as `matching.dropped_refs` in
-`extraction_stats.json`, and `dgml check` flags source-less computed fields
-as `computed_field_unattributed`). Errors are the
+Provenance follows DGML 0.71. In values JSON a leaf carries `locations` (where
+its own text is printed), `inputs` (dotted paths of the values it used), and,
+when the page doesn't print it, `method`: `calculated`, `inferred`, or
+`defaulted` (no inputs). The XML carries the same as `dg:origin` (boxes only),
+`dg:inputs` (`#id; #id`, with the targets given `xml:id`s) and `dg:method`. A
+value printed only in part, like a "3/1" period start whose year comes from
+the commencement date, keeps its boxes **and** names its `inputs`. A box whose
+words on the page's text layer don't read as its value moves to the nearest exact
+match on its line (`matching.snapped_boxes`) or is stripped
+(`matching.rejected_boxes`), and a printed value left with no box is dropped
+rather than written without `dg:origin` (`matching.dropped_unboxed_values`). Printed
+text a value used that no schema field extracts comes back as `evidence`
+(`[{text, locations}]`) and is written as an anonymous `dg:chunk` next to the
+field. When writing a derivation `## Prompt:`, prefer making every input it
+mentions an extracted field of its own. The model cites the text it read with
+each input, and extraction re-points a miscounted array index at the matching
+entry (`matching.repaired_inputs`). Unresolvable or unmatched inputs, and
+evidence that couldn't be boxed, are counted as `matching.dropped_inputs` in
+`extraction_stats.json`. Values with nothing to verify them by (no box, no
+default, nothing they used) are not written, counted as
+`matching.unsupported_values`. `dgml check` reports `method_misplaced`,
+`inputs_dangling` and `inputs_cycle`, and `value_unsupported` for a 0.7
+computed element with no `dg:href`. 0.7 files (`dg:origin="computed"` +
+`dg:href`) still read, with the href targets as inputs. Errors are the
 usual envelope: `SCHEMA_NOT_FOUND` (no schema set), `GUIDANCE_NOT_FOUND`
 (no guidance set), `NO_FILES` (empty docset, no `--from-file`),
 `VALUES_NOT_FOUND` (extract not run yet), `GROUNDED_CONFIG_MISSING` (no

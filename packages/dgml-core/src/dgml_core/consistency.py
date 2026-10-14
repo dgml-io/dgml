@@ -751,39 +751,53 @@ def _check_dgml_xml(ws: Workspace, *, docset_id: str, file_id: str, report: Chec
         except Exception:
             continue
         name = key.rsplit("/", 1)[-1]
-        _check_computed_attribution(
-            xml, docset_id=docset_id, file_id=file_id, name=name, report=report
+        _check_provenance(
+            xml,
+            docset_id=docset_id,
+            file_id=file_id,
+            name=name,
+            report=report,
         )
         _check_semantic_links(xml, docset_id=docset_id, file_id=file_id, name=name, report=report)
 
 
-def _check_computed_attribution(
+def _check_provenance(
     xml: bytes, *, docset_id: str, file_id: str, name: str, report: CheckReport
 ) -> None:
-    """Flag ``dg:origin="computed"`` elements with no ``dg:href``.
-
-    A computed field's value is verifiable only by walking its ``dg:href``
-    sources and recomputing the derivation (spec §13); one with no sources is
-    an unauditable claim — usually the model derived it from document content
-    the schema never extracted."""
-    from .extraction_xml import unattributed_computed_fields
+    """Flag provenance a verifier can't follow (DGML 0.71): ``dg:method``
+    that contradicts the element, ``dg:inputs`` that dangle or loop, and 0.7
+    computed elements that name no sources. A bare value (no boxes, inputs
+    or method) is not flagged here — in the XML it looks the same as one
+    grounding couldn't box; extraction counts the unsupported ones in
+    ``extraction_stats.json``. See
+    :func:`dgml_core.extraction_xml.provenance_issues`."""
+    from .extraction_xml import provenance_issues
 
     try:
-        tags = unattributed_computed_fields(xml)
+        found = provenance_issues(xml)
     except Exception:
         return
-    if tags:
+    by_kind: dict[str, list[str]] = {}
+    for kind, tag, detail in found:
+        by_kind.setdefault(kind, []).append(f"{tag} ({detail})")
+    for kind, entries in sorted(by_kind.items()):
         report.issues.append(
             Issue(
-                kind="computed_field_unattributed",
+                kind=kind,
                 target_type="docset",
                 target_id=docset_id,
-                message=(
-                    f"file '{file_id}' {name}: computed element(s) with no "
-                    f"dg:href sources: {', '.join(sorted(set(tags)))}"
-                ),
+                message=f"file '{file_id}' {name}: {_PROVENANCE_MESSAGES[kind]}: "
+                + ", ".join(sorted(set(entries))),
             )
         )
+
+
+_PROVENANCE_MESSAGES = {
+    "value_unsupported": 'value(s) with dg:origin="computed" that name no sources',
+    "method_misplaced": "dg:method that contradicts the element's other attributes",
+    "inputs_dangling": "dg:inputs target(s) with no element",
+    "inputs_cycle": "element(s) that are their own input",
+}
 
 
 def _check_semantic_links(

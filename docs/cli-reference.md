@@ -444,7 +444,10 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `text_extraction_failed` | file | pdfminer.six failed to extract any words (records a permanent error so future checks skip retry) |
 | `text_extraction_failed_permanent` | file | A previous extraction recorded a permanent failure; not retried without `--retry-errors` |
 | `dangling_file_reference` | docset | DocSet references a File ID that doesn't exist |
-| `computed_field_unattributed` | docset | A `dg:origin="computed"` element in a file's DGML XML has no `dg:href` sources — the derivation can't be audited (spec §13 requires computed fields to name their sources) |
+| `value_unsupported` | docset | A 0.7 `dg:origin="computed"` element in a file's DGML XML has no `dg:href` sources, so it claims a derivation and names nothing a verifier can check. This replaces `computed_field_unattributed`. A 0.71 value with no `dg:origin`, `dg:inputs` or `dg:method` isn't flagged here; extraction doesn't write one (it drops it and counts it as `unsupported_values` in `extraction_stats.json`) |
+| `method_misplaced` | docset | A `dg:method` that contradicts the element: on an element with `dg:origin`, an unknown method, `defaulted` with `dg:inputs`, or `calculated`/`inferred` without them |
+| `inputs_dangling` | docset | A `dg:inputs` target (`#id`) names an `xml:id` no element in the file carries. Cross-file (`fileid#id`) inputs are not checked |
+| `inputs_cycle` | docset | An element is its own input, directly or through other inputs |
 | `semlink_dangling_href` | docset | A semantic link's `dg:href` names an `xml:id` no element in the document carries |
 | `semlink_nested` | docset | A semantic link points at the subject's own ancestor or descendant, stating a relationship the tree's nesting already states. Newly generated files can't carry one — re-generating clears it |
 
@@ -1273,10 +1276,11 @@ Accepted JSON dialects (all convert to the same RNC):
   system): a root `$ref`, local `$defs`/`definitions` `$ref`s (sibling
   annotation keys merge over the target), `title` as the DGML element name,
   and leaves recognized *structurally* — an object whose properties are a
-  subset of `{text, value, locations, derived_from, computed}` with `text`
-  present is a leaf, its `value` subschema mapped to the field type
-  (`enum` list → value enumeration; `format: date` / `type: integer` /
-  `boolean` / `number` / a plain-decimal `pattern` → the XSD datatype).
+  subset of `{text, value, locations, inputs, evidence, method}` (or the 0.7
+  `derived_from`/`computed`) with `text` present is a leaf, its `value`
+  subschema mapped to the field type (`enum` list → value enumeration;
+  `format: date` / `type: integer` / `boolean` / `number` / a plain-decimal
+  `pattern` → the XSD datatype).
 
 Same-named tags must share one identical definition; two definitions with the
 same name but different content or annotations are rejected with
@@ -1288,9 +1292,10 @@ rendered RNC carries an explicit `start` rule so the field stays a root.
 
 Return the DocSet's schema as canonical RNC (default) or as the engine's
 JSON Schema projection (`--schema-format json`), whose leaves are
-`extracted_value` refs (`{text, value?, locations?, computed?, derived_from?}`
-— note: projections exported before the merged leaf shape used a
-`grounded_field`/`computed_field` union; both are still accepted on
+`extracted_value` refs (`{text, value?, locations?, inputs?, evidence?, method?}`
+— note: projections exported before DGML 0.71 carried `computed?` /
+`derived_from?` instead of `inputs?` / `method?`, and older ones a
+`grounded_field`/`computed_field` union; all are still accepted on
 `set-schema` input). Errors `SCHEMA_NOT_FOUND` if none is set.
 
 ### `dgml extraction set-guidance <docset_id> --guidance-file PATH`
@@ -1315,7 +1320,10 @@ Return the DocSet's extraction guidance as `{docset_id, guidance}`. Errors
 
 Extract values from a file against the DocSet schema and write a `dg:extraction`
 element into the file's core `<stem>.dgml.xml`. Runs a three-phase pipeline
-(LLM text+pages → code OCR matching → per-page LLM bbox). If the file already has
+(LLM text+pages → code OCR matching → per-page LLM location for what matching
+couldn't place). On a page with OCR words, phase 3 names the value's words by
+index and code builds the boxes from them; on a page without, it draws boxes on
+a 0-1000 grid of the page image. If the file already has
 a generated document tree the extraction is added alongside it
 (`mode: full-extraction`); otherwise a minimal core file is created
 (`mode: extraction`). `extraction_stats.json` is written only under the global
@@ -1382,35 +1390,134 @@ file has no `dg:extraction` element yet (extraction not run).
 }
 ```
 
-A leaf whose schema `## Prompt:` describes a derivation rule (spec §13) comes
-back **computed** instead of grounded: `computed: true`, no `locations`, and
-`derived_from` listing the dotted paths of the values it was derived from
-(cross-file or unresolvable `dg:href` targets stay as raw references):
+#### Value provenance (DGML 0.71)
+
+Every leaf says where its value came from, with up to three keys that mirror
+three XML attributes:
+
+| JSON | XML | Question it answers |
+| --- | --- | --- |
+| `locations` | `dg:origin` | Where is the element's own text printed? (boxes only) |
+| `inputs` (+ `evidence`) | `dg:inputs` | Which elements did the value use? |
+| `method` | `dg:method` | How was a value the page doesn't print produced? `calculated`, `inferred` or `defaulted` |
+
+That gives four cases:
+
+| | No inputs | Has inputs |
+| --- | --- | --- |
+| **Has `locations`** | Read from its printed text ("$4,200.00" → `4200.00`) | Printed in part, completed from the inputs ("3/1" + the commencement year) |
+| **No `locations`** | `method: "defaulted"`: the field's stated default. Without a method: unsupported, and extraction doesn't write it (`matching.unsupported_values`) | `method: "calculated"` (recomputable) or `"inferred"` (a judgment). Without a method: read as `inferred` |
+
+Where the page has a text layer, every box is checked against it: the words
+inside a box must read as its value (a piece of a wrapped value, a loose box
+that also takes in the label, and OCR noise all pass). A box that also takes in
+other words (a label, or the whole row) shrinks to the words that spell the
+value. A value printed in several places at once (a line-item name made of a
+section heading and a tier column header) is kept when its boxes, read in
+order, spell it through a run of words each, and each box shrinks to its run. Choosing words within a box, or snapping it,
+respects capitalization when the value has letters: a box over "Gas
+Delivery Charges" in a sentence doesn't locate the "GAS DELIVERY
+CHARGES" heading. When nothing on the box's own line matches, it moves to the
+nearest exact copy of the value elsewhere on the page. The text of every box
+is checked against the page; when a value is printed several times, which
+copy it gets is not. A box
+holding nothing but the value is kept whatever its capitalization. A box drawn on the wrong span, such as a total boxed on a neighbouring
+number, moves to the nearest span
+whose words match the value exactly, preferring its own line (or lines)
+(`matching.snapped_boxes`). When the page prints no such span, or two are
+equally near, the box is stripped (`matching.rejected_boxes`).
+
+A value phase 1 returns as bare text, with no locations (a model sometimes
+reads a value off the page and leaves out where), is first placed on the first
+page that prints its exact text, so phase 2 can ground it
+(`matching.located_pageless`).
+
+Every value extraction writes can be verified, so two kinds are **dropped**,
+not written:
+
+- a printed value (in full or in part) left with no bounding box: without
+  `dg:origin` it would read as unsupported, or, if it named inputs, as an
+  inferred judgment (`matching.dropped_unboxed_values`);
+- a value with no box, no default and nothing it used: the model returned it
+  bare, or claimed a calculation or inference and named nothing that
+  resolves (`matching.unsupported_values`).
+
+Inputs that named a dropped value are dropped too, and array indices after it
+are renumbered; a value left with nothing it used is dropped in turn. Each
+dropped value is listed as `"path=text"` in `matching.dropped_unboxed`
+(unsupported ones marked `(unsupported)`).
+
+A value printed in part keeps its boxes **and** names its inputs, so one
+element holds the whole fact:
 
 ```json
 {
+  "PeriodStart": {
+    "text": "3/1",
+    "value": "2026-03-01",
+    "locations": [{"page_number": 2, "bounding_box": [410, 980, 520, 1025]}],
+    "inputs": ["CommencementDate"]
+  },
   "InvoiceTotal": {
     "text": "$349.85",
     "value": "349.85",
-    "computed": true,
-    "derived_from": ["LineItems[0].Quantity", "LineItems[0].UnitPrice"]
+    "method": "calculated",
+    "inputs": ["LineItems[0].Amount", "LineItems[1].Amount"]
   }
 }
 ```
 
-In the XML form (`--as xml`), the same field carries `dg:origin="computed"`,
-`dg:value`, and `dg:itemprop="computedFrom"`/`dg:href` pointing at the source
-elements, which are stamped with matching `xml:id` attributes.
+`inputs` are dotted paths of other extracted values (cross-file or
+unresolvable targets stay as raw references). The paths are positional, and a
+model miscounting its own array entries would name a real but wrong element,
+which no check could catch. So the model cites the text it read with each
+input (`"LineItems[6].Amount=$58.20"`), and extraction checks every citation
+before writing. A matching target is kept. A mismatch is re-pointed
+(`matching.repaired_inputs`) when the cited text matches the same path under
+one of the value's own ancestors (a path written relative to the value) or at
+exactly one sibling index (a miscounted index). Otherwise it is dropped
+(`matching.dropped_inputs`). The citation
+text itself is not stored. When a value used printed text
+that **no schema field extracts**, that text comes back in `evidence` —
+`[{text, locations}]` — instead, so the schema doesn't need a field per piece
+of evidence.
 
-**Schema-authoring rule for derivations:** every input a `## Prompt:`
-derivation rule mentions must itself be an extracted field in the schema.
-The model can fold any page content into its arithmetic, but `dg:href` can
-only point at extracted elements — an un-extracted input leaves the computed
-value unverifiable. A `derived_from` entry that doesn't resolve is dropped
-from `dg:href` and counted in `extraction_stats.json` under
-`matching.dropped_refs` (written under `--debug`); a computed field that ends
-up with no `dg:href` at all is flagged by `dgml check` as
-`computed_field_unattributed`.
+In the XML form (`--as xml`) the same fields read:
+
+```xml
+<docset:PeriodStart xsi:type="date" dg:value="2026-03-01"
+    dg:origin="2 410 980 520 1025" dg:inputs="#commencement-date">3/1</docset:PeriodStart>
+<docset:InvoiceTotal xsi:type="decimal" dg:value="349.85"
+    dg:inputs="#line-items-0-amount; #line-items-1-amount"
+    dg:method="calculated">$349.85</docset:InvoiceTotal>
+
+<dg:chunk xml:id="end-date--in-0" dg:origin="1 300 410 620 450">January 15, 2026</dg:chunk>
+<dg:chunk xml:id="end-date--in-1" dg:origin="1 300 520 980 560">a term of twenty-four (24) months</dg:chunk>
+<docset:EndDate xsi:type="date" dg:value="2028-01-14"
+    dg:inputs="#end-date--in-0; #end-date--in-1" dg:method="calculated">2028-01-14</docset:EndDate>
+```
+
+Every element an input names gets a matching `xml:id`. An `evidence` item
+becomes an anonymous `dg:chunk` (its boxes and printed text) just ahead of the
+field that uses it. `dg:itemprop`/`dg:href` are semantic links only and never
+carry provenance.
+
+**Reading 0.7 files.** DGML 0.7 wrote an unprinted value as
+`dg:origin="computed"` plus `dg:itemprop="computedFrom"`/`dg:href`. Those
+files still read: the `"computed"` origin is ignored and the `dg:href`
+targets read as `inputs` (with `method: "inferred"`, the safe reading), so
+the values JSON no longer carries 0.7's `computed`/`derived_from` keys. New extractions
+write only the 0.71 form, and since rewriting an element changes its hash,
+re-anchor any attested file you re-extract. There is no JSON-LD export yet.
+
+**Schema-authoring rule for derivations:** prefer making every input a
+`## Prompt:` derivation rule mentions an extracted field in the schema, so
+`dg:inputs` can point at it. An input the schema doesn't extract can only be
+recorded as `evidence` text. An `inputs` entry that doesn't resolve is
+dropped from `dg:inputs`, and so is `evidence` that phases 2/3 couldn't box.
+Both are counted in `extraction_stats.json` under `matching.dropped_inputs`
+(written under `--debug`). A calculated or inferred value left with nothing
+it used is dropped, and counted under `matching.unsupported_values`.
 
 Extraction asks each model for its own maximum output (128K on current
 frontier Claude/Gemini, 64K on Haiku 4.5 — read from the provider's model
@@ -1518,9 +1625,20 @@ instead of never running.
 `unnormalized_enum_values` (enum-field leaves whose returned value wasn't one
 of the schema's tokens — those serialize text-only, never guessed) and a
 report-only derivation recompute: `derivations_checked` /
-`derivations_mismatched` (computed leaves whose numeric inputs all resolve
-are recomputed; a leaf mismatches when its value agrees with neither the sum,
-the count, nor any single input within $0.05). The top-level
+`derivations_mismatched` (`calculated` leaves whose numeric inputs all
+resolve are recomputed; a leaf mismatches when its value agrees with neither
+the sum, the count, nor any single input within $0.05; `inferred` values and
+values calculated from `evidence` text are not recomputed). It also counts
+`unprinted_fields` (values with no `locations`), `partly_printed_fields`
+(`locations` plus `inputs`), `dropped_inputs` and `unsupported_values`
+(values with no box, no default and nothing they used, which are not
+written), and
+`repaired_inputs` (inputs re-pointed to where their cited text matched), and
+`dropped_unboxed_values` (printed values no box was found for, which are not
+written; `dropped_unboxed` lists each as `"path=text"`), `snapped_boxes` and `rejected_boxes` (boxes whose words on the text
+layer didn't read as their value: moved to the exact match on their line, or
+stripped). The first four replace 0.7's
+`computed_fields` and `dropped_refs`. The top-level
 `phase1_tool_schema` field records whether the docset schema rode inside the
 `submit_values` tool parameter (`"inlined"`, provider-enforced shape) or
 extraction fell back to a permissive parameter with code-side vocabulary

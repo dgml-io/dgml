@@ -5897,8 +5897,10 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     capsys.readouterr()
     _seed_file_dir(ws, "fileauto0001", pages=1)
 
-    # Empty locations → phase 2 has nothing to match, no phase-3 call needed.
-    values = {"VendorName": {"text": "Acme", "locations": []}}
+    # An unprinted (defaulted) value → phase 2 has nothing to match, no
+    # phase-3 call needed. (A bare value with no box and no method would be
+    # dropped as unverifiable.)
+    values = {"VendorName": {"text": "Acme", "method": "defaulted"}}
     response = _tool_response("submit_values", {"values": values})
     with patch("litellm.completion", return_value=response):
         rc = main(_ws_args(ws) + ["docset", "add-file", "fileauto0001", "--docset", ds_id])

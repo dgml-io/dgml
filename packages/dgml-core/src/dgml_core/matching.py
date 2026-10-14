@@ -69,11 +69,12 @@ space.
 from __future__ import annotations
 
 import copy
+import difflib
 import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from .errors import FileNotFound
 from .storage import Workspace
@@ -88,6 +89,9 @@ from .textmatch import (
 )
 from .textmatch import (
     find_spans as _find_spans,
+)
+from .textmatch import (
+    line_boxes as _line_boxes,
 )
 from .textmatch import (
     line_groups as _line_groups,
@@ -167,20 +171,10 @@ def _span_to_locations(
     boxes stay in pixel space."""
     del dims  # boxes are emitted in pixels; no normalization needed
     start, end = span
-    span_words = page_words[start:end]
-    locs: list[dict[str, Any]] = []
-    for line in _line_groups(span_words):
-        left = min(w.left for w in line)
-        top = min(w.top for w in line)
-        right = max(w.right for w in line)
-        bottom = max(w.bottom for w in line)
-        locs.append(
-            {
-                "page_number": page_number,
-                "bounding_box": [left, top, right, bottom],
-            }
-        )
-    return locs
+    return [
+        {"page_number": page_number, "bounding_box": box}
+        for box in _line_boxes(page_words[start:end])
+    ]
 
 
 def _bbox_norm(loc: dict[str, Any], dims: _PageDims) -> tuple[float, float, float, float]:
@@ -202,12 +196,22 @@ def _bbox_norm(loc: dict[str, Any], dims: _PageDims) -> tuple[float, float, floa
 # ---- Walking helpers ------------------------------------------------------
 
 
-def is_computed_leaf(value: dict[str, Any]) -> bool:
-    """True for a computed_field-shaped leaf: a value derived by reasoning
-    (``computed``/``derived_from`` keys) rather than read off the page
-    (``locations``). Computed leaves carry no page locations, so the
-    matcher and phase 3 never touch them."""
-    return "locations" not in value and ("computed" in value or "derived_from" in value)
+def is_unprinted_leaf(value: dict[str, Any]) -> bool:
+    """True for a leaf the page doesn't print: no ``locations``, but an
+    ``inputs`` list or a ``method`` saying how the value was produced
+    (``calculated``, ``inferred`` or ``defaulted``). Unprinted leaves have
+    nothing to ground, so the matcher and phase 3 never touch them.
+
+    A leaf printed only in part (the "3/1" of a period start whose year comes
+    from the commencement date) carries ``locations`` *and* ``inputs``; it is
+    grounded like any other leaf, not unprinted."""
+    return "locations" not in value and any(k in value for k in ("inputs", "evidence", "method"))
+
+
+def has_inputs(value: dict[str, Any]) -> bool:
+    """True for a leaf whose value names what it used: other values
+    (``inputs``) or printed text the schema doesn't extract (``evidence``)."""
+    return any(isinstance(value.get(k), list) and bool(value[k]) for k in ("inputs", "evidence"))
 
 
 def _walk_leaves(values: Any, path: LeafPath = ()) -> Iterable[tuple[LeafPath, dict[str, Any]]]:
@@ -216,13 +220,18 @@ def _walk_leaves(values: Any, path: LeafPath = ()) -> Iterable[tuple[LeafPath, d
     A leaf is recognized by having both ``text`` and ``locations`` keys
     on a dict. Walking stops descending once a leaf is recognized so
     nested dicts inside the locations array don't confuse the walker.
-    Computed leaves (see :func:`is_computed_leaf`) are skipped entirely —
-    they have nothing to ground."""
+    Unprinted leaves (see :func:`is_unprinted_leaf`) have nothing of their
+    own to ground and are skipped.
+
+    A leaf's ``evidence`` items — printed text the value used that is not a
+    schema field (see :func:`walk_evidence`) — are grounded like leaves too,
+    at path ``(*leaf_path, "evidence", i)``, whether or not the leaf itself
+    is printed."""
     if isinstance(values, dict):
-        if "text" in values and "locations" in values:
-            yield path, values
-            return
-        if "text" in values and is_computed_leaf(values):
+        if "text" in values and ("locations" in values or is_unprinted_leaf(values)):
+            if "locations" in values:
+                yield path, values
+            yield from walk_evidence(values, path)
             return
         for k, v in values.items():
             yield from _walk_leaves(v, path + (k,))
@@ -231,22 +240,475 @@ def _walk_leaves(values: Any, path: LeafPath = ()) -> Iterable[tuple[LeafPath, d
             yield from _walk_leaves(v, path + (i,))
 
 
-def walk_computed_leaves(
-    values: Any, path: LeafPath = ()
+# The values-tree key holding a leaf's evidence items; an item's path is
+# ``(*leaf_path, _EVIDENCE_KEY, i)``. Tag names are PascalCase, so it can't
+# collide with a field.
+_EVIDENCE_KEY = "evidence"
+
+
+def walk_evidence(
+    leaf: dict[str, Any], path: LeafPath
 ) -> Iterable[tuple[LeafPath, dict[str, Any]]]:
-    """Yield ``(path, leaf)`` for every computed_field-shaped leaf — the
-    complement of :func:`_walk_leaves` over the same tree."""
+    """Yield ``(path, item)`` for each groundable ``evidence`` item of *leaf*.
+
+    An evidence item is ``{"text", "locations"}``: verbatim printed text the
+    value used that the schema doesn't extract (the "a term of twenty-four
+    (24) months" an EndDate is calculated from). It serializes as an
+    anonymous ``dg:chunk`` next to the field, named in its ``dg:inputs``."""
+    evidence = leaf.get(_EVIDENCE_KEY)
+    if not isinstance(evidence, list):
+        return
+    for i, item in enumerate(evidence):
+        if isinstance(item, dict) and isinstance(item.get("text"), str) and "locations" in item:
+            yield path + (_EVIDENCE_KEY, i), item
+
+
+def walk_all_leaves(values: Any, path: LeafPath = ()) -> Iterable[tuple[LeafPath, dict[str, Any]]]:
+    """Yield ``(path, leaf)`` for every leaf, grounded or not. Leaves are
+    recognized by their lowercase ``text`` key (tag names are PascalCase),
+    as :func:`_walk_leaves` does."""
     if isinstance(values, dict):
-        if "text" in values and "locations" in values:
-            return
-        if "text" in values and is_computed_leaf(values):
+        if "text" in values:
             yield path, values
             return
         for k, v in values.items():
-            yield from walk_computed_leaves(v, path + (k,))
+            yield from walk_all_leaves(v, path + (k,))
     elif isinstance(values, list):
         for i, v in enumerate(values):
-            yield from walk_computed_leaves(v, path + (i,))
+            yield from walk_all_leaves(v, path + (i,))
+
+
+def walk_unprinted_leaves(
+    values: Any, path: LeafPath = ()
+) -> Iterable[tuple[LeafPath, dict[str, Any]]]:
+    """Yield ``(path, leaf)`` for every unprinted leaf — the complement of
+    :func:`_walk_leaves` among leaves that state their provenance."""
+    for leaf_path, leaf in walk_all_leaves(values, path):
+        if is_unprinted_leaf(leaf):
+            yield leaf_path, leaf
+
+
+def walk_input_leaves(
+    values: Any, path: LeafPath = ()
+) -> Iterable[tuple[LeafPath, dict[str, Any]]]:
+    """Yield ``(path, leaf)`` for every leaf with ``inputs`` — unprinted and
+    partly printed alike."""
+    for leaf_path, leaf in walk_all_leaves(values, path):
+        if has_inputs(leaf):
+            yield leaf_path, leaf
+
+
+# ---- Box verification against the text layer -------------------------------
+
+_BOX_SLACK_PX = 3
+_BOX_FUZZY_RATIO = 0.8
+_BOX_KEY_RE = re.compile(r"[^0-9a-z]+")
+
+
+def _box_key(text: str) -> str:
+    """Letters and digits only, lowercased: "$18,642.30" and "18642.30" agree."""
+    return _BOX_KEY_RE.sub("", text.lower())
+
+
+_CASE_KEY_RE = re.compile(r"[^0-9A-Za-z]+")
+
+
+def _case_key(text: str) -> str:
+    """Letters and digits only, case kept: :func:`_box_key` without folding."""
+    return _CASE_KEY_RE.sub("", text)
+
+
+def _cased(text: str | None) -> bool:
+    """True when runs for *text* are matched with case: it has letters."""
+    return text is not None and any(c.isalpha() for c in _case_key(text))
+
+
+def _run_keys(words: list[_Word], key: str, text: str | None) -> tuple[list[str], str]:
+    """The per-word keys and target that a run of *words* must spell. A value
+    with letters is matched with its capitalization: choosing *which* words
+    inside a loose box are the value ("Gas Delivery Charges" in a
+    sentence vs the "GAS DELIVERY CHARGES" heading) is where case
+    tells copies apart. A value with no letters, or no *text*, folds case."""
+    if text is not None and _cased(text):
+        return [_case_key(w.text) for w in words], _case_key(text)
+    return [_box_key(w.text) for w in words], key
+
+
+def _box_agrees(
+    words: list[_Word], key: str, *, one_of_several: bool = False, text: str | None = None
+) -> bool:
+    """True when the words inside a box read as the value whose *key* it
+    claims to locate: a run of its words spells it (a loose box that also
+    takes in a label counts), the two are close enough to be OCR noise, or —
+    only when the value wraps across several boxes that together spell it
+    (*one_of_several*) — the box holds a piece of it. A lone box holding a
+    piece is clipped: it disagrees, and snaps to the full span."""
+    keys = [_box_key(w.text) for w in words]
+    joined = "".join(keys)
+    if not joined:
+        return True
+    if joined == key or (one_of_several and joined in key):
+        return True
+    run_keys, run_target = _run_keys(words, key, text)
+    if _run_spells(run_keys, run_target):
+        return True
+    glued = _CASE_KEY_RE.split(words[0].text) if len(words) == 1 else []
+    parts = glued if _cased(text) else [part.lower() for part in glued]
+    if len(words) == 1 and _run_spells(parts, run_target):
+        # One OCR word with the value glued to a label by punctuation
+        # ("Total:$318.40", "Invoice#INV-12345"): whole parts of the word must
+        # spell the value — "Paid" isn't in "Unpaid", "318.40" isn't in
+        # "1318.40".
+        return True
+    return _reads_as(joined, key)
+
+
+def _reads_as(joined: str, key: str) -> bool:
+    """True when *joined* is *key* up to OCR noise: equal, or a close match of
+    nearly the same length that changes no digit. Extra letters are not noise
+    ("unpaid" is not "paid"), and a changed digit is a different number."""
+    if joined == key:
+        return True
+    if abs(len(joined) - len(key)) > max(1, len(key) // 10):
+        return False
+    matcher = difflib.SequenceMatcher(None, joined, key)
+    return matcher.ratio() >= _BOX_FUZZY_RATIO and not _digits_differ(matcher, joined, key)
+
+
+def _run_spells(parts: list[str], key: str) -> bool:
+    """True when a contiguous run of *parts* (already keyed the way *key*
+    is) joins to exactly *key*."""
+    for i in range(len(parts)):
+        run = ""
+        for part in parts[i:]:
+            run += part
+            if run == key:
+                return True
+            if len(run) >= len(key):
+                break
+    return False
+
+
+def _spelling_run(words: list[_Word], key: str, text: str | None = None) -> list[_Word] | None:
+    """The words of the first contiguous run of *words* that spells *key*
+    (with its capitalization, when *text* has letters — see
+    :func:`_run_keys`), when that run leaves other words in the box out — a
+    box over a whole row, or over a label and its value. ``None`` when every
+    word is part of the value, or no run spells it."""
+    keys, key = _run_keys(words, key, text)
+    for i in range(len(keys)):
+        run = ""
+        for j in range(i, len(keys)):
+            run += keys[j]
+            if run == key:
+                return words[i : j + 1] if j - i + 1 < len(words) else None
+            if len(run) >= len(key):
+                break
+    return None
+
+
+def _wrapped_runs(
+    boxes: list[list[_Word]], key: str, text: str | None = None
+) -> list[list[_Word]] | None:
+    """For a value located by several boxes: one contiguous run of words per
+    box, in box order, that together spell *key* exactly — or ``None`` when
+    no choice of runs does. Each box must contribute; a box may hold more than
+    its run (a loose box over the label, or the rest of a header row), and
+    the run is what it locates. This is how a name composed of a section
+    heading and a column header ("Gas Delivery" + "Tier 1") is boxed in
+    two places.
+
+    Runs are matched with the value's capitalization when it has letters (see
+    :func:`_run_keys`). Failing that, a case-folded match is accepted only when
+    every box is wholly its run — choosing words *within* a box is where case
+    decides between copies, and a box that is exactly its share needs no
+    choosing."""
+    folded = [[_box_key(w.text) for w in ws] for ws in boxes]
+    keys = [_run_keys(ws, key, text)[0] for ws in boxes]
+    target = _run_keys([], key, text)[1]
+    found = _solve_runs(boxes, keys, target)
+    if found is None and _cased(text):
+        loose = _solve_runs(boxes, folded, key)
+        if loose is not None and all(len(r) == len(ws) for r, ws in zip(loose, boxes, strict=True)):
+            found = loose
+    return found
+
+
+def _solve_runs(
+    boxes: list[list[_Word]], keys: list[list[str]], key: str
+) -> list[list[_Word]] | None:
+    """One contiguous, non-empty run per box, in box order, whose keys join
+    to exactly *key*; ``None`` when there is no such choice."""
+
+    def solve(b: int, pos: int) -> list[list[_Word]] | None:
+        if b == len(boxes):
+            return [] if pos == len(key) else None
+        ks = keys[b]
+        for i in range(len(ks)):
+            if not ks[i]:
+                continue  # a run starts on a word with letters or digits
+            run = ""
+            for j in range(i, len(ks)):
+                run += ks[j]
+                if not key.startswith(run, pos):
+                    break
+                if ks[j] and (rest := solve(b + 1, pos + len(run))) is not None:
+                    return [boxes[b][i : j + 1], *rest]
+        return None
+
+    return solve(0, 0)
+
+
+# Letters OCR commonly reads in place of a digit ("1O0" for "100").
+_OCR_DIGIT_LOOKALIKES = str.maketrans("oilszb", "011528")
+
+
+def _digits_differ(matcher: difflib.SequenceMatcher[str], a: str, b: str) -> bool:
+    """True when the two strings disagree on a digit: one digit replaced by
+    another, or a digit added or removed — a different number (the
+    neighbouring "$318.41" for "$318.40"), not OCR noise. A disagreement
+    explained by a letter OCR mistook for a digit ("1O0" for "100") is noise."""
+    edits_digit = False
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        a_digits = any(c.isdigit() for c in a[i1:i2])
+        b_digits = any(c.isdigit() for c in b[j1:j2])
+        if (a_digits and b_digits) or (tag != "replace" and (a_digits or b_digits)):
+            edits_digit = True
+            break
+    if not edits_digit:
+        return False
+
+    def digits(s: str) -> str:
+        return "".join(c for c in s.translate(_OCR_DIGIT_LOOKALIKES) if c.isdigit())
+
+    return digits(a) != digits(b)
+
+
+class BoxCheck(NamedTuple):
+    """What :func:`verify_boxes` did to boxes whose words disagreed with their
+    value: moved to the matching span on the same line, or stripped."""
+
+    snapped: int
+    rejected: int
+
+
+def _snap_to_line(
+    words: list[_Word], text: str, box: list[int], page: int
+) -> list[dict[str, Any]] | None:
+    """The locations of the span nearest *box* whose words match *text*
+    exactly (with case), preferring spans on the box's own line(s) — or
+    ``None`` when the page prints no such span, or the two nearest are equally
+    near (a tie is not guessed).
+
+    A model that found the right row but drew the box over the wrong column
+    (or straddling two rows) lands on the match in that row. One that boxed a
+    lookalike elsewhere ("Gas Delivery Charges" in a sentence, for the
+    "GAS DELIVERY CHARGES" heading, or the lowercase "northwind" of a URL
+    for "Northwind") moves to the nearest exact copy on the page. A value
+    printed several times then gets a copy that reads as it, which may not be
+    the one it was read from: the text is checked, the choice of copy is not.
+    """
+    top, bottom = box[1], box[3]
+    cx, cy = (box[0] + box[2]) / 2, (top + bottom) / 2
+    on_line: list[tuple[float, tuple[int, int]]] = []
+    elsewhere: list[tuple[float, tuple[int, int]]] = []
+    for start, end in _find_spans(text, words):
+        span = words[start:end]
+        sx = (min(w.left for w in span) + max(w.right for w in span)) / 2
+        sy = (min(w.top for w in span) + max(w.bottom for w in span)) / 2
+        scored = (((sx - cx) ** 2 + (sy - cy) ** 2) ** 0.5, (start, end))
+        if any(w.top < bottom and w.bottom > top for w in span):
+            on_line.append(scored)
+        else:
+            elsewhere.append(scored)
+    candidates = sorted(on_line) or sorted(elsewhere)
+    if not candidates:
+        return None
+    if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 1:
+        return None
+    return _span_to_locations(candidates[0][1], words, _PageDims(1, 1), page)
+
+
+def _overlaps_any(loc: Any, others: list[dict[str, Any]]) -> bool:
+    """True when *loc*'s box intersects a box of *others* on the same page."""
+    box = loc.get("bounding_box") if isinstance(loc, dict) else None
+    if not isinstance(box, list) or len(box) != 4:
+        return False
+    for other in others:
+        if other.get("page_number") != loc.get("page_number"):
+            continue
+        o = other["bounding_box"]
+        if box[0] < o[2] and o[0] < box[2] and box[1] < o[3] and o[1] < box[3]:
+            return True
+    return False
+
+
+def verify_boxes(workspace: Workspace, file_id: str, values: Any) -> BoxCheck:
+    """Check every bounding box against the page's text layer, in place.
+
+    Phase 3 asks a model to draw boxes on a page image, and a model can land
+    on the wrong span — a total boxed on a neighbouring number in the same
+    row. Wherever the page has a text layer the box can be checked: the words
+    whose centres fall inside it must read as the value (see
+    :func:`_box_agrees`). A box that fails is moved to the nearest span on
+    its own line(s) whose words match the value exactly (counted as snapped),
+    or, when there is none or two tie, keeps only its page number (counted as
+    rejected) — so a value left with no box at all is then dropped like any
+    value grounding couldn't box. A box with no words under it, a value with no letters or
+    digits ("$"), or a page with no text layer can't be checked and is kept.
+    """
+    cache: dict[int, list[_Word]] = {}
+
+    def page_words(page: int) -> list[_Word]:
+        if page not in cache:
+            try:
+                cache[page] = _load_page_words(workspace, file_id, page)[0]
+            except FileNotFound:
+                cache[page] = []
+        return cache[page]
+
+    def words_in(page: int, box: list[int]) -> list[_Word]:
+        # Reading order: visual lines top to bottom, words left to right
+        # within each line (words on one line differ in height, so the
+        # line comes from y-centre proximity, not a per-word bucket).
+        left, top, right, bottom = box
+        return [
+            w
+            for line in _line_groups(
+                [
+                    w
+                    for w in page_words(page)
+                    if left - _BOX_SLACK_PX <= (w.left + w.right) / 2 <= right + _BOX_SLACK_PX
+                    and top - _BOX_SLACK_PX <= w.y_center <= bottom + _BOX_SLACK_PX
+                ]
+            )
+            for w in sorted(line, key=lambda w: w.left)
+        ]
+
+    snapped = rejected = 0
+    for _path, leaf in _walk_leaves(values):
+        text = str(leaf.get("text") or "")
+        key = _box_key(text)
+        locations = leaf.get("locations")
+        if not key or not isinstance(locations, list):
+            continue
+
+        boxes = [
+            (loc, words_in(loc["page_number"], loc["bounding_box"]))
+            if isinstance(loc, dict)
+            and isinstance(loc.get("bounding_box"), list)
+            and len(loc["bounding_box"]) == 4
+            and isinstance(loc.get("page_number"), int)
+            else (loc, None)
+            for loc in locations
+        ]
+        # A value wrapped across several boxes: only then may one box hold a
+        # piece of it — when the boxes, read in order, spell the whole value
+        # (each box through a run of its words, so a loose box still counts),
+        # or do so up to OCR noise. Repeated copies (or boxes on other pages)
+        # are each checked whole.
+        boxed_words = [ws for _, ws in boxes if ws is not None]
+        runs = _wrapped_runs(boxed_words, key, text) if len(boxed_words) > 1 else None
+        wrapped = runs is not None or (
+            len(boxed_words) > 1
+            and _reads_as("".join(_box_key(w.text) for ws in boxed_words for w in ws), key)
+        )
+        run_of = iter(runs or [])
+        checked: list[Any] = []
+        snapped_locs: list[dict[str, Any]] = []
+        for loc, inside in boxes:
+            if inside is None:
+                checked.append(loc)
+                continue
+            box, page = loc["bounding_box"], loc["page_number"]
+            if runs is not None:
+                part = next(run_of)
+                if len(part) < len(inside):
+                    # This box's share of the value is a run of its words:
+                    # box that run (counted as snapped).
+                    tight = [{"page_number": page, "bounding_box": b} for b in _line_boxes(part)]
+                    checked.extend(tight)
+                    snapped += 1
+                else:
+                    checked.append(loc)
+                continue
+            run = None if wrapped else _spelling_run(inside, key, text)
+            if run is not None:
+                # A loose box (the whole row, or the label too): the run of
+                # its words that spells the value is the value — box that.
+                tight = [{"page_number": page, "bounding_box": b} for b in _line_boxes(run)]
+                checked.extend(tight)
+                snapped_locs.extend(tight)
+                snapped += 1
+            elif _box_agrees(inside, key, one_of_several=wrapped, text=text):
+                checked.append(loc)
+            elif (moved := _snap_to_line(page_words(page), text, box, page)) is not None:
+                checked.extend(moved)
+                snapped_locs.extend(moved)
+                snapped += 1
+            else:
+                checked.append({"page_number": page})
+                rejected += 1
+        if snapped_locs:
+            # A snap locates the whole value, so the value's other boxes it
+            # overlaps (the other line of a wrapped value, or a second box that
+            # snapped to the same span) would draw it twice.
+            deduped: list[Any] = []
+            for loc in checked:
+                if loc in deduped:
+                    continue
+                if loc not in snapped_locs and _overlaps_any(loc, snapped_locs):
+                    continue
+                deduped.append(loc)
+            checked = deduped
+        leaf["locations"] = checked
+    return BoxCheck(snapped, rejected)
+
+
+def locate_pageless_values(
+    workspace: Workspace, file_id: str, values: Any, page_count: int | None
+) -> int:
+    """Give each value phase 1 returned bare — text with no ``locations``,
+    ``inputs``, ``evidence`` or ``method`` — the first page that prints its
+    exact text, in place; return how many were placed.
+
+    A model sometimes reads a value off the page and leaves out where. Bare,
+    the value would be dropped as unverifiable (it has no box and nothing it
+    used); with a page, phase 2 grounds it like any other. The search is
+    :func:`textmatch.find_spans` — the case-sensitive span match phase 2
+    uses — so a value whose text the page doesn't print stays bare. The
+    first page is enough: any printed copy reads as the value, and naming
+    every page would send the repeats to phase 3."""
+    pages = list(range(1, page_count + 1)) if page_count else []
+    cache: dict[int, list[_Word]] = {}
+
+    def words_on(page: int) -> list[_Word]:
+        # Best effort: a page whose text can't be read (missing, or a
+        # payload without its size) is simply not searched.
+        if page not in cache:
+            try:
+                cache[page] = _load_page_words(workspace, file_id, page)[0]
+            except (FileNotFound, KeyError, TypeError, ValueError):
+                cache[page] = []
+        return cache[page]
+
+    placed = 0
+    for _path, leaf in walk_all_leaves(values):
+        text = leaf.get("text")
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or any(k in leaf for k in ("locations", "inputs", "evidence", "method"))
+        ):
+            continue
+        for page in pages:
+            if _find_spans(text, words_on(page)):
+                leaf["locations"] = [{"page_number": page}]
+                placed += 1
+                break
+    return placed
 
 
 def _get_at_path(values: dict[str, Any], path: LeafPath) -> Any:
@@ -273,8 +735,8 @@ _PATH_SEG_RE = re.compile(r"\.?([^.\[\]]+)|\[(\d+)\]")
 def parse_path(text: str) -> LeafPath | None:
     """Inverse of :func:`path_to_str` — ``"a.b[0].c"`` → ``("a", "b", 0, "c")``.
 
-    Computed leaves reference their sources with these dotted paths
-    (``derived_from``); this parses them back for resolution against the
+    Leaves reference the values they used with these dotted paths
+    (``inputs``); this parses them back for resolution against the
     values tree. Returns ``None`` for anything malformed rather than
     raising — a model-fumbled path is dropped, not fatal."""
     text = text.strip()
@@ -498,6 +960,11 @@ def run_phase2_matching(
 # tolerance.
 
 
+def _is_evidence_path(path: LeafPath) -> bool:
+    """True for an ``evidence`` item's path (``(*leaf_path, "evidence", i)``)."""
+    return len(path) >= 2 and path[-2] == _EVIDENCE_KEY and isinstance(path[-1], int)
+
+
 def _row_path(path: LeafPath) -> LeafPath | None:
     """Path identifying the 'row' a leaf belongs to: the path up to and
     including the rightmost array index. ``('transactions', 5, 'post_date')``
@@ -509,7 +976,15 @@ def _row_path(path: LeafPath) -> LeafPath | None:
     The earlier ``path[:-1]`` fallback made every top-level scalar share
     the empty pseudo-row ``()`` — so the first such field to match set a
     y-band that drove every other top-level field's lone candidate to
-    zero, sending otherwise-unambiguous values to phase 3."""
+    zero, sending otherwise-unambiguous values to phase 3.
+
+    An ``evidence`` item (``(*leaf_path, "evidence", i)``, see
+    :func:`walk_evidence`) is printed text that is *not* a schema field, so
+    it is no array row's cell either: it gets ``None`` too. Otherwise its
+    own index would make it a one-item pseudo-row, whose band would veto
+    top-level scalars on its line and its own repeat occurrences."""
+    if _is_evidence_path(path):
+        return None
     for i in range(len(path) - 1, -1, -1):
         if isinstance(path[i], int):
             return path[: i + 1]
@@ -982,6 +1457,10 @@ def _assign_row_by_columns(
         if len(s.path) < len(row_path):
             continue
         if s.path[: len(row_path)] != row_path:
+            continue
+        if _is_evidence_path(s.path):
+            # Evidence is printed elsewhere (not a cell of this row); its box
+            # would skew the row's y anchor and claim another column's x range.
             continue
         for loc in s.matched_locations:
             ymin, xmin, ymax, xmax = _bbox_norm(loc, dims)

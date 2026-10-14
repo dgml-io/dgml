@@ -43,12 +43,16 @@ from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree as ET
 
 from .. import layout
+from ..dg_refs import METHODS
 
 if TYPE_CHECKING:
     from dgml_core.storage import Workspace
 
 DG_NS = "http://dgml.io/ns/dg#"
 XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
+
+# dg:method's closed value set, from the one list readers and writers share.
+_METHOD_ATT = "attribute dg:method { " + " | ".join(f'"{m}"' for m in METHODS) + " }?"
 
 # xsi:type (as emitted by _detect_value_type) -> XSD datatype for dg:value
 _XSD_FOR_XSI = {
@@ -156,14 +160,18 @@ def build_rnc(
     w("start = dg.chunk")
     w("")
     w("# --- attributes common to every DGML element ------------------------")
-    w('# dg:origin  = grounding bbox: "page x1 y1 x2 y2"')
+    w('# dg:origin  = boxes of the element\'s own printed text: "page x1 y1 x2 y2"')
     w("# dg:itemprop / dg:href = semantic link (predicate + '#id' target(s))")
+    w("# dg:inputs  = elements the dg:value used ('#id' / 'fileid#id', '; '-joined)")
+    w("# dg:method  = how a value the page doesn't print was produced")
     w("common.atts =")
     w("  attribute dg:structure { text }?,")
     w("  attribute dg:origin { text }?,")
     w("  attribute xml:id { xsd:ID }?,")
     w("  attribute dg:itemprop { text }?,")
     w("  attribute dg:href { text }?,")
+    w("  attribute dg:inputs { text }?,")
+    w(f"  {_METHOD_ATT},")
     w("  attribute dg:value { text }?,")
     w("  attribute xsi:type { text }?")
     w("")
@@ -233,7 +241,9 @@ def build_rnc(
                 "  attribute dg:origin { text }?,\n"
                 "  attribute xml:id { xsd:ID }?,\n"
                 "  attribute dg:itemprop { text }?,\n"
-                "  attribute dg:href { text }?,\n" + typed
+                "  attribute dg:href { text }?,\n"
+                "  attribute dg:inputs { text }?,\n"
+                f"  {_METHOD_ATT},\n" + typed
             )
         else:
             atts = "  common.atts,"

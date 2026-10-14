@@ -34,7 +34,7 @@ from dgml_core.errors import (
     ValuesExtractionFailed,
     append_recorded_error,
 )
-from dgml_core.extraction_schema import parse_rnc
+from dgml_core.extraction_schema import EXTRACTED_VALUE, parse_rnc
 from dgml_core.extraction_xml import dgml_xml_to_values
 from dgml_core.files import FileStore
 from dgml_core.grounded import (
@@ -42,6 +42,7 @@ from dgml_core.grounded import (
     _SCHEMA_TREE_MAX_DEPTH,
     DEFAULT_MAX_TOOL_ITERS,
     GroundedConfig,
+    _drop_bboxes_from_schema,
     _empty_totals,
     _field_node_schema,
     _pdf_bytes,
@@ -1280,6 +1281,142 @@ def test_extract_values_phase3_page_without_words_uses_the_grid(workspace: Works
     assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (1, 0)
 
 
+def test_extract_values_rejects_a_phase3_box_on_the_wrong_words(workspace: Workspace) -> None:
+    """Phase 3 boxes "Goodnight" on the words "Hello world". The text layer
+    says the box is wrong, so it is stripped, and with no box left the value
+    is dropped rather than written pointing at the wrong span."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300)  # "Hello", "world"
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 210, 290, 242]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ):
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert "title" not in result.values
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["matched_phase3"] == 1
+    assert stats["matching"]["rejected_boxes"] == 1
+    assert stats["matching"]["dropped_unboxed_values"] == 1
+
+
+def _word(idx: int, text: str, box: list[int]) -> dict[str, Any]:
+    return {"idx": idx, "text": text, "location": {"page_number": 1, "bounding_box": box}}
+
+
+_RANGE_WORDS = {
+    w["idx"]: w
+    for w in [
+        _word(0, "Gas", [100, 100, 150, 130]),
+        _word(1, "Delivery", [160, 100, 330, 130]),
+        _word(2, "Charge", [100, 140, 190, 170]),  # next line
+        _word(3, "$", [400, 100, 410, 130]),
+        _word(4, "318", [410, 100, 460, 130]),
+        _word(5, ".", [460, 100, 465, 130]),
+        _word(6, "40", [465, 100, 490, 130]),
+    ]
+}
+
+
+def test_word_ranges_become_one_box_per_line() -> None:
+    from dgml_core.grounded import _boxes_from_word_ranges
+
+    assert _boxes_from_word_ranges([[3, 6]], _RANGE_WORDS) == [[400, 100, 490, 130]]
+    # A value wrapping onto a second line: two ranges, two boxes.
+    assert _boxes_from_word_ranges([[0, 1], [2, 2]], _RANGE_WORDS) == [
+        [100, 100, 330, 130],
+        [100, 140, 190, 170],
+    ]
+
+
+@pytest.mark.parametrize("ranges", [[], [[6, 3]], [[3]], [[3, 99]], [["3", "4"]], "3-6"])
+def test_malformed_or_unknown_word_ranges_locate_nothing(ranges: Any) -> None:
+    from dgml_core.grounded import _boxes_from_word_ranges
+
+    assert _boxes_from_word_ranges(ranges, _RANGE_WORDS) is None
+
+
+def test_extract_values_phase3_locates_by_word_ranges(workspace: Workspace) -> None:
+    """On a page with words, phase 3 names the value's words and code builds
+    the box from them: the model never writes a coordinate."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    # "286" printed twice, with nothing to tell phase 2 which is the value.
+    _seed_page_text(
+        workspace,
+        fid,
+        page=1,
+        width=2550,
+        height=3300,
+        words=[
+            {"t": "286", "l": [2366, 1163, 2415, 1192]},
+            {"t": "286", "l": [1544, 1592, 1600, 1625]},
+        ],
+    )
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "286", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "words": [[1, 1]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 2
+    tool = mock_completion.call_args_list[1].kwargs["tools"][0]["function"]
+    entry = tool["parameters"]["properties"]["locations"]["items"]
+    assert set(entry["properties"]) == {"id", "words"}
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [1544, 1592, 1600, 1625]}
+    ]
+
+
+def test_extract_values_grounds_a_value_phase1_left_without_locations(
+    workspace: Workspace,
+) -> None:
+    """Phase 1 reads "Hello world" but leaves out where. Bare, it would be
+    dropped as unverifiable; placed on the page that prints it, phase 2
+    grounds it."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Hello world"}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 1  # phase 2 grounded it; no phase 3
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 210, 290, 242]}
+    ]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["located_pageless"] == 1
+    assert stats["matching"]["unsupported_values"] == 0
+
+
 def test_extract_values_phase3_states_the_image_size(workspace: Workspace) -> None:
     """With words on the page the pixel contract stays, and the prompt says how
     big the image is, so pixel coordinates have a known frame."""
@@ -1302,7 +1439,10 @@ def test_extract_values_phase3_states_the_image_size(workspace: Workspace) -> No
         result = extract_values(workspace, ds_id, fid, config=config)
 
     kwargs = mock_completion.call_args_list[1].kwargs
-    assert "IMAGE PIXELS" in kwargs["messages"][0]["content"]
+    # Pages with words are answered with word ranges, not pixels; the size
+    # line stays to give the table's pixel positions a frame.
+    assert "WORD CONTRACT" in kwargs["messages"][0]["content"]
+    assert "IMAGE PIXELS" not in kwargs["messages"][0]["content"]
     assert "2550 x 3300 pixels (width x height)" in kwargs["messages"][1]["content"][0]["text"]
     # pages with words keep the default budget; only the grid path is lowered
     assert kwargs["reasoning_effort"] == "high"
@@ -1332,11 +1472,14 @@ def test_extract_values_phase3_drops_a_box_off_the_page(workspace: Workspace) ->
     ):
         result = extract_values(workspace, ds_id, fid, config=config)
 
-    assert result.values["title"]["locations"] == [{"page_number": 1}]
+    # The only box was off the page, so the value has none: it is dropped
+    # rather than written with no dg:origin.
+    assert "title" not in result.values
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None
     phase3 = stats["phases"]["phase3"]
     assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (0, 1)
+    assert stats["matching"]["dropped_unboxed_values"] == 1
 
 
 @pytest.mark.parametrize(
@@ -1536,8 +1679,16 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "matched_phase2": 1,
         "matched_phase3": 0,
         "unmatched": 0,
-        "computed_fields": 0,
-        "dropped_refs": 0,
+        "unprinted_fields": 0,
+        "partly_printed_fields": 0,
+        "dropped_inputs": 0,
+        "unsupported_values": 0,
+        "repaired_inputs": 0,
+        "located_pageless": 0,
+        "dropped_unboxed_values": 0,
+        "dropped_unboxed": [],
+        "rejected_boxes": 0,
+        "snapped_boxes": 0,
         "unnormalized_enum_values": 0,
         "derivations_checked": 0,
         "derivations_mismatched": 0,
@@ -2301,6 +2452,33 @@ def test_expand_refs_chained_definitions() -> None:
     assert expanded["properties"]["a"]["properties"]["v"] == {"type": "string"}
 
 
+def test_phase1_schema_strips_bbox_and_keeps_evidence_flat() -> None:
+    """Phase 1 must not demand bounding boxes, even when the schema has been
+    through JSON (no shared ``locations`` object left to alias). Evidence
+    items carry only a page_number: they ride on every leaf, so a nested
+    locations array there would grow the constrained-decoding state count."""
+    schema = json.loads(json.dumps({"definitions": {"extracted_value": EXTRACTED_VALUE}}))
+    leaf = _drop_bboxes_from_schema(schema)["definitions"]["extracted_value"]["properties"]
+    assert "bounding_box" not in leaf["locations"]["items"]["properties"]
+    assert leaf["locations"]["items"]["required"] == ["page_number"]
+    item = leaf["evidence"]["items"]
+    assert set(item["properties"]) == {"text", "page_number"}
+
+
+def test_normalize_leaf_provenance_turns_evidence_page_into_locations() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "End": {
+            "text": "x",
+            "method": "calculated",
+            "evidence": [{"text": "24 months", "page_number": 2}],
+        }
+    }
+    _normalize_leaf_provenance(values)
+    assert values["End"]["evidence"] == [{"text": "24 months", "locations": [{"page_number": 2}]}]
+
+
 def test_extract_values_phase1_submit_tool_strips_bbox(workspace: Workspace) -> None:
     """Phase 1's ``submit_values`` tool inlines the expanded docset schema
     with ``bounding_box`` stripped from ``extracted_value.locations`` — the
@@ -2332,11 +2510,12 @@ def test_extract_values_phase1_submit_tool_strips_bbox(workspace: Workspace) -> 
     # Schema is expanded and self-contained — no $ref left.
     assert "definitions" not in values_param
     assert "$ref" not in json.dumps(values_param)
-    # The leaf is the merged extracted_value shape — grounded and computed
-    # provenance share one object (no anyOf union).
+    # The leaf is the merged extracted_value shape — every provenance case
+    # (printed, printed in part, unprinted) shares one object (no anyOf union).
     leaf = values_param["properties"]["title"]
-    assert "derived_from" in leaf["properties"]
-    assert "computed" in leaf["properties"]
+    assert "inputs" in leaf["properties"]
+    assert leaf["properties"]["method"]["enum"] == ["calculated", "inferred", "defaulted"]
+    assert "derived_from" not in leaf["properties"] and "computed" not in leaf["properties"]
     assert "value" in leaf["properties"]
     # And crucially: bounding_box is gone from the leaf's locations[].
     location_props = leaf["properties"]["locations"]["items"]["properties"]
@@ -2360,7 +2539,7 @@ def test_extract_values_propagates_schema_not_found(workspace: Workspace) -> Non
 
 
 # ---------------------------------------------------------------------------
-# computed (reasoned) fields — spec §7/§13
+# values the page doesn't print: inputs + method (DGML 0.71)
 
 
 _COMPUTED_RNC = """\
@@ -2385,11 +2564,11 @@ word_count =
 """
 
 
-def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
-    """A computed leaf flows through untouched by phases 2/3 (it carries no
-    locations to ground), serializes with the spec's computed attribute set
-    (dg:origin="computed", dg:value, dg:itemprop/dg:href + xml:id on the
-    source), and is counted separately in extraction_stats.json."""
+def test_extract_values_calculated_field_end_to_end(workspace: Workspace) -> None:
+    """A calculated leaf flows through untouched by phases 2/3 (it carries no
+    locations to ground), serializes with dg:value, dg:inputs (+ xml:id on the
+    input) and dg:method — no dg:origin — and is counted separately in
+    extraction_stats.json."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
@@ -2403,8 +2582,8 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
         "word_count": {
             "text": "2",
             "value": "2",
-            "computed": True,
-            "derived_from": ["title"],
+            "inputs": ["title"],
+            "method": "calculated",
         },
     }
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
@@ -2414,16 +2593,14 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
     ) as mock_completion:
         result = extract_values(workspace, ds.id, fid, config=config)
 
-    # One LLM call: phase 2 matched the grounded leaf; the computed leaf
+    # One LLM call: phase 2 matched the grounded leaf; the calculated leaf
     # never became an unmatched item, so no phase 3.
     assert mock_completion.call_count == 1
     assert result.values["word_count"] == phase1_values["word_count"]
 
     xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
-    assert 'dg:origin="computed"' in xml
-    assert 'xsi:type="integer" dg:value="2"' in xml
-    assert 'dg:itemprop="computedFrom"' in xml
-    assert 'dg:href="#title"' in xml
+    assert 'xsi:type="integer" dg:value="2" dg:inputs="#title" dg:method="calculated"' in xml
+    assert "computed" not in xml and "dg:href" not in xml
     assert 'xml:id="title"' in xml
     # Round-trip through the persisted XML reproduces the values tree.
     vocab = parse_rnc(DocSetStore(workspace).get_schema(ds.id))
@@ -2436,8 +2613,16 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
         "matched_phase2": 1,
         "matched_phase3": 0,
         "unmatched": 0,
-        "computed_fields": 1,
-        "dropped_refs": 0,
+        "unprinted_fields": 1,
+        "partly_printed_fields": 0,
+        "dropped_inputs": 0,
+        "unsupported_values": 0,
+        "repaired_inputs": 0,
+        "located_pageless": 0,
+        "dropped_unboxed_values": 0,
+        "dropped_unboxed": [],
+        "rejected_boxes": 0,
+        "snapped_boxes": 0,
         "unnormalized_enum_values": 0,
         "derivations_checked": 0,
         "derivations_mismatched": 0,
@@ -2447,10 +2632,11 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
     }
 
 
-def test_extract_values_counts_dropped_refs_in_stats(workspace: Workspace) -> None:
-    """A computed leaf whose derived_from references values that were never
+def test_extract_values_counts_dropped_inputs_in_stats(workspace: Workspace) -> None:
+    """An unprinted leaf whose inputs reference values that were never
     extracted still lands in the XML, but the unresolvable entries are
-    counted in stats so the incomplete provenance is visible."""
+    counted in stats so the incomplete provenance is visible. The 0.7 leaf
+    keys (computed/derived_from) are still accepted from the model."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)
@@ -2478,29 +2664,230 @@ def test_extract_values_counts_dropped_refs_in_stats(workspace: Workspace) -> No
 
     stats = workspace.docs.get_doc("extraction_stats", f"{ds.id}/{fid}")
     assert stats is not None
-    assert stats["matching"]["computed_fields"] == 1
-    assert stats["matching"]["dropped_refs"] == 2
+    assert stats["matching"]["unprinted_fields"] == 1
+    assert stats["matching"]["dropped_inputs"] == 2
+
+
+def test_extract_values_grounds_evidence_into_chunks(workspace: Workspace) -> None:
+    """Evidence (printed text no schema field extracts) is grounded by phase 2
+    like any leaf and lands as a dg:chunk the value names in dg:inputs."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _COMPUTED_RNC)
+    store.add_file(ds.id, fid)
+
+    phase1_values = {
+        "word_count": {
+            "text": "2",
+            "value": "2",
+            "method": "calculated",
+            "evidence": [{"text": "Hello world", "page_number": 1}],
+        },
+    }
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        result = extract_values(workspace, ds.id, fid, config=config)
+
+    assert mock_completion.call_count == 1  # phase 2 boxed the evidence
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert '<dg:chunk xml:id="word_count--in-0" dg:origin="1 ' in xml
+    assert ">Hello world</dg:chunk>" in xml
+    assert 'dg:inputs="#word_count--in-0" dg:method="calculated"' in xml
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds.id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["unprinted_fields"] == 1
+    assert stats["matching"]["dropped_inputs"] == 0
+    assert stats["matching"]["matched_phase2"] == 1
+
+
+def test_normalize_leaf_provenance_keeps_only_groundable_evidence() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "End": {
+            "text": "2028-01-14",
+            "evidence": [
+                {"text": "a term of 24 months", "locations": [{"page_number": 1}]},
+                {"text": "", "locations": [{"page_number": 1}]},  # nothing to match
+                {"text": "no page", "locations": []},  # nowhere to ground it
+                "not an object",
+            ],
+        },
+        # defaulted forbids evidence as it forbids inputs
+        "Grace": {
+            "text": "0",
+            "method": "defaulted",
+            "evidence": [{"text": "x", "locations": [{"page_number": 1}]}],
+        },
+    }
+    _normalize_leaf_provenance(values)
+    assert values["End"] == {
+        "text": "2028-01-14",
+        "evidence": [{"text": "a term of 24 months", "locations": [{"page_number": 1}]}],
+        "method": "inferred",
+    }
+    assert values["Grace"] == {"text": "0", "method": "defaulted"}
+
+
+def test_normalize_leaf_provenance_flat_page_survives_empty_locations() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "End": {
+            "text": "2028-01-14",
+            "method": "calculated",
+            "evidence": [{"text": "a term of 24 months", "page_number": 2, "locations": []}],
+        },
+    }
+    assert _normalize_leaf_provenance(values) == 0
+    assert values["End"]["evidence"] == [
+        {"text": "a term of 24 months", "locations": [{"page_number": 2}]}
+    ]
+
+
+def test_normalize_leaf_provenance_wraps_a_lone_input_path() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "Currency": {"text": "CAD", "method": "inferred", "inputs": "PremisesAddress"},
+    }
+    assert _normalize_leaf_provenance(values) == 0
+    assert values["Currency"] == {
+        "text": "CAD",
+        "method": "inferred",
+        "inputs": ["PremisesAddress"],
+    }
+
+
+def test_extract_values_repairs_a_miscounted_input(workspace: Workspace) -> None:
+    """The slip: the model names the right value at the wrong index.
+    Its cited text points at the one entry that matches, so the input is
+    re-pointed there before serialization and counted as repaired."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(
+        workspace,
+        fid,
+        page=1,
+        words=[
+            {"t": "12.75", "l": [100, 100, 160, 120]},
+            {"t": "58.20", "l": [100, 200, 160, 220]},
+        ],
+    )
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _CHARGES_RNC)
+    store.add_file(ds.id, fid)
+
+    phase1_values = {
+        "Bill": {
+            "Items": [
+                {"Amount": {"text": "12.75", "locations": [{"page_number": 1}]}},
+                {"Amount": {"text": "58.20", "locations": [{"page_number": 1}]}},
+            ],
+            "Tax": {
+                "text": "58.20",
+                "value": "58.20",
+                "method": "calculated",
+                "inputs": ["Bill.Items[0].Amount=58.20"],  # right text, wrong index
+            },
+        }
+    }
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ):
+        result = extract_values(workspace, ds.id, fid, config=config)
+
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert 'dg:inputs="#bill-items-1-amount" dg:method="calculated"' in xml
+    assert result.values["Bill"]["Tax"]["inputs"] == ["Bill.Items[1].Amount"]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds.id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["repaired_inputs"] == 1
+    assert stats["matching"]["dropped_inputs"] == 0
+    assert stats["matching"]["derivations_mismatched"] == 0
+
+
+_CHARGES_RNC = """\
+namespace docset = "http://www.dgml.io/ws/Test"
+
+Bill =
+  element docset:Bill {
+    (text | Items | Tax)*
+  }
+
+Items =
+  element docset:Items {
+    Item*
+  }
+
+Item =
+  element docset:Item {
+    (text | Amount)*
+  }
+
+Amount =
+  element docset:Amount {
+    xsd:decimal
+  }
+
+## Prompt: Compute as the sum of the tax line amounts
+Tax =
+  element docset:Tax {
+    xsd:decimal
+  }
+"""
 
 
 # ── Merged-leaf provenance normalization & enum tool-schema specialization ───
 
 
-def test_normalize_leaf_provenance_grounded_wins_over_computed_markers() -> None:
+def test_normalize_leaf_provenance_boxes_plus_inputs_is_partly_printed() -> None:
+    """Locations and inputs together are a value printed in part: both are
+    kept, and the method goes — a boxed value never carries one."""
     from dgml_core.grounded import _normalize_leaf_provenance
 
     values = {
+        "Start": {
+            "text": "3/1",
+            "value": "2026-03-01",
+            "inputs": ["CommencementDate"],
+            "method": "inferred",
+            "locations": [{"page_number": 1}],
+        },
+        # The 0.7 keys read the same way.
         "Title": {
             "text": "hi",
             "computed": True,
             "derived_from": ["Other"],
             "locations": [{"page_number": 1}],
-        }
+        },
     }
     _normalize_leaf_provenance(values)
-    assert values["Title"] == {"text": "hi", "locations": [{"page_number": 1}]}
+    assert values["Start"] == {
+        "text": "3/1",
+        "value": "2026-03-01",
+        "inputs": ["CommencementDate"],
+        "locations": [{"page_number": 1}],
+    }
+    assert values["Title"] == {
+        "text": "hi",
+        "inputs": ["Other"],
+        "locations": [{"page_number": 1}],
+    }
 
 
-def test_normalize_leaf_provenance_computed_drops_empty_locations() -> None:
+def test_normalize_leaf_provenance_unprinted_drops_empty_locations() -> None:
+    """No usable location: the locations key goes, and inputs with no method
+    read as inferred (the safe reading)."""
     from dgml_core.grounded import _normalize_leaf_provenance
 
     values = {
@@ -2510,9 +2897,28 @@ def test_normalize_leaf_provenance_computed_drops_empty_locations() -> None:
     assert values["Total"] == {
         "text": "$5",
         "value": "5",
-        "computed": True,
-        "derived_from": ["Items[0].Amount"],
+        "inputs": ["Items[0].Amount"],
+        "method": "inferred",
     }
+
+
+def test_normalize_leaf_provenance_enforces_method_rules() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        # defaulted forbids inputs
+        "Grace": {"text": "0", "method": "defaulted", "inputs": ["Notes"]},
+        # calculated requires inputs: without them the claim is unsupported
+        "Months": {"text": "12", "method": "calculated", "inputs": []},
+        # an unknown method is dropped
+        "Region": {"text": "EMEA", "method": "guessed", "inputs": ["Hq"]},
+        "Kept": {"text": "12", "method": "calculated", "inputs": ["Start", "End"]},
+    }
+    assert _normalize_leaf_provenance(values) == 1  # Months: a claim naming nothing
+    assert values["Grace"] == {"text": "0", "method": "defaulted"}
+    assert values["Months"] == {"text": "12"}
+    assert values["Region"] == {"text": "EMEA", "inputs": ["Hq"], "method": "inferred"}
+    assert values["Kept"] == {"text": "12", "method": "calculated", "inputs": ["Start", "End"]}
 
 
 def test_normalize_leaf_provenance_filters_and_defaults() -> None:
@@ -2526,9 +2932,23 @@ def test_normalize_leaf_provenance_filters_and_defaults() -> None:
     }
     _normalize_leaf_provenance(values)
     assert values["A"] == {"text": "x", "locations": [{"page_number": 1}]}
-    assert values["B"] == {"text": "y", "computed": True, "derived_from": ["ok"]}
+    assert values["B"] == {"text": "y", "inputs": ["ok"], "method": "inferred"}
     assert values["C"] == {"text": "z"}
     assert values["Nested"][0]["D"]["locations"] == [{"page_number": 2}]
+
+
+def test_normalize_leaf_provenance_empty_inputs_keep_legacy_refs() -> None:
+    """A model mixing shapes (``inputs: []`` or ``null`` beside 0.7
+    ``derived_from``) keeps the legacy paths rather than losing them."""
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "A": {"text": "x", "inputs": [], "derived_from": ["B"], "computed": True},
+        "C": {"text": "y", "inputs": None, "derived_from": ["B"]},
+    }
+    assert _normalize_leaf_provenance(values) == 0
+    assert values["A"] == {"text": "x", "inputs": ["B"], "method": "inferred"}
+    assert values["C"] == {"text": "y", "inputs": ["B"], "method": "inferred"}
 
 
 def test_expand_refs_specializes_value_enum_and_carries_annotations() -> None:
@@ -3306,14 +3726,15 @@ def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Wo
     assert result.values["title"]["locations"] == [
         {"page_number": 1, "bounding_box": [10, 20, 30, 40]}
     ]
-    assert result.values["subtitle"]["text"] == "Farewell"
-    assert result.values["subtitle"]["locations"] == [{"page_number": 2}]
+    # Cited on a page the file doesn't have, so never boxed: dropped.
+    assert "subtitle" not in result.values
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None and stats["outcome"] == "ok"
     assert stats["phases"]["phase3"]["page_calls"] == 1
     assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
     assert stats["matching"]["matched_phase3"] == 1
     assert stats["matching"]["unmatched"] == 1
+    assert stats["matching"]["dropped_unboxed_values"] == 1
 
 
 def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
@@ -3333,11 +3754,11 @@ def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
         result = extract_values(workspace, ds_id, fid, config=config)
 
     assert mock_completion.call_count == 1
-    assert result.values["title"]["locations"] == [{"page_number": 3}]
-    # Persisted like any other unresolved leaf: the text is kept, a location
-    # without a box is not written, so it reads back with no locations.
+    # Like any printed value grounding couldn't box, it is dropped rather
+    # than written with no dg:origin.
+    assert "title" not in result.values
     xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
-    assert dgml_xml_to_values(xml)["title"] == {"text": "Hello world", "locations": []}
+    assert dgml_xml_to_values(xml) == {}
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None and stats["outcome"] == "ok"
     assert stats["phases"]["phase3"]["page_calls"] == 0
