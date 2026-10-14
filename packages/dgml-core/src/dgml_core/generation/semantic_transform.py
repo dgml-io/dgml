@@ -14,9 +14,9 @@
 
 Public API:
     transform_docset(input_dir, docset_json, workspace, output_dir,
-                     *, extra_formats, xhtml_tables, output_paths) -> int
+                     *, extra_formats, xhtml_tables, output_paths, date_order) -> int
     transform_file(xml_text, output_path, *,
-                   header, extra_formats, shared_tags) -> bool
+                   header, extra_formats, shared_tags, date_order) -> bool
     build_header(org, docset_name, docset_id) -> str
     docset_slug(name) -> str
     compute_shared_tags(input_dir, docset_json) -> frozenset[str]
@@ -126,9 +126,16 @@ def _safe_parse(xml_text: str) -> Any:
 _MAX_LEN = 40
 
 _DATE_PATTERN = re.compile(
-    r"^(?:(?P<MDY>\d{4}[-\/.\s]\d{1,2}[-\/.\s]\d{1,2})|"
-    r"(?P<DMY>\d{1,2}[-\/.\s]\d{1,2}[-\/.\s]\d{4}))$"
+    r"^(?:(?P<YEAR_FIRST>\d{4}[-\/.\s]\d{1,2}[-\/.\s]\d{1,2})|"
+    r"(?P<YEAR_LAST>\d{1,2}[-\/.\s]\d{1,2}[-\/.\s]\d{4}))$"
 )
+# Day/month reading of a year-last numeric date ("01/11/2024"), which the text
+# alone cannot settle. "DMY" (day-first) is the default and the long-standing
+# behaviour; "MDY" (month-first) suits a corpus known to be US-style. Either
+# way, a date the preferred order rejects ("10/31/2024" read day-first) is
+# parsed in the other order, since a day above 12 leaves only one reading.
+DATE_ORDERS: tuple[str, ...] = ("DMY", "MDY")
+DEFAULT_DATE_ORDER = "DMY"
 # Cheap pre-filter for _normalize_date: dateparser is very slow (per-call locale
 # sweeps), so only invoke it for strings that could actually be an absolute date —
 # a month name, a two-separator numeric date, or an ``M/YYYY``. Under the STRICT
@@ -179,10 +186,13 @@ _XHTML_TABLE_TYPES = frozenset(
 
 
 def _detect_year_position(date_str: str) -> str | None:
+    """``"YEAR_FIRST"`` for ``2024-11-01``, ``"YEAR_LAST"`` for ``01/11/2024``,
+    ``None`` for anything that is not a two-separator numeric date. Says nothing
+    about day/month order; that is what ``date_order`` decides."""
     m = _DATE_PATTERN.match(date_str)
     if not m:
         return None
-    return "MDY" if m.group("MDY") else "DMY"
+    return "YEAR_FIRST" if m.group("YEAR_FIRST") else "YEAR_LAST"
 
 
 def _normalize_date(s: str, prefer_day_first: bool = False) -> str | None:
@@ -227,11 +237,14 @@ def _clean_numeric(num: str) -> str:
 def _detect_value_type(
     text: str,
     extra_formats: bool,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> tuple[str | None, str | None, str | None]:
     """Return ``(xsi_type, dg_value, dg_format)`` for *text*, or all-None.
 
     *xsi_type* maps to a standard XSD built-in type (always emitted).
     *dg_format* carries extra hints (emitted only when *extra_formats* is True).
+    *date_order* is the day/month reading of a year-last numeric date, one of
+    :data:`DATE_ORDERS`.
     """
     s = text.strip()
     if not s or len(s) > _MAX_LEN:
@@ -250,15 +263,16 @@ def _detect_value_type(
         if 1900 <= year <= 2100:
             return "gYear", m.group(1), None
 
-    # _detect_year_position only tells us where the year sits ("MDY" = year
-    # first, "DMY" = year last); it says nothing about day/month order. A
-    # year-last numeric date is ambiguous ("11/1/2024"), and business documents
-    # are overwhelmingly month-first, so try MDY first and fall back to DMY
-    # only when MDY cannot parse (e.g. "31/10/2024").
+    # A year-last numeric date ("01/11/2024") is read in the configured
+    # *date_order*; year-first and spelled-out dates are unambiguous and parse
+    # as before. When the preferred order cannot parse it ("10/31/2024"
+    # day-first, "31/10/2024" month-first) the date is unambiguous in the other
+    # order, so read it that way rather than emit no typed value at all.
     year_pos = _detect_year_position(s)
-    date_val = _normalize_date(s, prefer_day_first=False)
-    if date_val is None and year_pos == "DMY":
-        date_val = _normalize_date(s, prefer_day_first=True)
+    day_first = year_pos == "YEAR_LAST" and date_order == "DMY"
+    date_val = _normalize_date(s, prefer_day_first=day_first)
+    if date_val is None and year_pos == "YEAR_LAST":
+        date_val = _normalize_date(s, prefer_day_first=not day_first)
     if date_val:
         return "date", date_val, None
 
@@ -380,12 +394,15 @@ def _transform_element(
     xhtml_tables: bool = False,
     shared_tags: frozenset[str] | None = None,
     depth: int = 0,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> None:
     original_tag = el.tag
     raw_structure = el.get("structure")
 
     for child in list(el):
-        _transform_element(child, root, extra_formats, xhtml_tables, shared_tags, depth + 1)
+        _transform_element(
+            child, root, extra_formats, xhtml_tables, shared_tags, depth + 1, date_order
+        )
 
     if shared_tags is None or original_tag in shared_tags:
         sem = f"docset:{original_tag}"
@@ -404,7 +421,7 @@ def _transform_element(
             el.set("structure", f"h{level}")
 
     if el.text and original_tag != "lim":
-        xsi_type, dg_value, dg_format = _detect_value_type(el.text, extra_formats)
+        xsi_type, dg_value, dg_format = _detect_value_type(el.text, extra_formats, date_order)
         if xsi_type:
             el.set("xsi:type", xsi_type)
         if dg_value:
@@ -462,6 +479,7 @@ def transform_file(
     extra_formats: bool = True,
     xhtml_tables: bool = False,
     shared_tags: frozenset[str] | None = None,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> bool:
     """Transform one DGML XML string and write the result to *output_path*.
 
@@ -472,6 +490,8 @@ def transform_file(
     *extra_formats=False* suppresses ``dg:format`` attributes.
     *xhtml_tables=True* emits table-structure elements as ``xhtml:td`` etc.
     with the semantic name in a ``semantic`` attribute (default: off).
+    *date_order* is the day/month reading of year-last numeric dates (one of
+    :data:`DATE_ORDERS`).
     """
     try:
         root = ET.fromstring(xml_text)
@@ -488,7 +508,7 @@ def transform_file(
             logger.warning("[skip] XML parse error: %s", exc)
             return False
 
-    _transform_element(root, root, extra_formats, xhtml_tables, shared_tags)
+    _transform_element(root, root, extra_formats, xhtml_tables, shared_tags, date_order=date_order)
     ET.ElementTree(root).write(output_path, encoding="utf-8", method="xml", xml_declaration=True)
 
     content = output_path.read_text(encoding="utf-8")
@@ -507,6 +527,7 @@ def transform_docset(
     extra_formats: bool = True,
     xhtml_tables: bool = False,
     output_paths: dict[str, Path] | None = None,
+    date_order: str = DEFAULT_DATE_ORDER,
 ) -> int:
     """Encode the plain ``.xml`` files in *input_dir* into namespaced DGML.
 
@@ -548,6 +569,7 @@ def transform_docset(
             extra_formats=extra_formats,
             xhtml_tables=xhtml_tables,
             shared_tags=shared,
+            date_order=date_order,
         ):
             ok += 1
     return ok

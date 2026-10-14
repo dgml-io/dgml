@@ -253,6 +253,19 @@ def test_load_config_invalid_when_grounded_not_object(workspace: Workspace) -> N
         load_grounded_config(workspace)
 
 
+def test_load_config_reads_generation_date_order(workspace: Workspace) -> None:
+    """``date_order`` lives under ``[generation]`` and is shared with the document
+    render; the grounded config carries it so extraction types dates the same way."""
+    from .conftest import write_config
+
+    grounded = {"schema_model": DEFAULT_SCHEMA_MODEL, "values_model": DEFAULT_VALUES_MODEL}
+    write_config(workspace, {"grounded": grounded})
+    assert load_grounded_config(workspace).date_order == "DMY"
+
+    write_config(workspace, {"grounded": grounded, "generation": {"date_order": "MDY"}})
+    assert load_grounded_config(workspace).date_order == "MDY"
+
+
 def test_load_config_missing_model_without_tier(workspace: Workspace) -> None:
     # One model set on the section, the other neither overridden nor tiered.
     _write_grounded_config(workspace, {"values_model": DEFAULT_VALUES_MODEL})

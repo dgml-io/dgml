@@ -871,7 +871,9 @@ credentials (`api_key`/`api_key_env`/`api_base` for transcription,
 name different providers. Anthropic extended thinking is off for both passes
 unless `generation.thinking = "adaptive"` says otherwise — a Claude 4.6+/5 model
 thinks adaptively when a request omits the field, so the mode is stated rather
-than inherited. See the [`generation` config
+than inherited. A year-last numeric date (`01/11/2024`) in a typed value is read
+day-first unless `generation.date_order = "MDY"` says month-first; a date the
+configured order cannot read is read the other way. See the [`generation` config
 section](storage-layout.md#generation-required-for-dgml-docset-generate).
 | `--window-size <n>` | `10` | Pages per transcription window. |
 | `--temperature <f>` | `0.0` | LLM temperature. |

@@ -62,6 +62,7 @@ from dgml_core.errors import (
     GenerationConfigMissing,
     short_error_message,
 )
+from dgml_core.generation.semantic_transform import DATE_ORDERS, DEFAULT_DATE_ORDER
 from dgml_core.models_config import ConfigSection, Tier, resolve_tiered_model
 from dgml_core.storage import Workspace
 
@@ -118,6 +119,30 @@ class GenerationConfig:
     # model is a Claude 5 model and those think adaptively unless told not to —
     # see the note on :data:`DEFAULT_THINKING`. Ignored for non-Anthropic models.
     thinking: str = DEFAULT_THINKING
+    # Day/month reading of a year-last numeric date ("01/11/2024") in the typed
+    # ``dg:value`` the render emits, one of
+    # :data:`~dgml_core.generation.semantic_transform.DATE_ORDERS`. Also read by
+    # the grounded extraction config (:func:`resolve_date_order`), so a
+    # document's extracted values and its document tree agree on the same date.
+    date_order: str = DEFAULT_DATE_ORDER
+
+
+def resolve_date_order(merged: dict[ConfigSection, Any]) -> str:
+    """Read ``[generation] date_order``, defaulting to :data:`DEFAULT_DATE_ORDER`.
+
+    One key for both consumers: the document render (``docset generate``) and the
+    extraction writer type year-last numeric dates with the same detector, and
+    the same document must be read the same way by both.
+    """
+    section = merged.get(ConfigSection.GENERATION) or {}
+    if not isinstance(section, dict):
+        return DEFAULT_DATE_ORDER
+    value = section.get("date_order", DEFAULT_DATE_ORDER)
+    if value not in DATE_ORDERS:
+        raise GenerationConfigInvalid(
+            f"'generation.date_order' must be one of {list(DATE_ORDERS)} (got {value!r})"
+        )
+    return str(value)
 
 
 def _resolve_thinking(merged: dict[ConfigSection, Any]) -> str:
@@ -170,6 +195,7 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
     )
     return GenerationConfig(
         thinking=_resolve_thinking(merged),
+        date_order=resolve_date_order(merged),
         model=transcribe.model,
         label_model=label.model,
         api_key=transcribe.api_key,

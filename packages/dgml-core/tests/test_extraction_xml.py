@@ -1017,3 +1017,30 @@ def test_invariant_under_a_single_root_is_checked_unqualified() -> None:
     assert violations == [
         "DocumentTotal: expected sum(LineItems[].LineAmount) = 349.85, got 500.00"
     ]
+
+
+_DATE_RNC = """\
+namespace docset = "http://www.dgml.io/acme/contracts#"
+
+EffectiveDate =
+  element docset:EffectiveDate {
+    xsd:date
+  }
+"""
+
+
+@pytest.mark.parametrize(("date_order", "expected"), [("DMY", "2024-01-11"), ("MDY", "2024-11-01")])
+def test_declared_date_follows_date_order(date_order: str, expected: str) -> None:
+    """A year-last numeric date is typed in the configured order, the same
+    ``[generation] date_order`` the document render reads, so the extraction
+    and the tree never disagree on one document's dates."""
+    vocab = parse_rnc(_DATE_RNC)
+    values = {"EffectiveDate": {"text": "11/1/2024", "locations": []}}
+    xml = standalone_extraction_doc(values, vocab=vocab, date_order=date_order)
+    assert f'<docset:EffectiveDate xsi:type="date" dg:value="{expected}"' in xml
+
+
+def test_declared_date_default_is_day_first() -> None:
+    vocab = parse_rnc(_DATE_RNC)
+    values = {"EffectiveDate": {"text": "11/1/2024", "locations": []}}
+    assert 'dg:value="2024-01-11"' in standalone_extraction_doc(values, vocab=vocab)

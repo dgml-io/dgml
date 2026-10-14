@@ -46,6 +46,7 @@ from dgml_core.generation.label import (
 )
 from dgml_core.generation.render import render_xml
 from dgml_core.generation.schema import Schema
+from dgml_core.generation.semantic_transform import DEFAULT_DATE_ORDER
 from dgml_core.generation.to_semantic import (
     render_dgml,
     render_semantic_xml,
@@ -136,6 +137,10 @@ class ConvertOptions:
     # model's own default in force (adaptive, on Claude 4.6+/5). The CLI passes
     # ``[generation] thinking``, which defaults to ``"disabled"``.
     thinking: str | None = None
+    # Day/month reading of a year-last numeric date ("01/11/2024") in the final
+    # render's typed dg:value: "DMY" (default) or "MDY". The CLI passes
+    # ``[generation] date_order``.
+    date_order: str = DEFAULT_DATE_ORDER
     cache_dir: Path | str | None = None
     # document name → its page_text/ dir (per-page word JSONs written before
     # generation). When a document has one, each transcription window is
@@ -390,7 +395,11 @@ def convert_batch(
         name, blocks = item
         if opts.dgml_header:
             xml = render_dgml(
-                blocks, header=opts.dgml_header, parent_map=opts.parent_map, vocab=vocab
+                blocks,
+                header=opts.dgml_header,
+                date_order=opts.date_order,
+                parent_map=opts.parent_map,
+                vocab=vocab,
             )
         else:
             xml = render_semantic_xml(blocks)
@@ -433,7 +442,11 @@ def convert_batch(
         changed: list[tuple[str, str]] = []
         for name, blocks in prior_docs.items():
             xml = render_dgml(
-                blocks, header=opts.dgml_header, parent_map=opts.parent_map, vocab=vocab
+                blocks,
+                header=opts.dgml_header,
+                date_order=opts.date_order,
+                parent_map=opts.parent_map,
+                vocab=vocab,
             )
             if prior_outputs is not None and prior_outputs.get(name) == xml:
                 continue
