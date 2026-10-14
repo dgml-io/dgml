@@ -79,6 +79,10 @@ from dgml_core.storage import Workspace
 # default.
 DEFAULT_THINKING = "disabled"
 
+# Pass A wire formats; see ``GenerationConfig.transcription``.
+TRANSCRIPTION_MODES = ("text", "lines")
+DEFAULT_TRANSCRIPTION = "text"
+
 
 @dataclass(frozen=True)
 class GenerationConfig:
@@ -118,6 +122,25 @@ class GenerationConfig:
     # model is a Claude 5 model and those think adaptively unless told not to —
     # see the note on :data:`DEFAULT_THINKING`. Ignored for non-Anthropic models.
     thinking: str = DEFAULT_THINKING
+    # How Pass A is asked for a window: ``"text"`` -- the model copies the
+    # text into typed block lines; ``"lines"`` -- the model assigns structure
+    # to the numbered lines of the text layer and the text is copied from the
+    # page (``dgml_core.generation.lines``). ``lines`` needs a text layer and
+    # falls back to ``text`` window by window where a page has none.
+    transcription: str = DEFAULT_TRANSCRIPTION
+
+
+def _resolve_transcription(merged: dict[ConfigSection, Any]) -> str:
+    """Read ``[generation] transcription``, defaulting to :data:`DEFAULT_TRANSCRIPTION`."""
+    section = merged.get(ConfigSection.GENERATION) or {}
+    if not isinstance(section, dict):
+        return DEFAULT_TRANSCRIPTION
+    value = section.get("transcription", DEFAULT_TRANSCRIPTION)
+    if value not in TRANSCRIPTION_MODES:
+        raise GenerationConfigInvalid(
+            f"'generation.transcription' must be one of {list(TRANSCRIPTION_MODES)} (got {value!r})"
+        )
+    return str(value)
 
 
 def _resolve_thinking(merged: dict[ConfigSection, Any]) -> str:
@@ -170,6 +193,7 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
     )
     return GenerationConfig(
         thinking=_resolve_thinking(merged),
+        transcription=_resolve_transcription(merged),
         model=transcribe.model,
         label_model=label.model,
         api_key=transcribe.api_key,

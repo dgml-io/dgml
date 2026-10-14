@@ -624,6 +624,7 @@ def ensure_complete(
     log: Callable[[str], None] = lambda _m: None,
     id_prefix: str = "f",
     window_starts: list[int] | None = None,
+    fill: bool = True,
 ) -> tuple[list[Block], dict[str, Any]]:
     """Return the blocks made complete against the page text, and a report.
 
@@ -631,6 +632,9 @@ def ensure_complete(
     the model; its blocks are used only if they claim the region's words.
     ``window_starts`` -- the index in *blocks* at which each transcription
     window's output begins -- lets overlap duplicates be removed by position.
+    With *fill* off, regions are reported but not filled or rescued: the
+    caller's transcription is complete by construction (structure over
+    text-layer lines) and the pass is a check and a dedupe only.
     """
     pages = load_page_words_dir(page_text_dir)
     if not pages or not blocks:
@@ -648,7 +652,8 @@ def ensure_complete(
     dups = len(dropped) - fabricated
     if late:
         al = align_blocks(blocks, pages)
-    regions = find_regions(al, pages)
+    regions = find_regions(al, pages) if fill else []
+    reported = find_regions(al, pages) if not fill else regions
 
     # Fill regions. Whole pages may go to the model first; everything else, and
     # any rescue that fails to claim its page, comes from the text layer.
@@ -702,6 +707,7 @@ def ensure_complete(
         )
     report = {
         "pages": per_page,
+        "filled": fill,
         "regions": [
             {
                 "page": r.page,
@@ -713,7 +719,7 @@ def ensure_complete(
                 "blocks": len(r.blocks),
                 "begins": r.first_words,
             }
-            for r in regions
+            for r in reported
         ],
         "dropped": {"duplicates": dups, "fabricated": fabricated},
         "dropped_blocks": dropped,

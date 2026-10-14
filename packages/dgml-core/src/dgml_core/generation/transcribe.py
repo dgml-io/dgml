@@ -34,6 +34,7 @@ from typing import Any
 
 from dgml_core import llm
 from dgml_core.generation import coverage, document
+from dgml_core.generation import lines as lines_mod
 from dgml_core.generation.blocks import (
     Block,
     Span,
@@ -147,6 +148,7 @@ def strip_fences(text: str) -> str:
 # (:func:`parse_window_any`), so legacy JSON replies — including cached raw
 # ``*_wNN_raw.json`` artifacts from older runs — keep parsing unchanged.
 SYSTEM_PROMPT = prompt("transcribe_system_compact")
+SYSTEM_PROMPT_LINES = prompt("transcribe_system_lines")
 
 
 def _heading_breadcrumb(blocks: list[Block]) -> list[str]:
@@ -200,6 +202,23 @@ def _window_instruction(first_page: int, last_page: int, total: int, context: st
     if context:
         parts.append(prompt("transcribe_window_context").format(context=context))
     parts.append(prompt("transcribe_window_compact"))
+    return "\n\n".join(parts)
+
+
+def _lines_instruction(
+    first_page: int, last_page: int, total: int, context: str, listing: str
+) -> str:
+    parts = [
+        prompt("transcribe_lines_header").format(
+            first=first_page + 1,
+            last=last_page + 1,
+            total=total,
+            n_lines=listing.count("\nL") + (1 if listing.startswith("L") else 0),
+        )
+    ]
+    if context:
+        parts.append(prompt("transcribe_window_context").format(context=context))
+    parts.append("Numbered lines:\n" + listing)
     return "\n\n".join(parts)
 
 
@@ -489,6 +508,9 @@ def _append_continuation(blocks: list[Block], continuation: str) -> None:
 _GATE_RECALL = 0.85
 _GATE_MIN_TOKENS = 50
 _GATE_RETRIES = 1
+# Lines mode: a window whose best attempt still leaves this many lines
+# unaccounted for gets one rescue call over just those lines.
+_LINES_RESCUE_MIN = 6
 
 
 def _tokens(text: str) -> list[str]:
@@ -585,8 +607,18 @@ def transcribe_document(
     pdf_config: PdfConfig | None = None,
     window_overlap: int = 1,
     complete: bool = True,
+    transcription: str = "text",
 ) -> list[Block]:
     """Transcribe one document into a flat block list (Pass A).
+
+    *transcription* picks the wire format: ``"text"`` has the model copy the
+    text into typed block lines; ``"lines"`` shows the model the numbered
+    lines of the pages' text layer and has it assign structure to line ids,
+    the text being copied from the page (:mod:`dgml_core.generation.lines`).
+    ``lines`` needs *page_text_dir*; a window with a page that has no usable
+    text layer is asked in the text format instead. In lines mode windows do
+    not overlap (line ids make the join exact) and a line the model left
+    unaccounted for is filled in as a plain block before the window is kept.
 
     Windows overlap by *window_overlap* page(s): the page a window skips at
     its start is then also the previous window's last page, and the
@@ -620,9 +652,22 @@ def transcribe_document(
         log(f"{doc_name}: reusing cached transcription ({len(cached)} block(s))")
         return cached
     total = _count_pages(pdf_bytes)
-    overlap = max(0, min(window_overlap, window_size - 1))
+    lines_mode = transcription == "lines" and page_text_dir is not None
+    page_words: dict[int, Any] = {}
+    if lines_mode:
+        from dgml_core.generation import completeness
+
+        page_words = completeness.load_page_words_dir(page_text_dir)
+        doc_vocab = lines_mod.document_vocabulary(page_words)
+        if not page_words:
+            log(f"{doc_name}: no text layer; transcribing in the text format")
+            lines_mode = False
+    overlap = 0 if lines_mode else max(0, min(window_overlap, window_size - 1))
     windows = document.iter_windows(total, window_size, overlap=overlap)
-    log(f"{doc_name}: {total} pages → {len(windows)} window(s)")
+    log(
+        f"{doc_name}: {total} pages → {len(windows)} window(s)"
+        + (" [structure over text-layer lines]" if lines_mode else "")
+    )
     page_tokens = _page_token_lists(page_text_dir)
     # Index in `blocks` at which each window's output begins; the completeness
     # pass uses it to remove the overlap page's second transcription.
@@ -644,16 +689,41 @@ def transcribe_document(
             # `total` was counted once for this document above; passing it keeps
             # each window from re-walking the whole page tree.
             pdf_slice = document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total)
-            instr = _window_instruction(pages[0], pages[-1], total, context)
             exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
+            # Lines mode for this window only when every page has a text layer.
+            wlines: list[lines_mod.TextLine] = []
+            if lines_mode and all(
+                len(page_words.get(p + 1, ([], None))[0]) >= lines_mod.MIN_PAGE_WORDS for p in pages
+            ):
+                wlines = lines_mod.window_lines(page_words, [p + 1 for p in pages])
+            if wlines:
+                listing = lines_mod.render_listing(wlines)
+                cache_write(cache_dir, f"{stem}_{wfile}_lines.txt", listing, debug=debug)
+                instr = _lines_instruction(pages[0], pages[-1], total, context, listing)
+                system_prompt = SYSTEM_PROMPT_LINES
+            else:
+                if lines_mode:
+                    log(f"{doc_name} {wlog}: a page has no text layer; asking in the text format")
+                instr = _window_instruction(pages[0], pages[-1], total, context)
+                system_prompt = SYSTEM_PROMPT
             n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)
             found: tuple[float, str, dict[str, Any]] | None = None
+            found_lines: lines_mod.LinesResult | None = None
             for attempt in range(n_attempts):
                 # Retry-nudge: at temperature 0 an identical retry tends to
                 # reproduce the same early stop, so tell the model what its
                 # previous attempt missed instead of re-rolling the same call.
                 attempt_instr = instr
-                if attempt > 0:
+                if attempt > 0 and wlines and found_lines is not None:
+                    attempt_instr = (
+                        instr
+                        + "\n\n"
+                        + prompt("transcribe_lines_retry").format(
+                            missing=lines_mod.describe_unassigned(found_lines.unassigned(wlines)),
+                            n_lines=len(wlines),
+                        )
+                    )
+                elif attempt > 0:
                     attempt_instr = (
                         instr
                         + "\n\n"
@@ -665,7 +735,7 @@ def transcribe_document(
                     )
                 raw = llm.call_continued(
                     config,
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     user_content=llm.build_user_content(
                         instruction_text=attempt_instr, pdf_bytes=pdf_slice
                     ),
@@ -678,6 +748,35 @@ def transcribe_document(
                     strip_fences(raw),
                     debug=debug,
                 )
+                if wlines and strip_fences(raw).lstrip().startswith("{"):
+                    # The model answered in the text format (copied text as
+                    # JSON) despite the lines prompt. Keep the window as a
+                    # text-format window: parse it as such and gate it on
+                    # word recall; no line accounting is possible.
+                    log(f"{doc_name} {wlog}: text-format reply to the lines prompt; kept as text")
+                    wlines_attempt_text = True
+                else:
+                    wlines_attempt_text = False
+                if wlines and not wlines_attempt_text:
+                    res = lines_mod.build_payload(strip_fences(raw), wlines, doc_vocab)
+                    recall = res.recall(wlines)
+                    if res.malformed or res.unknown_refs or res.literal_fields:
+                        log(
+                            f"{doc_name} {wlog}: lines reply: {res.malformed} malformed line(s), "
+                            f"{res.unknown_refs} unknown/duplicate ref(s), "
+                            f"{res.literal_fields} literal field(s)"
+                        )
+                    if found is None or recall > found[0]:
+                        found = (recall, raw, res.payload)
+                        found_lines = res
+                    if recall >= _GATE_RECALL:
+                        break
+                    log(
+                        f"{doc_name} {wlog}: {len(res.unassigned(wlines))} of {len(wlines)} "
+                        f"lines unaccounted for ({recall:.0%} of the words)"
+                        + ("; retrying window" if attempt + 1 < n_attempts else "")
+                    )
+                    continue
                 try:
                     payload = parse_window_any(raw, log=lambda m: log(f"{doc_name} {wlog}: {m}"))
                 except json.JSONDecodeError as exc:
@@ -704,6 +803,60 @@ def transcribe_document(
                     f"{recall:.0%} of the pages' words"
                     + ("; retrying window" if attempt + 1 < n_attempts else "")
                 )
+            if (
+                wlines
+                and found is not None
+                and found_lines is not None
+                and found[2] is found_lines.payload
+            ):
+                # A span the model skipped is asked for on its own: the
+                # sub-listing of just those lines, same pages attached. A
+                # tiny reply, and precise where a page split is not.
+                missing = found_lines.unassigned(wlines)
+                if len(missing) >= _LINES_RESCUE_MIN:
+                    sub = lines_mod.render_listing(missing)
+                    rescue_instr = (
+                        prompt("transcribe_lines_remaining").format(
+                            first=pages[0] + 1,
+                            last=pages[-1] + 1,
+                            total=total,
+                            n_lines=len(missing),
+                            missing=lines_mod.describe_unassigned(missing),
+                        )
+                        + "\n\nNumbered lines:\n"
+                        + sub
+                    )
+                    raw = llm.call_continued(
+                        config,
+                        system_prompt=SYSTEM_PROMPT_LINES,
+                        user_content=llm.build_user_content(
+                            instruction_text=rescue_instr, pdf_bytes=pdf_slice
+                        ),
+                        cache=True,
+                    )
+                    cache_write(
+                        cache_dir, f"{stem}_{wfile}_rescue_raw.json", strip_fences(raw), debug=debug
+                    )
+                    extra = lines_mod.build_payload(strip_fences(raw), missing, doc_vocab)
+                    got = len(extra.assigned | extra.decorations)
+                    log(
+                        f"{doc_name} {wlog}: rescue over {len(missing)} skipped line(s) "
+                        f"accounted for {got}"
+                    )
+                    lines_mod.merge_results(found_lines, extra)
+                # Whatever is still unaccounted for is filled from the text
+                # layer here, so the window is complete by construction.
+                filled = lines_mod.complete_payload(found_lines, wlines, doc_vocab)
+                moved = lines_mod.order_by_lines(found_lines)
+                if moved:
+                    log(f"{doc_name} {wlog}: {moved} block(s) put back in page order")
+                n_dec = len(found_lines.decorations)
+                log(
+                    f"{doc_name} {wlog}: {len(wlines)} lines → "
+                    f"{len(found_lines.payload['blocks'])} block(s), {n_dec} decoration(s)"
+                    + (f", {filled} line(s) filled from the text layer" if filled else "")
+                )
+                found = (1.0 if filled else found[0], found[1], found_lines.payload)
             return found
 
         for w_idx, page_indices in enumerate(windows):
@@ -748,7 +901,7 @@ def transcribe_document(
             # With overlap, a window's first page is also the previous window's
             # last, so a "continues" tail would complete text that is already
             # there in full.
-            if not (window_overlap and w_idx):
+            if not (overlap and w_idx):
                 _append_continuation(blocks, str(payload.get("continues", "") or ""))
             kept = 0
             window_starts.append(len(blocks))
@@ -799,6 +952,9 @@ def transcribe_document(
                 rescue=rescue_page,
                 log=lambda m: log(f"{doc_name}: {m}"),
                 window_starts=window_starts,
+                # Structure over lines is complete by construction; the pass
+                # then only checks, reports and removes duplicates.
+                fill=not lines_mode,
             )
             cache_write(
                 cache_dir,
