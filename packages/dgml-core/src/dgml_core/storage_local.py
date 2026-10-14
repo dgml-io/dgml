@@ -47,8 +47,10 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import os
 import shutil
 import tempfile
+import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -163,6 +165,21 @@ class LocalStore(BlobStore, DocStore):
                 f"against"
             )
         return dataclasses.replace(config, root=path)
+
+    # One appender at a time, process-wide. Python's append mode is not an
+    # atomic append on Windows: two handles opened on the same file each seek
+    # to the end they saw and the later write lands on the earlier one, so a
+    # thread pool writing usage rows lost some of them with no error (8
+    # workers, 24 rows: 20 to 23 arrived). POSIX O_APPEND is atomic for rows
+    # this size, which is why Linux CI never saw it. The lock is one per
+    # process rather than per store because ``functools.cached_property`` no
+    # longer serializes first access (3.12+): two threads touching
+    # ``Workspace.docs`` at once can each build a store, and per-instance
+    # locks would not see each other. Appends are tiny, so one lock for every
+    # store in the process costs nothing. Concurrent processes are not covered.
+    # A forked child gets a fresh lock (below), as ``logging`` does, so a fork
+    # taken while another thread holds it does not inherit it held.
+    _append_lock = threading.Lock()
 
     def __init__(self, config: StorageConfig) -> None:
         self._root = Path(config.root)
@@ -410,7 +427,7 @@ class LocalStore(BlobStore, DocStore):
         # newline="" as in the atomic writers: a log this code creates or
         # rewrites uses LF on every platform. An existing CRLF log is not
         # normalized for an append; the appended row is LF.
-        with path.open("a", encoding="utf-8", newline="") as fh:
+        with self._append_lock, path.open("a", encoding="utf-8", newline="") as fh:
             fh.write(line + "\n")
 
     def get_doc(self, collection: str, doc_id: str) -> dict[str, Any] | None:
@@ -508,3 +525,11 @@ class LocalStore(BlobStore, DocStore):
         if not isinstance(obj, dict):
             raise ValueError(f"document {path} is not a JSON object")
         return obj
+
+
+def _reset_append_lock() -> None:
+    LocalStore._append_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only; Windows has no fork
+    os.register_at_fork(after_in_child=_reset_append_lock)

@@ -38,6 +38,17 @@ extraction_schema_user_intro_single: |-
 extraction_schema_user_intro_multi: |-
   Given the {n_files} attached PDFs (all of the same kind), propose an extraction schema that captures the structured information someone would want to extract from documents of this kind. The schema you return must fit ALL of the attached files — favor what generalizes across instances over fields that only appear in one.
 
+# Added after the intro only when the provider refused the request as too
+# large and some samples are sent as their leading pages. .format()'d with
+# {excerpts}, one "- Sample N (pages 1-K of M)" line per partial sample.
+extraction_schema_user_excerpts: |-
+  Some of the samples were too large to send whole, so only their leading
+  pages are attached:
+  {excerpts}
+  Fields that appear only later in those documents may be missing from what
+  you can see. Do not conclude a field is absent from this kind of document
+  just because an excerpt ends before it.
+
 extraction_schema_user_body: |-
   Return the schema by calling ``submit_schema`` with ``fields`` — the list
   of top-level field nodes. Each node is an object:
@@ -297,6 +308,44 @@ extraction_values_phase1_retry_chunked: |-
   Computed fields that derive from array entries (sums, counts) go in
   the first ``submit_values`` call — their ``derived_from`` paths may
   reference entries appended afterwards.
+
+# Added to the phase-1 user prompt, ahead of the PDF, only when the provider
+# refused the whole document as too large and it is sent as page-range parts
+# (each extracted separately, then merged in code). .format()'d with
+# {first_page}, {last_page}, {total_pages}.
+extraction_values_phase1_part: |-
+  DOCUMENT PART. This {total_pages}-page document is too large for one
+  request, so it is sent in page-range parts that are extracted separately
+  and merged afterwards. The attached PDF holds only pages
+  {first_page}-{last_page} of the document.
+
+  - Extract the values that appear on these pages. Leave out any field
+    whose value is not on these pages (another part supplies it) instead
+    of guessing it or submitting it empty.
+  - For arrays, submit only the entries that appear on these pages, in
+    document order.
+  - Computed fields may derive only from values on these pages.
+  - Give every ``page_number`` relative to the attached PDF: its first
+    page is page 1 (page {first_page} of the full document).
+
+# Sent as a user turn when a phase-1 reply carries no tool call (plain text
+# instead of a submission), before the loop retries the model. Phase 1 offers
+# only submit_values (plus append_entries when chunked), so name no other tool.
+extraction_values_phase1_nudge_submit: |-
+  Your last reply contained no tool call. Extraction results are only
+  read from tool calls; text replies are discarded. Do not answer in
+  prose and do not ask questions. Call ``submit_values`` with the final
+  values, following the schema exactly.
+
+# The same reminder for a chunked run that already recorded a submit_values
+# call with done=false: it must continue the sequence, not resend the tree.
+extraction_values_phase1_nudge_continue: |-
+  Your last reply contained no tool call. Extraction results are only
+  read from tool calls; text replies are discarded. Do not answer in
+  prose and do not ask questions. Your earlier submissions are already
+  recorded; do not resubmit them. Continue with ``append_entries``,
+  sending only entries you have not sent yet, and set ``done: true`` on
+  the final call.
 
 # ── Grounded extraction: value extraction, phase 3 (attach bounding boxes) ────
 # The OCR word listing is rendered as a compact TOON table (see dgml_core.toon):

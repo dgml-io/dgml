@@ -321,6 +321,10 @@ class FileStore:
         different drive on Windows), which ``os.path.relpath`` signals with
         ``ValueError``.
         """
+        if self.ws.configuration is not None:
+            # No portable root to be relative to (it may be a scratch dir); the
+            # absolute path is the truthful record, and `original_filename` has the name.
+            return str(source_path)
         try:
             return os.path.relpath(source_path, self.ws.root)
         except ValueError:

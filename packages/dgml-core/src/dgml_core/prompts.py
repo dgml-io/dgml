@@ -47,12 +47,16 @@ class PromptKey(StrEnum):
     SCHEMA_USER_INTRO_SINGLE = "extraction_schema_user_intro_single"
     SCHEMA_USER_INTRO_MULTI = "extraction_schema_user_intro_multi"
     SCHEMA_USER_BODY = "extraction_schema_user_body"
+    SCHEMA_USER_EXCERPTS = "extraction_schema_user_excerpts"
 
     # Extraction: value extraction, phase 1 (values + page numbers)
     VALUES_PHASE1_SYSTEM = "extraction_values_phase1_system"
     VALUES_PHASE1_USER = "extraction_values_phase1_user"
     VALUES_PHASE1_GUIDANCE = "extraction_values_phase1_guidance"
     VALUES_PHASE1_RETRY_CHUNKED = "extraction_values_phase1_retry_chunked"
+    VALUES_PHASE1_PART = "extraction_values_phase1_part"
+    VALUES_PHASE1_NUDGE_SUBMIT = "extraction_values_phase1_nudge_submit"
+    VALUES_PHASE1_NUDGE_CONTINUE = "extraction_values_phase1_nudge_continue"
 
     # Extraction: value extraction, phase 3 (attach bounding boxes)
     VALUES_PHASE3_SYSTEM = "extraction_values_phase3_system"

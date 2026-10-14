@@ -31,7 +31,7 @@ import sys
 import tomllib
 from collections import Counter
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, assert_never
 
 from dgml_core import layout
 from dgml_core.classification import (
@@ -686,13 +686,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "After adding, use the configured vision LLM to assign the file "
             "to a DocSet. MODE is 'existing-or-new' (the default when the flag "
             "is passed bare): assign to an existing DocSet if one fits, "
-            "otherwise create a new one. 'existing' never creates a DocSet — "
-            "the LLM must pick the best-fitting existing one, and is required "
-            "to choose even when the fit is poor. Use 'existing' ONLY when you "
-            "already know the file belongs in one of the workspace's DocSets: "
-            "an off-type document is assigned to the closest DocSet anyway, "
-            "not flagged. With no DocSets to choose from it is an error "
-            "(NO_EXISTING_DOCSETS, exit 1). Note MODE is consumed greedily, so "
+            "otherwise create a new one. 'existing' never creates a DocSet: it "
+            "assigns to an existing DocSet if one fits, otherwise leaves the "
+            "file unassigned and reports decision 'none' (no auto-extraction). "
+            "'existing-forced' always assigns to the closest existing DocSet, "
+            "even an off-type file — use it only when every file is known to "
+            "belong in one. With no DocSets to choose from, both 'existing' "
+            "modes are an error (NO_EXISTING_DOCSETS, exit 1). Note MODE is consumed greedily, so "
             "put PATH before this flag (or pass MODE explicitly). Requires a "
             "'classification' section in <workspace>/config.toml; a missing or "
             "invalid config is a hard error (exit 1). Failures of the "
@@ -2584,7 +2584,11 @@ def _add_extraction_subparsers(
     ex_gen.add_argument(
         "--schema-model",
         default=None,
-        help="Override grounded.schema_model for this call (LiteLLM model string).",
+        help=(
+            "Override grounded.schema_model for this call (LiteLLM model string). "
+            "Credentials resolve as if it were set in config; a tier's key and "
+            "api_base never carry over."
+        ),
     )
 
     ex_set = extraction.add_parser(
@@ -2643,7 +2647,11 @@ def _add_extraction_subparsers(
     ex_extract.add_argument(
         "--values-model",
         default=None,
-        help="Override grounded.values_model for this call (LiteLLM model string).",
+        help=(
+            "Override grounded.values_model for this call (LiteLLM model string). "
+            "Credentials resolve as if it were set in config; a tier's key and "
+            "api_base never carry over."
+        ),
     )
     ex_extract.add_argument(
         "--values-effort",
@@ -2651,6 +2659,15 @@ def _add_extraction_subparsers(
         help=(
             "Override grounded.values_reasoning_effort for this call: none, minimal, "
             "low, medium, high, xhigh, or 'default' to send no reasoning effort."
+        ),
+    )
+    ex_extract.add_argument(
+        "--locations-effort",
+        default=None,
+        help=(
+            "Override grounded.locations_reasoning_effort (location grounding on pages "
+            "with OCR words) for this call: none, minimal, low, medium, high, xhigh, or "
+            "'default' to send no reasoning effort."
         ),
     )
 
@@ -2697,15 +2714,13 @@ def _coerce_schema_to_rnc(raw: str, path: Path, workspace_name: str, docset_name
 
 def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Dispatch the `extraction` command group."""
-    from dataclasses import replace
-
+    from dgml_core.extraction import extract_file
     from dgml_core.extraction_schema import parse_rnc, rnc_to_json_schema
     from dgml_core.extraction_xml import dgml_xml_to_values
     from dgml_core.grounded import (
-        extract_values,
         generate_schema,
         load_grounded_config,
-        parse_values_reasoning_effort,
+        parse_reasoning_effort,
     )
 
     store = DocSetStore(ws)
@@ -2713,9 +2728,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
     if sub == "generate-schema":
         ds = store.get(args.docset_id)  # raises DocSetNotFound
-        config = load_grounded_config(ws)
-        if args.schema_model:
-            config = replace(config, schema_model=args.schema_model)
+        config = load_grounded_config(ws, schema_model=args.schema_model or None)
         file_ids = args.from_files or store.list_files(args.docset_id)
         if not file_ids:
             return _emit_error(
@@ -2773,21 +2786,18 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         return 0
 
     if sub == "extract":
-        config = load_grounded_config(ws)
-        if args.values_model:
-            config = replace(config, values_model=args.values_model)
         if args.values_effort is not None:
-            config = replace(
-                config,
-                values_reasoning_effort=parse_values_reasoning_effort(
-                    args.values_effort, source="--values-effort"
-                ),
-            )
-        result = extract_values(
+            # Validated here too so the error names the flag, not the library kwarg.
+            parse_reasoning_effort(args.values_effort, source="--values-effort")
+        if args.locations_effort is not None:
+            parse_reasoning_effort(args.locations_effort, source="--locations-effort")
+        result = extract_file(
             ws,
             args.docset_id,
             args.file_id,
-            config=config,
+            values_model=args.values_model,
+            values_effort=args.values_effort,
+            locations_effort=args.locations_effort,
             write_stats=args.debug,
             debug=args.debug,
         )
@@ -2795,7 +2805,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             {
                 "docset_id": args.docset_id,
                 "file_id": args.file_id,
-                "model": config.values_model,
+                "model": result.model,
                 "mode": result.mode,
                 "tool_calls": result.tool_calls,
                 "field_count": len(result.values),
@@ -4054,11 +4064,12 @@ def _gather_pdfs(directory: Path, *, recursive: bool, suffixes: frozenset[str]) 
 
 
 def _require_existing_docsets(docsets: list[DocSet]) -> None:
-    """Guard the ``--auto-classify existing`` precondition.
+    """Guard the ``--auto-classify existing`` / ``existing-forced`` precondition.
 
-    That mode must place the file in an existing DocSet, so an empty workspace
-    admits no outcome at all. Raising beats degrading to "unassigned", which is
-    the very thing the mode is chosen to avoid.
+    Those modes can only route into existing DocSets, so in an empty workspace
+    there is nothing to ask the LLM: every file would come back unassigned.
+    Raising up front surfaces the misconfiguration instead of a run of
+    ``"none"`` decisions (or, for ``existing-forced``, no possible answer).
     """
     if not docsets:
         raise NoExistingDocSets(
@@ -4074,7 +4085,11 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
     per-file failure is recorded in its entry and the run continues. The
     payload carries a ``summary`` count block plus a per-file ``results``
     array; every entry carries a ``status`` (``added`` / ``skipped`` /
-    ``soft_failed`` / ``hard_failed``) matching the summary counts. The
+    ``soft_failed`` / ``hard_failed``) matching the summary counts. With
+    ``--auto-classify`` the summary also counts ``unassigned``: files this run
+    classified that still have no DocSet (declined under ``existing``, or a
+    soft-failed classification) — an overlay on the status counts, so callers
+    can tell from the summary alone whether any file needs routing. The
     command exits 0 as long as the run completes — individual soft- or
     hard-failures are reported, not raised (partial success is the contract,
     matching ``dgml cluster``). Only a run-level abort (workspace not
@@ -4084,12 +4099,10 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
     recursive: bool = args.recursive
     pdfs = _gather_pdfs(directory, recursive=recursive, suffixes=_ingestible_suffixes(ws))
 
-    classify_mode = getattr(args, "auto_classify", None)
-    auto_classify = classify_mode is not None
-    allow_new = classify_mode != ClassifyMode.EXISTING
+    classify_mode = _classify_mode(args)
     config: ClassificationConfig | None = None
     docsets: list[DocSet] | None = None
-    if auto_classify:
+    if classify_mode is not None:
         # Load the classification config once, up front: a missing/invalid
         # config is a hard failure that aborts the run before any file is
         # added, rather than recording the same error on every file.
@@ -4097,7 +4110,7 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         # Read existing DocSets once; _auto_classify appends newly-created
         # ones so similar PDFs cluster within the run without re-scanning.
         docsets = DocSetStore(ws).list_all()
-        if not allow_new:
+        if classify_mode != ClassifyMode.EXISTING_OR_NEW:
             # Checked here so the run aborts before any file is added rather
             # than on the first one.
             _require_existing_docsets(docsets)
@@ -4106,6 +4119,7 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
     text_mode = TextMode(args.text_mode)
 
     counts = {"added": 0, "skipped": 0, "soft_failed": 0, "hard_failed": 0}
+    unassigned = 0
     entries: list[dict[str, Any]] = []
     for pdf in pdfs:
         try:
@@ -4141,21 +4155,27 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
         counts[status] += 1
 
         entry: dict[str, Any] = {"status": status, "path": str(pdf), **_file_add_payload(result)}
-        if auto_classify:
-            entry["classification"] = _auto_classify(
+        if classify_mode is not None:
+            block = _auto_classify(
                 ws,
                 result,
                 config=config,
                 docsets=docsets,
-                allow_new=allow_new,
+                mode=classify_mode,
                 debug=args.debug,
             )
+            if block["performed"] and block["docset_id"] is None:
+                unassigned += 1
+            entry["classification"] = block
         entries.append(entry)
 
+    summary: dict[str, Any] = {"total": len(pdfs), **counts}
+    if classify_mode is not None:
+        summary["unassigned"] = unassigned
     payload: dict[str, Any] = {
         "directory": str(directory),
         "recursive": recursive,
-        "summary": {"total": len(pdfs), **counts},
+        "summary": summary,
         "results": entries,
     }
     _emit(payload, fmt)
@@ -4177,15 +4197,13 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     f"to choose each id."
                 )
             return _file_add_bulk(args, ws, store, fmt)
-        classify_mode = getattr(args, "auto_classify", None)
-        allow_new = classify_mode != ClassifyMode.EXISTING
+        classify_mode = _classify_mode(args)
         config: ClassificationConfig | None = None
         docsets: list[DocSet] | None = None
-        if classify_mode is not None and not allow_new:
-            # Assign-only mode has to land the file in an existing DocSet, so
-            # both its preconditions are checked *before* ingesting: erroring
-            # out after the add would leave behind exactly the unassigned file
-            # this mode exists to prevent. Same order as the bulk path.
+        if classify_mode is not None and classify_mode != ClassifyMode.EXISTING_OR_NEW:
+            # The existing-only modes' preconditions are checked *before*
+            # ingesting, so a misconfigured request errors out without leaving
+            # a stray file behind. Same order as the bulk path.
             config = load_classification_config(ws)
             docsets = DocSetStore(ws).list_all()
             _require_existing_docsets(docsets)
@@ -4207,7 +4225,7 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 result,
                 config=config,
                 docsets=docsets,
-                allow_new=allow_new,
+                mode=classify_mode,
                 debug=args.debug,
             )
         _emit(payload, fmt)
@@ -4223,23 +4241,32 @@ def _file_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     return 0
 
 
+def _classify_mode(args: argparse.Namespace) -> ClassifyMode | None:
+    """The ``--auto-classify`` MODE, or ``None`` when the flag wasn't passed."""
+    raw = getattr(args, "auto_classify", None)
+    return None if raw is None else ClassifyMode(raw)
+
+
 def _auto_classify(
     ws: Workspace,
     result: AddFileResult,
     *,
     config: ClassificationConfig | None = None,
     docsets: list[DocSet] | None = None,
-    allow_new: bool = True,
+    mode: ClassifyMode = ClassifyMode.EXISTING_OR_NEW,
     debug: bool = False,
 ) -> dict[str, Any]:
     """Run LLM auto-classification on a freshly added File and assign it.
 
     Returns the ``classification`` block embedded in ``dgml file add`` output.
 
-    ``allow_new=False`` (``--auto-classify existing``) forbids creating a
-    DocSet and always assigns: the LLM is given only the assign tool and must
-    return the best-fitting DocSet even when the fit is poor. With no DocSets
-    to choose from the mode has no possible outcome, so it is a **hard** error
+    ``--auto-classify existing`` forbids creating a DocSet: the LLM either
+    assigns the file to an existing DocSet that fits or declines, in which case
+    the file is left unassigned (and not extracted) and the block reports
+    ``"decision": "none"`` plus the LLM's one-line ``decline_reason``.
+    ``--auto-classify existing-forced`` also forbids creating one but always
+    assigns, to the closest DocSet. In either mode, with no DocSets to choose
+    from there is nothing to ask, so it is a **hard** error
     (``NO_EXISTING_DOCSETS``) — a precondition on the request rather than a
     failure of the classification call. Callers check it via
     :func:`_require_existing_docsets` before adding any file; the re-raise
@@ -4281,22 +4308,25 @@ def _auto_classify(
         "docset_created": False,
         "docset_name": None,
         "docset_key_questions": [],
+        "decline_reason": None,
         "error": None,
     }
 
     try:
         decision = classify_file(
-            ws, file_id, config=config, docsets=docsets, allow_new=allow_new, debug=debug
+            ws, file_id, config=config, docsets=docsets, mode=mode, debug=debug
         )
     except NoExistingDocSets:
         # A precondition on the request, not a failure of the call — callers
-        # check it before ingesting anything. Kept hard even if one didn't:
-        # soft-failing would leave the unassigned file this mode prevents.
+        # check it before ingesting anything. Kept hard even if one didn't.
         raise
     except DgmlError as exc:
         block["error"] = f"{exc.code}: {exc}"
         return block
 
+    # ``docset_id`` is set only once the assignment is actually stored, so a
+    # failure partway through never reports a file as placed (or as unplaced)
+    # when the store says otherwise — bulk callers count ``unassigned`` from it.
     docset_store = DocSetStore(ws)
     try:
         if decision.decision == "existing":
@@ -4306,16 +4336,23 @@ def _auto_classify(
             # carries any error; the assignment itself stands).
             from dgml_core.extraction import add_file_and_extract
 
-            extraction_block = add_file_and_extract(
-                ws, decision.existing_docset_id, file_id, write_stats=debug, debug=debug
-            )
             existing = docset_store.get(decision.existing_docset_id)
-            block.update(
-                decision="existing",
-                docset_id=existing.id,
-                docset_name=existing.name,
-                docset_key_questions=list(existing.key_questions),
-            )
+            assigned = {
+                "decision": "existing",
+                "docset_id": existing.id,
+                "docset_name": existing.name,
+                "docset_key_questions": list(existing.key_questions),
+            }
+            try:
+                extraction_block = add_file_and_extract(
+                    ws, existing.id, file_id, write_stats=debug, debug=debug
+                )
+            except DgmlError:
+                # The assignment may have landed before the failure.
+                if file_id in docset_store.list_files(existing.id):
+                    block.update(assigned)
+                raise
+            block.update(assigned)
             if extraction_block is not None:
                 block["extraction"] = extraction_block
         elif decision.decision == "new":
@@ -4325,7 +4362,13 @@ def _auto_classify(
                 description=decision.new_description,
                 key_questions=list(decision.new_key_questions),
             )
-            docset_store.add_file(created.id, file_id)
+            try:
+                docset_store.add_file(created.id, file_id)
+            except DgmlError:
+                # Don't leave behind a DocSet created for a file it never got.
+                with contextlib.suppress(DgmlError):
+                    docset_store.delete(created.id)
+                raise
             if docsets is not None:
                 docsets.append(created)
             block.update(
@@ -4335,8 +4378,12 @@ def _auto_classify(
                 docset_name=created.name,
                 docset_key_questions=list(created.key_questions),
             )
-        else:  # unreachable — classify_file returns only these three
-            raise AssertionError(f"unhandled classification decision: {decision.decision}")
+        elif decision.decision == "none":
+            # No existing DocSet fits: leave the file unassigned so the
+            # caller's own unknown-type handling runs.
+            block.update(decision="none", decline_reason=decision.reason)
+        else:
+            assert_never(decision.decision)
     except DgmlError as exc:
         block["error"] = f"{exc.code}: {exc}"
     return block
