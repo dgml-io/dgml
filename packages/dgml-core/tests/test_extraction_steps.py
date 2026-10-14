@@ -69,7 +69,7 @@ def run_extraction(ws: Workspace, capture_kwargs: Any, replies: list[Any], model
 # -- requests, through the sync path -----------------------------------------
 
 
-def test_gemini_phase1_request_has_no_cache_markers_and_medium_effort(
+def test_gemini_phase1_request_requires_a_tool_with_no_cache_markers_and_medium_effort(
     workspace: Workspace, capture_kwargs: Any
 ) -> None:
     (request,) = run_extraction(
@@ -80,7 +80,7 @@ def test_gemini_phase1_request_has_no_cache_markers_and_medium_effort(
     assert [block["type"] for block in user["content"]] == ["text", "file"]
     assert not any("cache_control" in block for block in user["content"])
     assert request["reasoning_effort"] == "medium"
-    assert "tool_choice" not in request
+    assert request["tool_choice"] == "required"
     assert tool_names(request) == ["submit_values"]
 
 
@@ -142,7 +142,8 @@ def phase1(ws: Workspace, run: grounded.Phase1Result) -> Any:
         workspace=ws,
         file_id=FID,
         run=run,
-        messages_factory=lambda *, chunked: [
+        pdf_bytes=b"%PDF",
+        messages_factory=lambda *, chunked, pdf, part: [
             {"role": "system", "content": "S"},
             {"role": "user", "content": [{"type": "text", "text": f"chunked={chunked}"}]},
         ],
@@ -200,7 +201,7 @@ def test_a_nested_envelope_is_unwrapped_and_counted(workspace: Workspace) -> Non
     with pytest.raises(StopIteration):
         gen.send(_tool_call_response("submit_values", {"values": {"values": bill}}))
     assert run.values == bill
-    assert run.counters == {"envelope_repairs": 1}
+    assert run.counters == {"envelope_repairs": 1, "no_tool_call_retries": 0}
     assert run.refusal is None
 
 
@@ -214,7 +215,10 @@ def test_a_tree_that_fits_no_root_is_flagged_not_raised(workspace: Workspace) ->
     reply = {"values": {"Invoice": {"text": "a"}}, "layout": layout}
     with pytest.raises(StopIteration):
         gen.send(_tool_call_response("submit_values", reply))
-    assert run.layout == layout and run.counters == {"envelope_repairs": 0}
+    assert run.layout == layout and run.counters == {
+        "envelope_repairs": 0,
+        "no_tool_call_retries": 0,
+    }
     assert run.refusal is not None and "got keys 'Invoice'" in run.refusal
 
 
@@ -264,6 +268,7 @@ def phase3(ws: Workspace) -> Any:
         api_base=None,
         max_tool_iters=3,
         totals=None,
+        reasoning_effort="high",
     )
 
 

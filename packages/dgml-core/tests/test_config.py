@@ -123,6 +123,48 @@ def test_cli_overrides_take_precedence(workspace: Workspace) -> None:
     assert merged[ConfigSection.MODELS]["light"] == "cli/model"
 
 
+def test_cli_overrides_go_through_the_settings_model(workspace: Workspace) -> None:
+    """An override is a layer like the others: an undeclared section is dropped and a
+    non-table is malformed config, not a bare `ValueError` or a `str` in the mapping."""
+    assert load_merged_config(workspace, cli_overrides={"other": {"k": 1}}) == {}
+    with pytest.raises(CorruptMetadata):
+        load_merged_config(workspace, cli_overrides={"generation": "haiku"})
+
+
+# ---- Cost ---------------------------------------------------------------------
+
+
+def test_merge_reads_the_workspace_config_once(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loader call is one merge, not a `Workspace.config` derivation (which also
+    reads identity and resolves storage, several reads of the same file)."""
+    reads = 0
+    original: property = vars(Workspace)["config_text"]
+
+    def counting(self: Workspace) -> str | None:
+        nonlocal reads
+        reads += 1
+        text: str | None = original.__get__(self, Workspace)
+        return text
+
+    monkeypatch.setattr(Workspace, "config_text", property(counting))
+    write_config(workspace, {"models": {"light": "ws/model"}})
+    load_merged_config(workspace)
+    assert reads == 1
+
+
+def test_merge_does_not_resolve_storage(workspace: Workspace) -> None:
+    """A storage binding only `Workspace.open` / `store_configs` can reject must not
+    fail a loader that never touches storage."""
+    workspace.config_path.write_text(
+        '[workspace]\nstorage_service = "other"\n[storage]\nprovider = "x:Y"\n'
+        '[models]\nlight = "ws/model"\n',
+        encoding="utf-8",
+    )
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == {"light": "ws/model"}
+
+
 _ALL_TIERS = {"light": "u/l", "standard": "u/s", "advanced": "u/a", "expert": "u/e"}
 
 

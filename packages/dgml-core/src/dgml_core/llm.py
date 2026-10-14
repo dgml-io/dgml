@@ -193,6 +193,59 @@ def is_model_reachability_error(exc: BaseException) -> bool:
     return isinstance(exc, openai.APIError)
 
 
+def is_request_rejection(exc: BaseException) -> bool:
+    """True when the provider refused the request as invalid (HTTP 400/422)
+    for a reason that could lie in an optional request parameter.
+
+    Such a refusal comes back before any generation, so resending the request
+    with a parameter removed costs one fast round trip. Excluded are the
+    rejections no parameter change fixes and that callers handle on their own:
+    an input over the context window and a content-policy block (both of which
+    litellm also raises as 400s). Timeouts, auth, rate limits and 5xx are not
+    rejections of the request's shape and are never matched.
+    """
+    from litellm.exceptions import (
+        BadRequestError,
+        ContentPolicyViolationError,
+        ContextWindowExceededError,
+        UnprocessableEntityError,
+    )
+
+    if isinstance(exc, (ContextWindowExceededError, ContentPolicyViolationError)):
+        return False
+    return isinstance(exc, (BadRequestError, UnprocessableEntityError))
+
+
+# How providers word "this request body is too big". litellm does not keep the
+# HTTP 413: it maps Anthropic's to a BadRequestError (status 400) and Gemini's
+# to a ContextWindowExceededError, so the provider's own text is what survives.
+_REQUEST_TOO_LARGE_MARKERS = (
+    "request_too_large",  # Anthropic's error type for a body over its limit
+    "request entity too large",  # the HTTP 413 reason phrase (OpenAI, proxies)
+    "payload size exceeds",  # Gemini / Vertex: "Request payload size exceeds the limit"
+)
+
+
+def is_request_too_large(exc: BaseException) -> bool:
+    """True when the provider refused a request because the body was too big.
+
+    A caller can answer this by sending less (fewer PDF pages, say), which a
+    retry of the same request never fixes. Checks *exc* and every exception it
+    was raised from, so a provider error wrapped in one of ours still counts.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "status_code", None) == 413:
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _REQUEST_TOO_LARGE_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def is_anthropic_model(model: str) -> bool:
     """True when the model is routed to Anthropic.
 

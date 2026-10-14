@@ -55,6 +55,36 @@ callback (`on_migration`), not in log text. `debug=` controls telemetry and
 intermediate files, never log output. Tests assert with pytest's `caplog`, not
 `capsys`.
 
+## Configuration
+
+A `Workspace` always has exactly one `Configuration` (`ws.config`,
+[src/dgml_core/configuration.py](src/dgml_core/configuration.py)), and every
+loader (`load_grounded_config`, `load_ocr_config`, …) reads its sections through
+`load_merged_config`. It is built one of two ways:
+
+- **In memory**, by an application: `Configuration.build(identity=…, storage=…,
+  models=Models(…), …)` with typed sections and credentials **by value**, then
+  `Workspace.open(configuration=cfg)`. No `config.toml`, no user config, no
+  `DGML_*` environment, no store of workspaces, nothing written back; the first
+  open writes the workspace's meta document to the docstore and later opens check
+  it names the same workspace. `root` is optional when every store is remote (an empty temp dir stands in); the
+  local store, whose data it is, cannot be opened without one.
+- **From TOML**, for a workspace addressed by path or id: derived on access from
+  the usual merge (user config → workspace config → environment) plus the
+  `[workspace]` and `[storage.<svc>]` tables — the only path that writes.
+
+The typed section classes render to exactly the keys their loader reads, so
+validation and the `*_CONFIG_INVALID` codes stay in the loaders; add a key to a
+loader and to its section class together. Readers that the derivation itself
+uses (`read_identity`, `resolve_store_configs`, `load_merged_config`) branch on
+the *supplied* `ws.configuration`; everything downstream reads `ws.config` or
+goes through those. Library code never calls `user_config_path()` outside that
+TOML derivation. The derived form is not memoized (a file-backed config is
+re-read on every access, as `config_text` has always been), and deriving it
+costs several reads of `config.toml`, which is why the loaders take the TOML
+merge directly rather than through `ws.config`. See
+[docs/library-configuration.md](../../docs/library-configuration.md).
+
 ## Optional extras
 
 `aws`, `azure`, `macos`, `pdfium`, `clustering`, and `chain` are declared
