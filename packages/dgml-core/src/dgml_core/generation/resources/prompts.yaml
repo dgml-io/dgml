@@ -75,6 +75,12 @@
   \n; the I line keeps its printed "(a)" enumerator in the lim field.)
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
+  The attached document is exactly those pages, cut out of the {total}-page
+  original: its first page IS page {first} and its last IS page {last}. Page
+  numbers printed in headers or footers may differ from these — ignore them;
+  never ask for other pages or say that pages are missing. Transcribe every
+  attached page in full, in order. The output will be long; that is expected —
+  do not shorten, summarise, or offer a narrower span.
 "transcribe_window_context": |-
   The pages before yours ended in this structure (shown only so you keep
   numbering and levels consistent — transcribe your OWN pages in full):
@@ -90,7 +96,9 @@
   on pages {first}-{last} — it skipped most of their content. Do not resume
   from where a previous section seemed to end: transcribe ALL content of ALL
   pages {first}-{last}, in reading order, starting from the top of page {first},
-  without skipping any page or clause.
+  without skipping any page or clause. The attachment IS pages {first}-{last};
+  printed page numbers are irrelevant. Output block lines only — never a
+  message about the pages, their numbering, or the length of the task.
 "label_system": |
   You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
   belong to one document set; your single most important job is to use the
