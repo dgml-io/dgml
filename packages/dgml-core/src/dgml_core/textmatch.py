@@ -330,12 +330,100 @@ def reorder_words_by_cell(words: list[Word]) -> list[Word]:
         banded.append((band_idx, left, cell))
     banded.sort(key=lambda t: (t[0], t[1]))
 
+    gutter = column_gutter(words)
     out: list[Word] = []
-    for _band, _left, cell in banded:
+    if gutter is None:
+        for _band, _left, cell in banded:
+            cell_words = [words[i] for i in cell]
+            for line in line_groups(cell_words):
+                out.extend(sorted(line, key=lambda w: w.left))
+        return out
+    # Two-column page: cells wholly left of the gutter are read before cells
+    # wholly right of it, for each run of bands between full-width cells
+    # (headings, tables spanning both columns), which keep their place.
+    lefts: list[list[int]] = []
+    rights: list[list[int]] = []
+
+    def emit(cell: list[int]) -> None:
         cell_words = [words[i] for i in cell]
         for line in line_groups(cell_words):
             out.extend(sorted(line, key=lambda w: w.left))
+
+    def flush() -> None:
+        for c in lefts:
+            emit(c)
+        for c in rights:
+            emit(c)
+        lefts.clear()
+        rights.clear()
+
+    for _band, _left, cell in banded:
+        left_edge = min(words[i].left for i in cell)
+        right_edge = max(words[i].right for i in cell)
+        if right_edge <= gutter:
+            lefts.append(cell)
+        elif left_edge >= gutter:
+            rights.append(cell)
+        else:
+            flush()
+            emit(cell)
+    flush()
     return out
+
+
+# Two-column prose: a visual line with ONE gap at least this many word
+# heights wide, at least this many words on each side and prose (not
+# figures) on the right, reads across both columns; when enough of a page's
+# long lines share such a gap at one x, that x is a gutter.
+_GUTTER_GAP_HEIGHTS = 2.0
+_GUTTER_MIN_WORDS_EACH_SIDE = 4
+_GUTTER_MIN_SHARE = 0.3
+
+
+def column_gutter(words: list[Word]) -> float | None:
+    """The x of a two-column gutter on this page, or None.
+
+    Conservative on purpose: a table row has several wide gaps and figures
+    on the right, a heading or a caption has too few words on a side, and a
+    page needs the same gap on 30% of its long lines before it counts."""
+    lines = line_groups(words)
+    long_lines = [
+        sorted(ln, key=lambda w: w.left)
+        for ln in lines
+        if len(ln) >= 2 * _GUTTER_MIN_WORDS_EACH_SIDE
+    ]
+    if len(long_lines) < 4:
+        return None
+    spans: list[tuple[float, float]] = []
+    for ln in long_lines:
+        heights = sorted(w.height for w in ln if w.height > 0)
+        h = heights[len(heights) // 2] if heights else 12.0
+        wide = [
+            (i, ln[i - 1].right, ln[i].left)
+            for i in range(1, len(ln))
+            if ln[i].left - ln[i - 1].right > _GUTTER_GAP_HEIGHTS * h
+        ]
+        if len(wide) != 1:
+            continue
+        i, a, b = wide[0]
+        right_ws = ln[i:]
+        figures = sum(1 for w in right_ws if any(ch.isdigit() for ch in w.text))
+        if (
+            i >= _GUTTER_MIN_WORDS_EACH_SIDE
+            and len(right_ws) >= _GUTTER_MIN_WORDS_EACH_SIDE
+            and figures * 2 < len(right_ws)
+        ):
+            spans.append((a, b))
+    need = max(4, _GUTTER_MIN_SHARE * len(long_lines))
+    if len(spans) < need:
+        return None
+    best_x, best_n = None, 0
+    for a, b in spans:
+        x = (a + b) / 2
+        n = sum(1 for a2, b2 in spans if a2 <= x <= b2)
+        if n > best_n:
+            best_x, best_n = x, n
+    return best_x if best_n >= need else None
 
 
 # ---- Span search ----------------------------------------------------------
