@@ -240,9 +240,17 @@ def _ocr_stream(
     return otoks, page_start
 
 
-def align_blocks(blocks: list[Block], pages: dict[int, tuple[list[Word], PageDims]]) -> Alignment:
+def align_blocks(
+    blocks: list[Block],
+    pages: dict[int, tuple[list[Word], PageDims]],
+    *,
+    order_free: bool = True,
+) -> Alignment:
     """Align block text (document order) against the page words (reading order).
-    Each page word is claimed by at most one block token."""
+    Each page word is claimed by at most one block token. With *order_free*
+    off only the ordered diff pass runs -- the view the duplicate check
+    needs, since the order-free pass lets a repeated block scavenge stray
+    words and look partly claimed."""
     otoks, page_start = _ocr_stream(pages)
     ocores = [t.core for t in otoks]
     xcores: list[str] = []
@@ -282,80 +290,176 @@ def align_blocks(blocks: list[Block], pages: dict[int, tuple[list[Word], PageDim
     # where the next one begins, widened to whole pages. A page no block was
     # aligned to is reached only by blocks sandwiched between its neighbours,
     # which is what keeps a genuinely lost page unclaimed.
+    if not order_free:
+        return Alignment(otoks, page_start, claimed, block_tokens, block_claimed, block_last)
+    # Only a block the diff credited with most of its words fences a
+    # neighbourhood: a row whose labels repeat on an earlier table can be
+    # credited a word or two there, and must not trap its neighbours.
     n = len(blocks)
+    anchored = [block_tokens[i] > 0 and block_claimed[i] / block_tokens[i] >= 0.5 for i in range(n)]
     prev_last = [-1] * n
     cur = -1
     for i in range(n):
         prev_last[i] = cur
-        if block_last[i] >= 0:
+        if anchored[i]:
             cur = block_last[i]
     next_first = [len(otoks)] * n
     cur = len(otoks)
     for i in range(n - 1, -1, -1):
         next_first[i] = cur
-        if block_first[i] < len(otoks):
+        if anchored[i]:
             cur = block_first[i]
     starts = sorted(page_start.values()) + [len(otoks)]
 
-    def page_bounds(lo: int, hi: int) -> tuple[int, int]:
+    def page_bounds(lo: int, hi: int, *, include_hi_page: bool) -> tuple[int, int]:
+        """Widen [lo, hi) to page starts. `hi` is where the next aligned block
+        begins -- very often the first word of a page. The narrow form stops
+        there; the wide form takes that page too, because a table or footnote
+        the model wrote before the page's first paragraph sits on it."""
         lo = max(0, min(lo, len(otoks) - 1))
         hi = max(lo + 1, min(hi, len(otoks)))
         plo = max(st for st in starts if st <= lo)
-        phi = min(st for st in starts if st >= hi) if any(st >= hi for st in starts) else len(otoks)
+        after = [st for st in starts if (st > hi if include_hi_page else st >= hi)]
+        phi = min(after) if after else len(otoks)
         return plo, phi
 
     pending: dict[int, Counter[str]] = {}
     for xi, c in enumerate(xcores):
         if xi not in xclaimed:
             pending.setdefault(xblock[xi], Counter())[c] += 1
-    for bi, need in pending.items():
-        lo = block_first[bi] if block_first[bi] < len(otoks) else prev_last[bi] + 1
-        hi = max(block_last[bi] + 1, next_first[bi])
-        lo, hi = page_bounds(min(lo, prev_last[bi] + 1), hi)
-        for oi in range(lo, hi):
-            if oi in claimed:
+    # Narrow neighbourhoods first, so every block claims what sits between
+    # its aligned neighbours before anyone may reach into the next page;
+    # then, for what is still pending, the neighbourhood widened by a page.
+    for include_hi_page in (False, True):
+        for bi, need in pending.items():
+            if not +need:
                 continue
-            c = otoks[oi].core
-            if need.get(c, 0) > 0:
-                need[c] -= 1
-                claimed[oi] = bi
-                block_claimed[bi] += 1
-                block_first[bi] = min(block_first[bi], oi)
-                block_last[bi] = max(block_last[bi], oi)
+            lo = block_first[bi] if block_first[bi] < len(otoks) else prev_last[bi] + 1
+            hi = max(block_last[bi] + 1, next_first[bi])
+            lo, hi = page_bounds(min(lo, prev_last[bi] + 1), hi, include_hi_page=include_hi_page)
+            for oi in range(lo, hi):
+                if oi in claimed:
+                    continue
+                c = otoks[oi].core
+                if need.get(c, 0) > 0:
+                    need[c] -= 1
+                    claimed[oi] = bi
+                    block_claimed[bi] += 1
+                    block_first[bi] = min(block_first[bi], oi)
+                    block_last[bi] = max(block_last[bi], oi)
     return Alignment(otoks, page_start, claimed, block_tokens, block_claimed, block_last)
 
 
 # ---- Dropping duplicates and fabrications -----------------------------------
 
 
-def _drop_unclaimed(blocks: list[Block], al: Alignment) -> tuple[list[Block], int, int]:
-    """Remove blocks that claim almost none of their words.
+def _dropped_entry(
+    blocks: list[Block], al: Alignment, i: int, share: float, reason: str
+) -> dict[str, Any]:
+    b = blocks[i]
+    return {
+        "id": b.id,
+        "structure": b.structure,
+        "reason": reason,
+        "share": round(share, 2),
+        "tokens": al.block_tokens[i],
+        "text": b.flat_text()[:160],
+    }
 
-    A duplicate repeats, within a page's worth of blocks, a block that did
-    claim its words -- that is what window overlap produces. A fabricated
-    block is a long paragraph whose words are not on the pages around it.
-    Rows are never dropped as fabricated: a figure row wrongly deleted costs
-    more than a figure row kept twice.
+
+def _shares(al: Alignment) -> list[float]:
+    return [c / n if n else 1.0 for n, c in zip(al.block_tokens, al.block_claimed, strict=True)]
+
+
+def _drop_duplicates(
+    blocks: list[Block], al: Alignment, window_starts: list[int] | None = None
+) -> tuple[list[Block], list[dict[str, Any]]]:
+    """Remove repeated blocks -- what window overlap and retry ladders produce.
+
+    With *window_starts* (the block index each transcription window begins
+    at) the overlap is known: a window's leading blocks that repeat, word for
+    word or as a part of, the previous window's trailing blocks are the
+    overlap page transcribed twice, and go. Without it, two blocks with the
+    same words within a page's worth of blocks are a duplicate pair when one
+    of them aligned nothing in order: the copy the ORDERED alignment credited
+    less goes, the later one on a tie (a column-wise table credits neither).
+    A short block inside a longer neighbour is dropped only when it claimed
+    almost nothing and the neighbour claimed most of its own. *al* must come
+    from ``align_blocks(..., order_free=False)``.
     """
-    shares = [c / n if n else 1.0 for n, c in zip(al.block_tokens, al.block_claimed, strict=True)]
+    shares = _shares(al)
     cores = [" ".join(_core(t) for t in b.flat_text().split() if _core(t)) for b in blocks]
+    gone: set[int] = set()
+    if window_starts:
+        bounds = sorted(set(window_starts)) + [len(blocks)]
+        page_of = [al.otoks[t].page if t >= 0 else None for t in al.block_last]
+        for w in range(1, len(bounds) - 1):
+            # The overlap page is the last page the previous window's blocks
+            # aligned to; its transcription there runs from the first block
+            # credited on that page to the window's end.
+            prev = range(bounds[w - 1], bounds[w])
+            last_pages = [page_of[j] for j in prev if page_of[j] is not None and shares[j] >= 0.5]
+            if not last_pages:
+                continue
+            overlap_page = max(last_pages)
+            first_on_page = next(j for j in prev if page_of[j] == overlap_page)
+            trail_cores = [cores[j] for j in range(first_on_page, bounds[w]) if cores[j]]
+            # The new window's transcription of the overlap page ends where
+            # its first block credited on a later page begins.
+            for i in range(bounds[w], min(bounds[w + 1], bounds[w] + 120)):
+                if shares[i] >= 0.5 and page_of[i] is not None and page_of[i] > overlap_page:
+                    break
+                if al.block_tokens[i] < 3 or not cores[i] or shares[i] >= 0.5:
+                    continue
+                long = al.block_tokens[i] >= _FABRICATED_MIN_TOKENS
+                if any(cores[i] == c or (long and cores[i] in c) for c in trail_cores):
+                    gone.add(i)
+    if not window_starts:
+        for i, (n_tok, sh) in enumerate(zip(al.block_tokens, shares, strict=True)):
+            if i in gone or n_tok < 3 or not cores[i] or sh >= _UNCLAIMED_MAX_SHARE:
+                continue
+            lo, hi = max(0, i - _DUPLICATE_WINDOW), min(len(blocks), i + _DUPLICATE_WINDOW + 1)
+            if any(
+                j != i and j not in gone and cores[j] == cores[i] and (shares[j], -j) >= (sh, -i)
+                for j in range(lo, hi)
+            ):
+                gone.add(i)
+    keep = [b for i, b in enumerate(blocks) if i not in gone]
+    dropped = [_dropped_entry(blocks, al, i, shares[i], "duplicate") for i in sorted(gone)]
+    return keep, dropped
+
+
+def _drop_unplaced(blocks: list[Block], al: Alignment) -> tuple[list[Block], list[dict[str, Any]]]:
+    """Judge the blocks the FULL alignment could not place.
+
+    One whose words all sit inside a neighbour that claimed most of its own
+    is a duplicate (a retry re-emitting part of a window). A long non-row
+    block whose distinctive words (5+ letters, or figures) mostly occur
+    nowhere in the text layer is fabricated -- a block the aligner merely
+    failed to place still has its words on some page. Rows are never dropped
+    as fabricated: a figure row wrongly deleted costs more than one kept
+    twice.
+    """
+    shares = _shares(al)
+    cores = [" ".join(_core(t) for t in b.flat_text().split() if _core(t)) for b in blocks]
+    doc_cores = {t.core for t in al.otoks}
     keep: list[Block] = []
-    dups = fabricated = 0
+    dropped: list[dict[str, Any]] = []
     for i, (b, n_tok, sh) in enumerate(zip(blocks, al.block_tokens, shares, strict=True)):
-        if sh >= _UNCLAIMED_MAX_SHARE or n_tok < 3:
-            keep.append(b)
-            continue
-        lo, hi = max(0, i - _DUPLICATE_WINDOW), min(len(blocks), i + _DUPLICATE_WINDOW + 1)
-        if cores[i] and any(
-            j != i and shares[j] >= 0.5 and cores[i] in cores[j] for j in range(lo, hi)
-        ):
-            dups += 1
-            continue
+        if n_tok >= 3 and sh < _UNCLAIMED_MAX_SHARE and cores[i]:
+            lo, hi = max(0, i - _DUPLICATE_WINDOW), min(len(blocks), i + _DUPLICATE_WINDOW + 1)
+            if any(j != i and shares[j] >= 0.5 and cores[i] in cores[j] for j in range(lo, hi)):
+                dropped.append(_dropped_entry(blocks, al, i, sh, "duplicate"))
+                continue
         if b.structure != "row" and n_tok >= _FABRICATED_MIN_TOKENS and sh < _FABRICATED_MAX_SHARE:
-            fabricated += 1
-            continue
+            distinct = [
+                c for c in (_core(t) for t in b.flat_text().split()) if len(c) >= 5 or _is_figure(c)
+            ]
+            if len(distinct) >= 3 and sum(c in doc_cores for c in distinct) / len(distinct) < 0.5:
+                dropped.append(_dropped_entry(blocks, al, i, sh, "fabricated"))
+                continue
         keep.append(b)
-    return keep, dups, fabricated
+    return keep, dropped
 
 
 # ---- Regions ------------------------------------------------------------------
@@ -519,21 +623,30 @@ def ensure_complete(
     rescue: Callable[[int], list[Block] | None] | None = None,
     log: Callable[[str], None] = lambda _m: None,
     id_prefix: str = "f",
+    window_starts: list[int] | None = None,
 ) -> tuple[list[Block], dict[str, Any]]:
     """Return the blocks made complete against the page text, and a report.
 
     ``rescue(page_index)`` (0-based) may re-transcribe a whole-page region with
     the model; its blocks are used only if they claim the region's words.
+    ``window_starts`` -- the index in *blocks* at which each transcription
+    window's output begins -- lets overlap duplicates be removed by position.
     """
     pages = load_page_words_dir(page_text_dir)
     if not pages or not blocks:
         return blocks, {"skipped": "no page text" if not pages else "no blocks"}
 
+    blocks, dropped = _drop_duplicates(
+        blocks, align_blocks(blocks, pages, order_free=False), window_starts
+    )
     al = align_blocks(blocks, pages)
     model_covered = len(al.claimed)
     n_content = len(al.otoks)
-    blocks, dups, fabricated = _drop_unclaimed(blocks, al)
-    if dups or fabricated:
+    blocks, late = _drop_unplaced(blocks, al)
+    dropped += late
+    fabricated = sum(1 for d in dropped if d["reason"] == "fabricated")
+    dups = len(dropped) - fabricated
+    if late:
         al = align_blocks(blocks, pages)
     regions = find_regions(al, pages)
 
@@ -603,6 +716,7 @@ def ensure_complete(
             for r in regions
         ],
         "dropped": {"duplicates": dups, "fabricated": fabricated},
+        "dropped_blocks": dropped,
         "content_words": n_content,
         "model_coverage_pct": round(100 * model_covered / n_content, 1) if n_content else 100.0,
         "final_coverage_pct": (

@@ -137,3 +137,37 @@ def test_ligatures_do_not_look_missing(tmp_path):
     blocks = [_p("net profit rose significantly in the first quarter of the year")]
     _, rep = completeness.ensure_complete(blocks, d)
     assert rep["model_coverage_pct"] == 100.0 and rep["regions"] == []
+
+
+def test_block_written_before_the_pages_first_paragraph_is_claimed(tmp_path):
+    """The model wrote a page's table before the paragraph the text layer
+    reads first. The paragraph aligns at the page's first word; the table
+    must still be claimed on that page, not dropped and re-filled."""
+    pages = [_words(_prose(1)), _words(_prose(2))]
+    d = _write_pages(tmp_path, pages)
+    first = _page_text(pages[1]).split()
+    para, table = " ".join(first[: len(first) // 2]), " ".join(first[len(first) // 2 :])
+    blocks = [_p(_page_text(pages[0]), "b1"), _p(table, "b2_table"), _p(para, "b3_para")]
+    out, rep = completeness.ensure_complete(blocks, d)
+    assert [b.id for b in out] == ["b1", "b2_table", "b3_para"]
+    assert rep["dropped"] == {"duplicates": 0, "fabricated": 0}
+    assert rep["regions"] == []
+
+
+def test_overlap_duplicate_is_dropped_by_window_position(tmp_path):
+    """With window starts known, the second window's leading blocks that
+    repeat the first window's trailing blocks are the overlap page and go,
+    whichever copy the ordered diff happened to credit."""
+    pages = [_words(_prose(1)), _words(_prose(2)), _words(_prose(3))]
+    d = _write_pages(tmp_path, pages)
+    t2 = _page_text(pages[1])
+    blocks = [
+        _p(_page_text(pages[0]), "b1"),
+        _p(t2, "b2"),
+        _p(t2, "b2again"),
+        _p(_page_text(pages[2]), "b3"),
+    ]
+    out, rep = completeness.ensure_complete(blocks, d, window_starts=[0, 2])
+    assert [b.id for b in out] == ["b1", "b2", "b3"]
+    assert rep["dropped"] == {"duplicates": 1, "fabricated": 0}
+    assert rep["regions"] == []

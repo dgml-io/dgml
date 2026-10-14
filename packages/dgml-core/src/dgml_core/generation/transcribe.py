@@ -624,6 +624,9 @@ def transcribe_document(
     windows = document.iter_windows(total, window_size, overlap=overlap)
     log(f"{doc_name}: {total} pages → {len(windows)} window(s)")
     page_tokens = _page_token_lists(page_text_dir)
+    # Index in `blocks` at which each window's output begins; the completeness
+    # pass uses it to remove the overlap page's second transcription.
+    window_starts: list[int] = []
 
     # One usage row per document, aggregating every window's call (gated on
     # --debug via the config). ``config`` is fresh per document in the pipeline,
@@ -748,6 +751,7 @@ def transcribe_document(
             if not (window_overlap and w_idx):
                 _append_continuation(blocks, str(payload.get("continues", "") or ""))
             kept = 0
+            window_starts.append(len(blocks))
             for raw_block in payload.get("blocks", []) or []:
                 if not isinstance(raw_block, dict):
                     continue
@@ -775,8 +779,26 @@ def transcribe_document(
                             out.append(b)
                 return out
 
+            # The block list as the windows produced it, before the pass, so a
+            # completeness report can be replayed offline (debug only).
+            cache_write(
+                cache_dir,
+                f"{stem}_blocks_prepass.json",
+                json.dumps(
+                    {
+                        "window_starts": window_starts,
+                        "blocks": [dataclasses.asdict(b) for b in blocks],
+                    },
+                    ensure_ascii=False,
+                ),
+                debug=debug,
+            )
             blocks, report = completeness.ensure_complete(
-                blocks, page_text_dir, rescue=rescue_page, log=lambda m: log(f"{doc_name}: {m}")
+                blocks,
+                page_text_dir,
+                rescue=rescue_page,
+                log=lambda m: log(f"{doc_name}: {m}"),
+                window_starts=window_starts,
             )
             cache_write(
                 cache_dir,
