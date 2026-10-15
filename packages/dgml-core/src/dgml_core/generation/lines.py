@@ -700,6 +700,27 @@ def merge_results(base: LinesResult, extra: LinesResult) -> None:
         base.payload["continues"] = extra.payload["continues"]
 
 
+def insert_page_blocks(
+    res: LinesResult, lines: list[TextLine], page: int, block_dicts: list[dict[str, Any]]
+) -> None:
+    """Splice blocks transcribed for *page* (no text layer, text-format call)
+    into the payload at that page's place: before the first block whose lines
+    sit on a later page."""
+    if not block_dicts:
+        return
+    page_of = {ln.id: ln.page for ln in lines}
+    blocks: list[dict[str, Any]] = res.payload["blocks"]
+    at = len(blocks)
+    for i, b in enumerate(blocks):
+        ids = b.get("lines") or []
+        if ids and min(page_of.get(x, 0) for x in ids) > page:
+            at = i
+            break
+    for b in block_dicts:
+        b["page"] = page
+    res.payload["blocks"] = blocks[:at] + list(block_dicts) + blocks[at:]
+
+
 def describe_unassigned(lines: list[TextLine]) -> str:
     """Compact id list for a retry prompt: ``L4, L9-L12, L40``."""
     ids = sorted(ln.id for ln in lines)

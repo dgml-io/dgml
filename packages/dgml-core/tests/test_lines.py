@@ -426,3 +426,56 @@ def test_hyphen_is_mended_only_into_a_known_word():
         res2.payload["blocks"][0]["text"]
         == "a former whollyowned subsidiary and a provider of services"
     )
+
+
+def test_textless_page_gets_its_own_text_call_in_a_lines_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Page 1 has a text layer, page 2 has none: the window is still asked in
+    lines mode, then page 2 alone is asked in the text format and spliced in
+    after page 1's blocks."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    page_text = _write_page_text(tmp_path, {1: PAGES[1], 2: ([], PageDims(W, H))})
+    calls: list[str] = []
+
+    def fake(config: llm.LLMConfig, **kw: object) -> str:
+        calls.append(kw["system_prompt"])
+        if kw["system_prompt"] == transcribe_mod.SYSTEM_PROMPT_LINES:
+            return (
+                "X\tL1\nH1\tITEM 1.\tL2\nP\tL3-L4\nR\tL5\nR\tL6\nR\tL7\n"
+                "I\t(a)\tL8\nI\t(b)\tL9\nX\tL10"
+            )
+        return "P\tScanned map of the network."
+
+    monkeypatch.setattr(llm, "call_continued", fake)
+    monkeypatch.setattr(transcribe_mod, "_count_pages", lambda _b: 2)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda b, _pages, **_kw: b)
+    blocks = transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
+        cache_dir=tmp_path,
+        page_text_dir=page_text,
+        transcription="lines",
+        complete=False,
+    )
+    assert calls == [transcribe_mod.SYSTEM_PROMPT_LINES, transcribe_mod.SYSTEM_PROMPT]
+    assert blocks[-1].text == "Scanned map of the network."
+    assert blocks[0].text == "Annual Report"  # page 1 content first
+
+
+def test_report_only_pass_fills_the_pages_it_is_told_to(tmp_path):
+    from dgml_core.generation import completeness
+    from dgml_core.generation.blocks import Block
+
+    d = _write_page_text(tmp_path, {1: PAGES[1], 2: PAGES[2]})
+    lines = lines_mod.window_lines({1: PAGES[1]}, [1])
+    blocks = [Block(id="b1", structure="p", text=lines[2].text + " " + lines[3].text)]
+    out, rep = completeness.ensure_complete(blocks, d, fill=False, fill_pages={2})
+    pages_filled = {r["page"] for r in rep["regions"] if r.get("source")}
+    assert 2 in pages_filled and len(out) > 1
+    assert any(
+        b.text.startswith("continues the sentence") or "Another paragraph" in b.text for b in out
+    )

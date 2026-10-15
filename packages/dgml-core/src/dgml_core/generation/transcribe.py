@@ -672,6 +672,10 @@ def transcribe_document(
     # Index in `blocks` at which each window's output begins; the completeness
     # pass uses it to remove the overlap page's second transcription.
     window_starts: list[int] = []
+    # In lines mode, the 1-based pages that were nevertheless transcribed in
+    # the text format (no text layer, or a text-format reply): the pass may
+    # fill those, and only those.
+    text_format_pages: set[int] = set()
 
     # One usage row per document, aggregating every window's call (gated on
     # --debug via the config). ``config`` is fresh per document in the pipeline,
@@ -690,12 +694,21 @@ def transcribe_document(
             # each window from re-walking the whole page tree.
             pdf_slice = document.slice_pdf(pdf_bytes, pages, config=pdf_config, total_pages=total)
             exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
-            # Lines mode for this window only when every page has a text layer.
+            # Lines mode for this window when a page has a text layer; a page
+            # without one (a scan, a map) gets a text-format call of its own
+            # after the lines reply, so one such page does not drag the whole
+            # window into the text format.
             wlines: list[lines_mod.TextLine] = []
-            if lines_mode and all(
-                len(page_words.get(p + 1, ([], None))[0]) >= lines_mod.MIN_PAGE_WORDS for p in pages
-            ):
-                wlines = lines_mod.window_lines(page_words, [p + 1 for p in pages])
+            textless: list[int] = []
+            if lines_mode:
+                with_text = [
+                    p
+                    for p in pages
+                    if len(page_words.get(p + 1, ([], None))[0]) >= lines_mod.MIN_PAGE_WORDS
+                ]
+                textless = [p for p in pages if p not in with_text]
+                if with_text:
+                    wlines = lines_mod.window_lines(page_words, [p + 1 for p in with_text])
             if wlines:
                 listing = lines_mod.render_listing(wlines)
                 cache_write(cache_dir, f"{stem}_{wfile}_lines.txt", listing, debug=debug)
@@ -703,7 +716,7 @@ def transcribe_document(
                 system_prompt = SYSTEM_PROMPT_LINES
             else:
                 if lines_mode:
-                    log(f"{doc_name} {wlog}: a page has no text layer; asking in the text format")
+                    log(f"{doc_name} {wlog}: no page has a text layer; asking in the text format")
                 instr = _window_instruction(pages[0], pages[-1], total, context)
                 system_prompt = SYSTEM_PROMPT
             n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)
@@ -803,12 +816,15 @@ def transcribe_document(
                     f"{recall:.0%} of the pages' words"
                     + ("; retrying window" if attempt + 1 < n_attempts else "")
                 )
-            if (
-                wlines
-                and found is not None
-                and found_lines is not None
-                and found[2] is found_lines.payload
-            ):
+            lines_won = (
+                found is not None and found_lines is not None and found[2] is found_lines.payload
+            )
+            if wlines and found is not None and not lines_won:
+                # The kept reply was in the text format (the model ignored the
+                # lines prompt): these pages were not accounted for line by
+                # line, so the completeness pass must be allowed to fill them.
+                text_format_pages.update(p + 1 for p in pages)
+            if wlines and lines_won:
                 # A span the model skipped is asked for on its own: the
                 # sub-listing of just those lines, same pages attached. A
                 # tiny reply, and precise where a page split is not.
@@ -848,6 +864,39 @@ def transcribe_document(
                 # layer here, so the window is complete by construction.
                 filled = lines_mod.complete_payload(found_lines, wlines, doc_vocab)
                 moved = lines_mod.order_by_lines(found_lines)
+                for p in textless:
+                    # The page without a text layer, transcribed in the text
+                    # format on its own and spliced in at its place.
+                    p_instr = _window_instruction(p, p, total, _window_context(blocks))
+                    p_slice = document.slice_pdf(
+                        pdf_bytes, [p], config=pdf_config, total_pages=total
+                    )
+                    p_raw = llm.call_continued(
+                        config,
+                        system_prompt=SYSTEM_PROMPT,
+                        user_content=llm.build_user_content(
+                            instruction_text=p_instr, pdf_bytes=p_slice
+                        ),
+                        cache=True,
+                    )
+                    cache_write(
+                        cache_dir,
+                        f"{stem}_{wfile}_p{p + 1:03d}_raw.json",
+                        strip_fences(p_raw),
+                        debug=debug,
+                    )
+                    try:
+                        p_tag = f"{doc_name} {wlog} p{p + 1}"
+                        p_payload = parse_window_any(p_raw, log=lambda m, t=p_tag: log(f"{t}: {m}"))
+                    except json.JSONDecodeError:
+                        p_payload = _salvage_window_json(p_raw) or {"blocks": []}
+                    p_blocks = [b for b in p_payload.get("blocks", []) or [] if isinstance(b, dict)]
+                    lines_mod.insert_page_blocks(found_lines, wlines, p + 1, p_blocks)
+                    log(
+                        f"{doc_name} {wlog}: page {p + 1} has no text layer; "
+                        f"{len(p_blocks)} block(s) from a text-format call"
+                    )
+                    text_format_pages.add(p + 1)
                 if moved:
                     log(f"{doc_name} {wlog}: {moved} block(s) put back in page order")
                 n_dec = len(found_lines.decorations)
@@ -955,6 +1004,7 @@ def transcribe_document(
                 # Structure over lines is complete by construction; the pass
                 # then only checks, reports and removes duplicates.
                 fill=not lines_mode,
+                fill_pages=text_format_pages if lines_mode else None,
             )
             cache_write(
                 cache_dir,
