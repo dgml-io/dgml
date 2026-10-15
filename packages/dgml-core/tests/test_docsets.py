@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from dgml_core import layout
 from dgml_core.docsets import DocSetStore
@@ -393,6 +395,131 @@ def test_reassign_is_idempotent(workspace: Workspace) -> None:
     assert len(workspace.docs.find_docs("assignments", {"docset_id": did})) == 1
     # and it must not disturb the pair's generated artifacts
     assert workspace.blobs.blob_exists(f"docsets/{did}/files/{fid}/report.dgml.xml")
+
+
+# ------------------------------------------------------------ docsets_for_file
+
+
+def test_docsets_for_file_lists_each_assignment(workspace: Workspace) -> None:
+    store = DocSetStore(workspace)
+    fid = "abcdefghijkl"
+    workspace.docs.put_doc("files", fid, {"id": fid})
+    a = store.create(name="A", description="first")
+    b = store.create(name="B")
+    store.create(name="Unrelated")
+    store.add_file(b.id, fid)
+    store.add_file(a.id, fid)
+
+    result = store.docsets_for_file(fid)
+
+    assert [r.docset.id for r in result] == sorted([a.id, b.id])
+    by_id = {r.docset.id: r for r in result}
+    assert by_id[a.id].docset == a
+    for did in (a.id, b.id):
+        doc = workspace.docs.get_doc("assignments", f"{did}/{fid}")
+        assert doc is not None
+        assert by_id[did].assigned_at == doc["assigned_at"]
+        assert by_id[did].assigned_at
+
+
+def test_docsets_for_file_unassigned_returns_empty(workspace: Workspace) -> None:
+    store = DocSetStore(workspace)
+    store.create(name="A")
+    workspace.docs.put_doc("files", "abcdefghijkl", {"id": "abcdefghijkl"})
+    assert store.docsets_for_file("abcdefghijkl") == []
+
+
+def test_docsets_for_file_reflects_remove_and_docset_delete(workspace: Workspace) -> None:
+    store, did, fid = _assigned_pair(workspace)
+    other = store.create(name="Y")
+    store.add_file(other.id, fid)
+
+    store.remove_file(did, fid)
+    assert [r.docset.id for r in store.docsets_for_file(fid)] == [other.id]
+    store.delete(other.id)
+    assert store.docsets_for_file(fid) == []
+
+
+def test_docsets_for_file_rejects_empty_and_missing_file(workspace: Workspace) -> None:
+    store = DocSetStore(workspace)
+    with pytest.raises(InvalidArgument):
+        store.docsets_for_file("  ")
+    with pytest.raises(FileNotFound):
+        store.docsets_for_file("nonexistent0")
+
+
+def test_docsets_for_file_missing_assigned_at(workspace: Workspace) -> None:
+    """Assignments written by the layout migration carry no timestamp."""
+    store = DocSetStore(workspace)
+    ds = store.create(name="X")
+    fid = "abcdefghijkl"
+    workspace.docs.put_doc("files", fid, {"id": fid})
+    workspace.docs.put_doc(
+        "assignments", layout.pair_id(ds.id, fid), {"docset_id": ds.id, "file_id": fid}
+    )
+
+    [assignment] = store.docsets_for_file(fid)
+    assert assignment.docset == ds
+    assert assignment.assigned_at is None
+    assert assignment.to_json() == {"docset": ds.to_json(), "assigned_at": None}
+
+
+def test_docsets_for_file_skips_dangling_assignment(workspace: Workspace) -> None:
+    store, did, fid = _assigned_pair(workspace)
+    workspace.docs.put_doc(
+        "assignments",
+        layout.pair_id("gonedocset01", fid),
+        {"docset_id": "gonedocset01", "file_id": fid, "assigned_at": "2026-01-01T00:00:00Z"},
+    )
+    assert [r.docset.id for r in store.docsets_for_file(fid)] == [did]
+
+
+def test_docsets_for_file_skips_corrupt_docset_like_list_all(workspace: Workspace) -> None:
+    """A corrupt ``docset.json`` reads as absent, as it does for ``list_all`` —
+    it must not raise and hide the file's other, healthy DocSets."""
+    store, did, fid = _assigned_pair(workspace)
+    broken = store.create(name="Broken")
+    store.add_file(broken.id, fid)
+    (workspace.root / "docsets" / broken.id / "docset.json").write_text(
+        '{"id": "truncated', encoding="utf-8"
+    )
+
+    assert [ds.id for ds in store.list_all()] == [did]
+    assert [r.docset.id for r in store.docsets_for_file(fid)] == [did]
+
+
+def test_docsets_for_file_warns_about_the_skipped_docset(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    store, _did, fid = _assigned_pair(workspace)
+    broken = store.create(name="Broken")
+    store.add_file(broken.id, fid)
+    (workspace.root / "docsets" / broken.id / "docset.json").write_text("{", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="dgml_core.docsets"):
+        store.docsets_for_file(fid)
+
+    [record] = caplog.records
+    assert broken.id in record.getMessage()
+    assert fid in record.getMessage()
+
+
+def test_docsets_for_file_unaffected_by_malformed_manifest_elsewhere(
+    workspace: Workspace,
+) -> None:
+    """A bad manifest only breaks lookups for files assigned to that DocSet.
+
+    This is why the DocSets are read one assignment at a time rather than via
+    ``list_all``: a manifest that parses but is malformed (valid JSON, no
+    ``name``) raises from ``list_all`` and would otherwise fail this lookup for
+    every file in the workspace."""
+    store, did, fid = _assigned_pair(workspace)
+    unrelated = store.create(name="Unrelated")
+    workspace.docs.put_doc("docsets", unrelated.id, {"id": unrelated.id})
+
+    with pytest.raises(KeyError):
+        store.list_all()
+    assert [r.docset.id for r in store.docsets_for_file(fid)] == [did]
 
 
 # ---- extraction guidance ---------------------------------------------------

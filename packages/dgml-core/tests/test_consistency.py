@@ -249,10 +249,13 @@ def test_check_no_longer_falls_back_to_any_pdf(workspace: Workspace) -> None:
 
 
 @needs_gs
-def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Path) -> None:
-    """A dg:origin="computed" element with no dg:href in a docset file's DGML
-    XML is an unauditable derivation — check reports it. An attributed
-    computed element (dg:href present) passes clean."""
+def test_unsupported_value_flagged(workspace: Workspace, text_pdf: Path) -> None:
+    """An extracted value with no dg:origin, dg:inputs or dg:method in a
+    docset file's DGML XML is an unsupported claim — check reports it. A 0.7
+    dg:origin="computed" element reads as having no origin, so without a
+    dg:href it is flagged too; with one (read as its inputs) it passes, as
+    does a 0.71 element with dg:inputs. A "#a; #b" list is not misread as a
+    dangling semantic link."""
     f = FileStore(workspace).add(text_pdf)
     store = DocSetStore(workspace)
     ds = store.create(name="X")
@@ -269,7 +272,7 @@ def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Pat
         ),
     )
     report = check_workspace(workspace)
-    flagged = [i for i in report.issues if i.kind == "computed_field_unattributed"]
+    flagged = [i for i in report.issues if i.kind == "value_unsupported"]
     assert len(flagged) == 1
     assert "Total" in flagged[0].message
     assert flagged[0].target_id == ds.id
@@ -280,13 +283,19 @@ def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Pat
             b'<dg:chunk xmlns:dg="http://dgml.io/ns/dg#" xmlns:docset="http://x/ns">'
             b"<dg:extraction>"
             b'<docset:Part xml:id="p1" dg:origin="1 1 2 3 4">4</docset:Part>'
+            b'<docset:Part xml:id="p2" dg:origin="1 1 5 3 8">6</docset:Part>'
             b'<docset:Total dg:origin="computed" dg:value="10" '
-            b'dg:itemprop="computedFrom" dg:href="#p1">10</docset:Total>'
+            b'dg:itemprop="computedFrom" dg:href="#p1; #p2">10</docset:Total>'
+            b'<docset:Count dg:value="2" dg:inputs="#p1; #p2" dg:method="calculated">2'
+            b"</docset:Count>"
             b"</dg:extraction></dg:chunk>"
         ),
     )
     report = check_workspace(workspace)
-    assert not [i for i in report.issues if i.kind == "computed_field_unattributed"]
+    kinds = {i.kind for i in report.issues}
+    assert "value_unsupported" not in kinds
+    assert "semlink_dangling_href" not in kinds
+    assert "inputs_dangling" not in kinds
 
 
 @needs_gs

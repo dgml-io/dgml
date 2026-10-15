@@ -444,7 +444,10 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `text_extraction_failed` | file | pdfminer.six failed to extract any words (records a permanent error so future checks skip retry) |
 | `text_extraction_failed_permanent` | file | A previous extraction recorded a permanent failure; not retried without `--retry-errors` |
 | `dangling_file_reference` | docset | DocSet references a File ID that doesn't exist |
-| `computed_field_unattributed` | docset | A `dg:origin="computed"` element in a file's DGML XML has no `dg:href` sources — the derivation can't be audited (spec §13 requires computed fields to name their sources) |
+| `value_unsupported` | docset | A 0.7 `dg:origin="computed"` element in a file's DGML XML has no `dg:href` sources, so it claims a derivation and names nothing a verifier can check. This replaces `computed_field_unattributed`. A 0.71 value with no `dg:origin`, `dg:inputs` or `dg:method` isn't flagged here; extraction doesn't write one (it drops it and counts it as `unsupported_values` in `extraction_stats.json`) |
+| `method_misplaced` | docset | A `dg:method` that contradicts the element: on an element with `dg:origin`, an unknown method, `defaulted` with `dg:inputs`, or `calculated`/`inferred` without them |
+| `inputs_dangling` | docset | A `dg:inputs` target (`#id`) names an `xml:id` no element in the file carries. Cross-file (`fileid#id`) inputs are not checked |
+| `inputs_cycle` | docset | An element is its own input, directly or through other inputs |
 | `semlink_dangling_href` | docset | A semantic link's `dg:href` names an `xml:id` no element in the document carries |
 | `semlink_nested` | docset | A semantic link points at the subject's own ancestor or descendant, stating a relationship the tree's nesting already states. Newly generated files can't carry one — re-generating clears it |
 
@@ -703,8 +706,9 @@ dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <
 **Auto-extract on assignment.** When the target DocSet has an extraction
 schema set (`extraction-schema.rnc`), every assignment path fires value
 extraction on the newly-assigned file: `docset add-file`, `file add
---auto-classify` (existing-DocSet decisions, which is every decision under
-`--auto-classify existing`), and `cluster` (existing-DocSet
+--auto-classify` (existing-DocSet decisions only — never a `"none"`
+decision under `--auto-classify existing`, which leaves the file
+unassigned), and `cluster` (existing-DocSet
 matches — a DocSet created mid-run can't have a schema yet). The payload
 gains an `extraction` block; extraction failures are **soft** (the error
 lands in `extraction.error`, the assignment stands, exit stays 0). No schema
@@ -1218,8 +1222,8 @@ Two formats are involved:
 
 The LLM is configurable like every other model-using command — via the
 `grounded` section of the workspace `config.toml` (`schema_model`,
-`values_model`, `values_reasoning_effort`, API keys, `max_tool_iters`), with
-per-call overrides on the commands below.
+`values_model`, `values_reasoning_effort`, `locations_reasoning_effort`, API
+keys, `max_tool_iters`), with per-call overrides on the commands below.
 
 ### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M]`
 
@@ -1234,6 +1238,15 @@ is rendered straight to the at-rest RNC (leaves emit `xsd:date`, `xsd:decimal`,
 etc.). There is no grounded-field JSON Schema intermediate; datatypes are native
 to the generated schema, and downstream extraction normalizes each typed value
 to a `dg:value`/`xsi:type`. The output shape is unchanged.
+
+All samples go in one request. If the provider refuses it as too large
+(Anthropic's `request_too_large`, an HTTP 413, Gemini's "payload size
+exceeds"), every sample stays in the request but the largest are cut to their
+leading pages, sharing half the bytes of the refused request fairly, and the
+model is told which samples are partial. This repeats until the request is
+accepted. A sample whose first page alone does not fit its share is left out,
+and each cut or left-out sample is logged as a warning. `from_file_ids` still
+lists every requested file.
 
 ```json
 {
@@ -1263,10 +1276,11 @@ Accepted JSON dialects (all convert to the same RNC):
   system): a root `$ref`, local `$defs`/`definitions` `$ref`s (sibling
   annotation keys merge over the target), `title` as the DGML element name,
   and leaves recognized *structurally* — an object whose properties are a
-  subset of `{text, value, locations, derived_from, computed}` with `text`
-  present is a leaf, its `value` subschema mapped to the field type
-  (`enum` list → value enumeration; `format: date` / `type: integer` /
-  `boolean` / `number` / a plain-decimal `pattern` → the XSD datatype).
+  subset of `{text, value, locations, inputs, evidence, method}` (or the 0.7
+  `derived_from`/`computed`) with `text` present is a leaf, its `value`
+  subschema mapped to the field type (`enum` list → value enumeration;
+  `format: date` / `type: integer` / `boolean` / `number` / a plain-decimal
+  `pattern` → the XSD datatype).
 
 Same-named tags must share one identical definition; two definitions with the
 same name but different content or annotations are rejected with
@@ -1278,9 +1292,10 @@ rendered RNC carries an explicit `start` rule so the field stays a root.
 
 Return the DocSet's schema as canonical RNC (default) or as the engine's
 JSON Schema projection (`--schema-format json`), whose leaves are
-`extracted_value` refs (`{text, value?, locations?, computed?, derived_from?}`
-— note: projections exported before the merged leaf shape used a
-`grounded_field`/`computed_field` union; both are still accepted on
+`extracted_value` refs (`{text, value?, locations?, inputs?, evidence?, method?}`
+— note: projections exported before DGML 0.71 carried `computed?` /
+`derived_from?` instead of `inputs?` / `method?`, and older ones a
+`grounded_field`/`computed_field` union; all are still accepted on
 `set-schema` input). Errors `SCHEMA_NOT_FOUND` if none is set.
 
 ### `dgml extraction set-guidance <docset_id> --guidance-file PATH`
@@ -1301,20 +1316,40 @@ fields, prompts for where to find one value. Returns
 Return the DocSet's extraction guidance as `{docset_id, guidance}`. Errors
 `GUIDANCE_NOT_FOUND` if none is set.
 
-### `dgml extraction extract <docset_id> <file_id> [--values-model M] [--values-effort E]`
+### `dgml extraction extract <docset_id> <file_id> [--values-model M] [--values-effort E] [--locations-effort E]`
 
 Extract values from a file against the DocSet schema and write a `dg:extraction`
 element into the file's core `<stem>.dgml.xml`. Runs a three-phase pipeline
-(LLM text+pages → code OCR matching → per-page LLM bbox). If the file already has
+(LLM text+pages → code OCR matching → per-page LLM location for what matching
+couldn't place). On a page with OCR words, phase 3 names the value's words by
+index and code builds the boxes from them; on a page without, it draws boxes on
+a 0-1000 grid of the page image. If the file already has
 a generated document tree the extraction is added alongside it
 (`mode: full-extraction`); otherwise a minimal core file is created
 (`mode: extraction`). `extraction_stats.json` is written only under the global
-`--debug` flag. Errors `SCHEMA_NOT_FOUND` if the DocSet has no schema.
+`--debug` flag. Errors `SCHEMA_NOT_FOUND` if the DocSet has no schema, and
+`FILE_NOT_FOUND` if the file is not assigned to the DocSet — assign it first with
+`docset add-file` (the schema and the assignment can be set in either order; only
+this command needs both in place).
+
+`--values-model` overrides `grounded.values_model` for this call and resolves
+credentials as if the model were set in config: `grounded.values_api_key` /
+`values_api_key_env` / `values_api_base` apply if set, and nothing from the
+`advanced` tier carries over to the new model. `--schema-model` on
+`generate-schema` works the same way.
 
 `--values-effort` overrides `grounded.values_reasoning_effort` for this call:
 `none`, `minimal`, `low`, `medium` (the default), `high`, `xhigh`, or `default`
 to send no reasoning effort and take the provider's own default. Any other value
-is refused before the model is called.
+is refused before the model is called. `--locations-effort` does the same for
+`grounded.locations_reasoning_effort`, the budget of the location-grounding call
+on pages with OCR words (default `high`; a page that goes through the no-words
+grid path keeps its own `medium`). Anthropic models never receive it, since that
+call forces its tool; every other provider does. Both efforts are checked by
+name, not against what the model supports: a values budget the provider
+refuses fails on the first call, but a locations budget it refuses fails in
+phase 3, after the values call has been paid for, on the first page that
+needs grounding.
 
 ```json
 {
@@ -1355,35 +1390,134 @@ file has no `dg:extraction` element yet (extraction not run).
 }
 ```
 
-A leaf whose schema `## Prompt:` describes a derivation rule (spec §13) comes
-back **computed** instead of grounded: `computed: true`, no `locations`, and
-`derived_from` listing the dotted paths of the values it was derived from
-(cross-file or unresolvable `dg:href` targets stay as raw references):
+#### Value provenance (DGML 0.71)
+
+Every leaf says where its value came from, with up to three keys that mirror
+three XML attributes:
+
+| JSON | XML | Question it answers |
+| --- | --- | --- |
+| `locations` | `dg:origin` | Where is the element's own text printed? (boxes only) |
+| `inputs` (+ `evidence`) | `dg:inputs` | Which elements did the value use? |
+| `method` | `dg:method` | How was a value the page doesn't print produced? `calculated`, `inferred` or `defaulted` |
+
+That gives four cases:
+
+| | No inputs | Has inputs |
+| --- | --- | --- |
+| **Has `locations`** | Read from its printed text ("$4,200.00" → `4200.00`) | Printed in part, completed from the inputs ("3/1" + the commencement year) |
+| **No `locations`** | `method: "defaulted"`: the field's stated default. Without a method: unsupported, and extraction doesn't write it (`matching.unsupported_values`) | `method: "calculated"` (recomputable) or `"inferred"` (a judgment). Without a method: read as `inferred` |
+
+Where the page has a text layer, every box is checked against it: the words
+inside a box must read as its value (a piece of a wrapped value, a loose box
+that also takes in the label, and OCR noise all pass). A box that also takes in
+other words (a label, or the whole row) shrinks to the words that spell the
+value. A value printed in several places at once (a line-item name made of a
+section heading and a tier column header) is kept when its boxes, read in
+order, spell it through a run of words each, and each box shrinks to its run. Choosing words within a box, or snapping it,
+respects capitalization when the value has letters: a box over "Gas
+Delivery Charges" in a sentence doesn't locate the "GAS DELIVERY
+CHARGES" heading. When nothing on the box's own line matches, it moves to the
+nearest exact copy of the value elsewhere on the page. The text of every box
+is checked against the page; when a value is printed several times, which
+copy it gets is not. A box
+holding nothing but the value is kept whatever its capitalization. A box drawn on the wrong span, such as a total boxed on a neighbouring
+number, moves to the nearest span
+whose words match the value exactly, preferring its own line (or lines)
+(`matching.snapped_boxes`). When the page prints no such span, or two are
+equally near, the box is stripped (`matching.rejected_boxes`).
+
+A value phase 1 returns as bare text, with no locations (a model sometimes
+reads a value off the page and leaves out where), is first placed on the first
+page that prints its exact text, so phase 2 can ground it
+(`matching.located_pageless`).
+
+Every value extraction writes can be verified, so two kinds are **dropped**,
+not written:
+
+- a printed value (in full or in part) left with no bounding box: without
+  `dg:origin` it would read as unsupported, or, if it named inputs, as an
+  inferred judgment (`matching.dropped_unboxed_values`);
+- a value with no box, no default and nothing it used: the model returned it
+  bare, or claimed a calculation or inference and named nothing that
+  resolves (`matching.unsupported_values`).
+
+Inputs that named a dropped value are dropped too, and array indices after it
+are renumbered; a value left with nothing it used is dropped in turn. Each
+dropped value is listed as `"path=text"` in `matching.dropped_unboxed`
+(unsupported ones marked `(unsupported)`).
+
+A value printed in part keeps its boxes **and** names its inputs, so one
+element holds the whole fact:
 
 ```json
 {
+  "PeriodStart": {
+    "text": "3/1",
+    "value": "2026-03-01",
+    "locations": [{"page_number": 2, "bounding_box": [410, 980, 520, 1025]}],
+    "inputs": ["CommencementDate"]
+  },
   "InvoiceTotal": {
     "text": "$349.85",
     "value": "349.85",
-    "computed": true,
-    "derived_from": ["LineItems[0].Quantity", "LineItems[0].UnitPrice"]
+    "method": "calculated",
+    "inputs": ["LineItems[0].Amount", "LineItems[1].Amount"]
   }
 }
 ```
 
-In the XML form (`--as xml`), the same field carries `dg:origin="computed"`,
-`dg:value`, and `dg:itemprop="computedFrom"`/`dg:href` pointing at the source
-elements, which are stamped with matching `xml:id` attributes.
+`inputs` are dotted paths of other extracted values (cross-file or
+unresolvable targets stay as raw references). The paths are positional, and a
+model miscounting its own array entries would name a real but wrong element,
+which no check could catch. So the model cites the text it read with each
+input (`"LineItems[6].Amount=$58.20"`), and extraction checks every citation
+before writing. A matching target is kept. A mismatch is re-pointed
+(`matching.repaired_inputs`) when the cited text matches the same path under
+one of the value's own ancestors (a path written relative to the value) or at
+exactly one sibling index (a miscounted index). Otherwise it is dropped
+(`matching.dropped_inputs`). The citation
+text itself is not stored. When a value used printed text
+that **no schema field extracts**, that text comes back in `evidence` —
+`[{text, locations}]` — instead, so the schema doesn't need a field per piece
+of evidence.
 
-**Schema-authoring rule for derivations:** every input a `## Prompt:`
-derivation rule mentions must itself be an extracted field in the schema.
-The model can fold any page content into its arithmetic, but `dg:href` can
-only point at extracted elements — an un-extracted input leaves the computed
-value unverifiable. A `derived_from` entry that doesn't resolve is dropped
-from `dg:href` and counted in `extraction_stats.json` under
-`matching.dropped_refs` (written under `--debug`); a computed field that ends
-up with no `dg:href` at all is flagged by `dgml check` as
-`computed_field_unattributed`.
+In the XML form (`--as xml`) the same fields read:
+
+```xml
+<docset:PeriodStart xsi:type="date" dg:value="2026-03-01"
+    dg:origin="2 410 980 520 1025" dg:inputs="#commencement-date">3/1</docset:PeriodStart>
+<docset:InvoiceTotal xsi:type="decimal" dg:value="349.85"
+    dg:inputs="#line-items-0-amount; #line-items-1-amount"
+    dg:method="calculated">$349.85</docset:InvoiceTotal>
+
+<dg:chunk xml:id="end-date--in-0" dg:origin="1 300 410 620 450">January 15, 2026</dg:chunk>
+<dg:chunk xml:id="end-date--in-1" dg:origin="1 300 520 980 560">a term of twenty-four (24) months</dg:chunk>
+<docset:EndDate xsi:type="date" dg:value="2028-01-14"
+    dg:inputs="#end-date--in-0; #end-date--in-1" dg:method="calculated">2028-01-14</docset:EndDate>
+```
+
+Every element an input names gets a matching `xml:id`. An `evidence` item
+becomes an anonymous `dg:chunk` (its boxes and printed text) just ahead of the
+field that uses it. `dg:itemprop`/`dg:href` are semantic links only and never
+carry provenance.
+
+**Reading 0.7 files.** DGML 0.7 wrote an unprinted value as
+`dg:origin="computed"` plus `dg:itemprop="computedFrom"`/`dg:href`. Those
+files still read: the `"computed"` origin is ignored and the `dg:href`
+targets read as `inputs` (with `method: "inferred"`, the safe reading), so
+the values JSON no longer carries 0.7's `computed`/`derived_from` keys. New extractions
+write only the 0.71 form, and since rewriting an element changes its hash,
+re-anchor any attested file you re-extract. There is no JSON-LD export yet.
+
+**Schema-authoring rule for derivations:** prefer making every input a
+`## Prompt:` derivation rule mentions an extracted field in the schema, so
+`dg:inputs` can point at it. An input the schema doesn't extract can only be
+recorded as `evidence` text. An `inputs` entry that doesn't resolve is
+dropped from `dg:inputs`, and so is `evidence` that phases 2/3 couldn't box.
+Both are counted in `extraction_stats.json` under `matching.dropped_inputs`
+(written under `--debug`). A calculated or inferred value left with nothing
+it used is dropped, and counted under `matching.unsupported_values`.
 
 Extraction asks each model for its own maximum output (128K on current
 frontier Claude/Gemini, 64K on Haiku 4.5 — read from the provider's model
@@ -1397,9 +1531,33 @@ payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
 `phases.phase1`: `chunk_calls` (1 = ordinary single submission),
-`truncated_retries`, and `envelope_repairs`. The last counts `submit_values`
+`truncated_retries`, `envelope_repairs`, and `no_tool_call_retries`.
+`envelope_repairs` counts `submit_values`
 calls that arrived with the tool's argument envelope repeated one level down,
 or serialized as a JSON string, and were unwrapped before the tree was read.
+`no_tool_call_retries` counts the reminder retries given to phase-1 turns that
+ended with plain text and no tool call (the turn that finally fails a run is
+not counted). Phase 1 sends `tool_choice="required"` to every provider except
+Anthropic, so these occur only where phase 1 runs on auto: on Claude models,
+which stay on auto because a forced tool choice switches off their extended
+thinking; where litellm silently drops the parameter for a provider it
+believes lacks it; and on an endpoint that rejects `"required"` as an invalid
+request (HTTP 400/422). Such a call is resent once on auto; when the resend
+succeeds, the endpoint is remembered for the rest of the process (later
+attempts start on auto) and a warning names the model once. Timeouts, auth,
+rate-limit, context-window and content-policy errors are never resent this way.
+A text-only turn that stopped normally is answered with a reminder to call `submit_values` (or,
+for a chunked run that already recorded part of its submission, to continue
+with `append_entries`, since a resent full tree would duplicate its entries)
+and the model is asked again. Retries are never forced, so the turn that
+produces the values keeps its thinking budget, and they do not count against
+`max_tool_iters`. A third text-only turn in one attempt, or any text-only turn
+that did not stop normally (a content filter or refusal stop; a missing
+`finish_reason` counts as normal), fails the run;
+the error quotes the reply's opening text, its `finish_reason`, and whether it
+was reasoning only. The counter totals every attempt of the run (a truncation
+or schema retry starts a new attempt), so it can exceed the per-attempt limit
+the error reports.
 A submission of which the vocabulary keeps nothing (no key names a schema
 root, or every named root carries a value of the wrong kind) is refused as an
 extraction error rather than written as an empty result; an empty tree, or
@@ -1410,6 +1568,16 @@ not checked here.
 phase 1 cited that the file does not have (outside `1..page_count`, with no
 page image): their items make no phase-3 call and stay unmatched, like any
 other leaf phase 3 could not resolve, and the run still writes the tree.
+
+Phase 1 sends the whole PDF in one request. If the provider refuses that
+request as too large (Anthropic's `request_too_large`, an HTTP 413, Gemini's
+"payload size exceeds"), the PDF is sliced in half with the workspace's PDF
+engine and each half is sent on its own, halving again until every part is
+accepted. The parts' values are merged in page order: arrays concatenate,
+page numbers refer to the full document, and a field found in more than one
+part keeps the first non-empty value. `phases.phase1.pdf_parts` lists the
+`[first_page, last_page]` of each part, and appears only when a split happened.
+A single page the provider still refuses fails the file.
 
 **Schema-declared invariants.** A field may carry a `## Invariant:` annotation
 naming a checkable relation against the rest of the submission — the
@@ -1457,9 +1625,20 @@ instead of never running.
 `unnormalized_enum_values` (enum-field leaves whose returned value wasn't one
 of the schema's tokens — those serialize text-only, never guessed) and a
 report-only derivation recompute: `derivations_checked` /
-`derivations_mismatched` (computed leaves whose numeric inputs all resolve
-are recomputed; a leaf mismatches when its value agrees with neither the sum,
-the count, nor any single input within $0.05). The top-level
+`derivations_mismatched` (`calculated` leaves whose numeric inputs all
+resolve are recomputed; a leaf mismatches when its value agrees with neither
+the sum, the count, nor any single input within $0.05; `inferred` values and
+values calculated from `evidence` text are not recomputed). It also counts
+`unprinted_fields` (values with no `locations`), `partly_printed_fields`
+(`locations` plus `inputs`), `dropped_inputs` and `unsupported_values`
+(values with no box, no default and nothing they used, which are not
+written), and
+`repaired_inputs` (inputs re-pointed to where their cited text matched), and
+`dropped_unboxed_values` (printed values no box was found for, which are not
+written; `dropped_unboxed` lists each as `"path=text"`), `snapped_boxes` and `rejected_boxes` (boxes whose words on the text
+layer didn't read as their value: moved to the exact match on their line, or
+stripped). The first four replace 0.7's
+`computed_fields` and `dropped_refs`. The top-level
 `phase1_tool_schema` field records whether the docset schema rode inside the
 `submit_values` tool parameter (`"inlined"`, provider-enforced shape) or
 extraction fell back to a permissive parameter with code-side vocabulary
@@ -1569,8 +1748,10 @@ The `dgml file add` response also includes:
   File record is still created (with `page_count: null`) and a permanent error
   is recorded. `null` for PDFs and successful conversions.
 - `classification` — present **only** when `--auto-classify` is passed.
-  `decision` is `"existing"` or `"new"` (always `"existing"` under
-  `--auto-classify existing`). See "Auto-classification" below.
+  `decision` is `"existing"` or `"new"`; under `--auto-classify existing` it
+  is `"existing"` or `"none"` (no DocSet fits; file left unassigned); under
+  `--auto-classify existing-forced` it is always `"existing"`. See
+  "Auto-classification" below.
 
 Error codes that can come back on `file add`:
 
@@ -1586,13 +1767,13 @@ Error codes that can come back on `file add`:
 | `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
 | `CLASSIFICATION_CONFIG_INVALID` | The `classification` section exists but a required field is missing or malformed. |
-| `NO_EXISTING_DOCSETS` | `--auto-classify existing` was passed but the workspace has no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | `--auto-classify existing` (or `existing-forced`) was passed but the workspace has no DocSets to assign to. |
 
 The classification config is a precondition for `--auto-classify`, so a
 missing/invalid one is a **hard** error (exit 1) rather than a per-file
 soft error — every file would otherwise report the same thing. Having at
 least one DocSet is the same kind of precondition for `--auto-classify
-existing`, and is treated the same way. For a bulk directory add both are
+existing` and `existing-forced`, and is treated the same way. For a bulk directory add both are
 checked once up front, so the run aborts before any file is added.
 
 Soft-fail codes recorded on the File rather than returned as an envelope (OCR/hybrid-specific):
@@ -1624,8 +1805,9 @@ bulk flag — it makes re-runs idempotent. With `--auto-classify`, a
 DocSet created for one file becomes visible to the files processed
 after it, so similar PDFs in the batch cluster into the same DocSet.
 Under `--auto-classify existing` no DocSets are created, so that in-run
-growth doesn't happen: every file is assigned within the same curated set
-the run started with.
+growth doesn't happen: each file is either assigned within the same curated
+set the run started with or left unassigned (`decision: "none"`).
+`existing-forced` likewise creates nothing, but assigns every file.
 
 Each file commits independently: a single bad PDF (or a conflict under
 `--on-conflict error`) is recorded in its entry and the run continues.
@@ -1677,7 +1859,7 @@ carries the same fields as a single `file add` response (plus `path`, and
 `classification` when `--auto-classify` is set). A hard-failed entry
 has `status`, `path`, and an `error` object instead of a `file` record.
 
-`summary` counts (they sum to `total`):
+`summary` counts (`added` through `hard_failed` sum to `total`):
 
 | Field | Meaning |
 |---|---|
@@ -1686,6 +1868,7 @@ has `status`, `path`, and an `error` object instead of a `file` record.
 | `skipped` | Existing records returned via `--on-conflict skip`/`replace` (`created: false`). |
 | `soft_failed` | Added, but with a `page_render_error`, `page_count_error`, `text_extraction_error`, or `conversion_error` recorded. |
 | `hard_failed` | The add raised (bad PDF, conflict under `--on-conflict error`, …); the entry carries an `error` object. |
+| `unassigned` | Present only with `--auto-classify`. Files this run classified (`classification.performed: true`) that still sit in no DocSet — a `"none"` decision under `existing`, or a soft-failed classification (`classification.error`). An overlay on the counts above, not a bucket of its own: a declined file is still counted as `added`. Non-zero means some files need routing. Files skipped as duplicates are not counted, since they were not classified this run. |
 
 Run `dgml check` afterward as the authoritative health signal for the
 whole workspace.
@@ -1702,19 +1885,35 @@ The flag takes an optional `MODE`:
 |---|---|
 | `--auto-classify` | Same as `existing-or-new` — the historical default. |
 | `--auto-classify existing-or-new` | Assign to an existing DocSet if one fits; otherwise create one. |
-| `--auto-classify existing` | Always assign to an existing DocSet — the best-fitting one. Never creates a DocSet, and never declines. |
+| `--auto-classify existing` | Assign to an existing DocSet if one fits; otherwise leave the file unassigned (`decision: "none"`). Never creates a DocSet. |
+| `--auto-classify existing-forced` | Always assign to the closest existing DocSet, even when the fit is poor. Never creates a DocSet and never declines. |
+
+> **Changed behavior.** Before `existing-forced` existed, `existing` meant
+> what `existing-forced` means now: every file was assigned and `decision`
+> was always `"existing"`. `existing` can now return `decision: "none"` with
+> `docset_id: null`. Callers that relied on forced assignment should switch
+> to `existing-forced`. It also changes cost: `existing` against a
+> one-DocSet workspace used to make no LLM call, and now makes one per file
+> (declining is a possible answer, so the model has to look). A file whose
+> pages failed to render, which used to be assigned there, now gets
+> `classification.error` instead. `existing-forced` keeps the old
+> no-call path for a single DocSet.
 
 Use `existing` when the workspace's DocSets are curated and an ingest run
 must not grow new ones — otherwise one odd file anchors a one-document
 DocSet that someone has to notice and clean up.
 
-> **`existing` assumes the files belong.** The LLM is required to return a
-> DocSet, so a document whose type isn't represented in the workspace is
-> assigned to the closest one anyway rather than flagged. Only pass
-> `existing` when you already know each file fits one of the DocSets; for a
-> mixed or unknown batch use `existing-or-new`, or `dgml cluster`. With no
-> DocSets to choose from the command fails with `NO_EXISTING_DOCSETS`
-> (exit 1) instead of guessing.
+> **`existing` as a fallback router.** A document whose type isn't
+> represented in the workspace comes back with `decision: "none"`: the File
+> is kept but sits in no DocSet and is not extracted, so a caller's own
+> unknown-type handling can take over. With no DocSets to choose from the
+> command fails with `NO_EXISTING_DOCSETS` (exit 1) — there is nothing to
+> route into.
+
+Use `existing-forced` only when every file is known to belong in one of the
+workspace's DocSets: an off-type document is assigned to the closest DocSet
+anyway, not flagged. With exactly one DocSet it makes no LLM call — there is
+only one possible answer.
 
 > **Argument order matters.** `MODE` is optional, so the parser takes the
 > *next* token as its value. Put `<path>` **before** the flag —
@@ -1759,23 +1958,26 @@ The LLM is forced to pick exactly one of two tools:
   document type can answer. The `key_questions` are persisted on the
   new DocSet and shown to future classifications.
 
-`--auto-classify existing` offers only `assign_to_existing_docset`, so
-with `tool_choice="required"` a choice is forced: the LLM is told a
-perfect fit isn't required and to return the closest DocSet. `decision`
-is therefore always `"existing"`. A model that calls `create_new_docset`
-anyway is refused with `CLASSIFICATION_FAILED`.
+`--auto-classify existing` swaps `create_new_docset` for
+`no_matching_docset(reason)`: the LLM assigns when a DocSet is the new
+file's document type, and otherwise declines, giving `decision: "none"` and
+a one-sentence `decline_reason`. Fit is judged by each DocSet's description, or by
+its name alone when it has none. Key questions only break ties between
+DocSets that both fit, so a DocSet created with just a `--name` is still a
+candidate. The model is called even when the workspace holds a single DocSet,
+since declining is a possible answer.
 
-Two cases skip the LLM entirely, since neither leaves anything to decide:
+`--auto-classify existing-forced` offers `assign_to_existing_docset` alone,
+so the LLM must pick the closest DocSet.
 
-- **Exactly one DocSet** — the file is assigned to it, with the same
-  payload the model would have returned. This mode creates no DocSets,
-  so a whole bulk run over a one-DocSet workspace costs no LLM calls.
-  (`existing-or-new` still calls here — it may need a new DocSet.)
-- **No DocSets** — the command fails with `NO_EXISTING_DOCSETS`
-  (exit 1). Both preconditions (config, and at least one DocSet) are
-  checked *before* the file is ingested, single and bulk alike, so a
-  failed run adds nothing — erroring after the add would leave behind
-  the unassigned file this mode exists to avoid.
+A model that calls a tool its mode didn't offer (`create_new_docset`
+outside the default mode, `no_matching_docset` outside `existing`) is
+refused with `CLASSIFICATION_FAILED`.
+
+With **no DocSets** the command fails with `NO_EXISTING_DOCSETS` (exit 1)
+and makes no LLM call. Both preconditions (config, and at least one
+DocSet) are checked *before* the file is ingested, single and bulk alike,
+so a failed run adds nothing.
 
 Classification runs **after** the file is added, and only when `created`
 is `true`. Re-runs on a duplicate (`--on-conflict skip`) skip the LLM
@@ -1797,18 +1999,43 @@ The `classification` payload block:
     "What is the invoice total?",
     "What is the invoice date?"
   ],
+  "decline_reason": null,
   "error": null
 }
 ```
+
+`docset_id` is set only once the file is actually stored in that DocSet, so
+a block with an `error` and a non-null `docset_id` means the assignment
+landed and a later step failed; a `null` one means the file is in no DocSet.
+If a newly created DocSet can't take the file, the DocSet is deleted again
+rather than left behind empty.
 
 `docset_key_questions` echoes the assigned DocSet's `key_questions`
 (empty list for DocSets created without them). When `decision`
 is `"new"`, this is the list the LLM just proposed and that has been
 persisted on the freshly-created DocSet.
 
-Under `--auto-classify existing` the block looks the same as the
-`"existing"` example above; `decision` is never `"new"` and never
-anything else, since the assign tool is the only one offered.
+Under `--auto-classify existing` `decision` is never `"new"`. When no
+DocSet fits it is `"none"`, the File is left unassigned, no `extraction`
+block is added, the DocSet fields stay empty, and `decline_reason` carries
+the LLM's one-sentence explanation. `decline_reason` is present on every
+performed block and `null` unless `decision` is `"none"`; a decline that
+comes back without a reason is treated as a malformed response
+(`CLASSIFICATION_FAILED` in `error`), so a `"none"` always says why:
+
+```json
+"classification": {
+  "performed": true,
+  "model": "gemini/gemini-flash-lite-latest",
+  "decision": "none",
+  "docset_id": null,
+  "docset_created": false,
+  "docset_name": null,
+  "docset_key_questions": [],
+  "decline_reason": "This is a commercial lease, not a vendor invoice or a safety datasheet.",
+  "error": null
+}
+```
 
 When the file already existed (`created: false`):
 
@@ -2448,7 +2675,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 |---|---|---|
 | `WORKSPACE_NOT_INITIALIZED` | hard | A command that needs a workspace ran against a directory that has no workspace **config** — which is what makes a directory a workspace, since the config names the storage backend and cannot be reconstructed. This covers both "never a workspace" and "a workspace whose `config.toml` was deleted"; nothing on disk distinguishes them for a remote-backed workspace, so one error carries all the remedies. The message names the resolved path and offers remedies that work against *that* workspace: `dgml workspace create <path> --organization <org>` to make one there, `dgml workspace list` to find one you already have, or restoring the config from backup. (It deliberately does not say a bare `dgml workspace create`, which would create a workspace elsewhere and leave the command failing identically.) |
 | `LEGACY_CONFIG_PRESENT` | hard | A pre-migration `<workspace>/config.toml` is the only config present; the format is now TOML. Run `dgml init` to write `~/.config/dgml/config.toml`, then migrate any settings. |
-| `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier or `family` set to a non-string or empty value, or `family` naming an unknown provider family). |
+| `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier, `family` or credential set to a non-string or empty value, `family` naming an unknown provider family, both `*_api_key` and `*_api_key_env` set for one tier or provider, or tier credentials without that tier). |
 | `MISSING_EXTRA` | hard | A command needs an optional extra that isn't installed (e.g. `dgml[clustering]`). |
 | `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`, a `file add --id` that is malformed, passed with a directory, or unsatisfiable under the chosen `--on-conflict`). |
 | `INTERNAL_ERROR` | hard | Unexpected exception; the message is a short, single-line `<ExcType>: <msg>` (capped, whitespace collapsed). Pass `--verbose` (or set `DGML_DEBUG=1`) for the full stderr traceback. |
@@ -2470,7 +2697,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CLASSIFICATION_CONFIG_MISSING` | hard | `--auto-classify` with no `classification` config. |
 | `CLASSIFICATION_CONFIG_INVALID` | hard | The `classification` config has a missing/invalid field. |
 | `CLASSIFICATION_FAILED` | soft | The classification LLM call failed; lands in `classification.error`. |
-| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` in a workspace with no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` or `existing-forced` in a workspace with no DocSets to assign to. |
 | `CLUSTERING_CONFIG_INVALID` | hard | The optional `clustering` config section failed validation. |
 | `GROUNDING_FAILED` | soft | Grounding a file failed; surfaces as `grounded: false` with a `grounding_error` on that file's `docset generate` result entry. |
 | `LABEL_MODEL_UNREACHABLE` | soft | A file's labeling could not reach the `label_model` at all (auth / bad model id / network); surfaces as a `label_error` on that file's `docset generate` result entry. The file still converts, unlabeled. |

@@ -581,6 +581,20 @@ def test_audit_flags_a_dangling_href() -> None:
     assert audit.mean_distance == 0.0  # nothing resolved, so no distance to average
 
 
+def test_audit_reads_semicolon_joined_and_cross_file_hrefs() -> None:
+    """``"#a; #b"`` is two references, not ``#a;`` plus ``#b``, and a
+    ``fileid#id`` reference names another file, so it can't dangle here."""
+    from dgml_core.generation.links import audit_links
+
+    joined = _TREE.replace(
+        '<dg:Cap xml:id="cap">',
+        '<dg:Cap xml:id="cap" dg:itemprop="references" dg:href="#rent; #term; 5kqt9r5fowno#x">',
+    )
+    audit = audit_links(joined)
+    assert audit.pairs == 2
+    assert audit.dangling == 0 and audit.dangling_hrefs == []
+
+
 def test_every_plan_entry_either_lands_or_is_accounted_for() -> None:
     """Nothing disappears quietly — including the links the format itself
     discards, because dg:itemprop/dg:href are attributes on the subject and a

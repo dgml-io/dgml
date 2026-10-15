@@ -342,7 +342,7 @@ Before anchoring anything, it helps to understand the two LLM-backed processing 
 
 **Generation** (`dgml docset generate`, used in Phase 1) transcribes the *whole* document into a semantic XML tree — every clause, table, and value typed, labeled with the DocSet's shared vocabulary, and grounded to its source-page position (`dg:origin`). Use it when the full document needs to stay queryable and verifiable.
 
-**Extraction** (`dgml extraction …`) pulls a *defined set of fields* out of a document against an extraction schema, and grounds each value back to the source page. The schema can be proposed by an LLM (`dgml extraction generate-schema <docset_id>`) or supplied by you (`set-schema`); `dgml extraction extract <docset_id> <file_id>` then writes the values as a `dg:extraction` element **inside the file's core `<stem>.dgml.xml`** — there is no separate values file. It uses the `grounded` config section (§1.4). See the [extraction commands](../docs/cli-reference.md#extraction-commands) for details.
+**Extraction** (`dgml extraction …`) pulls a *defined set of fields* out of a document against an extraction schema, and grounds each value back to the source page. The schema can be proposed by an LLM (`dgml extraction generate-schema <docset_id>`) or supplied by you (`set-schema`); `dgml extraction extract <docset_id> <file_id>` (for a file already assigned to that DocSet) then writes the values as a `dg:extraction` element **inside the file's core `<stem>.dgml.xml`** — there is no separate values file. It uses the `grounded` config section (§1.4). See the [extraction commands](../docs/cli-reference.md#extraction-commands) for details.
 
 When to use which:
 

@@ -183,6 +183,12 @@ stale fingerprint agree perfectly.
 
 ## Credentials
 
+**By value, for an in-memory configuration.** A workspace configured in code
+(`dgml_core.configuration`, nothing written to disk) may pass the full connection
+string as the `mongo_uri` option instead; it is used verbatim and takes precedence over
+the environment variables below. The storage seal treats `*uri` names as secrets, so
+rotating it never reads as a backend change. Do not put it in a `config.toml`.
+
 **Never put credentials in DGML config.** Mongo reads `DGML_MONGO_URI` if set (the
 full connection string, including any credentials); otherwise it connects to
 `mongo_host:mongo_port` with no auth. All four providers share this, and it

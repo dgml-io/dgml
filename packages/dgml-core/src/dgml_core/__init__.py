@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from . import layout
+from . import configuration, layout
+from .configuration import Configuration, Identity, ProviderSpec, Storage
 from .conversion import (
     ConverterConfig,
     DocConverter,
@@ -94,6 +95,10 @@ from .errors import (
     WorkspacesUnavailable,
     WorkspacesWriteConflict,
 )
+
+# Eager: ``.extraction`` imports only docsets/errors/storage at module scope and
+# reaches ``.grounded`` → ``.llm`` inside the function, so it costs nothing here.
+from .extraction import add_file_and_extract, extract_file
 from .file_attestation import (
     ArtifactKind,
     ArtifactRef,
@@ -125,7 +130,7 @@ from .migrations import (
     stamp_schema_version,
     workspace_schema_version,
 )
-from .models import DocSet, FileRecord
+from .models import DocSet, DocSetAssignment, FileRecord
 from .ocr import (
     BUILTIN_OCR_PROVIDERS,
     OcrConfig,
@@ -171,7 +176,15 @@ from .workspaces_resolve import (
 from .workspaces_store import WorkspacesConfig, WorkspacesStore, default_workspaces_root
 
 if TYPE_CHECKING:
+    from .classification import (
+        ClassificationConfig,
+        ClassificationDecision,
+        ClassifyMode,
+        classify_file,
+        load_classification_config,
+    )
     from .consistency import CheckReport, Issue, check_workspace
+    from .grounded import ExtractionResult
 
 __version__ = "0.1.0"
 
@@ -181,18 +194,25 @@ __version__ = "0.1.0"
 # falling through to Python's last-resort stderr handler.
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
-#: Names re-exported from ``.consistency``, resolved on FIRST ACCESS rather than
-#: at import (PEP 562). That module reaches ``.hybrid`` → ``.llm`` → ``litellm``,
-#: which costs ~1.4s of the package's ~1.66s import — paid by every consumer,
-#: including the ones that only ever touch ``Workspace``/``FileStore`` and never
-#: make an LLM call. Deterministic CLIs that invoke this package thousands of
-#: times per session (bill extraction) spend that entire budget on an unused
-#: client. Importing ``dgml_core.consistency`` directly, or touching any name
-#: below, still loads it exactly as before.
+#: Names re-exported from ``.consistency``, ``.classification`` and ``.grounded``,
+#: resolved on FIRST ACCESS rather than at import (PEP 562). All three reach ``.llm``
+#: → ``litellm`` (consistency via ``.hybrid``; the other two directly), which costs
+#: ~1.4s of the package's ~1.66s import — paid by every consumer, including the
+#: ones that only ever touch ``Workspace``/``FileStore`` and never make an LLM
+#: call. Deterministic CLIs that invoke this package thousands of times per
+#: session (bill extraction) spend that entire budget on an unused client.
+#: Importing a submodule directly, or touching any name below, still loads it
+#: exactly as before. ``tests/test_public_api.py`` pins the invariant.
 _LAZY_SUBMODULES = {
     "CheckReport": ".consistency",
+    "ClassificationConfig": ".classification",
+    "ClassificationDecision": ".classification",
+    "ClassifyMode": ".classification",
+    "ExtractionResult": ".grounded",
     "Issue": ".consistency",
     "check_workspace": ".consistency",
+    "classify_file": ".classification",
+    "load_classification_config": ".classification",
 }
 
 
@@ -234,11 +254,15 @@ __all__ = [
     "ChainRpcFailed",
     "ChainTxReverted",
     "CheckReport",
+    "ClassificationConfig",
     "ClassificationConfigInvalid",
     "ClassificationConfigMissing",
+    "ClassificationDecision",
     "ClassificationFailed",
+    "ClassifyMode",
     "ClusteringConfigInvalid",
     "Collection",
+    "Configuration",
     "ConflictError",
     "ConflictPolicy",
     "ConversionConfigInvalid",
@@ -249,12 +273,14 @@ __all__ = [
     "DgmlError",
     "DocConverter",
     "DocSet",
+    "DocSetAssignment",
     "DocSetNotFound",
     "DocSetStore",
     "DocStore",
     "EmptyModelResponse",
     "EngineName",
     "EngineNotAvailable",
+    "ExtractionResult",
     "FileAttestation",
     "FileNotFound",
     "FileRecord",
@@ -268,6 +294,7 @@ __all__ = [
     "GroundedConfigMissing",
     "GroundingFailed",
     "GuidanceNotFound",
+    "Identity",
     "IncrementalWithoutClusters",
     "InvalidArgument",
     "InvalidPDF",
@@ -295,11 +322,13 @@ __all__ = [
     "PdfConfigInvalid",
     "PdfSliceFailed",
     "PdfSlicer",
+    "ProviderSpec",
     "RecordNotFound",
     "RegistryNotFound",
     "SchemaGenerationFailed",
     "SchemaInvalid",
     "SchemaNotFound",
+    "Storage",
     "StorageBackendMismatch",
     "StorageConfig",
     "StorageConfigInvalid",
@@ -324,19 +353,24 @@ __all__ = [
     "WorkspacesUnavailable",
     "WorkspacesWriteConflict",
     "__version__",
+    "add_file_and_extract",
     "attest_file",
     "attest_file_version",
     "check_workspace",
+    "classify_file",
     "collect_file_version",
     "collect_from_attestation",
+    "configuration",
     "create_workspace",
     "default_workspaces_root",
     "default_workspaces_store",
     "export_attestation",
+    "extract_file",
     "generate_unique_workspace_id",
     "is_record_id",
     "is_workspace_id",
     "layout",
+    "load_classification_config",
     "load_conversion_config",
     "load_ocr_config",
     "load_pdf_config",

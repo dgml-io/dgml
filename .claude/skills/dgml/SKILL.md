@@ -142,7 +142,8 @@ uv run dgml docset create --name "Lease Abstract" \
 For that curated case, pass `--auto-classify existing` so the run can
 only *route into* those DocSets, never invent more. Without it, one
 document that matches nothing anchors a brand-new one-file DocSet that
-someone has to notice and clean up:
+someone has to notice and clean up; with it, that document is left
+unassigned (`decision: "none"`, `docset_name: null`):
 
 ```bash
 payload=$(uv run dgml file add --workspace "$wid" /path/to/docs \
@@ -150,14 +151,13 @@ payload=$(uv run dgml file add --workspace "$wid" /path/to/docs \
 jq -r '.results[] | "\(.classification.docset_name)\t\(.path)"' <<<"$payload"
 ```
 
-⚠️ **Only use `existing` when you already know every file belongs in one
-of the workspace's DocSets.** The LLM is *required* to return a DocSet —
-it is offered no other action — so an off-type document is filed under
-the closest DocSet rather than flagged. For a mixed or unknown batch use
-bare `--auto-classify` (which can create DocSets) or `dgml cluster`
-(which groups the batch and names each group from the whole group).
-Silently mis-filed documents are harder to notice later than an extra
-DocSet is.
+Files with `decision: "none"` are added but sit in no DocSet and are not
+extracted. `.summary.unassigned` counts them (plus any file whose
+classification soft-failed); list them, with the LLM's reason, via
+`jq -r '.results[] | select(.classification.decision == "none") | "\(.path)\t\(.classification.decline_reason)"'`
+and route them yourself (or run `dgml cluster` over them). Re-running the
+same command with `--on-conflict skip` does **not** retry them — existing
+files skip classification — so assign them with `docset add-file`.
 
 ⚠️ `--auto-classify` takes an *optional* MODE, so the parser eats the
 next token. Always put PATH **before** the flag (as above), or name the
@@ -168,18 +168,16 @@ mode explicitly (`--auto-classify existing /path/doc.pdf`).
 Key contract points:
 - `--auto-classify` (bare) == `--auto-classify existing-or-new`: assign
   if something fits, else create. `--auto-classify existing` never
-  creates and never declines — `decision` is always `"existing"`, so
-  every file lands in a DocSet whether or not it truly fits.
-- In `existing` mode against a workspace with **no** DocSets, the command
+  creates: assign if something fits, else leave the file unassigned with
+  `decision: "none"` (no auto-extraction). Fit is judged on each DocSet's
+  description (or name, if it has none); key questions only break ties.
+  `--auto-classify existing-forced` is the old `existing`: it always
+  assigns to the closest DocSet — use it only when every file is known to
+  belong in one. With a single DocSet, `existing` still makes one LLM call
+  per file (it may decline); `existing-forced` makes none.
+- In `existing` / `existing-forced` mode against a workspace with **no** DocSets, the command
   is a **hard** error (exit 1, `NO_EXISTING_DOCSETS`) and makes no LLM
   call — there is nothing it could assign to. Seed the DocSets first.
-- In `existing` mode against a workspace with exactly **one** DocSet, the
-  file is assigned to it **without** an LLM call — one answer, no way to
-  decline, nothing to decide. The payload is unchanged
-  (`decision: "existing"`); only the call is skipped. That mode creates
-  no DocSets, so a whole bulk run over a one-DocSet workspace costs
-  nothing in tokens. Bare `--auto-classify` still calls the LLM here,
-  since it could create a second DocSet instead.
 - A missing or invalid `classification` config is a **hard** error
   (exit 1, `CLASSIFICATION_CONFIG_MISSING` / `_INVALID`): config is a
   precondition, so the command aborts rather than recording the same
@@ -236,7 +234,7 @@ summing to `total`) is the quick health read; report it to the user.
 
 Variants:
 - **Add to an existing DocSet:** skip the `docset create` step; pass its known ID as `$ds`. Find it with `uv run dgml docset list | jq -r '.docsets[] | select(.name=="…") | .id'`.
-- **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome. Use `--auto-classify existing` instead when the workspace's DocSets are curated, the run must not create more, and you already know every file belongs in one of them — that mode forces the LLM to pick the closest DocSet for every file, so it mis-files an off-type document rather than flagging it.
+- **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome. Use `--auto-classify existing` instead when the workspace's DocSets are curated and the run must not create more — a file that fits none of them is left unassigned with `decision: "none"` for you to route.
 - **Recurse into subdirectories:** add `--recursive`.
 - **Hidden errors:** a PDF that fails to parse, render, or extract digital text still produces an entry — `soft_failed` (the `page_*`/`text_extraction_error` fields are set on its `file` entry) or `hard_failed` (the entry has an `error` object and no `file`). `dgml check` afterward is the authoritative whole-workspace health signal.
 
@@ -676,7 +674,8 @@ uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 #    NOTE: once the schema is set, assigning a file (docset add-file /
 #    --auto-classify / cluster into an existing docset) auto-extracts it —
 #    check the payload's `extraction` block; run `extract` manually only for
-#    files assigned before the schema existed or to re-extract.
+#    files assigned before the schema existed or to re-extract. The file must
+#    already be assigned to the docset (FILE_NOT_FOUND otherwise).
 uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_key}'
 
 # 3) Read them back. Default is values-shape JSON (projected from dg:extraction);
@@ -694,16 +693,30 @@ grounded value carries a `dg:origin` box back to `page_images/page_N.png`.
 
 A schema field's `## Prompt:` may describe a **derivation rule** instead of a
 place on the page ("Compute as sum of Quantity × UnitPrice for each LineItem").
-Such fields come back *computed* (spec §13): in values JSON as
-`{text, value, computed: true, derived_from: [dotted paths]}` with no
-`locations`; in the XML as `dg:origin="computed"` + `dg:value` +
-`dg:itemprop="computedFrom"`/`dg:href` pointing at the source elements (which
-get `xml:id`s). When writing a derivation `## Prompt:`, make every input it
-mentions an extracted field of its own — `dg:href` can only point at extracted
-elements, so an un-extracted input leaves the computed value unverifiable
-(unresolvable refs are counted as `matching.dropped_refs` in
-`extraction_stats.json`, and `dgml check` flags source-less computed fields
-as `computed_field_unattributed`). Errors are the
+Provenance follows DGML 0.71. In values JSON a leaf carries `locations` (where
+its own text is printed), `inputs` (dotted paths of the values it used), and,
+when the page doesn't print it, `method`: `calculated`, `inferred`, or
+`defaulted` (no inputs). The XML carries the same as `dg:origin` (boxes only),
+`dg:inputs` (`#id; #id`, with the targets given `xml:id`s) and `dg:method`. A
+value printed only in part, like a "3/1" period start whose year comes from
+the commencement date, keeps its boxes **and** names its `inputs`. A box whose
+words on the page's text layer don't read as its value moves to the nearest exact
+match on its line (`matching.snapped_boxes`) or is stripped
+(`matching.rejected_boxes`), and a printed value left with no box is dropped
+rather than written without `dg:origin` (`matching.dropped_unboxed_values`). Printed
+text a value used that no schema field extracts comes back as `evidence`
+(`[{text, locations}]`) and is written as an anonymous `dg:chunk` next to the
+field. When writing a derivation `## Prompt:`, prefer making every input it
+mentions an extracted field of its own. The model cites the text it read with
+each input, and extraction re-points a miscounted array index at the matching
+entry (`matching.repaired_inputs`). Unresolvable or unmatched inputs, and
+evidence that couldn't be boxed, are counted as `matching.dropped_inputs` in
+`extraction_stats.json`. Values with nothing to verify them by (no box, no
+default, nothing they used) are not written, counted as
+`matching.unsupported_values`. `dgml check` reports `method_misplaced`,
+`inputs_dangling` and `inputs_cycle`, and `value_unsupported` for a 0.7
+computed element with no `dg:href`. 0.7 files (`dg:origin="computed"` +
+`dg:href`) still read, with the href targets as inputs. Errors are the
 usual envelope: `SCHEMA_NOT_FOUND` (no schema set), `GUIDANCE_NOT_FOUND`
 (no guidance set), `NO_FILES` (empty docset, no `--from-file`),
 `VALUES_NOT_FOUND` (extract not run yet), `GROUNDED_CONFIG_MISSING` (no

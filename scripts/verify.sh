@@ -48,7 +48,7 @@ run uv run ruff format --check .
 # skill mirrors are hand-kept copies, and a stale one teaches a CLI surface that
 # no longer exists. `--fix` on the same script resyncs them.
 run scripts/check-agent-skills.sh
-run uv run mypy packages
+run uv run mypy packages samples/dgml-sample-service
 
 if [[ $fast -eq 0 ]]; then
   run uv run pytest

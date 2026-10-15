@@ -16,7 +16,8 @@ and the internal ``extracted_value`` JSON Schema the extraction engine drives of
 The DGML spec (§12) makes RELAX NG Compact the canonical docset schema. The
 grounded-extraction engine in :mod:`dgml_core.grounded`, however, was built
 around a JSON Schema whose every leaf is a reusable ``extracted_value``
-(verbatim text + optional normalized value + grounded-or-computed provenance).
+(verbatim text + optional normalized value + provenance: page locations,
+inputs, and how an unprinted value was produced).
 Rather than rewrite the engine, this module is the deterministic bridge:
 
     RNC (at rest)  ⇄  Vocabulary (intermediate)  ⇄  extracted_value JSON Schema
@@ -39,6 +40,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .dg_refs import METHODS
 from .errors import SchemaInvalid
 from .generation.semantic_transform import docset_slug, org_ns_segment
 
@@ -76,11 +78,11 @@ GROUNDED_FIELD: dict[str, Any] = {
 
 _GROUNDED_FIELD_REF = "#/definitions/grounded_field"
 
-# The computed alternative (spec §7/§13): a value the model derives by
-# reasoning over other extracted values (an InvoiceTotal summed from line
-# items) instead of reading it off the page. No ``locations`` — grounding is
-# expressed as ``derived_from`` paths into the same values tree, which the XML
-# serializer turns into dg:origin="computed" + dg:itemprop/dg:href.
+# The legacy (DGML 0.7) computed alternative: a value the model derives by
+# reasoning over other extracted values instead of reading it off the page,
+# grounded through ``derived_from`` paths. Older exported schemas may still
+# ``$ref`` it; it is accepted on input but no longer emitted, and a leaf in
+# this shape is read as ``inputs`` (see grounded._normalize_leaf_provenance).
 COMPUTED_FIELD: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -107,22 +109,26 @@ COMPUTED_FIELD: dict[str, Any] = {
 
 _COMPUTED_FIELD_REF = "#/definitions/computed_field"
 
-# The merged leaf definition (spec §13): every extracted value carries the
-# verbatim ``text``, an optional normalized ``value``, and its provenance —
-# either grounded to the page (``locations``) or computed from other values
-# (``computed``/``derived_from``), never both. One shape for both cases keeps
-# the provider tool schema small: a large schema whose every leaf is a
-# two-branch anyOf union doubles the constrained-decoding state count, and
-# Gemini rejects oversized tool schemas with "too many states for serving".
-# The single shape is also the only clean carrier for a model-returned
-# normalized ``value`` on grounded leaves (enum classification like
-# "Electric Service" → "electric" cannot be derived by code-side regexes).
+# The merged leaf definition (spec §13, provenance per DGML 0.71): every
+# extracted value carries the verbatim ``text``, an optional normalized
+# ``value``, and its provenance — ``locations`` where the page prints it,
+# ``inputs`` naming the other values it used, and ``method`` for a value the
+# page doesn't print. One shape for every case keeps the provider tool schema
+# small: a large schema whose every leaf is a multi-branch anyOf union
+# multiplies the constrained-decoding state count, and Gemini rejects
+# oversized tool schemas with "too many states for serving". The single shape
+# is also the only clean carrier for a model-returned normalized ``value`` on
+# grounded leaves (enum classification like "Electric Service" → "electric"
+# cannot be derived by code-side regexes).
 EXTRACTED_VALUE: dict[str, Any] = {
     "type": "object",
     "properties": {
         "text": {
             "type": "string",
-            "description": "Verbatim as printed on the document.",
+            "description": (
+                "Verbatim as printed on the document (for a value the page "
+                "doesn't print, the display form of the result)."
+            ),
         },
         "value": {
             "type": "string",
@@ -132,16 +138,45 @@ EXTRACTED_VALUE: dict[str, Any] = {
             ),
         },
         "locations": _LOCATIONS_SCHEMA,
-        "computed": {
-            "type": "boolean",
-            "description": "True marks the value as derived, not read off the page.",
-        },
-        "derived_from": {
+        "inputs": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Computed values only: dotted paths of the values in this same "
-                "submission the result derives from (e.g. 'LineItems[0].Quantity')."
+                "The other values in this same submission the result used, each "
+                "as '<dotted path>=<that value's text>' (e.g. "
+                "'LineItems[2].Amount=$27.05'). With locations: the value is "
+                "printed in part and completed from these. Without: it is "
+                "calculated or inferred from them."
+            ),
+        },
+        # Kept flat ({text, page_number}, no nested locations array): this
+        # rides on every leaf of the tool schema, so its shape multiplies the
+        # constrained-decoding state count. The normalizer turns page_number
+        # into the locations phases 2/3 ground.
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "page_number": {"type": "integer"},
+                },
+                "required": ["text", "page_number"],
+            },
+            "description": (
+                "Printed text the result used that no schema field extracts "
+                "(e.g. 'a term of twenty-four (24) months'), verbatim, with "
+                "the page it is on."
+            ),
+        },
+        "method": {
+            "type": "string",
+            "enum": list(METHODS),
+            "description": (
+                "Only for a value with no locations: 'calculated' (a "
+                "deterministic calculation over inputs), 'inferred' (a judgment "
+                "from inputs), or 'defaulted' (the field's stated default; no "
+                "inputs)."
             ),
         },
     },
@@ -478,7 +513,9 @@ def _properties_to_tags(properties: Any) -> list[Tag]:
 
 # Property names an object schema may use and still be a *leaf* (one extracted
 # value) rather than a container of fields. Matches EXTRACTED_VALUE's shape.
-_LEAF_SHAPE_KEYS = frozenset({"text", "value", "locations", "derived_from", "computed"})
+_LEAF_SHAPE_KEYS = frozenset(
+    {"text", "value", "locations", "inputs", "evidence", "method", "derived_from", "computed"}
+)
 
 # Annotation keys a $ref node may carry as siblings; they are merged over the
 # resolved target (2020-12 semantics: siblings apply alongside the $ref).
@@ -548,11 +585,11 @@ def _resolve_schema_dialect(schema: dict[str, Any]) -> dict[str, Any]:
     * local ``$defs``/``definitions`` ``$ref``\\s anywhere, resolved inline
       with sibling annotation keys merged over the target;
     * the **merged leaf shape** recognized structurally — an object whose
-      properties are a subset of ``{text, value, locations, derived_from,
-      computed}`` with ``text`` present becomes an ``extracted_value`` leaf,
-      its ``value`` subschema mapped to ``datatype``/``value_enum``
-      (``enum`` list, ``format: date``, ``type: integer/boolean/number``,
-      or a plain-decimal ``pattern``);
+      properties are a subset of ``{text, value, locations, inputs, evidence,
+      method}`` (or the 0.7 ``derived_from``/``computed``) with ``text`` present
+      becomes an ``extracted_value`` leaf, its ``value`` subschema mapped
+      to ``datatype``/``value_enum`` (``enum`` list, ``format: date``,
+      ``type: integer/boolean/number``, or a plain-decimal ``pattern``);
     * ``title`` as the element name (handled downstream in ``_node_to_tag``).
 
     Schemas already in the internal form pass through unchanged (internal

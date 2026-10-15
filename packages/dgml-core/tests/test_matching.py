@@ -19,11 +19,13 @@ import pytest
 from dgml_core import layout
 from dgml_core.matching import (
     _array_layout_key,
+    _field_name_tokens,
     _walk_leaves,
     parse_path,
     path_to_str,
     run_phase2_matching,
-    walk_computed_leaves,
+    walk_input_leaves,
+    walk_unprinted_leaves,
 )
 from dgml_core.models import FileRecord
 from dgml_core.storage import Workspace
@@ -1094,12 +1096,12 @@ def test_phase2_must_not_match(
 
 
 # ---------------------------------------------------------------------------
-# computed leaves + path helpers
+# unprinted leaves + path helpers
 
 
-def test_computed_leaf_skipped_by_matcher(workspace: Workspace) -> None:
-    """A computed leaf (no locations; computed/derived_from keys) is invisible
-    to phase 2: it creates no task, no unmatched item, and survives the copy
+def test_unprinted_leaf_skipped_by_matcher(workspace: Workspace) -> None:
+    """An unprinted leaf (no locations; inputs/method keys) is invisible to
+    phase 2: it creates no task, no unmatched item, and survives the copy
     untouched."""
     _seed_file_and_text(
         workspace,
@@ -1115,8 +1117,8 @@ def test_computed_leaf_skipped_by_matcher(workspace: Workspace) -> None:
         "word_count": {
             "text": "2",
             "value": "2",
-            "computed": True,
-            "derived_from": ["title"],
+            "inputs": ["title"],
+            "method": "calculated",
         },
     }
     result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
@@ -1126,18 +1128,29 @@ def test_computed_leaf_skipped_by_matcher(workspace: Workspace) -> None:
     assert result.values["word_count"] == phase1["word_count"]
 
 
-def test_walk_computed_leaves_complements_walk_leaves() -> None:
+def test_walk_unprinted_leaves_complements_walk_leaves() -> None:
     values = {
         "title": {"text": "Hello", "locations": [{"page_number": 1}]},
         "items": [
             {"qty": {"text": "3", "locations": [{"page_number": 2}]}},
-            {"qty": {"text": "2", "computed": True, "derived_from": ["items[0].qty"]}},
+            {"qty": {"text": "2", "inputs": ["items[0].qty"], "method": "inferred"}},
         ],
+        "grace": {"text": "0", "method": "defaulted"},
+        # Printed in part: grounded like any leaf, and it has inputs.
+        "start": {"text": "3/1", "locations": [{"page_number": 1}], "inputs": ["title"]},
+    }
+    values["end"] = {
+        "text": "2028-01-14",
+        "method": "calculated",
+        "evidence": [{"text": "24 months", "locations": [{"page_number": 1}]}],
     }
     grounded = {path for path, _ in _walk_leaves(values)}
-    computed = {path for path, _ in walk_computed_leaves(values)}
-    assert grounded == {("title",), ("items", 0, "qty")}
-    assert computed == {("items", 1, "qty")}
+    unprinted = {path for path, _ in walk_unprinted_leaves(values)}
+    with_inputs = {path for path, _ in walk_input_leaves(values)}
+    # An unprinted leaf's evidence is grounded even though the leaf isn't.
+    assert grounded == {("title",), ("items", 0, "qty"), ("start",), ("end", "evidence", 0)}
+    assert unprinted == {("items", 1, "qty"), ("grace",), ("end",)}
+    assert with_inputs == {("items", 1, "qty"), ("start",), ("end",)}
 
 
 @pytest.mark.parametrize(
@@ -1155,3 +1168,831 @@ def test_parse_path(text: str, expected: tuple[object, ...] | None) -> None:
     assert parse_path(text) == expected
     if expected is not None:
         assert parse_path(path_to_str(expected)) == expected
+
+
+# ---------------------------------------------------------------------------
+# repeated top-level values (running headers, fax banners, labels)
+
+
+def _box(result: Any, *path: Any) -> list[int]:
+    leaf = result.values
+    for seg in path:
+        leaf = leaf[seg]
+    locs = leaf["locations"]
+    assert len(locs) == 1 and "bounding_box" in locs[0], locs
+    return list(locs[0]["bounding_box"])
+
+
+def test_repeated_scalar_prefers_body_over_running_header(workspace: Workspace) -> None:
+    """A top-level value printed in the page's header band (a running
+    header, a fax banner) and once in the body resolves to the body
+    occurrence in phase 2, with no phase-3 item."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "A1234", "l": [800, 20, 880, 40]},  # header band (y≈30/1000)
+            {"t": "A1234", "l": [300, 400, 380, 420]},  # body
+        ],
+    )
+    phase1 = {"case_id": {"text": "A1234", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.unmatched == []
+    assert _box(result, "case_id") == [300, 400, 380, 420]
+    assert result.stats.repeated_value_picks == 1
+
+
+def test_repeated_scalar_prefers_footer_free_body_label(workspace: Workspace) -> None:
+    """A footer copy that carries its own label does not win over the
+    body: header/footer copies are dropped before the label vote."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Patient:", "l": [100, 970, 180, 990]},
+            {"t": "Jane", "l": [190, 970, 240, 990]},  # footer band, labelled
+            {"t": "Jane", "l": [300, 300, 350, 320]},  # body, no label
+        ],
+    )
+    phase1 = {"patient": {"text": "Jane", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "patient") == [300, 300, 350, 320]
+
+
+def test_repeated_scalar_picks_the_labelled_occurrence(workspace: Workspace) -> None:
+    """Two body occurrences: the one with the field name printed as its
+    label (left on the same line) wins."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Printed", "l": [100, 200, 180, 220]},
+            {"t": "01/02/1980", "l": [190, 200, 300, 220]},
+            {"t": "DOB:", "l": [100, 500, 150, 520]},
+            {"t": "01/02/1980", "l": [160, 500, 270, 520]},
+        ],
+    )
+    phase1 = {"PatientDOB": {"text": "01/02/1980", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "PatientDOB") == [160, 500, 270, 520]
+    assert result.stats.repeated_value_picks == 1
+
+
+def test_matched_evidence_is_not_a_table_row(workspace: Workspace) -> None:
+    """An evidence item (``(*leaf, "evidence", i)``) is not an array row's
+    cell. Its match must not lay a row band over its line that hides a
+    top-level scalar's labelled occurrence there."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Printed", "l": [100, 200, 180, 220]},
+            {"t": "01/02/1980", "l": [190, 200, 300, 220]},
+            {"t": "DOB:", "l": [100, 500, 150, 520]},
+            {"t": "01/02/1980", "l": [160, 500, 270, 520]},
+            {"t": "age", "l": [300, 500, 340, 520]},
+            {"t": "forty-four", "l": [350, 500, 450, 520]},
+        ],
+    )
+    phase1 = {
+        "PatientDOB": {"text": "01/02/1980", "locations": [{"page_number": 1}]},
+        "AgeBand": {
+            "text": "40-49",
+            "method": "inferred",
+            "evidence": [{"text": "age forty-four", "locations": [{"page_number": 1}]}],
+        },
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "AgeBand", "evidence", 0) == [300, 500, 450, 520]
+    assert _box(result, "PatientDOB") == [160, 500, 270, 520]
+
+
+def test_repeated_scalar_label_above_the_value(workspace: Workspace) -> None:
+    """A label printed over its box counts too (form cells), also when the
+    OCR box of the label slightly overlaps the value's box."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Order", "l": [500, 180, 560, 202]},
+            {"t": "No.", "l": [565, 180, 600, 202]},
+            {"t": "7781", "l": [500, 200, 560, 222]},
+            {"t": "7781", "l": [100, 600, 160, 622]},
+        ],
+    )
+    phase1 = {"order_number": {"text": "7781", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "order_number") == [500, 200, 560, 222]
+
+
+def test_repeated_scalar_defers_when_two_occurrences_are_labelled(
+    workspace: Workspace,
+) -> None:
+    """A form with repeated record blocks (two vehicles, each with its own
+    "LIC STATE" cell) gives the same label to two occurrences. That is
+    no evidence for either, so the value stays for phase 3."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "LIC", "l": [100, 300, 140, 318]},
+            {"t": "STATE", "l": [100, 318, 160, 336]},
+            {"t": "CA", "l": [105, 338, 140, 360]},
+            {"t": "LIC", "l": [100, 600, 140, 618]},
+            {"t": "STATE", "l": [100, 618, 160, 636]},
+            {"t": "CA", "l": [105, 638, 140, 660]},
+        ],
+    )
+    phase1 = {"LICState": {"text": "CA", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.stats.matched_locations == 0
+    assert result.stats.repeated_value_picks == 0
+
+
+def test_repeated_scalar_ignores_occurrence_on_a_matched_table_row(
+    workspace: Workspace,
+) -> None:
+    """An occurrence on the line of a matched array row is another field's
+    cell, even when it has a matching label. It is not a candidate; with
+    only one body occurrence left and no evidence, the matcher defers."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "ROW1", "l": [50, 500, 100, 520]},
+            {"t": "Patient", "l": [150, 500, 220, 520]},
+            {"t": "Smith", "l": [230, 500, 290, 520]},
+            {"t": "Smith", "l": [300, 300, 360, 320]},
+            {"t": "Smith", "l": [300, 400, 360, 420]},
+        ],
+    )
+    phase1 = {
+        "patient_name": {"text": "Smith", "locations": [{"page_number": 1}]},
+        "rows": [{"id": {"text": "ROW1", "locations": [{"page_number": 1}]}}],
+    }
+    layout = {"rows": {"kind": "table", "columns": ["id"]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1, layout=layout)
+
+    assert result.values["patient_name"]["locations"] == [{"page_number": 1}]
+    assert [u.text for u in result.unmatched] == ["Smith"]
+
+
+def test_repeated_scalar_never_picks_among_fuzzy_candidates(workspace: Workspace) -> None:
+    """Only exact renderings of the value are picked from. Two fuzzy
+    (OCR-noisy) occurrences stay for phase 3 even when one is in the
+    header band."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Northwind", "l": [100, 20, 200, 40]},
+            {"t": "Tradors", "l": [210, 20, 290, 40]},
+            {"t": "Northwind", "l": [100, 400, 200, 420]},
+            {"t": "Tradors", "l": [210, 400, 290, 420]},
+        ],
+    )
+    phase1 = {"vendor": {"text": "Northwind Traders", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.stats.matched_locations == 0
+
+
+def test_same_text_scalars_share_the_single_rendering(workspace: Workspace) -> None:
+    """Start date == end date, printed once: the second field adopts the
+    first one's box instead of going to phase 3."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Service", "l": [100, 300, 170, 320]},
+            {"t": "date:", "l": [175, 300, 220, 320]},
+            {"t": "03/04/2024", "l": [230, 300, 330, 320]},
+        ],
+    )
+    phase1 = {
+        "start_date": {"text": "03/04/2024", "locations": [{"page_number": 1}]},
+        "end_date": {"text": "03/04/2024", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.unmatched == []
+    assert _box(result, "start_date") == _box(result, "end_date") == [230, 300, 330, 320]
+    assert result.stats.shared_value_matches == 1
+
+
+def test_scalar_does_not_share_an_array_cell(workspace: Workspace) -> None:
+    """A top-level field does not adopt the span of an array row's cell,
+    even with the same text: the cell is that row's value, not proof of
+    where the top-level field is printed."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "ROW1", "l": [50, 500, 100, 520]},
+            {"t": "450.00", "l": [300, 500, 360, 520]},
+        ],
+    )
+    # The row is listed first, so its cell claims the lone span first.
+    phase1 = {
+        "rows": [
+            {
+                "id": {"text": "ROW1", "locations": [{"page_number": 1}]},
+                "amount": {"text": "450.00", "locations": [{"page_number": 1}]},
+            }
+        ],
+        "total": {"text": "450.00", "locations": [{"page_number": 1}]},
+    }
+    layout = {"rows": {"kind": "table", "columns": ["id", "amount"]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1, layout=layout)
+
+    assert _box(result, "rows", 0, "amount") == [300, 500, 360, 520]
+    assert result.values["total"]["locations"] == [{"page_number": 1}]
+    assert result.stats.shared_value_matches == 0
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        (("PatientDOB",), [{"patient"}, {"dob", "birth", "born", "birthdate"}]),
+        (("date_of_service",), [{"date", "dt"}, {"service"}]),
+        (("rows", 0, "InvoiceNumber"), [{"invoice"}, {"number", "no", "num", "nbr", "#"}]),
+        ((), []),
+    ],
+)
+def test_field_name_tokens(path: tuple[Any, ...], expected: list[set[str]]) -> None:
+    assert [set(t) for t in _field_name_tokens(path)] == expected
+
+
+def test_repeated_scalar_header_band_is_the_top_six_percent(workspace: Workspace) -> None:
+    """A copy whose centre sits at 5.5% of the page height is in the header
+    band (top 6%) and is dropped for the body copy. The footer band is the
+    bottom 5%, so the two bands are not interchangeable."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "A1234", "l": [800, 45, 880, 65]},  # centre y=55/1000
+            {"t": "A1234", "l": [300, 400, 380, 420]},
+        ],
+    )
+    phase1 = {"case_id": {"text": "A1234", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "case_id") == [300, 400, 380, 420]
+
+
+def test_repeated_scalar_label_to_the_right_does_not_count(workspace: Workspace) -> None:
+    """Only a label to the left on the same line (or above) counts. A field
+    name printed to the right of an occurrence is not its label."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "01/02/1980", "l": [100, 200, 210, 220]},
+            {"t": "DOB", "l": [400, 200, 450, 220]},  # right of the first copy
+            {"t": "DOB:", "l": [100, 500, 150, 520]},
+            {"t": "01/02/1980", "l": [160, 500, 270, 520]},
+        ],
+    )
+    phase1 = {"PatientDOB": {"text": "01/02/1980", "locations": [{"page_number": 1}]}}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "PatientDOB") == [160, 500, 270, 520]
+
+
+def test_repeated_values_in_an_array_are_left_to_phase_3(workspace: Workspace) -> None:
+    """The repeated pick is for top-level fields only. An array cell whose
+    text is printed twice keeps the existing array behaviour."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Code:", "l": [100, 300, 160, 320]},
+            {"t": "X9", "l": [170, 300, 200, 320]},
+            {"t": "X9", "l": [600, 700, 630, 720]},
+        ],
+    )
+    phase1 = {"items": [{"code": {"text": "X9", "locations": [{"page_number": 1}]}}]}
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.stats.repeated_value_picks == 0
+
+
+def test_same_text_field_with_its_own_free_occurrence_is_not_shared(
+    workspace: Workspace,
+) -> None:
+    """Start and end dates with the same value, each printed next to its
+    own label: each field gets its own occurrence, not a shared one."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Start:", "l": [100, 300, 160, 320]},
+            {"t": "05/01/2024", "l": [170, 300, 280, 320]},
+            {"t": "End:", "l": [100, 600, 150, 620]},
+            {"t": "05/01/2024", "l": [170, 600, 280, 620]},
+        ],
+    )
+    phase1 = {
+        "StartDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+        "EndDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "StartDate") == [170, 300, 280, 320]
+    assert _box(result, "EndDate") == [170, 600, 280, 620]
+    assert result.stats.shared_value_matches == 0
+
+
+def test_same_text_field_does_not_share_when_owners_disagree(workspace: Workspace) -> None:
+    """Two matched fields hold two different occurrences of the same text.
+    A third field with that text has no single span to share, so it stays
+    for phase 3."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Start:", "l": [100, 300, 160, 320]},
+            {"t": "05/01/2024", "l": [170, 300, 280, 320]},
+            {"t": "End:", "l": [100, 600, 150, 620]},
+            {"t": "05/01/2024", "l": [170, 600, 280, 620]},
+        ],
+    )
+    phase1 = {
+        "StartDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+        "EndDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+        "LossDate": {"text": "05/01/2024", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert result.values["LossDate"]["locations"] == [{"page_number": 1}]
+    assert result.stats.shared_value_matches == 0
+
+
+def test_same_text_field_with_free_occurrences_does_not_borrow_a_span(
+    workspace: Workspace,
+) -> None:
+    """A field may share a same-text span only when every occurrence of
+    its own is claimed. Here the second field still has two free,
+    unlabelled occurrences: it stays for phase 3 instead of borrowing the
+    first field's box."""
+    _seed_file_and_text(
+        workspace,
+        "f1aaaaaaaaaa",
+        page=1,
+        words=[
+            {"t": "Pages:", "l": [100, 200, 170, 220]},
+            {"t": "12", "l": [180, 200, 210, 220]},
+            {"t": "12", "l": [500, 400, 530, 420]},
+            {"t": "12", "l": [500, 700, 530, 720]},
+        ],
+    )
+    phase1 = {
+        "Pages": {"text": "12", "locations": [{"page_number": 1}]},
+        "Count": {"text": "12", "locations": [{"page_number": 1}]},
+    }
+    result = run_phase2_matching(workspace, "f1aaaaaaaaaa", phase1)
+
+    assert _box(result, "Pages") == [180, 200, 210, 220]
+    assert result.values["Count"]["locations"] == [{"page_number": 1}]
+    assert result.stats.shared_value_matches == 0
+
+
+# ---------------------------------------------------------------------------
+# box verification against the text layer
+
+
+def _words(*specs: tuple[str, int, int]) -> list[dict[str, Any]]:
+    """Words on one line, each ``(text, left, right)`` at y 100..130."""
+    return [{"t": t, "l": [left, 100, right, 130]} for t, left, right in specs]
+
+
+_METER_ROW = _words(
+    ("581204", 671, 782),
+    ("533454", 830, 940),
+    ("47", 1003, 1040),
+    (",", 1040, 1049),
+    ("750", 1049, 1105),
+    ("1.025", 1300, 1380),
+    ("Total", 1400, 1450),
+    ("Therms", 1455, 1500),
+    ("48216", 1507, 1600),
+)
+
+
+def _verify(workspace: Workspace, text: str, box: list[int]) -> tuple[int, list[Any]]:
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_METER_ROW)
+    values: dict[str, Any] = {
+        "V": {"text": text, "locations": [{"page_number": 1, "bounding_box": box}]}
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    return check.rejected + check.snapped, values["V"]["locations"]
+
+
+def test_box_on_a_neighbouring_number_snaps_to_the_match_on_its_line(
+    workspace: Workspace,
+) -> None:
+    """A usage total: 48216 boxed on the "47,750" in the same row. The
+    row has exactly one "48216", so the box moves there."""
+    assert _verify(workspace, "48216", [1003, 100, 1105, 130]) == (
+        1,
+        [{"page_number": 1, "bounding_box": [1507, 100, 1600, 130]}],
+    )
+
+
+def test_box_with_no_match_on_its_line_is_stripped(workspace: Workspace) -> None:
+    assert _verify(workspace, "99999", [1003, 100, 1105, 130]) == (1, [{"page_number": 1}])
+
+
+def test_box_on_the_value_is_kept(workspace: Workspace) -> None:
+    assert _verify(workspace, "48216", [1507, 100, 1600, 130])[0] == 0
+    assert _verify(workspace, "47,750", [1003, 100, 1105, 130])[0] == 0
+
+
+def test_loose_box_that_takes_in_the_label_is_tightened(workspace: Workspace) -> None:
+    """A box over "Total Therms 48216" for the value 48216 is right about the
+    place but too wide: it shrinks to the words that spell the value."""
+    assert _verify(workspace, "48216", [1400, 100, 1600, 130]) == (
+        1,
+        [{"page_number": 1, "bounding_box": [1507, 100, 1600, 130]}],
+    )
+
+
+def test_box_over_the_whole_row_is_tightened_to_the_cell(workspace: Workspace) -> None:
+    assert _verify(workspace, "1.025", [671, 100, 1600, 130]) == (
+        1,
+        [{"page_number": 1, "bounding_box": [1300, 100, 1380, 130]}],
+    )
+
+
+def test_box_holding_one_line_of_a_wrapped_value_is_kept(workspace: Workspace) -> None:
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_METER_ROW)
+    values: dict[str, Any] = {
+        "V": {
+            "text": "Total Therms 48216",
+            "locations": [
+                {"page_number": 1, "bounding_box": [1400, 100, 1500, 130]},
+                {"page_number": 1, "bounding_box": [1507, 100, 1600, 130]},
+            ],
+        }
+    }
+    assert verify_boxes(workspace, "f1aaaaaaaaaa", values) == (0, 0)
+
+
+def test_lone_box_holding_part_of_the_value_snaps_to_the_whole(workspace: Workspace) -> None:
+    """A clipped "Gas Delivery": one box over "Delivery"
+    only. A lone box must hold the whole value, so it snaps to the full span."""
+    assert _verify(workspace, "Total Therms", [1455, 100, 1500, 130]) == (
+        1,
+        [{"page_number": 1, "bounding_box": [1400, 100, 1500, 130]}],
+    )
+
+
+def test_ocr_noise_is_tolerated(workspace: Workspace) -> None:
+    assert _verify(workspace, "48Z16", [1507, 100, 1600, 130])[0] == 0
+
+
+def test_box_with_no_words_or_a_value_with_no_letters_is_kept(workspace: Workspace) -> None:
+    assert _verify(workspace, "48216", [10, 500, 90, 530])[0] == 0
+    assert _verify(workspace, "$", [1003, 100, 1105, 130])[0] == 0
+
+
+def test_box_straddling_two_rows_snaps_to_the_nearer_match(workspace: Workspace) -> None:
+    """A usage total: "286" printed on two adjacent rows; the model's
+    box straddles both but sits over the lower one's column."""
+    from dgml_core.matching import verify_boxes
+
+    rows = [
+        {"t": "286", "l": [2366, 1163, 2415, 1192]},  # chart row
+        {"t": "277", "l": [1003, 1192, 1059, 1225]},
+        {"t": "286", "l": [1507, 1192, 1560, 1225]},  # meter row
+    ]
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=rows)
+    values: dict[str, Any] = {
+        "V": {
+            "text": "286",
+            "locations": [{"page_number": 1, "bounding_box": [990, 1170, 1070, 1225]}],
+        }
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    assert (check.snapped, check.rejected) == (1, 0)
+    assert values["V"]["locations"] == [
+        {"page_number": 1, "bounding_box": [1507, 1192, 1560, 1225]}
+    ]
+
+
+def test_words_of_different_heights_on_one_line_read_in_order(workspace: Workspace) -> None:
+    """Low on a page, two words of one line whose heights differ by a pixel
+    must still read left to right, or an OCR-noisy value reads scrambled and
+    its correct box is stripped."""
+    from dgml_core.matching import verify_boxes
+
+    words = [
+        {"t": "Acrne", "l": [100, 2990, 160, 3010]},
+        {"t": "Corporation", "l": [170, 2989, 300, 3011]},
+    ]
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=words)
+    values: dict[str, Any] = {
+        "V": {
+            "text": "Acme Corporation",
+            "locations": [{"page_number": 1, "bounding_box": [100, 2989, 300, 3011]}],
+        }
+    }
+    assert verify_boxes(workspace, "f1aaaaaaaaaa", values) == (0, 0)
+
+
+def test_value_glued_to_its_label_in_one_word_is_kept(workspace: Workspace) -> None:
+    words = [{"t": "Total:$318.40", "l": [100, 100, 300, 130]}]
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=words)
+    from dgml_core.matching import verify_boxes
+
+    values: dict[str, Any] = {
+        "V": {
+            "text": "$318.40",
+            "locations": [{"page_number": 1, "bounding_box": [100, 100, 300, 130]}],
+        }
+    }
+    assert verify_boxes(workspace, "f1aaaaaaaaaa", values) == (0, 0)
+
+
+def test_snapped_line_does_not_duplicate_the_values_other_box(workspace: Workspace) -> None:
+    """One line of a two-box value snaps to the whole span; the value's other
+    box, already covered by the snap, is not kept as a second copy."""
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_METER_ROW)
+    values: dict[str, Any] = {
+        "V": {
+            "text": "Therms 48216",
+            "locations": [
+                {"page_number": 1, "bounding_box": [671, 100, 782, 130]},
+                {"page_number": 1, "bounding_box": [1507, 100, 1600, 130]},
+            ],
+        }
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    # The boxes don't spell the value together, so neither may hold a piece:
+    # both snap, to the same span, which is kept once.
+    assert check.snapped == 2
+    assert values["V"]["locations"] == [{"page_number": 1, "bounding_box": [1455, 100, 1600, 130]}]
+
+
+def test_repeated_copies_must_each_hold_the_whole_value(workspace: Workspace) -> None:
+    """A value printed twice has two boxes, but they aren't the lines of one
+    wrapped value: a box landing on part of it ("47" of "48216") disagrees."""
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_METER_ROW)
+    values: dict[str, Any] = {
+        "V": {
+            "text": "48216",
+            "locations": [
+                {"page_number": 1, "bounding_box": [1507, 100, 1600, 130]},
+                {"page_number": 1, "bounding_box": [1003, 100, 1040, 130]},  # "47"
+            ],
+        }
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    assert check.snapped + check.rejected == 1
+    assert values["V"]["locations"][0] == {"page_number": 1, "bounding_box": [1507, 100, 1600, 130]}
+
+
+@pytest.mark.parametrize(
+    ("word", "value", "agrees"),
+    [
+        ("Total:$318.40", "$318.40", True),
+        ("Invoice#INV-12345", "INV-12345", True),
+        ("Unpaid", "Paid", False),
+        ("1318.40", "318.40", False),
+    ],
+)
+def test_value_glued_to_a_label_in_one_word(word: str, value: str, agrees: bool) -> None:
+    from dgml_core.matching import _box_agrees, _box_key
+    from dgml_core.textmatch import Word
+
+    w = Word(idx=0, text=word, text_norm=word, left=0, top=0, right=10, bottom=10)
+    assert _box_agrees([w], _box_key(value)) is agrees
+
+
+# A bill: "Gas Delivery (Details below)" heads a section; the tier
+# table's header row prints "Tier 1 Tier 2 Tier 3". A line item named
+# "Gas Delivery Tier 2" is printed in those two places.
+_TIER_PAGE = [
+    {"t": "Gas", "l": [100, 1404, 150, 1440]},
+    {"t": "Delivery", "l": [160, 1404, 330, 1440]},
+    {"t": "(", "l": [340, 1404, 348, 1440]},
+    {"t": "Details", "l": [350, 1404, 430, 1440]},
+    {"t": "below", "l": [440, 1404, 510, 1440]},
+    {"t": ")", "l": [512, 1404, 520, 1440]},
+    {"t": "Tier", "l": [600, 1476, 650, 1510]},
+    {"t": "1", "l": [655, 1476, 670, 1510]},
+    {"t": "Tier", "l": [800, 1476, 850, 1510]},
+    {"t": "2", "l": [855, 1476, 870, 1510]},
+    {"t": "Tier", "l": [1000, 1476, 1050, 1510]},
+    {"t": "3", "l": [1055, 1476, 1070, 1510]},
+]
+
+
+def test_value_spelled_by_loose_boxes_in_two_places_is_kept_and_tightened(
+    workspace: Workspace,
+) -> None:
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_TIER_PAGE)
+    values: dict[str, Any] = {
+        "Name": {
+            "text": "Gas Delivery Tier 2",
+            "locations": [
+                {"page_number": 1, "bounding_box": [100, 1404, 520, 1440]},  # whole heading
+                {"page_number": 1, "bounding_box": [600, 1476, 1070, 1510]},  # whole tier row
+            ],
+        }
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    assert (check.snapped, check.rejected) == (2, 0)
+    assert values["Name"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 1404, 330, 1440]},  # "Gas Delivery"
+        {"page_number": 1, "bounding_box": [800, 1476, 870, 1510]},  # "Tier 2"
+    ]
+
+
+def test_boxes_that_cannot_spell_the_value_together_are_judged_alone(
+    workspace: Workspace,
+) -> None:
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_TIER_PAGE)
+    values: dict[str, Any] = {
+        "Name": {
+            "text": "Gas Delivery Tier 4",
+            "locations": [
+                {"page_number": 1, "bounding_box": [100, 1404, 520, 1440]},
+                {"page_number": 1, "bounding_box": [600, 1476, 1070, 1510]},
+            ],
+        }
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    assert check.rejected == 2
+    assert values["Name"]["locations"] == [{"page_number": 1}, {"page_number": 1}]
+
+
+# Section labels: the section heading prints in capitals; the totals line
+# carries the same words in a sentence.
+_LABEL_PAGE = [
+    {"t": "GAS", "l": [100, 1272, 160, 1305]},
+    {"t": "DELIVERY", "l": [170, 1272, 380, 1305]},
+    {"t": "CHARGES", "l": [390, 1272, 500, 1305]},
+    {"t": "Total", "l": [100, 2076, 160, 2110]},
+    {"t": "Taxes", "l": [170, 2076, 240, 2110]},
+    {"t": "on", "l": [250, 2076, 280, 2110]},
+    {"t": "Gas", "l": [290, 2076, 340, 2110]},
+    {"t": "Delivery", "l": [350, 2076, 520, 2110]},
+    {"t": "Charges", "l": [530, 2076, 620, 2110]},
+    {"t": "Gas", "l": [100, 2200, 150, 2230]},
+    {"t": "Charges", "l": [160, 2200, 250, 2230]},
+    {"t": "GAS", "l": [300, 2200, 360, 2230]},
+    {"t": "CHARGES", "l": [370, 2200, 480, 2230]},
+]
+
+
+def _verify_label(workspace: Workspace, text: str, box: list[int]) -> tuple[Any, list[Any]]:
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_LABEL_PAGE)
+    values: dict[str, Any] = {
+        "V": {"text": text, "locations": [{"page_number": 1, "bounding_box": box}]}
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    return check, values["V"]["locations"]
+
+
+def test_capitalised_label_boxed_on_a_sentence_snaps_to_its_heading(
+    workspace: Workspace,
+) -> None:
+    """The box over the totals line holds "Gas Delivery Charges" only
+    in lower case: not the label. The page prints the label once, so the box
+    moves there."""
+    check, locs = _verify_label(workspace, "GAS DELIVERY CHARGES", [100, 2076, 620, 2110])
+    assert (check.snapped, check.rejected) == (1, 0)
+    assert locs == [{"page_number": 1, "bounding_box": [100, 1272, 500, 1305]}]
+
+
+def test_loose_box_shrinks_to_the_run_with_matching_capitals(workspace: Workspace) -> None:
+    check, locs = _verify_label(workspace, "GAS CHARGES", [100, 2200, 480, 2230])
+    assert check.snapped == 1
+    assert locs == [{"page_number": 1, "bounding_box": [300, 2200, 480, 2230]}]
+    check, locs = _verify_label(workspace, "Gas Charges", [100, 2200, 480, 2230])
+    assert locs == [{"page_number": 1, "bounding_box": [100, 2200, 250, 2230]}]
+
+
+def test_box_that_is_exactly_the_value_keeps_any_capitals(workspace: Workspace) -> None:
+    """A box holding nothing but the value isn't choosing among copies: a
+    capitalisation difference (the model's, or OCR's) doesn't reject it."""
+    check, locs = _verify_label(workspace, "Gas Delivery Charges", [100, 1272, 500, 1305])
+    assert (check.snapped, check.rejected) == (0, 0)
+    assert locs == [{"page_number": 1, "bounding_box": [100, 1272, 500, 1305]}]
+
+
+def test_lowercase_value_does_not_take_a_capitalised_run(workspace: Workspace) -> None:
+    check, locs = _verify_label(workspace, "gas charges", [100, 2200, 480, 2230])
+    # Neither run reads "gas charges" with its case, and the page doesn't
+    # print it that way: the box can't be placed.
+    assert check.rejected == 1 and locs == [{"page_number": 1}]
+
+
+_PROVIDER_PAGE = [
+    {"t": "northwind", "l": [44, 359, 180, 397]},  # in the URL "northwind.com"
+    {"t": ".", "l": [180, 359, 186, 397]},
+    {"t": "com", "l": [186, 359, 240, 397]},
+    {"t": "Northwind", "l": [900, 1783, 1050, 1815]},
+    {"t": "Northwind", "l": [900, 2755, 1050, 2787]},
+]
+
+
+def _verify_on(workspace: Workspace, words: list[Any], text: str, box: list[int]) -> Any:
+    from dgml_core.matching import verify_boxes
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=words)
+    values: dict[str, Any] = {
+        "V": {"text": text, "locations": [{"page_number": 1, "bounding_box": box}]}
+    }
+    check = verify_boxes(workspace, "f1aaaaaaaaaa", values)
+    return check, values["V"]["locations"]
+
+
+def test_box_on_a_lowercase_url_snaps_to_the_nearest_printed_name(workspace: Workspace) -> None:
+    """The provider name boxed on "northwind.com": the page prints "Northwind"
+    twice elsewhere, and the nearer copy is taken."""
+    check, locs = _verify_on(workspace, _PROVIDER_PAGE, "Northwind", [44, 359, 240, 397])
+    assert (check.snapped, check.rejected) == (1, 0)
+    assert locs == [{"page_number": 1, "bounding_box": [900, 1783, 1050, 1815]}]
+
+
+def test_snap_refuses_two_equally_near_copies(workspace: Workspace) -> None:
+    words = [
+        {"t": "northwind", "l": [44, 1000, 180, 1030]},
+        {"t": ".", "l": [180, 1000, 186, 1030]},
+        {"t": "com", "l": [186, 1000, 240, 1030]},
+        {"t": "Northwind", "l": [72, 900, 212, 930]},
+        {"t": "Northwind", "l": [72, 1100, 212, 1130]},
+    ]
+    check, locs = _verify_on(workspace, words, "Northwind", [44, 1000, 240, 1030])
+    assert check.rejected == 1 and locs == [{"page_number": 1}]
+
+
+def test_pageless_values_are_placed_where_their_text_is_printed(workspace: Workspace) -> None:
+    from dgml_core.matching import locate_pageless_values
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_METER_ROW)
+    values: dict[str, Any] = {
+        "Usage": {"text": "48216"},  # printed: placed
+        "Units": {"text": "Therms"},  # printed: placed
+        "Missing": {"text": "99999"},  # not printed: stays bare
+        "Region": {"text": "EMEA", "method": "inferred", "inputs": ["Units"]},  # unprinted
+        "Boxed": {"text": "1.025", "locations": [{"page_number": 1}]},  # already placed
+    }
+    assert locate_pageless_values(workspace, "f1aaaaaaaaaa", values, page_count=1) == 2
+    assert values["Usage"]["locations"] == [{"page_number": 1}]
+    assert values["Units"]["locations"] == [{"page_number": 1}]
+    assert "locations" not in values["Missing"]
+    assert "locations" not in values["Region"]
+
+
+def test_pageless_search_skips_a_page_it_cannot_read(workspace: Workspace) -> None:
+    """A page_text payload without its size can't be loaded; the search
+    leaves the value bare rather than failing the extraction."""
+    from dgml_core.matching import locate_pageless_values
+
+    _seed_file_and_text(workspace, "f1aaaaaaaaaa", page=1, words=_METER_ROW)
+    workspace.blobs.put_blob(
+        layout.file_page_text_key("f1aaaaaaaaaa", 1),
+        json.dumps({"page": 1, "words": [{"t": "48216", "l": [1, 2, 3, 4]}]}).encode(),
+    )
+    values: dict[str, Any] = {"Usage": {"text": "48216"}}
+    assert locate_pageless_values(workspace, "f1aaaaaaaaaa", values, page_count=1) == 0
+    assert values == {"Usage": {"text": "48216"}}

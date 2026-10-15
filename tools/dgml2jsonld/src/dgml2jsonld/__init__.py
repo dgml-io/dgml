@@ -14,6 +14,7 @@ Public API:
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,18 @@ _XML_NS = "http://www.w3.org/XML/1998/namespace"
 _DG_NS = "http://dgml.io/ns/dg#"
 _ITEMPROP = f"{{{_DG_NS}}}itemprop"
 _HREF = f"{{{_DG_NS}}}href"
+_INPUTS = f"{{{_DG_NS}}}inputs"
+_ORIGIN = f"{{{_DG_NS}}}origin"
 _XML_ID = f"{{{_XML_NS}}}id"
+
+# DGML 0.7's reserved dg:origin value for a value the page doesn't print.
+# Retired in 0.71: read as no origin, with the element's dg:href as its
+# dg:inputs (spec Appendix C).
+_LEGACY_COMPUTED = "computed"
+
+# A reference list (dg:href, dg:inputs): "#a; #b" as writers join it, or the
+# older space-separated "#a #b" — readers split on either (spec §8).
+_REF_SPLIT = re.compile(r"[;\s]+")
 
 # Fixed xast: terms always added to @context.
 _XAST_CONTEXT: dict[str, Any] = {
@@ -71,6 +83,11 @@ def _clark_to_curie(clark: str, rev: dict[str, str], cache: dict[str, str]) -> s
     return curie
 
 
+def _split_refs(value: str) -> list[str]:
+    """The references in a dg:href / dg:inputs list."""
+    return [ref for ref in _REF_SPLIT.split(value) if ref]
+
+
 def _normalize_id(value: str) -> str:
     """Prefix plain local ids with #; leave URNs and full URIs unchanged."""
     if value.startswith("#") or ":" in value or "/" in value:
@@ -94,18 +111,30 @@ def _convert_element(
     if raw_id is not None:
         node["@id"] = _normalize_id(str(raw_id))
 
+    # A 0.7 computed element reads as its 0.71 equivalent: no origin, and its
+    # dg:href targets are its dg:inputs, not a semantic link.
+    legacy = elem.attrib.get(_ORIGIN) == _LEGACY_COMPUTED
+    inputs = elem.attrib.get(_INPUTS) or (elem.attrib.get(_HREF) if legacy else None)
+
     # dg:itemprop/dg:href on this element → named link property on this node.
-    # dg:href may hold more than one id (space-separated) when the property
-    # aggregates several targets; JSON-LD requires a single IRI per "@id", so
-    # multiple targets become a list of link objects instead of one.
+    # dg:href may hold more than one id when the property aggregates several
+    # targets; JSON-LD requires a single IRI per "@id", so multiple targets
+    # become a list of link objects instead of one.
     itemprop = elem.attrib.get(_ITEMPROP)
     href = elem.attrib.get(_HREF)
-    if itemprop is not None and href is not None:
-        ids = href.split()
+    if itemprop is not None and href is not None and not legacy:
+        ids = _split_refs(href)
         node[itemprop] = {"@id": ids[0]} if len(ids) == 1 else [{"@id": i} for i in ids]
 
-    # attributes — all except id, xml:id, dg:itemprop, dg:href
-    skip = {"id", _XML_ID, _ITEMPROP, _HREF}
+    # dg:inputs → the elements the value used, always a list (spec A.2).
+    if inputs:
+        node[_clark_to_curie(_INPUTS, rev, cache)] = [{"@id": ref} for ref in _split_refs(inputs)]
+
+    # attributes — all except id, xml:id, dg:itemprop, dg:href, dg:inputs
+    # (and a 0.7 element's "computed" origin, which is not a location)
+    skip = {"id", _XML_ID, _ITEMPROP, _HREF, _INPUTS}
+    if legacy:
+        skip.add(_ORIGIN)
     attrs: dict[str, str] = {}
     for k, v in elem.attrib.items():
         k = str(k)

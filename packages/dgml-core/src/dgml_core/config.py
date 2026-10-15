@@ -135,6 +135,18 @@ def _expand_layer(layer: dict[str, Any]) -> dict[str, Any]:
     return {**layer, ConfigSection.MODELS.value: expand_family(models)}
 
 
+def _merge_toml_layers(
+    workspace: Workspace, *, cli_overrides: dict[str, Any] | None = None
+) -> dict[ConfigSection, Any]:
+    """The TOML-path merge: user file → workspace config → env → ``cli_overrides``.
+
+    What ``Workspace.config`` derives a :class:`~dgml_core.configuration.Configuration`
+    from for a workspace addressed by path or id, and what :func:`load_merged_config`
+    returns for one.
+    """
+    return _merge_layers(workspace, cli_overrides)
+
+
 def load_merged_config(
     workspace: Workspace, *, cli_overrides: dict[str, Any] | None = None
 ) -> dict[ConfigSection, Any]:
@@ -147,7 +159,44 @@ def load_merged_config(
     :class:`~dgml_core.models_config.ConfigSection` members (every declared field
     name is a section), so loaders index the result with the enum rather than a
     bare string.
+
+    A workspace configured in memory has no file, user config or environment layer: its
+    sections are exactly what the caller built, plus ``cli_overrides``. One addressed by
+    path or id takes the TOML merge directly rather than through ``Workspace.config``:
+    deriving that also reads identity and resolves storage, which no loader needs and
+    which would cost several extra reads of ``config.toml`` per call.
     """
+    if workspace.configuration is None:
+        return _merge_toml_layers(workspace, cli_overrides=cli_overrides)
+    sections: dict[ConfigSection, Any] = {
+        key: dict(value) for key, value in workspace.configuration.sections.items()
+    }
+    for key, value in _expand_layer(cli_overrides or {}).items():
+        try:
+            section = ConfigSection(str(key))
+        except ValueError:
+            continue  # undeclared section: dropped, as ``extra="ignore"`` does on the TOML path
+        if not isinstance(value, dict):
+            raise CorruptMetadata(f"malformed config: '{key}' must be a table")
+        sections[section] = _deep_update(sections.get(section, {}), value)
+    return sections
+
+
+def _deep_update(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """pydantic-settings' source combination for one section: an overlay sets the
+    keys it names and inherits the rest, recursively."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_update(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_layers(
+    workspace: Workspace, cli_overrides: dict[str, Any] | None
+) -> dict[ConfigSection, Any]:
     user_path = user_config_path()
     if not user_path.exists() and workspace.has_legacy_json_config():
         raise LegacyConfigPresent(
