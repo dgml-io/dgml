@@ -398,7 +398,7 @@ def _drop_duplicates(
             # aligned to; its transcription there runs from the first block
             # credited on that page to the window's end.
             prev = range(bounds[w - 1], bounds[w])
-            last_pages = [page_of[j] for j in prev if page_of[j] is not None and shares[j] >= 0.5]
+            last_pages = [pg for j in prev if (pg := page_of[j]) is not None and shares[j] >= 0.5]
             if not last_pages:
                 continue
             overlap_page = max(last_pages)
@@ -407,7 +407,7 @@ def _drop_duplicates(
             # The new window's transcription of the overlap page ends where
             # its first block credited on a later page begins.
             for i in range(bounds[w], min(bounds[w + 1], bounds[w] + 120)):
-                if shares[i] >= 0.5 and page_of[i] is not None and page_of[i] > overlap_page:
+                if shares[i] >= 0.5 and (pg := page_of[i]) is not None and pg > overlap_page:
                     break
                 if al.block_tokens[i] < 3 or not cores[i] or shares[i] >= 0.5:
                     continue

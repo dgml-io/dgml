@@ -2,6 +2,8 @@
 page text. No model, no network -- synthetic pages with boxes."""
 
 import json
+from pathlib import Path
+from typing import Any
 
 from dgml_core.generation import completeness
 from dgml_core.generation.blocks import Block
@@ -11,10 +13,10 @@ LINE = 20  # word height
 GAP_CELL = 60  # gap between table cells (> 1.5 * LINE)
 
 
-def _words(lines, *, top=100, bold=False):
+def _words(lines: list[list[str]], *, top: int = 100, bold: bool = False) -> list[dict[str, Any]]:
     """Page words from a list of lines; a line is a list of cells, each a string.
     Cells are separated by a column gap, words within a cell by a space."""
-    out = []
+    out: list[dict[str, Any]] = []
     y = top
     for cells in lines:
         x = 50
@@ -28,7 +30,7 @@ def _words(lines, *, top=100, bold=False):
     return out
 
 
-def _write_pages(tmp_path, pages):
+def _write_pages(tmp_path: Path, pages: list[list[dict[str, Any]]]) -> Path:
     d = tmp_path / "page_text"
     d.mkdir()
     for n, words in enumerate(pages, 1):
@@ -37,19 +39,19 @@ def _write_pages(tmp_path, pages):
     return d
 
 
-def _prose(page, n=30):
+def _prose(page: int, n: int = 30) -> list[list[str]]:
     return [[" ".join(f"p{page}w{i:02d}" for i in range(k, k + 10))] for k in range(0, n, 10)]
 
 
-def _p(text, bid="b1"):
+def _p(text: str, bid: str = "b1") -> Block:
     return Block(id=bid, structure="p", text=text)
 
 
-def _page_text(words):
+def _page_text(words: list[dict[str, Any]]) -> str:
     return " ".join(w["t"] for w in words)
 
 
-def test_lost_first_page_is_filled_at_the_front(tmp_path):
+def test_lost_first_page_is_filled_at_the_front(tmp_path: Path) -> None:
     pages = [_words(_prose(1)), _words(_prose(2))]
     d = _write_pages(tmp_path, pages)
     blocks = [_p(_page_text(pages[1]), "b2")]  # page 1 never transcribed
@@ -61,7 +63,7 @@ def test_lost_first_page_is_filled_at_the_front(tmp_path):
     assert rep["final_coverage_pct"] == 100.0 and rep["pages"][0]["unclaimed_after"] == 0
 
 
-def test_lost_middle_page_lands_between_its_neighbours(tmp_path):
+def test_lost_middle_page_lands_between_its_neighbours(tmp_path: Path) -> None:
     pages = [_words(_prose(1)), _words(_prose(2)), _words(_prose(3))]
     d = _write_pages(tmp_path, pages)
     blocks = [_p(_page_text(pages[0]), "b1"), _p(_page_text(pages[2]), "b3")]
@@ -71,7 +73,7 @@ def test_lost_middle_page_lands_between_its_neighbours(tmp_path):
     assert rep["model_coverage_pct"] < 70 < rep["final_coverage_pct"] == 100.0
 
 
-def test_column_major_table_is_not_a_region(tmp_path):
+def test_column_major_table_is_not_a_region(tmp_path: Path) -> None:
     # the text layer reads the table column by column; the model wrote rows
     grid = [[f"r{i}c{j}" for j in range(4)] for i in range(6)]
     column_major = [[c] for j in range(4) for c in (grid[i][j] for i in range(6))]
@@ -82,7 +84,7 @@ def test_column_major_table_is_not_a_region(tmp_path):
     assert rep["model_coverage_pct"] == 100.0
 
 
-def test_lost_table_inside_a_present_page_becomes_rows(tmp_path):
+def test_lost_table_inside_a_present_page_becomes_rows(tmp_path: Path) -> None:
     prose = _prose(1, 20)
     table = [["Revenue", "1,267", "1,356"], ["Operating income", "203", "208"]]
     words = _words(prose) + _words(table, top=100 + 3 * int(LINE * 1.4) + 60)
@@ -96,7 +98,7 @@ def test_lost_table_inside_a_present_page_becomes_rows(tmp_path):
     assert rep["pages"][0]["unclaimed_figures_after"] == 0
 
 
-def test_overlap_duplicate_is_dropped(tmp_path):
+def test_overlap_duplicate_is_dropped(tmp_path: Path) -> None:
     pages = [_words(_prose(1)), _words(_prose(2))]
     d = _write_pages(tmp_path, pages)
     t2 = _page_text(pages[1])
@@ -107,7 +109,7 @@ def test_overlap_duplicate_is_dropped(tmp_path):
     assert rep["dropped"] == {"duplicates": 1, "fabricated": 0}
 
 
-def test_fabricated_block_is_dropped(tmp_path):
+def test_fabricated_block_is_dropped(tmp_path: Path) -> None:
     pages = [_words(_prose(1))]
     d = _write_pages(tmp_path, pages)
     blocks = [
@@ -119,7 +121,7 @@ def test_fabricated_block_is_dropped(tmp_path):
     assert rep["dropped"]["fabricated"] == 1
 
 
-def test_rescue_replaces_fallback_only_when_it_claims_the_page(tmp_path):
+def test_rescue_replaces_fallback_only_when_it_claims_the_page(tmp_path: Path) -> None:
     pages = [_words(_prose(1)), _words(_prose(2))]
     d = _write_pages(tmp_path, pages)
     blocks = [_p(_page_text(pages[1]), "b2")]
@@ -131,7 +133,7 @@ def test_rescue_replaces_fallback_only_when_it_claims_the_page(tmp_path):
     assert all(b.id != "wrong" for b in out) and rep["regions"][0]["source"] == "text-layer"
 
 
-def test_ligatures_do_not_look_missing(tmp_path):
+def test_ligatures_do_not_look_missing(tmp_path: Path) -> None:
     words = _words([["net proﬁt rose signiﬁcantly in the ﬁrst quarter of the year"]])
     d = _write_pages(tmp_path, [words])
     blocks = [_p("net profit rose significantly in the first quarter of the year")]
@@ -139,7 +141,7 @@ def test_ligatures_do_not_look_missing(tmp_path):
     assert rep["model_coverage_pct"] == 100.0 and rep["regions"] == []
 
 
-def test_block_written_before_the_pages_first_paragraph_is_claimed(tmp_path):
+def test_block_written_before_the_pages_first_paragraph_is_claimed(tmp_path: Path) -> None:
     """The model wrote a page's table before the paragraph the text layer
     reads first. The paragraph aligns at the page's first word; the table
     must still be claimed on that page, not dropped and re-filled."""
@@ -154,7 +156,7 @@ def test_block_written_before_the_pages_first_paragraph_is_claimed(tmp_path):
     assert rep["regions"] == []
 
 
-def test_overlap_duplicate_is_dropped_by_window_position(tmp_path):
+def test_overlap_duplicate_is_dropped_by_window_position(tmp_path: Path) -> None:
     """With window starts known, the second window's leading blocks that
     repeat the first window's trailing blocks are the overlap page and go,
     whichever copy the ordered diff happened to credit."""

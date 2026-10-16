@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ def _word(idx: int, text: str, left: int, top: int, *, bold: bool = False) -> Wo
     )
 
 
-def _page(rows: list[list[tuple[str, int]]], *, bold_rows: set[int] = frozenset()) -> list[Word]:
+def _page(rows: list[list[tuple[str, int]]], *, bold_rows: Collection[int] = ()) -> list[Word]:
     """Rows of (text, left) at successive baselines."""
     out: list[Word] = []
     for r, row in enumerate(rows):
@@ -71,7 +72,7 @@ PAGE2 = _page(
 PAGES = {1: (PAGE1, PageDims(W, H)), 2: (PAGE2, PageDims(W, H))}
 
 
-def test_window_lines_are_numbered_across_pages_with_cells():
+def test_window_lines_are_numbered_across_pages_with_cells() -> None:
     lines = lines_mod.window_lines(PAGES, [1, 2])
     assert [ln.id for ln in lines] == list(range(1, 15))
     assert [ln.page for ln in lines] == [1] * 10 + [2] * 4
@@ -96,7 +97,7 @@ def test_window_lines_are_numbered_across_pages_with_cells():
         ("", None),
     ],
 )
-def test_parse_refs(field, ids):
+def test_parse_refs(field: str, ids: list[int] | None) -> None:
     assert lines_mod.parse_refs(field) == ids
 
 
@@ -119,7 +120,7 @@ REPLY = "\n".join(
 )
 
 
-def test_build_payload_copies_text_from_the_lines():
+def test_build_payload_copies_text_from_the_lines() -> None:
     lines = lines_mod.window_lines(PAGES, [1, 2])
     res = lines_mod.build_payload(REPLY, lines)
     blocks = res.payload["blocks"]
@@ -151,7 +152,7 @@ def test_build_payload_copies_text_from_the_lines():
     assert (res.malformed, res.unknown_refs, res.literal_fields) == (0, 0, 0)
 
 
-def test_wrapped_row_merges_cellwise_and_literal_fields_pass_through():
+def test_wrapped_row_merges_cellwise_and_literal_fields_pass_through() -> None:
     page = _page(
         [
             [("Long label that", 100), ("1,234", 600), ("5,678", 800)],
@@ -165,7 +166,7 @@ def test_wrapped_row_merges_cellwise_and_literal_fields_pass_through():
     assert res.literal_fields == 1
 
 
-def test_unaccounted_lines_are_filled_in_place():
+def test_unaccounted_lines_are_filled_in_place() -> None:
     lines = lines_mod.window_lines(PAGES, [1, 2])
     # The model forgot the table (L5-L7) and the page number.
     reply = (
@@ -192,7 +193,7 @@ def test_unaccounted_lines_are_filled_in_place():
     assert res.recall(lines) == 1.0
 
 
-def test_unknown_and_duplicate_refs_are_counted_not_fatal():
+def test_unknown_and_duplicate_refs_are_counted_not_fatal() -> None:
     lines = lines_mod.window_lines(PAGES, [1])
     res = lines_mod.build_payload("P\tL3\nP\tL3\nP\tL99\nQ\tL4", lines)
     assert [b["text"] for b in res.payload["blocks"]] == ["We are a leading pro-", "", ""]
@@ -217,7 +218,7 @@ def _write_page_text(tmp_path: Path, pages: dict[int, tuple[list[Word], PageDims
     return d
 
 
-def test_transcribe_document_in_lines_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_transcribe_document_in_lines_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """End to end through Pass A: the model is shown the numbered listing with
     the lines system prompt, answers with ids, and the blocks carry the page's
     text; a forgotten line is filled before the window is kept."""
@@ -267,7 +268,7 @@ def test_transcribe_document_in_lines_mode(monkeypatch: pytest.MonkeyPatch, tmp_
     assert blocks[1].lim == "ITEM 1."
 
 
-def test_x_is_only_accepted_for_short_edge_lines():
+def test_x_is_only_accepted_for_short_edge_lines() -> None:
     """A model that marks a page's body as decorations gets it filled instead."""
     lines = lines_mod.window_lines(PAGES, [1, 2])
     reply = "X\tL1-L14"
@@ -277,7 +278,7 @@ def test_x_is_only_accepted_for_short_edge_lines():
     assert [ln.id for ln in res.unassigned(lines)] == list(range(2, 10)) + [12, 13]
 
 
-def test_literal_text_claims_the_matching_lines():
+def test_literal_text_claims_the_matching_lines() -> None:
     lines = lines_mod.window_lines(PAGES, [1])
     reply = "P\tWe are a leading pro- vider of services to clients.\nH1\t\tITEM 1. BUSINESS"
     res = lines_mod.build_payload(reply, lines)
@@ -287,7 +288,7 @@ def test_literal_text_claims_the_matching_lines():
     assert res.payload["blocks"][1]["text"] == "ITEM 1. BUSINESS"
 
 
-def test_restarted_reply_keeps_the_better_draft():
+def test_restarted_reply_keeps_the_better_draft() -> None:
     lines = lines_mod.window_lines(PAGES, [1, 2])
     reply = "X\tL1\nP\tL1-L2\nWait, that was wrong. Restarting:\n" + REPLY
     res = lines_mod.build_payload(reply, lines)
@@ -296,7 +297,7 @@ def test_restarted_reply_keeps_the_better_draft():
     assert res.payload["blocks"][0]["structure"] == "heading"
 
 
-def test_continuation_that_starts_a_sentence_becomes_a_paragraph():
+def test_continuation_that_starts_a_sentence_becomes_a_paragraph() -> None:
     lines = lines_mod.window_lines(PAGES, [1, 2])
     # L12 "continues the sentence…" is a real continuation; L2 "ITEM 1. BUSINESS" is not.
     res = lines_mod.build_payload("C\tL2\nC\tL12", lines)
@@ -305,7 +306,7 @@ def test_continuation_that_starts_a_sentence_becomes_a_paragraph():
     assert res.demoted_continuations == 1
 
 
-def test_blocks_are_put_back_in_page_order():
+def test_blocks_are_put_back_in_page_order() -> None:
     lines = lines_mod.window_lines(PAGES, [1])
     res = lines_mod.build_payload("I\t(b)\tL9\nI\t(a)\tL8\nP\tL3-L4\nH1\tITEM 1.\tL2", lines)
     moved = lines_mod.order_by_lines(res)
@@ -313,7 +314,7 @@ def test_blocks_are_put_back_in_page_order():
     assert [min(b["lines"]) for b in res.payload["blocks"]] == [2, 3, 8, 9]
 
 
-def test_report_only_pass_does_not_fill(tmp_path):
+def test_report_only_pass_does_not_fill(tmp_path: Path) -> None:
     from dgml_core.generation import completeness
     from dgml_core.generation.blocks import Block
 
@@ -327,7 +328,7 @@ def test_report_only_pass_does_not_fill(tmp_path):
     assert rep["regions"] and rep["final_coverage_pct"] == rep["model_coverage_pct"] < 50
 
 
-def test_a_row_range_is_one_row_per_line():
+def test_a_row_range_is_one_row_per_line() -> None:
     page = _page(
         [
             [("(in millions)", 100), ("2013", 600), ("2012", 800)],
@@ -347,7 +348,7 @@ def test_a_row_range_is_one_row_per_line():
 
 def test_text_format_reply_in_lines_mode_is_used_as_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
+) -> None:
     from dgml_core.generation import document as document_mod
     from dgml_core.generation import transcribe as transcribe_mod
 
@@ -375,7 +376,7 @@ def test_text_format_reply_in_lines_mode_is_used_as_text(
     assert [b.text for b in blocks] == ["We are a leading provider of services to clients."]
 
 
-def test_two_column_page_is_read_column_by_column():
+def test_two_column_page_is_read_column_by_column() -> None:
     rows = []
     for i in range(6):
         rows.append(
@@ -391,21 +392,21 @@ def test_two_column_page_is_read_column_by_column():
     assert texts[12].startswith("A full width")
 
 
-def test_table_is_not_mistaken_for_columns():
+def test_table_is_not_mistaken_for_columns() -> None:
     rows = [[("Revenue", 100), ("10,180", 600), ("9,337", 800)] for _ in range(6)]
     page = _page(rows)
     lines = lines_mod.window_lines({1: (page, PageDims(W, H))}, [1])
     assert len(lines) == 6 and lines[0].cells() == ["Revenue", "10,180", "9,337"]
 
 
-def test_lim_written_as_a_ref_resolves_to_text():
+def test_lim_written_as_a_ref_resolves_to_text() -> None:
     lines = lines_mod.window_lines(PAGES, [1])
     res = lines_mod.build_payload("H1\tL2\tL3", lines)
     assert res.payload["blocks"][0]["lim"] == "ITEM 1. BUSINESS"
     assert res.payload["blocks"][0]["text"] == "We are a leading pro-"
 
 
-def test_hyphen_is_mended_only_into_a_known_word():
+def test_hyphen_is_mended_only_into_a_known_word() -> None:
     page = _page(
         [
             _prose("a former wholly-"),
@@ -430,7 +431,7 @@ def test_hyphen_is_mended_only_into_a_known_word():
 
 def test_textless_page_gets_its_own_text_call_in_a_lines_window(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
+) -> None:
     """Page 1 has a text layer, page 2 has none: the window is still asked in
     lines mode, then page 2 alone is asked in the text format and spliced in
     after page 1's blocks."""
@@ -441,7 +442,7 @@ def test_textless_page_gets_its_own_text_call_in_a_lines_window(
     calls: list[str] = []
 
     def fake(config: llm.LLMConfig, **kw: object) -> str:
-        calls.append(kw["system_prompt"])
+        calls.append(str(kw["system_prompt"]))
         if kw["system_prompt"] == transcribe_mod.SYSTEM_PROMPT_LINES:
             return (
                 "X\tL1\nH1\tITEM 1.\tL2\nP\tL3-L4\nR\tL5\nR\tL6\nR\tL7\n"
@@ -466,7 +467,7 @@ def test_textless_page_gets_its_own_text_call_in_a_lines_window(
     assert blocks[0].text == "Annual Report"  # page 1 content first
 
 
-def test_report_only_pass_fills_the_pages_it_is_told_to(tmp_path):
+def test_report_only_pass_fills_the_pages_it_is_told_to(tmp_path: Path) -> None:
     from dgml_core.generation import completeness
     from dgml_core.generation.blocks import Block
 

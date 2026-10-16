@@ -146,9 +146,10 @@ def _gutter_x(lines: list[list[_OTok]]) -> float | None:
     if len(spans) < max(4, _GUTTER_MIN_SHARE * len(long_lines)):
         return None
     # The x crossed by the most spans: try each span's midpoint.
-    best_x, best_n = None, 0
-    for a, b in spans:
-        x = (a + b) / 2
+    best_x: float | None = None
+    best_n = 0
+    for lo, hi in spans:
+        x = (lo + hi) / 2
         n = sum(1 for a2, b2 in spans if a2 <= x <= b2)
         if n > best_n:
             best_x, best_n = x, n
@@ -509,7 +510,7 @@ def _build_segment(
             elif rest:
                 # Cells written out, or several cell fields each a ref.
                 cells: list[str] = []
-                ids: list[int] = []
+                ids = []
                 for c in rest:
                     t, i = text_of(c)
                     cells.append(t)
@@ -570,14 +571,13 @@ def _build_segment(
                 text, _ids = text_of(tail)
                 res.payload["continues"] = text
         elif sigil == "X":
-            ids = parse_refs(tail) or []
-            for i in ids:
-                ln = by_id.get(i)
-                if ln is None or i in res.assigned or not ln.may_be_decoration():
+            for lid in parse_refs(tail) or []:
+                dln = by_id.get(lid)
+                if dln is None or lid in res.assigned or not dln.may_be_decoration():
                     continue
-                per_page = sum(1 for j in res.decorations if by_id[j].page == ln.page)
+                per_page = sum(1 for j in res.decorations if by_id[j].page == dln.page)
                 if per_page < _DECORATION_MAX_PER_PAGE:
-                    res.decorations.add(i)
+                    res.decorations.add(lid)
         else:
             res.malformed += 1
     return res

@@ -657,6 +657,7 @@ def transcribe_document(
     if lines_mode:
         from dgml_core.generation import completeness
 
+        assert page_text_dir is not None  # lines_mode implies it
         page_words = completeness.load_page_words_dir(page_text_dir)
         doc_vocab = lines_mod.document_vocabulary(page_words)
         if not page_words:
@@ -825,6 +826,7 @@ def transcribe_document(
                 # line, so the completeness pass must be allowed to fill them.
                 text_format_pages.update(p + 1 for p in pages)
             if wlines and lines_won:
+                assert found is not None and found_lines is not None  # lines_won implies both
                 # A span the model skipped is asked for on its own: the
                 # sub-listing of just those lines, same pages attached. A
                 # tiny reply, and precise where a page split is not.
@@ -885,9 +887,13 @@ def transcribe_document(
                         strip_fences(p_raw),
                         debug=debug,
                     )
+                    p_tag = f"{doc_name} {wlog} p{p + 1}"
+
+                    def _page_log(m: str, _t: str = p_tag) -> None:
+                        log(f"{_t}: {m}")
+
                     try:
-                        p_tag = f"{doc_name} {wlog} p{p + 1}"
-                        p_payload = parse_window_any(p_raw, log=lambda m, t=p_tag: log(f"{t}: {m}"))
+                        p_payload = parse_window_any(p_raw, log=_page_log)
                     except json.JSONDecodeError:
                         p_payload = _salvage_window_json(p_raw) or {"blocks": []}
                     p_blocks = [b for b in p_payload.get("blocks", []) or [] if isinstance(b, dict)]

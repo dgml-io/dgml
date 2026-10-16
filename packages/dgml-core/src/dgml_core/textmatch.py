@@ -417,9 +417,10 @@ def column_gutter(words: list[Word]) -> float | None:
     need = max(4, _GUTTER_MIN_SHARE * len(long_lines))
     if len(spans) < need:
         return None
-    best_x, best_n = None, 0
-    for a, b in spans:
-        x = (a + b) / 2
+    best_x: float | None = None
+    best_n = 0
+    for lo, hi in spans:
+        x = (lo + hi) / 2
         n = sum(1 for a2, b2 in spans if a2 <= x <= b2)
         if n > best_n:
             best_x, best_n = x, n
