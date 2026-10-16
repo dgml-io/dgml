@@ -13,7 +13,7 @@
 """OPC (Open Packaging Conventions, ECMA-376 Part 2) packaging for DGMLX bundles.
 
 A DGMLX bundle is shaped as an **OPC package**: a set of *parts* (the source
-document, page images, page text, schema, and the
+document, page images, schemas, DGML XML, and the
 ``META-INF/dgml-attestation.xml`` attestation file) described by two well-known
 parts —
 

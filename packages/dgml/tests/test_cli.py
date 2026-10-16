@@ -4970,6 +4970,28 @@ def test_prove_file_bad_uri_is_invalid_argument(
     assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
 
 
+def test_prove_file_node_record_is_invalid_argument(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A node record (URI with a #leaf fragment) handed to `prove file` is the wrong
+    # command, not a tamper: it must be a structural error (exit 1), not valid=false (exit 2).
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rec = tmp_path / "rec.json"
+    rec.write_text(
+        json.dumps({"checksum": "ab", "checksum_algo": "sha256", "uri": "dgmlx://f00000/ds0000#3"}),
+        encoding="utf-8",
+    )
+    rc = main(
+        _ws_args(ws) + ["prove", "file", "--chain", "nvnm-testnet", "--record-json", str(rec)]
+    )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "INVALID_ARGUMENT"
+    assert "prove node" in err["message"]
+
+
 # --- discover ----------------------------------------------------------------
 
 _DISCOVER_XML = (

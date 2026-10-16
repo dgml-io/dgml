@@ -10,8 +10,11 @@ checksum + a URI + JSON metadata inside a *registry*. DGML talks to it
 (and to any compatible EVM chain) **directly** through the `dgml`
 CLI's chain commands — no MCP server. DGML anchors two granularities:
 
-- **Bundle (DGMLX)** — checksum = the bundle's Merkle root over every
-  artifact of a file (PDF, page images, page text, schema, DGML XML).
+- **Bundle (DGMLX)** — checksum = the bundle's Merkle root over the
+  file's bundled artifacts (source document, page images, the docset's
+  generation and extraction schemas, DGML XML). The per-page
+  `page_text/` token JSONs are an intermediate artifact and are **not**
+  covered — editing them does not break a bundle proof.
 - **Node** — checksum = the canonical hash of ONE element of the DGML
   XML; the record metadata carries the document tree's Merkle root and
   the RFC 6962 inclusion path, so the node can be proven against the
@@ -95,11 +98,26 @@ dgml prove file --chain "$chain" --record-json record.json --workspace "$ws"
 ```
 
 Use `prove file` for a bundle URI (no `#fragment`) and `prove node` for
-a node URI (`#leaf`). Both exit `0` proven / `2` mismatch
+a node URI (`#leaf`); handing either the other kind of record is an
+`INVALID_ARGUMENT` structural error. Both exit `0` proven / `2` mismatch
 (`valid: false` — report it, never paper over it) / `1` structural
-error. On a node mismatch, compare `computed_node_hash` vs
-`expected_node_hash` to tell "this node changed" from "the tree around
-it changed".
+error.
+
+A node proof checks only the element at the record's leaf index (its
+document-order position) against the anchored root, via the sibling
+path stored in the record. Edits elsewhere in the document do not affect
+it — the bundle proof is what covers the rest of the file. On a node
+mismatch:
+
+- `computed_node_hash` ≠ `expected_node_hash` — the element *now at that
+  position* differs. Either the staked element itself was edited, or
+  elements were inserted/removed earlier in the document so a different
+  element now sits at that index. The result's `xpath` names whichever
+  element is there now; if it is not the one that was staked, report a
+  shifted document, not an edited value.
+- Equal hashes but `valid: false` — the record's own proof path does
+  not lead to its `expected_root`: the record is corrupt or forged, not
+  the workspace.
 
 ## Gotchas
 

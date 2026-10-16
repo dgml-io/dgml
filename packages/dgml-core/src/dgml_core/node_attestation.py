@@ -100,9 +100,13 @@ class NodeVerifyResult:
     """Outcome of re-verifying a node proof against the current workspace.
 
     ``computed_node_hash`` is the canonical hash of whatever element sits
-    at the proof's leaf index *now*; on a failed verify, comparing it to
-    the proof's ``leaf_hash`` distinguishes "this node changed" from
-    "the tree around it changed".
+    at the proof's leaf index *now*. On a failed verify, a differing hash
+    means the element at that position changed — edited in place, or a
+    different element shifted into the index by an insertion or removal
+    earlier in the document (``xpath`` names the element now there). A
+    matching hash means the proof path or ``expected_root`` itself is
+    wrong — edits elsewhere in the document cannot cause it, since the
+    sibling path comes from the proof rather than the current tree.
     """
 
     file_id: str
