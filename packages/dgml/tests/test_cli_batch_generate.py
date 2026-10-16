@@ -146,12 +146,17 @@ def _ws_args(ws: Path) -> list[str]:
 
 
 def _seed(
-    root: Path, capsys: pytest.CaptureFixture[str], config: dict[str, Any] | None = None
+    root: Path,
+    capsys: pytest.CaptureFixture[str],
+    config: dict[str, Any] | None = None,
+    *,
+    ocr: bool | None = None,
 ) -> tuple[Path, str]:
     """A workspace with one DocSet holding the two documents of :data:`_PAGES`.
     With a ``style`` section the files are OCR files whose page words are the
     text their transcription will hold, so grounding places them and the
-    image-style pass runs."""
+    image-style pass runs. *ocr* overrides that (``False``: digital files under
+    an enabled ``style`` section)."""
     ws = root / "ws"
     _init_ws(ws)
     capsys.readouterr()
@@ -161,7 +166,8 @@ def _seed(
     did = str(_read_stdout(capsys)["id"])
     wsx = Workspace(root=ws)
     store = DocSetStore(wsx)
-    ocr = "style" in config
+    if ocr is None:
+        ocr = "style" in config
     for index, (name, pages) in enumerate(_PAGES.items()):
         fid = f"fgen0000000{index}"
         _seed_file_dir(ws, fid, pages=pages, pdf_name=name)
@@ -377,6 +383,14 @@ def test_style_batches_as_one_stage_and_matches_sync(
         if _system(wave[0].kwargs) == style_llm._SYSTEM_PROMPT
     ]
     assert [len(w) for w in style_waves] == [sum(_PAGES.values())]  # every page, one wave
+    # Grounding ran on a scratch copy; the --debug sidecar names the blob instead.
+    sidecars = sorted((tmp_path / "batch" / "ws").rglob("*.grounding_stats.json"))
+    assert len(sidecars) == len(_PAGES)
+    for sidecar in sidecars:
+        stats = json.loads(sidecar.read_text(encoding="utf-8"))
+        key = stats["source"]
+        assert stats["output"] == key
+        assert key.endswith(".dgml.xml") and (tmp_path / "batch" / "ws" / key).is_file()
     stage = payload["batch"]["stages"]["style"]
     assert stage["requests"] == stage["batch_ok"] == sum(_PAGES.values())
 
@@ -408,6 +422,27 @@ def test_a_stage_without_a_batch_backend_is_rejected_up_front(
     assert err["code"] == "BATCH_UNAVAILABLE"
     assert f"stage {stage!r}" in err["message"]
     assert not list((ws / layout.DOCSETS_DIR / did).rglob("*.dgml.xml"))
+
+
+def test_style_model_is_not_checked_when_no_file_is_ocr(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _Provider,
+) -> None:
+    """A style model with no batch backend does not block a docset of digital
+    files: grounding never sends them to it."""
+    config = {**_STYLE_CONFIG, "style": {"enabled": True, "model": "mistral/pixtral-large-latest"}}
+    monkeypatch.setenv("MISTRAL_API_KEY", "sk-test")  # never used: no style call is made
+    ws, did = _seed(tmp_path, capsys, config, ocr=False)
+    provider.install(_answer)
+    with patch("litellm.completion", side_effect=lambda **kw: _answer(kw)):
+        assert main(_argv(ws, did, *_BATCH)) == 0
+    payload = _read_stdout(capsys)
+    assert payload["summary"]["converted"] == len(_PAGES)
+    assert payload["batch"]["stages"]["style"] == {
+        "skipped": "no OCR document with a page to style"
+    }
 
 
 def test_batch_poll_interval_must_be_positive(

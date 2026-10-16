@@ -122,6 +122,12 @@ least ten transcription round trips. That is why batch mode is for work nobody
 is waiting on. Leave it off for interactive runs and for a handful of
 documents, where the savings are cents.
 
+Memory follows the same shape. The synchronous path holds at most
+`--max-parallel-calls` documents at a time; batch mode loads every document's
+PDF before the first wave and keeps it until its last window is transcribed,
+because every document's next window goes out together. For a docset of many
+large PDFs, split it into several DocSets or runs.
+
 ## What the run reports
 
 Without `--batch`, output and JSON payloads are byte-identical to a synchronous

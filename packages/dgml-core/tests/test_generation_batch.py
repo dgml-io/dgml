@@ -179,6 +179,7 @@ def _run(
     schema_text: str | None = None,
     logs: list[str] | None = None,
     pages: dict[str, int] | None = None,
+    label_errors: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Run convert_batch once; return everything observable about the run."""
     tmp.mkdir(parents=True, exist_ok=True)
@@ -210,6 +211,7 @@ def _run(
         ),
         on_output=outputs.__setitem__,
         on_error=errors.__setitem__,
+        on_label_error=(label_errors.__setitem__ if label_errors is not None else None),
     )
     files = {
         str(p.relative_to(cache_dir)): p.read_bytes()
@@ -484,6 +486,27 @@ def test_failed_transcription_is_dropped_with_the_sync_error(
     assert batch["stats"]["transcribe"]["sync_fallbacks"] >= 1
 
 
+def test_unreadable_input_is_dropped_with_the_sync_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
+) -> None:
+    """Inputs load concurrently; one that cannot be read is reported as the sync
+    path reports it and does not stop the others."""
+
+    def load(path: Any, *, converters: Any) -> bytes:
+        if Path(path).name == "bravo.pdf":
+            raise ValueError("not a PDF")
+        return f"%PDF-{Path(path).name}".encode()
+
+    monkeypatch.setattr(document_mod, "load_document_as_pdf", load)
+    sync = _run(tmp_path / "sync", make_answer(), monkeypatch, batch=None)
+    batch = _run(tmp_path / "batch", make_answer(), monkeypatch, batch=fake_provider)
+
+    assert set(batch["outputs"]) == {"alpha.pdf"}
+    assert batch["errors"] == sync["errors"]
+    assert "not a PDF" in batch["errors"]["bravo.pdf"]
+    assert batch["outputs"] == sync["outputs"]
+
+
 def test_cached_documents_make_no_request_and_write_no_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
 ) -> None:
@@ -550,6 +573,7 @@ def test_label_stage_failure_keeps_every_transcription(
         return backend
 
     register_backend("anthropic", factory)
+    label_errors: dict[str, dict[str, str]] = {}
     batch = _run(
         tmp_path / "batch",
         make_answer(),
@@ -557,9 +581,15 @@ def test_label_stage_failure_keeps_every_transcription(
         batch=fake_provider,
         vocab=_closed_vocab(),
         schema_text=_CLOSED_SCHEMA,
+        label_errors=label_errors,
     )
     assert set(batch["outputs"]) == set(_PAGES)
     assert all("Greeting" not in xml for xml in batch["outputs"].values())
+    # The documented label_error code, never the exception's class name.
+    assert set(label_errors) == set(_PAGES)
+    for err in label_errors.values():
+        assert err["code"] == "LABEL_MODEL_UNREACHABLE"
+        assert "provider down" in err["message"]
 
 
 def test_generation_batch_config_key(workspace: Workspace) -> None:

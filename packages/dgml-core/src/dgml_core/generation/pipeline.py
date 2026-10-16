@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 from dgml_core import llm
 from dgml_core.concurrency import map_concurrent
 from dgml_core.conversion import ConverterConfig
-from dgml_core.errors import short_error_message
+from dgml_core.errors import LabelModelUnreachable, short_error_message
 from dgml_core.generation import document
 from dgml_core.generation.blocks import Block, Span
 from dgml_core.generation.config import LABEL_MODE_ALL_AT_ONCE, LABEL_MODE_SYNC
@@ -640,12 +640,20 @@ def _transcribe_batched(
         log(f"[transcribe] {path.name} FAILED: {exc}; skipping")
         transcribe_errors[path.name] = short_error_message(exc)
 
-    units: list[Unit] = []
-    for path in paths:
+    def load(path: Path) -> bytes | Exception:
+        # Total, so one unreadable input never cancels the others' loads.
         try:
-            pdf_bytes = document.load_document_as_pdf(path, converters=opts.converters or {})
+            return document.load_document_as_pdf(path, converters=opts.converters or {})
         except Exception as exc:
-            failed(path, exc)
+            return exc
+
+    # Load (and convert, for Office inputs) concurrently, as the sync path
+    # does; failures are reported here, in input order.
+    loaded = map_concurrent(load, paths, max_workers=opts.max_parallel_docs)
+    units: list[Unit] = []
+    for path, pdf_bytes in zip(paths, loaded, strict=True):
+        if isinstance(pdf_bytes, Exception):
+            failed(path, pdf_bytes)
             continue
         config = _config(opts, operation=OPERATION_TRANSCRIBE)
         steps = transcribe_steps(
@@ -770,7 +778,12 @@ def _batch_labeler(
 def _stage_failed_label(name: str, error: BaseException) -> LabelResult:
     """The label result of a document a failed batch stage left unlabeled:
     a warning and a ``label_error`` carrying that failure (its transcription
-    is kept, as for an unreachable label model)."""
-    code = str(getattr(error, "code", type(error).__name__))
+    is kept, as for an unreachable label model).
+
+    The code is always ``LABEL_MODEL_UNREACHABLE``, the one ``label_error``
+    carries on the sync path: a stage failure can be any exception (a raw
+    transport error, say), and its class name is not a code. The message says
+    what failed."""
     message = short_error_message(error)
-    return [f"labeling {name} failed: {message}"], {"code": code, "message": message}, []
+    label_error = {"code": LabelModelUnreachable.code, "message": message}
+    return [f"labeling {name} failed: {message}"], label_error, []

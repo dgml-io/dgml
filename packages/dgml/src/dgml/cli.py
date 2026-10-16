@@ -69,6 +69,7 @@ from dgml_core.storage import (
     detected_api_keys,
     read_json,
     user_config_path,
+    write_json_atomic,
     write_user_config,
 )
 from dgml_core.storage import (
@@ -3302,6 +3303,19 @@ def _generate_payload(
 _STYLE_NOTHING_TO_STYLE = "no OCR document with a page to style"
 
 
+def _any_ocr_file(file_store: FileStore, file_ids: list[str]) -> bool:
+    """Whether any of *file_ids* is an OCR file, the only kind grounding sends
+    to the image-style model (``text_mode == "ocr"``; an unreadable record
+    counts as not OCR, as it does there)."""
+    for fid in file_ids:
+        try:
+            if file_store.get(fid).text_mode == TextMode.OCR.value:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _style_staged(staged: dict[str, dict[str, Any]], style_config: Any, batch_opts: Any) -> None:
     """Run the image-style passes ``docset generate --batch`` deferred while
     grounding (OCR files under an enabled ``style`` section) as one batch
@@ -3441,8 +3455,10 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         batch_enabled = args.batch if args.batch is not None else load_generation_batch(ws)
         if batch_enabled:
             batch_stages = {"transcribe": gen_model, "label": label_model}
-            if style_config is not None:
-                batch_stages["style"] = style_config.model  # OCR files' image style
+            if style_config is not None and _any_ocr_file(file_store, file_ids):
+                # Image style runs only for OCR files (the grounding gate), so a
+                # docset with none never reaches the style model.
+                batch_stages["style"] = style_config.model
             if not args.no_semlinks:
                 batch_stages["links"] = label_model
             _batch_preflight(batch_stages)
@@ -3705,6 +3721,12 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                 pending_style = res.pending_style
                 writes = {xml_key: gpath.read_bytes()}
                 if res.stats_path is not None and res.stats_path.exists():
+                    if batch_opts is not None:
+                        # gpath is a scratch copy deleted on exit; name the
+                        # blob the tree is written to instead.
+                        stats = json.loads(res.stats_path.read_bytes())
+                        stats["source"] = stats["output"] = xml_key
+                        write_json_atomic(res.stats_path, stats)
                     writes[
                         layout.pair_artifact_key(
                             args.docset_id, name_to_fid[name], res.stats_path.name
