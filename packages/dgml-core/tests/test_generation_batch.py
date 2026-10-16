@@ -34,6 +34,7 @@ import pytest
 from dgml_core import llm
 from dgml_core.batch import BatchItemError, BatchRequest, FakeBackend, register_backend
 from dgml_core.batch import registry as batch_registry
+from dgml_core.configuration import Configuration, Generation, Identity, ProviderSpec, Storage
 from dgml_core.errors import GenerationConfigInvalid
 from dgml_core.generation import document as document_mod
 from dgml_core.generation import label as label_mod
@@ -573,6 +574,22 @@ def test_generation_batch_config_key(workspace: Workspace) -> None:
             GenerationConfigInvalid, match=r"generation\.batch must be true or false"
         ):
             load_generation_batch(workspace)
+
+
+def test_generation_batch_from_an_in_memory_configuration(tmp_path: Path) -> None:
+    """A workspace configured in memory sets the switch through ``Generation``."""
+
+    def _ws(generation: Generation | None) -> Workspace:
+        cfg = Configuration.build(
+            identity=Identity(workspace_id="tenant-1", name="T", organization="T"),
+            storage=Storage.combined(ProviderSpec("dgml_core.storage_local:LocalStore")),
+            generation=generation,
+        )
+        return Workspace(root=tmp_path, configuration=cfg)
+
+    assert load_generation_batch(_ws(None)) is False
+    assert load_generation_batch(_ws(Generation(batch=True))) is True
+    assert load_generation_batch(_ws(Generation(batch=False))) is False
 
 
 @pytest.mark.parametrize(
