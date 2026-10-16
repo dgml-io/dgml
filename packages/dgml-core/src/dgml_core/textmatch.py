@@ -686,7 +686,8 @@ def find_fuzzy_spans(
 
     To stay fast on pages of repetitive prose (where every window has a
     similar character *and* common-word profile), candidate spans are
-    seeded by **anchor**: the target's rarest word-token on this page.
+    seeded by **anchor**: the target's rarest word-token on this page (ties: longest, then
+    first in the target).
     Only spans positioned so that anchor lines up (± a little slack) get
     the O(len²) distance computed — typically a handful per page. A
     mangled boundary token (``party:`` vs ``party``) just isn't chosen as
@@ -712,10 +713,19 @@ def find_fuzzy_spans(
     target_cores = [core_token(t) for t in target_tokens]
 
     # Anchor = the target token present on the page that occurs least
-    # often (ties broken toward the longest, most distinctive token). If
-    # no target token appears on the page at all there is nothing to seed
-    # from — defer.
-    present = {c for c in target_cores if c and c in positions}
+    # often, ties broken toward the longest, most distinctive token, then
+    # toward the token that comes first in the target. If no target token
+    # appears on the page at all there is nothing to seed from — defer.
+    #
+    # The last tie-break must be an explicit order, not set iteration:
+    # string hashes are salted per process (PYTHONHASHSEED), so picking
+    # from a set gave a different anchor — different start positions,
+    # sometimes a different match or none — between identical runs.
+    # ``dict.fromkeys`` keeps target order and ``min`` keeps the first
+    # minimum. First-in-target is also the better seed: fewer tokens sit
+    # before it that the page could split or merge, which would push the
+    # real start outside the ±_FUZZY_ANCHOR_SLACK window.
+    present = [c for c in dict.fromkeys(target_cores) if c and c in positions]
     if not present:
         return []
     anchor = min(present, key=lambda c: (len(positions[c]), -len(c)))
@@ -723,6 +733,8 @@ def find_fuzzy_spans(
         return []  # no distinctive anchor — can't localize cheaply or confidently
     anchor_word_idx = target_cores.index(anchor)
 
+    # Scan starts in page order. Int sets are already stable and the sort
+    # below is total, so this only makes the order explicit.
     starts: set[int] = set()
     for pos in positions[anchor]:
         base = pos - anchor_word_idx
@@ -732,7 +744,7 @@ def find_fuzzy_spans(
                 starts.add(s)
 
     scored: list[tuple[float, tuple[int, int]]] = []
-    for start in starts:
+    for start in sorted(starts):
         for end in range(max(start, start + lo_words - 1), min(n, start + hi_words)):
             acc = "".join(norms[start : end + 1])
             la = len(acc)
