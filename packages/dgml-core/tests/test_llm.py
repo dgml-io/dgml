@@ -920,6 +920,17 @@ def test_thinking_sent_to_anthropic_models() -> None:
     assert kwargs["thinking"] == {"type": "adaptive"}
 
 
+def test_between_tools_is_sonnet_55_off_switch() -> None:
+    """Claude Sonnet 5.5 rejects `{"type": "disabled"}`; `between_tools` is how it
+    turns thinking off for a plain text reply, and it goes on the wire verbatim
+    (type only, no other field)."""
+    msgs = [{"role": "user", "content": "hi"}]
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-sonnet-5-5", thinking="between_tools"), messages=msgs
+    )
+    assert kwargs["thinking"] == {"type": "between_tools"}
+
+
 def test_thinking_omitted_when_unset() -> None:
     """Unset means "say nothing", which leaves the model's own default in
     force — deliberately NOT the same as "disabled"."""

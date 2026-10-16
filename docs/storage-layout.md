@@ -711,7 +711,9 @@ Field rules:
   they may name different providers (e.g. the `anthropic_google` family blends
   Gemini and Anthropic models). These apply whether the models are set here
   or come from their tiers; when unset, litellm uses its per-provider env var.
-- `thinking` — optional; `"disabled"` (default) or `"adaptive"`. Anthropic
+- `thinking` — optional; `"disabled"` (default), `"adaptive"`, or
+  `"between_tools"` (Claude Sonnet 5.5 rejects `"disabled"`; this is its off
+  switch, thinking only between tool calls). Anthropic
   extended thinking, applied to **both** passes; ignored for non-Anthropic
   models. Omitting the field on the wire is not the same as turning thinking
   off: Claude 4.6+/5 models think adaptively unless told not to, so generation

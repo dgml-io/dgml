@@ -2921,14 +2921,16 @@ def _add_generate_subparser(
     )
     gen.add_argument(
         "--thinking",
-        choices=["disabled", "adaptive"],
+        choices=["disabled", "adaptive", "between_tools"],
         default=None,
         help=(
             "Anthropic extended thinking for both generation passes. Overrides "
             "[generation] thinking, whose default is 'disabled'. Omitting the "
             "field on the wire is NOT the same as turning thinking off: Claude "
-            "4.6+/5 models reason adaptively unless told not to. Ignored for "
-            "non-Anthropic models."
+            "4.6+/5 models reason adaptively unless told not to. Claude Sonnet "
+            "5.5 rejects 'disabled'; 'between_tools' is its off switch (thinking "
+            "only between tool calls, so none for these text replies). Ignored "
+            "for non-Anthropic models."
         ),
     )
     gen.add_argument(
