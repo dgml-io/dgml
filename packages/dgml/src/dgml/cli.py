@@ -2586,8 +2586,8 @@ def _add_extraction_subparsers(
         default=None,
         help=(
             "Override grounded.schema_model for this call (LiteLLM model string). "
-            "Credentials resolve as if it were set in config; a tier's key and "
-            "api_base never carry over."
+            "No configured key or api_base carries over to it; the model reads "
+            "LiteLLM's per-provider env var (e.g. ANTHROPIC_API_KEY)."
         ),
     )
 
@@ -2649,8 +2649,8 @@ def _add_extraction_subparsers(
         default=None,
         help=(
             "Override grounded.values_model for this call (LiteLLM model string). "
-            "Credentials resolve as if it were set in config; a tier's key and "
-            "api_base never carry over."
+            "No configured key or api_base carries over to it; the model reads "
+            "LiteLLM's per-provider env var (e.g. ANTHROPIC_API_KEY)."
         ),
     )
     ex_extract.add_argument(

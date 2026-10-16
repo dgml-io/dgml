@@ -30,9 +30,12 @@ mirroring the ``dgml cluster --config PRESET|PATH`` precedent:
 
 Both are applied as the merged config's highest-precedence layer
 (``load_merged_config(cli_overrides=...)``), so they override the keys they name
-while the rest of the resolution is unchanged: unnamed keys (e.g. a workspace
-``api_key_env``) survive, and a model neither the overlay nor the config names
-still falls back to its ``[models]`` tier.
+while the rest of the resolution is unchanged. A model's credentials move with
+it: an overlay that sets ``model`` replaces that model's whole ``api_key`` /
+``api_key_env`` / ``api_base`` group, so a workspace ``api_key_env`` does not
+follow the overlay's model (keys outside a model group, e.g. ``thinking``, do
+survive). A model neither the overlay nor the config names still falls back to
+its ``[models]`` tier.
 
 Both keep the model choice visible/recorded: a profile/file is a checked-in,
 named artifact, and the effective models (plus a ``source`` label recording
@@ -42,8 +45,9 @@ The two models can name different providers (e.g. the ``anthropic_google``
 family blends Gemini and Anthropic models), so each carries its
 own credentials: ``api_key`` / ``api_key_env`` / ``api_base`` for transcription
 and ``label_api_key`` / ``label_api_key_env`` / ``label_api_base`` for labeling.
-These apply whether the models are set here or come from their tiers; the tiers
-themselves carry no credentials.
+Each applies only to the model set beside it in this section; a model that comes
+from its tier brings the tier's credentials, and a section credential with no
+section model is an error.
 """
 
 from __future__ import annotations
@@ -269,10 +273,13 @@ def resolve_generation_config(
     1 and 2 are collapsed into one ``[generation]`` overlay handed to
     :func:`~dgml_core.config.load_merged_config` as ``cli_overrides``, its
     highest-precedence layer. So an overlay overrides the keys it names and
-    leaves the rest of the resolution intact — a workspace ``api_key_env`` still
-    applies, and a model the overlay doesn't name still falls back to its tier.
-    Passing both ``--model`` and ``--label-model`` therefore fully specifies the
-    models and works with no ``[generation]`` section at all.
+    leaves the rest of the resolution intact: a model the overlay doesn't name
+    still falls back to its tier, and keys outside a model group (``thinking``)
+    survive. A model's credentials move with it, so a model the overlay names
+    takes only the credentials the overlay sets — a workspace ``api_key_env``
+    does not follow it — else litellm reads its per-provider env var. Passing
+    both ``--model`` and ``--label-model`` therefore fully specifies the models
+    and works with no ``[generation]`` section at all.
 
     With no ``config`` and no overrides this is exactly
     :func:`load_generation_config` (so an unresolvable model still raises

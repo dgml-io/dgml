@@ -144,15 +144,33 @@ def test_tier_models_carry_no_credentials(workspace: Workspace) -> None:
     assert (cfg.label_api_key, cfg.label_api_key_env, cfg.label_api_base) == (None, None, None)
 
 
-def test_per_task_credentials_apply_to_tier_models(workspace: Workspace) -> None:
-    # Credentials live on the task section, independent per model, and apply even
-    # when the models themselves come from the tiers.
+def test_section_credentials_without_a_section_model_are_rejected(workspace: Workspace) -> None:
+    # A key is written beside the model it is for. Credentials on [generation] with
+    # no [generation] model would pair with a tier's model — a group split across
+    # two tables — so they are refused. Name the model here, or move the key to
+    # [models] as `standard_api_key_env` / `advanced_api_key_env`.
     write_config(
         workspace,
         {
             "models": {"standard": MODEL, "advanced": "gemini/gemini-2.5-pro"},
             "generation": {
                 "api_key_env": "MY_ANTH",
+                "label_api_key_env": "MY_GEM",
+            },
+        },
+    )
+    with pytest.raises(GenerationConfigInvalid, match=r"'generation\.model' is not"):
+        load_generation_config(workspace)
+
+
+def test_per_task_credentials_sit_beside_their_models(workspace: Workspace) -> None:
+    write_config(
+        workspace,
+        {
+            "generation": {
+                "model": MODEL,
+                "api_key_env": "MY_ANTH",
+                "label_model": "gemini/gemini-2.5-pro",
                 "label_api_key_env": "MY_GEM",
             },
         },
@@ -412,13 +430,23 @@ def test_resolve_partial_flag_falls_back_to_tier(workspace: Workspace) -> None:
     assert source == "override"
 
 
-def test_resolve_overlay_preserves_unnamed_keys(workspace: Workspace) -> None:
-    # A profile/file overrides the keys it names; a workspace credential the
-    # overlay is silent about survives the run.
-    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "api_key_env": "MY_KEY"})
+def test_resolve_overlay_replaces_the_models_credentials_with_them(workspace: Workspace) -> None:
+    # A profile overrides the models it names, and a model's credentials move with
+    # it: the workspace's key was written beside the old models and does not follow
+    # the profile's. A key outside any model group survives the overlay.
+    _write(
+        workspace,
+        {
+            "model": MODEL,
+            "label_model": LABEL_MODEL,
+            "api_key_env": "MY_KEY",
+            "thinking": "adaptive",
+        },
+    )
     cfg, source = resolve_generation_config(workspace, config="fast")
     assert cfg.label_model != LABEL_MODEL  # profile replaced the models...
-    assert cfg.api_key_env == "MY_KEY"  # ...but not the credentials
+    assert cfg.api_key_env is None  # ...and the credentials written beside them
+    assert cfg.thinking == "adaptive"  # ...but not a key outside the group
     assert source == "profile:fast"
 
 

@@ -27,8 +27,12 @@ The workspace config is assembled by merging, in increasing precedence:
 The merge is pydantic-settings' source combination (``deep_update`` across
 sources): each config section is modelled as a permissive ``dict`` field, so a
 higher-priority layer overrides only the keys it sets and inherits the rest.
-The env-var convention is the pydantic-settings standard — ``env_prefix="DGML_"``
-with ``env_nested_delimiter="__"`` — so ``DGML_MODELS__ADVANCED=…`` sets
+The one exception is a model's credential group: each layer is normalized first
+(:func:`_normalize_layer`), so a layer that sets a model also sets ``None`` for
+the credentials it leaves unset and replaces the group whole rather than
+pairing its model with a lower layer's key. The env-var convention is the
+pydantic-settings standard — ``env_prefix="DGML_"`` with
+``env_nested_delimiter="__"`` — so ``DGML_MODELS__ADVANCED=…`` sets
 ``models.advanced``. (``DGML_HOME`` / ``DGML_DEBUG`` have no ``__`` and match no
 declared field, so ``extra="ignore"`` drops them — they never reach the config.)
 
@@ -56,7 +60,12 @@ from pydantic_settings import (
 )
 
 from .errors import CorruptMetadata, LegacyConfigPresent
-from .models_config import ConfigSection, expand_family
+from .models_config import (
+    LLM_SECTIONS,
+    ConfigSection,
+    normalize_models_layer,
+    normalize_task_layer,
+)
 from .storage import user_config_path
 
 if TYPE_CHECKING:
@@ -123,16 +132,38 @@ def _build_settings_class(user_path: Path, ws_config: dict[str, Any] | None) -> 
                 ws_config or {},
                 TomlConfigSettingsSource(settings_cls, toml_file=user_path)(),
             )
-            return tuple(InitSettingsSource(settings_cls, _expand_layer(lyr)) for lyr in layers)
+            return tuple(InitSettingsSource(settings_cls, _normalize_layer(lyr)) for lyr in layers)
 
     return _DgmlSettings
 
 
-def _expand_layer(layer: dict[str, Any]) -> dict[str, Any]:
+def _normalize_layer(layer: dict[str, Any]) -> dict[str, Any]:
+    """One config layer with its model groups made atomic (see
+    :func:`~dgml_core.models_config.normalize_models_layer`): ``family`` expanded,
+    this layer's provider keys written onto this layer's tiers, and every model the
+    layer sets carrying ``None`` for the credentials it leaves unset — so the merge
+    replaces a model's group as a unit instead of pairing it with a lower layer's key."""
+    out = dict(layer)
     models = layer.get(ConfigSection.MODELS)
-    if not isinstance(models, dict):
-        return layer
-    return {**layer, ConfigSection.MODELS.value: expand_family(models)}
+    if isinstance(models, dict):
+        out[ConfigSection.MODELS.value] = normalize_models_layer(models)
+    for section in LLM_SECTIONS:
+        table = layer.get(section)
+        if isinstance(table, dict):
+            out[section.value] = normalize_task_layer(table, section)
+    return out
+
+
+def _drop_none_values(sections: dict[Any, Any]) -> dict[Any, Any]:
+    """Drop the explicit ``None``s once the layers are merged. Downstream, a key
+    absent and a key ``None`` mean the same thing, and the merged mapping is what
+    callers compare and serialize whole."""
+    return {
+        section: (
+            {k: v for k, v in table.items() if v is not None} if isinstance(table, dict) else table
+        )
+        for section, table in sections.items()
+    }
 
 
 def _merge_toml_layers(
@@ -171,7 +202,7 @@ def load_merged_config(
     sections: dict[ConfigSection, Any] = {
         key: dict(value) for key, value in workspace.configuration.sections.items()
     }
-    for key, value in _expand_layer(cli_overrides or {}).items():
+    for key, value in _normalize_layer(cli_overrides or {}).items():
         try:
             section = ConfigSection(str(key))
         except ValueError:
@@ -179,7 +210,7 @@ def load_merged_config(
         if not isinstance(value, dict):
             raise CorruptMetadata(f"malformed config: '{key}' must be a table")
         sections[section] = _deep_update(sections.get(section, {}), value)
-    return sections
+    return _drop_none_values(sections)
 
 
 def _deep_update(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -221,4 +252,4 @@ def _merge_layers(
         raise CorruptMetadata(f"malformed config: {exc}") from exc
     dump: dict[str, Any] = settings.model_dump(exclude_unset=True)
     # Field names are exactly the section names, so every key is a ConfigSection.
-    return {ConfigSection(section): value for section, value in dump.items()}
+    return _drop_none_values({ConfigSection(section): value for section, value in dump.items()})

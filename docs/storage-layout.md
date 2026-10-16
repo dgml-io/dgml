@@ -533,35 +533,52 @@ explicit tiers in the user config, while tiers set in the same layer as the
 family, or a higher one, still override it. To drop a user-level pin in one
 workspace, restate the family there.
 
-Credentials can sit at three levels; the most specific wins:
+A model and its credentials are **one group, written together in one config
+layer**: a tier's are the `<tier>_*` keys beside it, a task's are the keys on its
+own section, and a credential in a layer that does not set its model is an error.
+So a group never borrows from another tier, another section or another layer, and
+a key can never be separated from the model it was written beside.
 
 ```toml
 [models]
 family = "anthropic_google"
-anthropic_api_key_env = "ANTHROPIC_API_KEY"   # every anthropic/… model
-google_api_key_env    = "GEMINI_API_KEY"      # every gemini/… model
+anthropic_api_key_env = "ANTHROPIC_API_KEY"   # onto this layer's anthropic/… tiers
+google_api_key_env    = "GEMINI_API_KEY"      # … and its gemini/… tiers
 expert          = "anthropic/claude-opus-5"
-expert_api_key_env = "OPUS_KEY"               # this tier only
-expert_api_base = "https://proxy.example"
+expert_api_key_env = "OPUS_KEY"               # this tier's own key …
+expert_api_base = "https://proxy.example"     # … and endpoint
 ```
 
 - **Per task**, on the task's own section (`generation.api_key_env`,
-  `grounded.schema_api_key`, `classification.api_base`, …).
+  `grounded.schema_api_key`, `classification.api_base`, …) — for the model that
+  section names. Credentials on a section that names no model are an error: a key
+  beside no model has no model it was meant for.
 - **Per tier**: `<tier>_api_key` / `<tier>_api_key_env` / `<tier>_api_base` next
-  to the tier, used by every task that takes its model from that tier. A tier's
-  credentials require the tier itself to be set. Like every other key they layer
-  independently of the tier: a workspace `config.toml` that overrides `expert`
-  still inherits a user-level `expert_api_key_env`. For a credential that should
-  follow the model, use the provider key.
+  to the tier, taken whole by every task that gets its model from that tier. They
+  require the tier to be set **in the same layer** (a `family` there counts), and
+  they move with it: a layer that sets `expert` replaces `expert`'s whole group, so
+  a workspace `config.toml` that overrides `expert` does **not** inherit a
+  user-level `expert_api_key_env`. Keys kept in the environment name their model
+  there too — `DGML_MODELS__FAMILY=anthropic` with
+  `DGML_MODELS__ANTHROPIC_API_KEY_ENV=…` is the one-layer form.
 - **Per provider**: `anthropic_api_key`, `google_api_key`, `openai_api_key` (or
-  the `_env` form), matched on the model id's prefix (`anthropic/`, `gemini/`,
-  `openai/`) — for any model that sets nothing more specific, whether it came from
-  a tier or a task names it. One key per provider covers a mixed family such as
-  `anthropic_google`. A model of another provider (`ollama/…`) never receives
-  these keys.
+  the `_env` form) is shorthand within one layer. It is written onto every tier of
+  that provider (by model-id prefix: `anthropic/`, `gemini/`, `openai/`) that the
+  same layer sets or expands from `family`, unless the tier has its own key or an
+  `api_base`. One key per provider covers a mixed family such as
+  `anthropic_google`; a tier pointed at a custom `api_base` never receives it, and
+  neither does a task section's model or a tier set in another layer. A provider
+  key with no tier of its provider in the layer is simply unused — not an error.
 
-A model with none of these falls back to litellm's per-provider env var. A tier
-that is unset borrows its fallback tier's credentials along with its model.
+A model with no credentials falls back to litellm's per-provider env var — the one
+fallback there is. A tier that is unset borrows its fallback tier's model and
+credentials together.
+
+For an `openai/`, `anthropic/` or `gemini/` model at a custom `api_base`, set
+`api_key` (or `api_key_env`) beside it — the server's real key, or any placeholder
+such as `"EMPTY"` if it checks none. litellm requires a key for these providers, and
+without one it reads the provider's own environment variable and sends that to the
+custom host. `ollama/` models need no key and have no such fallback.
 
 `dgml init --provider {anthropic,anthropic_google,google,openai}` writes a
 family-only `[models]` block; omit `--provider` to auto-detect from the API-key

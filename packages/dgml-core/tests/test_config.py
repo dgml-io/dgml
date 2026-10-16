@@ -26,7 +26,12 @@ from pathlib import Path
 
 import pytest
 from dgml_core.config import load_merged_config
-from dgml_core.errors import CorruptMetadata, LegacyConfigPresent
+from dgml_core.errors import (
+    CorruptMetadata,
+    GenerationConfigInvalid,
+    LegacyConfigPresent,
+    ModelsConfigInvalid,
+)
 from dgml_core.models_config import ConfigSection
 from dgml_core.storage import Workspace, user_config_path
 
@@ -280,3 +285,89 @@ def test_bare_non_switch_section_reaches_loaders_as_empty(
     """
     Path(workspace.config_path).write_text(f"[{section}]\n", encoding="utf-8")
     assert load_merged_config(workspace) == {ConfigSection(section): {}}
+
+
+# ---- Model groups are atomic across layers ----------------------------------
+
+
+def test_a_layer_that_sets_a_tier_replaces_its_credentials_too(workspace: Workspace) -> None:
+    """The user config's key was written beside `anthropic/x`; a workspace that sets
+    `advanced` to another model must not inherit it — that key would go to OpenAI."""
+    _write_user_config({"models": {"advanced": "anthropic/x", "advanced_api_key": "sk-ant"}})
+    write_config(workspace, {"models": {"advanced": "openai/y"}})
+    assert load_merged_config(workspace)[ConfigSection.MODELS] == {"advanced": "openai/y"}
+
+
+def test_a_layer_that_sets_a_task_model_replaces_its_credentials_too(workspace: Workspace) -> None:
+    _write_user_config({"generation": {"model": "anthropic/x", "api_key_env": "ANT"}})
+    write_config(workspace, {"generation": {"model": "openai/y"}})
+    assert load_merged_config(workspace)[ConfigSection.GENERATION] == {"model": "openai/y"}
+
+
+def test_a_layer_that_leaves_the_model_alone_keeps_its_credentials(workspace: Workspace) -> None:
+    """The counterpart: only a layer that sets the *model* replaces the group."""
+    _write_user_config({"models": {"advanced": "anthropic/x", "advanced_api_key": "sk-ant"}})
+    write_config(workspace, {"models": {"expert": "anthropic/z"}})
+    merged = load_merged_config(workspace)[ConfigSection.MODELS]
+    assert merged["advanced"] == "anthropic/x"
+    assert merged["advanced_api_key"] == "sk-ant"
+
+
+def test_provider_key_lands_on_its_own_layers_family_tiers(workspace: Workspace) -> None:
+    _write_user_config({"models": {"family": "anthropic", "anthropic_api_key_env": "ANT"}})
+    merged = load_merged_config(workspace)[ConfigSection.MODELS]
+    assert all(
+        merged[f"{tier}_api_key_env"] == "ANT"
+        for tier in ("light", "standard", "advanced", "expert")
+    )
+
+
+def test_a_tier_credential_needs_its_tier_in_the_same_layer(workspace: Workspace) -> None:
+    """A key in a layer that does not set its model is refused. The user layer's
+    `family` sets `advanced`, but the workspace key would attach to whatever that
+    tier resolves to — and follow it if the user layer changed."""
+    _write_user_config({"models": {"family": "anthropic"}})
+    write_config(workspace, {"models": {"advanced_api_key": "k-ws"}})
+    with pytest.raises(ModelsConfigInvalid, match=r"'models\.advanced' is not in this config"):
+        load_merged_config(workspace)
+
+
+def test_a_key_cannot_outlive_a_model_changed_underneath_it(workspace: Workspace) -> None:
+    """The leak the rule exists for: the user layer's model moved to another provider
+    under a workspace layer holding only a key. Refused, not sent."""
+    _write_user_config({"models": {"advanced": "openai/y"}})
+    write_config(workspace, {"models": {"advanced_api_key": "sk-ant"}})
+    with pytest.raises(ModelsConfigInvalid):
+        load_merged_config(workspace)
+
+
+def test_a_section_credential_needs_its_model_in_the_same_layer(workspace: Workspace) -> None:
+    _write_user_config({"generation": {"model": "anthropic/x"}})
+    write_config(workspace, {"generation": {"api_key_env": "ANT"}})
+    with pytest.raises(GenerationConfigInvalid, match=r"'generation\.model' is not in this config"):
+        load_merged_config(workspace)
+
+
+def test_keys_in_the_environment_name_their_model_there_too(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-layer form for keys kept in the environment: family and provider key
+    together, so the env layer is self-describing."""
+    monkeypatch.setenv("DGML_MODELS__FAMILY", "anthropic")
+    monkeypatch.setenv("DGML_MODELS__ANTHROPIC_API_KEY_ENV", "ANT")
+    merged = load_merged_config(workspace)[ConfigSection.MODELS]
+    assert merged["advanced_api_key_env"] == "ANT"
+
+
+def test_one_provider_key_form_per_layer_is_not_a_clash(workspace: Workspace) -> None:
+    """Each layer consumes its own provider key onto its own tiers; the keys never
+    reach the merged table, so one form in the user config and the other in the
+    workspace config cannot collide there."""
+    _write_user_config({"models": {"family": "anthropic", "anthropic_api_key": "ant"}})
+    write_config(workspace, {"models": {"anthropic_api_key_env": "ANT"}})
+    merged = load_merged_config(workspace)[ConfigSection.MODELS]
+    assert not any(k.startswith("anthropic_") for k in merged), merged
+    # The user layer's tiers took the user layer's key; the workspace key, with no
+    # tier of its provider in its layer, was simply unused.
+    assert merged["advanced_api_key"] == "ant"
+    assert "advanced_api_key_env" not in merged

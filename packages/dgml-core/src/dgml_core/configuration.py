@@ -175,8 +175,9 @@ def _table(obj: Any, *, exclude: frozenset[str] = frozenset()) -> dict[str, Any]
 class Models:
     """``[models]``: the four tiers, or a provider ``family`` that expands into them
     (an explicit tier wins over its family default). A tier is a :class:`Model`, so it
-    may carry its own credentials; ``<provider>_api_key`` is the key for every model
-    of that provider — a tier's or a task section's — that sets none itself."""
+    may carry its own credentials; ``<provider>_api_key`` is written onto every tier
+    of that provider this ``Models`` sets or expands from ``family`` that carries
+    neither its own key nor an ``api_base``. Task sections carry their own."""
 
     family: str | None = None
     light: Model | None = None
@@ -357,7 +358,7 @@ class Configuration:
         already treat ``{}`` and absent alike. ``models.family`` is expanded into
         tiers here, exactly as it is for a TOML layer."""
         # Imported here: config.py imports storage.py, which names this module.
-        from .config import _expand_layer
+        from .config import _drop_none_values, _normalize_layer
 
         identity.require_complete()
         typed: dict[ConfigSection, Any] = {
@@ -373,7 +374,11 @@ class Configuration:
             ConfigSection.CLUSTERING: clustering,
         }
         layer = {s.value: t.table() for s, t in typed.items() if t is not None}
-        return cls.from_merged(identity=identity, storage=storage, sections=_expand_layer(layer))
+        # A single layer: normalized for the same provider-key and family rules as a
+        # TOML layer, then its explicit ``None``s dropped — there is no lower layer to
+        # override.
+        sections = _drop_none_values(_normalize_layer(layer))
+        return cls.from_merged(identity=identity, storage=storage, sections=sections)
 
     @classmethod
     def from_merged(

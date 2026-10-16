@@ -29,6 +29,7 @@ from dgml_core.models_config import (
     Tier,
     expand_family,
     load_models_config,
+    normalize_models_layer,
     provider_of,
     resolve_tiered_model,
 )
@@ -36,6 +37,11 @@ from dgml_core.models_config import (
 
 def _merged(models: Any) -> dict[ConfigSection, Any]:
     return {ConfigSection.MODELS: models}
+
+
+def _normalized(models: dict[str, Any]) -> ModelsConfig:
+    """One layer, as the merge sees it: family expanded, provider keys applied."""
+    return load_models_config(_merged(normalize_models_layer(models)))
 
 
 def _warned(caplog: pytest.LogCaptureFixture) -> str:
@@ -189,21 +195,23 @@ def test_tier_credentials_are_read_with_the_tier() -> None:
 
 
 def test_tier_credentials_without_the_tier_are_rejected() -> None:
-    with pytest.raises(ModelsConfigInvalid, match=r"need 'models\.light'"):
+    with pytest.raises(ModelsConfigInvalid, match=r"'models\.light' is not"):
         load_models_config(_merged({"standard": "s", "light_api_key": "k"}))
 
 
 @pytest.mark.parametrize("prefix", ["light_", "openai_"])
 def test_key_and_env_name_clash_is_rejected(prefix: str) -> None:
+    """Both forms in one layer: a tier's pair is caught at load, a provider's where it
+    is consumed — the normalizer, since provider keys never reach the merged table."""
     table = {"light": "openai/x", f"{prefix}api_key": "k", f"{prefix}api_key_env": "K"}
     with pytest.raises(
         ModelsConfigInvalid, match=f"'models.{prefix}api_key' / 'models.{prefix}api_key_env'"
     ):
-        load_models_config(_merged(table))
+        _normalized(table)
 
 
-def test_provider_key_fills_tiers_by_model_prefix_unless_the_tier_has_its_own() -> None:
-    cfg = _expanded(
+def test_provider_key_fills_its_layers_tiers_by_model_prefix_unless_the_tier_has_its_own() -> None:
+    cfg = _normalized(
         {
             "family": "anthropic_google",
             "expert": "anthropic/pinned",
@@ -212,17 +220,33 @@ def test_provider_key_fills_tiers_by_model_prefix_unless_the_tier_has_its_own() 
             "google_api_key": "goo",
         }
     )
-    assert cfg.light.api_key == "goo" if cfg.light else False  # gemini/… → google
+    assert cfg.light == Model(PROVIDER_MODELS["anthropic_google"]["light"], api_key="goo")
     assert cfg.standard == Model(PROVIDER_MODELS["anthropic_google"]["standard"], api_key_env="ANT")
     assert cfg.expert == Model("anthropic/pinned", api_key="pinned-key")
-    assert cfg.credentials_for("openai/x") == (None, None)
 
 
-def test_provider_keys_match_on_the_merged_table_not_per_layer() -> None:
-    """A key in one layer serves a tier another layer sets: the match happens at load."""
-    user = expand_family({"family": "anthropic", "anthropic_api_key": "ant"})
-    workspace = {"expert": "anthropic/other"}
-    assert _expanded({**user, **workspace}).expert == Model("anthropic/other", api_key="ant")
+def test_provider_key_never_reaches_a_tier_with_an_api_base() -> None:
+    """`openai/llama3` behind a vLLM endpoint is not OpenAI: the OpenAI key must not go there."""
+    cfg = _normalized(
+        {
+            "openai_api_key": "sk-real",
+            "light": "openai/llama3",
+            "light_api_base": "http://vllm:8000",
+        }
+    )
+    assert cfg.light == Model("openai/llama3", api_base="http://vllm:8000")
+
+
+def test_provider_key_does_not_cross_layers() -> None:
+    """A provider key is shorthand within its own layer. A tier another layer sets
+    arrives with its group replaced, so the key does not follow it — even to a model
+    of the same provider. That layer writes its own `expert_api_key` or relies on
+    litellm's env var."""
+    user = normalize_models_layer({"family": "anthropic", "anthropic_api_key": "ant"})
+    workspace = normalize_models_layer({"expert": "anthropic/other"})
+    cfg = load_models_config(_merged({**user, **workspace}))
+    assert cfg.expert == Model("anthropic/other")
+    assert cfg.standard == Model(PROVIDER_MODELS["anthropic"]["standard"], api_key="ant")
 
 
 def test_fallback_tier_brings_its_own_credentials() -> None:
@@ -230,26 +254,103 @@ def test_fallback_tier_brings_its_own_credentials() -> None:
     assert _resolve(merged, Tier.EXPERT) == Model("anthropic/s", api_key="s-key")
 
 
-def test_section_fields_override_the_tier_field_by_field() -> None:
+def test_section_credentials_without_a_section_model_are_rejected() -> None:
+    """A key is written beside the model it is for. Section credentials with no
+    section model would have to pair with a tier's model — a group split across two
+    tables — so they are refused rather than paired up."""
     merged = {
         ConfigSection.MODELS: {"standard": "s", "standard_api_key": "t", "standard_api_base": "tb"},
         ConfigSection.GENERATION: {"label_api_base": "sb"},
     }
-    assert _resolve(merged, Tier.STANDARD, "label_") == Model("s", api_key="t", api_base="sb")
+    with pytest.raises(ModelsConfigInvalid, match=r"'generation\.label_model' is not"):
+        _resolve(merged, Tier.STANDARD, "label_")
     merged[ConfigSection.GENERATION] = {"label_api_key_env": "SEC"}
-    assert _resolve(merged, Tier.STANDARD, "label_") == Model("s", api_key_env="SEC", api_base="tb")
+    with pytest.raises(ModelsConfigInvalid, match=r"'generation\.label_model' is not"):
+        _resolve(merged, Tier.STANDARD, "label_")
 
 
-def test_section_model_takes_its_providers_key() -> None:
+def test_section_takes_the_tier_model_whole() -> None:
+    merged = {
+        ConfigSection.MODELS: {"standard": "s", "standard_api_key": "t", "standard_api_base": "tb"},
+        ConfigSection.GENERATION: {},
+    }
+    assert _resolve(merged, Tier.STANDARD, "label_") == Model("s", api_key="t", api_base="tb")
+
+
+def test_section_model_takes_no_provider_key() -> None:
     merged = {
         ConfigSection.MODELS: {"openai_api_key": "oai", "anthropic_api_key": "ant"},
         ConfigSection.GENERATION: {"model": "openai/gpt", "label_model": "ollama/llama"},
     }
-    assert _resolve(merged) == Model("openai/gpt", api_key="oai")
+    assert _resolve(merged) == Model("openai/gpt")
     assert _resolve(merged, prefix="label_") == Model("ollama/llama")
+
+
+def test_section_model_behind_a_custom_endpoint_gets_no_provider_key() -> None:
+    """The leak this rule exists for: `openai/llama3` at a vLLM `api_base` is a
+    third-party server, and `openai_api_key` must not be sent to it."""
+    merged = {
+        ConfigSection.MODELS: {"openai_api_key": "sk-real-openai"},
+        ConfigSection.CLASSIFICATION: {
+            "model": "openai/llama3",
+            "api_base": "http://vllm.internal:8000",
+        },
+    }
+    rm = resolve_tiered_model(
+        merged,
+        section_name=ConfigSection.CLASSIFICATION,
+        tier=Tier.LIGHT,
+        invalid=ModelsConfigInvalid,
+        missing=ModelsConfigInvalid,
+    )
+    assert rm == Model("openai/llama3", api_base="http://vllm.internal:8000")
+
+
+def test_malformed_models_table_does_not_break_a_section_that_names_its_model() -> None:
+    """A section that names its model never consults [models], so a bad tier table
+    is not that task's problem."""
+    merged = {
+        ConfigSection.MODELS: {"family": "nope"},
+        ConfigSection.GENERATION: {"model": "openai/gpt"},
+    }
+    assert _resolve(merged) == Model("openai/gpt")
 
 
 def test_malformed_section_credentials_are_the_sections_error() -> None:
     merged = {ConfigSection.GENERATION: {"model": "m", "api_key": "", "api_key_env": None}}
     with pytest.raises(ModelsConfigInvalid, match=r"'generation\.api_key' must be a non-empty"):
         _resolve(merged)
+
+
+def test_normalize_rejects_a_tier_credential_without_its_tier_in_the_layer() -> None:
+    with pytest.raises(ModelsConfigInvalid, match=r"'models\.light' is not in this config"):
+        normalize_models_layer({"light_api_key": "k"})
+    # `family` sets the tier in this layer, so the key has its model.
+    out = normalize_models_layer({"family": "anthropic", "light_api_key": "k"})
+    assert out["light_api_key"] == "k"
+
+
+def test_normalize_leaves_an_unknown_family_for_load_to_report() -> None:
+    """A misspelled family with a tier key is the family's error, not the key's."""
+    layer = {"family": "antropic", "light_api_key": "k"}
+    assert normalize_models_layer(layer) == layer
+    with pytest.raises(ModelsConfigInvalid, match=r"'models\.family' must be one of"):
+        load_models_config(_merged(layer))
+
+
+def test_normalize_rejects_a_section_credential_without_its_model_in_the_layer() -> None:
+    from dgml_core.errors import GroundedConfigInvalid
+    from dgml_core.models_config import normalize_task_layer
+
+    with pytest.raises(GroundedConfigInvalid, match=r"'grounded\.values_model' is not in this"):
+        normalize_task_layer({"values_api_key_env": "K"}, ConfigSection.GROUNDED)
+    out = normalize_task_layer(
+        {"values_model": "m", "values_api_key_env": "K"}, ConfigSection.GROUNDED
+    )
+    assert out["values_api_key_env"] == "K" and out["values_api_base"] is None
+
+
+def test_provider_keys_are_consumed_and_dropped_by_the_layer() -> None:
+    out = normalize_models_layer({"family": "anthropic", "anthropic_api_key": "ant"})
+    assert "anthropic_api_key" not in out
+    assert out["advanced_api_key"] == "ant"

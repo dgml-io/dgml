@@ -1332,11 +1332,14 @@ a generated document tree the extraction is added alongside it
 `docset add-file` (the schema and the assignment can be set in either order; only
 this command needs both in place).
 
-`--values-model` overrides `grounded.values_model` for this call and resolves
-credentials as if the model were set in config: `grounded.values_api_key` /
-`values_api_key_env` / `values_api_base` apply if set, and nothing from the
-`advanced` tier carries over to the new model. `--schema-model` on
-`generate-schema` works the same way.
+`--values-model` overrides `grounded.values_model` for this call. A model's
+credentials move with it, so nothing configured carries over to the override:
+not `grounded.values_api_key` / `values_api_key_env` / `values_api_base`, and
+nothing from the `advanced` tier. There is no flag for credentials; the override
+reads LiteLLM's per-provider env var (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`OPENAI_API_KEY`, …). To run a model with a configured key or a custom endpoint,
+set it in `[grounded]` instead. `--schema-model` on `generate-schema` works the
+same way.
 
 `--values-effort` overrides `grounded.values_reasoning_effort` for this call:
 `none`, `minimal`, `low`, `medium` (the default), `high`, `xhigh`, or `default`

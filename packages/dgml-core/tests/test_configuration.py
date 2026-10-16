@@ -98,11 +98,12 @@ def test_every_section_renders_its_loader_keys() -> None:
         clustering=Clustering({"scenario": {"pooling_pages": 2}}),
     )
     assert cfg.sections == {
+        # `anthropic_api_key` is consumed by `build()`, not kept: it is written onto
+        # tiers of its provider that lack a key, and `advanced` has its own.
         ConfigSection.MODELS: {
             "advanced": "a/m",
             "advanced_api_key": "ak",
             "advanced_api_base": "https://a",
-            "anthropic_api_key": "k",
         },
         ConfigSection.GROUNDED: {
             "schema_model": "s",
@@ -189,13 +190,14 @@ def test_section_key_wins_over_tier_and_provider_keys() -> None:
     assert _resolve(cfg).api_key == "task"
 
 
-def test_provider_key_reaches_a_section_model_of_that_provider_only() -> None:
+def test_section_models_never_take_a_provider_key() -> None:
+    """A task's `Model` is one group. The provider key on `Models` serves the tiers
+    `Models` sets — not a section's model, even one of that very provider."""
     cfg = _build(
         models=Models(family="anthropic", anthropic_api_key="ant"),
         grounded=Grounded(schema_model=Model("anthropic/y"), values_model=Model("openai/gpt-4o")),
     )
-    assert _resolve(cfg, Tier.EXPERT, "schema_") == Model("anthropic/y", api_key="ant")
-    # Another provider's model never gets the Anthropic key: litellm reads OPENAI_API_KEY.
+    assert _resolve(cfg, Tier.EXPERT, "schema_") == Model("anthropic/y")
     assert _resolve(cfg) == Model("openai/gpt-4o")
 
 

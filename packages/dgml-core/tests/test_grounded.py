@@ -295,8 +295,9 @@ def test_load_config_section_overrides_tier(workspace: Workspace) -> None:
 
 
 def test_load_config_call_override_resolves_like_section(workspace: Workspace) -> None:
-    # A per-call override resolves as if written in [grounded]: the section's
-    # own credentials apply to it, and it wins over both the section and the tier.
+    # A per-call override is a layer above [grounded]: it wins over the section and
+    # the tier, and brings no credentials of its own — the section's key and
+    # endpoint were written beside `openai/gpt-5` and must not follow another model.
     from .conftest import write_config
 
     write_config(
@@ -314,8 +315,8 @@ def test_load_config_call_override_resolves_like_section(workspace: Workspace) -
         workspace, values_model="anthropic/claude-sonnet-5", schema_model="openai/gpt-5.4"
     )
     assert config.values_model == "anthropic/claude-sonnet-5"
-    assert (config.values_api_key, config.values_api_key_env) == (None, "MY_KEY")
-    assert config.values_api_base == "https://proxy.example"
+    assert (config.values_api_key, config.values_api_key_env) == (None, None)
+    assert config.values_api_base is None
     assert config.schema_model == "openai/gpt-5.4"
     assert (config.schema_api_key, config.schema_api_key_env, config.schema_api_base) == (
         None,
@@ -358,8 +359,9 @@ def test_load_config_defaults(workspace: Workspace) -> None:
 
 
 def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> None:
-    # Tier credentials belong to the tier's model: an override to another
-    # provider takes that provider's key and no api_base, never the tier's.
+    # Tier credentials belong to the tier's model: an override to another model
+    # takes nothing from the tier — not its key, not its api_base — and the
+    # provider key on [models] serves tiers, never an override.
     from .conftest import write_config
 
     write_config(
@@ -379,7 +381,7 @@ def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> No
     config = load_grounded_config(
         workspace, values_model="anthropic/claude-sonnet-5", schema_model="openai/gpt-5.4"
     )
-    assert (config.values_api_key, config.values_api_key_env) == ("sk-ant", None)
+    assert (config.values_api_key, config.values_api_key_env) == (None, None)
     assert config.values_api_base is None
     assert (config.schema_api_key, config.schema_api_key_env, config.schema_api_base) == (
         None,
