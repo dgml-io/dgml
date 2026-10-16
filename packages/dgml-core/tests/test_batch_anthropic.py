@@ -43,13 +43,21 @@ from dgml_core.batch import (
     resolve_backend,
 )
 from dgml_core.batch.anthropic import BATCH_PRICE_MULTIPLIER, _api_root
-from dgml_core.batch.types import BatchRejected, BatchSubmitUncertain, BatchThrottled
+from dgml_core.batch.types import (
+    BatchNotFound,
+    BatchRejected,
+    BatchSubmitUncertain,
+    BatchThrottled,
+)
 from dgml_core.usage import extract_cost_and_tokens
 from litellm.llms.custom_httpx.http_handler import HTTPHandler
 
 from .conftest import FakeLLMResponse
 
 MODEL = "anthropic/claude-haiku-4-5"
+# Read at import: the autouse ``_api_key`` fixture swaps the env var for a fake
+# key before any test body runs, so the live test must not read it from there.
+_LIVE_KEY = os.environ.get("ANTHROPIC_API_KEY")
 _PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 _TOOLS = [
@@ -745,14 +753,14 @@ def test_registered_for_first_party_anthropic_models() -> None:
 
 
 @pytest.mark.skipif(
-    not os.environ.get("ANTHROPIC_API_KEY") or os.environ["ANTHROPIC_API_KEY"] == "test-key",
+    not _LIVE_KEY or _LIVE_KEY == "test-key",
     reason="live Anthropic smoke test needs a real ANTHROPIC_API_KEY",
 )
 @pytest.mark.allow_network
 def test_live_smoke_round_trip() -> None:  # pragma: no cover - network
     import time
 
-    backend = AnthropicBatchBackend()
+    backend = AnthropicBatchBackend(api_key=_LIVE_KEY)
     kwargs = llm._build_completion_kwargs(
         llm.LLMConfig(model=MODEL, max_tokens=16),
         messages=[{"role": "user", "content": "Reply with the single word: pong"}],
@@ -763,6 +771,9 @@ def test_live_smoke_round_trip() -> None:  # pragma: no cover - network
         assert time.monotonic() < deadline, "batch did not end within 15 minutes"
         time.sleep(10)
     outcomes = dict(backend.results(job))
+    backend.cleanup(job)
+    with pytest.raises(BatchNotFound):
+        backend.poll(job)
     response = outcomes["ping"]
     assert not isinstance(response, BatchItemError), response
     assert "pong" in response.choices[0].message.content.lower()
@@ -794,7 +805,6 @@ def test_failed_submit_does_not_leak_a_stale_body_to_a_reused_id() -> None:
 
 @pytest.mark.parametrize("call", ["poll", "results", "cancel"])
 def test_a_batch_the_provider_no_longer_knows_is_batch_not_found(call: str) -> None:
-    from dgml_core.batch.types import BatchNotFound
 
     backend = AnthropicBatchBackend(
         api_key="test-key",
