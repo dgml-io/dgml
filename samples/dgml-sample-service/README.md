@@ -97,7 +97,7 @@ Everything goes through public `dgml_core` calls:
 | Generate a schema | `grounded.generate_schema(ws, file_ids, config=load_grounded_config(ws), docset_name=…)` |
 | Extract / re-extract | `extract_file(ws, docset_id, file_id)` |
 | A file's docsets | `DocSetStore(ws).docsets_for_file(file_id)` |
-| Read the pair's DGML and values | the `*.dgml.xml` blob under `layout.docset_pair_prefix(…)`, projected with `extraction_xml.dgml_xml_to_values` (as `dgml extraction get-values` does) |
+| Read the pair's DGML and values | `read_dgml(ws, docset_id, file_id)` (the full `.dgml.xml`) and `get_extracted_values(ws, docset_id, file_id)` — the same calls `dgml extraction get-values` makes |
 
 The workspace `Configuration` built from an organisation's settings:
 

@@ -201,6 +201,7 @@ class Grounded:
     values_model: Model | None = None
     max_tool_iters: int | None = None
     values_reasoning_effort: str | None = None
+    locations_reasoning_effort: str | None = None
 
     def table(self) -> dict[str, Any]:
         return _table(self)
@@ -289,12 +290,15 @@ class Conversion:
 @dataclass(frozen=True)
 class Generation:
     """``[generation]``: transcription (``model``) and labeling (``label_model``), both
-    standard tier by default, each with its own credentials. Reads
-    ``dgml_core.generation.config.load_generation_config``."""
+    standard tier by default, each with its own credentials, and ``batch`` (run
+    ``docset generate`` through the provider's batch API). Reads
+    ``dgml_core.generation.config.load_generation_config`` and
+    ``load_generation_batch``."""
 
     model: Model | None = None
     label_model: Model | None = None
     thinking: str | None = None
+    batch: bool | None = None
 
     def table(self) -> dict[str, Any]:
         return _table(self)

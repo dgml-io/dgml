@@ -73,11 +73,11 @@ class LLMAdjudicator:
         config: ClassificationConfig,
         *,
         attempts: int = 2,
-        debug: bool = False,
+        record_usage: bool = False,
     ) -> None:
         self.config = config
         self.attempts = max(1, attempts)
-        self.debug = debug
+        self.record_usage = record_usage
 
     # ── Adjudicator protocol ─────────────────────────────────────────────
     def __call__(
@@ -206,7 +206,7 @@ class LLMAdjudicator:
             # `classification.api_base` for consolidation alone.
             api_base=self.config.api_base,
             max_tokens=None,
-            debug=self.debug,
+            record_usage=self.record_usage,
             operation=OPERATION_CLUSTER,
             context={"consolidation": doc_ids},
         )

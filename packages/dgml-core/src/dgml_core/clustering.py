@@ -310,7 +310,8 @@ def clustering(
     mode: str = "auto",
     method: str = "auto",
     small_corpus_threshold: int = SMALL_CORPUS_MAX_FILES,
-    debug: bool = False,
+    write_stats: bool = False,
+    record_usage: bool = False,
 ) -> dict[str, Any]:
     """Cluster the unassigned files in ``workspace`` and assign each to a DocSet.
 
@@ -405,6 +406,11 @@ def clustering(
     ``mode`` selects fresh vs incremental clustering; see the module
     docstring. ``"incremental"`` on a workspace with no DocSets raises
     :class:`IncrementalWithoutClusters`.
+
+    ``write_stats`` and ``record_usage`` (both off by default; the CLI sets
+    both under ``--debug``) are forwarded to the auto-extraction that
+    assignment to a schema-bearing DocSet triggers, and ``record_usage`` also
+    to the clustering and naming LLM calls.
     """
     if mode not in CLUSTER_MODES:
         raise ClusteringConfigInvalid(
@@ -436,7 +442,7 @@ def clustering(
         mode=mode,
         method=method,
         small_corpus_threshold=small_corpus_threshold,
-        debug=debug,
+        record_usage=record_usage,
     )
     clusters = internal.clusters
 
@@ -460,7 +466,11 @@ def clustering(
     for file_id, cluster_name in clusters.items():
         if cluster_name in name_to_id:
             extraction_block = add_file_and_extract(
-                workspace, name_to_id[cluster_name], file_id, write_stats=debug, debug=debug
+                workspace,
+                name_to_id[cluster_name],
+                file_id,
+                write_stats=write_stats,
+                record_usage=record_usage,
             )
             assignments[file_id] = {
                 "docset": cluster_name,
@@ -513,7 +523,7 @@ def clustering(
                 sample = cluster_files[:MAX_FILES_PER_CLUSTER_NAMING]
                 try:
                     decision = propose_new_docset_for_files(
-                        workspace, sample, config=classification_config, debug=debug
+                        workspace, sample, config=classification_config, record_usage=record_usage
                     )
                 except DgmlError:
                     failed_file_ids.extend(cluster_files)
@@ -586,7 +596,7 @@ def clustering_internal(
     mode: str = "auto",
     method: str = "auto",
     small_corpus_threshold: int = SMALL_CORPUS_MAX_FILES,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> _InternalResult:
     """Cluster every unassigned file into a cluster name.
 
@@ -694,7 +704,7 @@ def clustering_internal(
             proto_docsets=proto_docsets,
             known_categories=known_categories,
             effective_mode=effective_mode,
-            debug=debug,
+            record_usage=record_usage,
             retry_on_embedding=method == "auto",
         )
         # ``None`` only under ``auto``, and only for a call that failed after it
@@ -776,7 +786,7 @@ def clustering_internal(
                 overrides=overrides,
                 cache_dir=workspace.embedding_cache_dir,
                 classification_config=_adjudication_config(workspace),
-                debug=debug,
+                record_usage=record_usage,
             )
         else:
             detailed = run_clustering_detailed(
@@ -785,7 +795,7 @@ def clustering_internal(
                 overrides=overrides,
                 cache_dir=workspace.embedding_cache_dir,
                 classification_config=_adjudication_config(workspace),
-                debug=debug,
+                record_usage=record_usage,
             )
 
     # Split off the noise bucket before it can pass for a cluster name. The
@@ -963,7 +973,7 @@ def _llm_cluster_internal(
     proto_docsets: list[Any],
     known_categories: list[str],
     effective_mode: str,
-    debug: bool,
+    record_usage: bool,
     retry_on_embedding: bool = False,
 ) -> _InternalResult | None:
     """Cluster ``usable`` files with the vision-LLM partitioner.
@@ -997,7 +1007,7 @@ def _llm_cluster_internal(
     ccfg = load_classification_config(workspace)
     try:
         result = llm_cluster_files(
-            workspace, usable, config=ccfg, docsets=proto_docsets, debug=debug
+            workspace, usable, config=ccfg, docsets=proto_docsets, record_usage=record_usage
         )
     except ClassificationFailed:
         if retry_on_embedding:

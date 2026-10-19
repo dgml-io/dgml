@@ -112,7 +112,9 @@ class ChainStore:
 
     def _save(self) -> None:
         if self.config_path is None:
-            raise ValueError("no chain-config path set; cannot persist custom chains")
+            raise ValueError(
+                "no chain-config path set, so custom chains cannot be persisted: pass config_path"
+            )
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {name: cfg.to_json() for name, cfg in sorted(self._custom.items())}
         self.config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

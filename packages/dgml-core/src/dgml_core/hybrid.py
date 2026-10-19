@@ -174,7 +174,7 @@ def extract_text_hybrid(
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
     dpi: int = DEFAULT_DPI,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> ExtractDigitalResult:
     """Run digital extraction then OCR and merge the per-page results.
 
@@ -233,7 +233,7 @@ def extract_text_hybrid(
             raster_pages=raster_pages,
             text_extraction_config=text_extraction_config,
             workspace=workspace,
-            debug=debug,
+            record_usage=record_usage,
         )
 
 
@@ -246,7 +246,7 @@ def _merge_into(
     raster_pages: set[int] | None = None,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> ExtractDigitalResult:
     """Merge per-page JSONs from ``digital_dir`` and ``ocr_dir`` into ``output_dir``."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -300,7 +300,7 @@ def _merge_into(
             raster_page=page_num in (raster_pages or set()),
             text_extraction_config=text_extraction_config,
             workspace=workspace,
-            debug=debug,
+            record_usage=record_usage,
         )
 
         _write_page_json(output_dir, page_num, file_id, width, height, merged, rotation=rotation)
@@ -325,7 +325,7 @@ def _merge_words(
     raster_page: bool = False,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply the merge rules described in the module docstring.
 
@@ -375,7 +375,7 @@ def _merge_words(
                 page_num=page_num,
                 config=text_extraction_config,
                 workspace=workspace,
-                debug=debug,
+                record_usage=record_usage,
             )
         except Exception as exc:
             # Safety net: per-batch failures are handled (and logged) inside
@@ -582,7 +582,7 @@ def _llm_emit_plan(
     page_num: int,
     config: TextExtractionConfig,
     workspace: Workspace | None,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> dict[int, list[dict[str, Any]]]:
     """Resolve regions with the configured LLM, batched across requests.
 
@@ -650,7 +650,7 @@ def _llm_emit_plan(
                 workspace=workspace,
                 file_id=file_id,
                 page_num=page_num,
-                debug=debug,
+                record_usage=record_usage,
             )
             # Resolve into a fragment first: a malformed entry raises before
             # any of the batch's decisions touch emit_plan, so the heuristic
@@ -758,12 +758,12 @@ def _call_merge_llm(
     workspace: Workspace | None,
     file_id: str,
     page_num: int,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> dict[str, Any]:
     """Send one page's regions to the LLM and return the parsed JSON object.
 
-    The call records its own usage row (gated on ``--debug``) from the context
-    carried on the config.
+    The call records its own usage row (gated on ``record_usage``) from the
+    context carried on the config.
     """
     llm_config = LLMConfig(
         model=config.model,
@@ -772,7 +772,7 @@ def _call_merge_llm(
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         workspace=workspace,
-        debug=debug,
+        record_usage=record_usage,
         operation=OPERATION_HYBRID_MERGE,
         context={"file_id": file_id, "page": page_num},
     )

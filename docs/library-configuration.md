@@ -51,7 +51,15 @@ What this does and does not do:
 - **`root` is optional when every store is remote.** The workspace gets an empty temp dir for
   its local-only paths, removed when the `Workspace` is garbage-collected. The bundled local
   store's data *is* the root, so `open` refuses to go without one for it (`INVALID_ARGUMENT`);
-  pass `root=`, or set `workspace_path` on the store.
+  pass `root=`, or set `workspace_path` on the store — which then *is* the root, not a temp
+  dir beside it (a `root=` that names a different directory is refused). The check is on
+  the resolved class, so an alias or subclass of the local store is held to the same rule.
+  The temp dir is `ws.scratch`, and nothing lasting goes into it: staking a file, or
+  broadcasting a node stake, needs an explicit `output_dir` (`INVALID_ARGUMENT`
+  otherwise; a node dry run writes nothing and needs none) and custom chains need an explicit
+  `config_path` (built-ins work without one). The embedding cache is not lasting output: it
+  lives under the temp dir for as long as the `Workspace` does, so hold the object across
+  runs to reuse it.
 - **`Identity.workspace_id` must be a valid workspace id** (3–40 chars of `[a-z0-9_-]`, starting
   with a letter or digit), the same rule `create_workspace` applies: it becomes a directory
   name, an S3 key prefix and a Mongo collection prefix. Normalize your own ids at the edge.
@@ -74,7 +82,7 @@ then litellm's own env var. See [the `[models]` tiers](storage-layout.md#the-mod
 | Section | TOML table | Notes |
 |---|---|---|
 | `Models(family, light, standard, advanced, expert, anthropic_api_key, google_api_key, openai_api_key)` | `[models]` | `family` expands into the four tiers; an explicit tier (a `Model`) wins. A provider key serves every model of that provider that carries none of its own. |
-| `Grounded(schema_model, values_model, max_tool_iters, values_reasoning_effort)` | `[grounded]` | Extraction (`values_model`, advanced tier) and schema generation (`schema_model`, expert tier). |
+| `Grounded(schema_model, values_model, max_tool_iters, values_reasoning_effort, locations_reasoning_effort)` | `[grounded]` | Extraction (`values_model`, advanced tier) and schema generation (`schema_model`, expert tier). |
 | `Classification(model, max_pages, naming_attempts)` | `[classification]` | Light tier. |
 | `Ocr(provider, max_concurrency, options)` | `[ocr]` | `options` are the provider's own fields, validated by its `parse_config`. |
 | `Pdf(provider)` | `[pdf]` | `ghostscript` (default) or `pypdfium2`. |

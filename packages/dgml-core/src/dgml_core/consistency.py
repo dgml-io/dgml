@@ -109,14 +109,14 @@ def _entity_ids(ws: Workspace, collection: str, blob_prefix: str) -> list[str]:
 
 
 def check_workspace(
-    ws: Workspace, *, retry_errors: bool = False, debug: bool = False
+    ws: Workspace, *, retry_errors: bool = False, record_usage: bool = False
 ) -> CheckReport:
     """Validate the workspace; repair fixable issues where safe.
 
     With ``retry_errors=True``, recorded permanent errors are cleared before
     checking so that previously-failed operations are re-attempted.
     Hybrid re-extraction logs its per-page diagnostics through
-    ``dgml_core.hybrid`` (see :mod:`dgml_core.hybrid`). ``debug`` is
+    ``dgml_core.hybrid`` (see :mod:`dgml_core.hybrid`). ``record_usage`` is
     forwarded so a hybrid LLM merge during re-extraction records its usage
     telemetry (only the hybrid path issues LLM calls).
     """
@@ -128,7 +128,7 @@ def check_workspace(
             ws,
             file_id,
             retry_errors=retry_errors,
-            debug=debug,
+            record_usage=record_usage,
             report=report,
         )
 
@@ -144,7 +144,7 @@ def _check_file(
     file_id: str,
     *,
     retry_errors: bool,
-    debug: bool,
+    record_usage: bool,
     report: CheckReport,
 ) -> None:
     # Scanned pages OCR could not recover leave a full set of page_text files
@@ -301,7 +301,7 @@ def _check_file(
             file_id=file_id,
             text_mode=text_mode,
             dpi=dpi,
-            debug=debug,
+            record_usage=record_usage,
             report=report,
             retry=retry_scanned_pages,
         )
@@ -522,7 +522,7 @@ def _check_text_extraction(
     file_id: str,
     text_mode: str,
     dpi: int,
-    debug: bool,
+    record_usage: bool,
     report: CheckReport,
     retry: bool = False,
 ) -> None:
@@ -560,7 +560,7 @@ def _check_text_extraction(
         return
 
     try:
-        result = _reextract(ws, source_key, file_id, text_mode, dpi=dpi, debug=debug)
+        result = _reextract(ws, source_key, file_id, text_mode, dpi=dpi, record_usage=record_usage)
     except (TextExtractionFailed, OcrFailed, AuthError, DgmlError) as exc:
         append_recorded_error(
             ws,
@@ -624,7 +624,7 @@ def _reextract(
     text_mode: str,
     *,
     dpi: int = DEFAULT_DPI,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> ExtractDigitalResult:
     """Re-extract text for ``file_id`` using whichever mode it was added with.
 
@@ -666,7 +666,7 @@ def _reextract(
                     text_extraction_config=text_extraction_config,
                     workspace=ws,
                     dpi=dpi,
-                    debug=debug,
+                    record_usage=record_usage,
                 )
         result = extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
         # Same per-page OCR fallback as `file add`, so configuring a provider and
@@ -751,39 +751,53 @@ def _check_dgml_xml(ws: Workspace, *, docset_id: str, file_id: str, report: Chec
         except Exception:
             continue
         name = key.rsplit("/", 1)[-1]
-        _check_computed_attribution(
-            xml, docset_id=docset_id, file_id=file_id, name=name, report=report
+        _check_provenance(
+            xml,
+            docset_id=docset_id,
+            file_id=file_id,
+            name=name,
+            report=report,
         )
         _check_semantic_links(xml, docset_id=docset_id, file_id=file_id, name=name, report=report)
 
 
-def _check_computed_attribution(
+def _check_provenance(
     xml: bytes, *, docset_id: str, file_id: str, name: str, report: CheckReport
 ) -> None:
-    """Flag ``dg:origin="computed"`` elements with no ``dg:href``.
-
-    A computed field's value is verifiable only by walking its ``dg:href``
-    sources and recomputing the derivation (spec §13); one with no sources is
-    an unauditable claim — usually the model derived it from document content
-    the schema never extracted."""
-    from .extraction_xml import unattributed_computed_fields
+    """Flag provenance a verifier can't follow (DGML 0.71): ``dg:method``
+    that contradicts the element, ``dg:inputs`` that dangle or loop, and 0.7
+    computed elements that name no sources. A bare value (no boxes, inputs
+    or method) is not flagged here — in the XML it looks the same as one
+    grounding couldn't box; extraction counts the unsupported ones in
+    ``extraction_stats.json``. See
+    :func:`dgml_core.extraction_xml.provenance_issues`."""
+    from .extraction_xml import provenance_issues
 
     try:
-        tags = unattributed_computed_fields(xml)
+        found = provenance_issues(xml)
     except Exception:
         return
-    if tags:
+    by_kind: dict[str, list[str]] = {}
+    for kind, tag, detail in found:
+        by_kind.setdefault(kind, []).append(f"{tag} ({detail})")
+    for kind, entries in sorted(by_kind.items()):
         report.issues.append(
             Issue(
-                kind="computed_field_unattributed",
+                kind=kind,
                 target_type="docset",
                 target_id=docset_id,
-                message=(
-                    f"file '{file_id}' {name}: computed element(s) with no "
-                    f"dg:href sources: {', '.join(sorted(set(tags)))}"
-                ),
+                message=f"file '{file_id}' {name}: {_PROVENANCE_MESSAGES[kind]}: "
+                + ", ".join(sorted(set(entries))),
             )
         )
+
+
+_PROVENANCE_MESSAGES = {
+    "value_unsupported": 'value(s) with dg:origin="computed" that name no sources',
+    "method_misplaced": "dg:method that contradicts the element's other attributes",
+    "inputs_dangling": "dg:inputs target(s) with no element",
+    "inputs_cycle": "element(s) that are their own input",
+}
 
 
 def _check_semantic_links(

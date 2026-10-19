@@ -105,13 +105,25 @@ export interface Location {
   bounding_box: [number, number, number, number];
 }
 
-/** A leaf of the extracted values tree: `{text, value?, locations?}`. */
+/** Printed text a value used that no schema field extracts (DGML 0.71). */
+export interface Evidence {
+  text: string;
+  locations?: Location[];
+}
+
+/**
+ * A leaf of the extracted values tree (DGML 0.71 provenance):
+ * `{text, value?, locations?, inputs?, evidence?, method?}`. `locations` are
+ * where its own text is printed; `inputs` the other values it used (dotted
+ * paths); `method` how a value the page doesn't print was produced.
+ */
 export interface ValueLeaf {
   text: string;
   value?: string;
   locations?: Location[];
-  computed?: boolean;
-  derived_from?: string[];
+  inputs?: string[];
+  evidence?: Evidence[];
+  method?: "calculated" | "inferred" | "defaulted";
 }
 
 export type ValueNode = ValueLeaf | ValueNode[] | { [tag: string]: ValueNode };

@@ -120,7 +120,7 @@ def llm_cluster_files(
     config: ClassificationConfig,
     docsets: list[DocSet] | None = None,
     max_files: int = DEFAULT_MAX_FILES,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> LLMClusteringResult:
     """Cluster ``file_ids`` in one vision-LLM call and return the partition.
 
@@ -196,7 +196,7 @@ def llm_cluster_files(
         # models (temperature is never sent there — see _build_completion_kwargs).
         temperature=0.0,
         workspace=workspace,
-        debug=debug,
+        record_usage=record_usage,
         operation=OPERATION_CLUSTER,
         context={"file_ids": usable},
     )

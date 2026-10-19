@@ -43,6 +43,10 @@ from dgml_core import (
     Workspace,
     layout,
 )
+
+# Aliased: the GET .../dgml route below is itself named ``read_dgml`` (its name is
+# the endpoint's OpenAPI operationId, so it stays).
+from dgml_core import read_dgml as read_dgml_document
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -449,19 +453,18 @@ def _routes(app: FastAPI) -> None:
 
     @app.get("/api/orgs/{org_id}/docsets/{docset_id}/files/{file_id}/dgml")
     def read_dgml(docset_id: str, file_id: str, ws: WorkspaceDep) -> dict[str, Any]:
-        if not DocSetStore(ws).is_assigned(docset_id, file_id):
-            raise HTTPException(404, f"file {file_id!r} is not assigned to docset {docset_id!r}")
+        # An unassigned file raises FileNotFound -> 404 (see _dgml_status).
         return ops.read_pair(ws, docset_id, file_id)
 
     @app.get("/api/orgs/{org_id}/docsets/{docset_id}/files/{file_id}/dgml.xml")
     def download_dgml(docset_id: str, file_id: str, ws: WorkspaceDep) -> Response:
-        key = ops.dgml_xml_key(ws, docset_id, file_id)
-        if key is None:
-            raise HTTPException(404, "no DGML for this file in this docset yet")
+        # The full DGML (tree and extraction). Unassigned -> FileNotFound, nothing
+        # generated or extracted yet -> DgmlNotFound; both are 404s.
+        doc = read_dgml_document(ws, docset_id, file_id)
         return Response(
-            ws.blobs.get_blob(key),
+            doc.xml,
             media_type="application/xml",
-            headers={"Content-Disposition": f'attachment; filename="{Path(key).name}"'},
+            headers={"Content-Disposition": f'attachment; filename="{Path(doc.key).name}"'},
         )
 
     # ---- files ----

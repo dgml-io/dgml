@@ -76,6 +76,13 @@ class Workspace:
     root, so ``open`` refuses to go without one for it). Excluded from ``__eq__`` for the
     same reason the store is: a workspace's identity is where it is, not who opened it.
 
+    ``scratch`` marks that generated root: it is removed with this object, so nothing
+    lasting may be written under it. Anything that would — a staking bundle, custom
+    chains — checks the flag and refuses. Caches may live there (the embedding cache
+    does) and go with it. Paths under a scratch root are valid only while this object
+    is referenced: read off a ``Workspace`` nothing else holds, they point at a
+    directory already removed.
+
     Whichever way it was configured, :attr:`config` is the one
     :class:`~dgml_core.configuration.Configuration` every reader consults.
     """
@@ -84,17 +91,20 @@ class Workspace:
     config_override: Path | None = None
     workspaces_id: str | None = None
     configuration: Configuration | None = field(default=None, compare=False, repr=False)
+    scratch: bool = field(default=False, compare=False)
 
     def __post_init__(self) -> None:
+        from .errors import InvalidArgument
+
         if self.configuration is not None and (
             self.workspaces_id is not None or self.config_override is not None
         ):
-            from .errors import InvalidArgument
-
             raise InvalidArgument(
                 "a workspace configured in memory takes no workspaces_id or "
                 "config_override: the Configuration is its only config source"
             )
+        if self.scratch and self.configuration is None:
+            raise InvalidArgument("only a workspace configured in memory has a scratch root")
 
     @staticmethod
     def scratch_root() -> Path:
@@ -267,28 +277,63 @@ class Workspace:
         warning, exactly as ``create`` does, and a changed ``name`` is just updated."""
         from .errors import ConflictError, InvalidArgument
         from .migrations import stamp_schema_version
-        from .storage_resolve import DEFAULT_STORAGE_PROVIDER
 
         configuration.identity.require_complete()
         ident = configuration.identity
         assert ident.workspace_id and ident.name and ident.organization  # require_complete
-        if root is None:
-            # The local store's data *is* the root; a scratch dir would vanish with
-            # this object. A store told where to live (`workspace_path`) is fine.
-            storage = configuration.storage
-            if any(
-                spec.provider == DEFAULT_STORAGE_PROVIDER and "workspace_path" not in spec.options
-                for spec in (storage.blobs, storage.docs)
-            ):
+        # The local store's data *is* the root, so everything that reads `ws.root`
+        # directly must see the tree the store actually writes:
+        #   1. For each local store, record its `workspace_path`, or refuse right there
+        #      if it has none and no `root=` was given.
+        #   2. Refuse if blobs and docs declared different paths.
+        #   3. If no `root=`, take the declared one (or none); if there is a `root=`,
+        #      refuse when it disagrees with the declared one.
+        #   4. A root is the caller's directory, not ours to remove; none means scratch.
+        # "Local store" is decided on the resolved class, not the provider string — an
+        # alias or a subclass is still the local store. A value the store itself would
+        # reject (blank, relative) is left to it: it fails on first use.
+        from .storage_local import LocalStore
+        from .storage_resolve import _import_store_class
+        from .storage_service import BlobStore, DocStore
+
+        if root is not None:
+            # Resolved as the TOML path resolves its root: a relative one would move
+            # with the working directory, away from where the store wrote.
+            root = root.expanduser().resolve()
+        storage = configuration.storage
+        declared_roots: set[Path] = set()
+        for spec, base in ((storage.blobs, BlobStore), (storage.docs, DocStore)):
+            if not issubclass(_import_store_class(spec.provider, base), LocalStore):
+                continue
+            declared = spec.options.get("workspace_path")
+            if isinstance(declared, str) and declared:
+                declared_roots.add(Path(declared).expanduser().resolve())
+            elif root is None:
                 raise InvalidArgument(
                     "the local store's data is the workspace root: pass root= to "
                     "Workspace.open(configuration=…), or set 'workspace_path' on the store"
                 )
-            ws = cls(root=cls.scratch_root(), configuration=configuration)
+        if len(declared_roots) > 1:
+            raise InvalidArgument(
+                "blobs and docs name different 'workspace_path' values; a workspace has one root"
+            )
+        if root is None:
+            root = next(iter(declared_roots), None)
+        elif declared_roots and root not in declared_roots:
+            # Exact after resolving: a case-folded compare would accept two different
+            # directories on a case-sensitive filesystem, and probing the disk is not
+            # reliable everywhere. A caller passing both simply spells them the same.
+            raise InvalidArgument(
+                f"root= ({root}) and the local store's 'workspace_path' "
+                f"({next(iter(declared_roots))}) disagree; a workspace has one root"
+            )
+        if root is not None:
+            # The caller's directory: it is the root, and it is not ours to remove.
+            ws = cls(root=root, configuration=configuration)
+        else:
+            ws = cls(root=cls.scratch_root(), configuration=configuration, scratch=True)
             # Ours, not the caller's: removed with the workspace, not left per open.
             weakref.finalize(ws, shutil.rmtree, ws.root, ignore_errors=True)
-        else:
-            ws = cls(root=root, configuration=configuration)
         meta = ws.read_meta()
         if not meta:
             ws.write_meta(
@@ -404,7 +449,7 @@ class Workspace:
     def embedding_cache_dir(self) -> Path:
         """Where clustering encoders cache content-hashed embeddings so
         re-embedding unchanged files across runs is cheap. Per-workspace and
-        safe to delete."""
+        safe to delete; on a scratch root it lives as long as this object does."""
         return self.root / layout.CACHE_DIR / layout.EMBEDDINGS_DIR
 
     # Naming workspace artifacts is :mod:`dgml_core.layout`'s job, not this

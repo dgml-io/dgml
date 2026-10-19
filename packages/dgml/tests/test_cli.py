@@ -2676,8 +2676,9 @@ def test_docset_generate_cache_dir_and_debug_threading(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The cache dir is always set (it holds functional files the next run
-    reloads); --debug only flips ConvertOptions.debug, which gates the
-    debug-only artifacts. An explicit --cache-dir always wins."""
+    reloads); --debug flips ConvertOptions.debug, which gates the debug-only
+    artifacts, and ConvertOptions.record_usage, which gates the usage rows.
+    An explicit --cache-dir always wins."""
     ws = tmp_path / "ws"
     did = _init_with_docset(ws, capsys)
     main(_ws_args(ws) + ["file", "add", str(text_pdf)])
@@ -2712,10 +2713,12 @@ def test_docset_generate_cache_dir_and_debug_threading(
     default_opts = _run([], [])
     assert default_opts.cache_dir == cache_dir
     assert default_opts.debug is False
+    assert default_opts.record_usage is False
     # --debug: same cache dir, debug on (debug-only files also written).
     debug_opts = _run(["--debug"], [])
     assert debug_opts.cache_dir == cache_dir
     assert debug_opts.debug is True
+    assert debug_opts.record_usage is True
     # Explicit --cache-dir always wins.
     explicit = tmp_path / "mycache"
     assert _run([], ["--cache-dir", str(explicit)]).cache_dir == explicit
@@ -5530,8 +5533,18 @@ def test_extraction_get_guidance_missing(
     assert _read_stderr(capsys)["error"]["code"] == "GUIDANCE_NOT_FOUND"
 
 
+def _assigned_file(ws: Path, ds_id: str, pdf: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    """Add *pdf* and assign it to *ds_id* (before any schema is set, so the
+    assignment doesn't fire auto-extraction). Returns the file id."""
+    main(_ws_args(ws) + ["file", "add", str(pdf)])
+    fid: str = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", ds_id])
+    capsys.readouterr()
+    return fid
+
+
 def test_extraction_get_values_json_and_xml(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """get-values projects the dg:extraction in the core dgml file to values
     JSON (default) or returns the raw XML with --as xml."""
@@ -5542,6 +5555,7 @@ def test_extraction_get_values_json_and_xml(
     _init_ws(ws)
     capsys.readouterr()
     ds_id = _new_docset(ws, capsys)
+    fid = _assigned_file(ws, ds_id, sample_pdf, capsys)
 
     schema_file = tmp_path / "schema.rnc"
     schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
@@ -5549,7 +5563,7 @@ def test_extraction_get_values_json_and_xml(
     capsys.readouterr()
 
     # Drop a core <stem>.dgml.xml (with a dg:extraction element) where
-    # extraction would have written it — get-values globs *.dgml.xml.
+    # extraction would have written it.
     wsx = Workspace(root=ws)
     vocab = parse_rnc(_RNC_SCHEMA)
     values = {
@@ -5559,18 +5573,18 @@ def test_extraction_get_values_json_and_xml(
         }
     }
     wsx.blobs.put_blob(
-        layout.dgml_xml_key(ds_id, "fileabc", "doc"),
+        layout.dgml_xml_key(ds_id, fid, sample_pdf.stem),
         standalone_extraction_doc(values, vocab=vocab).encode(),
     )
 
-    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "fileabc"])
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["format"] == "values"
     assert payload["values"]["VendorName"]["text"] == "Acme"
     assert payload["values"]["VendorName"]["locations"][0]["bounding_box"] == [10, 20, 30, 40]
 
-    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "fileabc", "--as", "xml"])
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid, "--as", "xml"])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["format"] == "xml"
@@ -5578,16 +5592,63 @@ def test_extraction_get_values_json_and_xml(
     assert "<docset:VendorName" in payload["xml"]
 
 
+@pytest.mark.parametrize("as_form", ["values", "xml"])
 def test_extraction_get_values_not_found(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str], as_form: str
+) -> None:
+    """Assigned with nothing generated or extracted → DGML_NOT_FOUND; a generated
+    tree with no dg:extraction → VALUES_NOT_FOUND. Same in both output forms."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    ds_id = _new_docset(ws, capsys)
+    fid = _assigned_file(ws, ds_id, sample_pdf, capsys)
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid, "--as", as_form])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "DGML_NOT_FOUND"
+
+    Workspace(root=ws).blobs.put_blob(
+        layout.dgml_xml_key(ds_id, fid, sample_pdf.stem),
+        b'<dg:chunk xmlns:dg="http://dgml.io/ns/dg#" xmlns:docset="http://dgml.io/ns/dgml/t">'
+        b"<docset:Header>tree only</docset:Header></dg:chunk>",
+    )
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid, "--as", as_form])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "VALUES_NOT_FOUND"
+
+
+def test_extraction_get_values_unassigned_file(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file that exists but isn't in the docset is FILE_NOT_FOUND, not
+    VALUES_NOT_FOUND — and an unknown id is too."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    ds_id = _new_docset(ws, capsys)
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid])
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "FILE_NOT_FOUND"
+    assert "not assigned" in err["message"]
+
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "nofile"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "FILE_NOT_FOUND"
+
+
+def test_extraction_get_values_unknown_docset(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
-    ds_id = _new_docset(ws, capsys)
-    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "nofile"])
+    rc = main(_ws_args(ws) + ["extraction", "get-values", "nodocset", "nofile"])
     assert rc == 1
-    assert _read_stderr(capsys)["error"]["code"] == "VALUES_NOT_FOUND"
+    assert _read_stderr(capsys)["error"]["code"] == "DOCSET_NOT_FOUND"
 
 
 def test_extraction_generate_schema_no_files(
@@ -5767,6 +5828,53 @@ def test_extraction_extract_values_effort_overrides_config(
     assert "reasoning_effort" not in _extract("--values-effort", "default")
 
 
+def test_extraction_extract_locations_effort_overrides_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--locations-effort` replaces `grounded.locations_reasoning_effort` for
+    one call. The flag reaches the config the extraction runs with; the
+    grounding call itself is pinned in the core tests."""
+    from dgml_core import grounded
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    seen: list[grounded.GroundedConfig] = []
+
+    def fake_extract(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["config"])
+        raise SystemExit(0)
+
+    with patch("dgml_core.grounded.extract_values", side_effect=fake_extract):
+        for flags in ([], ["--locations-effort", "low"], ["--locations-effort", "default"]):
+            with pytest.raises(SystemExit):
+                main(_ws_args(ws) + ["extraction", "extract", ds_id, "somefile", *flags])
+            capsys.readouterr()
+    assert [c.locations_reasoning_effort for c in seen] == ["high", "low", None]
+
+
+def test_extraction_extract_refuses_unknown_locations_effort(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    with patch("litellm.completion") as mock_completion:
+        rc = main(
+            _ws_args(ws)
+            + ["extraction", "extract", ds_id, "somefile", "--locations-effort", "turbo"]
+        )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "GROUNDED_CONFIG_INVALID"
+    assert "--locations-effort" in err["message"]
+    mock_completion.assert_not_called()
+
+
 def test_extraction_extract_refuses_unknown_values_effort(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -5790,9 +5898,10 @@ def test_extraction_extract_refuses_unknown_values_effort(
 def test_extraction_extract_records_usage_under_debug(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`extraction extract --debug` forwards debug into extract_values, so the
-    LLM cost/token row lands in usage.jsonl — same gating as every other LLM
-    op and the auto-extract path. Without --debug, no row is written."""
+    """`extraction extract --debug` turns on usage recording and the stats
+    document in extract_values, so the LLM cost/token row lands in usage.jsonl
+    and extraction_stats.json is stored — same gating as every other LLM op and
+    the auto-extract path. Without --debug, neither is written."""
     from dgml_core.usage import read_events
 
     ws = tmp_path / "ws"
@@ -5816,13 +5925,15 @@ def test_extraction_extract_records_usage_under_debug(
     response._hidden_params = {"response_cost": 0.004}
     response.usage = SimpleNamespace(prompt_tokens=300, completion_tokens=40, total_tokens=340)
 
-    # Without --debug: no usage row.
+    # Without --debug: no usage row and no stats document.
     fid = _fresh_file()
     with patch("litellm.completion", return_value=response):
         assert main(_ws_args(ws) + ["extraction", "extract", ds_id, fid]) == 0
     assert read_events(Workspace(root=ws)) == []
+    assert Workspace(root=ws).docs.get_doc("extraction_stats", f"{ds_id}/{fid}") is None
 
-    # With --debug (global flag, precedes the subcommand): one extract_values row.
+    # With --debug (global flag, precedes the subcommand): one extract_values
+    # row, and the stats document.
     _wsx = Workspace(root=ws)
     _wsx.blobs.delete_blob(layout.dgml_xml_key(ds_id, fid, "doc"))  # re-extract cleanly
     with patch("litellm.completion", return_value=response):
@@ -5831,6 +5942,8 @@ def test_extraction_extract_records_usage_under_debug(
     assert len(events) == 1
     assert events[0]["operation"] == "extract_values"
     assert events[0]["cost_usd"] == 0.004
+    stats = Workspace(root=ws).docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "ok"
 
 
 def test_docset_add_file_auto_extracts_when_schema_set(
@@ -5850,9 +5963,12 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     capsys.readouterr()
     _seed_file_dir(ws, "fileauto0001", pages=1)
 
-    # Empty locations → phase 2 has nothing to match, no phase-3 call needed.
-    values = {"VendorName": {"text": "Acme", "locations": []}}
+    # An unprinted (defaulted) value → phase 2 has nothing to match, no
+    # phase-3 call needed. (A bare value with no box and no method would be
+    # dropped as unverifiable.)
+    values = {"VendorName": {"text": "Acme", "method": "defaulted"}}
     response = _tool_response("submit_values", {"values": values})
+    response._hidden_params = {"response_cost": 0.03}
     with patch("litellm.completion", return_value=response):
         rc = main(_ws_args(ws) + ["docset", "add-file", "fileauto0001", "--docset", ds_id])
     assert rc == 0
@@ -5861,6 +5977,17 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     assert payload["extraction"]["performed"] is True
     assert payload["extraction"]["error"] is None
     assert payload["extraction"]["model"] == "gemini/gemini-2.5-pro"
+    # The run's cost is reported without --debug, so no usage.jsonl is needed.
+    assert payload["extraction"]["usage"]["cost_usd"] == 0.03
+    assert set(payload["extraction"]["usage"]) == {
+        "cost_usd",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "duration_s",
+    }
 
     _wsx = Workspace(root=ws)
     xml = _wsx.blobs.get_blob(layout.dgml_xml_key(ds_id, "fileauto0001", "doc")).decode("utf-8")
@@ -5908,9 +6035,39 @@ def test_docset_add_file_extraction_failure_is_soft(
     payload = _read_stdout(capsys)
     assert payload["assigned"] is True
     assert "GROUNDED_CONFIG_MISSING" in payload["extraction"]["error"]
+    # Nothing was spent before the config error.
+    assert payload["extraction"]["usage"] is None
     # Assignment is on disk despite the failed extraction.
     main(_ws_args(ws) + ["docset", "list-files", ds_id])
     assert "fileauto0003" in _read_stdout(capsys)["file_ids"]
+
+
+def test_docset_add_file_failed_extraction_reports_what_it_spent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A soft extraction failure after an LLM call still reports that call's
+    cost in `extraction.usage`, without --debug."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    schema_file = tmp_path / "schema.rnc"
+    schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
+    main(_ws_args(ws) + ["extraction", "set-schema", ds_id, "--schema-file", str(schema_file)])
+    capsys.readouterr()
+    _seed_file_dir(ws, "fileauto0004", pages=1)
+
+    # A tree that fits no schema root is refused after the call was billed.
+    bogus = {"Bogus": {"text": "x", "locations": [{"page_number": 1}]}}
+    response = _tool_response("submit_values", {"values": bogus})
+    response._hidden_params = {"response_cost": 0.05}
+    with patch("litellm.completion", return_value=response):
+        rc = main(_ws_args(ws) + ["docset", "add-file", "fileauto0004", "--docset", ds_id])
+    assert rc == 0
+    extraction = _read_stdout(capsys)["extraction"]
+    assert "VALUES_EXTRACTION_FAILED" in extraction["error"]
+    assert extraction["usage"]["cost_usd"] == 0.05
 
 
 @needs_gs
@@ -6062,12 +6219,28 @@ def test_link_usage_is_recorded_per_document(
 
     both_proposing = threading.Barrier(2, timeout=10)
 
-    def fake_call(config: Any, **kwargs: Any) -> str:
-        if "reviewer" in str(kwargs["system_prompt"]):
-            return json.dumps({"verdicts": [{"i": 0, "keep": True}]})
-        both_proposing.wait()  # exactly one propose call per document
-        return json.dumps(
-            {"links": [{"subject": "e0001", "object": "e0002", "predicate": "references"}]}
+    from litellm import ModelResponse
+
+    # Mocked at litellm, below every call path the link pass may take (it
+    # drives request steps now, so a mock of llm.call_continued would let the
+    # pass reach the real provider unnoticed).
+    def fake_completion(**kwargs: Any) -> Any:
+        reply: dict[str, Any]
+        if "reviewer" in json.dumps(kwargs["messages"]):
+            reply = {"verdicts": [{"i": 0, "keep": True}]}
+        else:
+            both_proposing.wait()  # exactly one propose call per document
+            reply = {"links": [{"subject": "e0001", "object": "e0002", "predicate": "references"}]}
+        return ModelResponse(
+            choices=[
+                {
+                    "message": {"role": "assistant", "content": json.dumps(reply)},
+                    "finish_reason": "stop",
+                    "index": 0,
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            model="fake/model",
         )
 
     def fake_convert(paths: Any, *, options: Any, on_output: Any, **_kw: Any) -> dict[str, str]:
@@ -6079,7 +6252,7 @@ def test_link_usage_is_recorded_per_document(
 
     with (
         patch("dgml_core.generation.convert_batch", side_effect=fake_convert),
-        patch("dgml_core.llm.call_continued", side_effect=fake_call),
+        patch("litellm.completion", side_effect=fake_completion),
     ):
         rc = main(_ws_args(ws) + ["--debug", "docset", "generate", did, "--no-coverage"])
     assert rc == 0
@@ -6087,6 +6260,9 @@ def test_link_usage_is_recorded_per_document(
     rows = [e for e in read_events(Workspace(root=ws)) if e["operation"] == "links"]
     assert len(rows) == 2  # one per document, not one covering both
     assert {r["context"]["doc"] for r in rows} == {"one.pdf", "two.pdf"}
+    # Each row is its own document's answered pass, not a failed call's row.
+    assert [r["outcome"] for r in rows] == ["ok", "ok"]
+    assert all(r["total_tokens"] > 0 for r in rows)
 
 
 @needs_gs

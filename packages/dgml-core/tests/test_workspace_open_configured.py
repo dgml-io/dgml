@@ -31,6 +31,9 @@ from dgml_core.configuration import (
 from dgml_core.errors import ConflictError, InvalidArgument
 from dgml_core.migrations import WORKSPACE_SCHEMA_VERSION, workspace_schema_version
 from dgml_core.storage import user_config_path
+from dgml_core.storage_local import LocalStore
+
+from .conftest import register_provider, scratch_configuration
 
 _LOCAL = Storage.combined(ProviderSpec("dgml_core.storage_local:LocalStore"))
 
@@ -109,10 +112,14 @@ def _pinned(tmp_path: Path) -> Configuration:
     )
 
 
-def test_no_root_means_a_scratch_dir(tmp_path: Path) -> None:
+def test_workspace_path_becomes_the_root(tmp_path: Path) -> None:
+    """A local store told where to live makes that the workspace root — not a scratch
+    dir beside it — so `files_dir` and every other direct reader of `ws.root` look at
+    the tree the store actually writes."""
     ws = Workspace.open(configuration=_pinned(tmp_path))
-    assert ws.root.is_dir() and ws.root.name.startswith("dgml-ws-")
-    assert (tmp_path / "workspace.json").exists()  # the data went where the store was told
+    assert ws.root == tmp_path.resolve()
+    assert ws.files_dir == tmp_path.resolve() / "files"
+    assert (tmp_path / "workspace.json").exists()
 
 
 def test_local_store_without_a_root_is_refused(tmp_path: Path) -> None:
@@ -122,12 +129,13 @@ def test_local_store_without_a_root_is_refused(tmp_path: Path) -> None:
     Workspace.open(configuration=_cfg(), root=tmp_path)  # with a root: fine
 
 
-def test_scratch_dir_goes_with_its_workspace(tmp_path: Path) -> None:
+def test_a_workspace_path_root_is_not_removed_with_the_workspace(tmp_path: Path) -> None:
+    """The caller's directory is the root, and it is not ours to remove."""
     ws = Workspace.open(configuration=_pinned(tmp_path))
     root = ws.root
     del ws
     gc.collect()
-    assert not root.exists()
+    assert root.exists() and (root / "workspace.json").exists()
 
 
 def test_a_callers_root_is_left_alone(tmp_path: Path) -> None:
@@ -170,3 +178,110 @@ def test_writers_refuse(tmp_path: Path) -> None:
         workspace_config.write_identity(ws, name="x")
     with pytest.raises(InvalidArgument, match="never written"):
         workspace_config.reseal(ws)
+
+
+def test_local_store_alias_without_a_root_is_refused() -> None:
+    """The guard decides on the resolved class, not the provider string: another
+    spelling of the same class is still the local store."""
+    alias = Configuration.build(
+        identity=Identity(workspace_id="tenant-1", name="Tenant", organization="TenantOrg"),
+        storage=Storage.combined(ProviderSpec("dgml_core:LocalStore")),
+    )
+    with pytest.raises(InvalidArgument, match=r"pass root=.*or set 'workspace_path'"):
+        Workspace.open(configuration=alias)
+
+
+def test_a_relative_root_is_resolved_at_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ws.root` must not move with the working directory: the store wrote where the
+    caller's path pointed at open time, and every direct reader must keep seeing it."""
+    monkeypatch.chdir(tmp_path)
+    ws = Workspace.open(configuration=_cfg(), root=Path("ws"))
+    assert ws.root == (tmp_path / "ws").resolve()
+    monkeypatch.chdir(tmp_path.parent)
+    assert ws.files_dir == (tmp_path / "ws").resolve() / "files"
+
+
+def test_root_must_agree_with_workspace_path(tmp_path: Path) -> None:
+    """An explicit `root=` beside a `workspace_path` is fine when they are the same
+    directory (however spelled) and refused when they are not: `ws.root` must be the
+    tree the store writes, or every direct reader of it looks at the wrong place."""
+    cfg = _pinned(tmp_path / "ws")
+    ws = Workspace.open(configuration=cfg, root=tmp_path / "ws")
+    assert ws.root == (tmp_path / "ws").resolve()
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "ws")
+    Workspace.open(configuration=cfg, root=link)  # another spelling of the same place
+    with pytest.raises(InvalidArgument, match="disagree"):
+        Workspace.open(configuration=cfg, root=tmp_path / "elsewhere")
+
+
+def test_blobs_and_docs_with_different_workspace_paths_are_refused(tmp_path: Path) -> None:
+    split = Configuration.build(
+        identity=Identity(workspace_id="tenant-1", name="Tenant", organization="TenantOrg"),
+        storage=Storage(
+            blobs=ProviderSpec(
+                "dgml_core.storage_local:LocalStore", {"workspace_path": str(tmp_path / "a")}
+            ),
+            docs=ProviderSpec(
+                "dgml_core.storage_local:LocalStore", {"workspace_path": str(tmp_path / "b")}
+            ),
+        ),
+    )
+    with pytest.raises(InvalidArgument, match="different 'workspace_path'"):
+        Workspace.open(configuration=split)
+
+
+# ---- the scratch-root path: every store remote, no local data at all ------------
+
+
+def test_local_store_subclass_without_a_root_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A subclass is still the local store: its data is still the root."""
+
+    class _Sub(LocalStore):
+        pass
+
+    sub = Configuration.build(
+        identity=Identity(workspace_id="tenant-1", name="Tenant", organization="TenantOrg"),
+        storage=Storage.combined(ProviderSpec(register_provider(monkeypatch, _Sub, "Sub"))),
+    )
+    with pytest.raises(InvalidArgument, match=r"pass root=.*or set 'workspace_path'"):
+        Workspace.open(configuration=sub)
+
+
+def test_scratch_dir_goes_with_its_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With every store remote there is no local data, so the root is a scratch dir
+    that holds nothing and is removed with the object."""
+    ws = Workspace.open(configuration=scratch_configuration(monkeypatch))
+    root = ws.root
+    assert ws.scratch
+    assert root.is_dir() and root.name.startswith("dgml-ws-")
+    assert ws.read_meta()["workspace_id"] == "tenant-1"  # went to the store, not to disk
+    assert list(root.iterdir()) == []
+    del ws
+    gc.collect()
+    assert not root.exists()
+
+
+def test_only_a_generated_root_is_scratch(tmp_path: Path) -> None:
+    assert not Workspace.open(configuration=_cfg(), root=tmp_path).scratch
+    assert not Workspace.open(configuration=_pinned(tmp_path)).scratch
+    with pytest.raises(InvalidArgument, match="scratch root"):
+        Workspace(root=tmp_path, scratch=True)
+
+
+def test_a_scratch_workspace_caches_embeddings_for_its_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache is not lasting output: it lives under the scratch root, so repeated
+    runs on a held `Workspace` reuse it, and it goes with the root at GC."""
+    ws = Workspace.open(configuration=scratch_configuration(monkeypatch))
+    cache = ws.embedding_cache_dir
+    assert cache.is_relative_to(ws.root)
+    cache.mkdir(parents=True)
+    (cache / "x.npy").write_bytes(b"")
+    assert ws.embedding_cache_dir == cache  # stable while the object lives
+    del ws
+    gc.collect()
+    assert not cache.exists()

@@ -15,13 +15,18 @@
 from __future__ import annotations
 
 import shutil
+import sys
+import types
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
 from dgml_core import DEFAULT_STORAGE_PROVIDER, BlobStore, LocalStore, StorageConfig
+from dgml_core.configuration import Configuration, Identity, ProviderSpec, Storage
 from dgml_core.pages import GS_BINARIES
 from dgml_core.storage import Workspace
+from dgml_core.storage_service import DocStore
 from dgml_core.workspaces_resolve import default_workspaces_store
 from dgml_core.workspaces_store import WORKSPACES_ENV_VAR
 
@@ -54,6 +59,96 @@ class DefaultBridgeStore(LocalStore):
 def default_bridge_store(root: Path) -> DefaultBridgeStore:
     cfg = LocalStore.parse_config(StorageConfig(DEFAULT_STORAGE_PROVIDER, root))
     return DefaultBridgeStore(cfg)
+
+
+class InMemoryStore(BlobStore, DocStore):
+    """A store with no directory — what "every store is remote" looks like to the
+    scratch-root guard — so that path can be exercised without a real backend."""
+
+    name = "in-memory"
+    config_fields = frozenset[str]()
+
+    @classmethod
+    def parse_config(cls, config: StorageConfig) -> StorageConfig:
+        cls._check_no_extra_fields(config.options)
+        return config
+
+    def __init__(self, config: StorageConfig) -> None:
+        self._blobs: dict[str, bytes] = {}
+        self._docs: dict[str, dict[str, dict[str, Any]]] = {}
+        self._log: dict[str, list[dict[str, Any]]] = {}
+
+    def put_blob(self, key: str, data: bytes) -> None:
+        self._blobs[key] = data
+
+    def get_blob(self, key: str) -> bytes:
+        try:
+            return self._blobs[key]
+        except KeyError:
+            raise FileNotFoundError(key) from None
+
+    def delete_blob(self, key: str) -> None:
+        self._blobs.pop(key, None)
+
+    def blob_exists(self, key: str) -> bool:
+        return key in self._blobs
+
+    def list_blobs(self, prefix: str) -> list[str]:
+        return sorted(k for k in self._blobs if k.startswith(prefix))
+
+    def upload_blob(self, key: str, src: Path) -> None:
+        self._blobs[key] = src.read_bytes()
+
+    def download_blob(self, key: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self.get_blob(key))
+
+    def delete_blobs(self, prefix: str) -> None:
+        for key in self.list_blobs(prefix):
+            del self._blobs[key]
+
+    def append_doc(self, collection: str, doc: dict[str, Any]) -> None:
+        self._log.setdefault(collection, []).append(dict(doc))
+
+    def get_doc(self, collection: str, doc_id: str) -> dict[str, Any] | None:
+        found = self._docs.get(collection, {}).get(doc_id)
+        return dict(found) if found is not None else None
+
+    def find_docs(self, collection: str, query: Mapping[str, Any]) -> list[dict[str, Any]]:
+        rows = list(self._docs.get(collection, {}).values()) + self._log.get(collection, [])
+        return [dict(d) for d in rows if all(d.get(k) == v for k, v in query.items())]
+
+    def put_doc(self, collection: str, doc_id: str, doc: dict[str, Any]) -> None:
+        self._docs.setdefault(collection, {})[doc_id] = dict(doc)
+
+    def delete_doc(self, collection: str, doc_id: str) -> None:
+        self._docs.get(collection, {}).pop(doc_id, None)
+
+    def delete_docs(self, collection: str, query: Mapping[str, Any]) -> int:
+        col = self._docs.get(collection, {})
+        hits = [i for i, d in col.items() if all(d.get(k) == v for k, v in query.items())]
+        for i in hits:
+            del col[i]
+        return len(hits)
+
+
+def register_provider(monkeypatch: pytest.MonkeyPatch, cls: type, attr: str) -> str:
+    """Register ``cls`` under an importable module name; return its dotted path."""
+    module = types.ModuleType("fake_stores")
+    setattr(module, attr, cls)
+    monkeypatch.setitem(sys.modules, "fake_stores", module)
+    return f"fake_stores:{attr}"
+
+
+def scratch_configuration(monkeypatch: pytest.MonkeyPatch) -> Configuration:
+    """A configuration whose stores are all remote, so `Workspace.open` makes a
+    scratch root for it."""
+    return Configuration.build(
+        identity=Identity(workspace_id="tenant-1", name="Tenant", organization="TenantOrg"),
+        storage=Storage.combined(
+            ProviderSpec(register_provider(monkeypatch, InMemoryStore, "InMemoryStore"))
+        ),
+    )
 
 
 def _toml_scalar(value: Any) -> str:
@@ -238,12 +333,15 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     the Logging section of ../CLAUDE.md) so tests stay order-independent —
     any test may trigger these paths, not only the modules that assert on them."""
     from dgml_core import grounded, models_config, ocr, rotation
+    from dgml_core.generation import pipeline
 
     models_config._WARNED_TIER_FALLBACKS.clear()
     models_config._WARNED_DISABLED.clear()
     ocr._WARNED_NO_OCR_PROVIDER.clear()
     grounded._REQUIRED_TOOL_CHOICE_REJECTED.clear()
+    grounded._WARNED_TELEMETRY.clear()
     monkeypatch.setattr(rotation, "_WARNED_PILLOW_MISSING", False)
+    monkeypatch.setattr(pipeline, "_WARNED_DEBUG_WITHOUT_USAGE", False)
 
 
 @pytest.fixture
@@ -414,3 +512,104 @@ def _isolate_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-home"))
     monkeypatch.setenv(WORKSPACES_ENV_VAR, str(tmp_path / "dgml-workspaces"))
     default_workspaces_store.cache_clear()
+
+
+# --- LLM call capture (shared by the llm / generation / grounded suites) ------
+
+
+class FakeLLMResponse(dict):  # type: ignore[type-arg]
+    """A canned completion response usable by every ``dgml_core.llm`` wrapper.
+
+    The wrappers read responses two ways — ``call`` / ``call_with_refinement``
+    subscript (``response["choices"][0]["message"]["content"]``) while
+    ``call_continued`` / ``call_with_tools`` use attributes
+    (``response.choices[0].message.content``, ``.finish_reason``,
+    ``.tool_calls``) — and :func:`dgml_core.usage.extract_cost_and_tokens`
+    reads ``.usage`` / ``._hidden_params``. One object serves all three.
+    """
+
+    def __init__(
+        self,
+        text: str,
+        *,
+        finish_reason: str = "stop",
+        tool_calls: list[Any] | None = None,
+        cost: float | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> None:
+        from types import SimpleNamespace
+
+        super().__init__(choices=[{"message": {"content": text}, "finish_reason": finish_reason}])
+        self.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(content=text, tool_calls=tool_calls),
+                finish_reason=finish_reason,
+            )
+        ]
+        self._hidden_params: dict[str, Any] = {}
+        if cost is not None:
+            self._hidden_params["response_cost"] = cost
+        total = (
+            None
+            if prompt_tokens is None and completion_tokens is None
+            else (prompt_tokens or 0) + (completion_tokens or 0)
+        )
+        self.usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total,
+            cache_read_input_tokens=cache_read_tokens,
+            cache_creation_input_tokens=cache_creation_tokens,
+        )
+
+
+class CapturedLLMCalls:
+    """What :func:`capture_kwargs` recorded: every kwargs dict the call layer
+    handed to ``_completion_with_retry`` (deep-copied at capture time, so later
+    mutation of a reused ``messages`` list cannot rewrite history), in call
+    order."""
+
+    def __init__(self) -> None:
+        self.kwargs: list[dict[str, Any]] = []
+
+
+@pytest.fixture
+def capture_kwargs(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Record the completion kwargs each ``dgml_core.llm`` call site builds.
+
+    Monkeypatches ``dgml_core.llm._completion_with_retry`` — the single seam
+    every wrapper (``call``, ``call_continued``, ``call_with_refinement``,
+    ``call_with_tools``) and every ``steps_*`` driver goes through — so no
+    network call happens and no retry/backoff runs. Usage: install canned
+    responses, run the code under test, then assert on ``captured.kwargs``::
+
+        captured = capture_kwargs([FakeLLMResponse("draft"), FakeLLMResponse("final")])
+        llm.call_with_refinement(cfg, ...)
+        assert captured.kwargs[1]["messages"][2]["content"] == "draft"
+
+    ``responses`` is either a sequence consumed in order (a request beyond the
+    end raises ``AssertionError`` naming the overflow) or a callable receiving
+    the kwargs and returning the response.
+    """
+    import copy
+
+    from dgml_core import llm as llm_mod
+
+    def _install(responses: Any) -> CapturedLLMCalls:
+        captured = CapturedLLMCalls()
+        queue = None if callable(responses) else list(responses)
+
+        def fake_completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
+            captured.kwargs.append(copy.deepcopy(kwargs))
+            if queue is None:
+                return responses(kwargs)
+            assert queue, f"capture_kwargs: request #{len(captured.kwargs)} has no canned response"
+            return queue.pop(0)
+
+        monkeypatch.setattr(llm_mod, "_completion_with_retry", fake_completion_with_retry)
+        return captured
+
+    return _install

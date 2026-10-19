@@ -616,6 +616,73 @@ def _claim_share(blocks: list[Block], al_page: Alignment, region: Region) -> flo
     return got / max(1, len(want))
 
 
+@dataclass
+class CompletionPlan:
+    """Everything :func:`ensure_complete` decides before any rescue call: the
+    deduplicated blocks, their alignment, and the regions to fill. Built by
+    :func:`plan_completion`; :attr:`rescue_pages` are the 0-based pages a
+    caller may re-transcribe with the model before :func:`finish_completion`.
+    ``skipped`` is set (and nothing else is meaningful) when the pass has
+    nothing to do."""
+
+    blocks: list[Block]
+    pages: dict[int, tuple[list[Word], PageDims]]
+    alignment: Alignment | None
+    reported: list[Region]
+    regions: list[Region]
+    dropped: list[dict[str, Any]]
+    model_covered: int
+    n_content: int
+    fill: bool
+    skipped: str | None = None
+
+    @property
+    def rescue_pages(self) -> list[int]:
+        """0-based pages whose whole-page region may go to the model first."""
+        return [r.page - 1 for r in self.regions if r.kind == "page"]
+
+
+def plan_completion(
+    blocks: list[Block],
+    page_text_dir: Path | str,
+    *,
+    window_starts: list[int] | None = None,
+    fill: bool = True,
+    fill_pages: set[int] | None = None,
+) -> CompletionPlan:
+    """The pure first half of :func:`ensure_complete`: align, drop duplicates
+    and fabrications, and find the regions to fill. Makes no model call."""
+    pages = load_page_words_dir(page_text_dir)
+    if not pages or not blocks:
+        return CompletionPlan(
+            blocks,
+            pages,
+            None,
+            [],
+            [],
+            [],
+            0,
+            0,
+            fill,
+            skipped="no page text" if not pages else "no blocks",
+        )
+    blocks, dropped = _drop_duplicates(
+        blocks, align_blocks(blocks, pages, order_free=False), window_starts
+    )
+    al = align_blocks(blocks, pages)
+    model_covered = len(al.claimed)
+    n_content = len(al.otoks)
+    blocks, late = _drop_unplaced(blocks, al)
+    dropped += late
+    if late:
+        al = align_blocks(blocks, pages)
+    reported = find_regions(al, pages)
+    regions = reported if fill else [r for r in reported if r.page in (fill_pages or ())]
+    return CompletionPlan(
+        blocks, pages, al, reported, regions, dropped, model_covered, n_content, fill
+    )
+
+
 def ensure_complete(
     blocks: list[Block],
     page_text_dir: Path | str,
@@ -638,32 +705,49 @@ def ensure_complete(
     text-layer lines) and the pass is a check and a dedupe only -- except on
     *fill_pages* (1-based), pages the caller handled in the text format
     after all, which are filled as usual.
-    """
-    pages = load_page_words_dir(page_text_dir)
-    if not pages or not blocks:
-        return blocks, {"skipped": "no page text" if not pages else "no blocks"}
 
-    blocks, dropped = _drop_duplicates(
-        blocks, align_blocks(blocks, pages, order_free=False), window_starts
+    This is :func:`plan_completion` followed by :func:`finish_completion`, with
+    the rescue calls made in between by *rescue*. A caller that cannot make
+    them from a callback (the Pass A generator, whose model calls are yields
+    to its driver) runs the two halves itself around its own rescue step.
+    """
+    plan = plan_completion(
+        blocks, page_text_dir, window_starts=window_starts, fill=fill, fill_pages=fill_pages
     )
-    al = align_blocks(blocks, pages)
-    model_covered = len(al.claimed)
-    n_content = len(al.otoks)
-    blocks, late = _drop_unplaced(blocks, al)
-    dropped += late
+    rescued: dict[int, list[Block] | None] = {}
+    if plan.skipped is None and rescue is not None:
+        for page_idx in plan.rescue_pages:
+            rescued[page_idx] = rescue(page_idx)
+    return finish_completion(plan, rescued, log=log, id_prefix=id_prefix)
+
+
+def finish_completion(
+    plan: CompletionPlan,
+    rescued: dict[int, list[Block] | None],
+    *,
+    log: Callable[[str], None] = lambda _m: None,
+    id_prefix: str = "f",
+) -> tuple[list[Block], dict[str, Any]]:
+    """The second half of :func:`ensure_complete`: fill *plan*'s regions --
+    from *rescued* (0-based page -> the model's blocks, used only if they claim
+    the page's words) where a whole page was rescued, else from the text layer
+    -- and build the report. Makes no model call."""
+    if plan.skipped is not None:
+        return plan.blocks, {"skipped": plan.skipped}
+    blocks, pages, regions, reported = plan.blocks, plan.pages, plan.regions, plan.reported
+    assert plan.alignment is not None  # set whenever not skipped
+    al = plan.alignment
+    dropped = plan.dropped
+    model_covered, n_content = plan.model_covered, plan.n_content
     fabricated = sum(1 for d in dropped if d["reason"] == "fabricated")
     dups = len(dropped) - fabricated
-    if late:
-        al = align_blocks(blocks, pages)
-    reported = find_regions(al, pages)
-    regions = reported if fill else [r for r in reported if r.page in (fill_pages or ())]
 
     # Fill regions. Whole pages may go to the model first; everything else, and
     # any rescue that fails to claim its page, comes from the text layer.
     for r in regions:
         got: list[Block] | None = None
-        if r.kind == "page" and rescue is not None:
-            got = rescue(r.page - 1)
+        if r.kind == "page":
+            got = rescued.get(r.page - 1)
             if got:
                 sub = {r.page: pages[r.page]}
                 probe = Region(r.page, r.kind, r.lines, 0)
@@ -710,7 +794,7 @@ def ensure_complete(
         )
     report = {
         "pages": per_page,
-        "filled": fill,
+        "filled": plan.fill,
         "regions": [
             {
                 "page": r.page,

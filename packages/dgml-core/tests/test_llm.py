@@ -716,7 +716,7 @@ def test_call_continued_sends_no_cache_markers_to_openai(
 
 
 # ---------------------------------------------------------------------------
-# Auto-recording of usage from the call layer (gated on --debug via the config)
+# Auto-recording of usage from the call layer (gated on record_usage via the config)
 # ---------------------------------------------------------------------------
 
 
@@ -741,7 +741,7 @@ def _tmp_workspace(tmp_path: Any) -> Any:
     return Workspace(root=tmp_path)
 
 
-def test_call_auto_records_one_row_under_debug(
+def test_call_auto_records_one_row_with_record_usage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
     from dgml_core.usage import read_events
@@ -749,7 +749,7 @@ def test_call_auto_records_one_row_under_debug(
     ws = _tmp_workspace(tmp_path)
     monkeypatch.setattr("litellm.completion", lambda **k: _PricedResp("hi", cost=0.01, tokens=100))
     cfg = llm.LLMConfig(
-        model="gpt-4o", workspace=ws, debug=True, operation="unit_test", context={"k": "v"}
+        model="gpt-4o", workspace=ws, record_usage=True, operation="unit_test", context={"k": "v"}
     )
 
     out = llm.call(cfg, system_prompt="SYS", user_content=[{"type": "text", "text": "U"}])
@@ -764,13 +764,15 @@ def test_call_auto_records_one_row_under_debug(
     assert events[0]["context"] == {"k": "v"}
 
 
-def test_call_records_nothing_without_debug(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+def test_call_records_nothing_without_record_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
     from dgml_core.usage import read_events
 
     ws = _tmp_workspace(tmp_path)
     monkeypatch.setattr("litellm.completion", lambda **k: _PricedResp("hi", cost=0.01, tokens=100))
-    # workspace set but debug False → gated off.
-    cfg = llm.LLMConfig(model="gpt-4o", workspace=ws, debug=False, operation="unit_test")
+    # workspace set but record_usage False (the default) → gated off.
+    cfg = llm.LLMConfig(model="gpt-4o", workspace=ws, operation="unit_test")
 
     llm.call(cfg, system_prompt="SYS", user_content=[{"type": "text", "text": "U"}])
     assert read_events(ws) == []
@@ -785,7 +787,7 @@ def test_record_usage_for_aggregates_calls_into_one_row(
 
     ws = _tmp_workspace(tmp_path)
     monkeypatch.setattr("litellm.completion", lambda **k: _PricedResp("x", cost=0.01, tokens=100))
-    cfg = llm.LLMConfig(model="gpt-4o", workspace=ws, debug=True, operation="agg")
+    cfg = llm.LLMConfig(model="gpt-4o", workspace=ws, record_usage=True, operation="agg")
 
     with llm.record_usage_for(cfg):
         for _ in range(3):

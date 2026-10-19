@@ -48,7 +48,7 @@ from .errors import (
     ClassificationFailed,
     NoExistingDocSets,
 )
-from .llm import LLMConfig, call_with_tools
+from .llm import CallResult, LLMConfig, LLMSteps, drive, steps_with_tools
 from .models import DocSet
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .storage import Workspace
@@ -213,7 +213,7 @@ def classify_file(
     config: ClassificationConfig,
     docsets: list[DocSet] | None = None,
     mode: ClassifyMode = ClassifyMode.EXISTING_OR_NEW,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> ClassificationDecision:
     """Ask the configured vision LLM to classify ``file_id`` into a DocSet.
 
@@ -263,7 +263,7 @@ def classify_file(
         config=config,
         prompt=_build_prompt(docsets, mode=mode),
         tools=_build_tools(docsets, mode=mode),
-        debug=debug,
+        record_usage=record_usage,
     )
     return _parse_response(response, docsets, mode=mode)
 
@@ -273,7 +273,7 @@ def propose_new_docset_for_files(
     file_ids: list[str],
     *,
     config: ClassificationConfig,
-    debug: bool = False,
+    record_usage: bool = False,
     attempts: int | None = None,
 ) -> ClassificationDecision:
     """Ask the configured vision LLM to propose a new DocSet (name,
@@ -323,7 +323,7 @@ def propose_new_docset_for_files(
                 config=config,
                 prompt=_build_prompt_new_only(),
                 tools=[_create_new_docset_tool()],
-                debug=debug,
+                record_usage=record_usage,
             )
             name, args = _extract_single_tool_call(response)
             decisions.append(_parse_new_docset_args(name, args))
@@ -366,24 +366,30 @@ def _normalize_name(name: str | None) -> str:
     return " ".join((name or "").lower().split())
 
 
-def _vision_tool_call(
+def classify_steps(
     workspace: Workspace,
     file_ids: list[str],
     *,
     config: ClassificationConfig,
     prompt: str,
     tools: list[dict[str, Any]],
-    debug: bool = False,
-) -> Any:
-    """Call the configured vision LLM with ``prompt`` + the rendered page
-    images of every file in ``file_ids`` (up to ``config.max_pages`` per
-    file), forcing it to invoke exactly one of ``tools``. Returns the raw
-    litellm response so callers can run their own tool-call parsing.
+    record_usage: bool = False,
+) -> tuple[LLMConfig, LLMSteps[CallResult]]:
+    """Prepare the classification request without sending it.
 
-    Shared between :func:`classify_file` (always a single file) and
-    :func:`propose_new_docset_for_files` (a cluster of files).
+    Gathers the rendered page images of every file in ``file_ids`` (up to
+    ``config.max_pages`` per file), builds the vision prompt, and returns the
+    :class:`LLMConfig` the request bills against together with a pure step
+    generator (see :data:`dgml_core.llm.LLMSteps`) that yields the single
+    ``tool_choice="required"`` request and returns its :class:`CallResult`.
+    Nothing here touches the network: :func:`_vision_tool_call` drives the
+    generator synchronously.
+
+    The page-image precondition is checked *here*, before any request exists,
+    so every driver sees the same :class:`ClassificationFailed` for a file
+    with no renderable pages. Credential resolution (``AuthError`` on an unset
+    ``api_key_env``) happens here too.
     """
-
     page_bytes: list[bytes] = []
     for fid in file_ids:
         page_bytes.extend(gather_file_pages(workspace, fid, config.max_pages))
@@ -398,25 +404,50 @@ def _vision_tool_call(
     for img in page_bytes:
         content.append({"type": "image_url", "image_url": {"url": image_to_data_url(img)}})
 
-    # The call records its own usage row (gated on --debug) from the context
-    # carried on the config; no wrapper needed for this single call.
+    # The driver records one usage row (gated on ``record_usage``) from the
+    # context carried on the config; no wrapper needed for this single call.
     llm_config = LLMConfig(
         model=config.model,
         api_key=api_key,
         api_base=config.api_base,
         max_tokens=None,
         workspace=workspace,
-        debug=debug,
+        record_usage=record_usage,
         operation=OPERATION_CLASSIFY,
         context={"file_ids": file_ids},
     )
+    steps = steps_with_tools(
+        llm_config,
+        messages=[{"role": "user", "content": content}],
+        tools=tools,
+        tool_choice="required",
+    )
+    return llm_config, steps
+
+
+def _vision_tool_call(
+    workspace: Workspace,
+    file_ids: list[str],
+    *,
+    config: ClassificationConfig,
+    prompt: str,
+    tools: list[dict[str, Any]],
+    record_usage: bool = False,
+) -> Any:
+    """Call the configured vision LLM with ``prompt`` + the rendered page
+    images of every file in ``file_ids`` (up to ``config.max_pages`` per
+    file), forcing it to invoke exactly one of ``tools``. Returns the raw
+    litellm response so callers can run their own tool-call parsing.
+
+    Shared between :func:`classify_file` (always a single file) and
+    :func:`propose_new_docset_for_files` (a cluster of files). The request
+    itself is prepared by :func:`classify_steps`; this is its sync driver.
+    """
+    llm_config, steps = classify_steps(
+        workspace, file_ids, config=config, prompt=prompt, tools=tools, record_usage=record_usage
+    )
     try:
-        result = call_with_tools(
-            llm_config,
-            messages=[{"role": "user", "content": content}],
-            tools=tools,
-            tool_choice="required",
-        )
+        result = drive(steps, llm_config)
     except Exception as exc:
         # litellm normalizes provider errors but we never want a raw
         # provider exception bubbling past — wrap unconditionally with

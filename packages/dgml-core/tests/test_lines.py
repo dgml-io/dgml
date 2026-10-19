@@ -12,6 +12,8 @@ from dgml_core import llm
 from dgml_core.generation import lines as lines_mod
 from dgml_core.textmatch import PageDims, Word, fuzzy_norm
 
+from .test_generation import _route_window_calls
+
 W, H = 1000, 1400
 LINE_H = 20
 
@@ -233,7 +235,7 @@ def test_transcribe_document_in_lines_mode(monkeypatch: pytest.MonkeyPatch, tmp_
         # forgets L7 (a table row) and L10 (page number)
         return "X\tL1\nH1\tITEM 1.\tL2\nP\tL3-L4\nR\tL5\nR\tL6\nI\t(a)\tL8\nI\t(b)\tL9"
 
-    monkeypatch.setattr(llm, "call_continued", fake_call_continued)
+    _route_window_calls(monkeypatch, fake_call_continued)
     monkeypatch.setattr(transcribe_mod, "_count_pages", lambda _b: 1)
     monkeypatch.setattr(document_mod, "slice_pdf", lambda b, _pages, **_kw: b)
 
@@ -361,7 +363,7 @@ def test_text_format_reply_in_lines_mode_is_used_as_text(
             ],
         }
     )
-    monkeypatch.setattr(llm, "call_continued", lambda config, **kw: reply)
+    _route_window_calls(monkeypatch, lambda config, **kw: reply)
     monkeypatch.setattr(transcribe_mod, "_count_pages", lambda _b: 1)
     monkeypatch.setattr(document_mod, "slice_pdf", lambda b, _pages, **_kw: b)
     blocks = transcribe_mod.transcribe_document(
@@ -450,7 +452,7 @@ def test_textless_page_gets_its_own_text_call_in_a_lines_window(
             )
         return "P\tScanned map of the network."
 
-    monkeypatch.setattr(llm, "call_continued", fake)
+    _route_window_calls(monkeypatch, fake)
     monkeypatch.setattr(transcribe_mod, "_count_pages", lambda _b: 2)
     monkeypatch.setattr(document_mod, "slice_pdf", lambda b, _pages, **_kw: b)
     blocks = transcribe_mod.transcribe_document(

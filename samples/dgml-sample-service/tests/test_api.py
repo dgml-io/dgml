@@ -261,6 +261,30 @@ def test_classify_assigns_and_extracts(
     assert client.get(f"{base}/{ds['id']}").json()["file_ids"] == []
 
 
+def test_dgml_reads_report_unassigned_and_not_generated(
+    client: TestClient, org: dict[str, Any], pdf: Any, wait_job: Any
+) -> None:
+    """The DGML routes go through dgml_core.read_dgml: an unassigned file is
+    FILE_NOT_FOUND, an assigned one with nothing written yet has no DGML."""
+    org_id = org["id"]
+    base = f"/api/orgs/{org_id}/docsets"
+    ds = client.post(base, json={"name": "Leases"}).json()
+    file_id = _add_file(client, org_id, pdf, wait_job)
+    pair_url = f"{base}/{ds['id']}/files/{file_id}"
+
+    for path in ("dgml", "dgml.xml"):
+        r = client.get(f"{pair_url}/{path}")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "FILE_NOT_FOUND"
+
+    assert client.post(pair_url, json={"extract": False}).json()["assigned"] is True
+    pair = client.get(f"{pair_url}/dgml").json()
+    assert pair["xml"] is None and pair["values"] is None and pair["has_extraction"] is False
+    r = client.get(f"{pair_url}/dgml.xml")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "DGML_NOT_FOUND"
+
+
 def test_classify_none_leaves_file_unassigned(
     client: TestClient,
     org: dict[str, Any],

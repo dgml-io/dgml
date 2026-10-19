@@ -515,7 +515,7 @@ def test_classify_file_records_usage_on_success(workspace: Workspace) -> None:
     response.usage = SimpleNamespace(prompt_tokens=400, completion_tokens=30, total_tokens=430)
     cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
     with patch("litellm.completion", return_value=response):
-        classify_file(workspace, new_id, config=cfg, debug=True)
+        classify_file(workspace, new_id, config=cfg, record_usage=True)
 
     events = read_events(workspace)
     assert len(events) == 1
@@ -535,16 +535,16 @@ def test_classify_file_records_usage_on_provider_exception(workspace: Workspace)
     cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
     with patch("litellm.completion", side_effect=RuntimeError("boom")):
         with pytest.raises(ClassificationFailed):
-            classify_file(workspace, new_id, config=cfg, debug=True)
+            classify_file(workspace, new_id, config=cfg, record_usage=True)
     events = read_events(workspace)
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert "boom" in (events[0]["error"] or "")
 
 
-def test_classify_file_no_usage_recording_without_debug(workspace: Workspace) -> None:
-    """Usage recording is gated on --debug: a normal (non-debug) classify
-    writes no usage.jsonl row."""
+def test_classify_file_no_usage_recording_by_default(workspace: Workspace) -> None:
+    """Usage recording is opt-in via record_usage: a plain classify writes no
+    usage.jsonl row."""
     from dgml_core.usage import read_events
 
     _, new_id = _seed_for_classify(workspace)
@@ -553,7 +553,7 @@ def test_classify_file_no_usage_recording_without_debug(workspace: Workspace) ->
     response.usage = SimpleNamespace(prompt_tokens=400, completion_tokens=30, total_tokens=430)
     cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
     with patch("litellm.completion", return_value=response):
-        classify_file(workspace, new_id, config=cfg)  # debug defaults False
+        classify_file(workspace, new_id, config=cfg)  # record_usage defaults False
 
     assert read_events(workspace) == []
 

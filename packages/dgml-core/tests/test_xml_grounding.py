@@ -133,7 +133,7 @@ def _parse_box(box: str) -> tuple[int, int, int, int, int]:
 
 def test_grounds_full_document(workspace: Workspace, tmp_path: Path) -> None:
     _standard_pages(workspace)
-    res = _ground(workspace, tmp_path, _STANDARD_XML)
+    res = _ground(workspace, tmp_path, _STANDARD_XML, write_stats=True)
 
     assert res.output_path == tmp_path / "contract.dgml.grounded.xml"
     assert res.output_path.exists()
@@ -160,11 +160,13 @@ def test_grounds_full_document(workspace: Workspace, tmp_path: Path) -> None:
     assert _parse_box(sig)[2] == 300  # top
 
 
-def test_write_stats_false_skips_sidecar(workspace: Workspace, tmp_path: Path) -> None:
-    """write_stats=False (set by the CLI unless --debug) produces the grounded
-    XML but no stats sidecar, and leaves stats_path None."""
+def test_write_stats_defaults_off_skips_sidecar(workspace: Workspace, tmp_path: Path) -> None:
+    """The default (write_stats=False, what the CLI passes unless --debug)
+    produces the grounded XML but no stats sidecar, and leaves stats_path
+    None — a caller grounding into its own directory gets only the file it
+    asked for."""
     _standard_pages(workspace)
-    res = _ground(workspace, tmp_path, _STANDARD_XML, write_stats=False)
+    res = _ground(workspace, tmp_path, _STANDARD_XML)
 
     assert res.output_path.exists()
     assert res.stats_path is None

@@ -249,10 +249,13 @@ def test_check_no_longer_falls_back_to_any_pdf(workspace: Workspace) -> None:
 
 
 @needs_gs
-def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Path) -> None:
-    """A dg:origin="computed" element with no dg:href in a docset file's DGML
-    XML is an unauditable derivation — check reports it. An attributed
-    computed element (dg:href present) passes clean."""
+def test_unsupported_value_flagged(workspace: Workspace, text_pdf: Path) -> None:
+    """An extracted value with no dg:origin, dg:inputs or dg:method in a
+    docset file's DGML XML is an unsupported claim — check reports it. A 0.7
+    dg:origin="computed" element reads as having no origin, so without a
+    dg:href it is flagged too; with one (read as its inputs) it passes, as
+    does a 0.71 element with dg:inputs. A "#a; #b" list is not misread as a
+    dangling semantic link."""
     f = FileStore(workspace).add(text_pdf)
     store = DocSetStore(workspace)
     ds = store.create(name="X")
@@ -269,7 +272,7 @@ def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Pat
         ),
     )
     report = check_workspace(workspace)
-    flagged = [i for i in report.issues if i.kind == "computed_field_unattributed"]
+    flagged = [i for i in report.issues if i.kind == "value_unsupported"]
     assert len(flagged) == 1
     assert "Total" in flagged[0].message
     assert flagged[0].target_id == ds.id
@@ -280,13 +283,19 @@ def test_unattributed_computed_field_flagged(workspace: Workspace, text_pdf: Pat
             b'<dg:chunk xmlns:dg="http://dgml.io/ns/dg#" xmlns:docset="http://x/ns">'
             b"<dg:extraction>"
             b'<docset:Part xml:id="p1" dg:origin="1 1 2 3 4">4</docset:Part>'
+            b'<docset:Part xml:id="p2" dg:origin="1 1 5 3 8">6</docset:Part>'
             b'<docset:Total dg:origin="computed" dg:value="10" '
-            b'dg:itemprop="computedFrom" dg:href="#p1">10</docset:Total>'
+            b'dg:itemprop="computedFrom" dg:href="#p1; #p2">10</docset:Total>'
+            b'<docset:Count dg:value="2" dg:inputs="#p1; #p2" dg:method="calculated">2'
+            b"</docset:Count>"
             b"</dg:extraction></dg:chunk>"
         ),
     )
     report = check_workspace(workspace)
-    assert not [i for i in report.issues if i.kind == "computed_field_unattributed"]
+    kinds = {i.kind for i in report.issues}
+    assert "value_unsupported" not in kinds
+    assert "semlink_dangling_href" not in kinds
+    assert "inputs_dangling" not in kinds
 
 
 @needs_gs
@@ -335,11 +344,11 @@ def test_semantic_link_defects_flagged(workspace: Workspace, text_pdf: Path) -> 
     assert "semlink_nested" not in local and "semlink_dangling_href" not in local
 
 
-@pytest.mark.parametrize("debug", [True, False])
-def test_reextract_hybrid_threads_debug(
-    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, debug: bool
+@pytest.mark.parametrize("record_usage", [True, False])
+def test_reextract_hybrid_threads_record_usage(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, record_usage: bool
 ) -> None:
-    """The hybrid re-extraction branch forwards ``debug`` to
+    """The hybrid re-extraction branch forwards ``record_usage`` to
     ``extract_text_hybrid`` so ``dgml check --debug`` records hybrid_merge
     usage (and plain ``check`` records nothing)."""
     import dgml_core.consistency as consistency
@@ -351,7 +360,7 @@ def test_reextract_hybrid_threads_debug(
     monkeypatch.setattr(consistency, "load_text_extraction_config", lambda ws: object())
 
     def fake_hybrid(*args: Any, **kwargs: Any) -> ExtractDigitalResult:
-        captured["debug"] = kwargs.get("debug")
+        captured["record_usage"] = kwargs.get("record_usage")
         return ExtractDigitalResult(pages_written=1, pages_with_words=1, total_words=1)
 
     monkeypatch.setattr(consistency, "extract_text_hybrid", fake_hybrid)
@@ -359,6 +368,6 @@ def test_reextract_hybrid_threads_debug(
     fid = "fid"
     workspace.blobs.put_blob(f"files/{fid}/doc.pdf", b"%PDF-1.4\n")
     source_key = layout.file_source_key(fid, "doc.pdf")
-    _reextract(workspace, source_key, fid, "hybrid", debug=debug)
+    _reextract(workspace, source_key, fid, "hybrid", record_usage=record_usage)
 
-    assert captured["debug"] is debug
+    assert captured["record_usage"] is record_usage

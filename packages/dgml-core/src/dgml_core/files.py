@@ -150,7 +150,7 @@ class FileStore:
         on_conflict: ConflictPolicy = ConflictPolicy.ERROR,
         text_mode: TextMode = TextMode.DIGITAL,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
     ) -> AddFileResult:
         # Validated here, alongside the OCR-config check below, so a rejected
         # add leaves the workspace untouched rather than half-built.
@@ -277,7 +277,7 @@ class FileStore:
             conflict_kind=("hash" if same_hash else "path" if same_path else None),
             text_mode=text_mode,
             dpi=dpi,
-            debug=debug,
+            record_usage=record_usage,
         )
 
     def _existing_result(
@@ -322,7 +322,8 @@ class FileStore:
         ``ValueError``.
         """
         if self.ws.configuration is not None:
-            # No portable root to be relative to (it may be a scratch dir); the
+            # The root is not where the workspace lives (a scratch dir, or a `root=`
+            # the next open may change), so nothing is portable relative to it; the
             # absolute path is the truthful record, and `original_filename` has the name.
             return str(source_path)
         try:
@@ -366,7 +367,7 @@ class FileStore:
         text_mode: TextMode,
         file_id: str | None = None,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
     ) -> AddFileResult:
         file_id = file_id or new_id()
         # The store owns container creation (upload_blob writes the source blob),
@@ -416,7 +417,7 @@ class FileStore:
                 text_mode=text_mode,
                 page_count=page_count,
                 dpi=dpi,
-                debug=debug,
+                record_usage=record_usage,
             )
 
         record = FileRecord(
@@ -568,7 +569,7 @@ class FileStore:
         text_mode: TextMode,
         page_count: int | None,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """Run text extraction for ``text_mode`` and record any failure.
 
@@ -587,7 +588,7 @@ class FileStore:
             return self._extract_text_ocr(pdf_path, file_id, page_count=page_count)
         if text_mode is TextMode.HYBRID:
             return self._extract_text_hybrid(
-                pdf_path, file_id, page_count=page_count, dpi=dpi, debug=debug
+                pdf_path, file_id, page_count=page_count, dpi=dpi, record_usage=record_usage
             )
         return None, None
 
@@ -664,7 +665,7 @@ class FileStore:
         *,
         page_count: int | None,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         # Imported HERE, not at module scope: ``.hybrid`` reaches ``.llm`` →
         # ``litellm``, ~1.4s of the package's ~1.66s import cost, and this is the
@@ -694,7 +695,7 @@ class FileStore:
                     text_extraction_config=text_extraction_config,
                     workspace=self.ws,
                     dpi=dpi,
-                    debug=debug,
+                    record_usage=record_usage,
                 )
         except (OcrFailed, AuthError, MissingExtra) as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None

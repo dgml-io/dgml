@@ -101,11 +101,12 @@ extraction_schema_user_body: |-
      adds the matching token as the normalized value. Don't force an
      enum onto open-ended values (names, ids, free text).
   5. A ``prompt`` phrased as a derivation — "Compute as ...", "Derive
-     from ...", "Count the number of ..." — makes the field a COMPUTED
-     field at extraction time: its value is reasoned from other
-     extracted fields instead of read off the page. Use that only for
-     genuine derivations, and make sure every input the rule mentions
-     is itself a field in the schema.
+     from ...", "Count the number of ...", "Take the year from ..." —
+     tells extraction how to produce a value the page doesn't print in
+     full: calculated or inferred from other extracted fields, or
+     completed from them when the page prints only part of it. Use that
+     only for genuine derivations, and make sure every input the rule
+     mentions is itself a field in the schema.
   6. Every ``name`` in the tree must be UNIQUE, at every level — a name is
      one schema definition shared by all its occurrences, not a label
      scoped to its parent. Two nodes may share a name only when they are
@@ -129,7 +130,9 @@ extraction_values_phase1_system: |-
   Each leaf value you return is an object with a ``text`` field (the
   value verbatim as printed), an optional normalized ``value``, and a
   ``locations`` array. Each location identifies the ``page_number``
-  (1-indexed integer) where that value appears. This phase deliberately
+  (1-indexed integer) where that value appears. Every value you read off
+  the page carries its ``locations`` — never return printed text without
+  them. This phase deliberately
   omits bounding boxes — a later phase will add them.
 
   NORMALIZED ``value`` — alongside the verbatim ``text``, return the
@@ -152,16 +155,15 @@ extraction_values_phase1_system: |-
      b. The token is your JUDGMENT about other content, with nothing on
         the page stating it — sorting a line item into a category from
         its printed name, or reading a document's type from how it is
-        laid out. Return the COMPUTED form instead — ``computed: true``
-        and ``derived_from`` citing the field(s) you judged from — with
-        no ``locations``. The page never printed the category; you
-        concluded it.
+        laid out. Return an INFERRED value instead — ``method:
+        "inferred"`` and ``inputs`` citing the field(s) you judged from
+        — with no ``locations``. The page never printed the category;
+        you concluded it.
 
      Never copy a sibling field's verbatim text into an enum leaf's
      ``text``. If your evidence for the classification IS that sibling
      (the line item's printed name, a section heading), that is case
-     (b): cite it in ``derived_from`` rather than duplicating its
-     text.
+     (b): cite it in ``inputs`` rather than duplicating its text.
   2. Typed fields — dates as ISO (YYYY-MM-DD), numbers as plain
      unformatted digits ("1234.50", not "$1,234.50").
   3. Free-text fields — omit ``value``; the verbatim ``text`` is the
@@ -201,38 +203,79 @@ extraction_values_phase1_system: |-
      the parts. If the schema instead breaks the signature into
      ``signatures[].name`` and ``signatures[].title``, the labels go.
 
-  COMPUTED (REASONED) FIELDS. Some schema fields carry a ``prompt``
-  that describes a derivation rule — "Compute as the sum of ...",
-  "Derive from ...", "Count the number of ..." — rather than a place on
-  the page. For those fields, return the computed form instead of a
-  grounded value:
+  VALUES THE PAGE DOESN'T PRINT IN FULL. Every value says where it
+  came from. Most are read straight off the page: ``text`` plus
+  ``locations``, nothing more. The others take one of four forms.
+  ``inputs`` always lists the OTHER values in this same submission
+  that the result used. Write each one as its full dotted path from
+  the top of ``values``, then "=", then that value's ``text`` exactly
+  as you returned it: "CommencementDate=March 1, 2026",
+  "Accounts[0].LineItems[2].Amount=$27.05". Always write the full path,
+  even for a value inside the same entry ("Accounts[0].LineItems[2].Name",
+  not "Name"). Paths are zero-based and positional — LineItems[2] is the
+  third entry you returned — and the text after "=" is how each
+  reference is checked, so cite the text of the entry you actually used. Only reference values you are actually
+  returning, and list every one the result used.
+  When the result used printed text that NO schema field extracts,
+  quote that text verbatim in ``evidence`` instead, with the page it
+  is on — a contract that prints only a start date and a term gives
+  an end date like:
+    {"text": "2028-01-14", "value": "2028-01-14",
+     "method": "calculated",
+     "evidence": [
+       {"text": "January 15, 2026", "page_number": 1},
+       {"text": "a term of twenty-four (24) months", "page_number": 1}]}
+  Quote the shortest span that carries the fact, exactly as printed.
+  Never put a schema field's value in ``evidence`` — reference it in
+  ``inputs``.
 
-    {"text": "<display form>", "value": "<canonical result>",
-     "computed": true, "derived_from": ["<dotted path>", ...]}
+  a. PRINTED IN PART — the page prints some of the value and the rest
+     comes from elsewhere in the document. A rent schedule prints a
+     period start as "3/1" and the year comes from the commencement
+     date; a price prints only "$" and the premises address settles
+     which dollar. Return the printed part as ``text`` with its
+     ``locations``, the completed result as ``value``, and ``inputs``
+     (or ``evidence``) naming what completed it:
+       {"text": "3/1", "value": "2026-03-01",
+        "locations": [{"page_number": 2}],
+        "inputs": ["CommencementDate=March 1, 2026"]}
+     When the same text is printed several times (a "$" on every
+     amount), give a location for each.
+  b. CALCULATED — a deterministic calculation over other values that
+     anyone could redo: a sum, a count, date arithmetic. Typically the
+     field's ``prompt`` says "Compute as ...", "Count ...". No
+     ``locations``:
+       {"text": "$349.85", "value": "349.85", "method": "calculated",
+        "inputs": ["LineItems[0].Amount=$300.00",
+                   "LineItems[1].Amount=$49.85"]}
+  c. INFERRED — a value no spot on the page states, that you conclude
+     from evidence: a currency from the issuer's country, a category
+     from a line item's description. No ``locations``; ``inputs`` names
+     the evidence:
+       {"text": "CAD", "value": "CAD", "method": "inferred",
+        "inputs": ["PremisesAddress=100 King St W, Toronto"]}
+  d. DEFAULTED — the document says nothing and the field's ``prompt``
+     names a default to use in that case. No ``locations``, no
+     ``inputs`` and no ``evidence``:
+       {"text": "0", "value": "0", "method": "defaulted"}
 
-  1. ``derived_from`` lists the OTHER values in this same submission
-     the result was derived from, as dotted paths into ``values``
-     (e.g. "LineItems[0].Quantity", "LineItems[1].UnitPrice"). Only
-     reference values you are actually returning; list every input the
-     derivation used.
-  2. ``value`` is the canonical machine-readable result (e.g.
-     "349.85"); ``text`` is the display form (e.g. "$349.85").
-  3. Computed values carry NO ``locations`` — they are not read off
-     the page.
-  4. Use the computed form ONLY when the field's ``prompt`` says to
-     derive, compute, or reason. A value printed on the document that
-     you merely read is a grounded value with ``locations``, even if
-     you also verified it against a calculation. When a derivation
-     rule says to verify against a printed value and the two disagree,
-     follow the rule and return the computed result.
-  5. INFERRED values are computed values too — a value no single spot
-     on the page states, that you conclude from evidence (a currency
-     inferred from the issuer's country, a count of the entries in a
-     list). Cite the extracted values that constitute the evidence in
-     ``derived_from`` (e.g. the currency's evidence is the issuer name
-     you extracted; a count's is each entry it counts).
-     A computed value with an empty ``derived_from`` is an unauditable
-     claim — always name your evidence when it is in the submission.
+  Rules:
+  1. ``value`` is the canonical machine-readable result (e.g.
+     "349.85"); ``text`` is the printed part for (a) and the display
+     form of the result for (b)–(d).
+  2. ``method`` goes only on values with NO ``locations`` — (b), (c)
+     and (d). A value with ``locations`` never carries one.
+  3. Calculated and inferred values always name what they used, in
+     ``inputs`` or ``evidence``. One that names nothing is an
+     unauditable claim.
+  4. A value printed on the document that you merely read is a plain
+     grounded value, even if you also verified it against a
+     calculation. When a derivation rule says to verify against a
+     printed value and the two disagree, follow the rule and return the
+     calculated result.
+  5. Never use ``defaulted`` to fill in a value you simply couldn't
+     find — omit the field instead. Defaults come only from the
+     field's ``prompt``.
 
   Submit final results via the ``submit_values`` tool call. Do not
   invent values; if a field is not present in the document, omit it
@@ -266,7 +309,7 @@ extraction_values_phase1_system: |-
   Use dotted notation for nested arrays (e.g. ``"company.contacts"``).
 
 extraction_values_phase1_user: |-
-  Extract values from the attached PDF against this JSON Schema. Each grounded leaf value carries the verbatim ``text``, the normalized ``value`` where one exists (the classifying enum token for fields with a ``value_enum`` list, ISO dates, plain numbers — omit when the text can't be normalized), and ``locations`` that need only carry the page_number (1-indexed); a later phase will add bounding boxes. Fields whose ``prompt`` describes a derivation rule take the computed form instead — ``text``, ``value``, ``computed: true``, ``derived_from`` — with no locations. If any array-of-objects in the schema is laid out as a table on the page, also return a ``layout`` descriptor naming the columns in visual left-to-right order. Submit results via the submit_values tool call when done.
+  Extract values from the attached PDF against this JSON Schema. Each grounded leaf value carries the verbatim ``text``, the normalized ``value`` where one exists (the classifying enum token for fields with a ``value_enum`` list, ISO dates, plain numbers — omit when the text can't be normalized), and ``locations`` that need only carry the page_number (1-indexed); a later phase will add bounding boxes. A value the page doesn't print in full names the values it used in ``inputs``, each as ``<dotted path>=<that value's text>``: printed in part, it keeps its ``locations`` for the printed text; not printed at all, it has no locations and a ``method`` (``calculated``, ``inferred``, or ``defaulted`` with no inputs). If any array-of-objects in the schema is laid out as a table on the page, also return a ``layout`` descriptor naming the columns in visual left-to-right order. Submit results via the submit_values tool call when done.
 
   SCHEMA:
   {schema}
@@ -305,8 +348,8 @@ extraction_values_phase1_retry_chunked: |-
   Keep every individual call small — at most ~40 array entries.
   Completeness comes from the NUMBER of calls, not their size; array
   completeness above still applies across the whole sequence.
-  Computed fields that derive from array entries (sums, counts) go in
-  the first ``submit_values`` call — their ``derived_from`` paths may
+  Calculated fields that derive from array entries (sums, counts) go
+  in the first ``submit_values`` call — their ``inputs`` paths may
   reference entries appended afterwards.
 
 # Added to the phase-1 user prompt, ahead of the PDF, only when the provider
@@ -355,6 +398,51 @@ extraction_values_phase1_nudge_continue: |-
 # {needs_locating} (dgml_core.grounded).
 extraction_values_phase3_system: |-
   You are given one page of a PDF (as an image) plus the OCR words on
+  that page, and a list of values that need to be located on this page.
+  For each value, name the OCR words it is printed as, via the
+  ``submit_locations`` tool call. Code turns the words you name into
+  bounding boxes — you never write coordinates.
+
+  The OCR words are given as a TOON table: a header line
+  ``words[N]{idx,text,left,top,right,bottom}:`` naming the N columns,
+  followed by one comma-separated row per word. Each row is
+  ``idx,text,left,top,right,bottom`` where ``idx`` is the word's OCR
+  index, ``text`` is the word (double-quoted when it contains a comma,
+  quote, or other special character), and ``left,top,right,bottom`` are
+  its position in image pixels, there to tell rows and columns apart.
+  There is exactly one row per word.
+
+  WORD CONTRACT — non-negotiable:
+
+  1. Answer each id with ``words``: a list of ``[first_idx, last_idx]``
+     ranges of the ``idx`` column, inclusive. ``[412, 412]`` is the
+     single word 412; ``[412, 414]`` is words 412, 413 and 414.
+  2. One range per visual line. A value that wraps across two lines
+     gets two ranges, in reading order.
+  3. Name exactly the words of the value — the words whose ``text``
+     spells it, e.g. "$", "318", ".", "40" for "$318.40" — not its
+     label, and not the rest of the row.
+  4. When the same text is printed in several places, pick the
+     occurrence that is this value: the right table row and column, the
+     right section. The positions and the page image help you tell them
+     apart.
+
+  The KNOWN_LOCATIONS section lists values on this page that have
+  already been located by another pass. Use them as row anchors —
+  unmatched fields in the same table row should share a y band with
+  their already-matched siblings.
+
+  ID DISCIPLINE:
+  - For every id in NEEDS_LOCATING, return exactly one ``locations``
+    entry keyed by that id.
+  - Do NOT echo ids that are not in NEEDS_LOCATING. Do NOT invent ids.
+  - Do NOT change the value text — your only job is to name its words.
+
+# The pixel contract, kept for the one case neither alternative covers: a
+# page with no OCR words whose image size is unknown, so neither word ranges
+# nor the 0-1000 grid (which needs the size to scale) can be used.
+extraction_values_phase3_system_pixels: |-
+  You are given one page of a PDF (as an image) plus the OCR words on
   that page with their bounding boxes, and a list of values that need
   to be located on this page. For each value, return its bounding box
   (or several if the text wraps across visual lines) via the
@@ -398,7 +486,7 @@ extraction_values_phase3_system: |-
   - Do NOT change the value text — your only job is to attach bboxes.
 
 extraction_values_phase3_user: |-
-  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool. The OCR words table below carries pixel-accurate positions; the page image is provided as a visual fallback.{image_size}
+  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool, naming the value's words as ``[first_idx, last_idx]`` ranges of the idx column — one range per visual line. The positions in the table and the page image are there to tell repeated text apart.{image_size}
 
   OCR_WORDS as a TOON table — a header line names the columns, then one comma-separated row per word (idx = the word's OCR index; left,top,right,bottom = its pixel bounding box). All words are on page {page_number}:
   {ocr_words}
@@ -409,6 +497,18 @@ extraction_values_phase3_user: |-
   NEEDS_LOCATING (return exactly these ids):
   {needs_locating}
 
+
+extraction_values_phase3_user_pixels: |-
+  Locate every NEEDS_LOCATING value on page {page_number}. Return one entry per id via the submit_locations tool. The OCR words table below carries pixel-accurate positions; the page image is provided as a visual fallback.{image_size}
+
+  OCR_WORDS as a TOON table — a header line names the columns, then one comma-separated row per word (idx = the word's OCR index; left,top,right,bottom = its pixel bounding box). All words are on page {page_number}:
+  {ocr_words}
+
+  KNOWN_LOCATIONS on page {page_number} (already located, for row anchoring — do NOT include these in your output):
+  {known_locations}
+
+  NEEDS_LOCATING (return exactly these ids):
+  {needs_locating}
 # Phase 3 for a page that has no OCR words (a scan added in digital mode, a
 # page whose text layer is empty). There is no word table to union, so the
 # model reads positions off the image on a 0-1000 grid (Gemini's native box

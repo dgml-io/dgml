@@ -841,6 +841,32 @@ _DIALECT_SCHEMA: dict[str, object] = {
 }
 
 
+def test_dialect_leaf_with_inputs_and_method_is_a_leaf() -> None:
+    """A leaf schema carrying the 0.71 provenance keys (``inputs``,
+    ``method``) is still recognized as one extracted value, not a container."""
+    from dgml_core.extraction_schema import json_schema_to_vocabulary
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "period_months": {
+                "title": "PeriodMonths",
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "value": {"type": "integer"},
+                    "inputs": {"type": "array", "items": {"type": "string"}},
+                    "method": {"type": "string", "enum": ["calculated", "inferred", "defaulted"]},
+                },
+                "required": ["text"],
+            }
+        },
+    }
+    vocab = json_schema_to_vocabulary(schema, namespace_uri="urn:x")
+    (tag,) = vocab.roots
+    assert (tag.name, tag.kind, tag.value_type) == ("PeriodMonths", "field", "integer")
+
+
 def test_standard_dialect_schema_ingests() -> None:
     from dgml_core.extraction_schema import json_schema_to_vocabulary
 

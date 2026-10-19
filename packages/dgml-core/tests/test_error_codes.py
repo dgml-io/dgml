@@ -54,7 +54,6 @@ CLI_ONLY_CODES = frozenset(
         # `docset generate` / `extraction` move into `dgml_core`.
         "EMPTY_DOCSET",
         "NO_FILES",
-        "VALUES_NOT_FOUND",
     }
 )
 

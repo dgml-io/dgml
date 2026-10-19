@@ -100,7 +100,7 @@ def test_no_schema_is_refused_first(workspace: Workspace, monkeypatch: pytest.Mo
         extract_file(workspace, ds_id, "fileaaaaaaaa")
 
 
-def test_uses_workspace_config_and_defaults_stats_off(
+def test_uses_workspace_config_and_defaults_stats_and_usage_off(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ds_id = _docset(workspace)
@@ -109,7 +109,7 @@ def test_uses_workspace_config_and_defaults_stats_off(
 
     result = extract_file(workspace, ds_id, "fileaaaaaaaa")
 
-    assert seen == {"config": _CONFIG, "write_stats": False, "debug": False}
+    assert seen == {"config": _CONFIG, "write_stats": False, "record_usage": False}
     assert result.model == "test/values-model"
 
 
@@ -137,3 +137,29 @@ def test_invalid_effort_is_refused(workspace: Workspace, monkeypatch: pytest.Mon
     _use_config(monkeypatch)
     with pytest.raises(GroundedConfigInvalid, match="values_effort"):
         extract_file(workspace, ds_id, "fileaaaaaaaa", values_effort="turbo")
+
+
+def test_locations_effort_override(workspace: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    ds_id = _docset(workspace)
+    _use_config(monkeypatch)
+    seen = _capture_extract(monkeypatch)
+
+    extract_file(workspace, ds_id, "fileaaaaaaaa", locations_effort="low")
+    assert seen["config"].locations_reasoning_effort == "low"
+    # The values effort is untouched by a locations override.
+    assert seen["config"].values_reasoning_effort == _CONFIG.values_reasoning_effort
+
+    extract_file(workspace, ds_id, "fileaaaaaaaa", locations_effort="default")
+    assert seen["config"].locations_reasoning_effort is None
+
+    extract_file(workspace, ds_id, "fileaaaaaaaa")
+    assert seen["config"].locations_reasoning_effort == _CONFIG.locations_reasoning_effort
+
+
+def test_invalid_locations_effort_is_refused(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds_id = _docset(workspace)
+    _use_config(monkeypatch)
+    with pytest.raises(GroundedConfigInvalid, match="locations_effort"):
+        extract_file(workspace, ds_id, "fileaaaaaaaa", locations_effort="turbo")

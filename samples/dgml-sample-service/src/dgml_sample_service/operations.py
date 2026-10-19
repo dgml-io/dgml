@@ -13,8 +13,9 @@
 """The DGML operations the service performs — every one a ``dgml_core`` library call.
 
 Nothing here shells out to the ``dgml`` CLI. The CLI's composite flows (``file add
---auto-classify``, ``extraction get-values``) are re-composed from the same public
-library calls, the way an embedding host has to.
+--auto-classify``) are re-composed from the same public library calls, the way an
+embedding host has to; reading a pair's DGML and values uses the library's own
+``read_dgml`` and ``get_extracted_values``, as ``extraction get-values`` does.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import Any
 from dgml_core import (
     AddFileResult,
     ClassifyMode,
+    DgmlNotFound,
     DocSetStore,
     FileStore,
     TextMode,
@@ -34,8 +36,10 @@ from dgml_core import (
     add_file_and_extract,
     classify_file,
     extract_file,
+    get_extracted_values,
     layout,
     load_classification_config,
+    read_dgml,
 )
 
 
@@ -140,18 +144,6 @@ def generate_schema(ws: Workspace, docset_id: str, file_ids: list[str]) -> dict[
     return {"docset_id": docset_id, "schema": rnc, "model": config.schema_model}
 
 
-def dgml_xml_key(ws: Workspace, docset_id: str, file_id: str) -> str | None:
-    """The pair's ``<stem>.dgml.xml`` blob key, if one exists. Mirrors the CLI's
-    ``extraction get-values``: the single ``*.dgml.xml`` blob in the pair's prefix
-    (a ``.dgml.grounded.xml`` sibling does not end in ``.dgml.xml``)."""
-    keys = sorted(
-        k
-        for k in ws.blobs.list_blobs(layout.docset_pair_prefix(docset_id, file_id))
-        if k.endswith(layout.DGML_XML_SUFFIX)
-    )
-    return keys[0] if keys else None
-
-
 def files_with_dgml(ws: Workspace, docset_id: str) -> set[str]:
     """The ids of the docset's files that have a ``.dgml.xml`` — one listing for the
     whole docset rather than one per file."""
@@ -166,24 +158,24 @@ def files_with_dgml(ws: Workspace, docset_id: str) -> set[str]:
 
 def read_pair(ws: Workspace, docset_id: str, file_id: str) -> dict[str, Any]:
     """A pair's DGML XML and its extracted values (``{tag: {text, value?, locations}}``,
-    projected through the docset schema's vocabulary when it has one)."""
-    from dgml_core.extraction_schema import parse_rnc
-    from dgml_core.extraction_xml import dgml_xml_to_values, has_document_tree, has_extraction
+    projected through the docset schema's vocabulary when it has one).
 
-    store = DocSetStore(ws)
-    key = dgml_xml_key(ws, docset_id, file_id)
-    xml = ws.blobs.get_blob(key).decode("utf-8") if key else None
+    ``read_dgml`` raises ``FileNotFound`` for a file that isn't assigned to the
+    docset; a pair with no DGML yet comes back with ``xml`` and ``values`` unset."""
+    from dgml_core.extraction_xml import has_document_tree, has_extraction
+
+    try:
+        doc = read_dgml(ws, docset_id, file_id)
+    except DgmlNotFound:
+        doc = None
+    xml = doc.xml.decode("utf-8") if doc else None
     extracted = bool(xml and has_extraction(xml))
-    values = None
-    if xml and extracted:
-        vocab = parse_rnc(store.get_schema(docset_id)) if store.has_schema(docset_id) else None
-        values = dgml_xml_to_values(xml, vocab=vocab)
     return {
         "docset_id": docset_id,
         "file_id": file_id,
-        "xml_key": key,
+        "xml_key": doc.key if doc else None,
         "xml": xml,
         "has_extraction": extracted,
         "has_document_tree": bool(xml and has_document_tree(xml)),
-        "values": values,
+        "values": get_extracted_values(ws, docset_id, file_id) if extracted else None,
     }

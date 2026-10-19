@@ -62,6 +62,18 @@ def test_none_fields_are_omitted_so_loader_defaults_apply() -> None:
     assert cfg.sections == {ConfigSection.GROUNDED: {"values_model": "x/y"}}
 
 
+def test_grounded_renders_both_reasoning_efforts() -> None:
+    cfg = _build(
+        grounded=Grounded(values_reasoning_effort="low", locations_reasoning_effort="default")
+    )
+    assert cfg.sections == {
+        ConfigSection.GROUNDED: {
+            "values_reasoning_effort": "low",
+            "locations_reasoning_effort": "default",
+        }
+    }
+
+
 def test_every_section_renders_its_loader_keys() -> None:
     cfg = _build(
         models=Models(

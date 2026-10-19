@@ -519,14 +519,39 @@ skips the debug-only cache artifacts (raw LLM responses,
 `usage.jsonl` cost/token rows. Pass the global `--debug` flag
 (`uv run dgml --debug docset generate "$ds"`) to retain those artifacts and to
 record per-operation cost telemetry to `<workspace>/usage.jsonl` (this gating
-applies to every LLM command — classify, cluster, generate). Coverage summaries
-still print on stderr under `--verbose` regardless.
+applies to every LLM command — classify, cluster, generate, extraction
+extract). `--debug` also writes a value extraction's per-file
+`extraction_stats.json` (phase timings, cost, match counts) from `docset
+add-file`, auto-classifying `file add`, `cluster`, and `extraction extract`.
+Coverage summaries still print on stderr under `--verbose` regardless.
 
 **Parallelism.** `--max-parallel-calls` transcribes that many documents
 concurrently (windows *within* a document stay serial, since each window
 sees the previous window's tail). The calls are network-bound, so threads
 overlap the latency. Raise it on high-RPM paid tiers; set `1` to serialize
 if you hit 429s.
+
+**Batch mode (half price, slow).** For offline or bulk runs where nobody is
+waiting on the result, add `--batch`. It sends transcription, roster
+planning, concept descriptions, OCR image style (when `[style]` is enabled)
+and the semantic-link pass through the provider's batch API at half the token
+price; results can take up to 24 hours per wave, and a long document needs
+one wave per window. Labeling batches too under a closed `--schema-path`
+vocabulary (every document at once); under an open or `--extend-schema`
+vocabulary it stays synchronous, because each document is labeled against
+the tags the documents before it coined. The output is the same as a
+synchronous run. Only `anthropic/` models have a batch backend; any other
+model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
+anything. The payload's `batch.stages` block reports what each stage did,
+including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report
+the saving without `--debug`.
+
+```bash
+uv run dgml docset generate "$ds" --batch --schema-path ./po-tags.json | jq .batch
+```
+
+Never use `--batch` on an interactive request: use it for nightly or bulk
+ingestion.
 
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
@@ -673,9 +698,12 @@ uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 #    builds the tree and carries the dg:extraction over (full-extraction).
 #    NOTE: once the schema is set, assigning a file (docset add-file /
 #    --auto-classify / cluster into an existing docset) auto-extracts it —
-#    check the payload's `extraction` block; run `extract` manually only for
+#    check the payload's `extraction` block (`error` on a soft failure;
+#    `usage.cost_usd` is the run's cost, reported even without --debug and
+#    even when the extraction failed); run `extract` manually only for
 #    files assigned before the schema existed or to re-extract. The file must
 #    already be assigned to the docset (FILE_NOT_FOUND otherwise).
+uv run dgml docset add-file "$fid" --docset "$ds" | jq '.extraction | {error, cost: .usage.cost_usd}'
 uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_key}'
 
 # 3) Read them back. Default is values-shape JSON (projected from dg:extraction);
@@ -693,19 +721,36 @@ grounded value carries a `dg:origin` box back to `page_images/page_N.png`.
 
 A schema field's `## Prompt:` may describe a **derivation rule** instead of a
 place on the page ("Compute as sum of Quantity × UnitPrice for each LineItem").
-Such fields come back *computed* (spec §13): in values JSON as
-`{text, value, computed: true, derived_from: [dotted paths]}` with no
-`locations`; in the XML as `dg:origin="computed"` + `dg:value` +
-`dg:itemprop="computedFrom"`/`dg:href` pointing at the source elements (which
-get `xml:id`s). When writing a derivation `## Prompt:`, make every input it
-mentions an extracted field of its own — `dg:href` can only point at extracted
-elements, so an un-extracted input leaves the computed value unverifiable
-(unresolvable refs are counted as `matching.dropped_refs` in
-`extraction_stats.json`, and `dgml check` flags source-less computed fields
-as `computed_field_unattributed`). Errors are the
+Provenance follows DGML 0.71. In values JSON a leaf carries `locations` (where
+its own text is printed), `inputs` (dotted paths of the values it used), and,
+when the page doesn't print it, `method`: `calculated`, `inferred`, or
+`defaulted` (no inputs). The XML carries the same as `dg:origin` (boxes only),
+`dg:inputs` (`#id; #id`, with the targets given `xml:id`s) and `dg:method`. A
+value printed only in part, like a "3/1" period start whose year comes from
+the commencement date, keeps its boxes **and** names its `inputs`. A box whose
+words on the page's text layer don't read as its value moves to the nearest exact
+match on its line (`matching.snapped_boxes`) or is stripped
+(`matching.rejected_boxes`), and a printed value left with no box is dropped
+rather than written without `dg:origin` (`matching.dropped_unboxed_values`). Printed
+text a value used that no schema field extracts comes back as `evidence`
+(`[{text, locations}]`) and is written as an anonymous `dg:chunk` next to the
+field. When writing a derivation `## Prompt:`, prefer making every input it
+mentions an extracted field of its own. The model cites the text it read with
+each input, and extraction re-points a miscounted array index at the matching
+entry (`matching.repaired_inputs`). Unresolvable or unmatched inputs, and
+evidence that couldn't be boxed, are counted as `matching.dropped_inputs` in
+`extraction_stats.json`. Values with nothing to verify them by (no box, no
+default, nothing they used) are not written, counted as
+`matching.unsupported_values`. `dgml check` reports `method_misplaced`,
+`inputs_dangling` and `inputs_cycle`, and `value_unsupported` for a 0.7
+computed element with no `dg:href`. 0.7 files (`dg:origin="computed"` +
+`dg:href`) still read, with the href targets as inputs. Errors are the
 usual envelope: `SCHEMA_NOT_FOUND` (no schema set), `GUIDANCE_NOT_FOUND`
 (no guidance set), `NO_FILES` (empty docset, no `--from-file`),
-`VALUES_NOT_FOUND` (extract not run yet), `GROUNDED_CONFIG_MISSING` (no
+`DGML_NOT_FOUND` (from `get-values`: nothing generated or extracted yet),
+`VALUES_NOT_FOUND` (from `get-values`: generated but extract not run yet),
+`FILE_NOT_FOUND` (from `get-values`:
+the file isn't assigned to that DocSet), `GROUNDED_CONFIG_MISSING` (no
 `grounded` config). See
 [cli-reference.md](../../../docs/cli-reference.md) for full payloads.
 
