@@ -152,6 +152,29 @@ def test_all_sync_reports_each_file(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert all(r["status"] == "ok" and r["field_count"] == 0 for r in payload["results"])
 
 
+@pytest.mark.parametrize("extra", [[], ["--batch"]], ids=["sync", "batch"])
+def test_every_file_failing_exits_2_with_the_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], fakes: _Fakes, extra: list[str]
+) -> None:
+    fids = ["fgone0000001", "fgone0000002"]
+    ws, ds_id = _seed_extraction(tmp_path, capsys, fids)
+    for fid in fids:  # no source PDF: each file fails at setup, before any request
+        Workspace(root=ws).blobs.delete_blob(layout.file_source_key(fid, "doc.pdf"))
+    fakes.install("anthropic", _values_response)
+    with patch("litellm.completion", side_effect=AssertionError("no request expected")):
+        rc = main(_ws_args(ws) + ["extraction", "extract", ds_id, "--all", *extra])
+    assert rc == 2
+    payload = _read_stdout(capsys)  # the full payload still lands on stdout
+    assert payload["summary"] == {"total": 2, "ok": 0, "failed": 2}
+    assert all(r["status"] == "failed" for r in payload["results"])
+
+
+def test_all_on_an_empty_docset_exits_0(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    ws, ds_id = _seed_extraction(tmp_path, capsys, [])
+    assert main(_ws_args(ws) + ["extraction", "extract", ds_id, "--all"]) == 0
+    assert _read_stdout(capsys)["summary"] == {"total": 0, "ok": 0, "failed": 0}
+
+
 def test_all_batch_matches_sync_and_adds_a_batch_block(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], fakes: _Fakes
 ) -> None:
@@ -511,7 +534,9 @@ def test_extract_batch_unset_values_key_reports_each_file_like_sync(
     results = []
     for extra in ([], ["--batch"]):
         with patch("litellm.completion", side_effect=_no_request):
-            assert main(_ws_args(ws) + ["extraction", "extract", ds_id, "--all", *extra]) == 0
+            assert (
+                main(_ws_args(ws) + ["extraction", "extract", ds_id, "--all", *extra]) == 2
+            )  # every file failed
         results.append(_read_stdout(capsys)["results"])
     assert results[1] == results[0]
     assert all(

@@ -2865,6 +2865,12 @@ def _extract_many(
     ``--batch`` both LLM phases go through the provider's batch API
     (:func:`dgml_core.grounded.extract_values_many`) and the payload gains a
     ``batch`` block; the per-file entries are the same either way.
+
+    Exits ``0`` once the run completes, unless EVERY file failed: then the
+    payload is still emitted and the exit is ``2`` (as ``dgml check``: the run
+    finished, the outcome did not), so a script can detect a total failure
+    without parsing the summary. An empty run (``--all`` on an empty DocSet)
+    exits ``0``.
     """
     from dgml_core.grounded import extract_values_many, values_batch_stages
 
@@ -2942,7 +2948,8 @@ def _extract_many(
     if batch_block is not None:
         payload["batch"] = batch_block
     _emit(payload, fmt)
-    return 0
+    summary = payload["summary"]
+    return 2 if summary["total"] and summary["failed"] == summary["total"] else 0
 
 
 def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:

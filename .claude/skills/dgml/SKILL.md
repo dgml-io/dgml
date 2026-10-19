@@ -730,7 +730,9 @@ uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count
 
 #    Many files at once: name several ids or pass --all. Each file gets its own
 #    `results` entry and a failed file never aborts the others — check
-#    `.summary.failed` and each entry's `status`/`error`.
+#    `.summary.failed` and each entry's `status`/`error`. Exit is 0 even on a
+#    partial failure; it is 2 (payload still on stdout) only when EVERY file
+#    failed.
 #    Add --batch when nobody is waiting on the answer (a backfill, a nightly
 #    re-extract): both LLM phases go through the provider's batch API at about
 #    half price, but results take minutes to hours (up to 24h). Only Anthropic

@@ -28,7 +28,9 @@ flag-driven (no interactive prompts) and idempotent where reasonable.
 - Exit codes:
   - `0` — success
   - `1` — error (anything in the `error` envelope)
-  - `2` — `dgml check` ran but found issues
+  - `2` — the command ran and printed its payload, but the outcome is not
+    clean: `dgml check` found issues, or a multi-file `extraction extract`
+    failed on every file
 
 `--format text` switches to a basic key/value text format if a human is
 driving the CLI directly.
@@ -1495,7 +1497,11 @@ needs grounding.
 With more than one file id, or `--all` (every file in the DocSet), the command
 extracts each file independently and returns one entry per file. A file that
 fails is reported in its entry (`status: failed` with an `{code, message}`
-error) and the others still run; the command exits `0` once the run completes.
+error) and the others still run. The command exits `0` once the run completes
+— unless **every** file failed, when it exits `2` with the same payload on
+stdout, so a script can detect a total failure from the exit code alone. A
+partial failure exits `0` (read `.summary.failed`), and so does `--all` on a
+DocSet with no files.
 A single file id keeps the single-file output above, with or without `--batch`:
 under `--batch` it gains only the `batch` block below, and a failure is the
 same top-level error envelope a synchronous single-file run gives. Passing both
