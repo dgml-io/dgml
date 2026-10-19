@@ -229,12 +229,9 @@ _LOCATIONS_REASONING_EFFORT = _DEFAULT_REASONING_EFFORT
 _PHASE3_GRID_REASONING_EFFORT = "medium"
 
 
-# HTTP timeout for a single litellm call. The default in litellm is
-# in the few-minutes range and isn't long enough for high-reasoning
-# extractions on a multi-page document (observed real-world timeouts
-# at ~13min on a 7-page ledger with reasoning=high). 30 min gives
-# the model room to think through a long table without us cutting
-# the connection.
+# Long grounded calls stream automatically through LLMConfig. The 30-minute
+# value selects streaming rather than acting as the request timeout; streamed
+# reads use the shorter inter-chunk timeout so a stalled socket retries.
 _DEFAULT_TIMEOUT_SECONDS = 1800
 
 # Default number of files the schema-generation step samples from a
