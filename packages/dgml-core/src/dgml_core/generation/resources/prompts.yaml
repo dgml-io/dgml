@@ -73,8 +73,93 @@
   value field is empty and its INLAND MARINE option carries the printed
   mark, so it is prefixed *; the P line's address types its line breaks as
   \n; the I line keeps its printed "(a)" enumerator in the lim field.)
+"transcribe_system_lines": |
+  You assign STRUCTURE to the numbered lines of document pages. You do not
+  copy text: the lines are given to you, numbered L1, L2, ... in reading
+  order, next to the page images. You answer with typed block lines whose
+  text fields are LINE REFERENCES, and every numbered line must end up in
+  exactly one block line.
+
+  Block lines (the only ones) — one block per line, fields separated by ONE
+  real tab character; a reference is L<n> for one line, L<a>-L<b> for a run
+  of consecutive lines, L<a>+L<b> for a table row wrapped over two lines:
+  - H<level><TAB>lim<TAB>L<a>[-L<b>]  — a section/clause/rule heading; level
+                                        1-6 attached to the H ("H2"); lim is
+                                        the PRINTED enumerator ("2.1",
+                                        "ITEM 3", "(a)"), empty if none
+  - P<TAB>L<a>[-L<b>]                 — a paragraph of prose (all its lines)
+  - I<TAB>lim<TAB>L<a>[-L<b>]         — one list/enumeration item
+  - R<TAB>L<a>[+L<b>]                 — one table row; its cells are read off
+                                        the page geometry, you never type them
+  - F<TAB>lim<TAB>L<a>                — one label/value form line
+  - O<TAB>lim<TAB>label<TAB>value<TAB>option<TAB>option…
+                                      — a checkbox/radio choice group, typed
+                                        out (rare); checked options prefixed *
+  - X<TAB>L<a>[-L<b>]                 — page decorations: page numbers,
+                                        running headers/footers, "continued"
+  - C<TAB>L<a>[-L<b>]                 — FIRST line only: these lines finish
+                                        the previous window's last block
+
+  Rules:
+  1. Account for EVERY numbered line exactly once: in a block line, or in an
+     X line if it is a page decoration. Never leave a line out, never use
+     one twice.
+  2. A paragraph is ALL the lines of that paragraph, as one P line with a
+     span (P<TAB>L13-L19), not one P per line. A heading is usually one line.
+  3. lim holds the printed enumerator exactly as shown at the start of the
+     line; it is removed from the text for you.
+  4. Heading levels reflect the document's own hierarchy: deeper numbering
+     means a deeper level, consistently (if "2" is level 2 then "2.1" is
+     level 3); lettered or roman sub-headings sit one level below the
+     heading that contains them.
+  5. A line with cells (shown with "|") inside a visibly aligned table is an
+     R line; a table's header line is an R line too. A label wrapped under
+     its row's figures is the same row: R<TAB>L20+L21.
+  6. A paragraph that begins with a printed enumerator and has a sibling in
+     the same series ("(a) …" then "(b) …") is one I line per entry.
+  7. F is only for label/value lines whose value is short data (a name, a
+     date, an amount). A numbered clause with sentences is H plus P lines.
+  8. Output block lines only — no JSON, no code fences, no prose, no
+     message about the pages. If a line's text is wrong or missing in the
+     listing, still assign the line; never retype it.
+
+  Example (real tabs between fields), for lines
+    L1  BlackRock, Inc. 2013 Form 10-K          L5  Item 1. Business
+    L2  PART I                                   L6  BlackRock, Inc. is a leading
+    L3  Item 1. Business  <- running header      L7  provider of investment
+    L4  (in millions) | 2013 | 2012 | 2011       L8  advisory services.
+  the answer is
+
+  X	L1
+  H1		L2
+  X	L3
+  R	L4
+  H2	Item 1.	L5
+  P	L6-L8
+
+"transcribe_lines_header": |-
+  Assign structure to the numbered lines of pages {first}-{last} of {total}.
+  The attached document is exactly those pages; the page numbers printed on
+  them may differ and are irrelevant. Below the instructions is the numbered
+  listing of their lines ({n_lines} lines); account for every one of them.
+"transcribe_lines_remaining": |-
+  Assign structure to the REMAINING numbered lines of pages {first}-{last} of
+  {total}: {missing} ({n_lines} lines). The other lines of these pages are
+  already done; answer with block lines for these lines only, every one of
+  them exactly once (X for a page decoration), keeping their ids as listed.
+"transcribe_lines_retry": |-
+  IMPORTANT: your previous answer left these lines unaccounted for:
+  {missing}. Every numbered line must appear in exactly one block line (or
+  an X line if it is a page decoration). Answer again with the complete set
+  of block lines for ALL {n_lines} lines.
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
+  The attached document is exactly those pages, cut out of the {total}-page
+  original: its first page IS page {first} and its last IS page {last}. Page
+  numbers printed in headers or footers may differ from these — ignore them;
+  never ask for other pages or say that pages are missing. Transcribe every
+  attached page in full, in order. The output will be long; that is expected —
+  do not shorten, summarise, or offer a narrower span.
 "transcribe_window_context": |-
   The pages before yours ended in this structure (shown only so you keep
   numbering and levels consistent — transcribe your OWN pages in full):
@@ -90,7 +175,9 @@
   on pages {first}-{last} — it skipped most of their content. Do not resume
   from where a previous section seemed to end: transcribe ALL content of ALL
   pages {first}-{last}, in reading order, starting from the top of page {first},
-  without skipping any page or clause.
+  without skipping any page or clause. The attachment IS pages {first}-{last};
+  printed page numbers are irrelevant. Output block lines only — never a
+  message about the pages, their numbering, or the length of the task.
 "label_system": |
   You assign SEMANTIC CONCEPTS to transcribed document blocks. The documents
   belong to one document set; your single most important job is to use the

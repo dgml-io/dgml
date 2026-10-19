@@ -438,6 +438,12 @@ def test_thinking_can_be_set_back_to_adaptive(workspace: Workspace) -> None:
     assert load_generation_config(workspace).thinking == "adaptive"
 
 
+def test_thinking_between_tools_is_accepted(workspace: Workspace) -> None:
+    """The off switch for Claude Sonnet 5.5, which rejects "disabled"."""
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "between_tools"})
+    assert load_generation_config(workspace).thinking == "between_tools"
+
+
 def test_invalid_thinking_mode_is_a_config_error(workspace: Workspace) -> None:
     """Caught at load time, where the message can name the file, rather than as
     a provider 400 after transcription has already been paid for."""
@@ -452,3 +458,22 @@ def test_thinking_survives_a_model_override(workspace: Workspace) -> None:
     _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "adaptive"})
     cfg, _source = resolve_generation_config(workspace, model=MODEL, label_model=LABEL_MODEL)
     assert cfg.thinking == "adaptive"
+
+
+# ── [generation] transcription ──────────────────────────────────────────────
+
+
+def test_transcription_defaults_to_text(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    assert load_generation_config(workspace).transcription == "text"
+
+
+def test_transcription_can_be_lines(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "transcription": "lines"})
+    assert load_generation_config(workspace).transcription == "lines"
+
+
+def test_invalid_transcription_mode_is_a_config_error(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "transcription": "ids"})
+    with pytest.raises(GenerationConfigInvalid, match=r"generation\.transcription"):
+        load_generation_config(workspace)

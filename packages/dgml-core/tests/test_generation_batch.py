@@ -180,6 +180,8 @@ def _run(
     logs: list[str] | None = None,
     pages: dict[str, int] | None = None,
     label_errors: dict[str, dict[str, str]] | None = None,
+    transcription: str = "text",
+    page_text_dirs: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Run convert_batch once; return everything observable about the run."""
     tmp.mkdir(parents=True, exist_ok=True)
@@ -209,6 +211,8 @@ def _run(
             vocab=vocab,
             progress=(logs.append if logs is not None else None),
             batch=batch_opts,
+            transcription=transcription,
+            page_text_dirs=page_text_dirs,
         ),
         on_output=outputs.__setitem__,
         on_error=errors.__setitem__,
@@ -696,3 +700,51 @@ def test_batch_package_stays_off_the_default_import_path() -> None:
     assert litellm_on_light_path == "False"
     assert batch_on_light_path == "False"
     assert batch_on_pipeline_path == "False"
+
+
+def test_lines_mode_reaches_the_batch_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
+) -> None:
+    """``transcription="lines"`` is honored under ``--batch`` exactly as it is
+    synchronously: the window is asked with the lines prompt and its blocks
+    carry the text layer's words, and the two runs' outputs are identical.
+
+    Guards the batch call site in ``pipeline.py``: it builds ``transcribe_steps``
+    itself, so an option threaded only through ``transcribe_document`` would be
+    silently ignored there and the batch run would fall back to the text format
+    with no error.
+    """
+    from .test_lines import PAGES, _write_page_text
+
+    base = make_answer()
+    systems: list[str] = []
+
+    def answer(kwargs: dict[str, Any]) -> Any:
+        system = _system_text(kwargs)
+        if system == transcribe_mod.SYSTEM_PROMPT_LINES:
+            systems.append("lines")
+            # Every line accounted for (ids are per the listing of PAGES[1]).
+            return _reply(
+                "X\tL1\nH1\tITEM 1.\tL2\nP\tL3-L4\nR\tL5\nR\tL6\nR\tL7\n"
+                "I\t(a)\tL8\nI\t(b)\tL9\nX\tL10"
+            )
+        if system == transcribe_mod.SYSTEM_PROMPT:
+            systems.append("text")
+        return base(kwargs)
+
+    text_layers = {"alpha.pdf": _write_page_text(tmp_path, {1: PAGES[1]})}
+    common: dict[str, Any] = {
+        "pages": {"alpha.pdf": 1},
+        "transcription": "lines",
+        "page_text_dirs": text_layers,
+    }
+    sync = _run(tmp_path / "sync", answer, monkeypatch, batch=None, **common)
+    n_sync = len(systems)
+    batch = _run(tmp_path / "batch", answer, monkeypatch, batch=fake_provider, **common)
+
+    assert systems[:n_sync] == ["lines"], systems  # the sync run asked in lines mode
+    assert systems[n_sync:] == ["lines"], systems  # and so did the batch run
+    assert "BUSINESS" in batch["outputs"]["alpha.pdf"]  # a heading copied from the page
+    assert "alpha_w01_lines.txt" in batch["files"]  # the listing the window was shown
+    assert batch["outputs"] == sync["outputs"]
+    assert batch["stats"]["transcribe"]["batch_ok"] >= 1

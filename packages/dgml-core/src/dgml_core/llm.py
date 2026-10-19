@@ -138,8 +138,13 @@ ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
 
 # Accepted values for `LLMConfig.thinking`, Anthropic's extended-thinking switch.
 #
-#   "disabled" — no thinking tokens.
-#   "adaptive" — the model decides per request (Claude 4.6+/5 only).
+#   "disabled"      — no thinking tokens.
+#   "adaptive"      — the model decides per request (Claude 4.6+/5 only).
+#   "between_tools" — thinking only between tool calls, i.e. off for a plain
+#                     text reply. This is how Claude Sonnet 5.5 turns thinking
+#                     off: it rejects `{"type": "disabled"}` with a 400 ("To turn
+#                     thinking off..."), and accepts "between_tools" at effort
+#                     high or below, with no other field beside `type`.
 #
 # OMITTING the field is not the same as "disabled": Claude 4.6+/5 models think
 # adaptively when a request carries no `thinking`, so a caller that never sets it
@@ -149,7 +154,7 @@ ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
 # `{"type": "enabled", "budget_tokens": N}` is deliberately not offered here:
 # claude-sonnet-5 rejects `budget_tokens`. A caller that needs it can pass the
 # whole dict through `LLMConfig.extra`.
-ANTHROPIC_THINKING_MODES = ("disabled", "adaptive")
+ANTHROPIC_THINKING_MODES = ("disabled", "adaptive", "between_tools")
 
 # OpenAI families that accept ONLY the default temperature (1). Prefix-matched
 # so future point releases are covered automatically; see

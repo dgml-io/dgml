@@ -3200,15 +3200,30 @@ def _add_generate_subparser(
     # why the ceiling is 64000 rather than 32000.
     gen.add_argument("--max-tokens", type=int, default=64000)
     gen.add_argument(
+        "--transcription",
+        choices=["text", "lines"],
+        default=None,
+        help=(
+            "How Pass A is asked for a window. 'text': the model copies the text "
+            "into typed block lines. 'lines': the model assigns structure to the "
+            "numbered lines of the page's text layer and the text is copied from "
+            "the page (a tenth of the output tokens, nothing to hallucinate); "
+            "pages without a text layer fall back to 'text'. Overrides "
+            "[generation] transcription, whose default is 'text'."
+        ),
+    )
+    gen.add_argument(
         "--thinking",
-        choices=["disabled", "adaptive"],
+        choices=["disabled", "adaptive", "between_tools"],
         default=None,
         help=(
             "Anthropic extended thinking for both generation passes. Overrides "
             "[generation] thinking, whose default is 'disabled'. Omitting the "
             "field on the wire is NOT the same as turning thinking off: Claude "
-            "4.6+/5 models reason adaptively unless told not to. Ignored for "
-            "non-Anthropic models."
+            "4.6+/5 models reason adaptively unless told not to. Claude Sonnet "
+            "5.5 rejects 'disabled'; 'between_tools' is its off switch (thinking "
+            "only between tool calls, so none for these text replies). Ignored "
+            "for non-Anthropic models."
         ),
     )
     gen.add_argument(
@@ -4218,6 +4233,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
                     temperature=args.temperature,
                     max_tokens=args.max_tokens,
                     thinking=args.thinking or gen_cfg.thinking,
+                    transcription=args.transcription or gen_cfg.transcription,
                     max_parallel_docs=args.max_parallel_calls,
                     cache_dir=cache_dir,
                     debug=args.debug,

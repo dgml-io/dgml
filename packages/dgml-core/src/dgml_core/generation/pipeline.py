@@ -287,6 +287,8 @@ class ConvertOptions:
     # model's own default in force (adaptive, on Claude 4.6+/5). The CLI passes
     # ``[generation] thinking``, which defaults to ``"disabled"``.
     thinking: str | None = None
+    # Pass A wire format, "text" or "lines" (see GenerationConfig.transcription).
+    transcription: str = "text"
     cache_dir: Path | str | None = None
     # document name → its page_text/ dir (per-page word JSONs written before
     # generation). When a document has one, each transcription window is
@@ -471,6 +473,7 @@ def convert_batch(
                 log=log,
                 page_text_dir=(opts.page_text_dirs or {}).get(path.name),
                 pdf_config=opts.pdf_config,
+                transcription=opts.transcription,
             )
         except Exception as exc:
             log(f"[transcribe] {path.name} FAILED: {exc}; skipping")
@@ -702,6 +705,7 @@ def _transcribe_batched(
             log=log,
             page_text_dir=(opts.page_text_dirs or {}).get(path.name),
             pdf_config=opts.pdf_config,
+            transcription=opts.transcription,
         )
         units.append(Unit(name=path.name, config=config, steps=steps))
 
