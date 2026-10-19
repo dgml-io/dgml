@@ -58,7 +58,7 @@ import os
 import shutil
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -360,6 +360,41 @@ def slice_pages(
         raise PdfSliceFailed(f"page(s) {out_of_range} out of range for a {total}-page PDF")
 
     return make_slicer(config).slice(pdf_bytes, ordered)
+
+
+def pinned_slice(
+    pdf_bytes: bytes,
+    page_numbers: Sequence[int],
+    *,
+    config: PdfConfig | None,
+    make: Callable[[], bytes],
+) -> bytes:
+    """The slice *make* produces of ``page_numbers`` (1-based), pinned to the
+    running batch job, if any.
+
+    Slicing is not byte-reproducible across processes: ghostscript's
+    ``pdfwrite`` stamps a random trailer ``/ID`` and an XMP creation date, and
+    PDFium's output differs run to run too. A batch job replays a resumed run's
+    requests by their digest, so a fresh slice on resume would look like a
+    changed input and be paid for again. Under a batch job the first slice of
+    each (document content, engine, page list) is therefore recorded in the
+    job's input store and every later run of the job reuses those exact bytes.
+    Outside a job this is exactly ``make()``. Every slice that goes into a
+    model request must come through here."""
+    # No session can exist unless dgml_core.batch.jobs is loaded, so this
+    # never imports the batch package.
+    jobs = sys.modules.get("dgml_core.batch.jobs")
+    job = None if jobs is None else jobs.active_session()
+    if job is None:
+        return make()
+    engine = config.provider if config is not None else "default"
+    pages = list(page_numbers)
+    source = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+    span = hashlib.sha256(",".join(map(str, pages)).encode()).hexdigest()[:16]
+    name = f"slices/{source}/{engine}/{pages[0]}-{pages[-1]}-{span}.pdf"
+    data = job.rewind_input(name, make)
+    assert data is not None  # slicing always produces bytes
+    return bytes(data)
 
 
 def _page_cache_root() -> Path | None:

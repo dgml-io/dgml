@@ -20,19 +20,20 @@ must write, for every file, the ``classification`` block the synchronous
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from dgml_core import auto_classify, classify_bulk_batch, prepare_bulk_classify
-from dgml_core.auto_classification import classification_block, soft_error
+from dgml_core.auto_classification import apply_classification, classification_block, soft_error
 from dgml_core.batch import FakeBackend, fake_model_response, provider_of, register_backend
 from dgml_core.batch import registry as batch_registry
-from dgml_core.classification import ClassificationConfig, ClassifyMode
+from dgml_core.classification import ClassificationConfig, ClassificationDecision, ClassifyMode
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import BatchUnavailable, ClassificationFailed
 from dgml_core.files import AddFileResult, FileStore
+from dgml_core.models import DocSet
 from dgml_core.storage import Workspace
 
 from .test_classification import DEFAULT_TEST_MODEL, _tool_call_response
@@ -248,3 +249,24 @@ def test_a_resumed_job_reuses_the_docsets_it_created(tmp_path: Path) -> None:
     assert job_id is not None
     assert BatchJobStore(ws, job_id).load().status == "completed"
     assert CREATED_DOCSETS_STATE == "classify_created_docsets"
+
+
+def test_a_failed_assignment_keeps_a_docset_an_earlier_run_created(tmp_path: Path) -> None:
+    # A resumed job's `create` hands back the DocSet its first run made, which
+    # other files may be assigned to by now: a failed add_file must not delete
+    # it. One made just now is still cleaned up.
+    ws = _ws(tmp_path / "ws")
+    store = DocSetStore(ws)
+    earlier = store.create(name="Invoices", description="d")
+    decision = ClassificationDecision(decision="new", new_name="Invoices", new_description="d")
+    hooks: list[Callable[[ClassificationDecision], tuple[DocSet, bool]]] = [
+        lambda _d: (earlier, False),
+        lambda _d: (store.create(name="Receipts", description="d"), True),
+    ]
+    for hook in hooks:
+        block = classification_block(ClassificationConfig(model=DEFAULT_TEST_MODEL))
+        apply_classification(ws, "missing", block, decision, None, lambda _ds: None, hook)
+        assert block["error"] is not None
+        assert block["docset_id"] is None
+    names = [ds.name for ds in store.list_all()]
+    assert names == ["Invoices"]

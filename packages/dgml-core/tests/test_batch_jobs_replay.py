@@ -43,6 +43,7 @@ from dgml_core.batch.jobs import RECORD_DROPPED, RECORD_OPEN, JobSession
 from dgml_core.errors import BatchJobNondeterministic, BatchPending
 from dgml_core.generation import document as document_mod
 from dgml_core.generation import transcribe as transcribe_mod
+from dgml_core.pages import EngineName, PdfConfig, pinned_slice
 from dgml_core.storage import Workspace
 
 from .conftest import _write_text_pdf, needs_gs
@@ -178,6 +179,29 @@ def test_in_a_job_a_drifting_slicer_is_called_once_per_window(
     _pause(resumed)
     assert again == first
     assert other != first  # a different window is its own slice
+
+
+def test_every_slicer_pins_through_the_same_helper(ws: Workspace) -> None:
+    # Schema-sample trimming and extraction page ranges slice with
+    # pages.slice_pages directly; pinned_slice pins them as it does a window.
+    counter = iter(range(1000))
+
+    def drifting() -> bytes:
+        return f"slice-{next(counter)}".encode()
+
+    assert pinned_slice(b"%PDF", [1, 2], config=None, make=drifting) == b"slice-0"
+    assert pinned_slice(b"%PDF", [1, 2], config=None, make=drifting) == b"slice-1"  # no job
+    session = _open(ws)
+    first = pinned_slice(b"%PDF", [1, 2], config=None, make=drifting)
+    _pause(session)
+    resumed = _open(ws, session.job_id)
+    again = pinned_slice(b"%PDF", [1, 2], config=None, make=drifting)
+    other = pinned_slice(
+        b"%PDF", [1, 2], config=PdfConfig(provider=EngineName.PYPDFIUM2), make=drifting
+    )
+    _pause(resumed)
+    assert again == first
+    assert other != first  # another engine slices differently, so it is its own input
 
 
 # ---- 2. superseded batches are canceled ----------------------------------------------

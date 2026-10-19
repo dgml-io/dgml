@@ -57,6 +57,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -126,7 +127,13 @@ from .matching import (
 )
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .ocr import _image_dimensions as _png_dimensions
-from .pages import PdfConfig, load_pdf_config, pdf_page_count_bytes, slice_pages
+from .pages import (
+    PdfConfig,
+    load_pdf_config,
+    pdf_page_count_bytes,
+    pinned_slice,
+    slice_pages,
+)
 from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
@@ -847,7 +854,14 @@ def _leading_pages(
     pages = max(1, min(count - 1, count * share // whole))
     while True:
         try:
-            sliced = slice_pages(pdf, range(1, pages + 1), config=pdf_config, total_pages=count)
+            sliced = pinned_slice(
+                pdf,
+                range(1, pages + 1),
+                config=pdf_config,
+                make=partial(
+                    slice_pages, pdf, range(1, pages + 1), config=pdf_config, total_pages=count
+                ),
+            )
         except Exception as exc:
             raise SchemaGenerationFailed(
                 f"could not cut file '{file_id}' to its first {pages} pages to fit the "
@@ -3222,8 +3236,13 @@ def _phase1_in_parts(
 
     def attempt(first: int, last: int) -> LLMSteps[list[tuple[_PdfPart, _Phase1Run]]]:
         try:
-            sliced = slice_pages(
-                pdf_bytes, range(first, last + 1), config=pdf_config, total_pages=page_count
+            sliced = pinned_slice(
+                pdf_bytes,
+                range(first, last + 1),
+                config=pdf_config,
+                make=lambda: slice_pages(
+                    pdf_bytes, range(first, last + 1), config=pdf_config, total_pages=page_count
+                ),
             )
         except Exception as exc:
             raise ValuesExtractionFailed(

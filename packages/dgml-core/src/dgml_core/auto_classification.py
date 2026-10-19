@@ -93,7 +93,7 @@ def apply_classification(
     decision: ClassificationDecision,
     docsets: list[DocSet] | None,
     assign: Callable[[str], dict[str, Any] | None],
-    create: Callable[[ClassificationDecision], DocSet] | None = None,
+    create: Callable[[ClassificationDecision], tuple[DocSet, bool]] | None = None,
 ) -> None:
     """Act on a file's classification *decision*, filling *block* in place.
 
@@ -105,8 +105,9 @@ def apply_classification(
     created for a ``new`` decision is appended to *docsets* when given.
 
     *create* makes the DocSet a ``new`` decision names (default: create it in
-    the store). A resumed batch job passes one that returns the DocSet its
-    first run already created for this file instead of creating it twice.
+    the store) and says whether it made it just now. A resumed batch job passes
+    one that returns the DocSet its first run already created for this file
+    instead of creating it twice.
     """
     # ``docset_id`` is set only once the assignment is actually stored, so a
     # failure partway through never reports a file as placed (or as unplaced)
@@ -135,19 +136,23 @@ def apply_classification(
         elif decision.decision == "new":
             assert decision.new_name is not None and decision.new_description is not None
             if create is not None:
-                created = create(decision)
+                created, fresh = create(decision)
             else:
                 created = docset_store.create(
                     name=decision.new_name,
                     description=decision.new_description,
                     key_questions=list(decision.new_key_questions),
                 )
+                fresh = True
             try:
                 docset_store.add_file(created.id, file_id)
             except DgmlError:
                 # Don't leave behind a DocSet created for a file it never got.
-                with suppress(DgmlError):
-                    docset_store.delete(created.id)
+                # One an earlier run of the job created may hold other files'
+                # assignments by now, so only a DocSet made just now goes.
+                if fresh:
+                    with suppress(DgmlError):
+                        docset_store.delete(created.id)
                 raise
             if docsets is not None:
                 docsets.append(created)
@@ -514,13 +519,13 @@ def _classify_in_order(
         session.state.setdefault(CREATED_DOCSETS_STATE, {}) if session is not None else {}
     )
 
-    def creator(file_id: str) -> Callable[[ClassificationDecision], DocSet]:
-        def create(decision: ClassificationDecision) -> DocSet:
+    def creator(file_id: str) -> Callable[[ClassificationDecision], tuple[DocSet, bool]]:
+        def create(decision: ClassificationDecision) -> tuple[DocSet, bool]:
             store = DocSetStore(ws)
             prior = made.get(file_id)
             if prior is not None:
                 try:
-                    return store.get(prior)
+                    return store.get(prior), False
                 except DocSetNotFound:
                     pass  # deleted since that run: create it afresh
             assert decision.new_name is not None and decision.new_description is not None
@@ -532,7 +537,7 @@ def _classify_in_order(
             if session is not None:
                 made[file_id] = docset.id
                 session.persist()
-            return docset
+            return docset, True
 
         return create
 
