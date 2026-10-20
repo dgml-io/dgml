@@ -2733,13 +2733,16 @@ def _batch_resume(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         _emit({"batch_job": waiting}, fmt)
         return 0
     manifest = jobs.BatchJobStore(ws, args.job_id).load()
-    root = str(Path(ws.root).resolve())
+    # Reopened the way this run opened it: a workspace held in the store of
+    # workspaces by its id (its config may not be under its root at all, as in
+    # MongoDB), any other by its absolute path.
+    where = ws.workspaces_id or str(Path(ws.root).resolve())
     # Canonical first (a job stored by a library caller may carry
     # abbreviations), so the stripping below sees every spelling.
     argv = _canonical_argv(manifest.argv)
     argv = _strip_flag(_strip_flag(argv, "--job"), "--workspace")
     argv = _strip_flag(argv, "--format")
-    prefix = ["--workspace", root, "--format", fmt]
+    prefix = ["--workspace", where, "--format", fmt]
     if getattr(args, "verbose", False) and "--verbose" not in argv:
         prefix.append("--verbose")
     replay = [*prefix, *argv, "--job", manifest.job_id]

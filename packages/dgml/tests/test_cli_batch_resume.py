@@ -20,12 +20,18 @@ prints the pending payload a pausing run prints without re-running anything.
 
 from __future__ import annotations
 
+import sys
+import tomllib
+import types
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
 from dgml.cli import main
 from dgml_core import layout
+from dgml_core.workspaces_local import LocalDirWorkspacesStore
+from dgml_core.workspaces_resolve import default_workspaces_store
 
 from .test_cli import _read_stdout
 from .test_cli_batch_extraction import _seed_extraction
@@ -70,3 +76,57 @@ def test_resume_while_no_batch_has_ended_reports_pending_without_rerunning(
     assert out.out == ""
     assert '"code": "BATCH_JOB_INVALID"' in out.err and "already completed" in out.err
     assert len(backend.submitted) == 1
+
+
+class _ConfigElsewhereStore(LocalDirWorkspacesStore):
+    """A store of workspaces that, like the MongoDB one, keeps each config away from
+    the workspace's data: nothing at ``<root>/config.toml`` names the workspace, so it
+    opens only by its id."""
+
+    data_roots: ClassVar[dict[str, Path]] = {}
+
+    def _config_path(self, workspace_id: str) -> Path:
+        return self.root / "configs" / f"{workspace_id}.toml"
+
+    def workspace_root(self, workspace_id: str) -> Path:
+        return self.data_roots[workspace_id]
+
+    def config_file(self, workspace_id: str) -> Path | None:
+        return None
+
+
+def test_resume_reopens_a_store_held_workspace_by_its_id(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws, ds_id = _seed_extraction(tmp_path, capsys, ["fjob00000001"])
+    config = ws / layout.CONFIG_FILE
+    wid = tomllib.loads(config.read_text(encoding="utf-8"))["workspace"]["workspace_id"]
+    # Hand the workspace's config to the store: its data root keeps none.
+    module = types.ModuleType("_config_elsewhere_store")
+    module.Store = _ConfigElsewhereStore  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(_ConfigElsewhereStore, "data_roots", {wid: ws})
+    user_config = tmp_path / "xdg-home" / "dgml" / "config.toml"
+    user_config.parent.mkdir(parents=True, exist_ok=True)
+    user_config.write_text(
+        f'[workspaces]\nprovider = "{module.__name__}:Store"\nroot = "{tmp_path / "store"}"\n',
+        encoding="utf-8",
+    )
+    default_workspaces_store.cache_clear()
+    default_workspaces_store().create_config(wid, config.read_text(encoding="utf-8"))
+    config.unlink()
+
+    provider.install("anthropic", _values_answer, polls=1)
+    argv = ["--workspace", wid, *_extract_argv(ws, ds_id, "--no-wait")[2:]]
+    assert main(argv) == 0
+    job_id = _read_stdout(capsys)["batch_job"]["job_id"]
+    with patch("litellm.completion", side_effect=AssertionError("no full-price fallback")):
+        for _ in range(5):
+            assert main(["--workspace", wid, "batch", "resume", job_id]) == 0
+            out = _read_stdout(capsys)
+            if "batch_job" not in out:
+                break
+    assert out["summary"] == {"total": 1, "ok": 1, "failed": 0}
