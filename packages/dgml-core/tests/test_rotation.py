@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-import logging
-import sys
 from io import BytesIO
 from typing import Any
 
@@ -144,30 +142,18 @@ def test_deskew_page_small_angle_no_expand_keeps_dims() -> None:
     assert new_words and len(new_words[0]["l"]) == 4
 
 
-def test_deskew_page_pillow_warning_once_per_process(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Pillow availability is process-global, so a multi-page skewed scan logs
-    the install hint once — not once per page, whatever the angles."""
-    monkeypatch.setitem(sys.modules, "PIL", None)
-    words = [{"t": "x", "l": [1, 2, 3, 4]}]
-    with caplog.at_level(logging.WARNING, logger="dgml_core.rotation"):
-        for angle in (3.17, 2.94, 1.5):
-            deskew_page(b"not-a-real-png", (10, 10), words, angle)
-    assert caplog.text.count("Pillow is not installed") == 1
+@pytest.mark.parametrize("fmt", ["JPEG", "PNG"])
+def test_deskew_page_keeps_the_image_format(fmt: str) -> None:
+    """The deskewed image is written back under the page's own name, so a
+    JPEG page stays a JPEG and a legacy PNG page stays a PNG."""
+    from PIL import Image
 
-
-def test_deskew_page_without_pillow_noops_with_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """If Pillow is unavailable, deskew returns inputs unchanged and warns —
-    OCR text is still usable, just not deskewed."""
-    monkeypatch.setitem(sys.modules, "PIL", None)
-    words = [{"t": "x", "l": [1, 2, 3, 4]}]
-    original = b"not-a-real-png"
-    with caplog.at_level(logging.WARNING, logger="dgml_core.rotation"):
-        out_bytes, out_dims, out_words = deskew_page(original, (10, 10), words, 15.0)
-    assert "Pillow is not installed" in caplog.text
-    assert out_bytes is original
-    assert out_dims == (10, 10)
-    assert out_words == words
+    w, h = 300, 200
+    im = Image.open(BytesIO(_png_bytes(w, h, (40, 40, 120, 90)))).convert("RGB")
+    buf = BytesIO()
+    im.save(buf, format=fmt)
+    words = [{"t": "x", "l": [40, 40, 120, 90]}]
+    out, (nw, nh), _ = deskew_page(buf.getvalue(), (w, h), words, 8.0)
+    with Image.open(BytesIO(out)) as rotated:
+        assert rotated.format == fmt
+        assert rotated.size == (nw, nh)

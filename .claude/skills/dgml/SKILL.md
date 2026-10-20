@@ -290,7 +290,7 @@ Install the providers you reference: `pip install translators-pdf` (LibreOffice 
 
 ### Text extraction
 
-`file add` extracts digital text at ingest time (default `--text-mode digital`, via `pdfminer.six`) and writes one compact JSON per page to `<workspace>/files/<file_id>/page_text/page_N.json`. Word locations are integer `[left, top, right, bottom]` pixel boxes that align with the matching `page_images/page_N.png`.
+`file add` extracts digital text at ingest time (default `--text-mode digital`, via `pdfminer.six`) and writes one compact JSON per page to `<workspace>/files/<file_id>/page_text/page_N.json`. Word locations are integer `[left, top, right, bottom]` pixel boxes that align with the matching `page_images/page_N.{png,jpg}`.
 
 A PDF with no extractable digital text (e.g. a scan) still gets a File record — the failure is *soft*. The response payload has `text_extraction_error` set, a permanent error is recorded, and `dgml check` reports `text_extraction_failed_permanent` until `--retry-errors` clears it. Always look at `text_extraction_error` after `file add`, the same way you look at `page_render_error`.
 
@@ -574,7 +574,7 @@ ingestion.
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
 a `dg:origin` bounding-box attribute (`<page> <x1> <y1> <x2> <y2>`,
-space-separated, in integer image pixels, matching `page_images/page_N.png`) to
+space-separated, in integer image pixels, matching `page_images/page_N.{png,jpg}`) to
 every element whose subtree grounded: elements with text content get one
 box per visual line, and pure containers (sections, lists, tables, rows,
 the document root) get one union box per page. It's deterministic (no LLM, no config),
@@ -754,7 +754,7 @@ Inspect or convert the stored schema with `get-schema` (`--schema-format rnc`
 default, or `json` for the engine's extracted-value projection). Typed values
 carry a normalized `dg:value`/`xsi:type` (dates, amounts, integers), enum
 fields carry the schema token as `dg:value` (no `xsi:type`), and every
-grounded value carries a `dg:origin` box back to `page_images/page_N.png`.
+grounded value carries a `dg:origin` box back to `page_images/page_N.{png,jpg}`.
 
 A schema field's `## Prompt:` may describe a **derivation rule** instead of a
 place on the page ("Compute as sum of Quantity × UnitPrice for each LineItem").
@@ -898,7 +898,7 @@ asked to name a new one, bundling multiple files per cluster into a
 single call). The only time a placeholder like `"unknown_0"` shows up
 here is for a file that also appears in `failed_file_ids`.
 
-`failed_file_ids` covers two distinct cases: files whose `page_1.png` is
+`failed_file_ids` covers two distinct cases: files whose `page_1.{png,jpg}` is
 missing (page render failed at ingest — can't be embedded) and files
 whose cluster needed LLM naming but that call failed. Both surface in
 the same channel.

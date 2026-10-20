@@ -67,6 +67,7 @@ _CONTENT_TYPE_BY_EXT: dict[str, str] = {
     "rels": _RELS_CONTENT_TYPE,
     "xml": "application/xml",
     "png": "image/png",
+    "jpg": "image/jpeg",
     "json": "application/json",
     "rnc": "text/plain",
     "pdf": "application/pdf",

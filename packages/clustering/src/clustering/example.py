@@ -25,10 +25,10 @@ The workspace layout this script consumes is described in
     │   └── files/<file_id>/           # marker: file is assigned to this docset
     └── files/<file_id>/
         ├── file.json                  # { id, original_filename, page_count, ... }
-        ├── page_images/page_1.png     # 300 dpi render of page 1
+        ├── page_images/page_1.png     # render of page 1 (.png or .jpg)
         └── page_text/page_N.json      # word boxes (one per page)
 
-We treat each file as one document, use ``page_1.png`` as the visual
+We treat each file as one document, use ``page_1.{png,jpg}`` as the visual
 input, and concatenate ``page_text/*.json`` words into the text input.
 A file's "label" — used as supervision by S2/S3/S5 — is the *name* of
 the DocSet it's already assigned to, or ``None`` if it's unassigned.
@@ -99,8 +99,8 @@ class WorkspaceDataset(DocumentDataset):
 def _page_one_image(file_dir: Path) -> Path | None:
     """Return the page-1 image for a workspace file, or None if absent.
 
-    The DGML renderer emits ``page_images/page_<n>.png`` (canonical); older
-    workspaces may carry ``.jpg``. Resolve by extension-agnostic glob rather
+    The DGML renderer emits ``page_images/page_<n>.jpg`` or ``.png``, whichever
+    encoding was smaller for that page. Resolve by extension-agnostic glob rather
     than hardcoding a suffix so this tracks the renderer's format.
     """
     matches = sorted((file_dir / "page_images").glob("page_1.*"))

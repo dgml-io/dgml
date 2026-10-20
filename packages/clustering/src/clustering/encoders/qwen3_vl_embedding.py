@@ -18,7 +18,7 @@ purpose-built **multimodal embedding** model (base: Qwen3-VL-*-Instruct). It
 emits a single, already-normalized vector per input in a *shared text+image
 space*, so the same encoder serves both sides of the pipeline:
 
-* as ``encoder_image`` it embeds a page render (``page_1.png``);
+* as ``encoder_image`` it embeds a page render (``page_1.{png,jpg}``);
 * as ``encoder_text`` it embeds the page's OCR text;
 
 and because both land in one space, the fusion layer combines genuinely

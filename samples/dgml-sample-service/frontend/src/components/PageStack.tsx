@@ -1,7 +1,7 @@
 // The document's rendered pages with bounding boxes drawn over them.
 //
 // DGML locations (dg:origin) are integer pixels in the page image DGML rendered —
-// page_images/page_N.png, top-left origin — so an overlay is just that box scaled by
+// page_images/page_N.{png,jpg}, top-left origin — so an overlay is just that box scaled by
 // the image's displayed size over its natural size.
 
 import { useEffect, useRef, useState } from "react";

@@ -36,7 +36,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from . import layout, llm
+from . import llm
 from .concurrency import map_concurrent
 from .errors import short_error_message
 from .generation.transcribe import strip_fences
@@ -44,6 +44,7 @@ from .storage import Workspace
 from .storage_service import BlobStore
 from .style import ALLOWED, merge_styles, validate_style
 from .usage import OPERATION_STYLE_ANNOTATE
+from .utils import page_image_key
 
 if TYPE_CHECKING:
     from .batch import BatchExecutor
@@ -193,8 +194,8 @@ def prepare_style_jobs(
     # fan-out that follows is over nothing but self-contained work items.
     jobs: list[_PageJob] = []
     for page, pairs in by_page.items():
-        image_key = layout.file_page_image_key(file_id, page)
-        if not workspace.blobs.blob_exists(image_key):
+        image_key = page_image_key(workspace, file_id, page)
+        if image_key is None:
             continue
         capped = pairs[:_MAX_SNIPPETS_PER_PAGE]
         jobs.append(

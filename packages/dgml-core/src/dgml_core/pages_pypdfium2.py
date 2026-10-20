@@ -40,6 +40,7 @@ from typing import Any
 from .errors import EngineNotAvailable, PageRenderFailed, PdfSliceFailed
 from .pages import (
     PAGE_FILENAME_TEMPLATE,
+    PageImageSpec,
     PageRenderer,
     PdfConfig,
     PdfSlicer,
@@ -96,17 +97,10 @@ class Pypdfium2Renderer(PageRenderer):
 
     def __init__(self, config: PdfConfig) -> None:
         self._pdfium = _import_pdfium()
-        # Pillow writes the PNGs (pypdfium2's to_pil()); it ships with the same
-        # extra, so its absence means a partial/hand-rolled install.
-        try:
-            import PIL.Image  # noqa: F401
-        except ImportError as exc:
-            raise EngineNotAvailable(
-                "pdf.provider is 'pypdfium2' but Pillow is not installed — "
-                "install it with: pip install dgml[pdfium]"
-            ) from exc
 
-    def render(self, pdf_path: Path, output_dir: Path, *, dpi: int) -> None:
+    def render(
+        self, pdf_path: Path, output_dir: Path, *, dpi: int, image_spec: PageImageSpec
+    ) -> None:
         scale = dpi / _PDF_POINTS_PER_INCH
         # Held across open → render → close: those are all pdfium calls.
         with _PDFIUM_LOCK:
@@ -119,7 +113,14 @@ class Pypdfium2Renderer(PageRenderer):
                 for index in range(len(pdf)):
                     page_num = index + 1
                     try:
-                        self._render_page(pdf[index], output_dir, page_num, dpi=dpi, scale=scale)
+                        self._render_page(
+                            pdf[index],
+                            output_dir,
+                            page_num,
+                            dpi=dpi,
+                            scale=scale,
+                            image_spec=image_spec,
+                        )
                     except Exception as exc:
                         # PDFium's page count comes from the catalog's ``/Count``,
                         # which ``pdf_page_count`` deliberately distrusts (it walks
@@ -140,9 +141,18 @@ class Pypdfium2Renderer(PageRenderer):
                 pdf.close()
 
     def _render_page(
-        self, page: Any, output_dir: Path, page_num: int, *, dpi: int, scale: float
+        self,
+        page: Any,
+        output_dir: Path,
+        page_num: int,
+        *,
+        dpi: int,
+        scale: float,
+        image_spec: PageImageSpec,
     ) -> None:
-        """Rasterize one page to ``page_<n>.png`` at exactly ``dpi``."""
+        """Rasterize one page to ``page_<n>.png`` at exactly its stored size:
+        ``dpi`` for a page inside ``image_spec``'s edge bounds, else rendered
+        straight at :meth:`PageImageSpec.fit` of that size."""
         # PDFium sizes its canvas from the CropBox, but ghostscript rasterizes
         # the MediaBox and ``page_text/`` word boxes are MediaBox-relative. Left
         # alone, a PDF whose CropBox trims the MediaBox renders at a different
@@ -157,8 +167,21 @@ class Pypdfium2Renderer(PageRenderer):
         # get_size() is already rotation-aware (a /Rotate 90 page reports
         # swapped dimensions), so the target is computed from it directly.
         width_pts, height_pts = page.get_size()
-        target_w = round(width_pts * dpi / _PDF_POINTS_PER_INCH)
-        target_h = round(height_pts * dpi / _PDF_POINTS_PER_INCH)
+        nominal = (
+            round(width_pts * dpi / _PDF_POINTS_PER_INCH),
+            round(height_pts * dpi / _PDF_POINTS_PER_INCH),
+        )
+        target_w, target_h = image_spec.fit(*nominal)
+        if (target_w, target_h) != nominal and width_pts > 0 and height_pts > 0:
+            # Outside the bounds: rasterize at the fitted size directly rather
+            # than at ``dpi`` and resizing — a large sheet costs a fraction of
+            # the pixels, and a small page gains real detail instead of an
+            # interpolated stretch. The larger per-axis scale keeps both axes
+            # at or over their target. The fit rounds each axis on its own, so
+            # the other axis can overshoot by more than the float pixel the
+            # crop below trims — a 40-pixel-wide receipt strip carries a 1%
+            # rounding error that is 30+ pixels down its 3508-pixel length.
+            scale = max(target_w / width_pts, target_h / height_pts)
 
         # PDFium computes its canvas as ceil(pts * scale) in binary float, so an
         # exactly-integral size overshoots by a pixel: 792pt at 300dpi is
@@ -171,15 +194,26 @@ class Pypdfium2Renderer(PageRenderer):
         over_w = math.ceil(width_pts * scale) - target_w
         over_h = math.ceil(height_pts * scale) - target_h
         # crop is (left, bottom, right, top); trimming right/bottom keeps the
-        # page anchored at the top-left, which is the page_text/ origin.
+        # page anchored at the top-left, which is the page_text/ origin. Only a
+        # one-pixel overshoot is cropped: anything larger is page content at a
+        # scale page_text/ does not use on that axis, so it is kept and the
+        # resize below squeezes it to the target, as ghostscript's path does.
         crop = (
             0.0,
-            over_h / scale if over_h > 0 else 0.0,
-            over_w / scale if over_w > 0 else 0.0,
+            over_h / scale if over_h == 1 else 0.0,
+            over_w / scale if over_w == 1 else 0.0,
             0.0,
         )
-        bitmap = page.render(scale=scale, crop=crop)
-        bitmap.to_pil().save(output_dir / (PAGE_FILENAME_TEMPLATE % page_num), format="PNG")
+        image = page.render(scale=scale, crop=crop).to_pil()
+        if image.size != (target_w, target_h):
+            # Float rounding left the canvas a pixel off, or an axis of a fitted
+            # page overshot by more than a pixel. The store step cannot tell a
+            # page one pixel short of a bound from one already fitted, so the
+            # size has to be exact here.
+            from PIL import Image
+
+            image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        image.save(output_dir / (PAGE_FILENAME_TEMPLATE % page_num), format="PNG")
 
 
 class Pypdfium2Slicer(PdfSlicer):

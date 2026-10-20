@@ -66,7 +66,7 @@ from dgml_core.errors import (
 from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
 from dgml_core.ids import RECORD_ID_SHAPE
 from dgml_core.models import DocSet
-from dgml_core.pages import DEFAULT_DPI, load_pdf_config
+from dgml_core.pages import DEFAULT_DPI, PAGE_MAX_EDGE, PAGE_MIN_EDGE, load_pdf_config
 from dgml_core.storage import (
     API_KEY_ENV_VARS,
     Workspace,
@@ -682,7 +682,10 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Resolution to rasterize page images at, in dots per inch "
             f"(default: {DEFAULT_DPI}). Lower values (e.g. 150) roughly halve "
             "render time and page_images/ disk use and are usually ample for "
-            "OCR and clustering; higher values cost both. The value is stored "
+            "OCR and clustering; higher values cost render time. Each stored "
+            f"image's longest edge is then fit between {PAGE_MIN_EDGE} and "
+            f"{PAGE_MAX_EDGE} pixels, so "
+            "a render outside that range is rescaled. The value is stored "
             "on the File as 'page_image_dpi' and reused by `dgml check "
             "--retry-errors`, and digital word boxes in page_text/ are written "
             "in this render's pixel space."

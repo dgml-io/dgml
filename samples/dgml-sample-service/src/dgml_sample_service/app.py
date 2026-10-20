@@ -42,6 +42,7 @@ from dgml_core import (
     UnsupportedFileType,
     Workspace,
     layout,
+    read_page_image,
 )
 
 # Aliased: the GET .../dgml route below is itself named ``read_dgml`` (its name is
@@ -547,12 +548,13 @@ def _routes(app: FastAPI) -> None:
 
     @app.get("/api/orgs/{org_id}/files/{file_id}/pages/{page}")
     def page_image(file_id: str, page: int, ws: WorkspaceDep) -> Response:
-        key = layout.file_page_image_key(file_id, page)
-        try:
-            data = ws.blobs.get_blob(key)
-        except FileNotFoundError:
-            raise HTTPException(404, f"no page image {page} for file {file_id!r}") from None
-        return Response(data, media_type="image/png", headers={"Cache-Control": "max-age=3600"})
+        found = read_page_image(ws, file_id, page)
+        if found is None:
+            raise HTTPException(404, f"no page image {page} for file {file_id!r}")
+        key, data = found
+        # A page image is a JPEG or a PNG, whichever encoding was smaller.
+        media_type = "image/png" if key.endswith(".png") else "image/jpeg"
+        return Response(data, media_type=media_type, headers={"Cache-Control": "max-age=3600"})
 
     @app.post("/api/orgs/{org_id}/files/{file_id}/classify", status_code=202)
     def classify_file(

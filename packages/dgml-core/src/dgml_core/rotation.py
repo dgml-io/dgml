@@ -16,13 +16,10 @@ When an OCR provider reports that a rendered page's content is skewed
 (Azure Document Intelligence's ``page.angle``), we rotate the page image
 *and* the OCR word boxes by the identical transform so the boxes stay
 aligned with the content, and rewrite the deskewed image back to
-``page_images/page_N.png`` so every downstream consumer (grounding,
+``page_images/page_N.{png,jpg}`` so every downstream consumer (grounding,
 generation's vision transcription, DGMLX export) sees the corrected page.
 
-The image rotation uses Pillow — an optional dependency shipped with the
-OCR extras (``pip install dgml[azure]`` / ``dgml[aws]``). If Pillow is not
-installed we skip deskew with a warning rather than failing the OCR run.
-The box transform is pure ``math`` (no NumPy) so it always runs.
+The image rotation uses Pillow; the box transform is pure ``math`` (no NumPy).
 
 Angle convention: ``angle`` is clockwise-positive, matching Azure DI's
 ``page.angle`` (the clockwise orientation of the content). Pillow's
@@ -34,18 +31,11 @@ exactly, so image and boxes never drift.
 
 from __future__ import annotations
 
-import logging
 import math
 from io import BytesIO
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
-# Whether the Pillow-missing warning was already logged. Pillow's availability is
-# process-global and cannot change mid-run, so one line per process is the right
-# amount — deskew_page runs once per skewed page, and a 200-page scan needs the
-# install hint once, not 200 times.
-_WARNED_PILLOW_MISSING = False
+from .pages import PAGE_JPEG_QUALITY
 
 # Below this magnitude a page is treated as upright and left untouched — sub-degree
 # angles are rendering noise, not real skew (mirrors the prior-art threshold).
@@ -71,37 +61,28 @@ def deskew_page(
 
     ``dims`` is the current ``(width, height)`` of ``image_bytes`` in pixels;
     ``words`` are ``{"t": ..., "l": [left, top, right, bottom]}`` boxes in that
-    same pixel space. Returns ``(new_png_bytes, (new_w, new_h), new_words)``
+    same pixel space. Returns ``(new_image_bytes, (new_w, new_h), new_words)``
     with the image rotated counter-clockwise by ``angle`` (correcting a
     clockwise skew) and every box rotated by the matching transform. Boxes
     that rotate entirely out of the (possibly re-sized) frame are dropped.
-
-    If Pillow is unavailable, returns the inputs unchanged (image, dims, words)
-    and logs a warning, once per process — OCR text is still usable, just not
-    deskewed.
+    The image is re-encoded in its own format (a JPEG page stays a JPEG, a
+    PNG page a PNG), since it is written back under the same name.
     """
-    global _WARNED_PILLOW_MISSING
-    try:
-        from PIL import Image
-    except ImportError:
-        if not _WARNED_PILLOW_MISSING:
-            _WARNED_PILLOW_MISSING = True
-            logger.warning(
-                "Pillow is not installed; skipping page deskew for this and any "
-                f"further skewed pages (this page's angle={angle:.2f}°). Install "
-                "with `pip install dgml[azure]` (or dgml[aws]) to enable deskew."
-            )
-        return image_bytes, dims, words
+    from PIL import Image
 
     expand = abs(angle) >= ROTATE_EXPAND_ANGLE_DEG
     with Image.open(BytesIO(image_bytes)) as im:
         im.load()
+        fmt = "JPEG" if im.format == "JPEG" else "PNG"
         fill = _fill_color(im.mode)
         rotated = im.rotate(angle, resample=Image.Resampling.BICUBIC, expand=expand, fillcolor=fill)
         old_w, old_h = im.width, im.height
         new_w, new_h = rotated.width, rotated.height
         buf = BytesIO()
-        rotated.save(buf, format="PNG")
+        if fmt == "JPEG":
+            rotated.save(buf, format=fmt, quality=PAGE_JPEG_QUALITY, optimize=True)
+        else:
+            rotated.save(buf, format=fmt)
         new_bytes = buf.getvalue()
 
     new_words = rotate_word_boxes(words, angle, (old_w, old_h), (new_w, new_h))

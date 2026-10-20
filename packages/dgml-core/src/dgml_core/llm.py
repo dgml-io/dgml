@@ -474,11 +474,13 @@ def _pdf_content_block(pdf_bytes: bytes) -> dict[str, Any]:
     }
 
 
-def _image_content_block(png_bytes: bytes) -> dict[str, Any]:
-    b64 = base64.b64encode(png_bytes).decode("ascii")
+def _image_content_block(image_bytes: bytes) -> dict[str, Any]:
+    # A page image is a JPEG or a PNG, whichever encoding was smaller.
+    mime = "image/jpeg" if image_bytes.startswith(b"\xff\xd8\xff") else "image/png"
+    b64 = base64.b64encode(image_bytes).decode("ascii")
     return {
         "type": "image_url",
-        "image_url": {"url": f"data:image/png;base64,{b64}"},
+        "image_url": {"url": f"data:{mime};base64,{b64}"},
     }
 
 

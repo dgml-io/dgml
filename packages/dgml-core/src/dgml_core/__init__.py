@@ -166,6 +166,7 @@ from .storage_service import (
     StorageConfig,
 )
 from .text_extraction import TextMode
+from .utils import page_image_key, read_page_image
 from .workspace_config import WorkspaceIdentity
 from .workspace_create import CreateWorkspaceResult, create_workspace
 from .workspace_id import (
@@ -448,11 +449,13 @@ __all__ = [
     "make_workspaces_store",
     "migrate_workspace",
     "new_workspace_id",
+    "page_image_key",
     "pending_migrations",
     "prepare_bulk_classify",
     "prune_jobs",
     "read_attestation",
     "read_dgml",
+    "read_page_image",
     "resolve_store_configs",
     "resume_would_wait",
     "slice_pages",

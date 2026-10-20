@@ -85,13 +85,14 @@ def _workspace_images(workspace: Path, limit: int) -> list[Any]:
     files_root = workspace / "files"
     images: list[Any] = []
     for file_dir in sorted(p for p in files_root.iterdir() if p.is_dir()):
-        page1 = file_dir / "page_images" / "page_1.png"
-        if page1.exists():
+        # Stored as .jpg or .png, whichever encoding was smaller for the page.
+        page1 = next(iter(sorted((file_dir / "page_images").glob("page_1.*"))), None)
+        if page1 is not None:
             images.append(Image.open(page1).convert("RGB"))
         if len(images) >= limit:
             break
     if not images:
-        raise SystemExit(f"No page_images/page_1.png found under {files_root}")
+        raise SystemExit(f"No page_images/page_1.(jpg|png) found under {files_root}")
     return images
 
 

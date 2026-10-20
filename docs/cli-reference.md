@@ -438,7 +438,7 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `hash_mismatch` | file | Stored sha256 doesn't match current PDF bytes |
 | `pdf_unreadable` | file | pypdf can't parse the PDF (records a permanent error so the next check skips re-parsing) |
 | `pdf_unreadable_permanent` | file | A previous parse recorded a permanent failure; not retried without `--retry-errors` |
-| `page_count_mismatch` | file | `page_images/` has the wrong number of PNGs (`repaired: true` if rerendered successfully) |
+| `page_count_mismatch` | file | `page_images/` has the wrong number of page images (`repaired: true` if rerendered successfully) |
 | `page_render_failed` | file | the configured page renderer failed during rerender |
 | `page_render_failed_permanent` | file | A previous render recorded a permanent failure; not retried without `--retry-errors` |
 | `page_text_count_mismatch` | file | `page_text/` has the wrong number of per-page JSONs (`repaired: true` if re-extracted successfully) |
@@ -816,8 +816,8 @@ is written but left ungrounded, with a warning — it does not fail the run.
 the `dg` prefix to (the open `dgml.io` scheme on generated DGML; plain
 `origin` on namespace-free XML). Its value is a `"; "`-separated list of
 boxes, each `<page> <x1> <y1> <x2> <y2>` (space-separated) in integer image
-pixels — top-left origin, 300 dpi, relative to the page's
-`page_images/page_N.png`:
+pixels — top-left origin, relative to the page's
+`page_images/page_N.{png,jpg}`:
 
 ```xml
 <docset:Body structure="h3"
@@ -872,7 +872,7 @@ with the deterministic digital/hybrid path. A malformed `style` section fails
 `generate` up front with `STYLE_CONFIG_INVALID`.
 
 Requires only the base `dgml` install — the generation pipeline reuses
-the workspace's pre-rendered `page_images/page_N.png` files at LLM
+the workspace's pre-rendered `page_images/page_N.{png,jpg}` files at LLM
 input time, so no extra rasterizer is needed at run time (and no
 GPL/poppler escape hatch). For non-workspace inputs (library callers
 passing arbitrary paths), the pipeline renders to a tempdir via the
@@ -1833,8 +1833,11 @@ failed at `file add` (the message repeats the converter's error).
 ### `dgml file add <path> [--id FILE_ID] [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify [MODE]] [--batch]`
 
 Add a File. The source is copied into the workspace, hashed, its pages
-are rendered to PNGs via `gs` (300 dpi by default — see `--dpi`), and
-per-page word boxes are written to `page_text/` according to `--text-mode`.
+are rendered via `gs` (300 dpi by default — see `--dpi`) and stored, each as
+the smaller of PNG and JPEG, with the longest edge fit between 1000 and 3508
+pixels (see
+[Page images](storage-layout.md#page-images-jpeg-edge-bounds)), and per-page
+word boxes are written to `page_text/` according to `--text-mode`.
 
 `<path>` is a `.pdf`, or a convertible source (`.docx`/`.doc`/`.xlsx`/`.xls`)
 when a converter is configured for its format family in the workspace
@@ -1888,10 +1891,15 @@ rather than the current default, so a repair reproduces the file's existing
 geometry.
 
 Note that `--dpi` also governs `page_text/` word boxes, which are expressed
-in **page-image pixel space** (`round(pdf_pts * dpi / 72)`) rather than PDF
-points — so the coordinates in a File added with `--dpi 150` are half those
-of the same File added at 300. Anything consuming `dg:origin` boxes should
-read `page_image_dpi` off the File record rather than assuming 300.
+in **page-image pixel space** (`round(pdf_pts * dpi / 72)`, refit with the
+image when the page falls outside the edge bounds) rather than PDF points — so
+the coordinates in a File added with `--dpi 150` are half those of the same
+File added at 300. Anything consuming `dg:origin` boxes should take the page's
+size from its `page_text/` `width` / `height` (or the image itself) rather
+than assuming 300 dpi. The edge bounds override `--dpi`: one low enough to put
+a page's long edge under 1000 pixels is brought back up to 1000, and one high
+enough to put it over 3508 is brought down (ghostscript resizes its render;
+the `pypdfium2` engine rasterizes such a page straight at the fitted size).
 
 Conflict types recorded in the success payload as `conflict_kind`:
 
@@ -2162,7 +2170,7 @@ Configure the model via the `classification` section in
 | Field | Required | Meaning |
 |---|---|---|
 | `model` | yes | `<provider>/<model>` in [litellm](https://docs.litellm.ai/docs/providers) form — e.g. `gemini/gemini-flash-lite-latest`, `anthropic/claude-opus-5`, `openai/gpt-4o`. |
-| `max_pages` | no (default `3`) | How many rendered page images (`page_images/page_1.png` …) to send to the LLM. Cap is per-classification cost: 1 is the cheap setting, 4+ is the thorough one. |
+| `max_pages` | no (default `3`) | How many rendered page images (`page_images/page_1.{png,jpg}` …) to send to the LLM. Cap is per-classification cost: 1 is the cheap setting, 4+ is the thorough one. |
 | `naming_attempts` | no (default `1`) | How many independent proposals to request when naming a *newly clustered* DocSet (`dgml cluster`, not per-file `--auto-classify`). At `1` the single proposal is used as-is. At `2`+ the name the plurality of attempts agreed on wins, and that share is reported as the file's `naming_confidence` — a 3-of-3 agreement is safe to accept unreviewed, a 2-1 split is worth a look. Costs tokens linearly, so raise it only for runs where a wrong DocSet name is expensive to undo. |
 | `api_key` | no | Optional literal API key. Use only on per-developer workspaces (config.toml isn't checked in). Mutually exclusive with `api_key_env`. |
 | `api_key_env` | no | Optional name of the env var to read the API key from. Mutually exclusive with `api_key`. When neither is set, litellm uses its built-in per-provider lookup (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …). When `api_key_env` references an unset env var, `AUTH_ERROR` is raised. |

@@ -15,7 +15,7 @@
 Walks pdfminer.six's page layout, groups characters into whitespace-separated
 words, and emits one compact JSON file per page in the file's ``page_text/``
 directory. Coordinates are converted from PDF points (origin bottom-left) to
-image pixels matching the corresponding ``page_images/page_N.png`` render.
+image pixels matching the corresponding ``page_images/page_N.{png,jpg}`` render.
 
 OCR and hybrid extraction live in :mod:`dgml.ocr` and :mod:`dgml.hybrid` and
 share the per-page JSON shape emitted here so downstream consumers don't have
@@ -46,7 +46,7 @@ from statistics import median
 from typing import Any
 
 from .errors import TextExtractionFailed
-from .pages import DEFAULT_DPI
+from .pages import DEFAULT_DPI, DEFAULT_PAGE_IMAGE_SPEC, PageImageSpec
 from .style import fontname_is_bold, fontname_is_italic, rgb_to_named
 
 PAGE_TEXT_FILENAME = "page_{page}.json"
@@ -291,17 +291,20 @@ def extract_text_digital(
     *,
     file_id: str,
     dpi: int = DEFAULT_DPI,
+    image_spec: PageImageSpec = DEFAULT_PAGE_IMAGE_SPEC,
 ) -> ExtractDigitalResult:
     """Extract digital text from each PDF page and write per-page JSON.
 
     One ``page_N.json`` is written per page, where ``N`` is 1-based to align
-    with ``page_images/page_N.png``. Stale ``page_*.json`` files in
+    with ``page_images/page_N.{png,jpg}``. Stale ``page_*.json`` files in
     ``output_dir`` are removed first so retries don't leave orphans.
 
-    ``dpi`` must be the resolution the matching ``page_images/`` were rendered
-    at, because word boxes are written in that render's *pixel* space. Passing a
-    different value silently misaligns every box against its page image — and
-    against the OCR boxes the hybrid merge compares them to.
+    ``dpi`` and ``image_spec`` must be what the matching ``page_images/`` were
+    rendered with, because word boxes are written in that render's *pixel*
+    space: ``round(pts * dpi / 72)``, refit by :meth:`PageImageSpec.fit` when
+    the page falls outside its edge bounds. Passing a different value silently
+    misaligns every box against its page image — and against the OCR boxes
+    the hybrid merge compares them to.
 
     Raises :class:`TextExtractionFailed` if pdfminer.six cannot parse the PDF.
     A successful run with zero words on every page returns a result with
@@ -343,12 +346,19 @@ def extract_text_digital(
             x0, y0, x1, y1 = page_layout.bbox
             page_w_pts = float(x1 - x0)
             page_h_pts = float(y1 - y0)
-            width_px = max(0, round(page_w_pts * dpi / 72))
-            height_px = max(0, round(page_h_pts * dpi / 72))
+            rendered_w = max(0, round(page_w_pts * dpi / 72))
+            rendered_h = max(0, round(page_h_pts * dpi / 72))
+            width_px, height_px = image_spec.fit(rendered_w, rendered_h)
+            # Per axis, so a box lands where the stored image's own rounding
+            # put that edge. Exactly ``dpi / 72`` when the page was not refit.
+            scale_x = dpi / 72 * (width_px / rendered_w if rendered_w else 1.0)
+            scale_y = dpi / 72 * (height_px / rendered_h if rendered_h else 1.0)
 
             words: list[dict[str, Any]] = []
             for text, (x0, y0, x1, y1), style in _iter_words(page_layout):
-                box = _pts_box_to_pixel_lt_rb(x0, y0, x1, y1, page_h_pts=page_h_pts, dpi=dpi)
+                box = _pts_box_to_pixel_lt_rb(
+                    x0, y0, x1, y1, page_h_pts=page_h_pts, scale_x=scale_x, scale_y=scale_y
+                )
                 if box is None:
                     continue
                 word: dict[str, Any] = {"t": text, "l": list(box)}
@@ -482,18 +492,19 @@ def _pts_box_to_pixel_lt_rb(
     y1: float,
     *,
     page_h_pts: float,
-    dpi: int,
+    scale_x: float,
+    scale_y: float,
 ) -> tuple[int, int, int, int] | None:
     """Convert a PDF-points bbox (origin bottom-left) to image-pixel
-    ``(left, top, right, bottom)`` ints (origin top-left). Returns ``None``
-    if the resulting box is degenerate (zero width or height).
+    ``(left, top, right, bottom)`` ints (origin top-left), at ``scale_x`` /
+    ``scale_y`` pixels per point. Returns ``None`` if the resulting box is
+    degenerate (zero width or height).
     """
-    scale = dpi / 72.0
-    left = round(x0 * scale)
-    right = round(x1 * scale)
+    left = round(x0 * scale_x)
+    right = round(x1 * scale_x)
     # PDF y is bottom-up; image y is top-down. y1 (PDF top) -> image top.
-    top = round((page_h_pts - y1) * scale)
-    bottom = round((page_h_pts - y0) * scale)
+    top = round((page_h_pts - y1) * scale_y)
+    bottom = round((page_h_pts - y0) * scale_y)
     left = max(0, left)
     top = max(0, top)
     right = max(left, right)

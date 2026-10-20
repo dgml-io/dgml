@@ -205,7 +205,8 @@ uv run dgml file add "dgml-spec/samples/1-NonTraded-NAV-REITs/files" --recursive
 Behind the scenes, DGML performs the following tasks per PDF:
 1. Copies the file into `<workspace>/files/<file_id>/`.
 2. Computes the SHA-256 hash of the bytes.
-3. Renders each page into a high-resolution (300 DPI) PNG under `page_images/`.
+3. Renders each page at 300 DPI and stores it under `page_images/` as a PNG or a JPEG,
+   whichever is smaller, with the longest edge fit between 1000 and 3508 pixels.
 4. Extracts per-page text layout word boxes using `pdfminer.six` and stores them as JSON under `page_text/`.
 
 *Tip: on a large corpus, rendering is the slowest step. Add `--dpi 150` to halve

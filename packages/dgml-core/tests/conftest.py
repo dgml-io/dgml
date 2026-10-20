@@ -189,13 +189,17 @@ def _write_blank_pdf(path: Path, pages: int) -> None:
     _write_text_pdf(path, pages_text=[""] * pages)
 
 
-def _write_text_pdf(path: Path, pages_text: list[str]) -> None:
+def _write_text_pdf(
+    path: Path,
+    pages_text: list[str],
+    page_size: tuple[float, float] = (PAGE_WIDTH_PTS, PAGE_HEIGHT_PTS),
+) -> None:
     """Write a minimal PDF where each page has one line of Helvetica text
     rendered at (100, 700) in PDF points (origin bottom-left).
 
     Hand-constructed bytes so digital-text extraction has a stable, dependency-
-    light fixture. Each page is US Letter (612x792 pts); single Type1 Helvetica
-    font; one BT/ET text block per page.
+    light fixture. Each page is ``page_size`` points (US Letter, 612x792, by
+    default); single Type1 Helvetica font; one BT/ET text block per page.
     """
     out = bytearray()
     offsets: list[int] = []
@@ -225,7 +229,7 @@ def _write_text_pdf(path: Path, pages_text: list[str]) -> None:
     for page_id, content_id in zip(page_obj_ids, content_obj_ids, strict=True):
         body = (
             f"<< /Type /Page /Parent {pages_id} 0 R "
-            f"/MediaBox [0 0 {PAGE_WIDTH_PTS} {PAGE_HEIGHT_PTS}] "
+            f"/MediaBox [0 0 {page_size[0]} {page_size[1]}] "
             f"/Contents {content_id} 0 R "
             f"/Resources << /Font << /F1 {font_id} 0 R >> >> >>"
         ).encode()
@@ -332,7 +336,7 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset the library's ``_WARNED_*`` once-per-process warning dedup (see
     the Logging section of ../CLAUDE.md) so tests stay order-independent —
     any test may trigger these paths, not only the modules that assert on them."""
-    from dgml_core import grounded, models_config, ocr, rotation
+    from dgml_core import grounded, models_config, ocr
     from dgml_core.generation import pipeline
 
     models_config._WARNED_TIER_FALLBACKS.clear()
@@ -340,7 +344,6 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     ocr._WARNED_NO_OCR_PROVIDER.clear()
     grounded._REQUIRED_TOOL_CHOICE_REJECTED.clear()
     grounded._WARNED_TELEMETRY.clear()
-    monkeypatch.setattr(rotation, "_WARNED_PILLOW_MISSING", False)
     monkeypatch.setattr(pipeline, "_WARNED_DEBUG_WITHOUT_USAGE", False)
 
 

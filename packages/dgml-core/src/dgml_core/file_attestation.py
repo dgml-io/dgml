@@ -17,7 +17,7 @@ together, constitute everything DGML knows about that file at a moment
 in time. Five artifact categories participate:
 
 1. Source document (binary) — the original ``.pdf``/``.docx``/… (slot ``source``)
-2. Page images, one PNG per page (binary)
+2. Page images, one JPEG or PNG per page (binary)
 3. The DocSet's ``full-schema.rnc`` generation tag schema (binary — raw RNC
    bytes; docset-scoped). The RNC render is lossless over ``schema.json``
    (every field survives as ``# Field: value`` comments), so attesting it
@@ -89,7 +89,6 @@ inventory, missing file, missing docset) raises.
 
 from __future__ import annotations
 
-import re
 import shutil
 import tempfile
 import zipfile
@@ -121,7 +120,7 @@ from .opc import (
     write_package_rels,
     zip_package,
 )
-from .pages import PAGE_GLOB
+from .pages import page_number_from_image_name
 from .storage import Workspace
 
 _ATTESTATION_VERSION = "1"
@@ -214,13 +213,6 @@ class FileAttestation:
 # --- discovery --------------------------------------------------------------
 
 
-# Page images use the renderer's canonical extension (PNG; see
-# dgml.pages.PAGE_GLOB) — deriving it here keeps attestation in lockstep
-# with whatever the render pipeline writes rather than hardcoding a guess.
-_PAGE_IMAGE_EXT = PAGE_GLOB.rsplit(".", 1)[-1]
-_PAGE_FILE_RE = re.compile(rf"^page_(\d+)\.{_PAGE_IMAGE_EXT}$")
-
-
 def _page_num(path: Path) -> int:
     """Pull the page index out of a ``page_N.<ext>`` page-image filename.
 
@@ -228,10 +220,12 @@ def _page_num(path: Path) -> int:
     ``page_images/`` is bad input, not a missing artifact, and surfacing it
     loudly beats silently sorting alphabetically.
     """
-    m = _PAGE_FILE_RE.match(path.name)
-    if m is None:
+    # The render pipeline's own parser, so attestation accepts exactly the
+    # extensions it stores (JPEG and PNG) rather than a guess.
+    number = page_number_from_image_name(path.name)
+    if number is None:
         raise ValueError(f"unexpected file name '{path.name}' (expected 'page_N.<ext>')")
-    return int(m.group(1))
+    return number
 
 
 def collect_file_version(

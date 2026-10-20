@@ -64,7 +64,7 @@ from dgml_core.docsets import DocSetStore
 from dgml_core.errors import DgmlError
 from dgml_core.files import FileStore
 from dgml_core.llm_clustering import llm_cluster_files
-from dgml_core.pages import PAGE_GLOB
+from dgml_core.pages import list_page_images
 from dgml_core.run_clustering import resolve_text_settings, run_clustering
 from dgml_core.storage import Workspace, read_json
 
@@ -114,7 +114,7 @@ def clusterable_files(ws: Workspace, gt: dict[str, str]) -> tuple[list[str], lis
     """Split ground-truth file ids into (has page image, missing page image)."""
     usable, missing = [], []
     for fid in gt:
-        if ws.file_pages_dir(fid).exists() and any(ws.file_pages_dir(fid).glob(PAGE_GLOB)):
+        if ws.file_pages_dir(fid).exists() and list_page_images(ws.file_pages_dir(fid)):
             usable.append(fid)
         else:
             missing.append(fid)

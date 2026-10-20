@@ -9,8 +9,9 @@ Every bounding box DGML stores — in `page_text/page_N.json` and in the
 `dg:origin` attributes of `<stem>.dgml.xml` (both the generated document tree
 and the `dg:extraction` element) — uses **one**
 convention: integer **image pixels** `[left, top, right, bottom]`,
-top-left origin, at 300 dpi relative to the page's
-`page_images/page_N.png`. Page is carried in a sibling `page_number`
+top-left origin, relative to the page's `page_images/page_N.{png,jpg}` (rendered
+at 300 dpi by default, then fit to the page-edge bounds; see
+[Page images](#page-images-jpeg-edge-bounds)). Page is carried in a sibling `page_number`
 field for structured forms, or as a leading integer inside each
 `dg:origin` box (`<page> <x1> <y1> <x2> <y2>`, space-separated) since one
 element can span pages.
@@ -104,8 +105,9 @@ at all — see [storage services](#storage-services-storage).
         │                             #   not already a PDF; what pages/text and
         │                             #   generation use (see docs/conversion.md)
         ├── file.json                 # metadata (see schema below)
-        ├── page_images/              # PNG page renders at page_image_dpi
-        │                             #   (300 by default; cacheable, see below)
+        ├── page_images/              # JPEG/PNG page renders at page_image_dpi
+        │                             #   (300 by default), fit to the page-edge
+        │                             #   bounds (see below; cacheable)
         │   ├── page_1.png
         │   └── page_2.png
         ├── page_text/                # one JSON of word boxes per page
@@ -125,14 +127,41 @@ everywhere an ID appears.
 
 DocSet IDs are always generated today.
 
+## Page images (JPEG, edge bounds)
+
+Each page is rendered at the file's dpi (`page_image_dpi`, 300 by default) and
+then stored with its **longest edge between 1000 and 3508 pixels**, as a PNG
+(`page_N.png`) or a JPEG at quality 90 (`page_N.jpg`), whichever is smaller for
+that page — a crisp text page is usually far smaller as a PNG, a photo or scan
+far smaller as a JPEG, so one file's pages can mix the two. A page whose render already falls in that range — Letter (2550 ×
+3300) and A4 (2480 × 3508) at 300 dpi — is stored at exactly its render size; a
+large-format sheet is scaled down to a 3508-pixel long edge, and a small page
+(or a low `--dpi`) is scaled up to a 1000-pixel one. The scale is uniform, so
+the aspect ratio is kept.
+
+The bounds decide the pixel space every box is in: digital text extraction
+applies the same fit, so `page_text/` and `dg:origin` boxes always match the
+stored image, refit or not. The bounds are not recorded per file; `dgml check`
+repairs with the current ones.
+
+Files added before the edge bounds have **full-size PNG** renders
+(`page_N.png`). They stay valid — their boxes are in those PNGs' pixels — and
+every reader accepts either extension. If `dgml check` has to re-render such a
+file's pages, it writes bounded images: identical geometry for a page already
+inside the bounds, but a page outside them (a large-format sheet, or a
+`--dpi` low enough to fall under the min edge) no longer matches its stored
+`page_text/` boxes. Delete and re-add such a file instead, which re-extracts
+its text against the new images.
+
 ## Page-image render cache (`$DGML_PAGE_CACHE`, optional)
 
 Rendering `page_images/` runs the configured renderer (the system
 ghostscript binary by default, or PDFium via `[pdf] provider =
 "pypdfium2"`), which dominates the cost of `dgml file add`. The render is a
-pure function of the PDF bytes, the renderer, and the dpi, so when the
-**`DGML_PAGE_CACHE`** environment variable names a directory, the renderer
-keys each render by a hash of all three and reuses it:
+pure function of the PDF bytes, the renderer, the dpi, and the stored-image
+format and edge bounds, so when the **`DGML_PAGE_CACHE`** environment
+variable names a directory, the renderer keys each render by a hash of them
+all and reuses it:
 
 - **Hit** — an identical PDF rendered before is copied from the cache and
   the render backend is not invoked (it need not even be installed).
@@ -144,7 +173,7 @@ The cache is **off by default**; unset, rendering is unchanged. It is keyed by
 content, not by workspace — so it pays off when the same PDFs are ingested into
 many workspaces (e.g. the clustering sweep's per-cell workspaces in
 [evaluation/clustering/](../evaluation/clustering/), which sets it automatically;
-`--no-page-cache` opts out). Entries are plain `<hash>/page_*.png` directories
+`--no-page-cache` opts out). Entries are plain `<hash>/page_*.{jpg,png}` directories
 and are safe to delete at any time.
 
 ## Staging scratch space (`$TMPDIR`)
@@ -929,7 +958,7 @@ converted to the engine's `extracted_value` JSON Schema, whose leaf values
 carry `{ "text", "value"?, "locations": [{ "page_number", "bounding_box":
 [left, top, right, bottom] }] }` — verbatim text, optional normalized value
 (enum token, ISO date, plain number), and locations in integer image pixels
-(top-left origin, 300 dpi, relative to `page_images/page_N.png`) — so every
+(top-left origin, relative to `page_images/page_N.{png,jpg}`) — so every
 extracted value traces back to one or more regions of the source PDF.
 
 When present, `extraction-schema.rnc` is one of the artifacts captured in a
@@ -1220,8 +1249,8 @@ rendered tree is aligned against the file's `page_text/` OCR and a
 onto every element whose subtree grounded — so `<stem>.dgml.xml`
 carries page positions directly, with no separate grounded artifact. Each
 attribute is a `"; "`-separated box list, each box `<page> <x1> <y1> <x2>
-<y2>` (space-separated) in integer image pixels (top-left origin, 300
-dpi, relative to `page_images/page_N.png`). Elements with text-node
+<y2>` (space-separated) in integer image pixels (top-left origin,
+relative to `page_images/page_N.{png,jpg}`). Elements with text-node
 children (leaves and mixed-content parents) carry one box per visual
 line on each page (a parent's lines cover its whole subtree); pure
 containers (all-element children — sections, lists, tables, rows, the
@@ -1294,20 +1323,22 @@ source was already a PDF.
 
 One per page, written regardless of `text_mode` (`"digital"`, `"ocr"`,
 or `"hybrid"` all share this shape). Word locations are
-in **image-pixel space** matching the corresponding `page_images/page_N.png`
+in **image-pixel space** matching the corresponding `page_images/page_N.{png,jpg}`
 render — i.e. ints with the top-left origin, computed as
 `round(pdf_pts * dpi / 72)` where `dpi` is the file's `page_image_dpi` — the
-same value `render_pages` used, 300 unless `--dpi` said otherwise. Consumers
-of these coordinates should read `page_image_dpi` off `file.json` rather than
-assuming 300: the boxes in a File added with `--dpi 150` are half the size of
-the same File's at 300. Files are compact (one line, no pretty-printing) so a
+same value `render_pages` used, 300 unless `--dpi` said otherwise — and then
+scaled by the same fit to the edge bounds as the stored image, when the page
+falls outside them. Consumers of these coordinates should take the page's
+`width` / `height` here (or the image's own size) rather than assuming 300
+dpi: the boxes in a File added with `--dpi 150` are half the size of the same
+File's at 300, and a large-format sheet's are scaled to its 3508-pixel image. Files are compact (one line, no pretty-printing) so a
 workspace with many pages doesn't bloat on disk:
 
 ```json
 {"file_id":"ab55kdjs93kk","page":1,"width":2550,"height":3300,"words":[{"t":"Hello","l":[100,210,182,242],"s":{"b":1,"sz":24.0,"c":"red"}},{"t":"world","l":[190,210,290,242],"s":{"sz":12.0}}]}
 ```
 
-- `width` / `height` — dimensions of the matching `page_images/page_N.png`.
+- `width` / `height` — dimensions of the matching `page_images/page_N.{png,jpg}`.
 - `words[*].t` — word text (whitespace-separated run of non-whitespace chars).
 - `words[*].l` — `[left, top, right, bottom]` ints (top-left origin, pixels).
 - `words[*].s` — observed style facts, present only on the digital path (and

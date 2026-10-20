@@ -1312,3 +1312,14 @@ def test_provider_error_context_reads_only_well_typed_fields() -> None:
 
     exc.response = SimpleNamespace(headers={"x-request-id": None})  # type: ignore[attr-defined]
     assert llm.provider_error_context(exc) == ""
+
+
+def test_build_user_content_labels_each_image_by_its_own_format() -> None:
+    """A page image is a JPEG or a PNG, whichever encoding was smaller; each
+    image block must carry the MIME type of the bytes it holds."""
+    jpeg = b"\xff\xd8\xff\xe0 jpeg body"
+    png = b"\x89PNG\r\n\x1a\n png body"
+    content = llm.build_user_content(instruction_text="x", images=[jpeg, png])
+    urls = [block["image_url"]["url"] for block in content if block["type"] == "image_url"]
+    assert urls[0].startswith("data:image/jpeg;base64,")
+    assert urls[1].startswith("data:image/png;base64,")

@@ -30,8 +30,6 @@ dev = [
     { name = "mypy", specifier = ">=1.11" },
     { name = "networkx", specifier = ">=3.6.1" },
     { name = "numba", specifier = ">=0.61" },
-    { name = "pillow", specifier = ">=10.0" },
-    { name = "pillow", specifier = ">=10.2" },
     { name = "pip-licenses", specifier = ">=4.4" },
     { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin'", specifier = ">=10.0" },
     { name = "pyobjc-framework-vision", marker = "sys_platform == 'darwin'", specifier = ">=10.0" },
@@ -1132,6 +1130,7 @@ dependencies = [
     { name = "litellm" },
     { name = "lxml" },
     { name = "pdfminer-six" },
+    { name = "pillow" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
 ]
@@ -1139,12 +1138,10 @@ dependencies = [
 [package.optional-dependencies]
 aws = [
     { name = "boto3" },
-    { name = "pillow" },
 ]
 azure = [
     { name = "azure-ai-documentintelligence" },
     { name = "azure-identity" },
-    { name = "pillow" },
 ]
 chain = [
     { name = "dgml-chain" },
@@ -1157,7 +1154,6 @@ macos = [
     { name = "pyobjc-framework-vision", marker = "sys_platform == 'darwin'" },
 ]
 pdfium = [
-    { name = "pillow" },
     { name = "pypdfium2" },
 ]
 
@@ -1172,9 +1168,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.51.0" },
     { name = "lxml", specifier = ">=5.0.0" },
     { name = "pdfminer-six", specifier = ">=20240706" },
-    { name = "pillow", marker = "extra == 'aws'", specifier = ">=10.0" },
-    { name = "pillow", marker = "extra == 'azure'", specifier = ">=10.0" },
-    { name = "pillow", marker = "extra == 'pdfium'", specifier = ">=10.2" },
+    { name = "pillow", specifier = ">=10.2" },
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin' and extra == 'macos'", specifier = ">=10.0" },
     { name = "pyobjc-framework-vision", marker = "sys_platform == 'darwin' and extra == 'macos'", specifier = ">=10.0" },

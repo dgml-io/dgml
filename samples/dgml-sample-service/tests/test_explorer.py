@@ -44,9 +44,11 @@ def test_s3_browse_and_preview(
     assert f"files/{file_id}/page_text/page_1.json" in {o["key"] for o in deep["objects"]}
 
     pages = client.get(base, params={"prefix": f"files/{file_id}/page_images"}).json()
-    png = client.get(f"{base}/object", params={"key": pages["objects"][0]["key"]})
-    assert png.status_code == 200 and png.headers["content-type"] == "image/png"
-    assert png.headers["content-security-policy"] == "sandbox"
+    key = pages["objects"][0]["key"]
+    image = client.get(f"{base}/object", params={"key": key})
+    expected = "image/png" if key.endswith(".png") else "image/jpeg"
+    assert image.status_code == 200 and image.headers["content-type"] == expected
+    assert image.headers["content-security-policy"] == "sandbox"
 
     text_key = f"files/{file_id}/page_text/page_1.json"
     text = client.get(f"{base}/object", params={"key": text_key})

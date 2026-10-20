@@ -31,6 +31,7 @@ from dgml_core.errors import (
     UnsupportedFileType,
 )
 from dgml_core.files import ConflictPolicy, FileStore
+from dgml_core.ocr import _image_dimensions
 from dgml_core.storage import Workspace
 
 from .conftest import needs_gs
@@ -111,7 +112,7 @@ def test_add_pdf(store: FileStore, sample_pdf: Path) -> None:
     assert result.record.page_image_dpi == 300
     assert result.record.page_image_renderer == "ghostscript"
     assert result.record.pdf_converter is None
-    pages = _page_pngs(store.ws, result.record.id)
+    pages = _page_images(store.ws, result.record.id)
     assert len(pages) == 2
 
 
@@ -125,7 +126,7 @@ def test_add_pdf_with_pypdfium2_renderer(store: FileStore, sample_pdf: Path) -> 
     assert result.created
     assert result.page_render_error is None
     assert result.record.page_image_renderer == "pypdfium2"
-    assert len(_page_pngs(store.ws, result.record.id)) == 2
+    assert len(_page_images(store.ws, result.record.id)) == 2
 
 
 @needs_gs
@@ -133,27 +134,25 @@ def test_add_pdf_custom_dpi_is_rendered_and_recorded(store: FileStore, sample_pd
     result = store.add(sample_pdf, dpi=150)
     assert result.page_render_error is None
     assert result.record.page_image_dpi == 150
-    pages = _page_pngs(store.ws, result.record.id)
+    pages = _page_images(store.ws, result.record.id)
     assert len(pages) == 2
     # The record has to describe the pixels actually on disk, since `dgml check`
     # reproduces this geometry when it repairs the file later.
-    width, height = _png_size(store.ws.blobs.get_blob(pages[0]))
+    width, height = _image_dimensions(store.ws.blobs.get_blob(pages[0]))
     at_300 = store.add(sample_pdf, on_conflict=ConflictPolicy.DUPLICATE)
-    w300, h300 = _png_size(store.ws.blobs.get_blob(_page_pngs(store.ws, at_300.record.id)[0]))
+    w300, h300 = _image_dimensions(
+        store.ws.blobs.get_blob(_page_images(store.ws, at_300.record.id)[0])
+    )
     assert width < w300 and height < h300
 
 
-def _png_size(data: bytes) -> tuple[int, int]:
-    """Width/height from a PNG's IHDR — avoids depending on an image library."""
-    header = data[16:24]
-    return int.from_bytes(header[:4], "big"), int.from_bytes(header[4:], "big")
-
-
-def _page_pngs(ws: Workspace, file_id: str) -> list[str]:
+def _page_images(ws: Workspace, file_id: str) -> list[str]:
     """Sorted page-image blob keys for ``file_id`` (store analogue of globbing
-    page_*.png in the page-images dir)."""
+    page_*.{jpg,png} in the page-images dir)."""
     return sorted(
-        k for k in ws.blobs.list_blobs(layout.file_pages_prefix(file_id)) if k.endswith(".png")
+        k
+        for k in ws.blobs.list_blobs(layout.file_pages_prefix(file_id))
+        if k.endswith((".jpg", ".png"))
     )
 
 

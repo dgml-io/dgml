@@ -338,7 +338,7 @@ def clustering(
     LLM call for a given cluster fails, the files in *that* cluster
     land in ``failed_file_ids`` while every other cluster (matched or
     successfully named) is still assigned. Files whose page rendering
-    failed at ingest time (no ``page_1.png``), and files the clusterer
+    failed at ingest time (no ``page_1.{png,jpg}``), and files the clusterer
     placed in no cluster at all, also land in ``failed_file_ids``. The
     function does not raise.
 

@@ -57,6 +57,7 @@ an actionable message.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import struct
@@ -72,7 +73,7 @@ from .concurrency import map_concurrent
 from .config import load_merged_config
 from .errors import DgmlError, OcrConfigInvalid, OcrConfigMissing, OcrFailed
 from .models_config import ConfigSection
-from .pages import PAGE_GLOB
+from .pages import list_page_images, page_number_from_image_name
 from .provider import ProviderConfigFields, import_provider_class
 from .rotation import deskew_page, should_rotate
 from .storage import Workspace
@@ -438,14 +439,14 @@ def extract_text_ocr(
     page image raises :class:`OcrFailed`. Without it, every page is OCR'd and
     stale page JSONs are cleared first.
 
-    All providers operate per rendered page image (``page_images/page_N.png``):
+    All providers operate per rendered page image (``page_images/page_N.{png,jpg}``):
     one provider call per page, no whole-PDF dispatch. This keeps the
     code path symmetric, sidesteps Azure's per-file page ceilings, and
     lets a single bad page surface with a clear page number. Output
     shape matches :func:`extract_text_digital` so consumers and the
     consistency check don't special-case OCR-derived text.
 
-    Page dimensions are read directly from each PNG's IHDR chunk —
+    Page dimensions are read directly from each image's header —
     these are the dimensions Textract's normalized bboxes are
     referenced against by definition, so there's no chance of drift
     from a hypothetical mismatch between the PDF's mediabox and what
@@ -473,13 +474,13 @@ def extract_text_ocr(
     provider = make_ocr_provider(config)
     workers = config.max_concurrency if max_concurrency is None else max_concurrency
 
-    page_image_paths = sorted(page_images_dir.glob(PAGE_GLOB))
+    page_image_paths = list_page_images(page_images_dir)
     if pages is not None:
         wanted = set(pages)
         page_image_paths = [
-            p for p in page_image_paths if _page_num_from_image_name(p.name) in wanted
+            p for p in page_image_paths if page_number_from_image_name(p.name) in wanted
         ]
-        found = {_page_num_from_image_name(p.name) for p in page_image_paths}
+        found = {page_number_from_image_name(p.name) for p in page_image_paths}
         missing = wanted - found
         if missing:
             raise OcrFailed(
@@ -500,14 +501,14 @@ def extract_text_ocr(
         """Read one page image, derive its pixel dims, call the provider, and
         write its page JSON — deskewing the image and word boxes first when the
         provider reports a significant page skew."""
-        page_num = _page_num_from_image_name(path.name)
+        page_num = page_number_from_image_name(path.name)
         if page_num is None:
             return None
         image_bytes = path.read_bytes()
         try:
             dims = _image_dimensions(image_bytes)
         except ValueError as exc:
-            raise OcrFailed(f"page {page_num}: invalid PNG at {path}: {exc}") from exc
+            raise OcrFailed(f"page {page_num}: invalid page image at {path}: {exc}") from exc
         page = _as_page_result(provider.analyze_image(image_bytes, dims, page_num))
         words = page.words
         rotation: float | None = None
@@ -548,41 +549,41 @@ def extract_text_ocr(
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE = b"\xff\xd8\xff"
 
 
 def _image_dimensions(data: bytes) -> tuple[int, int]:
-    """Parse ``(width, height)`` in pixels from a PNG's IHDR chunk.
+    """Parse ``(width, height)`` in pixels from a page image's header.
 
     Reading dims from the image bytes (rather than computing them from
     PDF mediabox times DPI) ensures we match exactly what's on disk —
     immune to mediabox/CropBox/rotation mismatches between the PDF
-    parser and the renderer.
+    parser and the renderer, and to the page-edge fit applied at render.
 
-    PNG layout: 8-byte signature, then a chunk with 4-byte big-endian
-    length, 4-byte type ("IHDR"), then payload starting with width
-    (uint32 BE) at byte offset 16 and height (uint32 BE) at offset 20.
+    A PNG is read straight from its IHDR chunk: 8-byte
+    signature, then a chunk with 4-byte big-endian length, 4-byte type
+    ("IHDR"), then width (uint32 BE) at byte offset 16 and height at 20. A
+    JPEG is read by Pillow, which parses the header without decoding pixels.
 
-    Raises ``ValueError`` if the bytes don't start with the PNG
-    signature or the IHDR chunk is missing/truncated.
+    Raises ``ValueError`` if the bytes are neither, or the header is
+    missing/truncated.
     """
-    if not data.startswith(_PNG_SIGNATURE):
-        raise ValueError("not a PNG: missing signature")
-    if len(data) < 24:
-        raise ValueError("truncated PNG: header less than 24 bytes")
-    if data[12:16] != b"IHDR":
-        raise ValueError("PNG IHDR chunk missing or not first")
-    width, height = struct.unpack(">II", data[16:24])
-    return width, height
+    if data.startswith(_PNG_SIGNATURE):
+        if len(data) < 24:
+            raise ValueError("truncated PNG: header less than 24 bytes")
+        if data[12:16] != b"IHDR":
+            raise ValueError("PNG IHDR chunk missing or not first")
+        width, height = struct.unpack(">II", data[16:24])
+        return width, height
+    if data.startswith(_JPEG_SIGNATURE):
+        from PIL import Image
 
-
-def _page_num_from_image_name(name: str) -> int | None:
-    """Parse ``page_<N>.png`` → ``N``; return None if the name doesn't match."""
-    if not name.startswith("page_") or not name.endswith(".png"):
-        return None
-    try:
-        return int(name[len("page_") : -len(".png")])
-    except ValueError:
-        return None
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                return im.size
+        except Exception as exc:
+            raise ValueError(f"unreadable JPEG header: {exc}") from exc
+    raise ValueError("not a PNG or JPEG: missing signature")
 
 
 def recover_unusable_pages(

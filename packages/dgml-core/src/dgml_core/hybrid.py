@@ -264,8 +264,8 @@ def _merge_into(
         d_payload = _read_page(digital_pages.get(page_num))
         o_payload = _read_page(ocr_pages.get(page_num))
 
-        # Prefer OCR's reported dimensions — the PNG IHDR is the source of
-        # truth they were measured against. Digital fills in only when OCR
+        # Prefer OCR's reported dimensions — the page image's header is the
+        # source of truth they were measured against. Digital fills in only when OCR
         # didn't process this page.
         rotation: float | None = None
         if o_payload is not None:

@@ -4524,7 +4524,7 @@ def test_dgmlx_verify_detects_tamper(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     capsys.readouterr()
 
-    (out_dir / "page_images" / "page_1.png").write_bytes(b"TAMPERED")
+    (out_dir / "page_images" / "page_1.jpg").write_bytes(b"TAMPERED")
     rc = main(_ws_args(ws) + ["dgmlx", "verify", str(out_dir)])
     assert rc == 2  # mirrors `check`: verified-but-failed
     payload = _read_stdout(capsys)

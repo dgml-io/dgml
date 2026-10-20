@@ -85,8 +85,8 @@ CSS ``getClientRects()`` model); pure containers (all-element children
 (the ``getBoundingClientRect()`` model), since repeating every
 descendant's line boxes up each ancestor would bloat the document.
 Each box is ``<page> <x1> <y1> <x2> <y2>``
-(space-separated) in integer image pixels (top-left origin, 300 dpi,
-relative to ``page_images/page_N.png``), boxes ``"; "``-separated, e.g.::
+(space-separated) in integer image pixels (top-left origin, relative to
+``page_images/page_N.{png,jpg}``), boxes ``"; "``-separated, e.g.::
 
     dg:origin="3 307 367 1098 428; 4 307 254 1093 376"
 
