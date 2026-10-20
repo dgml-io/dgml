@@ -46,6 +46,7 @@ No optional dependency: ``httpx`` ships with litellm.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -224,6 +225,15 @@ class AnthropicBatchBackend:
 
     def _key(self) -> str | None:
         return self._api_key or os.environ.get("ANTHROPIC_API_KEY") or None
+
+    def credential_fingerprint(self) -> str | None:
+        """The first 12 hex digits of the SHA-256 of the key this backend
+        sends, or ``None`` with no key: enough to tell two keys apart, never
+        enough to recover one. A batch job keeps it on each batch it creates,
+        since a 404 under another account's key does not mean the batch is
+        gone."""
+        key = self._key()
+        return hashlib.sha256(key.encode()).hexdigest()[:12] if key else None
 
     def _headers(self) -> dict[str, str]:
         key = self._key()

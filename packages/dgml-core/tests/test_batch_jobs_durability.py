@@ -51,7 +51,12 @@ from dgml_core.batch.jobs import (
     unlock_job,
 )
 from dgml_core.batch.types import BatchJob, BatchNotFound, BatchRequest
-from dgml_core.errors import BatchJobBusy, BatchJobLeaseLost, BatchPending
+from dgml_core.errors import (
+    BatchExecutionFailed,
+    BatchJobBusy,
+    BatchJobLeaseLost,
+    BatchPending,
+)
 from dgml_core.storage import Workspace
 from dgml_core.usage import UsageEvent, extract_cost_and_tokens, read_events, record_usage
 
@@ -467,3 +472,113 @@ def test_j6_a_used_response_is_never_also_billed_as_unused(ws: Workspace) -> Non
     session.close(None)
     assert [r["cost_usd"] for r in read_events(ws)] == [0.25, 0.25]
     assert all(not r["context"] for r in read_events(ws))
+
+
+# ---- J7: a job abandoned with cancel / delete / prune still bills what it collected --
+
+
+def _collected_then_paused(
+    ws: Workspace, backend: FakeBackend, *, record_usage: bool = True
+) -> str:
+    """A pending job whose second run collected and used ``_WAVE``'s batch,
+    then paused on a later wave: its rows were dropped, its responses kept."""
+    first = start_session(
+        ws, command="test run", argv=[], job_id=None, wait=False, record_usage=record_usage
+    )
+    with pytest.raises(BatchPending) as pending:
+        _executor(backend, first).run_wave(_WAVE)
+    first.close(pending.value)
+    second = _open(ws, first.job_id, wait=False)
+    for response in _executor(backend, second).run_wave(_WAVE).values():
+        _row(ws, response)
+    second.close(BatchPending(first.job_id, submitted_batches=1, requests_in_flight=1))
+    assert read_events(ws) == []  # a paused run writes no row
+    return first.job_id
+
+
+def test_j7_cancel_bills_what_paused_runs_collected_once(ws: Workspace) -> None:
+    backend = _install(FakeBackend(_answer, provider="anthropic", polls_until_ended=1))
+    job_id = _collected_then_paused(ws, backend)
+    cancel_job(ws, job_id)
+    rows = read_events(ws)
+    assert [r["cost_usd"] for r in rows] == [0.25, 0.25]
+    assert {r["operation"] for r in rows} == {usage.OPERATION_BATCH_UNUSED}
+    assert all(r["context"] == {"unused": True, "batch_job": job_id} for r in rows)
+    delete_job(ws, job_id)
+    assert len(read_events(ws)) == 2  # billed once, at cancel
+
+
+def test_j7_delete_bills_what_paused_runs_collected(ws: Workspace) -> None:
+    backend = _install(FakeBackend(_answer, provider="anthropic", polls_until_ended=1))
+    job_id = _collected_then_paused(ws, backend)
+    delete_job(ws, job_id)
+    assert [r["cost_usd"] for r in read_events(ws)] == [0.25, 0.25]
+
+
+def test_j7_prune_bills_what_a_failed_job_collected(ws: Workspace) -> None:
+    backend = _install(FakeBackend(_answer, provider="anthropic"))
+    session = _open(ws)
+    extra = BatchRequest("x-1", _kwargs("x"))
+    session.add_record(
+        backend.submit([extra]),
+        model=_MODEL,
+        api_base=None,
+        keys={"x-1": session.next_key(extra.kwargs)},
+    )
+    session.close(RuntimeError("the stage failed"))  # settles: collects x, unused
+    assert read_events(ws) == []
+    assert prune_jobs(ws)["deleted"] == [session.job_id]
+    (row,) = read_events(ws)
+    assert row["operation"] == usage.OPERATION_BATCH_UNUSED and row["cost_usd"] == 0.25
+
+
+def test_j7_a_job_that_records_no_usage_writes_no_unused_rows(ws: Workspace) -> None:
+    backend = _install(FakeBackend(_answer, provider="anthropic", polls_until_ended=1))
+    job_id = _collected_then_paused(ws, backend, record_usage=False)
+    cancel_job(ws, job_id)
+    assert read_events(ws) == []
+    assert len(BatchJobStore(ws, job_id).load().billed) == 2  # accounted all the same
+
+
+# ---- J8: a 404 under another account's key is not "gone" ----------------------------
+
+
+def test_j8_a_404_under_another_key_never_resubmits_or_drops(ws: Workspace) -> None:
+    backend = _install(_GoneBackend(_answer, provider="anthropic", polls_until_ended=5))
+    backend.key_fingerprint = "aaaaaaaaaaaa"
+    job_id = _paused(ws, backend)
+    store = BatchJobStore(ws, job_id)
+    (record,) = store.load().provider_batches
+    assert record["key_fingerprint"] == "aaaaaaaaaaaa"
+    # Another account's key: the provider says 404 for a batch that still runs.
+    backend.key_fingerprint = "bbbbbbbbbbbb"
+    backend.forget(record["job"]["job_id"])
+
+    session = _open(ws, job_id)
+    with pytest.raises(BatchExecutionFailed, match="key aaaaaaaaaaaa"):
+        _executor(backend, session).run_wave(_WAVE)
+    session.close(None)
+    assert len(backend.submitted) == 1  # nothing submitted again
+    (status_entry,) = job_status(ws, job_id)["batches"]
+    assert "gone" not in status_entry and "key aaaaaaaaaaaa" in status_entry["error"]
+    assert cancel_job(ws, job_id)["canceled"] is False
+    with pytest.raises(BatchExecutionFailed):
+        delete_job(ws, job_id, force=True)
+    assert store.load().provider_batches[0]["state"] == jobs_mod.RECORD_OPEN
+
+    # With the key that created it, a 404 means gone, as before.
+    backend.key_fingerprint = "aaaaaaaaaaaa"
+    assert delete_job(ws, job_id, force=True)["deleted"] is True
+
+
+def test_j8_a_credential_whose_config_no_longer_loads_raises(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dgml_core.grounded as grounded_mod
+
+    def broken(_ws: Workspace) -> Any:
+        raise ValueError("bad [grounded] section")
+
+    monkeypatch.setattr(grounded_mod, "load_grounded_config", broken)
+    with pytest.raises(ValueError, match="bad"):
+        jobs_mod.resolve_credential(ws, jobs_mod.credential_ref("grounded", "values", None))

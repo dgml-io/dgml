@@ -239,6 +239,41 @@ def retry_cleanup(
 GONE_REASON = "batch no longer exists at the provider (404)"
 
 
+def key_fingerprint(backend: Any) -> str | None:
+    """A short, non-secret fingerprint of the API key *backend* sends (its
+    optional ``credential_fingerprint``), or ``None`` when it cannot tell."""
+    fingerprint = getattr(backend, "credential_fingerprint", None)
+    if fingerprint is None:
+        return None
+    try:
+        value = fingerprint()
+    except Exception:
+        return None
+    return str(value) if value else None
+
+
+def key_mismatch(record: Mapping[str, Any], backend: Any) -> str | None:
+    """Why a 404 for *record*'s batch does not show it is gone, or ``None``.
+
+    A provider answers 404 for a batch another account created, too. So a
+    record that knows which key created its batch is closed out as gone
+    (:func:`resolve_gone`) only when *backend* sends that same key; under
+    another key the batch may still exist and be billing, and the caller
+    must neither resubmit its requests nor drop it."""
+    recorded = record.get("key_fingerprint")
+    if not recorded:
+        return None
+    current = key_fingerprint(backend)
+    if current == recorded:
+        return None
+    in_use = f"key {current}…" if current else "no key"
+    return (
+        f"batch {_record_id(record)} was not found with the API key in use ({in_use}), "
+        f"but key {recorded}… created it: it may still exist, and be billing, under that "
+        "key's account. Run again with the key that created it"
+    )
+
+
 def resolve_gone(store: BatchJobStore, record: dict[str, Any]) -> str:
     """Close out an open *record* whose provider batch is gone
     (:class:`~dgml_core.batch.types.BatchNotFound`: deleted, or never
@@ -359,7 +394,8 @@ def credential_ref(section: str, field_name: str, env: str | None) -> dict[str, 
 
 def resolve_credential(workspace: Workspace, ref: Mapping[str, Any] | None) -> str | None:
     """The API key *ref* points at, or ``None`` (the provider's own default
-    environment variable then applies, as it would for the command)."""
+    environment variable then applies, as it would for the command). Raises
+    when the config the key lives in no longer loads."""
     if not ref:
         return None
     env = ref.get("env")
@@ -368,28 +404,27 @@ def resolve_credential(workspace: Workspace, ref: Mapping[str, Any] | None) -> s
         if value:
             return value
     section, field_name = ref.get("section"), ref.get("field")
-    try:
-        if section == "grounded":
-            from dgml_core.grounded import load_grounded_config
+    # A config that no longer loads raises: swallowing it would fall back to
+    # the provider's default key, silently, possibly another account's.
+    if section == "grounded":
+        from dgml_core.grounded import load_grounded_config
 
-            grounded = load_grounded_config(workspace)
-            return grounded.schema_api_key if field_name == "schema" else grounded.values_api_key
-        if section == "classification":
-            from dgml_core.classification import load_classification_config
+        grounded = load_grounded_config(workspace)
+        return grounded.schema_api_key if field_name == "schema" else grounded.values_api_key
+    if section == "classification":
+        from dgml_core.classification import load_classification_config
 
-            return load_classification_config(workspace).api_key
-        if section == "generation":
-            from dgml_core.generation.config import load_generation_config
+        return load_classification_config(workspace).api_key
+    if section == "generation":
+        from dgml_core.generation.config import load_generation_config
 
-            gen = load_generation_config(workspace)
-            return gen.label_api_key if field_name == "label" else gen.api_key
-        if section == "style":
-            from dgml_core.style_config import load_style_config
+        gen = load_generation_config(workspace)
+        return gen.label_api_key if field_name == "label" else gen.api_key
+    if section == "style":
+        from dgml_core.style_config import load_style_config
 
-            style = load_style_config(workspace)
-            return style.api_key if style is not None else None
-    except Exception:
-        return None
+        style = load_style_config(workspace)
+        return style.api_key if style is not None else None
     return None
 
 
@@ -436,6 +471,9 @@ class Manifest:
     state: dict[str, Any] = field(default_factory=dict)
     #: executor key → run number → that run's WaveStats (job-wide totals).
     run_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Whether the command records usage rows (the CLI's ``--debug``). Rows
+    #: the job writes itself, for responses no run used, follow it.
+    record_usage: bool = True
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -453,6 +491,7 @@ class Manifest:
             "inputs": dict(self.inputs),
             "state": self.state,
             "run_stats": self.run_stats,
+            "record_usage": self.record_usage,
         }
 
     @classmethod
@@ -472,6 +511,7 @@ class Manifest:
             inputs=dict(doc.get("inputs", {})),
             state=dict(doc.get("state", {})),
             run_stats=dict(doc.get("run_stats", {})),
+            record_usage=bool(doc.get("record_usage", True)),
         )
 
     def open_records(self) -> list[dict[str, Any]]:
@@ -929,6 +969,9 @@ class JobSession:
             "model": model,
             "api_base": api_base,
             "credential": dict(credential) if credential else None,
+            # Which key created the batch (never the key itself): a 404 under
+            # another key does not mean it is gone (see key_mismatch).
+            "key_fingerprint": key_fingerprint(backend) if backend is not None else None,
             "stage": stage,
             "stats_key": stats_key,
             "keys": dict(keys),
@@ -1171,7 +1214,9 @@ class JobSession:
                     continue
                 reason = "still running when the run ended"
             except BatchNotFound:
-                if self._gone(record) == RECORD_DROPPED:
+                if mismatch := key_mismatch(record, backend):
+                    problems.append(mismatch)  # kept open: it may still be billing
+                elif self._gone(record) == RECORD_DROPPED:
                     problems.append(f"{batch_id}: {GONE_REASON}; its requests run again")
                 continue
             except Exception as exc:
@@ -1179,7 +1224,9 @@ class JobSession:
             try:
                 backend.cancel(job)
             except BatchNotFound:
-                if self._gone(record) == RECORD_DROPPED:
+                if mismatch := key_mismatch(record, backend):
+                    problems.append(mismatch)  # kept open: it may still be billing
+                elif self._gone(record) == RECORD_DROPPED:
                     problems.append(f"{batch_id}: {GONE_REASON}; its requests run again")
                 continue
             except Exception as exc:
@@ -1190,54 +1237,15 @@ class JobSession:
         return problems
 
     def _unused_rows(self) -> list[tuple[Workspace, UsageEvent]]:
-        """One usage row per stored response no run of the job ever billed —
-        a superseded batch's results, a request the job stopped asking for, a
-        batch collected only as the run ended — each marked billed. They were
-        paid for, so ``usage.jsonl`` must show them, but no command's row
-        counts them: they are ``operation`` :data:`OPERATION_BATCH_UNUSED`,
-        ``context`` ``{"unused": true, "batch_job": <job id>}``, at the tier
-        that served them (``batch`` unless a synchronous fallback). The
-        caller persists the billed keys, then writes the rows."""
-        models = {
-            str(key): str(record.get("model") or "")
-            for record in self.manifest.provider_batches
-            for key in (record.get("keys") or {}).values()
-        }
-        rows: list[tuple[Workspace, UsageEvent]] = []
-        for key in self.store.response_keys():
-            with self._lock:
-                if key in self._billed or key in self._served:
-                    continue
-            try:
-                response = self.store.get_response(key)
-            except Exception:
-                continue  # unreadable: nothing to count
-            if response is None:
-                continue
-            totals = extract_cost_and_tokens(response)
-            hidden = getattr(response, "_hidden_params", None) or {}
-            rows.append(
-                (
-                    self.store.workspace,
-                    UsageEvent(
-                        at=now_iso(),
-                        operation=OPERATION_BATCH_UNUSED,
-                        model=models.get(key) or str(getattr(response, "model", "") or ""),
-                        cost_usd=totals["cost_usd"],
-                        prompt_tokens=totals["prompt_tokens"],
-                        completion_tokens=totals["completion_tokens"],
-                        total_tokens=totals["total_tokens"],
-                        duration_s=0.0,
-                        outcome=OUTCOME_OK,
-                        context={"unused": True, "batch_job": self.job_id},
-                        cache_read_tokens=totals["cache_read_tokens"],
-                        cache_creation_tokens=totals["cache_creation_tokens"],
-                        tier=str(hidden.get(TIER_MARKER) or TIER_BATCH),
-                    ),
-                )
-            )
-            with self._lock:
-                self._billed.add(key)
+        """:func:`unbilled_rows` for every stored response no run of the job
+        ever billed — a superseded batch's results, a request the job stopped
+        asking for, a batch collected only as the run ended — each then marked
+        billed. The caller persists the billed keys, then writes the rows."""
+        with self._lock:
+            skip = self._billed | self._served
+        rows, keys = unbilled_rows(self.store, self.manifest, skip=skip)
+        with self._lock:
+            self._billed |= keys
         return rows
 
     def _gone(self, record: dict[str, Any]) -> str:
@@ -1382,6 +1390,7 @@ def start_session(
     job_id: str | None,
     wait: bool,
     cwd: str | None = None,
+    record_usage: bool = True,
     log: Callable[[str], None] = lambda _m: None,
 ) -> JobSession:
     """Begin (``job_id=None``) or continue a job and make it this process's
@@ -1394,7 +1403,9 @@ def start_session(
     that no other process holds its lease
     (:class:`~dgml_core.errors.BatchJobBusy`). *cwd* is recorded on a new job
     so ``dgml batch resume`` can replay relative paths from where the command
-    was first run (defaults to the current directory)."""
+    was first run (defaults to the current directory). *record_usage* is
+    recorded on a new job too: whether the command writes usage rows (the
+    CLI's ``--debug``), which the rows the job writes itself follow."""
     global _ACTIVE
     silent = False
     if job_id is None:
@@ -1408,6 +1419,7 @@ def start_session(
             cwd=cwd if cwd is not None else os.getcwd(),
             created_at=now,
             updated_at=now,
+            record_usage=record_usage,
         )
         silent = wait
     else:
@@ -1694,7 +1706,12 @@ class ReplayExecutor(BatchExecutor):
         (:class:`BatchNotFound`): close its record out (:func:`resolve_gone`),
         serve every request of it that has a stored response, and hand the
         rest back as retryable failures, so they are submitted again as new
-        requests."""
+        requests. Under an API key other than the one that created the batch
+        a 404 proves nothing (:func:`key_mismatch`): the run stops instead,
+        with the record still open, so nothing is submitted twice."""
+        if mismatch := key_mismatch(record, self.backend):
+            self.session.persist()
+            raise BatchExecutionFailed(mismatch)
         self.session._gone(record)
         keys: dict[str, str] = record["keys"]
         for provider_cid, current in idmap.items():
@@ -2027,8 +2044,10 @@ def _poll_entries(workspace: Workspace, manifest: Manifest) -> list[dict[str, An
     for record in manifest.provider_batches:
         job, entry = _batch_entry(record)
         if record.get("state") == RECORD_OPEN:
+            backend: BatchBackend | None = None
             try:
-                status = record_backend(workspace, record).poll(job)
+                backend = record_backend(workspace, record)
+                status = backend.poll(job)
                 entry["last_status"] = {
                     "state": status.state.value,
                     "succeeded": status.succeeded,
@@ -2039,10 +2058,13 @@ def _poll_entries(workspace: Workspace, manifest: Manifest) -> list[dict[str, An
                 }
                 entry["done"] = status.done
             except BatchNotFound:
-                # Gone at the provider: ended. The next run, `cancel` or
-                # `delete --force` records it (see resolve_gone).
-                entry["done"] = True
-                entry["gone"] = True
+                if mismatch := key_mismatch(record, backend):
+                    entry["error"] = mismatch
+                else:
+                    # Gone at the provider: ended. The next run, `cancel` or
+                    # `delete --force` records it (see resolve_gone).
+                    entry["done"] = True
+                    entry["gone"] = True
             except Exception as exc:  # reported, never hidden
                 entry["error"] = short_error_message(exc)
         batches.append(entry)
@@ -2218,14 +2240,21 @@ def _drop_batches(
             entry["state"] = RECORD_DROPPED
             entry["acknowledged"] = True
         if record.get("state") == RECORD_OPEN:
+            backend: BatchBackend | None = None
             try:
-                record_backend(workspace, record).cancel(job)
+                backend = record_backend(workspace, record)
+                backend.cancel(job)
                 mark_dropped(record, f"`dgml batch {verb}`")
                 entry["state"] = RECORD_DROPPED
             except BatchNotFound:
-                # Nothing left to cancel: the batch is gone (treated as ended).
-                entry["state"] = resolve_gone(store, record)
-                entry["gone"] = True
+                if mismatch := key_mismatch(record, backend):
+                    # Not shown gone: it may still be running, and billing.
+                    failures += 1
+                    entry["error"] = mismatch
+                else:
+                    # Nothing left to cancel: the batch is gone (treated as ended).
+                    entry["state"] = resolve_gone(store, record)
+                    entry["gone"] = True
             except Exception as exc:
                 if _collect_if_ended(workspace, store, manifest, record, job):
                     # It ended before the cancel reached it (a provider then
@@ -2240,6 +2269,76 @@ def _drop_batches(
             entry["cleanup"] = retry_cleanup(workspace, record)
         batches.append(entry)
     return batches, failures
+
+
+def unbilled_rows(
+    store: BatchJobStore, manifest: Manifest, *, skip: set[str] | None = None
+) -> tuple[list[tuple[Workspace, UsageEvent]], set[str]]:
+    """One usage row per response *store* holds that *manifest* has not billed
+    (nor *skip* names), and the keys they stand for. They were paid for, so
+    ``usage.jsonl`` must show them, but no command's row counts them: they are
+    ``operation`` :data:`OPERATION_BATCH_UNUSED`, ``context`` ``{"unused":
+    true, "batch_job": <job id>}``, at the tier that served them (``batch``
+    unless a synchronous fallback). No rows for a job whose command records
+    no usage; the keys are returned regardless, so the caller can mark them
+    billed either way."""
+    done = set(manifest.billed) | (skip or set())
+    models = {
+        str(key): str(record.get("model") or "")
+        for record in manifest.provider_batches
+        for key in (record.get("keys") or {}).values()
+    }
+    rows: list[tuple[Workspace, UsageEvent]] = []
+    keys: set[str] = set()
+    for key in store.response_keys():
+        if key in done:
+            continue
+        try:
+            response = store.get_response(key)
+        except Exception:
+            continue  # unreadable: nothing to count
+        if response is None:
+            continue
+        keys.add(key)
+        if not manifest.record_usage:
+            continue
+        totals = extract_cost_and_tokens(response)
+        hidden = getattr(response, "_hidden_params", None) or {}
+        rows.append(
+            (
+                store.workspace,
+                UsageEvent(
+                    at=now_iso(),
+                    operation=OPERATION_BATCH_UNUSED,
+                    model=models.get(key) or str(getattr(response, "model", "") or ""),
+                    cost_usd=totals["cost_usd"],
+                    prompt_tokens=totals["prompt_tokens"],
+                    completion_tokens=totals["completion_tokens"],
+                    total_tokens=totals["total_tokens"],
+                    duration_s=0.0,
+                    outcome=OUTCOME_OK,
+                    context={"unused": True, "batch_job": manifest.job_id},
+                    cache_read_tokens=totals["cache_read_tokens"],
+                    cache_creation_tokens=totals["cache_creation_tokens"],
+                    tier=str(hidden.get(TIER_MARKER) or TIER_BATCH),
+                ),
+            )
+        )
+    return rows, keys
+
+
+def _bill_unbilled(store: BatchJobStore, manifest: Manifest) -> None:
+    """Write the rows of :func:`unbilled_rows` for a job no run will finish
+    (canceled, or about to be deleted): the responses earlier runs collected
+    were paid for, and a paused run wrote no row for them. The billed keys
+    are saved before the rows are written, as a run's close does, so a
+    resume never counts them again."""
+    rows, keys = unbilled_rows(store, manifest)
+    if not keys:
+        return
+    manifest.billed = sorted(set(manifest.billed) | keys)
+    store.save(manifest)
+    flush_usage(rows)
 
 
 def _with_lease(
@@ -2271,6 +2370,9 @@ def cancel_job(workspace: Workspace, job_id: str) -> dict[str, Any]:
             manifest.status = STATUS_FAILED
             manifest.error = "canceled with `dgml batch cancel`"
         store.save(manifest)
+        # No run may finish this job: bill what its runs collected (a batch
+        # `_drop_batches` collected just now included).
+        _bill_unbilled(store, manifest)
         payload = {**job_summary(manifest), "batches": batches}
         payload["canceled"] = failures == 0
         return payload
@@ -2300,6 +2402,7 @@ def delete_job(workspace: Workspace, job_id: str, *, force: bool = False) -> dic
                 f"could not cancel {failures} open provider batch(es) of job "
                 f"'{manifest.job_id}'; nothing was deleted"
             )
+        _bill_unbilled(store, manifest)
         store.delete()
         return {"job_id": manifest.job_id, "deleted": True, "batches": batches}
 
@@ -2352,6 +2455,7 @@ def prune_jobs(workspace: Workspace, *, older_than_days: float = 0.0) -> dict[st
             if any(outcome != CLEANUP_DONE for outcome in outcomes):
                 store.save(manifest)
                 return {"outcome": "cleanup_pending"}
+        _bill_unbilled(store, manifest)
         store.delete()
         return {"outcome": "deleted"}
 

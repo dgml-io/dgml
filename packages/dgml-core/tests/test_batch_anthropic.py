@@ -880,3 +880,17 @@ def test_results_are_streamed_not_read_whole() -> None:
     assert stream.read < len(body)  # the first result came before the body was read
     rest = list(results)
     assert len(rest) == 49 and stream.read == len(body) and stream.closed
+
+
+def test_the_credential_fingerprint_tells_keys_apart_and_hides_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    one = AnthropicBatchBackend(api_key="sk-ant-one").credential_fingerprint()
+    assert one == hashlib.sha256(b"sk-ant-one").hexdigest()[:12]
+    assert AnthropicBatchBackend(api_key="sk-ant-two").credential_fingerprint() != one
+    assert AnthropicBatchBackend().credential_fingerprint() is None
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-one")
+    assert AnthropicBatchBackend().credential_fingerprint() == one  # the key it would send

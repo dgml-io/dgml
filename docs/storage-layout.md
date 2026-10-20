@@ -1083,6 +1083,11 @@ command stopped asking for, a batch collected only as the run ended) is still
 shown: when the job completes it writes one `batch_unused` row per such
 response, at the tier that served it, with `context`
 `{"unused": true, "batch_job": "<job id>"}`. No command's own row counts it.
+A job no run will finish writes them too: `dgml batch cancel` for every
+response its runs collected and no row counted yet (a paused run's included),
+and `dgml batch delete` / `prune` for any left before the job is removed. These
+rows follow the command's own setting: a job whose command records no usage
+(run without `--debug`) writes none.
 
 ## `batches/<job_id>/` (optional)
 
@@ -1116,6 +1121,10 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
        "stage": "transcribe",               // the pipeline stage the batch served
        "credential": {"section": "generation", "field": "transcribe",
                       "env": "MY_ANTHROPIC_KEY"},   // where the key comes from; never the key
+       "key_fingerprint": "3f9a1c07d2e4",   // first 12 hex digits of sha256(key) the batch
+                                           // was created with (null if the backend cannot
+                                           // tell); a 404 under a different key is not
+                                           // "gone": the run stops, the record stays open
        "keys": {"<custom_id>": "<request key>"},
        "state": "collected",               // open | collected | dropped (canceled) |
                                            // uncertain (create outcome unknown; has "error"
@@ -1132,8 +1141,10 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
     "billed": ["<request key>", "…"],      // responses already counted on a usage row
     "inputs": {"generate/schema.json": true, "presence:generate/blocks/a.pdf": false},
     "state": {},                           // command-specific (file add: its ingest results)
-    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}}
+    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}},
                                            // per executor, per run: summed for the payload
+    "record_usage": true                   // the command writes usage rows (`--debug`);
+                                           // the job's own `batch_unused` rows follow it
   }
   ```
 
@@ -1149,7 +1160,8 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
   accounting needs (`response_cost`, `dgml_tier`) — no provider headers and never
   a credential.
 - **`inputs/slices/<source sha>/<engine>/<first>-<last>-<pages sha>.pdf`** — each
-  transcription window's PDF slice, recorded the first time it is cut and
+  PDF slice sent to a model (a transcription window, a schema sample trimmed to
+  fit, an extraction page range; page numbers 1-based), recorded the first time it is cut and
   reused by every resume, because slicing is not byte-reproducible; and
   `inputs/generate/converted/<name>.pdf` for a document converted on demand.
   Deleted with the responses when the job completes.

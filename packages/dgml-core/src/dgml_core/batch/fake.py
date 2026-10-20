@@ -126,6 +126,9 @@ class FakeBackend:
         cancel_settle_polls: int = 0,
     ) -> None:
         self._processed_early = processed_early
+        #: What :meth:`credential_fingerprint` reports (``None``: no check);
+        #: public so a test can switch the "key" between runs.
+        self.key_fingerprint: str | None = None
         #: Polls a canceled batch reports `running` for; public so a test can
         #: let a long-settling cancel end later.
         self.cancel_settle_polls = cancel_settle_polls
@@ -173,6 +176,9 @@ class FakeBackend:
         return BatchJob(
             provider=self.provider, job_id=job_id, custom_ids=tuple(r.custom_id for r in batch)
         )
+
+    def credential_fingerprint(self) -> str | None:
+        return self.key_fingerprint
 
     def poll(self, job: BatchJob) -> BatchStatus:
         self.polls += 1
