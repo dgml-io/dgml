@@ -126,6 +126,7 @@ class _SyncCapture:
 def _gemini_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", KEY)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_BASE", raising=False)
 
 
 @pytest.fixture
@@ -884,17 +885,14 @@ _GONE_FILE = httpx.Response(
 )
 
 
-@pytest.mark.parametrize("batch_reply", [httpx.Response(200, json={}), httpx.Response(404)])
-def test_cleanup_counts_a_403_on_an_already_deleted_input_file_as_done(
-    batch_reply: httpx.Response,
-) -> None:
+def test_cleanup_counts_a_403_on_an_already_deleted_input_file_as_done() -> None:
     """F7: the File API answers 403 PERMISSION_DENIED for a file that no longer
     exists (deleted by an earlier cleanup attempt, or expired after 48 h). With
-    the same key otherwise working, that is 'already gone', not a failure owed
+    the same key deleting the batch, that is 'already gone', not a failure owed
     forever."""
     server = _Server()
     server.add("DELETE", "/v1beta/files/in1", _GONE_FILE)
-    server.add("DELETE", f"/v1beta/{OP}", batch_reply)
+    server.add("DELETE", f"/v1beta/{OP}", httpx.Response(200, json={}))
     job = BatchJob(
         provider="gemini",
         job_id=OP,
@@ -908,6 +906,23 @@ def test_a_file_403_is_still_a_failure_when_the_key_itself_is_refused() -> None:
     server = _Server()
     server.add("DELETE", "/v1beta/files/in1", _GONE_FILE)
     server.add("DELETE", f"/v1beta/{OP}", _GONE_FILE)
+    job = BatchJob(
+        provider="gemini",
+        job_id=OP,
+        custom_ids=("a",),
+        extra={"mode": "file", "input_file": "files/in1"},
+    )
+    with pytest.raises(GeminiBatchError, match="files/in1"):
+        server.backend().cleanup(job)
+
+
+def test_a_file_403_with_a_batch_404_is_still_a_failure() -> None:
+    """A key from another project answers 403 for the file and 404 for the
+    batch, exactly like a cleanup whose targets are both gone: the 404 does not
+    prove the key works, so cleanup must not report the artifacts deleted."""
+    server = _Server()
+    server.add("DELETE", "/v1beta/files/in1", _GONE_FILE)
+    server.add("DELETE", f"/v1beta/{OP}", httpx.Response(404))
     job = BatchJob(
         provider="gemini",
         job_id=OP,
@@ -1015,6 +1030,64 @@ def test_api_base_override_and_env_key_fallback(monkeypatch: pytest.MonkeyPatch)
     backend.poll(BatchJob(provider="gemini", job_id=OP, custom_ids=("a",)))
     assert str(seen[0].url) == f"https://proxy.example/v1beta/{OP}"
     assert seen[0].headers["x-goog-api-key"] == "google-key"
+
+
+def test_key_and_base_resolve_as_the_sync_path_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    """litellm's sync ``gemini/`` route prefers GOOGLE_API_KEY over
+    GEMINI_API_KEY and honors GEMINI_API_BASE; batches must bill the same key
+    and reach the same endpoint, or batch and sync fallbacks split accounts."""
+    from litellm.llms.gemini.common_utils import GeminiModelInfo, get_api_key_from_env
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    monkeypatch.setenv("GEMINI_API_BASE", "https://gemini-proxy.example")
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return _op("BATCH_STATE_RUNNING")
+
+    backend = GeminiBatchBackend(BackendConfig(model=MODEL), transport=httpx.MockTransport(handler))
+    backend.poll(BatchJob(provider="gemini", job_id=OP, custom_ids=("a",)))
+    assert seen[0].headers["x-goog-api-key"] == get_api_key_from_env() == "google-key"
+    assert str(seen[0].url) == f"{GeminiModelInfo.get_api_base()}/v1beta/{OP}"
+    assert str(seen[0].url).startswith("https://gemini-proxy.example/")
+    # An explicit stage credential still wins over both env vars.
+    assert _backend()._api_key == KEY
+
+
+def test_credential_fingerprint_tells_keys_apart_without_revealing_them() -> None:
+    import hashlib
+
+    one = GeminiBatchBackend(BackendConfig(model=MODEL, api_key="key-one"))
+    two = GeminiBatchBackend(BackendConfig(model=MODEL, api_key="key-two"))
+    fp = one.credential_fingerprint()
+    assert fp == hashlib.sha256(b"key-one").hexdigest()[:12]
+    assert fp != two.credential_fingerprint()
+    assert "key-one" not in (fp or "")
+
+
+def test_a_404_under_another_key_is_not_treated_as_gone() -> None:
+    """The job store records the creating key's fingerprint, so a poll that
+    404s under a different key is refused rather than resubmitted (which would
+    pay twice while the original batch may still be running)."""
+    from dgml_core.batch.jobs import key_fingerprint, key_mismatch
+
+    creator = GeminiBatchBackend(BackendConfig(model=MODEL, api_key="key-one"))
+    record = {"key_fingerprint": key_fingerprint(creator), "job": {"job_id": OP}}
+    assert key_mismatch(record, creator) is None
+    other = GeminiBatchBackend(BackendConfig(model=MODEL, api_key="key-two"))
+    reason = key_mismatch(record, other)
+    assert reason is not None and "may still exist" in reason
+
+
+def test_encode_reuses_the_cached_body_instead_of_copying_it() -> None:
+    """Planning and submit both encode; neither may hold a second copy of a
+    request's body (page images make a file-mode batch large)."""
+    backend = _backend()
+    request = _req("a")
+    first, second = backend.encode(request), backend.encode(request)
+    assert first["request"] is second["request"]
+    assert first["metadata"] == {"key": "a"}
 
 
 def test_missing_key_is_a_configuration_error(monkeypatch: pytest.MonkeyPatch) -> None:

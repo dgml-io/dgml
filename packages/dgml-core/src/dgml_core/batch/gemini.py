@@ -44,9 +44,8 @@ accepted (the endpoint takes no idempotency key).
 
 from __future__ import annotations
 
-import copy
+import hashlib
 import json
-import os
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -267,16 +266,21 @@ class GeminiBatchBackend:
         timeout: float = 120.0,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        from litellm.llms.gemini.common_utils import GeminiModelInfo, get_api_key_from_env
+
         self.model = config.model
         self._bare = _bare_model(config.model)
-        key = config.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        # Resolved by litellm's own helpers, so a batch bills the same key and
+        # reaches the same endpoint as the sync path (and its fallbacks):
+        # GOOGLE_API_KEY before GEMINI_API_KEY, GEMINI_API_BASE honored.
+        key = config.api_key or get_api_key_from_env()
         if not key:
             raise ValueError(
                 f"batch mode for {config.model!r} needs a Gemini API key: set generation "
-                "credentials or the GEMINI_API_KEY / GOOGLE_API_KEY environment variable"
+                "credentials or the GOOGLE_API_KEY / GEMINI_API_KEY environment variable"
             )
         self._api_key = key
-        base = (config.api_base or DEFAULT_API_BASE).rstrip("/")
+        base = (GeminiModelInfo.get_api_base(config.api_base) or DEFAULT_API_BASE).rstrip("/")
         if base.endswith(f"/{API_VERSION}"):
             base = base[: -len(API_VERSION) - 1]
         self._base = base
@@ -293,6 +297,13 @@ class GeminiBatchBackend:
         # right after the poll that saw it end doubles the largest download.
         self._ended: dict[str, dict[str, Any]] = {}
 
+    def credential_fingerprint(self) -> str | None:
+        """The first 12 hex digits of the SHA-256 of the key this backend
+        sends: enough to tell two keys apart, never enough to recover one. A
+        batch job keeps it on each batch it creates, since a 404 under another
+        project's key does not mean the batch is gone."""
+        return hashlib.sha256(self._api_key.encode()).hexdigest()[:12]
+
     # ── encode ───────────────────────────────────────────────────────────
 
     def encode(self, request: BatchRequest) -> dict[str, Any]:
@@ -305,7 +316,9 @@ class GeminiBatchBackend:
         body = self._bodies.get(request)
         if body is None:
             body = self._bodies.put(request, self._sync_request_body(request.kwargs))
-        return {"request": copy.deepcopy(body), "metadata": {"key": request.custom_id}}
+        # The cached body itself, not a copy: callers only serialize it, and a
+        # file-mode batch must not hold a second whole-batch copy of it.
+        return {"request": body, "metadata": {"key": request.custom_id}}
 
     def release(self, custom_ids: Sequence[str]) -> None:
         self._bodies.release(custom_ids)
@@ -531,8 +544,9 @@ class GeminiBatchBackend:
         live, it answers 404 once the batch is deleted. Every target is
         tried; one already gone (404 — or, for the input file, 403
         ``PERMISSION_DENIED``, which is how the File API answers for a file
-        that no longer exists, while the same key could delete the batch)
-        counts as deleted, and any other failure
+        that no longer exists, but only when the same key just deleted the
+        batch: a 404 there proves nothing about the key) counts as deleted,
+        and any other failure
         raises :class:`GeminiBatchError` naming each target that failed —
         callers treat cleanup as best-effort and log the failure
         (:func:`~dgml_core.batch.executor.cleanup_batch`). The File API also
@@ -558,7 +572,8 @@ class GeminiBatchBackend:
             except GeminiBatchError as exc:
                 status = getattr(exc.__cause__, "status_code", None)
                 if status == 404:
-                    key_works = key_works or name == job.job_id
+                    # Gone — or never visible to this key, so it proves nothing
+                    # about the key (a wrong project's key 404s the batch too).
                     continue
                 if status == 403 and name.startswith("files/") and "PERMISSION_DENIED" in str(exc):
                     gone_files.append(f"{name}: {exc}")

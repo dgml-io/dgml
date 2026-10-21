@@ -23,8 +23,10 @@ fields, see the [CLI reference](cli-reference.md).
 | Anthropic (first-party API) | Message Batches | `anthropic/…` |
 | Google Gemini (Developer API) | Batch API (`batchGenerateContent`) | `gemini/…` |
 
-**Gemini.** The key comes from the stage's credentials, else `GEMINI_API_KEY`
-or `GOOGLE_API_KEY`. A batch travels inline when its body is at most 20 MB,
+**Gemini.** The key comes from the stage's credentials, else `GOOGLE_API_KEY`
+or `GEMINI_API_KEY` (litellm's order, so batches and their synchronous
+fallbacks bill the same key), and `GEMINI_API_BASE` overrides the endpoint as
+it does for synchronous calls. A batch travels inline when its body is at most 20 MB,
 otherwise as a JSONL file uploaded through the File API. The uploaded file and
 the finished batch are deleted once their results are read. A Gemini batch may
 wait up to 48 hours before it expires, so its polling deadline is 49 hours.
