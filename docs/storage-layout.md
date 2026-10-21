@@ -1220,9 +1220,11 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
                                            // and a placeholder "uncertain_…" job_id) |
                                            // settling (canceled at --batch-deadline, cancel
                                            // not settled; has "settling_reason" and
-                                           // "possibly_double_billed"; once it ends it gets
-                                           // "late_billed": {"requests", "cost_usd"},
-                                           // "settled_at", and becomes dropped)
+                                           // "possibly_double_billed", and "collected" (the
+                                           // custom_ids already stored, when a collection
+                                           // failed part-way: never counted late); once it
+                                           // ends it gets "late_billed": {"requests",
+                                           // "cost_usd"}, "settled_at", and becomes dropped)
        "last_status": {"state": "ended", "succeeded": 12, "errored": 0, "expired": 0,
                        "canceled": 0, "processing": 0},
        "cleanup": "done"}                   // dropped batches only: provider-side delete

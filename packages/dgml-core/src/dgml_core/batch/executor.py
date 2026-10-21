@@ -423,6 +423,27 @@ class BatchExecutor:
         error = failed.get(custom_id)
         return error is not None and error.kind == "invalid"
 
+    def _unsplit_at_deadline(self, ids: Iterable[str], failed: dict[str, BatchItemError]) -> None:
+        """A batch rejected whole after the deadline is not split and
+        resubmitted (nothing new is submitted after it): its requests run
+        synchronously, as the deadline's doing (``sync_after_deadline``)."""
+        for cid in ids:
+            why = failed[cid].message
+            failed[cid] = self._deadline_error(
+                cid, f"its batch was rejected whole ({why}) and is not split after it"
+            )
+
+    def _ended_despite_cancel(self, job: BatchJob) -> bool:
+        """After a refused cancel: whether *job* has in fact ended (it may end
+        between the last poll and the cancel, and a provider then refuses to
+        cancel it), so its results are collected rather than paid for again
+        synchronously. One poll; False when it is still running or cannot be
+        polled."""
+        try:
+            return bool(self.backend.poll(job).done)
+        except Exception:
+            return False
+
     @staticmethod
     def _is_deadline_error(error: BatchItemError) -> bool:
         """Whether *error* is one :meth:`_deadline_error` made."""
@@ -510,10 +531,18 @@ class BatchExecutor:
         a result lands in *failed*, non-retryable, so it runs synchronously."""
         assert self.deadline is not None
         canceled: list[tuple[BatchJob, list[BatchRequest]]] = []
+        finished: list[tuple[BatchJob, list[BatchRequest]]] = []
         for job, batch in open_jobs:
             try:
                 self.backend.cancel(job)
             except Exception as exc:
+                if self._ended_despite_cancel(job):
+                    self._log(
+                        f"{self._tag} deadline: {job.job_id} had already ended "
+                        f"(cancel refused: {type(exc).__name__}: {exc}); collecting it"
+                    )
+                    finished.append((job, batch))
+                    continue
                 self._log(
                     f"{self._tag} deadline: canceling {job.job_id} failed "
                     f"({type(exc).__name__}: {exc}); its requests run synchronously"
@@ -533,7 +562,10 @@ class BatchExecutor:
             self.deadline.canceled_batches += 1
             canceled.append((job, batch))
         ended = self._await_cancels([job for job, _b in canceled])
-        for job, batch in canceled:
+        canceled_ids = {job.job_id for job, _b in canceled}
+        ended.update(job.job_id for job, _b in finished)
+        for job, batch in canceled + finished:
+            was_canceled = job.job_id in canceled_ids
             before = len(served)
             if job.job_id in ended:
                 try:
@@ -561,7 +593,8 @@ class BatchExecutor:
                     job, unsettled, "no batch job records it, so its late cost is not reconciled"
                 )
             got = len(served) - before
-            self.deadline.collected_after_cancel += got
+            if was_canceled:  # an ended batch's results are ordinary batch results
+                self.deadline.collected_after_cancel += got
             for request in batch:
                 if request.custom_id not in served and not self._own_verdict(
                     failed, request.custom_id
@@ -570,8 +603,9 @@ class BatchExecutor:
                         request.custom_id, "its batch was canceled before it ran"
                     )
             self._log(
-                f"{self._tag} {job.job_id} canceled at the batch deadline: {got} of "
-                f"{len(batch)} result(s) collected; the rest run synchronously"
+                f"{self._tag} {job.job_id} {'canceled' if was_canceled else 'ended'} at the "
+                f"batch deadline: {got} of {len(batch)} result(s) collected; the rest run "
+                "synchronously"
             )
 
     def _unsettled(
@@ -899,11 +933,9 @@ class BatchExecutor:
                     ) from exc
                 self._cleanup(job)
                 ids = [r.custom_id for r in batch]
-                if (
-                    len(batch) > 1
-                    and self._rejected_whole(ids, failed)
-                    and not self._deadline_passed()
-                ):
+                if len(batch) > 1 and self._rejected_whole(ids, failed) and self._deadline_passed():
+                    self._unsplit_at_deadline(ids, failed)
+                if len(batch) > 1 and self._rejected_whole(ids, failed):
                     why = failed[ids[0]].message
                     for cid in ids:
                         del failed[cid]

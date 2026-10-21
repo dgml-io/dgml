@@ -59,6 +59,10 @@ CANCEL_SETTLE_S = 180.0
 #: Longest pause between two polls of a settling cancel. Providers settle
 #: cancels on multi-minute sweep cycles, so polling faster gains nothing.
 CANCEL_SETTLE_POLL_S = 10.0
+#: Longest ``--batch-deadline`` accepted. A job may pause (``--no-wait``) and
+#: resume for days, but a deadline beyond a month bounds nothing a provider
+#: batch could do, and an unbounded one overflows the UTC time it is stored as.
+MAX_DEADLINE_S = 30 * 86400.0
 
 
 def cancel_settle_s(backend: object) -> float:
@@ -78,7 +82,7 @@ _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.IGNORECASE)
 def parse_duration(text: str) -> float:
     """Seconds in *text*: ``90m``, ``6h``, ``1d``, ``45s`` or plain seconds
     (``5400``). Raises :class:`ValueError` for anything else, or a duration
-    that is not strictly positive."""
+    that is not strictly positive or exceeds :data:`MAX_DEADLINE_S`."""
     match = _DURATION_RE.match(str(text))
     if match is None:
         raise ValueError(
@@ -88,6 +92,8 @@ def parse_duration(text: str) -> float:
     seconds = float(match.group(1)) * _UNITS[(match.group(2) or "s").lower()]
     if seconds <= 0:
         raise ValueError(f"a batch deadline must be positive, got {text!r}")
+    if seconds > MAX_DEADLINE_S:
+        raise ValueError(f"a batch deadline may be at most 30d, got {text!r}")
     return seconds
 
 

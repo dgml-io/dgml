@@ -2974,7 +2974,7 @@ the same way, so they are paid for once.
 
 A provider batch usually ends within an hour but may run for its whole
 lifetime (24 hours), and one slow wave holds the whole run. `--batch-deadline
-<duration>` bounds that; without it nothing changes. Once the deadline has
+<duration>` (at most `30d`) bounds that; without it nothing changes. Once the deadline has
 passed:
 
 - every open provider batch of the current wave is canceled; the run waits a
@@ -2995,7 +2995,11 @@ may still process them (OpenAI does, while `cancelling`), each counts in
 replaces the one the run used. Once the batch has ended, the job's next run,
 `dgml batch cancel`, `delete` or `prune` records what it billed (the batch
 entry's `late_billed: {"requests", "cost_usd"}`), cleans it up and marks it
-`dropped`; `dgml batch status` reports that read-only. When both apply, the
+`dropped`; `dgml batch status` reports that read-only. `dgml batch delete`
+refuses a job whose batch is still settling (`BATCH_JOB_INVALID`: its late cost
+would be lost) unless `--force`. A batch that ended just before its cancel (the
+provider then refuses the cancel) is collected like any ended batch, not run
+again. When both apply, the
 earlier of the deadline and the polling deadline (the provider's batch
 lifetime plus an hour) wins.
 
@@ -3009,7 +3013,8 @@ resume is accepted when it is the same duration the job was created with (what
 `dgml batch resume` replays) and changes nothing; a different duration fails
 with `BATCH_JOB_INVALID`, since a job's deadline cannot be moved. On a job
 created without one, the first resume that passes `--batch-deadline` sets it,
-from that moment.
+from that moment. A resume that starts after the deadline says so on stderr
+(`[batch-job] … its batch deadline … has already passed`).
 
 When a deadline is set, the run's payload `batch` block gains `deadline`
 (job-wide counts, over every run of the job):
@@ -3044,7 +3049,8 @@ in the block's `cost_usd`, which covers only the responses the run used: what
 the job actually cost is `cost_usd + late_billed_usd`. These keys are absent
 when no cancel ever failed to settle in time. A blocking run's silent job is
 kept (not deleted when the run finishes) while one of its cancels is still
-settling, so that cost can be recorded.
+settling, so that cost can be recorded; while any is, the block also names it
+(`"job_id": "bj_…"`), for `dgml batch cancel` or `prune` to close out.
 
 ### `dgml batch resume <job_id>`
 
@@ -3125,7 +3131,9 @@ had already ended is collected instead (its responses kept for a resume).
 
 Delete the job's stored state. Refused with `BATCH_JOB_INVALID` while the job
 has open provider batches; `--force` cancels them first, and if any cancel
-fails nothing is deleted (`BATCH_EXECUTION_FAILED`). Prints `{"job_id",
+fails nothing is deleted (`BATCH_EXECUTION_FAILED`). Also refused while a batch
+canceled at the `--batch-deadline` is still settling (after one attempt to
+record its late cost); `--force` deletes it without that cost. Prints `{"job_id",
 "deleted": true, "batches": [...]}`.
 
 ### `dgml batch prune [--older-than DAYS]`

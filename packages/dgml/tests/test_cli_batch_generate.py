@@ -509,3 +509,27 @@ def test_batch_poll_interval_must_be_positive(
     with pytest.raises(SystemExit) as exc:
         main(_argv(ws, did, "--batch", "--batch-poll-interval", "0"))
     assert exc.value.code == 2
+
+
+def test_a_batch_deadline_adds_its_block_and_changes_nothing_else(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], provider: _Provider
+) -> None:
+    """``--batch-deadline`` on ``docset generate``: an unreached deadline
+    reports ``batch.deadline`` and the run is otherwise the plain batch run."""
+    *_sync, plain, plain_state, _calls = _run_both(tmp_path / "plain", capsys, provider)
+    with patch("dgml_core.batch.deadline.wall_clock", lambda: 1_800_000_000.0):
+        *_sync, timed, timed_state, calls = _run_both(
+            tmp_path / "timed", capsys, provider, batch_extra=("--batch-deadline", "90m")
+        )
+
+    assert timed["batch"].pop("deadline") == {
+        "at": "2027-01-15T09:30:00Z",
+        "expired": False,
+        "canceled_batches": 0,
+        "collected_after_cancel": 0,
+        "sync_after_deadline": 0,
+        "possibly_double_billed": 0,
+    }
+    assert _payload_shape(timed) == _payload_shape(plain)
+    assert timed_state["outputs"] == plain_state["outputs"]
+    assert calls == []

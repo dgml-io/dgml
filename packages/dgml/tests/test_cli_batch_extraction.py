@@ -542,3 +542,27 @@ def test_extract_batch_unset_values_key_reports_each_file_like_sync(
     assert all(
         r["status"] == "failed" and r["error"]["code"].startswith("AUTH") for r in results[1]
     )
+
+
+@needs_gs
+def test_directory_batch_reports_its_batch_deadline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], fakes: _Fakes
+) -> None:
+    ws, contracts, _, src = _seed_classify_ws(tmp_path, capsys, "deadline")
+    fakes.install("anthropic", _assign_to(contracts))
+    argv = ["file", "add", str(src), "--auto-classify", "existing", "--batch"]
+    with (
+        patch("litellm.completion", side_effect=AssertionError("no sync call expected")),
+        patch("dgml_core.batch.deadline.wall_clock", lambda: 1_800_000_000.0),
+    ):
+        assert main(_ws_args(ws) + [*argv, "--batch-deadline", "6h"]) == 0
+    payload = _read_stdout(capsys)
+    assert payload["batch"]["deadline"] == {
+        "at": "2027-01-15T14:00:00Z",
+        "expired": False,
+        "canceled_batches": 0,
+        "collected_after_cancel": 0,
+        "sync_after_deadline": 0,
+        "possibly_double_billed": 0,
+    }
+    assert payload["batch"]["classification"]["requests"] == 2

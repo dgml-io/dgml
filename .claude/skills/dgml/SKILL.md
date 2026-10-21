@@ -604,8 +604,8 @@ uv run dgml batch prune                           # drop finished jobs
 
 **Bound the wait with `--batch-deadline`.** A wave usually ends within an
 hour but can take many hours. When the user needs results by a certain time,
-add `--batch-deadline <duration>` (`90m`, `6h`, `1d`; with `--batch`, on any
-batch command). Once it passes, open batches are canceled, results already
+add `--batch-deadline <duration>` (`90m`, `6h`, `1d`, at most `30d`; with
+`--batch`, on any batch command). Once it passes, open batches are canceled, results already
 produced are kept at batch price, and the rest of the run finishes
 synchronously at standard price, so the saving shrinks but the run ends. The
 deadline belongs to the job: set it on the first run; every `batch resume`
@@ -622,7 +622,9 @@ keeps processing while canceling (OpenAI does) may bill those twice.
 keeps such a batch as `settling`; once it ends, the next resume, `batch
 cancel` or `batch prune` records its real extra cost in `late_billed` /
 `late_billed_usd` (real spend is `cost_usd + late_billed_usd`), and `batch
-prune` keeps the job until then (listed in `settling`).
+prune` keeps the job until then (listed in `settling`). While one is settling,
+`.batch.deadline.job_id` names that job, and `batch delete` refuses it without
+`--force` (the late cost would be lost).
 
 ```bash
 job=$(uv run dgml docset generate "$ds" --batch --no-wait --batch-deadline 6h | jq -r .batch_job.job_id)
