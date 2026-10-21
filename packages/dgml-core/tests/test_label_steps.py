@@ -161,3 +161,26 @@ def test_sync_labeling_retries_a_failed_request(capture_kwargs: Any) -> None:
     assert len(captured.kwargs) == 2 and captured.kwargs[0] == captured.kwargs[1]
     assert (warnings, label_error) == ([], None)
     assert all(b.concept for b in blocks)
+
+
+def test_a_crash_in_one_chunk_stops_the_document_before_later_chunks_are_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunks fan out, but the sync driver still stops where the serial loop
+    did: a non-call error escaping chunk 1 sends no request for chunk 2."""
+    monkeypatch.setattr(label_mod, "_MAX_CHUNK_CHARS", 40)  # one chunk per block
+    assert len(label_mod._chunks(document())) == 3
+
+    def crash(*_a: Any, **_k: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(label_mod, "apply_labels", crash)
+    sent: list[dict[str, Any]] = []
+
+    def execute(request: dict[str, Any]) -> Any:
+        sent.append(request)
+        return labels(block_ids(request))
+
+    with pytest.raises(OSError, match="disk full"):
+        llm.drive(steps(document()), llm.LLMConfig(model=HAIKU), execute)
+    assert [block_ids(r) for r in sent] == [["b0001"]]

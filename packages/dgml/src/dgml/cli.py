@@ -2612,8 +2612,10 @@ def _start_batch_job(
 def _reject_job_flags_without_batch(args: argparse.Namespace) -> None:
     if getattr(args, "no_wait", False) or getattr(args, "job", None):
         raise BatchJobInvalid("--no-wait and --job are batch job options; they need --batch")
-    if getattr(args, "batch_label", None) is not None:
-        raise BatchJobInvalid("--no-batch-label is a batch option; it needs --batch")
+    batch_label = getattr(args, "batch_label", None)
+    if batch_label is not None:
+        flag = "--batch-label" if batch_label else "--no-batch-label"
+        raise BatchJobInvalid(f"{flag} is a batch option; it needs --batch")
 
 
 def _subcommands(parser: argparse.ArgumentParser) -> Mapping[str, argparse.ArgumentParser]:

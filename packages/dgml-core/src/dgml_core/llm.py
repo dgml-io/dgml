@@ -1328,17 +1328,21 @@ class FanOut:
       that is what keeps the outcome identical whichever driver runs it.
     - **Sync** (:func:`drive`): the children run one after another, to
       completion, in child order — so the request sequence and every request
-      byte are exactly those of ``yield from child_0; yield from child_1; ...``.
+      byte are exactly those of ``yield from child_0; yield from child_1; ...``,
+      failures included: the first child that fails stops the run there, and
+      the children after it are closed without making a request.
     - **Batch** (:func:`dgml_core.batch.run_stage`): the children's pending
       requests are extra in-flight requests of the same unit, sharing each wave
       with every other unit's; the parent resumes once every child has
       returned. Within one child, requests stay strictly ordered.
     - **Failures, per child as for a unit**: a request a driver could not serve
       is thrown into *that child* at its pending ``yield``; only an exception
-      escaping the child fails it. Every child runs to the end even when an
-      earlier one failed (both drivers), and then the first failed child's
-      exception, in child order, is thrown into the parent at the ``FanOut``
-      yield instead of sending the results. An interrupt (a non-``Exception``
+      escaping the child fails it. In batch every child runs to the end even
+      when an earlier one failed (their requests share waves, so they are
+      already in flight); in sync the first failure stops the run (above).
+      Either way the first failed child's exception, in child order, is
+      thrown into the parent at the ``FanOut`` yield instead of sending the
+      results. An interrupt (a non-``Exception``
       ``BaseException``) closes every child and propagates.
     - **Usage folds in child order**: each child's per-wrapper subtotals are
       folded, after the parent's preceding ones, in child order — exactly the
@@ -1590,12 +1594,13 @@ def _drive_fanout(
     run: Callable[[LLMStep], Any],
     fold: _UsageFold,
 ) -> tuple[list[Any], Exception | None]:
-    """Run every child of *fan* to the end, in child order (the sync side of
-    the :class:`FanOut` contract). Returns the results in child order and the
-    first child's ``Exception`` (or ``None``); an interrupt closes the
-    children not yet run and propagates."""
+    """Run the children of *fan* one after another, in child order (the sync
+    side of the :class:`FanOut` contract), as ``yield from`` would: the first
+    child whose ``Exception`` escapes stops the run, and the children after it
+    are closed without making a request. Returns the results in child order
+    and that ``Exception`` (or ``None``); an interrupt closes the children not
+    yet run and propagates."""
     results: list[Any] = []
-    failure: Exception | None = None
     unrun = list(fan.children)
     try:
         while unrun:
@@ -1603,13 +1608,11 @@ def _drive_fanout(
             try:
                 results.append(_drive_steps(child, config, run, fold))
             except Exception as exc:
-                results.append(None)
-                if failure is None:
-                    failure = exc
+                return results, exc
     finally:
-        for child in unrun:  # only after an interrupt
+        for child in unrun:  # after a failure or an interrupt
             child.close()
-    return results, failure
+    return results, None
 
 
 def steps_call(

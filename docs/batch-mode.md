@@ -47,7 +47,7 @@ versions. Runs without `--batch` are unaffected by this check.
 | Transcription (Pass A) | Yes | `transcribe` | one per page window of the longest document | Documents are independent; windows of one document are chained. |
 | Roster planning (draft, then refine) | Yes | `plan` | 2 | One request chain per docset, as a one-unit stage. Unseeded runs only. |
 | Gap planning (`--extend-schema`) | Yes | `plan_gaps` | 1 | One request per docset, as a one-unit stage. |
-| Labeling (Pass B), closed vocabulary | Yes (unless `--no-batch-label`) | `label` | one per chunk of the longest document (+1 for a section retry) | No document can change the roster the others see. |
+| Labeling (Pass B), closed vocabulary | Yes (unless `--no-batch-label`) | `label` | 1 (+1 for a section retry or a split chunk) | No document can change the roster the others see, so every chunk of every document shares one wave. |
 | Labeling (Pass B), open or extending vocabulary | Yes (unless `--no-batch-label`), one document at a time | `label` | about one per document (+1 for a section retry or a split chunk) | Each document is labeled against the roster the previous ones grew; see below. |
 | Concept descriptions | Yes | `describe` | 1 | One request per docset, after labeling. Skipped when no concept was coined (always under a closed vocabulary). |
 | Image style for OCR files (`[style]` enabled) | Yes | `style` | 1 | Pages are independent: every document's pages in one wave, after grounding and before links. |
@@ -179,8 +179,8 @@ output is deterministic whichever result arrived first.
 A run takes as many batch round trips as its longest chain of dependent
 requests: the transcription windows of its longest document, then two for
 roster planning (unseeded runs), the labeling waves (about one per document
-under an open vocabulary; one per chunk of the longest document under a closed
-one; none under `--no-batch-label`), one for descriptions when labeling coined a concept, one for image style, and up to
+under an open vocabulary; about one under a closed one; none under
+`--no-batch-label`), one for descriptions when labeling coined a concept, one for image style, and up to
 two for links (none when every link plan is already cached). The docset's size
 changes how large the batches are, not how many there are.
 

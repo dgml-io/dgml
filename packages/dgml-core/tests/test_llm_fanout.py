@@ -161,7 +161,7 @@ def test_batch_and_sync_return_the_same_result_and_requests() -> None:
     assert sorted(t for wave in _waves(backend) for t in wave) == sorted(sync_seen)
 
 
-def test_child_failure_is_thrown_into_the_parent_after_every_child_ran() -> None:
+def test_failure_of_the_last_child_is_thrown_into_the_parent() -> None:
     cfg = _cfg()
     result, seen = _sync(_parent(cfg, fail_b=True, catch=True), cfg)
     assert seen == ["p1", "a1", "a2", "b1", "p2"]  # a ran to the end despite b
@@ -169,6 +169,24 @@ def test_child_failure_is_thrown_into_the_parent_after_every_child_ran() -> None
     out, backend, _ = _batch([Unit("u", cfg, _parent(cfg, fail_b=True, catch=True))])
     assert out["u"].result == result
     assert _waves(backend) == [["p1"], ["a1", "b1"], ["a2"], ["p2"]]
+
+
+def test_sync_stops_at_the_first_failed_child_as_yield_from_would() -> None:
+    cfg = _cfg()
+
+    def parent() -> llm.LLMFlow[str]:
+        try:
+            yield llm.FanOut([_child(cfg, "a1", fail=True), _child(cfg, "b1", "b2")])
+        except ValueError as exc:
+            return str(exc)
+        return "no failure"
+
+    result, seen = _sync(parent(), cfg)
+    assert (result, seen) == ("child a1 failed", ["a1"])  # b never sent
+    # Batch: b's first request shares a's wave, so b runs on; same outcome.
+    out, backend, _ = _batch([Unit("u", cfg, parent())])
+    assert out["u"].result == result
+    assert _waves(backend) == [["a1", "b1"], ["b2"]]
 
 
 def test_uncaught_child_failure_fails_the_unit_only() -> None:

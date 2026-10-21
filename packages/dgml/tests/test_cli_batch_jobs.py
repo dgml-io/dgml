@@ -610,7 +610,7 @@ def test_batch_label_config_key_and_flag(
 ) -> None:
     """Batch labeling is on by default; `[generation] batch_label = false` and
     `--no-batch-label` turn it off; `--batch-label` overrides a false config;
-    `--no-batch-label` is refused without batch mode."""
+    either flag is refused without batch mode."""
     provider.install("anthropic", _generation_answer, polls=0)
     modes = {}
     cases: dict[str, tuple[bool | None, list[str]]] = {
@@ -626,12 +626,12 @@ def test_batch_label_config_key_and_flag(
             section["batch_label"] = config
         _write_ws_config(ws, {"generation": section})
         with patch("litellm.completion", side_effect=lambda **kw: _generation_answer(kw)):
-            if name == "flag-off":
+            if extra:  # either flag, refused without batch mode, by its own name
                 no_batch = [a for a in _generate_argv(ws, did) if a != "--batch"]
-                assert main([*no_batch, "--no-batch", "--no-batch-label"]) == 1
+                assert main([*no_batch, "--no-batch", *extra]) == 1
                 error = _read_stderr(capsys)["error"]
                 assert error["code"] == "BATCH_JOB_INVALID"
-                assert "--no-batch-label" in error["message"]
+                assert error["message"].startswith(f"{extra[0]} is a batch option")
             assert main(_generate_argv(ws, did, *extra)) == 0
         modes[name] = _read_stdout(capsys)["batch"]["stages"]["label"]["mode"]
     assert modes == {

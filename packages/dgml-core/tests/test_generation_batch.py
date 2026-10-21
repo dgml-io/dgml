@@ -661,6 +661,25 @@ def test_batch_labeling_batches_a_closed_vocab_all_at_once(
     assert label["requests"] == len(_PAGES) and label["waves"] == 1
 
 
+def test_closed_vocab_labels_every_chunk_of_every_document_in_one_wave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
+) -> None:
+    """A document's chunks fan out, so all-at-once labeling takes one wave
+    however many chunks the longest document has (not one per chunk)."""
+    monkeypatch.setattr(label_mod, "_MAX_BLOCKS_PER_CALL", 1)  # one chunk per block
+    batch = _run(
+        tmp_path / "batch",
+        make_answer(),
+        monkeypatch,
+        batch=fake_provider,
+        vocab=_closed_vocab(),
+        schema_text=_CLOSED_SCHEMA,
+    )
+    label = batch["stats"]["label"]
+    assert label["mode"] == "all-at-once"
+    assert label["requests"] > len(_PAGES) and label["waves"] == 1
+
+
 def test_per_document_label_stage_failure_leaves_every_document_unlabeled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_provider: _Provider
 ) -> None:
