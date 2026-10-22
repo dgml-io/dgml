@@ -1345,9 +1345,9 @@ exactly as its standalone command would:
 | `--schema-from FILE_ID` | Sample file for the schema step. Repeatable. Used only when the docset has no extraction schema. |
 | `--no-generate` | Skip step 2. |
 | `--no-extract` | Skip steps 1 and 3. |
-| `--generation-config`, `--model`, `--label-model`, `--window-size`, `--temperature`, `--max-tokens`, `--thinking`, `--no-coverage`, `--cache-dir`, `--max-parallel-calls`, `--schema-path`, `--extend-schema`, `--no-roster`, `--no-semlinks`, `--no-semlink-cache`, `--no-semlink-verify`, `--batch-label` / `--no-batch-label` | Passed to `docset generate` unchanged. |
+| `--generation-config`, `--model`, `--label-model`, `--window-size`, `--temperature`, `--max-tokens`, `--transcription`, `--thinking`, `--no-coverage`, `--cache-dir`, `--max-parallel-calls`, `--schema-path`, `--extend-schema`, `--no-roster`, `--no-semlinks`, `--no-semlink-cache`, `--no-semlink-verify`, `--batch-label` / `--no-batch-label` | Passed to `docset generate` unchanged. |
 | `--schema-model M` | Passed to `extraction generate-schema`. |
-| `--values-model M`, `--values-effort E` | Passed to `extraction extract`. |
+| `--values-model M`, `--values-effort E`, `--locations-effort E` | Passed to `extraction extract`. |
 | `--batch` / `--no-batch` | Every step through the provider's batch API, under **one** batch job. Defaults to `[generation] batch`. |
 | `--batch-poll-interval S` | Seconds between batch status polls (default 30). |
 | `--no-wait`, `--job ID` | Batch job mode for the whole run (see [Batch jobs](#batch-jobs---no-wait-and-dgml-batch)). |
@@ -1400,7 +1400,7 @@ any batch job is created), so a bad value — `--window-size abc`,
 `--thinking sometimes` — fails the run at once with `INVALID_ARGUMENT` naming
 the step and the flag, instead of argparse usage text (exit 2) from the
 generate step after the schema step has already paid. A bad `--values-effort`
-is refused up front too (`GROUNDED_CONFIG_INVALID`).
+or `--locations-effort` is refused up front too (`GROUNDED_CONFIG_INVALID`).
 
 ```json
 {"error": {"code": "INVALID_ARGUMENT",

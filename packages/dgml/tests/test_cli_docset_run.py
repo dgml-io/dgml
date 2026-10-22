@@ -445,6 +445,20 @@ def test_unknown_values_effort_fails_the_run_before_any_step(
     assert "--values-effort" in err["message"]
 
 
+def test_unknown_locations_effort_fails_the_run_before_any_step(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--locations-effort` is the extract step's too: refused up front, like
+    `--values-effort`."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        rc = main(_run_argv(ws, did, "--locations-effort", "turbo"))
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "GROUNDED_CONFIG_INVALID"
+    assert "--locations-effort" in err["message"]
+
+
 def test_a_step_that_fails_as_a_whole_fails_the_run_naming_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -642,17 +656,30 @@ def test_run_step_argv_hands_each_step_only_its_own_options() -> None:
             "m2",
             "--values-effort",
             "low",
+            "--locations-effort",
+            "minimal",
+            "--transcription",
+            "lines",
         ]
     )
     assert _run_step_argv(args, "generate") == [
         "--window-size",
         "2",
+        "--transcription",
+        "lines",
         "--thinking",
         "adaptive",
         "--no-semlinks",
     ]
     assert _run_step_argv(args, "schema") == ["--schema-model", "m1"]
-    assert _run_step_argv(args, "extract") == ["--values-model", "m2", "--values-effort", "low"]
+    assert _run_step_argv(args, "extract") == [
+        "--values-model",
+        "m2",
+        "--values-effort",
+        "low",
+        "--locations-effort",
+        "minimal",
+    ]
 
 
 def test_a_non_dgml_step_exception_names_the_step(

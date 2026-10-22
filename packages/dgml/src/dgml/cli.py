@@ -4070,6 +4070,7 @@ _RUN_PASSTHROUGH: tuple[tuple[str, str, bool, str], ...] = (
     ("--window-size", "window_size", True, "generate"),
     ("--temperature", "temperature", True, "generate"),
     ("--max-tokens", "max_tokens", True, "generate"),
+    ("--transcription", "transcription", True, "generate"),
     ("--thinking", "thinking", True, "generate"),
     ("--no-coverage", "no_coverage", False, "generate"),
     ("--cache-dir", "cache_dir", True, "generate"),
@@ -4084,6 +4085,7 @@ _RUN_PASSTHROUGH: tuple[tuple[str, str, bool, str], ...] = (
     ("--schema-model", "schema_model", True, "schema"),
     ("--values-model", "values_model", True, "extract"),
     ("--values-effort", "values_effort", True, "extract"),
+    ("--locations-effort", "locations_effort", True, "extract"),
 )
 _RUN_BOOLEAN_OPTIONAL: frozenset[str] = frozenset({"--batch-label"})
 
@@ -5396,7 +5398,7 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     from dgml_core.generation import load_generation_batch, resolve_generation_config
     from dgml_core.grounded import (
         load_grounded_config,
-        parse_values_reasoning_effort,
+        parse_reasoning_effort,
         schema_batch_request,
         values_batch_stages,
     )
@@ -5424,11 +5426,16 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     for name, argv in step_argvs.items():
         if may_run[name]:
             _parse_run_step(name, prefix + argv)
-    # Its value is only checked by the extract step's handler, which runs last:
-    # refuse a bad one (GROUNDED_CONFIG_INVALID) before generate pays.
+    # Their values are only checked by the extract step's handler, which runs
+    # last: refuse a bad one (GROUNDED_CONFIG_INVALID) before generate pays.
     values_effort = (
-        parse_values_reasoning_effort(args.values_effort, source="--values-effort")
+        parse_reasoning_effort(args.values_effort, source="--values-effort")
         if want_extract and args.values_effort is not None
+        else None
+    )
+    locations_effort = (
+        parse_reasoning_effort(args.locations_effort, source="--locations-effort")
+        if want_extract and args.locations_effort is not None
         else None
     )
 
@@ -5449,6 +5456,8 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             grounded = replace(grounded, values_model=args.values_model)
         if grounded is not None and args.values_effort is not None:
             grounded = replace(grounded, values_reasoning_effort=values_effort)
+        if grounded is not None and args.locations_effort is not None:
+            grounded = replace(grounded, locations_reasoning_effort=locations_effort)
         # A resumed job may already have written the schema it set out to
         # generate, so check the schema model whenever the run could make one.
         if grounded is not None and args.schema_from and (schema_needed or args.job):
