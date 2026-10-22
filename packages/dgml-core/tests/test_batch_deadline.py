@@ -611,7 +611,7 @@ def test_an_unsettled_cancel_is_kept_settling_and_no_late_result_replaces_the_sy
     assert record["late_billed"] == {"requests": 2, "cost_usd": 0.5}
 
 
-def test_status_reports_a_settled_late_cost_read_only_and_prune_keeps_the_job(
+def test_status_polls_a_settling_batch_without_downloading_and_prune_keeps_the_job(
     ws: Workspace,
 ) -> None:
     clock = Clock()
@@ -629,14 +629,24 @@ def test_status_reports_a_settled_late_cost_read_only_and_prune_keeps_the_job(
     assert status["deadline"]["late_billed"] == 0
 
     backend.cancel_settle_polls = 0
+    downloads: list[str] = []
+    real_results = backend.results
+
+    def counted_results(job: Any) -> Any:
+        downloads.append(job.job_id)
+        return real_results(job)
+
+    backend.results = counted_results  # type: ignore[method-assign]
     status = job_status(ws, job_id)
     (entry,) = status["batches"]
-    assert entry["done"] is True and entry["late_billed"] == {"requests": 2, "cost_usd": 0.5}
-    assert status["deadline"]["late_billed"] == 2
-    assert status["deadline"]["settling_batches"] == 0
+    # Ended, but status only polls: it never downloads the results file, so
+    # the late cost is reported once a writer has recorded it.
+    assert entry["done"] is True and "late_billed" not in entry
+    assert downloads == []
     # Read-only: nothing stored, nothing cleaned up.
     assert BatchJobStore(ws, job_id).load().provider_batches[0]["state"] == RECORD_SETTLING
     assert backend.cleaned == []
+    backend.results = real_results  # type: ignore[method-assign]
 
     # `batch cancel` records it for good and cleans the batch up.
     payload = cancel_job(ws, job_id)
@@ -1109,3 +1119,155 @@ def test_parse_duration_rejects_more_than_thirty_days() -> None:
     assert parse_duration("30d") == 30 * 86400.0
     with pytest.raises(ValueError, match="at most 30d"):
         parse_duration("99999999d")
+
+
+# ---- PR review: the nondeterminism guard still runs after the deadline ---------------
+
+
+def test_a_drifted_wave_resumed_after_the_deadline_is_refused_not_run_sync(
+    ws: Workspace,
+) -> None:
+    from dgml_core.errors import BatchJobNondeterministic
+
+    clock = Clock()
+    backend = FakeBackend(_answer, provider="anthropic", polls_until_ended=1_000_000)
+    first = _open(ws, clock, deadline_s=100)
+    with pytest.raises(BatchPending):
+        _replay(backend, first, clock).run_wave(_wave("a", "b"))
+    first.close(BatchPending(first.job_id, submitted_batches=1, requests_in_flight=2))
+
+    clock.now += 3600  # past the deadline
+    calls: list[str] = []
+    with _litellm_sync(calls):
+        resumed = _open(ws, clock, first.job_id, wait=True)
+        # Same positions, inputs rebuilt differently: nothing matches.
+        drifted = {"u_a": _kwargs("a drifted"), "u_b": _kwargs("b drifted")}
+        with pytest.raises(BatchJobNondeterministic):
+            _replay(backend, resumed, clock).run_wave(drifted)
+        resumed.close(None)
+    assert calls == []  # the drifted wave was not paid for again, synchronously
+    assert len(backend.submitted) == 1
+
+
+# ---- PR review: a 404 at the deadline is a gone batch, not a failed cancel -----------
+
+
+class _GoneAtCancel(FakeBackend):
+    """The batch is deleted at the provider: cancel and poll answer 404."""
+
+    def cancel(self, job: Any) -> None:
+        from dgml_core.batch.types import BatchNotFound
+
+        self.canceled.append(job.job_id)
+        raise BatchNotFound(f"batch {job.job_id} not found")
+
+    def poll(self, job: Any) -> Any:
+        from dgml_core.batch.types import BatchNotFound
+
+        if job.job_id in self.canceled:
+            raise BatchNotFound(f"batch {job.job_id} not found")
+        return super().poll(job)
+
+
+def test_a_batch_gone_at_the_deadline_is_not_counted_possibly_double_billed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = Clock()
+    backend = _still_running(_GoneAtCancel)
+    deadline = BatchDeadline(at=T0 + 100, clock=clock)
+    ex, _sync = _executor(backend, clock, deadline)
+
+    with caplog.at_level(logging.WARNING, logger="dgml_core.batch"):
+        out = ex.run_wave(_wave("a", "b"))
+
+    assert {_text(r) for r in out.values()} == {"sync:a", "sync:b"}
+    assert deadline.possibly_double_billed == 0 and deadline.canceled_batches == 0
+    assert deadline.sync_after_deadline == 2
+    assert _double_billed_warnings(caplog) == []
+
+
+def test_a_job_batch_gone_at_the_deadline_is_closed_out_not_kept_settling(
+    ws: Workspace,
+) -> None:
+    clock = Clock()
+    backend = _still_running(_GoneAtCancel)
+    with _litellm_sync([]):
+        session = _open(ws, clock, wait=True, deadline_s=100)
+        out = _replay(backend, session, clock).run_wave(_wave("a", "b"))
+        session.close(None)
+
+    assert {_text(r) for r in out.values()} == {"sync:a", "sync:b"}
+    block = session.deadline_json()
+    assert block is not None and block["possibly_double_billed"] == 0
+    assert "settling_batches" not in block
+    assert not BatchJobStore(ws, session.job_id).exists()  # nothing left to reconcile
+
+
+# ---- PR review: shared counters, rounding, --no-wait, prune age ----------------------
+
+
+def test_deadline_counters_are_safe_across_threads() -> None:
+    deadline = BatchDeadline(at=T0)
+
+    def bump() -> None:
+        for _ in range(5000):
+            deadline.count("sync_after_deadline")
+            deadline.count("possibly_double_billed", 2)
+
+    threads = [threading.Thread(target=bump) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert deadline.counters()["sync_after_deadline"] == 40_000
+    assert deadline.counters()["possibly_double_billed"] == 80_000
+    with pytest.raises(ValueError):
+        deadline.count("not_a_counter")
+
+
+@pytest.mark.parametrize(("now", "seconds", "at"), [(1000.2, 0.5, 1001.0), (1000.2, 60, 1061.0)])
+def test_a_fractional_deadline_rounds_up_never_already_past(
+    now: float, seconds: float, at: float
+) -> None:
+    deadline = BatchDeadline.after(seconds, clock=lambda: now)
+    assert deadline.at == at and deadline.at >= now + seconds
+    assert not deadline.expired
+
+
+def test_no_wait_never_waits_out_a_cancel_at_the_deadline(ws: Workspace) -> None:
+    clock = Clock()
+    backend = _unsettling()  # a cancel takes far longer than one status check
+    first = _open(ws, clock, deadline_s=100)
+    with pytest.raises(BatchPending):
+        _replay(backend, first, clock).run_wave(_wave("a", "b"))
+    first.close(BatchPending(first.job_id, submitted_batches=1, requests_in_flight=2))
+
+    clock.now += 3600
+    resumed_at = clock.now
+    with _litellm_sync([]):
+        resumed = _open(ws, clock, first.job_id)  # --no-wait
+        out = _replay(backend, resumed, clock).run_wave(_wave("a", "b"))
+        resumed.close(None)
+
+    assert {_text(r) for r in out.values()} == {"sync:a", "sync:b"}
+    assert clock.now == resumed_at  # no settle wait at all
+    (record,) = BatchJobStore(ws, first.job_id).load().provider_batches
+    assert record["state"] == RECORD_SETTLING
+    assert "not settled after 0s" in record["settling_reason"]
+
+
+def test_prune_does_not_reset_a_settling_jobs_age(ws: Workspace) -> None:
+    clock = Clock()
+    backend = _unsettling()
+    register_backend("anthropic", lambda _cfg: backend)
+    job_id, _calls = _settling_job(ws, clock, backend)
+    store = BatchJobStore(ws, job_id)
+    manifest = store.load()
+    manifest.status = STATUS_COMPLETED
+    manifest.updated_at = "2020-01-01T00:00:00Z"
+    store.save(manifest, touch=False)
+
+    for _ in range(2):  # every prune still sees the job as old, and retries it
+        pruned = prune_jobs(ws, older_than_days=7)
+        assert pruned["settling"] == [job_id]
+        assert store.load().updated_at == "2020-01-01T00:00:00Z"

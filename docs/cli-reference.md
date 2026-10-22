@@ -2892,7 +2892,8 @@ block):
 ```
 
 A run that fails with an error envelope carries the same object as
-`error.details.batch.job`. The entry is absent whenever the run finished its
+`error.details.batch.job` (and, for a job with a `--batch-deadline`, the
+`deadline` block as `error.details.batch.deadline`). The entry is absent whenever the run finished its
 job, so a successful run's payload is unchanged.
 
 **How resuming works.** A job never saves the pipeline's in-flight state. It
@@ -2974,14 +2975,17 @@ the same way, so they are paid for once.
 
 A provider batch usually ends within an hour but may run for its whole
 lifetime (24 hours), and one slow wave holds the whole run. `--batch-deadline
-<duration>` (at most `30d`) bounds that; without it nothing changes. Once the deadline has
+<duration>` (at most `30d`; the deadline is rounded up to the whole second)
+bounds that; without it nothing changes. Once the deadline has
 passed:
 
 - every open provider batch of the current wave is canceled; the run waits a
   bounded, per-provider time for each cancel to settle (the backend's
   `cancel_settle_s`: Anthropic 450 s, Gemini 60 s; 180 s for a backend that declares none;
   polled every 10 s; see [Batch mode](batch-mode.md#batch-deadline)) and
-  collects the results the provider had already produced. Those requests keep
+  collects the results the provider had already produced. A `--no-wait` run
+  never waits out a cancel: it checks once, and keeps what has not settled as
+  `settling` at once; Those requests keep
   their batch result, at batch price;
 - every other request of that wave, and every request of every later wave of
   the run, runs synchronously at standard price. Nothing new is submitted;
@@ -2995,7 +2999,8 @@ may still process them (OpenAI does, while `cancelling`), each counts in
 replaces the one the run used. Once the batch has ended, the job's next run,
 `dgml batch cancel`, `delete` or `prune` records what it billed (the batch
 entry's `late_billed: {"requests", "cost_usd"}`), cleans it up and marks it
-`dropped`; `dgml batch status` reports that read-only. `dgml batch delete`
+`dropped`; `dgml batch status` only polls it (reporting `done` once it has
+ended) and never downloads its results. `dgml batch delete`
 refuses a job whose batch is still settling (`BATCH_JOB_INVALID`: its late cost
 would be lost) unless `--force`. A batch that ended just before its cancel (the
 provider then refuses the cancel) is collected like any ended batch, not run
@@ -3109,8 +3114,10 @@ A job created with `--batch-deadline` also reports `deadline`: `{"at":
 "2026-09-30T18:00:00Z", "expired": false}`, when the deadline is and whether it
 has passed (a resume after it cancels, collects and finishes synchronously).
 Jobs without one have no `deadline` field. A job with a `settling` batch adds
-`settling_batches`, `late_billed` and `late_billed_usd` to it, computed
-read-only (nothing is written until a later run, `cancel` or `prune`).
+`settling_batches`, `late_billed` and `late_billed_usd` to it, as recorded so
+far: status polls each settling batch (its entry's `done`) but never
+downloads its results, so a late cost appears once a later run, `cancel`,
+`delete` or `prune` has recorded it. Nothing is written.
 
 ### `dgml batch list`
 

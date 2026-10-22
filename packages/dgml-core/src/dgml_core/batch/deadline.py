@@ -33,8 +33,10 @@ keeps working on a ``cancelling`` batch, so its requests, run synchronously
 now, can be billed twice. Each such request counts in
 ``possibly_double_billed``. A job keeps that batch's record (``settling``),
 and a later run of the job, ``dgml batch cancel`` or ``prune`` records what
-it billed once it has ended (``dgml batch status`` reports it read-only; see
-:mod:`dgml_core.batch.jobs`). A run without a job can only warn and count.
+it billed once it has ended (``dgml batch status`` only polls it; see
+:mod:`dgml_core.batch.jobs`). A ``--no-wait`` run never waits a cancel out:
+what has not settled at its one check is kept settling at once. A run
+without a job can only warn and count.
 
 A job stores its deadline in the manifest on the run that set it (see
 :mod:`dgml_core.batch.jobs`), so every resume honors the same instant.
@@ -43,7 +45,9 @@ A job stores its deadline in the manifest on the run that set it (see
 from __future__ import annotations
 
 import logging
+import math
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -143,13 +147,18 @@ class BatchDeadline:
     possibly_double_billed: int = 0
     #: Counters of earlier runs of the same job (summed into :meth:`to_json`).
     prior: list[dict[str, Any]] = field(default_factory=list)
+    #: Guards the counters: every executor of the run (each stage, and each
+    #: one's fallback pool) shares this deadline, so :meth:`count` is the only
+    #: way they change.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @classmethod
     def after(cls, seconds: float, *, clock: Callable[[], float] | None = None) -> BatchDeadline:
         """A deadline *seconds* from now, in whole seconds (the precision a
-        job's manifest stores it with, so every run sees the same instant)."""
+        job's manifest stores it with, so every run sees the same instant),
+        rounded up: never shorter than asked, and never already past."""
         now = (clock or wall_clock)()
-        return cls(at=float(int(now + float(seconds))), clock=clock)
+        return cls(at=float(math.ceil(now + float(seconds))), clock=clock)
 
     def now(self) -> float:
         return (self.clock or wall_clock)()
@@ -178,14 +187,22 @@ class BatchDeadline:
         )
         return True
 
+    def count(self, name: str, n: int = 1) -> None:
+        """Add *n* to the counter *name* (one of :data:`COUNTERS`), thread-safely."""
+        if name not in COUNTERS:
+            raise ValueError(f"unknown deadline counter {name!r}")
+        with self._lock:
+            setattr(self, name, int(getattr(self, name)) + n)
+
     def counters(self) -> dict[str, int]:
         """This run's counters (what a job records per run)."""
-        return {name: int(getattr(self, name)) for name in COUNTERS}
+        with self._lock:
+            return {name: int(getattr(self, name)) for name in COUNTERS}
 
     def to_json(self) -> dict[str, Any]:
         """The payload's ``batch.deadline`` block: the deadline, whether it
         has passed, and the counters summed over every run of the job."""
         out: dict[str, Any] = {"at": format_utc(self.at), "expired": self.expired}
-        for name in COUNTERS:
-            out[name] = int(getattr(self, name)) + sum(int(p.get(name, 0)) for p in self.prior)
+        for name, value in self.counters().items():
+            out[name] = value + sum(int(p.get(name, 0)) for p in self.prior)
         return out

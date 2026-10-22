@@ -2427,21 +2427,21 @@ def _flush_job_capture(
     deadline: dict[str, Any] | None = None,
 ) -> None:
     """Emit the output a job run held back. *job* (a job the run left behind)
-    goes into the last payload's ``batch.job`` — or, when the run emitted no
-    payload, into its last error envelope's ``details.batch.job``. *deadline*
-    (the job's batch deadline, when it has one) goes into the last payload's
-    ``batch.deadline``."""
+    and *deadline* (the job's batch deadline block, when it has one) go into
+    the last payload's ``batch.job`` / ``batch.deadline`` — or, when the run
+    emitted no payload, into its last error envelope's ``details.batch``."""
     if capture is None:
         return
-    if deadline is not None and payloads and capture.payloads:
-        _attach_batch_field(capture.payloads[-1], "deadline", deadline)
-    if job is not None:
-        if payloads and capture.payloads:
-            _attach_batch_field(capture.payloads[-1], "job", job)
-        elif capture.errors:
-            error = capture.errors[-1].get("error")
-            if isinstance(error, dict):
-                error.setdefault("details", {})["batch"] = {"job": job}
+    fields = {name: value for name, value in (("job", job), ("deadline", deadline)) if value}
+    if payloads and capture.payloads:
+        for name, value in fields.items():
+            _attach_batch_field(capture.payloads[-1], name, value)
+    elif fields and capture.errors:
+        error = capture.errors[-1].get("error")
+        if isinstance(error, dict):
+            batch = error.setdefault("details", {}).setdefault("batch", {})
+            if isinstance(batch, dict):
+                batch.update(fields)
     if payloads:
         for payload in capture.payloads:
             _emit(payload, fmt)
@@ -2568,9 +2568,14 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             _end_job_capture()
             return _emit_lease_lost(fenced, session, fmt)
         job = _left_behind(session)
-        _flush_job_capture(_end_job_capture(), fmt, job=None, deadline=_deadline_block(session))
-        if job is not None and isinstance(exc, DgmlError):
-            return _emit_error(exc.code, str(exc), fmt, details={"batch": {"job": job}})
+        deadline = _deadline_block(session)
+        _flush_job_capture(_end_job_capture(), fmt, job=None, deadline=deadline)
+        if isinstance(exc, DgmlError) and (job is not None or deadline is not None):
+            # The failure's envelope names the job left behind and the deadline
+            # block (possibly_double_billed, a settling job's id): with no
+            # payload, it is the only place an agent can learn them.
+            batch = {name: value for name, value in (("job", job), ("deadline", deadline)) if value}
+            return _emit_error(exc.code, str(exc), fmt, details={"batch": batch})
         raise
     session = _active_batch_job()
     job = None

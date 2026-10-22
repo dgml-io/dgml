@@ -91,6 +91,7 @@ from dgml_core.batch.deadline import CANCEL_SETTLE_POLL_S, BatchDeadline, cancel
 from dgml_core.batch.types import (
     BatchItemError,
     BatchJob,
+    BatchNotFound,
     BatchRejected,
     BatchRequest,
     BatchSubmitUncertain,
@@ -114,6 +115,18 @@ DEFAULT_SYNC_WORKERS = 4
 #: How :meth:`BatchExecutor._deadline_error` messages begin (what marks an
 #: item failure as the deadline's doing).
 _DEADLINE_MESSAGE = "batch deadline passed: "
+
+
+@dataclass
+class AtDeadline:
+    """One provider batch still open when the deadline passed: *job*, the
+    custom ids of the wave it carries (*ids*), and what the executor's
+    collect hooks need (*extra*: its requests, or a job's id map and record)."""
+
+    job: BatchJob
+    ids: list[str]
+    extra: Any = None
+
 
 #: Polling deadline when neither the caller nor the backend (``max_wait_s``)
 #: says otherwise: the classic 24-hour batch completion window.
@@ -399,8 +412,10 @@ class BatchExecutor:
 
     def _has_open_batches(self, pending: Mapping[str, dict[str, Any]]) -> bool:
         """Whether a provider batch submitted earlier still carries any of
-        *pending* (a job's resume: see ``ReplayExecutor``). Such requests are
-        canceled and collected after the deadline, never simply rerun."""
+        *pending*, or sits at their positions (a job's resume: see
+        ``ReplayExecutor``). Such a wave takes the batch path even after the
+        deadline: its open batches are canceled and collected, never simply
+        rerun, and the job's guards see them."""
         return False
 
     def _poll_pause(self) -> float:
@@ -455,8 +470,7 @@ class BatchExecutor:
         own reason — it cannot be encoded, the provider called it invalid, the
         wave is below ``min_wave_size`` — is not)."""
         if self.deadline is not None:
-            with self._count_lock:
-                self.deadline.sync_after_deadline += 1
+            self.deadline.count("sync_after_deadline")
 
     def _run_sync(self, items: list[tuple[str, dict[str, Any], bool]]) -> dict[str, Any]:
         """Run ``(custom_id, kwargs, deadline_caused)`` requests synchronously,
@@ -482,28 +496,40 @@ class BatchExecutor:
             self._account_sync(outcome)
         return {cid: outcome for (cid, _kw, _d), outcome in zip(items, outcomes, strict=True)}
 
-    def _await_cancels(self, jobs: list[BatchJob]) -> set[str]:
-        """Poll canceled *jobs* until each has ended or ``cancel_settle_s`` has
-        elapsed on the deadline's clock, whichever is first; the ids of those
-        that ended, whose results can now be collected.
+    def _cancel_settle_budget(self) -> float:
+        """How long, after canceling at the deadline, to wait for the cancels
+        to settle: the backend's ``cancel_settle_s``."""
+        return self.cancel_settle_s
 
-        The wait is a time budget, not a number of rounds: it lasts the full
-        ``cancel_settle_s`` whatever the poll interval (a pause is the poll
-        interval capped at :data:`CANCEL_SETTLE_POLL_S`, and the last one is
-        cut short so the final poll lands on the budget's end)."""
+    def _await_cancels(self, jobs: list[BatchJob]) -> tuple[set[str], set[str]]:
+        """Poll canceled *jobs* until each has ended or the settle budget
+        (:meth:`_cancel_settle_budget`) has elapsed on the deadline's clock,
+        whichever is first: ``(ended, gone)``, the ids of those that ended,
+        whose results can now be collected, and of those the provider no
+        longer knows (404).
+
+        The wait is a time budget, not a number of rounds: it lasts the whole
+        budget whatever the poll interval (a pause is the poll interval capped
+        at :data:`CANCEL_SETTLE_POLL_S`, and the last one is cut short so the
+        final poll lands on the budget's end). A zero budget polls once."""
         assert self.deadline is not None
+        budget = self._cancel_settle_budget()
         pause = min(self.poll_interval_s, CANCEL_SETTLE_POLL_S)
-        until = self.deadline.now() + self.cancel_settle_s
+        until = self.deadline.now() + budget
         ended: set[str] = set()
+        gone: set[str] = set()
         waiting = list(jobs)
         # A backstop only: the clock ends the wait first, unless it never moves
         # (an injected sleep that does not advance it).
-        rounds = int(self.cancel_settle_s / pause) + 2 if pause > 0 else 2
+        rounds = int(budget / pause) + 2 if pause > 0 else 2
         for _ in range(rounds):
             still: list[BatchJob] = []
             for job in waiting:
                 try:
                     done = self.backend.poll(job).done
+                except BatchNotFound:
+                    gone.add(job.job_id)
+                    continue
                 except Exception as exc:
                     self._log(f"{self._tag} polling canceled batch {job.job_id} failed: {exc}")
                     done = False
@@ -516,60 +542,82 @@ class BatchExecutor:
             if not waiting or remaining <= 0:
                 break
             self._sleep(min(pause, remaining) if pause > 0 else remaining)
-        return ended
+        return ended, gone
 
     def _cancel_and_collect(
         self,
-        open_jobs: list[tuple[BatchJob, list[BatchRequest]]],
+        open_batches: list[AtDeadline],
         pending: Mapping[str, dict[str, Any]],
         served: dict[str, Any],
         failed: dict[str, BatchItemError],
     ) -> None:
-        """The deadline passed with *open_jobs* still running: cancel each,
+        """The deadline passed with *open_batches* still running: cancel each,
         let the cancels settle, and collect what the provider already produced
         through the ordinary ``results`` contract. Every request left without
-        a result lands in *failed*, non-retryable, so it runs synchronously."""
+        a result lands in *failed*, non-retryable, so it runs synchronously.
+
+        A batch that ended before its cancel reached it (the provider refuses
+        the cancel) is collected like any ended batch; one the provider no
+        longer knows (404) bills nothing more (:meth:`_deadline_gone`). A batch
+        whose outcome stays unknown — its cancel failed, did not settle within
+        the budget, or its results could not be read — goes to
+        :meth:`_deadline_unsettled`. The job executor overrides the three
+        ``_deadline_*`` hooks; everything else is shared."""
         assert self.deadline is not None
-        canceled: list[tuple[BatchJob, list[BatchRequest]]] = []
-        finished: list[tuple[BatchJob, list[BatchRequest]]] = []
-        for job, batch in open_jobs:
+        canceled: list[AtDeadline] = []
+        finished: list[AtDeadline] = []
+        gone: set[str] = set()
+        for item in open_batches:
+            job = item.job
             try:
                 self.backend.cancel(job)
+            except BatchNotFound:
+                gone.add(job.job_id)
+                finished.append(item)
+                continue
             except Exception as exc:
                 if self._ended_despite_cancel(job):
                     self._log(
                         f"{self._tag} deadline: {job.job_id} had already ended "
                         f"(cancel refused: {type(exc).__name__}: {exc}); collecting it"
                     )
-                    finished.append((job, batch))
+                    finished.append(item)
                     continue
                 self._log(
                     f"{self._tag} deadline: canceling {job.job_id} failed "
                     f"({type(exc).__name__}: {exc}); its requests run synchronously"
                 )
                 # Not canceled, so the provider may well run (and bill) it.
-                self._unsettled(
-                    job,
-                    len(batch),
-                    "no batch job records it, so its late cost is not reconciled",
+                self._deadline_unsettled(
+                    item,
+                    len(item.ids),
                     why=f"could not be canceled ({type(exc).__name__}: {exc})",
+                    reason=f"batch deadline passed; cancel failed ({type(exc).__name__}: {exc})",
                 )
-                for request in batch:
-                    failed[request.custom_id] = self._deadline_error(
-                        request.custom_id, "its batch could not be canceled"
-                    )
+                for cid in item.ids:
+                    failed[cid] = self._deadline_error(cid, "its batch could not be canceled")
                 continue
-            self.deadline.canceled_batches += 1
-            canceled.append((job, batch))
-        ended = self._await_cancels([job for job, _b in canceled])
-        canceled_ids = {job.job_id for job, _b in canceled}
-        ended.update(job.job_id for job, _b in finished)
-        for job, batch in canceled + finished:
-            was_canceled = job.job_id in canceled_ids
+            self.deadline.count("canceled_batches")
+            canceled.append(item)
+        ended, gone_after = self._await_cancels([item.job for item in canceled])
+        gone |= gone_after
+        canceled_ids = {item.job.job_id for item in canceled}
+        ended.update(item.job.job_id for item in finished)
+        for item in canceled + finished:
+            job = item.job
             before = len(served)
-            if job.job_id in ended:
+            collected = False
+            if job.job_id in gone:
+                self._log(
+                    f"{self._tag} deadline: {job.job_id} is gone at the provider (404); "
+                    "nothing more is billed for it"
+                )
+                self._deadline_gone(item, served, failed)
+            elif job.job_id in ended:
                 try:
-                    self._collect(job, batch, pending, served, failed)
+                    stored_all = self._deadline_collect(item, pending, served, failed)
+                except BatchNotFound:
+                    self._deadline_gone(item, served, failed)
                 except Exception as exc:
                     self._log(
                         f"{self._tag} collecting canceled batch {job.job_id} failed "
@@ -577,50 +625,83 @@ class BatchExecutor:
                     )
                     # Whatever it processed is billed but unread: running those
                     # requests again synchronously may pay for them twice.
-                    self._unsettled(
-                        job,
-                        sum(1 for r in batch if r.custom_id not in served),
-                        "no batch job records it, so its late cost is not reconciled",
+                    self._deadline_unsettled(
+                        item,
+                        sum(1 for cid in item.ids if cid not in served),
                         why=(
                             f"ended but its results could not be read ({type(exc).__name__}: {exc})"
                         ),
+                        reason=(
+                            "batch deadline passed; canceled, results unavailable "
+                            f"({type(exc).__name__}: {exc})"
+                        ),
                     )
                 else:
-                    self._cleanup(job)
+                    collected = True
+                    if stored_all:
+                        self._cleanup(job)
             else:
-                unsettled = sum(1 for r in batch if r.custom_id not in served)
-                self._unsettled(
-                    job, unsettled, "no batch job records it, so its late cost is not reconciled"
+                self._deadline_unsettled(
+                    item, sum(1 for cid in item.ids if cid not in served), why=None, reason=None
                 )
             got = len(served) - before
-            if was_canceled:  # an ended batch's results are ordinary batch results
-                self.deadline.collected_after_cancel += got
-            for request in batch:
-                if request.custom_id not in served and not self._own_verdict(
-                    failed, request.custom_id
-                ):
-                    failed[request.custom_id] = self._deadline_error(
-                        request.custom_id, "its batch was canceled before it ran"
-                    )
+            was_canceled = job.job_id in canceled_ids
+            if was_canceled and collected:  # an ended batch's are ordinary batch results
+                self.deadline.count("collected_after_cancel", got)
+            for cid in item.ids:
+                if cid not in served and not self._own_verdict(failed, cid):
+                    failed[cid] = self._deadline_error(cid, "its batch was canceled before it ran")
             self._log(
                 f"{self._tag} {job.job_id} {'canceled' if was_canceled else 'ended'} at the "
-                f"batch deadline: {got} of {len(batch)} result(s) collected; the rest run "
+                f"batch deadline: {got} of {len(item.ids)} result(s) collected; the rest run "
                 "synchronously"
             )
+
+    def _deadline_collect(
+        self,
+        item: AtDeadline,
+        pending: Mapping[str, dict[str, Any]],
+        served: dict[str, Any],
+        failed: dict[str, BatchItemError],
+    ) -> bool:
+        """Collect an ended batch at the deadline; whether it may be cleaned
+        up provider-side (every response it served is kept)."""
+        self._collect(item.job, item.extra, pending, served, failed)
+        return True
+
+    def _deadline_gone(
+        self, item: AtDeadline, served: dict[str, Any], failed: dict[str, BatchItemError]
+    ) -> None:
+        """A batch the provider no longer knows (404) at the deadline: nothing
+        is billing, and without a job nothing of it was stored, so its
+        requests simply run synchronously."""
+
+    def _deadline_unsettled(
+        self, item: AtDeadline, requests: int, *, why: str | None, reason: str | None
+    ) -> None:
+        """A batch whose outcome stays unknown at the deadline (*why* says
+        how; *reason* is the job record's wording): without a job, count and
+        warn it (:meth:`_unsettled`) — nothing can reconcile it later."""
+        self._unsettled(
+            item.job,
+            requests,
+            "no batch job records it, so its late cost is not reconciled",
+            why=why,
+        )
 
     def _unsettled(
         self, job: BatchJob, requests: int, what_next: str, *, why: str | None = None
     ) -> None:
         """A batch at the deadline whose outcome is unknown: its cancel did not
-        settle within ``cancel_settle_s`` (the default *why*), the cancel
-        itself failed, or the canceled batch's results could not be read. Its
+        settle within the settle budget (the default *why*), the cancel itself
+        failed, or the canceled batch's results could not be read. Its
         *requests* now run synchronously while the provider may still be
         processing (and billing) them — counted in the deadline's
         ``possibly_double_billed`` and reported as a WARNING (the output's
         cost is degraded). *what_next* says what becomes of the batch."""
         assert self.deadline is not None
-        self.deadline.possibly_double_billed += requests
-        why = why or f"was canceled but had not settled after {self.cancel_settle_s:.0f}s"
+        self.deadline.count("possibly_double_billed", requests)
+        why = why or (f"was canceled but had not settled after {self._cancel_settle_budget():.0f}s")
         self._log(f"{self._tag} batch {job.job_id} at the deadline {why}")
         logger.warning(
             "batch deadline: %s batch %s %s; its %d request(s) run synchronously and may be "
@@ -956,7 +1037,10 @@ class BatchExecutor:
             if not open_jobs:
                 return
             if self._deadline_passed():
-                self._cancel_and_collect(open_jobs, pending, served, failed)
+                at_deadline = [
+                    AtDeadline(job, [r.custom_id for r in batch], batch) for job, batch in open_jobs
+                ]
+                self._cancel_and_collect(at_deadline, pending, served, failed)
                 return
             if time.monotonic() >= deadline:
                 ids_text = ", ".join(job.job_id for job, _b in open_jobs)

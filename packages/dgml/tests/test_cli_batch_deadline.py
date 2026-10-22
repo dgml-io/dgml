@@ -248,3 +248,26 @@ def test_a_job_resumed_after_its_deadline_cancels_collects_and_finishes_sync(
     assert block["saved_usd"] == pytest.approx(block["standard_cost_usd"] - block["cost_usd"])
     (manifest,) = list_jobs(Workspace(root=ws))
     assert manifest.status == "completed"
+
+
+# ---- a failed run with no payload still reports the deadline -------------------------
+
+
+def test_a_failed_run_puts_the_deadline_block_in_its_error_envelope(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from dgml.cli import _Capture, _flush_job_capture
+
+    deadline = {"at": "2027-01-15T09:00:00Z", "expired": True, "possibly_double_billed": 2}
+    job = {"job_id": "bj_x", "status": "failed"}
+    capture = _Capture()
+    capture.errors.append({"error": {"code": "BATCH_EXECUTION_FAILED", "message": "boom"}})
+    _flush_job_capture(capture, "json", job=job, deadline=deadline)
+    error = _read_stderr(capsys)["error"]
+    assert error["details"]["batch"] == {"job": job, "deadline": deadline}
+
+    # A run that did emit a payload still gets both there, not in the error.
+    capture = _Capture()
+    capture.payloads.append({"summary": {}})
+    _flush_job_capture(capture, "json", job=job, deadline=deadline)
+    assert _read_stdout(capsys)["batch"] == {"deadline": deadline, "job": job}

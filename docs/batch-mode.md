@@ -257,7 +257,8 @@ Providers settle cancels on sweep cycles of several minutes, so after
 canceling, the run waits for each batch to reach a terminal state before it
 collects what the batch already produced. Each backend declares that wait
 (`cancel_settle_s`); one that declares none gets 180 s. The run polls a
-settling cancel every 10 s. Live measurements (2026-09-30):
+settling cancel every 10 s. A `--no-wait` run does not wait at all: it checks
+each canceled batch once, and keeps one still canceling as `settling`. Live measurements (2026-09-30):
 
 | provider | measured cancel → ended |
 |---|---|
