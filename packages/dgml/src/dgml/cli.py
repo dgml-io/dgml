@@ -2615,7 +2615,7 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             return _emit_lease_lost(fenced, session, fmt)
         # A paused run's one result is the job to resume.
         _flush_job_capture(_end_job_capture(), fmt, job=None, payloads=False)
-        from dgml_core.batch.jobs import deadline_summary, pending_job_payload
+        from dgml_core.batch.jobs import RUN_STEP_STATE, deadline_summary, pending_job_payload
 
         block = pending_job_payload(
             pending.job_id,
@@ -2623,6 +2623,7 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             submitted_batches=pending.submitted_batches,
             requests_in_flight=pending.requests_in_flight,
             deadline=deadline_summary(session.manifest) if session is not None else None,
+            step=session.state.get(RUN_STEP_STATE) if session is not None else None,
         )
         _emit({"batch_job": block}, fmt)
         return 0
@@ -5439,6 +5440,22 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         else None
     )
 
+    # Only an extraction that will actually run needs the grounded config, and
+    # it is resolved now in either mode: a missing or invalid one
+    # (GROUNDED_CONFIG_MISSING / _INVALID) fails the run before generate pays.
+    # The flag models go in as the loader's overrides, as the steps pass them:
+    # they satisfy resolution and carry their own credentials.
+    extracting = want_extract and (has_schema or bool(args.schema_from))
+    grounded = (
+        load_grounded_config(
+            ws,
+            schema_model=args.schema_model or None,
+            values_model=args.values_model or None,
+        )
+        if extracting
+        else None
+    )
+
     session = None
     if batch:
         # Every model a planned step will send to a batch, checked before any
@@ -5447,19 +5464,6 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
         stages: dict[str, Any] = {}
         pinned: dict[str, str | bool] = {}  # resolved from config, recorded with the job
-        # Only an extraction that will actually run needs the grounded config.
-        extracting = want_extract and (has_schema or bool(args.schema_from))
-        # The flag models go in as the loader's overrides, as the steps pass
-        # them: they satisfy resolution and carry their own credentials.
-        grounded = (
-            load_grounded_config(
-                ws,
-                schema_model=args.schema_model or None,
-                values_model=args.values_model or None,
-            )
-            if extracting
-            else None
-        )
         if grounded is not None and args.values_effort is not None:
             grounded = replace(grounded, values_reasoning_effort=values_effort)
         if grounded is not None and args.locations_effort is not None:
@@ -5507,12 +5511,15 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         session.persist()
 
     steps: dict[str, Any] = {}
+    completed: list[str] = []  # steps that ran, in run order
 
     def run_step(
         name: str, argv: list[str], handler: Callable[[argparse.Namespace, Workspace, str], int]
     ) -> int:
         """Run one step's command handler; 0 with its payload recorded under
-        ``steps[name]``, else the step's error re-emitted naming the step."""
+        ``steps[name]``, 2 likewise when the step ran but failed on every file
+        (as its standalone command exits 2), else the step's error re-emitted
+        naming the step."""
         if session is not None:
             from dgml_core.batch.jobs import RUN_STEP_STATE
 
@@ -5537,21 +5544,28 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
                     traceback.print_exc()
                 rc, error = 1, {"code": "INTERNAL_ERROR", "message": short_error_message(exc)}
-        if rc == 0 and captured.payloads:
+        if rc in (0, 2) and captured.payloads:
             steps[name] = captured.payloads[-1]
-            return 0
+            completed.append(name)
+            return rc
         if error is None:
             envelope = captured.errors[-1] if captured.errors else {}
             error = envelope.get("error") or {
                 "code": "INTERNAL_ERROR",
                 "message": f"step '{name}' produced no result",
             }
+            own = dict(error.get("details") or {})  # an emitted error's own details
+        skipped = [n for n, v in steps.items() if n not in completed]
         return _emit_error(
             str(error["code"]),
             f"docset run: step '{name}' failed: {error['message']}",
             fmt,
-            details={**own, "step": name, "completed_steps": sorted(steps)},
+            details={**own, "step": name, "completed_steps": completed, "skipped_steps": skipped},
         )
+
+    # A step that exits 2 ran but failed on every file: the run stops there and
+    # reports its payload with exit 2 (the later steps are skipped, naming it).
+    failed_all: str | None = None
 
     # 1. Extraction schema.
     if not want_extract:
@@ -5564,28 +5578,38 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         }
     elif schema_needed:
         rc = run_step("schema", step_argvs["schema"], _extraction_cmd)
-        if rc != 0:
+        if rc not in (0, 2):
             return rc
+        if rc == 2:
+            failed_all = "schema"
     else:
         steps["schema"] = {"skipped": "the docset already has an extraction schema"}
 
     # 2. DGML generation.
-    if args.no_generate:
+    if failed_all is not None:
+        steps["generate"] = {"skipped": f"step '{failed_all}' failed on every file"}
+    elif args.no_generate:
         steps["generate"] = {"skipped": "--no-generate"}
     else:
         rc = run_step("generate", step_argvs["generate"], _docset_cmd)
-        if rc != 0:
+        if rc not in (0, 2):
             return rc
+        if rc == 2:
+            failed_all = "generate"
 
     # 3. Extraction.
-    if not want_extract:
+    if failed_all is not None:
+        steps["extract"] = {"skipped": f"step '{failed_all}' failed on every file"}
+    elif not want_extract:
         steps["extract"] = {"skipped": "--no-extract"}
     elif schema_needed and "skipped" in steps["schema"]:
         steps["extract"] = {"skipped": "the docset has no extraction schema"}
     else:
         rc = run_step("extract", step_argvs["extract"], _extraction_cmd)
-        if rc != 0:
+        if rc not in (0, 2):
             return rc
+        if rc == 2:
+            failed_all = "extract"
 
     payload: dict[str, Any] = {"docset_id": args.docset_id, "steps": steps}
     if batch:
@@ -5605,7 +5629,9 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
             session.state[RUN_STEP_STATE] = "completed"
     _emit(payload, fmt)
-    return 0
+    # As `dgml check` and a multi-file `extraction extract`: the payload is
+    # printed, but the outcome is not clean.
+    return 2 if failed_all is not None else 0
 
 
 def _docset_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:

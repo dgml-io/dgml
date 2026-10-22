@@ -2619,14 +2619,16 @@ def pending_job_payload(
     submitted_batches: int,
     requests_in_flight: int,
     deadline: dict[str, Any] | None = None,
+    step: str | None = None,
 ) -> dict[str, Any]:
     """The ``batch_job`` block a paused ``--no-wait`` run reports — built here
     once for both places that print it: a run that raised
     :class:`~dgml_core.errors.BatchPending` and a ``dgml batch resume`` that
     :func:`resume_would_wait` short-circuits. Keys and their order are part of
     the CLI's JSON contract. *deadline* (:func:`deadline_summary`), when the
-    job has one, is appended as ``deadline``; a job without one reports
-    exactly the keys above."""
+    job has one, is appended as ``deadline``, then *step* — the step a
+    ``docset run`` job is paused in (:data:`RUN_STEP_STATE`) — as ``step``; a
+    job with neither reports exactly the keys above."""
     out: dict[str, Any] = {
         "job_id": job_id,
         "status": JobStatus.PENDING.value,
@@ -2637,6 +2639,8 @@ def pending_job_payload(
     }
     if deadline is not None:
         out["deadline"] = deadline
+    if step is not None:
+        out["step"] = step
     return out
 
 
@@ -2680,6 +2684,7 @@ def resume_would_wait(workspace: Workspace, job_id: str) -> dict[str, Any] | Non
         submitted_batches=len(records),
         requests_in_flight=manifest.requests_in_flight(),
         deadline=deadline_summary(manifest),
+        step=manifest.state.get(RUN_STEP_STATE),
     )
 
 

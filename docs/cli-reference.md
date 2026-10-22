@@ -30,7 +30,7 @@ flag-driven (no interactive prompts) and idempotent where reasonable.
   - `1` — error (anything in the `error` envelope)
   - `2` — the command ran and printed its payload, but the outcome is not
     clean: `dgml check` found issues, or a multi-file `extraction extract`
-    failed on every file
+    (or the extract step of `docset run`) failed on every file
 
 `--format text` switches to a basic key/value text format if a human is
 driving the CLI directly.
@@ -1385,13 +1385,18 @@ or `"the step ran no batch"`):
 ```
 
 **Exit code.** `0` when every step completed; per-file failures stay per file,
-as in the standalone commands. A step that fails as a whole (an empty docset, a
-missing configuration) fails the run: the step's own error code (or
-`INTERNAL_ERROR` for an unexpected error), with `details` naming it either way:
+as in the standalone commands. A step that fails on **every** file (as a
+multi-file `extraction extract` exits `2`) ends the run there: the full payload
+is printed on stdout, each file's error in its entry, any later step is
+`skipped` naming it, and the run exits `2`. A step that fails as a whole (an
+empty docset, a missing configuration) fails the run: the step's own error code
+(or `INTERNAL_ERROR` for an unexpected error), with `details` naming it either
+way — plus any details of the step's own error, `completed_steps` (the steps
+that ran, in run order) and `skipped_steps`:
 
 ```json
 {"error": {"code": "EMPTY_DOCSET", "message": "docset run: step 'generate' failed: ...",
-           "details": {"step": "generate", "completed_steps": ["schema"]}}}
+           "details": {"step": "generate", "completed_steps": [], "skipped_steps": ["schema"]}}}
 ```
 
 **Pass-through options are checked up front.** Every step that may run is
@@ -1400,7 +1405,9 @@ any batch job is created), so a bad value — `--window-size abc`,
 `--thinking sometimes` — fails the run at once with `INVALID_ARGUMENT` naming
 the step and the flag, instead of argparse usage text (exit 2) from the
 generate step after the schema step has already paid. A bad `--values-effort`
-or `--locations-effort` is refused up front too (`GROUNDED_CONFIG_INVALID`).
+or `--locations-effort` is refused up front too (`GROUNDED_CONFIG_INVALID`), and
+so is a missing `grounded` config when the extract step will run
+(`GROUNDED_CONFIG_MISSING`), with or without `--batch`.
 
 ```json
 {"error": {"code": "INVALID_ARGUMENT",
@@ -2964,8 +2971,8 @@ All three require batch mode; without it they fail with `BATCH_JOB_INVALID`.
 }
 ```
 
-A job with a `--batch-deadline` also carries `deadline: {at, expired}` as the
-block's last key, the same object `dgml batch status` shows, so a scheduler
+A job with a `--batch-deadline` also carries `deadline: {at, expired}` after
+`resume`, the same object `dgml batch status` shows, so a scheduler
 sees when the job stops waiting without a separate status call:
 
 ```json
@@ -2975,7 +2982,8 @@ sees when the job stops waiting without a separate status call:
 ```
 
 A job without a deadline has no `deadline` key: its payload is exactly the one
-above.
+above. A `docset run` job's block ends with `step`, the step it paused in
+(`schema`, `generate` or `extract`), as `dgml batch status` reports it.
 
 A run that finishes prints the command's normal payload. Its `batch` block
 gains a `replayed` count (requests served from the job's store) when it is not

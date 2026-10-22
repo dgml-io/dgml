@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -44,6 +46,7 @@ from dgml_core.errors import BatchUnavailable
 from dgml_core.generation import transcribe as transcribe_mod
 from dgml_core.storage import Workspace
 
+from .conftest import dump_toml
 from .test_cli import (
     _RNC_SCHEMA,
     _init_ws,
@@ -68,6 +71,7 @@ from .test_cli_batch_schema import _schema_reply
 _FIDS = [f"fgen0000000{i}" for i in range(len(_PAGES))]
 # The last (longest: 3 pages) document is the schema sample.
 _SAMPLE = _FIDS[-1]
+_NEW_FID = "fgen00000009"  # assigned mid-job
 _DOCS = len(_PAGES)  # batch labeling: one wave per document (open vocabulary)
 
 
@@ -336,6 +340,7 @@ def test_no_wait_job_spans_every_step_and_matches_a_blocking_run(
         assert main(argv) == 0
         pending = _read_stdout(capsys)
         assert pending["batch_job"]["command"] == "docset run"
+        assert pending["batch_job"]["step"] == "schema"  # the step it paused in
         job_id = pending["batch_job"]["job_id"]
         # The batch-label choice resolved from config is pinned on the job.
         assert list_jobs(Workspace(root=ws_j))[0].argv[-1] == "--batch-label"
@@ -349,6 +354,7 @@ def test_no_wait_job_spans_every_step_and_matches_a_blocking_run(
             if "batch_job" not in out:
                 break
             assert out["batch_job"]["job_id"] == job_id
+            assert out["batch_job"]["step"] in ("schema", "generate", "extract")
         else:
             raise AssertionError("the job never completed")
 
@@ -531,7 +537,12 @@ def test_a_step_that_fails_as_a_whole_fails_the_run_naming_it(
     assert main(_ws_args(ws) + ["docset", "run", did]) == 1
     err = _read_stderr(capsys)["error"]
     assert err["code"] == "EMPTY_DOCSET"
-    assert err["details"] == {"step": "generate", "completed_steps": ["schema"]}
+    # The schema step was skipped (no --schema-from), not completed.
+    assert err["details"] == {
+        "step": "generate",
+        "completed_steps": [],
+        "skipped_steps": ["schema"],
+    }
 
 
 def test_job_flags_need_batch_mode(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -743,6 +754,158 @@ def test_run_step_argv_hands_each_step_only_its_own_options() -> None:
     ]
 
 
+def _resume_until_done(
+    ws: Path,
+    job_id: str,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    at_step: str,
+    change: Callable[[], object],
+) -> dict[str, Any]:
+    """Resume *job_id* to completion, making *change* to the workspace once,
+    while the job is paused in *at_step*; the finished run's payload."""
+    changed = False
+    for _ in range(25):
+        assert main(_ws_args(ws) + ["batch", "status", job_id]) == 0
+        step = _read_stdout(capsys)["step"]
+        if not changed and step == at_step:
+            change()
+            changed = True
+        assert main(_ws_args(ws) + ["batch", "resume", job_id]) == 0
+        out = _read_stdout(capsys)
+        if "batch_job" not in out:
+            assert changed, f"the job never paused in {at_step!r}"
+            return out
+    raise AssertionError("the job never completed")
+
+
+@pytest.mark.parametrize("at_step", ["generate", "extract"])
+def test_a_file_added_while_a_run_job_is_paused_is_generated_and_extracted(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,  # noqa: F811
+    pdf_stubs: None,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    at_step: str,
+) -> None:
+    """A resume re-runs each step over the docset as it is then: a file
+    assigned mid-job is converted and extracted with the rest, not refused as
+    nondeterminism (its requests are new positions, not changed ones)."""
+    from . import test_cli_batch_jobs
+
+    ws, did = _seed(tmp_path, capsys)
+    _install(provider, polls=1)
+    argv = _run_argv(ws, did, "--schema-from", _SAMPLE, "--batch", *_POLL, "--no-wait")
+
+    def add_file() -> None:
+        monkeypatch.setitem(test_cli_batch_jobs._PAGES, "charlie.pdf", 1)  # after _seed
+        _seed_file_dir(ws, _NEW_FID, pages=1, pdf_name="charlie.pdf")
+        page = {"file_id": _NEW_FID, "page": 1, "width": 1000, "height": 1000, "words": []}
+        Workspace(root=ws).blobs.put_blob(
+            layout.file_page_text_key(_NEW_FID, 1), json.dumps(page).encode()
+        )
+        DocSetStore(Workspace(root=ws)).add_file(did, _NEW_FID)
+
+    with patch("litellm.completion", side_effect=_sync):
+        assert main(argv) == 0
+        job_id = _read_stdout(capsys)["batch_job"]["job_id"]
+        out = _resume_until_done(ws, job_id, capsys, at_step=at_step, change=add_file)
+    generated = {r["file_id"]: r["status"] for r in out["steps"]["generate"]["results"]}
+    assert generated == {**dict.fromkeys(_FIDS, "converted"), _NEW_FID: "converted"}
+    assert out["steps"]["extract"]["summary"] == {"total": 3, "ok": 3, "failed": 0}
+    (manifest,) = list_jobs(Workspace(root=ws))
+    assert manifest.status == "completed"
+
+
+def test_a_schema_cleared_while_a_run_job_is_paused_is_restored_by_replay(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    provider: _Provider,  # noqa: F811
+    pdf_stubs: None,  # noqa: F811
+) -> None:
+    """Which steps a job runs is fixed when it starts: a resume after the
+    schema it generated was cleared runs the schema step again — replayed
+    from the job, so it stores the same schema at no cost — and extracts."""
+    ws, did = _seed(tmp_path, capsys)
+    _install(provider, polls=1)
+    argv = _run_argv(ws, did, "--schema-from", _SAMPLE, "--batch", *_POLL, "--no-wait")
+    store = DocSetStore(Workspace(root=ws))
+    with patch("litellm.completion", side_effect=_sync):
+        assert main(argv) == 0
+        job_id = _read_stdout(capsys)["batch_job"]["job_id"]
+        out = _resume_until_done(
+            ws, job_id, capsys, at_step="generate", change=lambda: store.clear_schema(did)
+        )
+    assert store.has_schema(did)
+    assert "skipped" not in out["steps"]["schema"]
+    assert out["steps"]["extract"]["summary"] == {"total": 2, "ok": 2, "failed": 0}
+    assert out["batch"]["steps"]["schema"]["waves"] == 1  # submitted once, then replayed
+
+
+def test_a_step_that_fails_on_every_file_ends_the_run_with_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """As a multi-file `extraction extract` does: every file failing is not an
+    error envelope but the payload on stdout with exit 2, each file's error in
+    its own entry."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    with patch("litellm.completion", side_effect=RuntimeError("bad key")):
+        assert main(_run_argv(ws, did, "--no-generate")) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""  # no error envelope
+    out = json.loads(captured.out)
+    assert list(out["steps"]) == ["schema", "generate", "extract"]
+    extract = out["steps"]["extract"]
+    assert extract["summary"] == {"total": len(_FIDS), "ok": 0, "failed": len(_FIDS)}
+    for entry in extract["results"]:
+        assert entry["status"] == "failed" and "bad key" in entry["error"]["message"]
+
+
+def test_a_step_that_fails_after_another_completed_lists_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    pdf_stubs: None,  # noqa: F811
+) -> None:
+    """`completed_steps` names the steps that ran, in run order; a step's own
+    error `details` survive into the run's envelope."""
+    import dgml.cli as cli
+
+    ws, did = _seed(tmp_path, capsys)
+
+    def refuse(_args: argparse.Namespace, _ws: Workspace, fmt: str) -> int:
+        return cli._emit_error("EMPTY_DOCSET", "nothing to do", fmt, details={"why": "test"})
+
+    monkeypatch.setattr(cli, "_docset_generate_cmd", refuse)
+    with patch("litellm.completion", side_effect=_sync):
+        assert main(_run_argv(ws, did, "--schema-from", _SAMPLE)) == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "EMPTY_DOCSET"
+    assert err["details"] == {
+        "why": "test",
+        "step": "generate",
+        "completed_steps": ["schema"],
+        "skipped_steps": [],
+    }
+
+
+def test_sync_run_checks_the_grounded_config_before_generate_pays(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without --batch too: an extraction that will run needs `[grounded]`, and
+    a missing one fails the run before any step makes a model call."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    config = Workspace(root=ws).config_path
+    data = tomllib.loads(config.read_text(encoding="utf-8"))
+    del data["grounded"]
+    config.write_text(dump_toml(data) + "\n", encoding="utf-8")
+    # Counted, not raised: generate would record a raised error per file and go on.
+    with patch("litellm.completion", side_effect=_sync) as completion:
+        assert main(_run_argv(ws, did, "--no-batch")) == 1
+    assert completion.call_count == 0
+    assert _read_stderr(capsys)["error"]["code"] == "GROUNDED_CONFIG_MISSING"
+
+
 def test_a_non_dgml_step_exception_names_the_step(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -758,7 +921,11 @@ def test_a_non_dgml_step_exception_names_the_step(
     err = _read_stderr(capsys)["error"]
     assert err["code"] == "INTERNAL_ERROR"
     assert "step 'extract'" in err["message"] and "kaboom" in err["message"]
-    assert err["details"] == {"step": "extract", "completed_steps": ["generate", "schema"]}
+    assert err["details"] == {
+        "step": "extract",
+        "completed_steps": [],
+        "skipped_steps": ["schema", "generate"],  # in run order
+    }
 
 
 def test_batch_steps_report_skipped_as_a_reason(

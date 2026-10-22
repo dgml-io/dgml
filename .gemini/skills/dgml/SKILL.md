@@ -660,7 +660,10 @@ echo "$out" | jq -e .batch_job >/dev/null \
 
 A step that fails as a whole (for example `EMPTY_DOCSET`) fails the run with
 that step's error code (`INTERNAL_ERROR` for an unexpected error) and
-`error.details.step`; per-file failures stay per file in the step's payload.
+`error.details.step` (with `completed_steps` / `skipped_steps`, in run order);
+per-file failures stay per file in the step's payload. A step that fails on
+EVERY file ends the run with its payload on stdout and exit 2 (later steps
+`skipped`), as a multi-file `extraction extract` does.
 Under `--batch`, a step that ran no batch shows `.batch.steps.<step>.skipped`
 as a string reason. With no schema and no `--schema-from`, extraction
 is skipped (`.steps.extract.skipped`), never guessed. In `docset run`,
