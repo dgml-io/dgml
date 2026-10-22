@@ -26,7 +26,7 @@ from dgml_core.classification import ClassificationConfig
 from dgml_core.errors import ClassificationFailed, SchemaGenerationFailed
 from dgml_core.generation import label as label_mod
 from dgml_core.generation.blocks import Block
-from dgml_core.generation.single_calls import STAGE_PLAN, single_calls_through
+from dgml_core.generation.single_calls import SingleCallStage, single_calls_through
 from dgml_core.grounded import GroundedConfig, generate_schema
 from dgml_core.storage import Workspace
 from dgml_core.usage import read_events
@@ -180,16 +180,16 @@ def test_a_runner_sees_the_same_requests_under_the_plan_stage(
     sync = capture_kwargs(list(replies))
     plan(tmp_path / "sync")
 
-    stages: list[str] = []
+    stages: list[SingleCallStage] = []
 
-    def runner(stage: str, config: llm.LLMConfig, steps: Any) -> Any:
+    def runner(stage: SingleCallStage, config: llm.LLMConfig, steps: Any) -> Any:
         stages.append(stage)
         return llm.drive(steps, config)
 
     through_runner = capture_kwargs(list(replies))
     with single_calls_through(runner):
         assert plan(tmp_path / "runner") == REFINED["concepts"]
-    assert stages == [STAGE_PLAN]
+    assert stages == [SingleCallStage.PLAN]
     assert through_runner.kwargs == sync.kwargs
 
 

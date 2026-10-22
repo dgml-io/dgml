@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
-from dgml_core import ClassificationDecision, layout
+from dgml_core import ClassificationDecision, DecisionKind, layout
 from dgml_core.grounded import ExtractionResult
 from dgml_sample_service import operations
 from dgml_sample_service.db import dgml_settings
@@ -205,7 +205,7 @@ def test_classify_assigns_and_extracts(
 
     def fake_classify(ws: Any, fid: str, *, config: Any, mode: Any) -> ClassificationDecision:
         seen["mode"], seen["model"] = mode, config.model
-        return ClassificationDecision(decision="existing", existing_docset_id=ds["id"])
+        return ClassificationDecision(decision=DecisionKind.EXISTING, existing_docset_id=ds["id"])
 
     def fake_extract(ws: Any, docset_id: str, fid: str, **_: Any) -> ExtractionResult:
         key = layout.dgml_xml_key(docset_id, fid, "lease")
@@ -302,7 +302,9 @@ def test_classify_none_leaves_file_unassigned(
     monkeypatch.setattr(
         operations,
         "classify_file",
-        lambda *a, **k: ClassificationDecision(decision="none", reason="a lease, not an invoice"),
+        lambda *a, **k: ClassificationDecision(
+            decision=DecisionKind.NONE, reason="a lease, not an invoice"
+        ),
     )
     job = client.post(f"/api/orgs/{org_id}/files/{file_id}/classify", json={}).json()
     done = wait_job(org_id, job["id"])
@@ -328,7 +330,7 @@ def test_classify_new_creates_docset(
         operations,
         "classify_file",
         lambda *a, **k: ClassificationDecision(
-            decision="new",
+            decision=DecisionKind.NEW,
             new_name="Lease",
             new_description="A lease",
             new_key_questions=("What is the rent?",),

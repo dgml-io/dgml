@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from clustering.config.schema import FusionConfig
+from clustering.config.schema import FusionConfig, FusionName, Modality
 from clustering.encoders.base import EncoderOutput
 from clustering.fusion.base import Fusion, FusionOutput, register_fusion
 
@@ -33,14 +33,14 @@ class NoneFusion(Fusion):
 
     def __init__(self, cfg: FusionConfig, *, text_dim: int, image_dim: int) -> None:
         super().__init__()
-        self.prefer: str = cfg.prefer_modality
-        self.output_dim = image_dim if self.prefer == "image" else text_dim
+        self.prefer: Modality = cfg.prefer_modality
+        self.output_dim = image_dim if self.prefer == Modality.IMAGE else text_dim
 
     def forward(self, text: EncoderOutput, image: EncoderOutput) -> FusionOutput:
-        chosen = image if self.prefer == "image" else text
+        chosen = image if self.prefer == Modality.IMAGE else text
         return FusionOutput(pooled=chosen.pooled, tokens=chosen.tokens)
 
 
-@register_fusion("none")
+@register_fusion(FusionName.NONE)
 def _factory(cfg: FusionConfig, *, text_dim: int, image_dim: int, **_: Any) -> Fusion:
     return NoneFusion(cfg, text_dim=text_dim, image_dim=image_dim)

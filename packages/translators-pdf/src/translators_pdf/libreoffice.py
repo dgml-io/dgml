@@ -12,7 +12,7 @@
 
 """LibreOffice document-to-PDF converter.
 
-Converts docx/doc/xlsx/xls by driving a headless ``soffice`` subprocess. No
+Converts docx/doc/xlsx/xls/pptx/ppt by driving a headless ``soffice`` subprocess. No
 installable Python dependency — LibreOffice is a user-installed external tool
 (like ghostscript), discovered on PATH or at the standard per-OS install path.
 """
@@ -52,7 +52,9 @@ def _find_soffice() -> str | None:
 
 class LibreOfficeConverter(DocConverter):
     name: ClassVar[str] = "libreoffice"
-    input_formats: ClassVar[frozenset[str]] = frozenset({".docx", ".doc", ".xlsx", ".xls"})
+    input_formats: ClassVar[frozenset[str]] = frozenset(
+        {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"}
+    )
     config_fields: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod

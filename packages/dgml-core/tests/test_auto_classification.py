@@ -29,7 +29,12 @@ from dgml_core import auto_classify, classify_bulk_batch, prepare_bulk_classify
 from dgml_core.auto_classification import apply_classification, classification_block, soft_error
 from dgml_core.batch import FakeBackend, fake_model_response, provider_of, register_backend
 from dgml_core.batch import registry as batch_registry
-from dgml_core.classification import ClassificationConfig, ClassificationDecision, ClassifyMode
+from dgml_core.classification import (
+    ClassificationConfig,
+    ClassificationDecision,
+    ClassifyMode,
+    DecisionKind,
+)
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import BatchUnavailable, ClassificationFailed
 from dgml_core.files import AddFileResult, FileStore
@@ -278,7 +283,9 @@ def test_a_failed_assignment_keeps_a_docset_an_earlier_run_created(tmp_path: Pat
     ws = _ws(tmp_path / "ws")
     store = DocSetStore(ws)
     earlier = store.create(name="Invoices", description="d")
-    decision = ClassificationDecision(decision="new", new_name="Invoices", new_description="d")
+    decision = ClassificationDecision(
+        decision=DecisionKind.NEW, new_name="Invoices", new_description="d"
+    )
     hooks: list[Callable[[ClassificationDecision], tuple[DocSet, bool]]] = [
         lambda _d: (earlier, False),
         lambda _d: (store.create(name="Receipts", description="d"), True),

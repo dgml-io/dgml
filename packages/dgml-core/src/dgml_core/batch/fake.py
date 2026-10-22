@@ -55,6 +55,7 @@ from dgml_core.batch.types import (
     BatchRequest,
     BatchState,
     BatchStatus,
+    ItemErrorKind,
 )
 
 ResponseScript = Mapping[str, Any] | Callable[[BatchRequest], Any]
@@ -241,11 +242,15 @@ class FakeBackend:
                 continue
             if state.canceled:
                 outcome: Any = BatchItemError(
-                    request.custom_id, "canceled", "batch canceled before this request ran"
+                    request.custom_id,
+                    ItemErrorKind.CANCELED,
+                    "batch canceled before this request ran",
                 )
             elif state.rejected:
                 outcome = BatchItemError(
-                    request.custom_id, "batch_rejected", "batch failed validation (fake)"
+                    request.custom_id,
+                    ItemErrorKind.BATCH_REJECTED,
+                    "batch failed validation (fake)",
                 )
             else:
                 outcome = self._scripted(request)
@@ -258,7 +263,9 @@ class FakeBackend:
             return self._responses[request.custom_id]
         except KeyError:
             return BatchItemError(
-                request.custom_id, "invalid", f"no scripted response for {request.custom_id!r}"
+                request.custom_id,
+                ItemErrorKind.INVALID,
+                f"no scripted response for {request.custom_id!r}",
             )
 
     @staticmethod
@@ -267,9 +274,9 @@ class FakeBackend:
         for outcome in state.outcomes.values():
             if not isinstance(outcome, BatchItemError):
                 succeeded += 1
-            elif outcome.kind == "expired":
+            elif outcome.kind == ItemErrorKind.EXPIRED:
                 expired += 1
-            elif outcome.kind == "canceled":
+            elif outcome.kind == ItemErrorKind.CANCELED:
                 canceled += 1
             else:
                 errored += 1

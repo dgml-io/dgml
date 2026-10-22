@@ -194,11 +194,11 @@ def _item_error(custom_id: str, error: dict[str, Any]) -> BatchItemError:
     message = str(error.get("message") or status)
     kind: ItemErrorKind
     if status == "CANCELLED":
-        kind = "canceled"
+        kind = ItemErrorKind.CANCELED
     elif status in _INVALID_STATUSES:
-        kind = "invalid"
+        kind = ItemErrorKind.INVALID
     else:
-        kind = "errored"
+        kind = ItemErrorKind.ERRORED
     return BatchItemError(custom_id, kind, f"{status}: {message}")
 
 
@@ -502,7 +502,9 @@ class GeminiBatchBackend:
             if not isinstance(body, dict):
                 yield (
                     key,
-                    BatchItemError(key, "errored", "result carries neither response nor error"),
+                    BatchItemError(
+                        key, ItemErrorKind.ERRORED, "result carries neither response nor error"
+                    ),
                 )
                 continue
             yield key, self._decode(body)
@@ -511,22 +513,32 @@ class GeminiBatchBackend:
         op_error = operation.get("error")
         for key in [c for c in job.custom_ids if c in pending]:
             if raw_state.endswith("EXPIRED"):
-                yield key, BatchItemError(key, "expired", "batch expired before this request ran")
+                yield (
+                    key,
+                    BatchItemError(
+                        key, ItemErrorKind.EXPIRED, "batch expired before this request ran"
+                    ),
+                )
             elif status.state is BatchState.CANCELED:
-                yield key, BatchItemError(key, "canceled", "batch was canceled")
+                yield key, BatchItemError(key, ItemErrorKind.CANCELED, "batch was canceled")
             elif isinstance(op_error, dict):
                 op_status = _error_status(op_error)
                 op_message = str(op_error.get("message", ""))
                 # The accepted batch failed as a whole at a size/quota limit:
                 # nothing about this request, so the caller decides (see types).
-                kind: ItemErrorKind = (
-                    "batch_rejected"
+                kind = (
+                    ItemErrorKind.BATCH_REJECTED
                     if is_batch_limit_error(f"{op_status}: {op_message}")
-                    else "errored"
+                    else ItemErrorKind.ERRORED
                 )
                 yield key, BatchItemError(key, kind, f"batch failed: {op_status}: {op_message}")
             else:
-                yield key, BatchItemError(key, "errored", "no result returned for this request")
+                yield (
+                    key,
+                    BatchItemError(
+                        key, ItemErrorKind.ERRORED, "no result returned for this request"
+                    ),
+                )
 
     def cancel(self, job: BatchJob) -> None:
         try:

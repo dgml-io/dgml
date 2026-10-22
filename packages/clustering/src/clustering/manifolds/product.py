@@ -28,7 +28,7 @@ from typing import cast
 
 import torch
 
-from clustering.config.schema import ManifoldComponent, ManifoldConfig
+from clustering.config.schema import ManifoldComponent, ManifoldConfig, ManifoldName
 from clustering.manifolds.base import ManifoldHead, register_manifold
 from clustering.manifolds.euclidean import EuclideanHead
 from clustering.manifolds.hyperbolic import HyperbolicHead
@@ -37,13 +37,13 @@ from clustering.manifolds.spherical import SphericalHead
 
 def _component_head(c: ManifoldComponent) -> ManifoldHead:
     sub_cfg = ManifoldConfig(name=c.name, dim=c.dim, curvature=c.curvature)
-    if c.name == "euclidean":
+    if c.name == ManifoldName.EUCLIDEAN:
         return EuclideanHead(sub_cfg)
-    if c.name == "spherical":
+    if c.name == ManifoldName.SPHERICAL:
         return SphericalHead(sub_cfg)
-    if c.name == "hyperbolic":
+    if c.name == ManifoldName.HYPERBOLIC:
         return HyperbolicHead(sub_cfg)
-    raise ValueError(f"Unknown component manifold: {c.name!r}")
+    raise ValueError(f"Unknown component manifold: '{c.name}'")
 
 
 class ProductHead(ManifoldHead):
@@ -120,6 +120,6 @@ class ProductHead(ManifoldHead):
         return torch.cat([head.manifold_origin() for head in self.components], dim=-1)
 
 
-@register_manifold("product")
+@register_manifold(ManifoldName.PRODUCT)
 def _factory(cfg: ManifoldConfig) -> ManifoldHead:
     return ProductHead(cfg)

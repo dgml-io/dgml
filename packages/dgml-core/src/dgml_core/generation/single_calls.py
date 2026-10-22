@@ -41,19 +41,31 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from enum import StrEnum
 from typing import Any, cast
 
 from dgml_core import llm
 
-#: Drives one request chain: ``runner(stage, config, steps) -> result``.
-#: *stage* names it ("plan", "plan_gaps", "describe"); *config* is the config
-#: *steps* was built from, whose usage row the run records.
-SingleCallRunner = Callable[[str, llm.LLMConfig, llm.LLMSteps[Any]], Any]
 
-#: Stage names of the three calls.
-STAGE_PLAN = "plan"
-STAGE_PLAN_GAPS = "plan_gaps"
-STAGE_DESCRIBE = "describe"
+class SingleCallStage(StrEnum):
+    """Which of Pass B's docset-wide calls a request chain is.
+
+    ``PLAN`` is roster planning (a draft, then a grounded refine turn),
+    ``PLAN_GAPS`` gap planning for an extendable authored vocabulary, and
+    ``DESCRIBE`` the concept descriptions for the roles coined during labeling.
+    In batch mode each names its one-unit batch stage, so the value is the key
+    of that stage's stats in a run's batch report.
+    """
+
+    PLAN = "plan"
+    PLAN_GAPS = "plan_gaps"
+    DESCRIBE = "describe"
+
+
+#: Drives one request chain: ``runner(stage, config, steps) -> result``.
+#: *stage* names it; *config* is the config *steps* was built from, whose usage
+#: row the run records.
+SingleCallRunner = Callable[[SingleCallStage, llm.LLMConfig, llm.LLMSteps[Any]], Any]
 
 _RUNNER: ContextVar[SingleCallRunner | None] = ContextVar("dgml_single_call_runner", default=None)
 
@@ -70,7 +82,7 @@ def single_calls_through(runner: SingleCallRunner | None) -> Iterator[None]:
 
 
 def call(
-    stage: str,
+    stage: SingleCallStage,
     config: llm.LLMConfig,
     *,
     system_prompt: str | tuple[str, str],
@@ -88,7 +100,7 @@ def call(
 
 
 def call_with_refinement(
-    stage: str,
+    stage: SingleCallStage,
     config: llm.LLMConfig,
     *,
     system_prompt: str | tuple[str, str],

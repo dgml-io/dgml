@@ -53,7 +53,7 @@ import threading
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, assert_never
 from urllib.parse import urlsplit
 
 from dgml_core.batch.types import BatchRequest
@@ -267,7 +267,7 @@ def capture_sync_request(
     params["num_retries"] = 0
     sink: list[CapturedRequest] = []
     if seam is not CaptureSeam.HTTPX_HANDLER:  # pragma: no cover - one seam today
-        raise ValueError(f"unknown capture seam {seam!r}")
+        assert_never(seam)
     client = _httpx_handler(sink, reply)
     params["client"] = client
     error: Exception | None = None

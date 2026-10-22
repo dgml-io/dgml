@@ -38,6 +38,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from . import layout
@@ -100,10 +101,26 @@ class FileNotFound(NotFoundError):
     code = "FILE_NOT_FOUND"
 
 
+class ConflictErrorKind(StrEnum):
+    """What a :class:`ConflictError` collided with (its ``kind``).
+
+    ``HASH`` / ``PATH`` are the :class:`dgml_core.files.ConflictKind` matches
+    :meth:`~dgml_core.files.FileStore.add` refuses under ``on_conflict=error``;
+    ``ID`` is a caller-chosen file id already held; ``WORKSPACE`` is a workspace
+    id or path already taken. Wider than ``ConflictKind``, which names only the
+    matches an ``AddFileResult`` can report.
+    """
+
+    HASH = "hash"
+    PATH = "path"
+    ID = "id"
+    WORKSPACE = "workspace"
+
+
 class ConflictError(DgmlError):
     code = "CONFLICT"
 
-    def __init__(self, message: str, *, kind: str, existing_id: str) -> None:
+    def __init__(self, message: str, *, kind: ConflictErrorKind, existing_id: str) -> None:
         super().__init__(message)
         self.kind = kind
         self.existing_id = existing_id

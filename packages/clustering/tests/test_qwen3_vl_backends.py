@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders import build_encoder
 from clustering.encoders.qwen3_vl_embedding import (
     Qwen3VLEmbeddingEncoder,
@@ -92,7 +92,7 @@ def _server_cfg(**extra: object) -> EncoderConfig:
     base: dict[str, object] = {"backend": "server", "base_url": "http://localhost:8000/v1"}
     base.update(extra)
     return EncoderConfig(
-        name="qwen3_vl_embedding",
+        name=EncoderName.QWEN3_VL_EMBEDDING,
         model_id="Qwen/Qwen3-VL-Embedding-8B",
         embedding_dim=4,
         extra=base,
@@ -101,7 +101,7 @@ def _server_cfg(**extra: object) -> EncoderConfig:
 
 def test_server_backend_requires_base_url() -> None:
     cfg = EncoderConfig(
-        name="qwen3_vl_embedding",
+        name=EncoderName.QWEN3_VL_EMBEDDING,
         model_id="Qwen/Qwen3-VL-Embedding-8B",
         extra={"backend": "server"},
     )
@@ -134,7 +134,7 @@ def test_server_encode_truncates_and_renormalizes(monkeypatch: pytest.MonkeyPatc
 
 def test_unknown_backend_raises() -> None:
     cfg = EncoderConfig(
-        name="qwen3_vl_embedding",
+        name=EncoderName.QWEN3_VL_EMBEDDING,
         model_id="Qwen/Qwen3-VL-Embedding-8B",
         extra={"backend": "banana"},
     )

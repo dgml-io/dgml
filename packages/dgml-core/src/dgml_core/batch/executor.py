@@ -87,7 +87,12 @@ from typing import Any
 
 from dgml_core.batch.backend import BatchBackend
 from dgml_core.batch.chunking import plan_batches, request_size
-from dgml_core.batch.deadline import CANCEL_SETTLE_POLL_S, BatchDeadline, cancel_settle_s
+from dgml_core.batch.deadline import (
+    CANCEL_SETTLE_POLL_S,
+    BatchDeadline,
+    DeadlineCounter,
+    cancel_settle_s,
+)
 from dgml_core.batch.types import (
     BatchItemError,
     BatchJob,
@@ -99,12 +104,12 @@ from dgml_core.batch.types import (
     ItemErrorKind,
 )
 from dgml_core.errors import BatchExecutionFailed, BatchUnavailable
-from dgml_core.usage import TIER_BATCH, TIER_STANDARD
 
 # Marker key on ``response._hidden_params`` naming the path that produced the
-# response (``TIER_BATCH`` or ``TIER_STANDARD``): stamped here, defined in
+# response (a :class:`PricingTier` value): stamped here, defined in
 # :mod:`dgml_core.usage`, which splits usage rows by it.
 from dgml_core.usage import TIER_MARKER as TIER_MARKER
+from dgml_core.usage import PricingTier
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +174,7 @@ class WaveStats:
     standard_cost_usd: float = 0.0
     unpriced: int = 0
 
-    def add_cost(self, response: Any, tier: str) -> None:
+    def add_cost(self, response: Any, tier: PricingTier) -> None:
         """Count one response received from the provider — a batch result
         (*tier* batch) or a synchronous fallback (standard). ``cost_usd`` is
         what it was billed at; ``standard_cost_usd`` what it would have cost
@@ -181,7 +186,7 @@ class WaveStats:
             self.unpriced += 1
             return
         self.cost_usd += float(cost)
-        self.standard_cost_usd += float(cost) * (2 if tier == TIER_BATCH else 1)
+        self.standard_cost_usd += float(cost) * (2 if tier == PricingTier.BATCH else 1)
 
     def cost_json(self) -> dict[str, float | None]:
         return cost_fields(self.cost_usd, self.standard_cost_usd, self.unpriced)
@@ -231,14 +236,14 @@ def _has_choices(response: Any) -> bool:
     return bool(choices)
 
 
-def _mark_tier(response: Any, tier: str) -> None:
+def _mark_tier(response: Any, tier: PricingTier) -> None:
     """Stamp the serving path on the response without touching its cost."""
     hidden = getattr(response, "_hidden_params", None)
     if isinstance(hidden, dict):
-        hidden[TIER_MARKER] = tier
+        hidden[TIER_MARKER] = str(tier)  # litellm's plain dict, and stored as JSON
         return
     try:
-        response._hidden_params = {TIER_MARKER: tier}
+        response._hidden_params = {TIER_MARKER: str(tier)}
     except (AttributeError, TypeError):
         pass
 
@@ -427,7 +432,9 @@ class BatchExecutor:
 
     @staticmethod
     def _deadline_error(custom_id: str, why: str) -> BatchItemError:
-        return BatchItemError(custom_id, "canceled", f"{_DEADLINE_MESSAGE}{why}", retryable=False)
+        return BatchItemError(
+            custom_id, ItemErrorKind.CANCELED, f"{_DEADLINE_MESSAGE}{why}", retryable=False
+        )
 
     @staticmethod
     def _own_verdict(failed: Mapping[str, BatchItemError], custom_id: str) -> bool:
@@ -436,7 +443,7 @@ class BatchExecutor:
         synchronously with or without the deadline), not replaced by a
         deadline error."""
         error = failed.get(custom_id)
-        return error is not None and error.kind == "invalid"
+        return error is not None and error.kind == ItemErrorKind.INVALID
 
     def _unsplit_at_deadline(self, ids: Iterable[str], failed: dict[str, BatchItemError]) -> None:
         """A batch rejected whole after the deadline is not split and
@@ -462,7 +469,7 @@ class BatchExecutor:
     @staticmethod
     def _is_deadline_error(error: BatchItemError) -> bool:
         """Whether *error* is one :meth:`_deadline_error` made."""
-        return error.kind == "canceled" and error.message.startswith(_DEADLINE_MESSAGE)
+        return error.kind == ItemErrorKind.CANCELED and error.message.startswith(_DEADLINE_MESSAGE)
 
     def _count_deadline_fallback(self) -> None:
         """Count a request the deadline took off the batch path in the
@@ -470,7 +477,7 @@ class BatchExecutor:
         own reason — it cannot be encoded, the provider called it invalid, the
         wave is below ``min_wave_size`` — is not)."""
         if self.deadline is not None:
-            self.deadline.count("sync_after_deadline")
+            self.deadline.count(DeadlineCounter.SYNC_AFTER_DEADLINE)
 
     def _run_sync(self, items: list[tuple[str, dict[str, Any], bool]]) -> dict[str, Any]:
         """Run ``(custom_id, kwargs, deadline_caused)`` requests synchronously,
@@ -597,7 +604,7 @@ class BatchExecutor:
                 for cid in item.ids:
                     failed[cid] = self._deadline_error(cid, "its batch could not be canceled")
                 continue
-            self.deadline.count("canceled_batches")
+            self.deadline.count(DeadlineCounter.CANCELED_BATCHES)
             canceled.append(item)
         ended, gone_after = self._await_cancels([item.job for item in canceled])
         gone |= gone_after
@@ -647,7 +654,7 @@ class BatchExecutor:
             got = len(served) - before
             was_canceled = job.job_id in canceled_ids
             if was_canceled and collected:  # an ended batch's are ordinary batch results
-                self.deadline.count("collected_after_cancel", got)
+                self.deadline.count(DeadlineCounter.COLLECTED_AFTER_CANCEL, got)
             for cid in item.ids:
                 if cid not in served and not self._own_verdict(failed, cid):
                     failed[cid] = self._deadline_error(cid, "its batch was canceled before it ran")
@@ -700,7 +707,7 @@ class BatchExecutor:
         ``possibly_double_billed`` and reported as a WARNING (the output's
         cost is degraded). *what_next* says what becomes of the batch."""
         assert self.deadline is not None
-        self.deadline.count("possibly_double_billed", requests)
+        self.deadline.count(DeadlineCounter.POSSIBLY_DOUBLE_BILLED, requests)
         why = why or (f"was canceled but had not settled after {self._cancel_settle_budget():.0f}s")
         self._log(f"{self._tag} batch {job.job_id} at the deadline {why}")
         logger.warning(
@@ -788,7 +795,7 @@ class BatchExecutor:
             except Exception as exc:
                 self._log(f"{self._tag} {custom_id}: cannot encode ({type(exc).__name__}: {exc})")
                 failed[custom_id] = BatchItemError(
-                    custom_id, "invalid", f"encode failed: {type(exc).__name__}: {exc}"
+                    custom_id, ItemErrorKind.INVALID, f"encode failed: {type(exc).__name__}: {exc}"
                 )
                 continue
             encodable.append(request)
@@ -887,7 +894,11 @@ class BatchExecutor:
         refused: list[tuple[list[BatchRequest], Exception]], failed: dict[str, BatchItemError]
     ) -> None:
         for refused_batch, why in refused:
-            kind: ItemErrorKind = "batch_rejected" if isinstance(why, BatchRejected) else "invalid"
+            kind = (
+                ItemErrorKind.BATCH_REJECTED
+                if isinstance(why, BatchRejected)
+                else ItemErrorKind.INVALID
+            )
             for request in refused_batch:
                 failed[request.custom_id] = BatchItemError(
                     request.custom_id,
@@ -952,7 +963,8 @@ class BatchExecutor:
         """Every id in *ids* came back ``batch_rejected``."""
         listed = list(ids)
         return bool(listed) and all(
-            (err := failed.get(cid)) is not None and err.kind == "batch_rejected" for cid in listed
+            (err := failed.get(cid)) is not None and err.kind == ItemErrorKind.BATCH_REJECTED
+            for cid in listed
         )
 
     def _wait_all(
@@ -1066,16 +1078,16 @@ class BatchExecutor:
                 failed[custom_id] = outcome
             elif not _has_choices(outcome):
                 failed[custom_id] = BatchItemError(
-                    custom_id, "errored", "batch result carries no choices"
+                    custom_id, ItemErrorKind.ERRORED, "batch result carries no choices"
                 )
             else:
-                _mark_tier(outcome, TIER_BATCH)
-                self.stats.add_cost(outcome, TIER_BATCH)
+                _mark_tier(outcome, PricingTier.BATCH)
+                self.stats.add_cost(outcome, PricingTier.BATCH)
                 served[custom_id] = outcome
         for request in batch:
             if request.custom_id not in seen:
                 failed[request.custom_id] = BatchItemError(
-                    request.custom_id, "errored", "no result returned for this request"
+                    request.custom_id, ItemErrorKind.ERRORED, "no result returned for this request"
                 )
 
     def _fallback(self, kwargs: dict[str, Any]) -> Any:
@@ -1089,7 +1101,7 @@ class BatchExecutor:
         """Add a synchronous fallback's cost (standard tier) — on the thread
         that folds the wave, never on a pool worker (see :meth:`_run_sync`)."""
         if not isinstance(outcome, BaseException):
-            self.stats.add_cost(outcome, TIER_STANDARD)
+            self.stats.add_cost(outcome, PricingTier.STANDARD)
 
     def _sync_call(self, kwargs: dict[str, Any]) -> Any:
         """One synchronous fallback call — safe on a pool worker: it
@@ -1109,7 +1121,7 @@ class BatchExecutor:
                 self.stats.failed += 1
             self._log(f"{self._tag} synchronous fallback failed: {type(exc).__name__}: {exc}")
             return exc
-        _mark_tier(response, TIER_STANDARD)
+        _mark_tier(response, PricingTier.STANDARD)
         return response
 
 

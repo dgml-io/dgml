@@ -31,7 +31,7 @@ from dgml_core.batch import FakeBackend, fake_model_response, register_backend
 from dgml_core.batch import registry as batch_registry
 from dgml_core.docsets import DocSetStore
 from dgml_core.storage import Workspace
-from dgml_core.usage import TIER_BATCH, TIER_STANDARD, read_events
+from dgml_core.usage import PricingTier, read_events
 
 from .test_cli import _init_ws, _new_docset, _read_stderr, _read_stdout, _seed_file_dir, _ws_args
 from .test_cli_batch_extraction import _write_config
@@ -136,7 +136,7 @@ def test_batch_matches_sync_and_adds_a_batch_block(
     assert batch["batch"]["sync_fallbacks"] == 0
     assert len(backend.submitted) == 1
     tiers = [r["tier"] for r in read_events(Workspace(root=ws))]
-    assert tiers == [TIER_STANDARD, TIER_BATCH]
+    assert tiers == [PricingTier.STANDARD, PricingTier.BATCH]
     assert _rows(ws) == sync_rows * 2  # identical rows apart from the tier
 
 

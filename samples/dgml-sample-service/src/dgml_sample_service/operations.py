@@ -28,6 +28,7 @@ from typing import Any
 from dgml_core import (
     AddFileResult,
     ClassifyMode,
+    DecisionKind,
     DgmlNotFound,
     DocSetStore,
     FileStore,
@@ -52,16 +53,11 @@ def add_file(ws: Workspace, upload: Path, *, text_mode: str) -> AddFileResult:
 
 
 def add_result_json(result: AddFileResult) -> dict[str, Any]:
-    return {
-        "file": result.record.to_json(),
-        "created": result.created,
-        "conflict_kind": result.conflict_kind,
-        "page_render_error": result.page_render_error,
-        "page_count_error": result.page_count_error,
-        "text_extraction_error": result.text_extraction_error,
-        "conversion_error": result.conversion_error,
-        "note": result.note,
-    }
+    """:meth:`AddFileResult.to_json` minus ``text_extraction`` (the per-page
+    extraction detail ``dgml file add`` reports), which this API does not return."""
+    out = result.to_json()
+    del out["text_extraction"]
+    return out
 
 
 def stage_upload(filename: str, data: bytes) -> Path:
@@ -78,26 +74,28 @@ def discard_upload(path: Path) -> None:
     shutil.rmtree(path.parent, ignore_errors=True)
 
 
-def classify(ws: Workspace, file_id: str, *, mode: str, extract: bool = True) -> dict[str, Any]:
+def classify(
+    ws: Workspace, file_id: str, *, mode: ClassifyMode, extract: bool = True
+) -> dict[str, Any]:
     """Classify a file into a docset, then assign it (and extract, when the docset
     has an extraction schema) — the library form of ``dgml file add --auto-classify``.
 
-    ``mode`` is a :class:`ClassifyMode`: ``existing`` may decline (``"none"``) and
-    leave the file unassigned; ``existing-or-new`` creates the proposed docset when
-    nothing fits."""
+    ``existing`` may decline (``"none"``) and leave the file unassigned;
+    ``existing-or-new`` creates the proposed docset when nothing fits. The HTTP
+    layer coerces the request's string to a :class:`ClassifyMode`."""
     config = load_classification_config(ws)
-    decision = classify_file(ws, file_id, config=config, mode=ClassifyMode(mode))
+    decision = classify_file(ws, file_id, config=config, mode=mode)
     out: dict[str, Any] = {
-        "decision": decision.decision,
+        "decision": str(decision.decision),
         "reason": decision.reason,
         "docset_id": None,
         "created_docset": False,
         "extraction": None,
     }
     store = DocSetStore(ws)
-    if decision.decision == "none":
+    if decision.decision == DecisionKind.NONE:
         return out
-    if decision.decision == "new":
+    if decision.decision == DecisionKind.NEW:
         ds = store.create(
             decision.new_name or "Untitled",
             decision.new_description or "",

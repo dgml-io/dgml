@@ -25,6 +25,7 @@ from dgml_core.classification import (
     ClassificationConfig,
     ClassificationDecision,
     ClassifyMode,
+    DecisionKind,
     classify_file,
     load_classification_config,
     propose_new_docset_for_files,
@@ -322,7 +323,9 @@ def test_classify_file_existing_decision(workspace: Workspace) -> None:
     with patch("litellm.completion", return_value=response) as mock_completion:
         decision = classify_file(workspace, new_id, config=cfg)
 
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=existing_id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=existing_id
+    )
     # api_key_env was unset → no api_key kwarg passed; litellm uses its own
     # per-provider env var lookup.
     call_kwargs = mock_completion.call_args.kwargs
@@ -340,7 +343,7 @@ def test_classify_file_new_decision(workspace: Workspace) -> None:
         decision = classify_file(workspace, new_id, config=cfg)
 
     assert decision == ClassificationDecision(
-        decision="new",
+        decision=DecisionKind.NEW,
         new_name="Purchase Orders",
         new_description="vendor POs",
         new_key_questions=tuple(_DEFAULT_NEW_QUESTIONS),
@@ -648,7 +651,9 @@ def test_classify_file_existing_only_assigns(workspace: Workspace) -> None:
     with patch("litellm.completion", return_value=response):
         decision = classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING)
 
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=existing_id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=existing_id
+    )
 
 
 def test_classify_file_existing_only_declines_off_type_file(workspace: Workspace) -> None:
@@ -661,7 +666,9 @@ def test_classify_file_existing_only_declines_off_type_file(workspace: Workspace
     with patch("litellm.completion", return_value=response):
         decision = classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING)
 
-    assert decision == ClassificationDecision(decision="none", reason="A lease, not an invoice.")
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.NONE, reason="A lease, not an invoice."
+    )
 
 
 @pytest.mark.parametrize("raw_args", ["", "  ", "{}", '{"reason": "  "}', '{"reason": 3}'])
@@ -731,7 +738,7 @@ def test_classify_file_existing_only_single_docset_calls_llm(workspace: Workspac
         decision = classify_file(workspace, "newfid", config=cfg, mode=ClassifyMode.EXISTING)
 
     mock_completion.assert_called_once()
-    assert decision == ClassificationDecision(decision="none", reason="Not an invoice.")
+    assert decision == ClassificationDecision(decision=DecisionKind.NONE, reason="Not an invoice.")
 
 
 def test_classify_file_single_docset_still_calls_llm_in_default_mode(
@@ -908,7 +915,9 @@ def test_classify_file_forced_offers_assign_alone(workspace: Workspace) -> None:
         decision = classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING_FORCED)
 
     assert _tool_names(mock_completion) == ["assign_to_existing_docset"]
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=existing_id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=existing_id
+    )
     prompt_text = _prompt_text(mock_completion)
     assert "closest" in prompt_text
     assert "no_matching_docset" not in prompt_text
@@ -933,7 +942,9 @@ def test_classify_file_forced_single_docset_skips_llm(workspace: Workspace) -> N
         )
 
     mock_completion.assert_not_called()
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=only.id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=only.id
+    )
 
 
 def test_classify_file_forced_raises_without_docsets(workspace: Workspace) -> None:
@@ -984,7 +995,7 @@ def test_propose_new_docset_returns_name_and_description(workspace: Workspace) -
         decision = propose_new_docset_for_files(workspace, ["fid1"], config=cfg)
 
     assert decision == ClassificationDecision(
-        decision="new",
+        decision=DecisionKind.NEW,
         new_name="Purchase Orders",
         new_description="vendor POs",
         new_key_questions=tuple(_DEFAULT_NEW_QUESTIONS),

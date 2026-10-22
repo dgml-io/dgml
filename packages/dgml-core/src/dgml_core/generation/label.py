@@ -1010,13 +1010,16 @@ def plan_concept_roster(
         listing,
         debug=debug,
     )
+    stage = (
+        single_calls.SingleCallStage.PLAN_GAPS if gap_mode else single_calls.SingleCallStage.PLAN
+    )
     try:
         if refine:
             # Two-turn grounded build: draft the roster, then have the model
             # ADD recurring roles it missed, grounded on the same skeletons.
             # Add-only — no synonym merging — so it can only raise recall.
             draft_raw, raw = single_calls.call_with_refinement(
-                single_calls.STAGE_PLAN_GAPS if gap_mode else single_calls.STAGE_PLAN,
+                stage,
                 config,
                 system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
@@ -1029,7 +1032,7 @@ def plan_concept_roster(
         else:
             # Single-call roster: the draft only, without the add-only completion turn.
             raw = single_calls.call(
-                single_calls.STAGE_PLAN_GAPS if gap_mode else single_calls.STAGE_PLAN,
+                stage,
                 config,
                 system_prompt=system_prompt,
                 user_content=[{"type": "text", "text": listing}],
@@ -1182,7 +1185,7 @@ def describe_concepts(
         lines.append(f"- {name}" + (f' — "{ex}"' if ex else ""))
     try:
         raw = single_calls.call(
-            single_calls.STAGE_DESCRIBE,
+            single_calls.SingleCallStage.DESCRIBE,
             config,
             system_prompt=prompt("describe_concepts"),
             user_content=[{"type": "text", "text": "\n".join(lines)}],

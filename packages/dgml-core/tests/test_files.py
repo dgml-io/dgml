@@ -21,16 +21,17 @@ from typing import Any, ClassVar
 
 import pytest
 from dgml_core import layout
-from dgml_core.conversion import ConverterConfig, DocConverter
+from dgml_core.conversion import ConverterConfig, DocConverter, FormatFamily
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     ConflictError,
+    ConversionConfigInvalid,
     FileNotFound,
     InvalidArgument,
     InvalidPDF,
     UnsupportedFileType,
 )
-from dgml_core.files import ConflictPolicy, FileStore
+from dgml_core.files import ConflictKind, ConflictPolicy, FileStore
 from dgml_core.ocr import _image_dimensions
 from dgml_core.storage import Workspace
 
@@ -44,10 +45,11 @@ def store(workspace: Workspace) -> FileStore:
 
 class _StubDocxConverter(DocConverter):
     """Returns deterministic bytes so persistence can be asserted without a
-    real converter binary."""
+    real converter binary. Declares the suffixes the tests feed it, so every add
+    goes through the ``input_formats`` check with a restricted set."""
 
     name: ClassVar[str] = "stub-docx"
-    input_formats: ClassVar[frozenset[str]] = frozenset({".docx"})
+    input_formats: ClassVar[frozenset[str]] = frozenset({".docx", ".pptx"})
     config_fields: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod
@@ -68,34 +70,42 @@ sys.modules["files_stub_conv"] = _stub_mod
 _STUB_DOCX = "files_stub_conv:_StubDocxConverter"
 
 
+@pytest.mark.parametrize(
+    ("family", "filename"),
+    [(FormatFamily.DOCX, "foo.docx"), (FormatFamily.PPTX, "foo.pptx")],
+)
 def test_convertible_source_persists_converted_pdf(
-    store: FileStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: FileStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: FormatFamily,
+    filename: str,
 ) -> None:
     """A convertible source is stored as-is and its converted PDF is persisted
     alongside it at ``<stem>.pdf`` (the artifact generation later reuses)."""
     from .conftest import write_config
 
-    write_config(store.ws, {"conversion": {"docx": {"provider": _STUB_DOCX}}})
+    write_config(store.ws, {"conversion": {family: {"provider": _STUB_DOCX}}})
     # The PDF-only post-steps need ghostscript / pdfminer; stub them out so the
     # test isolates the conversion-persistence behavior.
     monkeypatch.setattr(FileStore, "_safe_page_count", lambda self, *a, **k: (None, None))
     monkeypatch.setattr(FileStore, "_render_pages", lambda self, *a, **k: None)
     monkeypatch.setattr(FileStore, "_extract_text", lambda self, *a, **k: (None, None))
 
-    src = tmp_path / "foo.docx"
-    src.write_bytes(b"original docx bytes")
+    src = tmp_path / filename
+    src.write_bytes(b"original source bytes")
     result = store.add(src)
 
     assert result.conversion_error is None
-    assert result.record.original_filename == "foo.docx"
+    assert result.record.original_filename == filename
     # original preserved + converted PDF persisted, both as blobs under the file
     assert (
-        store.ws.blobs.get_blob(layout.file_source_key(result.record.id, "foo.docx"))
-        == b"original docx bytes"
+        store.ws.blobs.get_blob(layout.file_source_key(result.record.id, filename))
+        == b"original source bytes"
     )
     assert (
         store.ws.blobs.get_blob(layout.file_source_key(result.record.id, "foo.pdf"))
-        == b"%PDF-stub:foo.docx"
+        == b"%PDF-stub:" + filename.encode()
     )
     assert result.record.pdf_converter == "stub-docx"  # converter named on the record
 
@@ -188,6 +198,32 @@ def test_reject_non_pdf(store: FileStore, tmp_path: Path) -> None:
         store.add(bad)
 
 
+def test_reject_family_pointed_at_a_converter_that_cannot_handle_it(
+    store: FileStore, tmp_path: Path
+) -> None:
+    """A converter whose ``input_formats`` excludes the family's suffix is a config
+    error, refused before any write — not a per-file ``conversion_error``."""
+    from .conftest import write_config
+
+    # The stub handles .docx/.pptx; configured here for spreadsheets.
+    write_config(store.ws, {"conversion": {FormatFamily.XLSX: {"provider": _STUB_DOCX}}})
+    book = tmp_path / "book.xlsx"
+    book.write_bytes(b"PK\x03\x04 not really a workbook")
+    with pytest.raises(ConversionConfigInvalid, match=r"does not handle '\.xlsx'"):
+        store.add(book)
+    assert store.list_all() == []
+    assert store.ws.blobs.list_blobs(f"{layout.FILES_DIR}/") == []
+
+
+def test_reject_convertible_source_without_converter(store: FileStore, tmp_path: Path) -> None:
+    """A known convertible format with no converter configured is rejected as
+    unconfigured, not as an unknown file type."""
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"PK\x03\x04 not really a pptx")
+    with pytest.raises(UnsupportedFileType, match=r"conversion\.pptx\.provider"):
+        store.add(deck)
+
+
 def test_reject_invalid_magic(store: FileStore, tmp_path: Path) -> None:
     bad = tmp_path / "fake.pdf"
     bad.write_bytes(b"NOT A PDF")
@@ -214,7 +250,7 @@ def test_conflict_hash_skip_returns_existing(store: FileStore, sample_pdf: Path)
     second = store.add(sample_pdf, on_conflict=ConflictPolicy.SKIP)
     assert second.record.id == first.record.id
     assert not second.created
-    assert second.conflict_kind == "hash"
+    assert second.conflict_kind is ConflictKind.HASH
 
 
 @needs_gs
@@ -504,6 +540,7 @@ def test_free_id_honoured_when_replace_swaps_path(
     shutil.copy2(sample_pdf_alt, sample_pdf)
     second = store.add(sample_pdf, file_id="rev-2", on_conflict=ConflictPolicy.REPLACE)
     assert second.created
+    assert second.conflict_kind is ConflictKind.PATH
     assert second.record.id == "rev-2"
     assert {r.id for r in store.list_all()} == {"rev-2"}
 

@@ -144,7 +144,7 @@ def split_view_spec(view: TextView) -> tuple[str, ...]:
 
     A single name returns a 1-tuple, so callers need no special case. Raises
     :class:`ValueError` on an unknown name, an empty component, or a repeated
-    one — ``TextView`` is a bare ``str`` alias with no ``Literal`` to validate
+    one — ``TextView`` is a bare ``str`` alias with no enum to validate
     against, and a multi-view spec arrives from user config, so it is checked
     here (once, at assembly) rather than failing deeper in an encoder.
     """
@@ -343,34 +343,39 @@ def cluster_workspace(workspace: Path) -> dict[str, str]:
         Config,
         CorpusConfig,
         EncoderConfig,
+        EncoderName,
         FusionConfig,
+        FusionName,
         LoggerConfig,
+        LoggerName,
         ManifoldConfig,
+        ManifoldName,
         ScenarioConfig,
+        ScenarioName,
         TrainingConfig,
     )
 
     if known_categories:
-        scenario_cfg = ScenarioConfig(name="s2", known_categories=known_categories)
+        scenario_cfg = ScenarioConfig(name=ScenarioName.S2, known_categories=known_categories)
     else:
-        scenario_cfg = ScenarioConfig(name="s1")
+        scenario_cfg = ScenarioConfig(name=ScenarioName.S1)
 
     config = Config(
         scenario=scenario_cfg,
         encoder_text=EncoderConfig(
-            name="st_minilm",
+            name=EncoderName.ST_MINILM,
             model_id="sentence-transformers/all-MiniLM-L6-v2",
             embedding_dim=384,
         ),
         encoder_image=EncoderConfig(
-            name="vit",
+            name=EncoderName.VIT,
             model_id="google/vit-base-patch16-224",
             embedding_dim=768,
         ),
-        fusion=FusionConfig(name="late_concat", output_dim=256),
-        manifold=ManifoldConfig(name="euclidean", dim=256),
+        fusion=FusionConfig(name=FusionName.LATE_CONCAT, output_dim=256),
+        manifold=ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=256),
         training=TrainingConfig(epochs=0, batch_size=8),
-        logger=LoggerConfig(name="none"),
+        logger=LoggerConfig(name=LoggerName.NONE),
         # corpus.root is required by the schema but unused here — we pass
         # the dataset to the scenario directly.
         corpus=CorpusConfig(root=workspace / "files"),

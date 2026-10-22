@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from enum import StrEnum
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -230,16 +231,20 @@ def load_generation_batch(workspace: Workspace) -> bool:
     return parsed
 
 
-#: ``batch.stages.label.mode`` in a batch run's payload: how Pass B labeled.
-#: ``all-at-once`` — every document as one batch stage (a closed vocabulary:
-#: the roster cannot change between documents); ``per-document`` — one batch
-#: stage per document, in the synchronous order (any other vocabulary: each
-#: document's labels extend the roster the next one is shown, so the output
-#: is byte-identical to a synchronous run); ``sync`` — ordinary synchronous
-#: calls (``[generation] batch_label = false`` / ``--no-batch-label``).
-LABEL_MODE_ALL_AT_ONCE = "all-at-once"
-LABEL_MODE_PER_DOCUMENT = "per-document"
-LABEL_MODE_SYNC = "sync"
+class LabelMode(StrEnum):
+    """``batch.stages.label.mode`` in a batch run's payload: how Pass B labeled.
+
+    ``ALL_AT_ONCE`` — every document as one batch stage (a closed vocabulary:
+    the roster cannot change between documents); ``PER_DOCUMENT`` — one batch
+    stage per document, in the synchronous order (any other vocabulary: each
+    document's labels extend the roster the next one is shown, so the output
+    is byte-identical to a synchronous run); ``SYNC`` — ordinary synchronous
+    calls (``[generation] batch_label = false`` / ``--no-batch-label``).
+    """
+
+    ALL_AT_ONCE = "all-at-once"
+    PER_DOCUMENT = "per-document"
+    SYNC = "sync"
 
 
 def load_generation_batch_label(workspace: Workspace) -> bool:

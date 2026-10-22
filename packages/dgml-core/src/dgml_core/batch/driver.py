@@ -69,7 +69,7 @@ from typing import Any
 from dgml_core import llm
 from dgml_core.batch.executor import TIER_MARKER, BatchExecutor
 from dgml_core.llm import SINK_TIER_KEY
-from dgml_core.usage import TIER_BATCH, add_partial, extract_cost_and_tokens, with_tier
+from dgml_core.usage import PricingTier, add_partial, extract_cost_and_tokens, with_tier
 
 #: Every request id the driver emits matches this — the strictest provider
 #: rule (Anthropic: ``^[a-zA-Z0-9_-]{1,64}$``), applied to every backend.
@@ -275,7 +275,7 @@ def _finish(state: _Live, exc: BaseException | None, *, own: bool = False) -> No
 
 def _served_by_batch(response: Any) -> bool:
     hidden = getattr(response, "_hidden_params", None)
-    return isinstance(hidden, dict) and hidden.get(TIER_MARKER) == TIER_BATCH
+    return isinstance(hidden, dict) and hidden.get(TIER_MARKER) == PricingTier.BATCH
 
 
 def run_stage(
@@ -340,14 +340,14 @@ def _run_stage(
     # The tier goes on the configs the generators hold (not a copy), for the
     # stage's lifetime; restored in the finally. An enclosing usage scope is
     # marked batch through its sink (record_usage_for reads it on exit).
-    saved_tiers: dict[int, tuple[llm.LLMConfig, str]] = {}
+    saved_tiers: dict[int, tuple[llm.LLMConfig, PricingTier]] = {}
     for unit in units:
         cfg = unit.config
         if id(cfg) not in saved_tiers:
             saved_tiers[id(cfg)] = (cfg, cfg.tier)
-            cfg.tier = TIER_BATCH
+            cfg.tier = PricingTier.BATCH
             if cfg._usage_sink is not None:
-                cfg._usage_sink[SINK_TIER_KEY] = TIER_BATCH
+                cfg._usage_sink[SINK_TIER_KEY] = PricingTier.BATCH
 
     def resume(state: _Live, strand: _Strand, response: Any | None, *, fresh: bool = False) -> None:
         """Move one strand on: to its next request (queued on ``state.ready``),

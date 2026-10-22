@@ -116,7 +116,7 @@ nothing. A run after the deadline cancels and collects the job's open
 batches and finishes synchronously; the synchronous responses are recorded
 like any other, so a later replay serves them. A canceled batch that has not
 settled within the backend's ``cancel_settle_s`` is kept as a ``settling``
-record (:data:`RECORD_SETTLING`): its requests run synchronously now, and once
+record (:attr:`RecordState.SETTLING`): its requests run synchronously now, and once
 it ends a later run, ``dgml batch cancel``, ``delete`` or ``prune`` records
 what it billed (``late_billed``) without ever using its results, then cleans
 it up; ``dgml batch status`` reports the same read-only.
@@ -134,6 +134,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 from dgml_core import layout, llm
@@ -157,7 +158,9 @@ from dgml_core.batch.types import (
     BatchNotFound,
     BatchRequest,
     BatchSubmitUncertain,
+    ItemErrorKind,
 )
+from dgml_core.enums import parse_enum
 from dgml_core.errors import (
     BatchExecutionFailed,
     BatchJobBusy,
@@ -172,10 +175,11 @@ from dgml_core.errors import (
 from dgml_core.storage import Workspace
 from dgml_core.usage import (
     BILLED_MARKER,
-    OPERATION_BATCH_UNUSED,
-    OUTCOME_OK,
-    TIER_BATCH,
+    PricingTier,
     UsageEvent,
+    UsageOperation,
+    UsageOutcome,
+    as_pricing_tier,
     buffered_usage,
     extract_cost_and_tokens,
     flush_usage,
@@ -183,33 +187,79 @@ from dgml_core.usage import (
 
 logger = logging.getLogger(__name__)
 
-#: Job statuses. ``ready`` means ``dgml batch status`` found every open
-#: provider batch ended, so a resume will make progress without waiting.
-STATUS_PENDING = "pending"
-STATUS_READY = "ready"
-STATUS_COMPLETED = "completed"
-STATUS_FAILED = "failed"
 
-#: Provider-batch record states in the manifest.
-RECORD_OPEN = "open"
-RECORD_COLLECTED = "collected"
-RECORD_DROPPED = "dropped"  # canceled by `dgml batch cancel`; never collected
-#: A batch create whose outcome is unknown (a timeout or server error after
-#: the request was sent): the batch may exist and be billing. Never polled or
-#: settled — there is no provider id to poll — only reported (``error``). A
-#: job with one refuses to run again until ``dgml batch cancel`` acknowledges
-#: it (the record becomes ``dropped``), so its requests are never resubmitted
-#: while the batch may still exist.
-RECORD_UNCERTAIN = "uncertain"
+class JobStatus(StrEnum):
+    """A batch job's status (the manifest's ``status``).
 
-#: A dropped record's provider-side cleanup (``record["cleanup"]``). A canceled
-#: batch cannot be deleted at the provider until the cancel settles (an
-#: Anthropic batch sits ``canceling`` for a while), so dropping one marks its
-#: cleanup ``pending``; every later ``dgml batch cancel``, ``prune`` and run of
-#: the job retries it, and it becomes ``done`` once the batch is deleted (or
-#: found gone). ``dgml batch status`` only reports it: it deletes nothing.
-CLEANUP_PENDING = "pending"
-CLEANUP_DONE = "done"
+    A job is ``PENDING`` until a run of it ends ``COMPLETED`` or ``FAILED``.
+    ``READY`` is never stored: ``dgml batch status`` reports it for a pending
+    job when every open provider batch has ended, so a resume will make
+    progress without waiting.
+
+    A manifest is read back tolerantly: a status this version doesn't know (a
+    newer dgml wrote it) is kept as its plain string, so it round-trips and
+    reads as none of the known states, rather than failing the load.
+    """
+
+    PENDING = "pending"
+    READY = "ready"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class RecordState(StrEnum):
+    """A provider-batch record's state in the manifest (``record["state"]``).
+
+    ``OPEN`` is a submitted batch not yet collected, ``COLLECTED`` one whose
+    responses are all stored, and ``DROPPED`` one canceled by ``dgml batch
+    cancel`` (or gone at the provider) and never collected. ``UNCERTAIN`` is a
+    batch create whose outcome is unknown (a timeout or server error after the
+    request was sent): the batch may exist and be billing. It is never polled or
+    settled — there is no provider id to poll — only reported (``error``). A job
+    with one refuses to run again until ``dgml batch cancel`` acknowledges it
+    (the record becomes ``DROPPED``), so its requests are never resubmitted
+    while the batch may still exist.
+
+    Records stay plain JSON dicts, so they hold the bare value; readers compare
+    against members, and a state this version doesn't know matches none.
+    """
+
+    OPEN = "open"
+    COLLECTED = "collected"
+    DROPPED = "dropped"
+    UNCERTAIN = "uncertain"
+    #: Canceled at the ``--batch-deadline``, its cancel not settled when the
+    #: run stopped waiting (see :func:`mark_settling`).
+    SETTLING = "settling"
+
+
+class CleanupState(StrEnum):
+    """A dropped record's provider-side cleanup (``record["cleanup"]``).
+
+    A canceled batch cannot be deleted at the provider until the cancel settles
+    (an Anthropic batch sits ``canceling`` for a while), so dropping one marks
+    its cleanup ``PENDING``; every later ``dgml batch cancel``, ``prune`` and
+    run of the job retries it, and it becomes ``DONE`` once the batch is
+    deleted (or found gone). ``dgml batch status`` only reports it: it deletes
+    nothing.
+    """
+
+    PENDING = "pending"
+    DONE = "done"
+
+
+def _job_status(raw: object) -> JobStatus | object:
+    """A stored ``status`` as a :class:`JobStatus`, or the raw value as loaded
+    when it names none this version knows — an unknown string, or a non-string
+    (``null``, a number) — so it round-trips unchanged (see :class:`JobStatus`)."""
+    status = parse_enum(JobStatus, raw)
+    return raw if status is None else status
+
+
+def _status_json(status: object) -> object:
+    """A manifest status as written: a member's bare value, else the raw value."""
+    return status.value if isinstance(status, JobStatus) else status
+
 
 #: A batch canceled at the batch deadline whose cancel had not settled when
 #: the wait (the backend's ``cancel_settle_s``) ended. Its requests ran
@@ -222,17 +272,14 @@ CLEANUP_DONE = "done"
 #: provider and marks it ``dropped``. A job run, ``dgml batch cancel``,
 #: ``delete`` and ``prune`` reconcile; ``dgml batch status`` reports the
 #: outcome read-only. ``dgml batch prune`` keeps a job with one.
-RECORD_SETTLING = "settling"
-#: What :func:`reconcile_settling` returns once it recorded the late cost.
-SETTLED = "settled"
 
 
 def mark_dropped(record: dict[str, Any], reason: str) -> None:
     """Mark a canceled provider batch's record ``dropped``, its provider-side
-    cleanup owed (:data:`CLEANUP_PENDING`)."""
-    record["state"] = RECORD_DROPPED
+    cleanup owed (:attr:`CleanupState.PENDING`)."""
+    record["state"] = RecordState.DROPPED.value
     record["dropped_reason"] = reason
-    record["cleanup"] = CLEANUP_PENDING
+    record["cleanup"] = CleanupState.PENDING.value
 
 
 def owed_cleanups(manifest: Manifest) -> list[dict[str, Any]]:
@@ -240,39 +287,40 @@ def owed_cleanups(manifest: Manifest) -> list[dict[str, Any]]:
     return [
         r
         for r in manifest.provider_batches
-        if r.get("state") == RECORD_DROPPED and r.get("cleanup") == CLEANUP_PENDING
+        if r.get("state") == RecordState.DROPPED and r.get("cleanup") == CleanupState.PENDING
     ]
 
 
 def retry_cleanup(
     workspace: Workspace, record: dict[str, Any], *, backend: BatchBackend | None = None
-) -> str:
+) -> tuple[CleanupState, str | None]:
     """Try a dropped batch's owed cleanup once: poll it and, once its cancel
-    has settled (ended/canceled), delete it at the provider. Returns
-    :data:`CLEANUP_DONE` (recorded in *record*), :data:`CLEANUP_PENDING`
-    (still canceling: retried later), or a one-line error (also retried
+    has settled (ended/canceled), delete it at the provider. Returns the
+    record's cleanup state after the attempt and, when the attempt failed, a
+    one-line error: ``(DONE, None)`` (recorded in *record*), ``(PENDING, None)``
+    (still canceling: retried later), or ``(PENDING, error)`` (also retried
     later). Never raises."""
     job = BatchJob.from_json(record["job"])
     try:
         backend = backend or record_backend(workspace, record)
         if not backend.poll(job).done:
-            return CLEANUP_PENDING
+            return CleanupState.PENDING, None
         cleanup = getattr(backend, "cleanup", None)
         if cleanup is not None:
             cleanup(job)
     except BatchNotFound:
         pass  # already gone at the provider: nothing left to clean
     except Exception as exc:
-        return f"cleanup failed: {short_error_message(exc)}"
-    record["cleanup"] = CLEANUP_DONE
-    return CLEANUP_DONE
+        return CleanupState.PENDING, f"cleanup failed: {short_error_message(exc)}"
+    record["cleanup"] = CleanupState.DONE.value
+    return CleanupState.DONE, None
 
 
 def mark_settling(record: dict[str, Any], waited_s: float, requests: int) -> None:
     """Mark a batch canceled at the deadline whose cancel had not settled
-    after *waited_s* :data:`RECORD_SETTLING`; *requests* of it ran
+    after *waited_s* :attr:`RecordState.SETTLING`; *requests* of it ran
     synchronously and may be billed twice."""
-    record["state"] = RECORD_SETTLING
+    record["state"] = RecordState.SETTLING
     record["settling_reason"] = (
         f"batch deadline passed; canceled, cancel not settled after {waited_s:.0f}s"
     )
@@ -281,7 +329,7 @@ def mark_settling(record: dict[str, Any], waited_s: float, requests: int) -> Non
 
 def settling_records(manifest: Manifest) -> list[dict[str, Any]]:
     """The records still waiting for a canceled batch to settle."""
-    return [r for r in manifest.provider_batches if r.get("state") == RECORD_SETTLING]
+    return [r for r in manifest.provider_batches if r.get("state") == RecordState.SETTLING]
 
 
 #: Why a record whose batch the provider no longer knows was closed out.
@@ -323,23 +371,25 @@ def key_mismatch(record: Mapping[str, Any], backend: Any) -> str | None:
     )
 
 
-def resolve_gone(store: BatchJobStore, record: dict[str, Any]) -> str:
+def resolve_gone(store: BatchJobStore, record: dict[str, Any]) -> RecordState:
     """Close out an open *record* whose provider batch is gone
     (:class:`~dgml_core.batch.types.BatchNotFound`: deleted, or never
     existed), which is treated as ended. When every request of it has a stored
     response, it was collected before the batch went away: the record becomes
-    :data:`RECORD_COLLECTED`. Otherwise it is :data:`RECORD_DROPPED` with
+    :attr:`RecordState.COLLECTED`. Otherwise it is :attr:`RecordState.DROPPED` with
     :data:`GONE_REASON` and no cleanup owed: its requests without a stored
     response are made again, as new requests, by the next run that asks for
     them. Returns the record's new state; the caller persists it."""
     keys = record.get("keys") or {}
     if keys and all(store.has_response(str(k)) for k in keys.values()):
-        record["state"] = RECORD_COLLECTED
+        state = RecordState.COLLECTED
+        record["state"] = str(state)
     else:
+        state = RecordState.DROPPED
         mark_dropped(record, GONE_REASON)
-        record["cleanup"] = CLEANUP_DONE
+        record["cleanup"] = CleanupState.DONE.value
     record["gone"] = True
-    return str(record["state"])
+    return state
 
 
 def _late_billed(
@@ -375,41 +425,42 @@ def reconcile_settling(
     *,
     backend: BatchBackend | None = None,
     preview: bool = False,
-) -> str:
-    """Try once to close out a :data:`RECORD_SETTLING` record: poll its batch
+) -> tuple[RecordState, str | None]:
+    """Try once to close out a :attr:`RecordState.SETTLING` record: poll its batch
     and, once the cancel has settled, record what it billed in
     ``record["late_billed"]`` and mark it ``dropped`` — then, unless *preview*,
     delete it at the provider (``record["cleanup"]`` says how that went; a
     failed delete stays owed like any dropped batch's). Its results are never
     stored: the requests were already served synchronously.
 
-    Returns :data:`SETTLED`, :data:`RECORD_SETTLING` (still canceling:
-    retried later), or a one-line error (also retried later). Never raises.
-    ``dgml batch status`` passes ``preview=True``: it only polls (one cheap
-    status call; it never downloads results), returns :data:`SETTLED` once
-    the batch has ended, and changes nothing, so a later writer records the
-    late cost."""
+    Returns the record's state after the attempt and, when the attempt
+    failed, a one-line error: ``(DROPPED, None)`` once settled (recorded in
+    *record*), ``(SETTLING, None)`` (still canceling: retried later), or
+    ``(SETTLING, error)`` (also retried later). Never raises. ``dgml batch
+    status`` passes ``preview=True``: it only polls (one cheap status call; it
+    never downloads results), returns ``(DROPPED, None)`` once the batch has
+    ended, and changes nothing, so a later writer records the late cost."""
     job = BatchJob.from_json(record["job"])
     try:
         backend = backend or record_backend(workspace, record)
         if not backend.poll(job).done:
-            return RECORD_SETTLING
+            return RecordState.SETTLING, None
         if preview:
-            return SETTLED
+            return RecordState.DROPPED, None
         late = _late_billed(backend, job, record.get("collected") or ())
     except BatchNotFound:
         if mismatch := key_mismatch(record, backend):
             # Not shown gone: under another key the batch may still be
             # running, and billing. It stays settling, retried later.
-            return mismatch
+            return RecordState.SETTLING, mismatch
         # The provider no longer knows the batch: it has ended, and what it
         # billed late can no longer be read. Nothing is left to clean up.
         record["settled_at"] = now_iso()
         mark_dropped(record, f"batch deadline passed; canceled, then {GONE_REASON}")
-        record["cleanup"] = CLEANUP_DONE
-        return SETTLED
+        record["cleanup"] = CleanupState.DONE
+        return RecordState.DROPPED, None
     except Exception as exc:
-        return f"late collection failed: {short_error_message(exc)}"
+        return RecordState.SETTLING, f"late collection failed: {short_error_message(exc)}"
     record["late_billed"] = late
     record["settled_at"] = now_iso()
     mark_dropped(record, "batch deadline passed; canceled, settled after its requests ran")
@@ -424,7 +475,7 @@ def reconcile_settling(
             short_error_message(exc),
         )
     else:
-        record["cleanup"] = CLEANUP_DONE
+        record["cleanup"] = CleanupState.DONE
     if late["requests"]:
         logger.warning(
             "batch deadline: canceled %s batch %s settled late and billed %d result(s) "
@@ -434,7 +485,7 @@ def reconcile_settling(
             late["requests"],
             "unpriced" if late["cost_usd"] is None else f"${late['cost_usd']:.6f}",
         )
-    return SETTLED
+    return RecordState.DROPPED, None
 
 
 def late_billed_summary(manifest: Manifest) -> dict[str, Any] | None:
@@ -625,7 +676,9 @@ class Manifest:
     argv: list[str]
     created_at: str
     updated_at: str
-    status: str = STATUS_PENDING
+    #: A :class:`JobStatus`, or — for a stored value this version doesn't know
+    #: (a newer dgml's status, or a non-string) — the raw value as loaded.
+    status: JobStatus | object = JobStatus.PENDING
     error: str | None = None
     runs: int = 0
     cwd: str | None = None
@@ -651,7 +704,7 @@ class Manifest:
             "cwd": self.cwd,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "status": self.status,
+            "status": _status_json(self.status),
             "error": self.error,
             "runs": self.runs,
             "provider_batches": self.provider_batches,
@@ -674,7 +727,7 @@ class Manifest:
             cwd=doc.get("cwd"),
             created_at=str(doc["created_at"]),
             updated_at=str(doc.get("updated_at", doc["created_at"])),
-            status=str(doc.get("status", STATUS_PENDING)),
+            status=_job_status(doc.get("status", JobStatus.PENDING)),
             error=doc.get("error"),
             runs=int(doc.get("runs", 0)),
             provider_batches=list(doc.get("provider_batches", [])),
@@ -696,7 +749,7 @@ class Manifest:
             return None
 
     def open_records(self) -> list[dict[str, Any]]:
-        return [r for r in self.provider_batches if r.get("state") == RECORD_OPEN]
+        return [r for r in self.provider_batches if r.get("state") == RecordState.OPEN]
 
     def requests_in_flight(self) -> int:
         return sum(len(r.get("keys", {})) for r in self.open_records())
@@ -705,7 +758,7 @@ class Manifest:
         """Batch creates whose outcome is unknown and nobody has acknowledged
         yet (``dgml batch cancel`` does): the job must not run again while
         any exist, or it would submit their requests a second time."""
-        return [r for r in self.provider_batches if r.get("state") == RECORD_UNCERTAIN]
+        return [r for r in self.provider_batches if r.get("state") == RecordState.UNCERTAIN]
 
 
 def uncertain_refusal(job_id: str, records: list[dict[str, Any]]) -> BatchJobInvalid:
@@ -931,7 +984,7 @@ class BatchJobStore:
         # credential, api_base and the batch's custom ids.
         manifest.provider_batches = [
             r
-            if r.get("state") == RECORD_SETTLING
+            if r.get("state") == RecordState.SETTLING
             else {
                 "job": {k: v for k, v in r["job"].items() if k != "custom_ids"},
                 "model": r.get("model"),
@@ -1023,7 +1076,7 @@ class JobSession:
         #: provider call (:meth:`refuse_if_halted`).
         self.nondeterministic: BatchJobNondeterministic | None = None
         #: One message per batch create this run could not confirm (see
-        #: :data:`RECORD_UNCERTAIN`): the run ends ``failed`` with them.
+        #: :attr:`RecordState.UNCERTAIN`): the run ends ``failed`` with them.
         self.uncertain: list[str] = []
         #: One message per wave that failed as a whole this run (see
         #: :meth:`note_stage_failure`): the run ends ``failed`` with them.
@@ -1173,7 +1226,7 @@ class JobSession:
             "stage": stage,
             "stats_key": stats_key,
             "keys": dict(keys),
-            "state": RECORD_OPEN,
+            "state": RecordState.OPEN.value,
             "last_status": None,
         }
         with self._lock:
@@ -1229,7 +1282,7 @@ class JobSession:
             "stage": stage,
             "stats_key": stats_key,
             "keys": dict(keys),
-            "state": RECORD_UNCERTAIN,
+            "state": RecordState.UNCERTAIN.value,
             "last_status": None,
             "error": message,
         }
@@ -1398,15 +1451,15 @@ class JobSession:
                         key = record["keys"].get(provider_cid)
                         if key and not isinstance(outcome, BatchItemError):
                             if _has_choices(outcome):
-                                _mark_tier(outcome, TIER_BATCH)
+                                _mark_tier(outcome, PricingTier.BATCH)
                                 # Billed, and a resume only replays it (never
                                 # counted): count it here, as `batch cancel`
                                 # does (:func:`_collect_if_ended`).
                                 stats = self._stats_for(record)
                                 stats.batch_ok += 1
-                                stats.add_cost(outcome, TIER_BATCH)
+                                stats.add_cost(outcome, PricingTier.BATCH)
                                 stored_all &= self.save(key, outcome, used=False)
-                    record["state"] = RECORD_COLLECTED
+                    record["state"] = RecordState.COLLECTED.value
                     if stored_all:
                         # Durable first: the batch is deleted only once the
                         # manifest says it was collected.
@@ -1417,7 +1470,7 @@ class JobSession:
             except BatchNotFound:
                 if mismatch := key_mismatch(record, backend):
                     problems.append(mismatch)  # kept open: it may still be billing
-                elif self._gone(record) == RECORD_DROPPED:
+                elif self._gone(record) == RecordState.DROPPED:
                     problems.append(f"{batch_id}: {GONE_REASON}; its requests run again")
                 continue
             except Exception as exc:
@@ -1427,7 +1480,7 @@ class JobSession:
             except BatchNotFound:
                 if mismatch := key_mismatch(record, backend):
                     problems.append(mismatch)  # kept open: it may still be billing
-                elif self._gone(record) == RECORD_DROPPED:
+                elif self._gone(record) == RecordState.DROPPED:
                     problems.append(f"{batch_id}: {GONE_REASON}; its requests run again")
                 continue
             except Exception as exc:
@@ -1449,7 +1502,7 @@ class JobSession:
             self._billed |= keys
         return rows
 
-    def _gone(self, record: dict[str, Any]) -> str:
+    def _gone(self, record: dict[str, Any]) -> RecordState:
         """:func:`resolve_gone` for one of this run's records, logged."""
         with self._lock:
             state = resolve_gone(self.store, record)
@@ -1471,15 +1524,15 @@ class JobSession:
                 ),
                 None,
             )
-            outcome = reconcile_settling(self.store.workspace, record, backend=backend)
-            if outcome == SETTLED:
+            state, error = reconcile_settling(self.store.workspace, record, backend=backend)
+            if state == RecordState.DROPPED:
                 late = record.get("late_billed") or {}
                 self.log(
                     f"[batch-job] {batch_id}: canceled batch settled; "
                     f"{late.get('requests', 0)} late result(s) billed, not used"
                 )
-            elif outcome != RECORD_SETTLING:
-                self.log(f"[batch-job] {batch_id}: {outcome} (retried later)")
+            elif error is not None:
+                self.log(f"[batch-job] {batch_id}: {error} (retried later)")
 
     def close(self, exc: BaseException | None, *, ok: bool = True) -> None:
         """End the run. Pending → rows dropped, nothing billed; anything else →
@@ -1507,7 +1560,7 @@ class JobSession:
                 released = True
                 return
             if isinstance(exc, BatchPending):
-                self.manifest.status = STATUS_PENDING
+                self.manifest.status = JobStatus.PENDING
                 self.manifest.error = None
                 self.persist()
                 return
@@ -1537,17 +1590,17 @@ class JobSession:
                 # Canceled batches (this run's or earlier) still owed a
                 # provider-side cleanup: one attempt each, never a failure.
                 for record in owed_cleanups(self.manifest):
-                    outcome = retry_cleanup(
+                    _, error = retry_cleanup(
                         self.store.workspace, record, backend=self._backends.get(_record_id(record))
                     )
-                    if outcome not in (CLEANUP_DONE, CLEANUP_PENDING):
-                        self.log(f"[batch-job] {_record_id(record)}: {outcome} (retried later)")
+                    if error is not None:
+                        self.log(f"[batch-job] {_record_id(record)}: {error} (retried later)")
             problems = [*self.uncertain, *self.stage_failures, *problems]
             if exc is None and ok and not problems:
-                self.manifest.status = STATUS_COMPLETED
+                self.manifest.status = JobStatus.COMPLETED
                 self.manifest.error = None
             else:
-                self.manifest.status = STATUS_FAILED
+                self.manifest.status = JobStatus.FAILED
                 reasons = []
                 if exc is not None:
                     reasons.append(f"{type(exc).__name__}: {exc}")
@@ -1566,7 +1619,7 @@ class JobSession:
                 self.store.delete()
                 released = True
                 return
-            if self.manifest.status == STATUS_COMPLETED:
+            if self.manifest.status == JobStatus.COMPLETED:
                 # Responses the job paid for that no run ever used: billed
                 # now (persisted first, as above), before retention drops them.
                 unused = self._unused_rows()
@@ -1684,7 +1737,7 @@ def start_session(
                 f"batch job '{job_id}' was created by `dgml {manifest.command}`, "
                 f"not `dgml {command}`"
             )
-        if manifest.status == STATUS_COMPLETED:
+        if manifest.status == JobStatus.COMPLETED:
             raise BatchJobInvalid(f"batch job '{job_id}' already completed; nothing to resume")
         if uncertain := manifest.uncertain_records():
             raise uncertain_refusal(job_id, uncertain)
@@ -1912,7 +1965,7 @@ class ReplayExecutor(BatchExecutor):
             if isinstance(response, BaseException):
                 continue
             hidden = getattr(response, "_hidden_params", None) or {}
-            if hidden.get(TIER_MARKER) != TIER_BATCH:
+            if hidden.get(TIER_MARKER) != PricingTier.BATCH:
                 self.session.save(self._keys[custom_id], response)
         out.update(served)
         return {cid: out[cid] for cid in steps}
@@ -2045,7 +2098,7 @@ class ReplayExecutor(BatchExecutor):
                 self._count_served(served, current, stored)
             else:
                 failed[current] = BatchItemError(
-                    current, "errored", f"its {GONE_REASON}", retryable=True
+                    current, ItemErrorKind.ERRORED, f"its {GONE_REASON}", retryable=True
                 )
 
     def _recorder(self, sink: list[_Wait]) -> Callable[[BatchJob, list[BatchRequest]], None]:
@@ -2090,7 +2143,7 @@ class ReplayExecutor(BatchExecutor):
             stats_key=self.stats_key,
         )
         for job, _idmap, record in fresh:
-            if record.get("state") != RECORD_OPEN:
+            if record.get("state") != RecordState.OPEN:
                 continue
             try:
                 self.backend.cancel(job)
@@ -2331,7 +2384,7 @@ class ReplayExecutor(BatchExecutor):
         *,
         why: str | None = None,
     ) -> None:
-        """Mark *record* :data:`RECORD_SETTLING` (its late cost reconciled once
+        """Mark *record* :attr:`RecordState.SETTLING` (its late cost reconciled once
         the batch ends; *reason*, when given, replaces the default
         ``settling_reason``) and count and warn its *requests* as possibly
         billed twice (:meth:`BatchExecutor._unsettled`)."""
@@ -2367,18 +2420,20 @@ class ReplayExecutor(BatchExecutor):
                 continue
             seen.add(provider_cid)
             current = idmap.get(provider_cid)
-            if isinstance(outcome, BatchItemError) and outcome.kind == "batch_rejected":
+            if isinstance(outcome, BatchItemError) and outcome.kind == ItemErrorKind.BATCH_REJECTED:
                 rejected += 1
             if isinstance(outcome, BatchItemError) or not _has_choices(outcome):
                 if current is not None:
                     failed[current] = (
                         outcome
                         if isinstance(outcome, BatchItemError)
-                        else BatchItemError(current, "errored", "batch result carries no choices")
+                        else BatchItemError(
+                            current, ItemErrorKind.ERRORED, "batch result carries no choices"
+                        )
                     )
                 continue
-            _mark_tier(outcome, TIER_BATCH)
-            self.stats.add_cost(outcome, TIER_BATCH)
+            _mark_tier(outcome, PricingTier.BATCH)
+            self.stats.add_cost(outcome, PricingTier.BATCH)
             # Every served response is recorded, even one this run no longer
             # asks for (a later run will), so no paid result is ever lost.
             stored_all &= self.session.save(keys[provider_cid], outcome, used=current is not None)
@@ -2387,9 +2442,9 @@ class ReplayExecutor(BatchExecutor):
         for provider_cid, current in idmap.items():
             if provider_cid not in seen:
                 failed[current] = BatchItemError(
-                    current, "errored", "no result returned for this request"
+                    current, ItemErrorKind.ERRORED, "no result returned for this request"
                 )
-        record["state"] = RECORD_COLLECTED
+        record["state"] = RecordState.COLLECTED.value
         return bool(keys) and rejected == len(keys), stored_all
 
 
@@ -2406,7 +2461,7 @@ def job_summary(manifest: Manifest) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "job_id": manifest.job_id,
         "command": manifest.command,
-        "status": manifest.status,
+        "status": _status_json(manifest.status),
         "created_at": manifest.created_at,
         "updated_at": manifest.updated_at,
         "runs": manifest.runs,
@@ -2447,7 +2502,7 @@ def _poll_entries(workspace: Workspace, manifest: Manifest) -> list[dict[str, An
     batches: list[dict[str, Any]] = []
     for record in manifest.provider_batches:
         job, entry = _batch_entry(record)
-        if record.get("state") == RECORD_OPEN:
+        if record.get("state") == RecordState.OPEN:
             backend: BatchBackend | None = None
             try:
                 backend = record_backend(workspace, record)
@@ -2493,10 +2548,12 @@ def job_status(workspace: Workspace, job_id: str) -> dict[str, Any]:
     batches = _poll_entries(workspace, manifest)
     preview = _status_settling(workspace, manifest, batches)
     summary = job_summary(manifest)
-    if manifest.status in (STATUS_PENDING, STATUS_READY):
-        open_entries = [b for b in batches if b["state"] == RECORD_OPEN]
+    if manifest.status in (JobStatus.PENDING, JobStatus.READY):
+        open_entries = [b for b in batches if b["state"] == RecordState.OPEN]
         summary["status"] = (
-            STATUS_READY if all(b.get("done") for b in open_entries) else STATUS_PENDING
+            JobStatus.READY.value
+            if all(b.get("done") for b in open_entries)
+            else JobStatus.PENDING.value
         )
     if (deadline := deadline_summary(manifest)) is not None:
         # A job with a deadline: when it is and whether it has passed (a
@@ -2519,16 +2576,16 @@ def _status_settling(
     by_id = {entry["batch_id"]: entry for entry in batches}
     records: list[dict[str, Any]] = []
     for record in manifest.provider_batches:
-        if record.get("state") != RECORD_SETTLING:
+        if record.get("state") != RecordState.SETTLING:
             records.append(record)
             continue
         copy = dict(record)
-        outcome = reconcile_settling(workspace, copy, preview=True)
+        state, error = reconcile_settling(workspace, copy, preview=True)
         entry = by_id.get(_record_id(record))
         if entry is not None:
-            entry["done"] = outcome == SETTLED
-            if outcome not in (SETTLED, RECORD_SETTLING):
-                entry["error"] = outcome
+            entry["done"] = state == RecordState.DROPPED
+            if error is not None:
+                entry["error"] = error
         records.append(copy)
     return Manifest.from_json({**manifest.to_json(), "provider_batches": records})
 
@@ -2564,7 +2621,7 @@ def pending_job_payload(
     exactly the keys above."""
     out: dict[str, Any] = {
         "job_id": job_id,
-        "status": STATUS_PENDING,
+        "status": JobStatus.PENDING.value,
         "command": command,
         "submitted_batches": submitted_batches,
         "requests_in_flight": requests_in_flight,
@@ -2596,7 +2653,10 @@ def resume_would_wait(workspace: Workspace, job_id: str) -> dict[str, Any] | Non
     :class:`BatchJobNotFound`."""
     store = BatchJobStore(workspace, job_id)
     manifest = store.load()
-    if manifest.status not in (STATUS_PENDING, STATUS_READY) or "--no-wait" not in manifest.argv:
+    if (
+        manifest.status not in (JobStatus.PENDING, JobStatus.READY)
+        or "--no-wait" not in manifest.argv
+    ):
         return None
     if deadline_passed(manifest):
         return None  # the run cancels, collects and finishes synchronously
@@ -2604,7 +2664,7 @@ def resume_would_wait(workspace: Workspace, job_id: str) -> dict[str, Any] | Non
     if not records or manifest.uncertain_records() or store.lease_holder() is not None:
         return None
     for entry in _poll_entries(workspace, manifest):
-        if entry["state"] == RECORD_OPEN and ("error" in entry or entry.get("done")):
+        if entry["state"] == RecordState.OPEN and ("error" in entry or entry.get("done")):
             return None
     return pending_job_payload(
         manifest.job_id,
@@ -2650,12 +2710,12 @@ def _collect_if_ended(
     for provider_cid, outcome in outcomes:
         key = keys.get(provider_cid)
         if key and not isinstance(outcome, BatchItemError) and _has_choices(outcome):
-            _mark_tier(outcome, TIER_BATCH)
+            _mark_tier(outcome, PricingTier.BATCH)
             stats.batch_ok += 1
-            stats.add_cost(outcome, TIER_BATCH)
+            stats.add_cost(outcome, PricingTier.BATCH)
             stored_all &= store.put_response(key, outcome)
     _add_to_last_run(manifest, str(record.get("stats_key") or ""), stats)
-    record["state"] = RECORD_COLLECTED
+    record["state"] = RecordState.COLLECTED.value
     record.pop("error", None)
     if stored_all:
         cleanup_batch(backend, job, logger.info)
@@ -2695,21 +2755,21 @@ def _drop_batches(
     store = BatchJobStore(workspace, manifest.job_id)
     for record in manifest.provider_batches:
         job, entry = _batch_entry(record)
-        if record.get("state") == RECORD_UNCERTAIN:
+        if record.get("state") == RecordState.UNCERTAIN:
             # No provider id to cancel: the user has checked the console (the
             # resume refusal told them to); acknowledging it lets a resume
             # submit those requests again.
-            record["state"] = RECORD_DROPPED
+            record["state"] = RecordState.DROPPED.value
             record["dropped_reason"] = f"uncertain create acknowledged with `dgml batch {verb}`"
-            entry["state"] = RECORD_DROPPED
+            entry["state"] = RecordState.DROPPED.value
             entry["acknowledged"] = True
-        if record.get("state") == RECORD_OPEN:
+        if record.get("state") == RecordState.OPEN:
             backend: BatchBackend | None = None
             try:
                 backend = record_backend(workspace, record)
                 backend.cancel(job)
                 mark_dropped(record, f"`dgml batch {verb}`")
-                entry["state"] = RECORD_DROPPED
+                entry["state"] = RecordState.DROPPED.value
             except BatchNotFound:
                 if mismatch := key_mismatch(record, backend):
                     # Not shown gone: it may still be running, and billing.
@@ -2717,28 +2777,33 @@ def _drop_batches(
                     entry["error"] = mismatch
                 else:
                     # Nothing left to cancel: the batch is gone (treated as ended).
-                    entry["state"] = resolve_gone(store, record)
+                    entry["state"] = str(resolve_gone(store, record))
                     entry["gone"] = True
             except Exception as exc:
                 if _collect_if_ended(workspace, store, manifest, record, job):
                     # It ended before the cancel reached it (a provider then
                     # refuses the cancel): nothing is billing, so collect it.
-                    entry["state"] = RECORD_COLLECTED
+                    entry["state"] = RecordState.COLLECTED.value
                 else:
                     # Reported, never hidden: the batch stays open (it may
                     # still be running and billing).
                     failures += 1
                     entry["error"] = short_error_message(exc)
-        if record.get("state") == RECORD_SETTLING:
+        if record.get("state") == RecordState.SETTLING:
             # Already canceled at the deadline: record its late cost once it
             # has ended (and clean it up); still canceling, it stays settling.
-            outcome = reconcile_settling(workspace, record)
-            if outcome == SETTLED:
+            settled, settle_error = reconcile_settling(workspace, record)
+            if settled == RecordState.DROPPED:
                 _job, entry = _batch_entry(record)
-            elif outcome != RECORD_SETTLING:
-                entry["error"] = outcome
-        if record.get("state") == RECORD_DROPPED and record.get("cleanup") == CLEANUP_PENDING:
-            entry["cleanup"] = retry_cleanup(workspace, record)
+            elif settle_error is not None:
+                entry["error"] = settle_error
+        if (
+            record.get("state") == RecordState.DROPPED
+            and record.get("cleanup") == CleanupState.PENDING
+        ):
+            state, error = retry_cleanup(workspace, record)
+            # The entry's ``cleanup``: the state's bare value, or the error.
+            entry["cleanup"] = str(state) if error is None else error
         batches.append(entry)
     return batches, failures
 
@@ -2749,7 +2814,7 @@ def unbilled_rows(
     """One usage row per response *store* holds that *manifest* has not billed
     (nor *skip* names), and the keys they stand for. They were paid for, so
     ``usage.jsonl`` must show them, but no command's row counts them: they are
-    ``operation`` :data:`OPERATION_BATCH_UNUSED`, ``context`` ``{"unused":
+    ``operation`` :attr:`UsageOperation.BATCH_UNUSED`, ``context`` ``{"unused":
     true, "batch_job": <job id>}``, at the tier that served them (``batch``
     unless a synchronous fallback). No rows for a job whose command records
     no usage; the keys are returned regardless, so the caller can mark them
@@ -2781,18 +2846,18 @@ def unbilled_rows(
                 store.workspace,
                 UsageEvent(
                     at=now_iso(),
-                    operation=OPERATION_BATCH_UNUSED,
+                    operation=UsageOperation.BATCH_UNUSED,
                     model=models.get(key) or str(getattr(response, "model", "") or ""),
                     cost_usd=totals["cost_usd"],
                     prompt_tokens=totals["prompt_tokens"],
                     completion_tokens=totals["completion_tokens"],
                     total_tokens=totals["total_tokens"],
                     duration_s=0.0,
-                    outcome=OUTCOME_OK,
+                    outcome=UsageOutcome.OK,
                     context={"unused": True, "batch_job": manifest.job_id},
                     cache_read_tokens=totals["cache_read_tokens"],
                     cache_creation_tokens=totals["cache_creation_tokens"],
-                    tier=str(hidden.get(TIER_MARKER) or TIER_BATCH),
+                    tier=as_pricing_tier(hidden.get(TIER_MARKER), PricingTier.BATCH),
                 ),
             )
         )
@@ -2838,8 +2903,8 @@ def cancel_job(workspace: Workspace, job_id: str) -> dict[str, Any]:
     def body(store: BatchJobStore) -> dict[str, Any]:
         manifest = store.load()
         batches, failures = _drop_batches(workspace, manifest, "cancel")
-        if manifest.status != STATUS_COMPLETED and not manifest.open_records():
-            manifest.status = STATUS_FAILED
+        if manifest.status != JobStatus.COMPLETED and not manifest.open_records():
+            manifest.status = JobStatus.FAILED
             manifest.error = "canceled with `dgml batch cancel`"
         store.save(manifest)
         # No run may finish this job: bill what its runs collected (a batch
@@ -2891,6 +2956,20 @@ def delete_job(workspace: Workspace, job_id: str, *, force: bool = False) -> dic
     return _with_lease(workspace, job_id, "delete", body)
 
 
+class PruneOutcome(StrEnum):
+    """What :func:`prune_jobs` did with one job: ``DELETED``; ``KEPT`` (not
+    prunable, or its lease is held elsewhere); ``CLEANUP_PENDING`` (kept: a
+    canceled batch's provider-side cleanup is still owed); or ``SETTLING``
+    (kept: a batch canceled at the deadline has not settled, so its late cost
+    is not recorded yet). Internal to the
+    prune loop — the payload lists job ids, never these values."""
+
+    KEPT = "kept"
+    CLEANUP_PENDING = "cleanup_pending"
+    SETTLING = "settling"
+    DELETED = "deleted"
+
+
 def prune_jobs(workspace: Workspace, *, older_than_days: float = 0.0) -> dict[str, Any]:
     """``dgml batch prune``: delete finished jobs last updated more than
     *older_than_days* ago — completed, or failed with no open provider batch
@@ -2901,11 +2980,11 @@ def prune_jobs(workspace: Workspace, *, older_than_days: float = 0.0) -> dict[st
     job while prune works on it.
 
     A finished job whose canceled batches are still owed a provider-side
-    cleanup (:data:`CLEANUP_PENDING`) gets one attempt per batch first; if
+    cleanup (:attr:`CleanupState.PENDING`) gets one attempt per batch first; if
     any is still owed (the cancel has not settled, or the delete failed), the
     job is kept — it is the only record of that batch — its progress saved,
     and its id listed in ``cleanup_pending`` (``dgml batch delete`` removes it
-    regardless). A job with a :data:`RECORD_SETTLING` record (a deadline
+    regardless). A job with a :attr:`RecordState.SETTLING` record (a deadline
     cancel that had not settled) gets one :func:`reconcile_settling` attempt
     per record first, and is kept — listed in ``settling`` — while any has not
     ended. Returns ``{"deleted", "kept"}``, plus ``cleanup_pending`` and
@@ -2923,8 +3002,8 @@ def prune_jobs(workspace: Workspace, *, older_than_days: float = 0.0) -> dict[st
             updated = cutoff
         # An unacknowledged uncertain create is kept: the job is the only
         # record that a batch may exist and be billing.
-        finished = manifest.status == STATUS_COMPLETED or (
-            manifest.status == STATUS_FAILED
+        finished = manifest.status == JobStatus.COMPLETED or (
+            manifest.status == JobStatus.FAILED
             and not manifest.open_records()
             and not manifest.uncertain_records()
         )
@@ -2935,22 +3014,22 @@ def prune_jobs(workspace: Workspace, *, older_than_days: float = 0.0) -> dict[st
         # listing may be stale (a resume may have run since).
         manifest = store.load()
         if not prunable(manifest):
-            return {"outcome": "kept"}
+            return {"outcome": PruneOutcome.KEPT}
         if waiting := settling_records(manifest):
             # A deadline cancel not yet settled: the job is the only record
             # of what it may still bill. Reconciled once it ends.
-            outcomes = [reconcile_settling(workspace, record) for record in waiting]
-            if any(outcome != SETTLED for outcome in outcomes):
+            settled = [reconcile_settling(workspace, record)[0] for record in waiting]
+            if any(state != RecordState.DROPPED for state in settled):
                 store.save(manifest, touch=False)
-                return {"outcome": "settling"}
+                return {"outcome": PruneOutcome.SETTLING}
         if owed := owed_cleanups(manifest):
-            outcomes = [retry_cleanup(workspace, record) for record in owed]
-            if any(outcome != CLEANUP_DONE for outcome in outcomes):
+            states = [retry_cleanup(workspace, record)[0] for record in owed]
+            if any(state != CleanupState.DONE for state in states):
                 store.save(manifest, touch=False)
-                return {"outcome": "cleanup_pending"}
+                return {"outcome": PruneOutcome.CLEANUP_PENDING}
         _bill_unbilled(store, manifest)
         store.delete()
-        return {"outcome": "deleted"}
+        return {"outcome": PruneOutcome.DELETED}
 
     for listed in list_jobs(workspace):
         job_id = listed.job_id
@@ -2962,16 +3041,16 @@ def prune_jobs(workspace: Workspace, *, older_than_days: float = 0.0) -> dict[st
             # holds it keeps the job, and none can start while prune works.
             outcome = _with_lease(workspace, job_id, "prune", body)["outcome"]
         except BatchJobBusy:
-            outcome = "kept"
+            outcome = PruneOutcome.KEPT
         except BatchJobNotFound:
             continue  # deleted by someone else meanwhile
-        if outcome == "deleted":
+        if outcome == PruneOutcome.DELETED:
             deleted.append(job_id)
             continue
         kept.append(job_id)
-        if outcome == "settling":
+        if outcome == PruneOutcome.SETTLING:
             settling.append(job_id)
-        elif outcome == "cleanup_pending":
+        elif outcome == PruneOutcome.CLEANUP_PENDING:
             cleanup_pending.append(job_id)
     out: dict[str, Any] = {"deleted": deleted, "kept": kept}
     if cleanup_pending:

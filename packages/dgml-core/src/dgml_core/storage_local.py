@@ -205,8 +205,8 @@ class LocalStore(BlobStore, DocStore):
         the two namespaces apart and needs no such check.
 
         No caller can currently reach this: every reserved basename ends in
-        ``.json``/``.jsonl`` and no ingestable source suffix does
-        (``.pdf``/``.doc``/``.docx``/``.xls``/``.xlsx``), so this is
+        ``.json``/``.jsonl`` and no ingestable source suffix does (``.pdf``, or a
+        convertible suffix in ``conversion.FAMILY_BY_SUFFIX``), so this is
         defence-in-depth rather than a fix for a live bug. It earns its place by
         making the *next* document filename or accepted extension fail loudly
         here instead of silently clobbering a manifest."""

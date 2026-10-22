@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from dgml_core import (
+    ClassifyMode,
     ConflictError,
     DgmlError,
     DocSetStore,
@@ -500,6 +501,7 @@ def _routes(app: FastAPI) -> None:
         if text_mode is not None and text_mode not in TEXT_MODES:
             raise InvalidArgument(f"text_mode must be one of {list(TEXT_MODES)}")
         mode = text_mode or services.registry.settings(org_id).text_mode
+        classify_mode = None if classify == "none" else ClassifyMode(classify)
         queued = []
         for upload in files:
             filename = upload.filename or "upload.pdf"
@@ -508,7 +510,7 @@ def _routes(app: FastAPI) -> None:
                 services.jobs.submit(
                     org_id,
                     "add_file",
-                    _add_file_fn(services, org_id, ws, staged, mode, classify),
+                    _add_file_fn(services, org_id, ws, staged, mode, classify_mode),
                     label=f"Add {filename}",
                     params={"filename": filename, "text_mode": mode, "classify": classify},
                 )
@@ -562,11 +564,12 @@ def _routes(app: FastAPI) -> None:
     ) -> dict[str, Any]:
         if body.mode not in CLASSIFY_MODES:
             raise InvalidArgument(f"mode must be one of {list(CLASSIFY_MODES)}")
+        mode = ClassifyMode(body.mode)
         record = FileStore(ws).get(file_id)
 
         def run() -> dict[str, Any]:
             with services.registry.file_lock(org_id, file_id):
-                return ops.classify(ws, file_id, mode=body.mode, extract=body.extract)
+                return ops.classify(ws, file_id, mode=mode, extract=body.extract)
 
         return services.jobs.submit(
             org_id,
@@ -681,7 +684,7 @@ def _add_file_fn(
     ws: Workspace,
     staged: Path,
     text_mode: str,
-    classify: str,
+    classify: ClassifyMode | None,
 ) -> JobFn:
     def run() -> dict[str, Any]:
         try:
@@ -690,7 +693,7 @@ def _add_file_fn(
             ops.discard_upload(staged)
         out = ops.add_result_json(result)
         file_id = result.record.id
-        if classify != "none" and result.page_render_error is None:
+        if classify is not None and result.page_render_error is None:
             # Classification is a vision call over the page images, so it needs the
             # render to have succeeded. A classify failure does not undo the add.
             try:

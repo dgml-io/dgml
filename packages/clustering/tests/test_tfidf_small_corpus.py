@@ -36,7 +36,7 @@ import warnings
 from pathlib import Path
 
 import pytest
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.lexical import _MAX_DF, _MIN_DF, TfidfEncoder
 
 
@@ -56,7 +56,7 @@ def _corpus(root: Path, docs: list[str]) -> Path:
 def _encoder(files_dir: Path, dim: int = 256) -> TfidfEncoder:
     return TfidfEncoder(
         EncoderConfig(
-            name="tfidf",
+            name=EncoderName.TFIDF,
             model_id="tfidf",
             embedding_dim=dim,
             extra={"corpus_dir": str(files_dir), "text_view": "full"},

@@ -43,11 +43,12 @@ import json
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
+from clustering.config.schema import ConsolidationMode
 from clustering.consolidation import AdjudicationRequest, AdjudicationVerdict
 
 from .classification import ClassificationConfig, _resolve_api_key
 from .llm import CallResult, LLMConfig, call_with_tools
-from .usage import OPERATION_CLUSTER
+from .usage import UsageOperation
 from .utils import MANY_IMAGE_MAX_EDGE, image_to_data_url
 
 if TYPE_CHECKING:
@@ -85,12 +86,12 @@ class LLMAdjudicator:
         dataset: DocumentDataset,
         requests: list[AdjudicationRequest],
         *,
-        mode: str,
+        mode: ConsolidationMode,
         batch_size: int,
     ) -> dict[str, AdjudicationVerdict]:
         if not requests:
             return {}
-        if mode == "repartition":
+        if mode == ConsolidationMode.REPARTITION:
             return self._repartition(dataset, requests, batch_size)
         # "reassign" and "auto" both use the per-document path; "auto" would
         # route genuinely contested *regions* to repartition, but a per-doc
@@ -207,7 +208,7 @@ class LLMAdjudicator:
             api_base=self.config.api_base,
             max_tokens=None,
             record_usage=self.record_usage,
-            operation=OPERATION_CLUSTER,
+            operation=UsageOperation.CLUSTER,
             context={"consolidation": doc_ids},
         )
 

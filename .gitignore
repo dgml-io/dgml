@@ -252,3 +252,6 @@ local_config.json
 local_config.json.bak
 samples//schema.rnc
 PR_DESCRIPTION.md
+
+# Vite dev-server dependency cache
+.vite/

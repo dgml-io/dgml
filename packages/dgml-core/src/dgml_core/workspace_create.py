@@ -26,6 +26,7 @@ from typing import Any
 from . import workspace_config as wsconfig
 from .errors import (
     ConflictError,
+    ConflictErrorKind,
     CorruptMetadata,
     InvalidArgument,
     WorkspacesWriteConflict,
@@ -91,7 +92,7 @@ def _already_held(store: WorkspacesStore, workspace_id: str) -> ConflictError:
         f"workspace, re-run create against it — create_workspace("
         f"Workspace.resolve({workspace_id!r})) is safe to re-run. Otherwise pick "
         f"another id.",
-        kind="workspace",
+        kind=ConflictErrorKind.WORKSPACE,
         existing_id=workspace_id,
     )
 
@@ -184,7 +185,7 @@ def create_workspace(
                 f"workspace, re-run create against it — create_workspace("
                 f"Workspace.resolve({workspace_id!r})) is safe to re-run. Otherwise pick "
                 f"another id.",
-                kind="workspace",
+                kind=ConflictErrorKind.WORKSPACE,
                 existing_id=workspace_id,
             )
         # The id comes first: for a listed workspace the root is derived from it —

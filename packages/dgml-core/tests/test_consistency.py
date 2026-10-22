@@ -206,6 +206,10 @@ def test_corrupt_docset_metadata_does_not_crash(workspace: Workspace) -> None:
         i.target_type == "docset" and i.target_id == did and i.kind == "corrupt_metadata"
         for i in report.issues
     )
+    # The JSON form carries the plain wire string, not the enum member.
+    emitted = [i for i in report.to_json()["issues"] if i["target_id"] == did]
+    assert emitted
+    assert all(type(i["target_type"]) is str and i["target_type"] == "docset" for i in emitted)
 
 
 def test_corrupt_metadata_alongside_clean_continues_walk(

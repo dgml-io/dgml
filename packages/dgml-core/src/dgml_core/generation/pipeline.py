@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from dgml_core import llm
 from dgml_core.concurrency import map_concurrent
-from dgml_core.conversion import ConverterConfig
+from dgml_core.conversion import ConverterConfig, FormatFamily
 from dgml_core.errors import (
     GenerationConfigInvalid,
     LabelModelUnreachable,
@@ -42,11 +42,7 @@ from dgml_core.errors import (
 )
 from dgml_core.generation import document
 from dgml_core.generation.blocks import Block, Span
-from dgml_core.generation.config import (
-    LABEL_MODE_ALL_AT_ONCE,
-    LABEL_MODE_PER_DOCUMENT,
-    LABEL_MODE_SYNC,
-)
+from dgml_core.generation.config import LabelMode
 from dgml_core.generation.label import (
     RosterEntry,
     _parse_labels_json,
@@ -59,7 +55,11 @@ from dgml_core.generation.label import (
 )
 from dgml_core.generation.render import render_xml
 from dgml_core.generation.schema import Schema
-from dgml_core.generation.single_calls import SingleCallRunner, single_calls_through
+from dgml_core.generation.single_calls import (
+    SingleCallRunner,
+    SingleCallStage,
+    single_calls_through,
+)
 from dgml_core.generation.to_semantic import (
     render_dgml,
     render_semantic_xml,
@@ -68,7 +68,7 @@ from dgml_core.generation.transcribe import transcribe_document, transcribe_step
 from dgml_core.generation.vocab import OPEN_VOCAB, TagVocab
 from dgml_core.pages import PdfConfig
 from dgml_core.storage import Workspace
-from dgml_core.usage import OPERATION_LABEL, OPERATION_TRANSCRIBE
+from dgml_core.usage import UsageOperation
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ class BatchOptions:
     document at a time, in the serial order, with output byte-identical to
     the synchronous run (see :func:`_per_document_labeler`). The ``label``
     stage's stats carry ``mode``: ``"all-at-once"``, ``"per-document"`` or
-    ``"sync"`` (``LABEL_MODE_*`` in :mod:`dgml_core.generation.config`).
+    ``"sync"`` (:class:`~dgml_core.generation.config.LabelMode`).
     ``poll_interval_s``,
     ``max_poll_s`` and ``min_wave_size`` configure the
     :class:`dgml_core.batch.BatchExecutor`; ``log`` receives its progress
@@ -217,8 +217,10 @@ def batch_single_call_runner(
     *api_key* / *api_base* are the labeling model's credentials (the config the
     call carries names the model)."""
 
-    def run(stage: str, config: llm.LLMConfig, steps: llm.LLMSteps[Any]) -> Any:
+    def run(stage: SingleCallStage, config: llm.LLMConfig, steps: llm.LLMSteps[Any]) -> Any:
         from dgml_core.batch import Unit, run_stage
+
+        name = stage.value  # the batch stage's name, and its key in ``batch.stats``
 
         try:
             executor = make_batch_executor(
@@ -229,10 +231,10 @@ def batch_single_call_runner(
             raise
         try:
             outcome = run_stage(
-                [Unit(name=stage, config=config, steps=steps)], executor, log=log, stage=stage
-            )[stage]
+                [Unit(name=name, config=config, steps=steps)], executor, log=log, stage=name
+            )[name]
         finally:
-            batch.stats[stage] = executor.stats.to_json()
+            batch.stats[name] = executor.stats.to_json()
         if outcome.error is not None:
             raise outcome.error
         return outcome.result
@@ -341,7 +343,7 @@ class ConvertOptions:
     # Per-format-family converters (docx/xlsx → PDF), from the workspace
     # `conversion` config. Passed to load_document_as_pdf so non-PDF inputs
     # convert; None/empty means PDF-only (every input must already be a PDF).
-    converters: dict[str, ConverterConfig] | None = None
+    converters: dict[FormatFamily, ConverterConfig] | None = None
     # PDF engine for page slicing (the per-window transcription payload), from
     # the workspace `pdf` config. None means the ghostscript default — which is
     # also what library callers with no workspace get.
@@ -413,7 +415,7 @@ def _warn_if_debug_without_usage(opts: ConvertOptions) -> None:
 
 
 def _config(
-    opts: ConvertOptions, model: str | None = None, *, operation: str | None = None
+    opts: ConvertOptions, model: str | None = None, *, operation: UsageOperation | None = None
 ) -> llm.LLMConfig:
     return llm.LLMConfig(
         model=model or opts.model,
@@ -492,7 +494,7 @@ def convert_batch(
             return transcribe_document(
                 pdf_bytes,
                 doc_name=path.name,
-                config=_config(opts, operation=OPERATION_TRANSCRIBE),
+                config=_config(opts, operation=UsageOperation.TRANSCRIBE),
                 window_size=opts.window_size,
                 cache_dir=opts.cache_dir,
                 debug=opts.debug,
@@ -550,7 +552,7 @@ def convert_batch(
         thinking=opts.thinking,
         workspace=opts.workspace,
         record_usage=opts.record_usage,
-        operation=OPERATION_LABEL,
+        operation=UsageOperation.LABEL,
     )
     label_config.context = {"doc_count": len(docs)}
 
@@ -606,7 +608,7 @@ def convert_batch(
         label_document = _per_document_labeler(docs, opts, opts.batch, label_config, log)
     elif opts.batch is not None and docs:
         log(f"Pass B: labeling stays synchronous under batch mode ({BATCH_LABEL_OFF})")
-        opts.batch.stats["label"] = {"skipped": BATCH_LABEL_OFF, "mode": LABEL_MODE_SYNC}
+        opts.batch.stats["label"] = {"skipped": BATCH_LABEL_OFF, "mode": str(LabelMode.SYNC)}
     with llm.record_usage_for(label_config), single_calls_through(single_runner):
         label_documents(
             docs,
@@ -739,7 +741,7 @@ def _transcribe_batched(
         if isinstance(pdf_bytes, Exception):
             failed(path, pdf_bytes)
             continue
-        config = _config(opts, operation=OPERATION_TRANSCRIBE)
+        config = _config(opts, operation=UsageOperation.TRANSCRIBE)
         steps = transcribe_steps(
             pdf_bytes,
             doc_name=path.name,
@@ -840,7 +842,7 @@ def _batch_labeler(
         )
         log(f"Pass B: labeling {len(units)} doc(s) as one batch stage (the roster is fixed)")
         outcomes = run_stage(units, executor, log=log, stage="label")
-        batch.stats["label"] = {**executor.stats.to_json(), "mode": LABEL_MODE_ALL_AT_ONCE}
+        batch.stats["label"] = {**executor.stats.to_json(), "mode": str(LabelMode.ALL_AT_ONCE)}
         for name in order:
             outcome = outcomes[name]
             if outcome.error is not None and not outcome.stage_error:
@@ -950,7 +952,7 @@ def _per_document_labeler(
         outcome = run_stage([unit], executor, log=log, stage="label")[name]
         batch.stats["label"] = {
             **executor.stats.to_json(),
-            "mode": LABEL_MODE_PER_DOCUMENT,
+            "mode": str(LabelMode.PER_DOCUMENT),
             "documents": labeled,
         }
         if outcome.error is None:

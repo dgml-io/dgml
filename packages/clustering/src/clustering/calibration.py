@@ -69,16 +69,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 
-if TYPE_CHECKING:
-    from clustering.config.schema import SupportSelection
-    from clustering.manifolds.base import ManifoldHead
+from clustering.config.schema import CalibrationMethod, SupportSelection
 
-CalibrationMethod = Literal["none", "temperature", "platt"]
+if TYPE_CHECKING:
+    from clustering.manifolds.base import ManifoldHead
 
 # Bounds for the temperature search. T -> 0 sharpens toward argmax; large T
 # flattens toward uniform. The optimum for well-behaved logits is near 1.
@@ -180,7 +179,7 @@ class Calibrator:
     an unconfigured :class:`Calibrator` never changes behavior.
     """
 
-    method: CalibrationMethod = "none"
+    method: CalibrationMethod = CalibrationMethod.NONE
     temperature: float = 1.0
     platt_a: float = 1.0
     platt_b: float = 0.0
@@ -196,7 +195,7 @@ class Calibrator:
     n_calibration: int = 0
 
     def _tempered_softmax(self, logits_np: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
-        t = self.temperature if self.method == "temperature" else 1.0
+        t = self.temperature if self.method == CalibrationMethod.TEMPERATURE else 1.0
         return _softmax_np(logits_np / max(t, _T_MIN))
 
     def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -221,7 +220,7 @@ class Calibrator:
         probs = self._tempered_softmax(logits_np)
         top1 = probs.max(axis=-1)
 
-        if self.method == "platt" and not self.platt_identity:
+        if self.method == CalibrationMethod.PLATT and not self.platt_identity:
             cal = 1.0 / (1.0 + np.exp(-(self.platt_a * top1 + self.platt_b)))
         else:
             cal = top1
@@ -241,7 +240,7 @@ class Calibrator:
     def as_dict(self) -> dict[str, Any]:
         """Provenance dict for :class:`ScenarioResult` metadata / attestation."""
         return {
-            "method": self.method,
+            "method": str(self.method),
             "temperature": self.temperature,
             "platt_a": self.platt_a,
             "platt_b": self.platt_b,
@@ -257,7 +256,7 @@ def fit_calibrator(
     logits: torch.Tensor,
     labels: torch.Tensor,
     *,
-    method: CalibrationMethod = "temperature",
+    method: CalibrationMethod = CalibrationMethod.TEMPERATURE,
     coverage: float | None = None,
     abstain_threshold: float | None = None,
 ) -> Calibrator:
@@ -292,13 +291,19 @@ def fit_calibrator(
     logits_np = _to_numpy(logits, np.float64)
     labels_np = _to_numpy(labels, np.int64)
     m = int(logits_np.shape[0])
-    if m < 2 or method not in ("none", "temperature", "platt"):
-        return Calibrator(method="none", n_calibration=m)
+    if m < 2:
+        return Calibrator(method=CalibrationMethod.NONE, n_calibration=m)
+    try:
+        method = CalibrationMethod(method)
+    except ValueError:
+        return Calibrator(method=CalibrationMethod.NONE, n_calibration=m)
 
-    temperature = _fit_temperature(logits_np, labels_np) if method == "temperature" else 1.0
+    temperature = (
+        _fit_temperature(logits_np, labels_np) if method == CalibrationMethod.TEMPERATURE else 1.0
+    )
 
     platt_a, platt_b, platt_identity = 1.0, 0.0, False
-    if method == "platt":
+    if method == CalibrationMethod.PLATT:
         probs = _softmax_np(logits_np)
         top1 = probs.max(axis=-1)
         pred = probs.argmax(axis=-1)
@@ -336,7 +341,7 @@ def support_loo_logits(
     manifold: ManifoldHead,
     *,
     n_shots: int | None = None,
-    selection: SupportSelection = "order",
+    selection: SupportSelection = SupportSelection.ORDER,
     prototype_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Build leave-one-out calibration logits from a labeled support set.
@@ -403,7 +408,7 @@ def support_loo_logits(
     def _prototype(cat: str, exclude: int | None) -> torch.Tensor:
         members = [k for k in by_cat[cat] if k != exclude]
         if n_shots is not None and len(members) > n_shots:
-            if selection == "central":
+            if selection == SupportSelection.CENTRAL:
                 # Recompute centrality on the post-exclusion set, mirroring how
                 # _support_prototypes would build the prototype from these rows.
                 m_emb = support_embeddings[torch.tensor(members)]
@@ -448,7 +453,7 @@ def fit_support_calibrator(
     coverage: float | None,
     abstain_threshold: float | None,
     n_shots: int | None = None,
-    selection: SupportSelection = "order",
+    selection: SupportSelection = SupportSelection.ORDER,
     prototype_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> Calibrator | None:
     """Fit a calibrator from a labeled support set, or ``None`` if not possible.
@@ -461,7 +466,7 @@ def fit_support_calibrator(
     ``abstain_threshold`` floor still applies downstream in either case, which
     is why it is not enough on its own to trigger a fit.
     """
-    if method == "none" and coverage is None:
+    if method == CalibrationMethod.NONE and coverage is None:
         return None
     loo = support_loo_logits(
         support_embeddings,

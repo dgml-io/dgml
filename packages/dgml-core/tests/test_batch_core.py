@@ -25,6 +25,7 @@ from dgml_core.batch import (
     BatchRequest,
     BatchState,
     FakeBackend,
+    ItemErrorKind,
     assert_batchable,
     fake_model_response,
     plan_batches,
@@ -283,7 +284,7 @@ def test_plan_batches_empty() -> None:
 
 def test_fake_backend_records_and_returns_scripted_results() -> None:
     ok = fake_model_response("hello", usage={"prompt_tokens": 3, "completion_tokens": 1}, cost=0.5)
-    err = BatchItemError("r1", "errored", "boom")
+    err = BatchItemError("r1", ItemErrorKind.ERRORED, "boom")
     backend = FakeBackend({"r0": ok, "r1": err}, polls_until_ended=2)
     job = backend.submit([_req("r0"), _req("r1")])
     assert job.custom_ids == ("r0", "r1")
@@ -402,7 +403,7 @@ def test_fake_backend_cancel_after_end_keeps_delivered_outcomes() -> None:
 
 
 def test_fake_backend_counts_expired() -> None:
-    backend = FakeBackend({"a": BatchItemError("a", "expired", "24h")})
+    backend = FakeBackend({"a": BatchItemError("a", ItemErrorKind.EXPIRED, "24h")})
     job = backend.submit([_req("a")])
     status = backend.poll(job)
     assert status.expired == 1 and status.errored == 0
@@ -430,11 +431,11 @@ def test_batch_job_json_round_trip() -> None:
 
 
 def test_batch_item_error_retryable_defaults() -> None:
-    assert BatchItemError("a", "errored", "m").retryable is True
-    assert BatchItemError("a", "expired", "m").retryable is True
-    assert BatchItemError("a", "canceled", "m").retryable is False
-    assert BatchItemError("a", "invalid", "m").retryable is False
-    assert BatchItemError("a", "errored", "m", retryable=False).retryable is False
+    assert BatchItemError("a", ItemErrorKind.ERRORED, "m").retryable is True
+    assert BatchItemError("a", ItemErrorKind.EXPIRED, "m").retryable is True
+    assert BatchItemError("a", ItemErrorKind.CANCELED, "m").retryable is False
+    assert BatchItemError("a", ItemErrorKind.INVALID, "m").retryable is False
+    assert BatchItemError("a", ItemErrorKind.ERRORED, "m", retryable=False).retryable is False
 
 
 def test_batch_request_identity_is_custom_id() -> None:

@@ -52,6 +52,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -117,13 +118,14 @@ def parse_utc(text: str) -> float:
     return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
 
 
-#: The counters a deadline reports, in payload order.
-COUNTERS = (
-    "canceled_batches",
-    "collected_after_cancel",
-    "sync_after_deadline",
-    "possibly_double_billed",
-)
+class DeadlineCounter(StrEnum):
+    """The counters a deadline reports (``batch.deadline`` keys, and the
+    :class:`BatchDeadline` attributes), in payload order."""
+
+    CANCELED_BATCHES = "canceled_batches"
+    COLLECTED_AFTER_CANCEL = "collected_after_cancel"
+    SYNC_AFTER_DEADLINE = "sync_after_deadline"
+    POSSIBLY_DOUBLE_BILLED = "possibly_double_billed"
 
 
 @dataclass
@@ -187,17 +189,16 @@ class BatchDeadline:
         )
         return True
 
-    def count(self, name: str, n: int = 1) -> None:
-        """Add *n* to the counter *name* (one of :data:`COUNTERS`), thread-safely."""
-        if name not in COUNTERS:
-            raise ValueError(f"unknown deadline counter {name!r}")
+    def count(self, counter: DeadlineCounter, n: int = 1) -> None:
+        """Add *n* to *counter*, thread-safely."""
+        counter = DeadlineCounter(counter)  # ValueError for an unknown name
         with self._lock:
-            setattr(self, name, int(getattr(self, name)) + n)
+            setattr(self, counter, int(getattr(self, counter)) + n)
 
     def counters(self) -> dict[str, int]:
         """This run's counters (what a job records per run)."""
         with self._lock:
-            return {name: int(getattr(self, name)) for name in COUNTERS}
+            return {str(c): int(getattr(self, c)) for c in DeadlineCounter}
 
     def to_json(self) -> dict[str, Any]:
         """The payload's ``batch.deadline`` block: the deadline, whether it

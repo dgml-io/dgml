@@ -33,6 +33,8 @@ import pytest
 from dgml_core import layout
 from dgml_core.classification import ClassificationConfig
 from dgml_core.clustering import (
+    ClusterMethod,
+    ClusterMode,
     _resolve_method,
     clustering,
     clustering_internal,
@@ -535,7 +537,7 @@ def test_clustering_llm_assignment_carries_confidence(workspace: Workspace) -> N
 
     groups = [_new_group("Invoice", ["doc_1", "doc_2"], confidence=0.85)]
     with patch("litellm.completion", return_value=_group_response(groups)):
-        out = clustering(workspace, method="llm")
+        out = clustering(workspace, method=ClusterMethod.LLM)
 
     assert out["assignments"]["a"]["confidence"] == 0.85
     assert out["assignments"]["b"]["confidence"] == 0.85
@@ -549,20 +551,25 @@ def test_clustering_llm_assignment_carries_confidence(workspace: Workspace) -> N
 @pytest.mark.parametrize(
     ("method", "n", "threshold", "mode", "expected"),
     [
-        ("auto", 3, 8, "fresh", "llm"),
-        ("auto", 8, 8, "fresh", "llm"),  # boundary: <= threshold
-        ("auto", 9, 8, "fresh", "embedding"),
+        (ClusterMethod.AUTO, 3, 8, ClusterMode.FRESH, ClusterMethod.LLM),
+        # boundary: <= threshold
+        (ClusterMethod.AUTO, 8, 8, ClusterMode.FRESH, ClusterMethod.LLM),
+        (ClusterMethod.AUTO, 9, 8, ClusterMode.FRESH, ClusterMethod.EMBEDDING),
         # An incremental batch is scored against prototypes that already exist,
         # so its size says nothing about whether the statistics hold — it stays
         # on the embedding path however small it is.
-        ("auto", 1, 8, "incremental", "embedding"),
-        ("auto", 8, 8, "incremental", "embedding"),
-        ("llm", 100, 8, "fresh", "llm"),  # explicit wins regardless of size
-        ("llm", 2, 8, "incremental", "llm"),  # ... and regardless of mode
-        ("embedding", 1, 8, "fresh", "embedding"),
+        (ClusterMethod.AUTO, 1, 8, ClusterMode.INCREMENTAL, ClusterMethod.EMBEDDING),
+        (ClusterMethod.AUTO, 8, 8, ClusterMode.INCREMENTAL, ClusterMethod.EMBEDDING),
+        # explicit wins regardless of size
+        (ClusterMethod.LLM, 100, 8, ClusterMode.FRESH, ClusterMethod.LLM),
+        # ... and regardless of mode
+        (ClusterMethod.LLM, 2, 8, ClusterMode.INCREMENTAL, ClusterMethod.LLM),
+        (ClusterMethod.EMBEDDING, 1, 8, ClusterMode.FRESH, ClusterMethod.EMBEDDING),
     ],
 )
-def test_resolve_method(method: str, n: int, threshold: int, mode: str, expected: str) -> None:
+def test_resolve_method(
+    method: ClusterMethod, n: int, threshold: int, mode: ClusterMode, expected: ClusterMethod
+) -> None:
     assert _resolve_method(method, n_usable=n, threshold=threshold, mode=mode) == expected
 
 
@@ -578,7 +585,7 @@ def test_clustering_internal_llm_returns_proposals(workspace: Workspace) -> None
 
     groups = [_new_group("Invoice", ["doc_1", "doc_2"])]
     with patch("litellm.completion", return_value=_group_response(groups)):
-        internal = clustering_internal(workspace, method="llm")
+        internal = clustering_internal(workspace, method=ClusterMethod.LLM)
 
     assert internal.method == "llm"
     assert internal.mode == "fresh"
@@ -598,10 +605,12 @@ def test_clustering_llm_creates_docsets_without_second_call(workspace: Workspace
         _new_group("Contract", ["doc_3"]),
     ]
     with patch("litellm.completion", return_value=_group_response(groups)) as completion:
-        out = clustering(workspace, method="llm")
+        out = clustering(workspace, method=ClusterMethod.LLM)
 
     assert completion.call_count == 1  # single grouping call, no naming pass
     assert out["mode"] == "fresh"
+    # A result dict carries plain strings, not enum members.
+    assert type(out["mode"]) is str and type(out["method"]) is str
     assert out["n_new_clusters"] == 2
     assert out["failed_file_ids"] == []
 
@@ -621,7 +630,7 @@ def test_clustering_auto_small_corpus_uses_llm(workspace: Workspace) -> None:
 
     groups = [_new_group("Invoice", ["doc_1", "doc_2"])]
     with patch("litellm.completion", return_value=_group_response(groups)) as completion:
-        out = clustering(workspace, method="auto", small_corpus_threshold=8)
+        out = clustering(workspace, method=ClusterMethod.AUTO, small_corpus_threshold=8)
 
     assert completion.call_count == 1
     assert out["n_new_clusters"] == 1
@@ -644,7 +653,7 @@ def test_clustering_llm_incremental_assigns_to_existing(workspace: Workspace) ->
         _new_group("Contract", ["doc_2"]),
     ]
     with patch("litellm.completion", return_value=_group_response(groups)):
-        out = clustering(workspace, method="llm", mode="incremental")
+        out = clustering(workspace, method=ClusterMethod.LLM, mode=ClusterMode.INCREMENTAL)
 
     assert out["mode"] == "incremental"
     assert out["clusters"]["a"] == "Invoice"
@@ -657,7 +666,7 @@ def test_clustering_llm_missing_classification_config_raises(workspace: Workspac
     # No classification config written → the llm method can't run.
     with patch("litellm.completion"):
         with pytest.raises(ClassificationConfigMissing):
-            clustering(workspace, method="llm")
+            clustering(workspace, method=ClusterMethod.LLM)
 
 
 def test_clustering_llm_runtime_failure_soft_fails(
@@ -669,7 +678,7 @@ def test_clustering_llm_runtime_failure_soft_fails(
     caplog.set_level(logging.DEBUG, logger="dgml_core.clustering")
 
     with patch("litellm.completion", side_effect=RuntimeError("boom")):
-        out = clustering(workspace, method="llm")
+        out = clustering(workspace, method=ClusterMethod.LLM)
 
     # Provider blew up → every file soft-fails, no DocSet created, no raise.
     assert out["n_new_clusters"] == 0
@@ -689,7 +698,7 @@ def test_unknown_method_rejected(workspace: Workspace) -> None:
     from dgml_core.errors import ClusteringConfigInvalid
 
     with pytest.raises(ClusteringConfigInvalid, match="unknown clustering method"):
-        clustering(workspace, method="telepathy")
+        clustering(workspace, method="telepathy")  # type: ignore[arg-type]
 
 
 def test_default_max_files_is_reasonable() -> None:
@@ -768,7 +777,7 @@ def test_auto_falls_back_to_embedding_without_classification_config(
         # Silent on purpose: a workspace that never configured a model is not
         # LLM-enabled, and saying so on every small run would be noise.
         with caplog.at_level(logging.WARNING, logger="dgml_core.clustering"):
-            internal = clustering_internal(workspace, method="auto")
+            internal = clustering_internal(workspace, method=ClusterMethod.AUTO)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     assert internal.method == "embedding"
@@ -807,7 +816,7 @@ def test_auto_retries_a_failed_partitioner_call_on_the_embedding_engine(
         ) as run_embedding,
     ):
         caplog.set_level(logging.DEBUG, logger="dgml_core.clustering")
-        internal = clustering_internal(workspace, method="auto")
+        internal = clustering_internal(workspace, method=ClusterMethod.AUTO)
 
     assert internal.method == "embedding"
     assert run_embedding.call_count == 1
@@ -826,7 +835,7 @@ def test_pinned_llm_never_falls_back(workspace: Workspace) -> None:
         _seed(workspace, fid)
 
     with pytest.raises(ClassificationConfigMissing):
-        clustering(workspace, method="llm")
+        clustering(workspace, method=ClusterMethod.LLM)
 
 
 def test_result_reports_the_method_that_ran(workspace: Workspace) -> None:
@@ -842,7 +851,7 @@ def test_result_reports_the_method_that_ran(workspace: Workspace) -> None:
 
     groups = [_new_group("Invoice", ["doc_1", "doc_2"])]
     with patch("litellm.completion", return_value=_group_response(groups)):
-        assert clustering(workspace, method="llm")["method"] == "llm"
+        assert clustering(workspace, method=ClusterMethod.LLM)["method"] == "llm"
 
     # A resolved embedding run reports embedding — through the public payload,
     # and on a run that actually reached the engine rather than short-circuiting.
@@ -852,7 +861,7 @@ def test_result_reports_the_method_that_ran(workspace: Workspace) -> None:
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"c": _prediction("unknown_0"), "d": _prediction("unknown_0")},
     ):
-        assert clustering(workspace, method="embedding")["method"] == "embedding"
+        assert clustering(workspace, method=ClusterMethod.EMBEDDING)["method"] == "embedding"
 
 
 def test_no_engine_ran_reports_a_null_method(workspace: Workspace) -> None:
@@ -893,7 +902,7 @@ def test_auto_routes_around_a_malformed_classification_section_but_says_so(
         return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
     ) as run_embedding:
         with caplog.at_level(logging.WARNING, logger="dgml_core.clustering"):
-            internal = clustering_internal(workspace, method="auto")
+            internal = clustering_internal(workspace, method=ClusterMethod.AUTO)
     assert "cannot be used" in caplog.text
 
     assert internal.method == "embedding"
@@ -907,7 +916,7 @@ def test_pinned_llm_still_raises_on_a_malformed_section(workspace: Workspace) ->
     write_classification_config(workspace, {"model": DEFAULT_TEST_MODEL, "max_pages": 0})
 
     with pytest.raises(ClassificationConfigInvalid):
-        clustering_internal(workspace, method="llm")
+        clustering_internal(workspace, method=ClusterMethod.LLM)
 
 
 def test_pinned_llm_still_raises_on_an_absent_credential(workspace: Workspace) -> None:
@@ -923,7 +932,7 @@ def test_pinned_llm_still_raises_on_an_absent_credential(workspace: Workspace) -
     )
 
     with pytest.raises(AuthError):
-        clustering_internal(workspace, method="llm")
+        clustering_internal(workspace, method=ClusterMethod.LLM)
 
 
 def test_incremental_batch_stays_on_the_embedding_path(workspace: Workspace) -> None:
@@ -976,7 +985,7 @@ def test_auto_validates_the_config_before_routing(workspace: Workspace) -> None:
 
     with patch("litellm.completion") as completion:
         with pytest.raises(ClusteringConfigInvalid):
-            clustering_internal(workspace, method="auto", config="no-such-preset")
+            clustering_internal(workspace, method=ClusterMethod.AUTO, config="no-such-preset")
     assert completion.call_count == 0
 
 
@@ -1000,7 +1009,7 @@ def test_auto_falls_back_when_the_credential_is_missing(
         return_value={"a": _prediction("unknown_0"), "b": _prediction("unknown_0")},
     ) as run_embedding:
         with caplog.at_level(logging.WARNING, logger="dgml_core.clustering"):
-            internal = clustering_internal(workspace, method="auto")
+            internal = clustering_internal(workspace, method=ClusterMethod.AUTO)
     assert "cannot be used" in caplog.text
 
     assert internal.method == "embedding"

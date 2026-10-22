@@ -1875,8 +1875,8 @@ pixels (see
 [Page images](storage-layout.md#page-images-jpeg-edge-bounds)), and per-page
 word boxes are written to `page_text/` according to `--text-mode`.
 
-`<path>` is a `.pdf`, or a convertible source (`.docx`/`.doc`/`.xlsx`/`.xls`)
-when a converter is configured for its format family in the workspace
+`<path>` is a `.pdf`, or a convertible source
+(`.docx`/`.doc`/`.xlsx`/`.xls`/`.pptx`/`.ppt`) when a converter is configured for its format family in the workspace
 `conversion` config. A convertible source is converted to PDF at add time and
 the result is **persisted** alongside the stored original at
 `files/<file_id>/<stem>.pdf`; pages are rendered from it and generation reuses
@@ -2012,7 +2012,8 @@ When `<path>` is a directory, `dgml file add` walks it for ingestible
 files, lex-sorts them, and runs the same per-file pipeline on each — one
 subprocess, one config load, one DocSet-store read for the whole batch
 instead of per file. "Ingestible" means `.pdf` always, plus the convertible
-source extensions (`.docx`/`.doc`/`.xlsx`/`.xls`, case-insensitive) **whose
+source extensions (`.docx`/`.doc`/`.xlsx`/`.xls`/`.pptx`/`.ppt`,
+case-insensitive) **whose
 format family has a converter configured** in the workspace `conversion`
 config. Convertible sources with no configured converter are skipped, not
 gathered — so a folder of PDFs with stray Office docs doesn't produce a pile
@@ -3298,8 +3299,8 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `UNSUPPORTED_FILE_TYPE` | hard | `file add` path is neither a PDF nor a convertible source. |
 | `INVALID_PDF` | hard | File does not start with the `%PDF-` magic. |
 | `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
-| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed. |
-| `CONVERSION_FAILED` | hard / soft | A docx/xlsx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
+| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed, or a family's converter cannot be resolved or does not handle that family's file types (checked before a file is added or gathered, so a misconfigured family is one error, not one per file). |
+| `CONVERSION_FAILED` | hard / soft | A docx/xlsx/pptx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
 | `OCR_CONFIG_MISSING` | hard | `--text-mode ocr`/`hybrid` with no `ocr` config section. |
 | `OCR_CONFIG_INVALID` | hard | The `ocr` config section has invalid fields, or names a provider that cannot be resolved. |
 | `OCR_FAILED` | soft | Provider API failure during `--text-mode ocr`/`hybrid`; recorded on the File (`text_extraction_error`). |

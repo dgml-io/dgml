@@ -25,7 +25,7 @@ a usable projected space for clustering.
 from __future__ import annotations
 
 import math
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
@@ -33,6 +33,7 @@ from clustering.config.schema import (
     UNSUPERVISED_LOSSES,
     Config,
     FusionConfig,
+    FusionName,
     ManifoldConfig,
     ManifoldName,
     TrainingConfig,
@@ -67,7 +68,7 @@ def _projector(
     torch.manual_seed(seed)
     curvature = 0.0 if manifold_name == "euclidean" else 1.0
     m = build_manifold(
-        ManifoldConfig(name=cast(ManifoldName, manifold_name), dim=dim, curvature=curvature)
+        ManifoldConfig(name=ManifoldName(manifold_name), dim=dim, curvature=curvature)
     )
     return ManifoldProjector(m, input_dim=dim, output_dim=dim, trainable=True)
 
@@ -81,7 +82,7 @@ def _cfg(**overrides: Any) -> TrainingConfig:
 # ── Schema ───────────────────────────────────────────────────────────────
 def test_unsupervised_loss_names_validate() -> None:
     for name in ("pseudo_label", "knn_contrastive", "cross_modal"):
-        assert TrainingConfig(loss=name).loss == name
+        assert TrainingConfig.model_validate({"loss": name}).loss == name
         assert name in UNSUPERVISED_LOSSES
     # The supervised trio is NOT in the unsupervised set.
     assert UNSUPERVISED_LOSSES.isdisjoint({"contrastive", "triplet", "prototypical"})
@@ -159,7 +160,7 @@ def test_knn_contrastive_trains_and_optimizes_prototypes() -> None:
 
 
 def test_neighbor_consistency_loss_entropy_term_penalizes_collapse() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=DIM, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=DIM, curvature=0.0))
     loss = NeighborConsistencyLoss(m, n_clusters=3, dim=DIM, entropy_weight=1.0, seed=0)
     z = m.expmap0(_blobs())
     # Soft assignments are valid distributions.
@@ -193,7 +194,7 @@ def test_cross_modal_trains_with_views() -> None:
 
 # ── VICReg ───────────────────────────────────────────────────────────────
 def test_vicreg_zero_for_single_sample_and_positive_for_collapse() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=DIM, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=DIM, curvature=0.0))
     reg = VICRegRegularizer(m, var_weight=1.0, cov_weight=1.0, gamma=1.0)
     assert float(reg(torch.zeros(1, DIM))) == 0.0
     # Fully collapsed batch: std≈0 in every dim → var hinge ≈ gamma
@@ -306,7 +307,7 @@ def test_s1_supervised_loss_reports_not_unsupervised() -> None:
 # ── Hyperbolic numerical stability (acosh-at-1 NaN gradient) ─────────────
 def test_hyperbolic_dist_has_finite_gradient_for_coincident_points() -> None:
     """acosh'(1) = +inf; dist(x, x) must still backprop without NaN."""
-    m = build_manifold(ManifoldConfig(name="hyperbolic", dim=DIM, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.HYPERBOLIC, dim=DIM, curvature=1.0))
     x = torch.randn(4, DIM, requires_grad=True)
     z = m.expmap0(x)
     m.dist(z, z.detach()).sum().backward()  # type: ignore[no-untyped-call]
@@ -320,7 +321,7 @@ def test_pseudo_label_on_hyperbolic_does_not_diverge_to_nan() -> None:
     Regression for the acosh-at-1 NaN that surfaced downstream as
     'PCA: Input X contains NaN' once the projector weights blew up.
     """
-    m = build_manifold(ManifoldConfig(name="hyperbolic", dim=DIM, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.HYPERBOLIC, dim=DIM, curvature=1.0))
     torch.manual_seed(0)
     proj = ManifoldProjector(m, input_dim=DIM, output_dim=DIM, trainable=True)
     base = torch.randn(1, DIM)
@@ -393,7 +394,7 @@ def test_train_fusion_projector_rejects_cross_modal() -> None:
 
     # late_concat has trainable weights; dims are arbitrary for the guard.
     fusion = build_fusion(
-        FusionConfig(name="late_concat", output_dim=DIM), text_dim=DIM, image_dim=DIM
+        FusionConfig(name=FusionName.LATE_CONCAT, output_dim=DIM), text_dim=DIM, image_dim=DIM
     )
     proj = _projector(dim=DIM)
     with pytest.raises(ValueError, match="cross_modal"):
@@ -405,3 +406,14 @@ def test_train_fusion_projector_rejects_cross_modal() -> None:
             [None] * 6,
             cfg=_cfg(loss="cross_modal"),
         )
+
+
+def test_unknown_loss_raises_value_error() -> None:
+    # Pydantic rejects an unknown loss on construction; ``model_construct``
+    # skips that, and the name must still fail as a ValueError, not an
+    # AssertionError from the exhaustive dispatch.
+    bogus = TrainingConfig.model_construct(**{**_cfg().model_dump(), "loss": "bogus"})
+    fused = _blobs()
+    labels = [f"c{i % 3}" for i in range(fused.shape[0])]
+    with pytest.raises(ValueError, match=r"Unknown loss: 'bogus'"):
+        train_projector(_projector(), fused, labels, cfg=bogus)

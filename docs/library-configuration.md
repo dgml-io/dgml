@@ -104,7 +104,7 @@ or litellm sends the provider's env-var key to that host; `ollama/` needs none. 
 | `Pdf(provider)` | `[pdf]` | `ghostscript` (default) or `pypdfium2`. |
 | `Style(model, max_tokens, enabled=True)` | `[style]` | Building one enables the feature. |
 | `TextExtraction(model, temperature, max_tokens, enabled=True)` | `[text_extraction]` | Same. |
-| `Conversion(families={"docx": ProviderSpec(...)})` | `[conversion]` | One provider per format family. |
+| `Conversion(families={FormatFamily.DOCX: ProviderSpec(...)})` | `[conversion]` | One provider per format family. |
 | `Generation(model, label_model, thinking)` | `[generation]` | Both passes default to the standard tier. |
 | `Clustering(overrides)` | `[clustering]` | Free-form; validated by the clusterer. |
 

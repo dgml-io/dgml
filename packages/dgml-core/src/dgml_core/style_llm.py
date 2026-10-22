@@ -43,7 +43,7 @@ from .generation.transcribe import strip_fences
 from .storage import Workspace
 from .storage_service import BlobStore
 from .style import ALLOWED, merge_styles, validate_style
-from .usage import OPERATION_STYLE_ANNOTATE
+from .usage import UsageOperation
 from .utils import page_image_key
 
 if TYPE_CHECKING:
@@ -213,7 +213,7 @@ def prepare_style_jobs(
                     config,
                     workspace=workspace,
                     record_usage=record_usage,
-                    operation=OPERATION_STYLE_ANNOTATE,
+                    operation=UsageOperation.STYLE_ANNOTATE,
                     context={"file_id": file_id, "page": page},
                 ),
             )

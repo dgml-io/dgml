@@ -41,6 +41,7 @@ from dgml_core.configuration import (
     Style,
     TextExtraction,
 )
+from dgml_core.conversion import FormatFamily
 from dgml_core.default_config import PROVIDER_MODELS
 from dgml_core.errors import GroundedConfigMissing, InvalidArgument
 from dgml_core.models_config import ConfigSection, Tier, resolve_tiered_model
@@ -93,7 +94,9 @@ def test_every_section_renders_its_loader_keys() -> None:
         pdf=Pdf(provider="pypdfium2"),
         style=Style(model=Model("st")),
         text_extraction=TextExtraction(model=Model("te"), temperature=0.5, enabled=False),
-        conversion=Conversion({"docx": ProviderSpec("mod:Conv", {"binary": "/usr/bin/x"})}),
+        conversion=Conversion(
+            {FormatFamily.DOCX: ProviderSpec("mod:Conv", {"binary": "/usr/bin/x"})}
+        ),
         generation=Generation(
             model=Model("g"), label_model=Model("l", api_key="lk"), thinking="disabled"
         ),
@@ -423,7 +426,9 @@ def test_reprs_never_show_a_credential() -> None:
             family="anthropic", anthropic_api_key="SECRET-ant", expert=expert, advanced=advanced
         ),
         ocr=Ocr(provider="azure", options={"endpoint": "https://e", "api_key": "SECRET-ocr"}),
-        conversion=Conversion({"docx": ProviderSpec("mod:Conv", {"auth_token": "SECRET-tok"})}),
+        conversion=Conversion(
+            {FormatFamily.DOCX: ProviderSpec("mod:Conv", {"auth_token": "SECRET-tok"})}
+        ),
     )
     objects = [cfg, cfg.storage, spec, cfg.models, cfg.models.expert, expert]
     objects += list(cfg.storage.store_configs(root=Path("/r"), workspace_id="t"))

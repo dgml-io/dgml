@@ -24,7 +24,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 from clustering.utils import resolve_device
 
@@ -73,16 +73,16 @@ class HFVisionEncoder(Encoder[Image.Image]):
         return EncoderOutput(pooled=pooled.detach().cpu())
 
 
-@register_encoder("dit")
+@register_encoder(EncoderName.DIT)
 def _factory_dit(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return HFVisionEncoder(cfg, device=device)
 
 
-@register_encoder("vit")
+@register_encoder(EncoderName.VIT)
 def _factory_vit(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return HFVisionEncoder(cfg, device=device)
 
 
-@register_encoder("donut")
+@register_encoder(EncoderName.DONUT)
 def _factory_donut(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return HFVisionEncoder(cfg, device=device)

@@ -22,22 +22,36 @@ which is sensitive to each algorithm's defaults.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
-from clustering.config.schema import ManifoldConfig
+from clustering.config.schema import (
+    ClusterAlgorithm,
+    LeidenGraphMethod,
+    LeidenKSelection,
+    ManifoldConfig,
+    ManifoldName,
+    ScenarioName,
+)
 from clustering.manifolds import build_manifold
 from clustering.scenarios.clustering import (
-    ClusterAlgorithm,
     _radius_knee,
     cluster_embeddings,
     manifold_affinity_propagation,
     manifold_dbscan,
+    manifold_graph_cc,
     manifold_leiden,
     manifold_meanshift,
     manifold_optics,
 )
 
-_ALGORITHMS: list[ClusterAlgorithm] = ["dbscan", "optics", "affinity_propagation", "meanshift"]
+_ALGORITHMS: list[ClusterAlgorithm] = [
+    ClusterAlgorithm.DBSCAN,
+    ClusterAlgorithm.OPTICS,
+    ClusterAlgorithm.AFFINITY_PROPAGATION,
+    ClusterAlgorithm.MEANSHIFT,
+]
 
 
 def _three_blobs(dim: int = 8, per: int = 12) -> torch.Tensor:
@@ -67,7 +81,7 @@ def test_discovers_multiple_clusters(algorithm: ClusterAlgorithm) -> None:
     dim = 8
     emb = _three_blobs(dim=dim)
     n = emb.shape[0]
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
 
     labels, centroids = cluster_embeddings(emb, manifold=manifold, algorithm=algorithm, seed=0)
 
@@ -79,7 +93,7 @@ def test_discovers_multiple_clusters(algorithm: ClusterAlgorithm) -> None:
 @pytest.mark.parametrize("algorithm", _ALGORITHMS)
 def test_empty_input(algorithm: ClusterAlgorithm) -> None:
     dim = 4
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
     labels, centroids = cluster_embeddings(
         torch.zeros((0, dim)), manifold=manifold, algorithm=algorithm
     )
@@ -90,7 +104,7 @@ def test_empty_input(algorithm: ClusterAlgorithm) -> None:
 @pytest.mark.parametrize("algorithm", _ALGORITHMS)
 def test_single_point(algorithm: ClusterAlgorithm) -> None:
     dim = 4
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
     labels, _ = cluster_embeddings(torch.ones((1, dim)), manifold=manifold, algorithm=algorithm)
     assert labels.shape == (1,)
     # A lone point is either its own cluster or noise — never crashes.
@@ -100,7 +114,7 @@ def test_single_point(algorithm: ClusterAlgorithm) -> None:
 def test_dbscan_explicit_eps_matches_auto_contract() -> None:
     dim = 8
     emb = _three_blobs(dim=dim)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
     labels, centroids = manifold_dbscan(emb, manifold=manifold, eps=1.0, min_samples=3)
     _assert_contract(labels, centroids, emb.shape[0], dim)
     assert len({int(x) for x in labels.tolist() if int(x) >= 0}) >= 2
@@ -110,7 +124,7 @@ def test_meanshift_cluster_all_false_allows_noise() -> None:
     # With a tiny bandwidth, lone points can't reach a mode → noise (-1).
     dim = 8
     emb = _three_blobs(dim=dim)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
     labels, _ = manifold_meanshift(
         emb, manifold=manifold, bandwidth=0.05, cluster_all=False, seed=0
     )
@@ -121,7 +135,7 @@ def test_optics_and_affinity_importable_and_run() -> None:
     # Smoke test the two functions not otherwise exercised individually.
     dim = 8
     emb = _three_blobs(dim=dim)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
     for fn in (manifold_optics, manifold_affinity_propagation):
         labels, centroids = fn(emb, manifold=manifold)
         _assert_contract(labels, centroids, emb.shape[0], dim)
@@ -138,7 +152,7 @@ def test_leiden_radius_mode_still_consumes_k_neighbors() -> None:
     """
     dim = 8
     emb = _three_blobs(dim=dim)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
     d_np = manifold.pairwise_dist(emb, emb).detach().numpy()
 
     r_small = _radius_knee(d_np, k=2)
@@ -146,8 +160,12 @@ def test_leiden_radius_mode_still_consumes_k_neighbors() -> None:
     assert r_small != r_big, "the knee must move with k, else this test proves nothing"
 
     # Auto-radius at k=20 must reproduce the run that is *told* that radius.
-    auto, _ = manifold_leiden(emb, manifold, graph_method="radius", k_neighbors=20, seed=0)
-    explicit, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=r_big, seed=0)
+    auto, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.RADIUS, k_neighbors=20, seed=0
+    )
+    explicit, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.RADIUS, radius=r_big, seed=0
+    )
     assert torch.equal(auto, explicit)
 
 
@@ -158,9 +176,13 @@ def test_leiden_radius_mode_ignores_k_neighbors_once_radius_is_explicit() -> Non
     """
     dim = 8
     emb = _three_blobs(dim=dim)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
-    a, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=1.0, k_neighbors=2, seed=0)
-    b, _ = manifold_leiden(emb, manifold, graph_method="radius", radius=1.0, k_neighbors=20, seed=0)
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
+    a, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.RADIUS, radius=1.0, k_neighbors=2, seed=0
+    )
+    b, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.RADIUS, radius=1.0, k_neighbors=20, seed=0
+    )
     assert torch.equal(a, b)
 
 
@@ -172,9 +194,13 @@ def test_leiden_k_selection_off_is_byte_identical() -> None:
     plain single leiden run — byte-identical to calling it directly."""
     dim = 8
     emb = _three_blobs(dim=dim, per=12)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
-    off, _ = cluster_embeddings(emb, manifold=manifold, algorithm="leiden", leiden_k_neighbors=25)
-    ref, _ = manifold_leiden(emb, manifold, graph_method="knn", k_neighbors=25, seed=0)
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
+    off, _ = cluster_embeddings(
+        emb, manifold=manifold, algorithm=ClusterAlgorithm.LEIDEN, leiden_k_neighbors=25
+    )
+    ref, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.KNN, k_neighbors=25, seed=0
+    )
     assert torch.equal(off, ref)
 
 
@@ -183,14 +209,16 @@ def test_leiden_k_selection_large_margin_never_switches() -> None:
     the result equals the selection-off run — the gate's conservative extreme."""
     dim = 8
     emb = _three_blobs(dim=dim, per=12)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
-    off, _ = cluster_embeddings(emb, manifold=manifold, algorithm="leiden", leiden_k_neighbors=25)
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
+    off, _ = cluster_embeddings(
+        emb, manifold=manifold, algorithm=ClusterAlgorithm.LEIDEN, leiden_k_neighbors=25
+    )
     held, _ = cluster_embeddings(
         emb,
         manifold=manifold,
-        algorithm="leiden",
+        algorithm=ClusterAlgorithm.LEIDEN,
         leiden_k_neighbors=25,
-        leiden_k_selection="silhouette",
+        leiden_k_selection=LeidenKSelection.SILHOUETTE,
         leiden_k_selection_margin=9.9,
     )
     assert torch.equal(held, off)
@@ -201,15 +229,17 @@ def test_leiden_k_selection_only_fires_on_the_knn_graph() -> None:
     a non-knn graph ignores it and runs the configured k unchanged."""
     dim = 8
     emb = _three_blobs(dim=dim, per=12)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
-    ref, _ = manifold_leiden(emb, manifold, graph_method="mutual_knn", k_neighbors=25, seed=0)
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
+    ref, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.MUTUAL_KNN, k_neighbors=25, seed=0
+    )
     got, _ = cluster_embeddings(
         emb,
         manifold=manifold,
-        algorithm="leiden",
-        leiden_graph_method="mutual_knn",
+        algorithm=ClusterAlgorithm.LEIDEN,
+        leiden_graph_method=LeidenGraphMethod.MUTUAL_KNN,
         leiden_k_neighbors=25,
-        leiden_k_selection="silhouette",
+        leiden_k_selection=LeidenKSelection.SILHOUETTE,
         leiden_k_selection_margin=0.0,
     )
     assert torch.equal(got, ref)
@@ -221,14 +251,16 @@ def test_leiden_k_selection_is_a_noop_when_the_candidate_would_not_lower_k() -> 
     configured run is returned unchanged (no wasted second clustering effect)."""
     dim = 8
     emb = _three_blobs(dim=dim, per=12)  # n = 36 → candidate k = 4
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
-    ref, _ = manifold_leiden(emb, manifold, graph_method="knn", k_neighbors=3, seed=0)
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
+    ref, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.KNN, k_neighbors=3, seed=0
+    )
     got, _ = cluster_embeddings(
         emb,
         manifold=manifold,
-        algorithm="leiden",
+        algorithm=ClusterAlgorithm.LEIDEN,
         leiden_k_neighbors=3,  # <= candidate 4, so selection can't lower it
-        leiden_k_selection="silhouette",
+        leiden_k_selection=LeidenKSelection.SILHOUETTE,
         leiden_k_selection_margin=0.0,
     )
     assert torch.equal(got, ref)
@@ -251,15 +283,19 @@ def test_leiden_k_selection_switches_to_the_higher_silhouette_partition() -> Non
 
     dim = 8
     emb = _closish_blobs(dim=dim, per=15)  # n = 45 → candidate k = 5
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
-    off, _ = cluster_embeddings(emb, manifold=manifold, algorithm="leiden", leiden_k_neighbors=35)
-    candidate, _ = manifold_leiden(emb, manifold, graph_method="knn", k_neighbors=5, seed=0)
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
+    off, _ = cluster_embeddings(
+        emb, manifold=manifold, algorithm=ClusterAlgorithm.LEIDEN, leiden_k_neighbors=35
+    )
+    candidate, _ = manifold_leiden(
+        emb, manifold, graph_method=LeidenGraphMethod.KNN, k_neighbors=5, seed=0
+    )
     sel, _ = cluster_embeddings(
         emb,
         manifold=manifold,
-        algorithm="leiden",
+        algorithm=ClusterAlgorithm.LEIDEN,
         leiden_k_neighbors=35,
-        leiden_k_selection="silhouette",
+        leiden_k_selection=LeidenKSelection.SILHOUETTE,
         leiden_k_selection_margin=0.0,
     )
     # The candidate must genuinely win on silhouette here, else the test proves nothing.
@@ -273,7 +309,7 @@ def test_leiden_k_selection_margin_rejects_a_negative_value() -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError, match="leiden_k_selection_margin must be >= 0"):
-        ScenarioConfig(name="s1", leiden_k_selection_margin=-0.1)
+        ScenarioConfig(name=ScenarioName.S1, leiden_k_selection_margin=-0.1)
 
 
 def test_leiden_k_selection_does_not_leak_into_the_emergent_bucket() -> None:
@@ -287,11 +323,55 @@ def test_leiden_k_selection_does_not_leak_into_the_emergent_bucket() -> None:
 
     dim = 8
     emb = _three_blobs(dim=dim, per=12)
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
-    base = ScenarioConfig(name="s2", cluster_algorithm="leiden", leiden_graph_method="knn")
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
+    base = ScenarioConfig(
+        name=ScenarioName.S2,
+        cluster_algorithm=ClusterAlgorithm.LEIDEN,
+        leiden_graph_method=LeidenGraphMethod.KNN,
+    )
     on = base.model_copy(
         update={"leiden_k_selection": "silhouette", "leiden_k_selection_margin": 0.0}
     )
     off_labels, _ = cluster_emergent_bucket(emb, scenario=base, manifold=manifold, seed=0)
     on_labels, _ = cluster_emergent_bucket(emb, scenario=on, manifold=manifold, seed=0)
     assert torch.equal(off_labels, on_labels)
+
+
+# ── Unknown names fail with the choices listed ────────────────────────────
+# The signatures take enum members, but a caller may pass a plain string. An
+# unknown one must raise a ValueError naming the valid choices — not reach an
+# ``assert_never`` as a bare AssertionError.
+_BOGUS: Any = "bogus"
+_R_METHOD_ERROR = r"Unknown r_method 'bogus'; expected 'knee' or 'mst_gap'\."
+
+
+@pytest.mark.parametrize(
+    ("function", "match"),
+    [
+        (
+            "cluster_embeddings",
+            r"Unknown clustering algorithm 'bogus'; expected one of 'kmeans', 'hdbscan', "
+            r"'graph_cc', 'leiden', 'dbscan', 'optics', 'affinity_propagation', 'meanshift'\.",
+        ),
+        (
+            "manifold_leiden",
+            r"Unknown graph_method 'bogus'; expected 'knn', 'mutual_knn', or 'radius'\.",
+        ),
+        ("manifold_graph_cc", _R_METHOD_ERROR),
+        ("manifold_dbscan", _R_METHOD_ERROR),
+    ],
+)
+def test_unknown_string_choice_raises_value_error_listing_choices(
+    function: str, match: str
+) -> None:
+    emb = _three_blobs(dim=8)
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
+    with pytest.raises(ValueError, match=match):
+        if function == "cluster_embeddings":
+            cluster_embeddings(emb, m, algorithm=_BOGUS, k=3)
+        elif function == "manifold_leiden":
+            manifold_leiden(emb, manifold=m, graph_method=_BOGUS)
+        elif function == "manifold_graph_cc":
+            manifold_graph_cc(emb, manifold=m, r_method=_BOGUS)
+        else:
+            manifold_dbscan(emb, manifold=m, r_method=_BOGUS)

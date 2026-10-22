@@ -32,7 +32,7 @@ from dgml_core.batch import FakeBackend, register_backend
 from dgml_core.batch import registry as batch_registry
 from dgml_core.docsets import DocSetStore
 from dgml_core.storage import Workspace
-from dgml_core.usage import TIER_BATCH, read_events
+from dgml_core.usage import PricingTier, read_events
 
 from .conftest import _write_text_pdf, dump_toml, needs_gs
 from .test_cli import (
@@ -197,7 +197,7 @@ def test_all_batch_matches_sync_and_adds_a_batch_block(
     assert batch["batch"]["requests"] == 3 and batch["batch"]["sync_fallbacks"] == 0
     assert fakes.submitted("anthropic") == [3]
     rows = read_events(Workspace(root=ws))
-    assert [r["tier"] for r in rows] == [TIER_BATCH] * 3
+    assert [r["tier"] for r in rows] == [PricingTier.BATCH] * 3
 
 
 def test_batch_isolates_a_failing_file(

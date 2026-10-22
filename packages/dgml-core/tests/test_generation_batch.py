@@ -32,7 +32,13 @@ from typing import Any
 
 import pytest
 from dgml_core import llm
-from dgml_core.batch import BatchItemError, BatchRequest, FakeBackend, register_backend
+from dgml_core.batch import (
+    BatchItemError,
+    BatchRequest,
+    FakeBackend,
+    ItemErrorKind,
+    register_backend,
+)
 from dgml_core.batch import registry as batch_registry
 from dgml_core.configuration import Configuration, Generation, Identity, ProviderSpec, Storage
 from dgml_core.errors import GenerationConfigInvalid
@@ -147,7 +153,7 @@ class _Provider:
         except RuntimeError as exc:
             # Not retryable: the executor serves it synchronously, where the
             # same answer raises again — the outcome the sync path sees.
-            return BatchItemError(request.custom_id, "invalid", str(exc))
+            return BatchItemError(request.custom_id, ItemErrorKind.INVALID, str(exc))
 
 
 @pytest.fixture

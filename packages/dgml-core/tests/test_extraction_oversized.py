@@ -32,6 +32,7 @@ from unittest.mock import patch
 
 import pytest
 from dgml_core import layout
+from dgml_core.batch import ItemErrorKind
 from dgml_core.default_config import PROVIDER_MODELS
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import ValuesExtractionFailed
@@ -286,7 +287,7 @@ def test_oversized_pdf_is_split_under_batch_like_sync(workspace: Workspace, tmp_
 
     def script(req: BatchRequest) -> Any:
         if len(json.dumps(req.kwargs["messages"]).encode()) > _LIMIT:
-            return BatchItemError(req.custom_id, "invalid", "request_too_large")
+            return BatchItemError(req.custom_id, ItemErrorKind.INVALID, "request_too_large")
         return _bill_model(req.kwargs)
 
     executor = BatchExecutor(FakeBackend(script), min_wave_size=1, sleep=lambda _s: None)

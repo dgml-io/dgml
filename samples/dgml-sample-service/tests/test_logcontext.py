@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from dgml_core import ClassificationDecision
+from dgml_core import ClassificationDecision, DecisionKind
 from dgml_sample_service import operations
 from dgml_sample_service.logcontext import (
     NO_WORKSPACE,
@@ -129,7 +129,7 @@ def test_job_lines_carry_the_workspace_id(
         operations,
         "classify_file",
         lambda ws, fid, **kw: ClassificationDecision(
-            decision="existing", existing_docset_id=ds["id"]
+            decision=DecisionKind.EXISTING, existing_docset_id=ds["id"]
         ),
     )
 

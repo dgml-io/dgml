@@ -17,18 +17,19 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from dgml_core.batch import BatchExecutor, BatchItemError, BatchRequest, FakeBackend
+from dgml_core.batch import BatchExecutor, BatchItemError, BatchRequest, FakeBackend, ItemErrorKind
 from dgml_core.classification import (
     ClassificationConfig,
     ClassificationDecision,
     ClassifyMode,
+    DecisionKind,
     classify_file,
     classify_files_batch,
 )
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import BatchExecutionFailed, ClassificationFailed, NoExistingDocSets
 from dgml_core.storage import Workspace
-from dgml_core.usage import TIER_BATCH, read_events
+from dgml_core.usage import PricingTier, read_events
 
 from .test_classification import (
     DEFAULT_TEST_MODEL,
@@ -92,7 +93,7 @@ def test_usage_rows_are_batch_tier_with_context(workspace: Workspace) -> None:
         workspace, fids, config=_cfg(), docsets=docsets, executor=executor, record_usage=True
     )
     rows = read_events(workspace)
-    assert [r["tier"] for r in rows] == [TIER_BATCH, TIER_BATCH]
+    assert [r["tier"] for r in rows] == [PricingTier.BATCH, PricingTier.BATCH]
     assert [r["context"]["file_ids"] for r in rows] == [[f] for f in fids]
 
 
@@ -125,7 +126,9 @@ def test_failures_are_isolated_and_match_sync_messages(
 
     def script(req: BatchRequest) -> Any:
         if "fake-2" in _decoded(str(req.kwargs["messages"])):
-            return BatchItemError(req.custom_id, "invalid", "rejected")  # → sync fallback raises
+            return BatchItemError(
+                req.custom_id, ItemErrorKind.INVALID, "rejected"
+            )  # → sync fallback raises
         return sync_respond(req.kwargs)
 
     executor, _ = _executor(script)
@@ -166,7 +169,9 @@ def test_single_docset_needs_no_request_when_forced(workspace: Workspace) -> Non
         executor=executor,
         mode=ClassifyMode.EXISTING_FORCED,
     )
-    assert batch == {"a": ClassificationDecision(decision="existing", existing_docset_id=only.id)}
+    assert batch == {
+        "a": ClassificationDecision(decision=DecisionKind.EXISTING, existing_docset_id=only.id)
+    }
     assert backend.submitted == []
 
 

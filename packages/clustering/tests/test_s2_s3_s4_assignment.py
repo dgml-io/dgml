@@ -33,11 +33,11 @@ from typing import Any
 
 import pytest
 import torch
-from clustering.config.schema import Config
+from clustering.config.schema import Config, LeidenGraphMethod
 from clustering.data.datasets import DocumentDataset, DocumentRecord
 from clustering.encoders.base import Encoder, EncoderOutput
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario
-from clustering.scenarios.clustering import LeidenGraphMethod, emergent_bucket_k_neighbors
+from clustering.scenarios.clustering import emergent_bucket_k_neighbors
 from clustering.scenarios.s2_partial_labels import S2PartialLabels
 from clustering.scenarios.s3_partial_few_shot import S3PartialFewShot
 from clustering.scenarios.s4_zero_shot import S4ZeroShot

@@ -45,6 +45,7 @@ from dgml_core.classification import (
     ClassificationConfig,
     ClassificationDecision,
     ClassifyMode,
+    DecisionKind,
     classify_file,
     load_classification_config,
 )
@@ -114,11 +115,11 @@ def apply_classification(
     # when the store says otherwise — bulk callers count ``unassigned`` from it.
     docset_store = DocSetStore(ws)
     try:
-        if decision.decision == "existing":
+        if decision.decision == DecisionKind.EXISTING:
             assert decision.existing_docset_id is not None
             existing = docset_store.get(decision.existing_docset_id)
             assigned = {
-                "decision": "existing",
+                "decision": DecisionKind.EXISTING.value,
                 "docset_id": existing.id,
                 "docset_name": existing.name,
                 "docset_key_questions": list(existing.key_questions),
@@ -133,7 +134,7 @@ def apply_classification(
             block.update(assigned)
             if extraction_block is not None:
                 block["extraction"] = extraction_block
-        elif decision.decision == "new":
+        elif decision.decision == DecisionKind.NEW:
             assert decision.new_name is not None and decision.new_description is not None
             if create is not None:
                 created, fresh = create(decision)
@@ -157,16 +158,16 @@ def apply_classification(
             if docsets is not None:
                 docsets.append(created)
             block.update(
-                decision="new",
+                decision=DecisionKind.NEW.value,
                 docset_id=created.id,
                 docset_created=True,
                 docset_name=created.name,
                 docset_key_questions=list(created.key_questions),
             )
-        elif decision.decision == "none":
+        elif decision.decision == DecisionKind.NONE:
             # No existing DocSet fits: leave the file unassigned so the
             # caller's own unknown-type handling runs.
-            block.update(decision="none", decline_reason=decision.reason)
+            block.update(decision=DecisionKind.NONE.value, decline_reason=decision.reason)
         else:
             assert_never(decision.decision)
     except DgmlError as exc:

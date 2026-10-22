@@ -44,19 +44,17 @@ from dgml_core.batch import (
 )
 from dgml_core.batch import registry as batch_registry
 from dgml_core.batch.jobs import (
-    RECORD_COLLECTED,
-    RECORD_DROPPED,
-    RECORD_SETTLING,
-    STATUS_COMPLETED,
     BatchJobStore,
     JobSession,
+    JobStatus,
+    RecordState,
     cancel_job,
     job_status,
     prune_jobs,
 )
 from dgml_core.errors import BatchExecutionFailed, BatchJobInvalid, BatchPending
 from dgml_core.storage import Workspace
-from dgml_core.usage import TIER_BATCH, TIER_STANDARD
+from dgml_core.usage import PricingTier
 
 T0 = 1_800_000_000.0  # 2027-01-15T08:00:00Z
 
@@ -170,7 +168,7 @@ def test_deadline_mid_wave_cancels_collects_partial_results_and_runs_the_rest_sy
         "u_c": "sync:c",
         "u_d": "sync:d",
     }
-    assert _tier(out["u_a"]) == TIER_BATCH and _tier(out["u_c"]) == TIER_STANDARD
+    assert _tier(out["u_a"]) == PricingTier.BATCH and _tier(out["u_c"]) == PricingTier.STANDARD
     assert sorted(sync.calls) == ["c", "d"]
     assert backend.canceled == ["fake_batch_0001"]
     assert len(backend.submitted) == 1  # the canceled requests were never resubmitted
@@ -197,7 +195,7 @@ def test_after_the_deadline_later_waves_run_synchronously_without_submitting() -
     ex, sync = _executor(backend, clock, deadline)
 
     first = ex.run_wave(_wave("a"))
-    assert _tier(first["u_a"]) == TIER_BATCH and not deadline.fired
+    assert _tier(first["u_a"]) == PricingTier.BATCH and not deadline.fired
     clock.now = T0 + 101
     second = ex.run_wave(_wave("b", "c"))
 
@@ -282,7 +280,7 @@ def test_no_deadline_leaves_polling_exactly_as_before() -> None:
     backend = FakeBackend(_answer, polls_until_ended=2)
     ex, sync = _executor(backend, clock, None)
     out = ex.run_wave(_wave("a"))
-    assert _tier(out["u_a"]) == TIER_BATCH and sync.calls == []
+    assert _tier(out["u_a"]) == PricingTier.BATCH and sync.calls == []
     assert clock.sleeps == [60.0, 60.0]
     assert backend.canceled == []
 
@@ -435,7 +433,7 @@ def test_pause_then_resume_after_the_deadline_cancels_collects_and_finishes_sync
     assert {cid: _text(r) for cid, r in out.items()} == {"u_a": "batch:a", "u_b": "sync:b"}
     assert calls == ["b"]
     assert len(backend.submitted) == 1 and backend.canceled == ["fake_batch_0001"]
-    assert [r["state"] for r in manifest.provider_batches] == [RECORD_COLLECTED]
+    assert [r["state"] for r in manifest.provider_batches] == [RecordState.COLLECTED]
     assert resumed.deadline_json() == {
         "at": "2027-01-15T09:00:00Z",
         "expired": True,
@@ -444,7 +442,7 @@ def test_pause_then_resume_after_the_deadline_cancels_collects_and_finishes_sync
         "sync_after_deadline": 1,
         "possibly_double_billed": 0,
     }
-    assert BatchJobStore(ws, job_id).load().status == STATUS_COMPLETED
+    assert BatchJobStore(ws, job_id).load().status == JobStatus.COMPLETED
 
 
 def test_a_post_deadline_sync_response_is_replayed_by_a_later_run(ws: Workspace) -> None:
@@ -582,7 +580,7 @@ def test_an_unsettled_cancel_is_kept_settling_and_no_late_result_replaces_the_sy
 
     manifest = BatchJobStore(ws, job_id).load()
     (record,) = manifest.provider_batches
-    assert record["state"] == RECORD_SETTLING and record["possibly_double_billed"] == 2
+    assert record["state"] == RecordState.SETTLING and record["possibly_double_billed"] == 2
     assert "not settled after 60s" in record["settling_reason"]
     assert manifest.open_records() == []  # never polled or collected as open
     assert manifest.deadline is not None
@@ -607,7 +605,7 @@ def test_an_unsettled_cancel_is_kept_settling_and_no_late_result_replaces_the_sy
     assert block["settling_batches"] == 0
     assert block["late_billed"] == 2 and block["late_billed_usd"] == 0.5
     (record,) = BatchJobStore(ws, job_id).load().provider_batches
-    assert record["state"] == RECORD_DROPPED and record["cleanup"] == "done"
+    assert record["state"] == RecordState.DROPPED and record["cleanup"] == "done"
     assert record["late_billed"] == {"requests": 2, "cost_usd": 0.5}
 
 
@@ -624,7 +622,7 @@ def test_status_polls_a_settling_batch_without_downloading_and_prune_keeps_the_j
     assert job_id in pruned["kept"] and pruned["settling"] == [job_id]
     status = job_status(ws, job_id)
     (entry,) = status["batches"]
-    assert entry["state"] == RECORD_SETTLING and entry["done"] is False
+    assert entry["state"] == RecordState.SETTLING and entry["done"] is False
     assert status["deadline"]["settling_batches"] == 1
     assert status["deadline"]["late_billed"] == 0
 
@@ -644,14 +642,14 @@ def test_status_polls_a_settling_batch_without_downloading_and_prune_keeps_the_j
     assert entry["done"] is True and "late_billed" not in entry
     assert downloads == []
     # Read-only: nothing stored, nothing cleaned up.
-    assert BatchJobStore(ws, job_id).load().provider_batches[0]["state"] == RECORD_SETTLING
+    assert BatchJobStore(ws, job_id).load().provider_batches[0]["state"] == RecordState.SETTLING
     assert backend.cleaned == []
     backend.results = real_results  # type: ignore[method-assign]
 
     # `batch cancel` records it for good and cleans the batch up.
     payload = cancel_job(ws, job_id)
     (entry,) = payload["batches"]
-    assert entry["state"] == RECORD_DROPPED and entry["cleanup"] == "done"
+    assert entry["state"] == RecordState.DROPPED and entry["cleanup"] == "done"
     assert entry["late_billed"] == {"requests": 2, "cost_usd": 0.5}
     assert backend.cleaned == ["fake_batch_0001"]
     assert prune_jobs(ws)["deleted"] == [job_id]
@@ -669,10 +667,10 @@ def test_a_silent_job_is_kept_while_its_deadline_cancel_is_settling(ws: Workspac
     assert session.deadline_json() is not None
     assert session.deadline_json()["possibly_double_billed"] == 1  # type: ignore[index]
     manifest = BatchJobStore(ws, session.job_id).load()
-    assert manifest.status == STATUS_COMPLETED
+    assert manifest.status == JobStatus.COMPLETED
     (record,) = manifest.provider_batches
     # Trimmed, but the settling record is kept whole for reconciling.
-    assert record["state"] == RECORD_SETTLING and record["job"]["custom_ids"]
+    assert record["state"] == RecordState.SETTLING and record["job"]["custom_ids"]
     backend.cancel_settle_polls = 0
     assert prune_jobs(ws)["deleted"] == [session.job_id]
     assert backend.cleaned == ["fake_batch_0001"]
@@ -770,7 +768,7 @@ def test_the_job_mode_settle_wait_lasts_cancel_settle_s_with_a_short_poll_interv
     assert clock.now - deadline_at >= 60.0
     manifest = BatchJobStore(ws, session.job_id).load()
     (record,) = manifest.provider_batches
-    assert record["state"] == RECORD_SETTLING
+    assert record["state"] == RecordState.SETTLING
 
 
 # ---- F10: sync_after_deadline counts only what the deadline sent to sync ------------
@@ -789,9 +787,9 @@ def test_sync_after_deadline_counts_only_deadline_caused_fallbacks() -> None:
 
     def answer(request: BatchRequest) -> Any:
         if request.custom_id == "u_invalid":
-            from dgml_core.batch import BatchItemError
+            from dgml_core.batch import BatchItemError, ItemErrorKind
 
-            return BatchItemError("u_invalid", "invalid", "schema rejected")
+            return BatchItemError("u_invalid", ItemErrorKind.INVALID, "schema rejected")
         return _answer(request)
 
     clock = Clock()
@@ -879,7 +877,7 @@ def test_a_failed_cancel_or_collect_at_the_deadline_keeps_the_job_record_settlin
     assert {_text(r) for r in out.values()} == {"sync:a", "sync:b"}
     manifest = BatchJobStore(ws, session.job_id).load()
     (record,) = manifest.provider_batches
-    assert record["state"] == RECORD_SETTLING
+    assert record["state"] == RecordState.SETTLING
     assert record["possibly_double_billed"] == 2
     assert session.deadline_json()["possibly_double_billed"] == 2  # type: ignore[index]
     assert len(_double_billed_warnings(caplog)) == 1
@@ -952,7 +950,7 @@ def test_a_job_batch_that_ended_before_its_cancel_is_collected_not_kept_settling
 
 
 def test_a_settling_record_is_not_closed_by_a_404_under_another_key(ws: Workspace) -> None:
-    from dgml_core.batch.jobs import SETTLED, reconcile_settling
+    from dgml_core.batch.jobs import reconcile_settling
     from dgml_core.batch.types import BatchNotFound
 
     clock = Clock()
@@ -960,7 +958,7 @@ def test_a_settling_record_is_not_closed_by_a_404_under_another_key(ws: Workspac
     backend.key_fingerprint = "aaaaaaaaaaaa"
     job_id, _calls = _settling_job(ws, clock, backend)
     (record,) = BatchJobStore(ws, job_id).load().provider_batches
-    assert record["state"] == RECORD_SETTLING
+    assert record["state"] == RecordState.SETTLING
     assert record["key_fingerprint"] == "aaaaaaaaaaaa"
 
     class _Gone(FakeBackend):
@@ -969,21 +967,22 @@ def test_a_settling_record_is_not_closed_by_a_404_under_another_key(ws: Workspac
 
     other = _Gone(_answer, provider="anthropic")
     other.key_fingerprint = "bbbbbbbbbbbb"
-    outcome = reconcile_settling(ws, record, backend=other)
-    assert "was not found with the API key in use" in outcome
-    assert record["state"] == RECORD_SETTLING and "cleanup" not in record
+    state, error = reconcile_settling(ws, record, backend=other)
+    assert state == RecordState.SETTLING
+    assert error is not None and "was not found with the API key in use" in error
+    assert record["state"] == RecordState.SETTLING and "cleanup" not in record
 
     # The key that created it: a 404 does show it is gone.
     other.key_fingerprint = "aaaaaaaaaaaa"
-    assert reconcile_settling(ws, record, backend=other) == SETTLED
-    assert record["state"] == RECORD_DROPPED
+    assert reconcile_settling(ws, record, backend=other) == (RecordState.DROPPED, None)
+    assert record["state"] == RecordState.DROPPED
 
 
 # ---- review: late_billed never recounts results a run already collected -------------
 
 
 def test_late_billed_skips_results_a_failed_collection_already_stored(ws: Workspace) -> None:
-    from dgml_core.batch.jobs import SETTLED, reconcile_settling
+    from dgml_core.batch.jobs import reconcile_settling
 
     class _ResultsBreakMidway(FakeBackend):
         broken = True
@@ -1007,10 +1006,10 @@ def test_late_billed_skips_results_a_failed_collection_already_stored(ws: Worksp
     # a came back before the stream broke (batch price); b ran synchronously.
     assert {cid: _text(r) for cid, r in out.items()} == {"u_a": "batch:a", "u_b": "sync:b"}
     (record,) = BatchJobStore(ws, session.job_id).load().provider_batches
-    assert record["state"] == RECORD_SETTLING and len(record["collected"]) == 1
+    assert record["state"] == RecordState.SETTLING and len(record["collected"]) == 1
 
     backend.broken = False
-    assert reconcile_settling(ws, record, backend=backend) == SETTLED
+    assert reconcile_settling(ws, record, backend=backend) == (RecordState.DROPPED, None)
     # Only b billed late; a is already in the run's own cost.
     assert record["late_billed"] == {"requests": 1, "cost_usd": 0.25}
 
@@ -1207,12 +1206,14 @@ def test_a_job_batch_gone_at_the_deadline_is_closed_out_not_kept_settling(
 
 
 def test_deadline_counters_are_safe_across_threads() -> None:
+    from dgml_core.batch.deadline import DeadlineCounter
+
     deadline = BatchDeadline(at=T0)
 
     def bump() -> None:
         for _ in range(5000):
-            deadline.count("sync_after_deadline")
-            deadline.count("possibly_double_billed", 2)
+            deadline.count(DeadlineCounter.SYNC_AFTER_DEADLINE)
+            deadline.count(DeadlineCounter.POSSIBLY_DOUBLE_BILLED, 2)
 
     threads = [threading.Thread(target=bump) for _ in range(8)]
     for thread in threads:
@@ -1222,7 +1223,7 @@ def test_deadline_counters_are_safe_across_threads() -> None:
     assert deadline.counters()["sync_after_deadline"] == 40_000
     assert deadline.counters()["possibly_double_billed"] == 80_000
     with pytest.raises(ValueError):
-        deadline.count("not_a_counter")
+        deadline.count("not_a_counter")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(("now", "seconds", "at"), [(1000.2, 0.5, 1001.0), (1000.2, 60, 1061.0)])
@@ -1252,7 +1253,7 @@ def test_no_wait_never_waits_out_a_cancel_at_the_deadline(ws: Workspace) -> None
     assert {_text(r) for r in out.values()} == {"sync:a", "sync:b"}
     assert clock.now == resumed_at  # no settle wait at all
     (record,) = BatchJobStore(ws, first.job_id).load().provider_batches
-    assert record["state"] == RECORD_SETTLING
+    assert record["state"] == RecordState.SETTLING
     assert "not settled after 0s" in record["settling_reason"]
 
 
@@ -1263,7 +1264,7 @@ def test_prune_does_not_reset_a_settling_jobs_age(ws: Workspace) -> None:
     job_id, _calls = _settling_job(ws, clock, backend)
     store = BatchJobStore(ws, job_id)
     manifest = store.load()
-    manifest.status = STATUS_COMPLETED
+    manifest.status = JobStatus.COMPLETED
     manifest.updated_at = "2020-01-01T00:00:00Z"
     store.save(manifest, touch=False)
 

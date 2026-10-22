@@ -21,7 +21,7 @@ the ``model_id`` / ``multi_vector`` guards in ``__init__``).
 from __future__ import annotations
 
 import pytest
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders import build_encoder, registered_encoders
 
 
@@ -44,7 +44,9 @@ def test_missing_model_id_raises(name: str) -> None:
 
 
 def test_qwen_vl_rejects_multi_vector() -> None:
-    cfg = EncoderConfig(name="qwen_vl", model_id="Qwen/Qwen2.5-VL-3B-Instruct", multi_vector=True)
+    cfg = EncoderConfig(
+        name=EncoderName.QWEN_VL, model_id="Qwen/Qwen2.5-VL-3B-Instruct", multi_vector=True
+    )
     with pytest.raises(ValueError, match="single-vector only"):
         build_encoder(cfg, device="cpu")
 

@@ -27,6 +27,7 @@ from dgml_core.batch import (
     BatchItemError,
     BatchRequest,
     FakeBackend,
+    ItemErrorKind,
     Unit,
     run_stage,
 )
@@ -94,7 +95,7 @@ def _sync(gen: Any, cfg: llm.LLMConfig) -> tuple[Any, list[str]]:
 def _batch(units: list[Unit]) -> tuple[dict[str, Any], FakeBackend, BatchExecutor]:
     def script(request: BatchRequest) -> Any:
         if _tag(request.kwargs) == "boom":
-            return BatchItemError(request.custom_id, "invalid", "refused")
+            return BatchItemError(request.custom_id, ItemErrorKind.INVALID, "refused")
         return _answer(request.kwargs)
 
     backend = FakeBackend(script)

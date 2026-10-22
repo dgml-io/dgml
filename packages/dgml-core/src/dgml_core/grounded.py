@@ -57,13 +57,14 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import layout, llm
 from .config import load_merged_config
-from .dg_refs import METHOD_DEFAULTED, METHOD_INFERRED, METHODS
+from .dg_refs import METHODS, ValueMethod
 from .docsets import DocSetStore
 from .errors import (
     CONVERT_TO_PDF_OPERATION,
@@ -141,13 +142,11 @@ from .textmatch import Word as TextWord
 from .textmatch import fuzzy_norm, line_boxes
 from .toon import encode_phase3_words
 from .usage import (
-    OPERATION_EXTRACT_VALUES,
-    OPERATION_SCHEMA_GENERATE,
-    OUTCOME_ERROR,
-    OUTCOME_OK,
-    TIER_STANDARD,
     TIERS_KEY,
+    PricingTier,
     UsageEvent,
+    UsageOperation,
+    UsageOutcome,
     add_partial,
     public_totals,
     scope_events,
@@ -674,7 +673,7 @@ def generate_schema_steps(
         reasoning_effort=_DEFAULT_REASONING_EFFORT,
         workspace=workspace,
         record_usage=record_usage,
-        operation=OPERATION_SCHEMA_GENERATE,
+        operation=UsageOperation.SCHEMA_GENERATE,
         context={"from_file_ids": list(file_ids)},
     )
     steps = _schema_request_steps(
@@ -1217,7 +1216,7 @@ class _FileExtraction:
         config: GroundedConfig,
         write_stats: bool,
         record_usage: bool,
-        tier: str = TIER_STANDARD,
+        tier: PricingTier = PricingTier.STANDARD,
     ) -> None:
         self.workspace = workspace
         self.docset_id = docset_id
@@ -1247,7 +1246,7 @@ class _FileExtraction:
         self.phase1_totals: dict[str, Any] = _empty_totals()
         self.phase3_totals: dict[str, Any] = _empty_totals()
         self.tool_calls_total = 0
-        self.outcome = OUTCOME_ERROR
+        self.outcome = UsageOutcome.ERROR
         self.error_msg: str | None = None
         self.started = time.monotonic()
 
@@ -1283,7 +1282,7 @@ class _FileExtraction:
         self.invariants_checked = 0
         self.invariant_violations: list[str] = []
         self.phase1_layout: dict[str, Any] | None = None
-        self.phase1_tool_schema_mode = "inlined"
+        self.phase1_tool_schema_mode = ToolSchemaMode.INLINED
         self.phase1_chunk_calls = 0
         self.phase1_truncated_retries = 0
         self.phase1_envelope_repairs = 0
@@ -1622,7 +1621,7 @@ class _FileExtraction:
             mode = "extraction"
             doc = standalone_extraction_doc(final_values, vocab=self.vocab)
         workspace.blobs.put_blob(xml_key, doc.encode("utf-8"))
-        self.outcome = OUTCOME_OK
+        self.outcome = UsageOutcome.OK
         # The values are already stored: telemetry failing to build must not
         # turn this into a failed extraction.
         self.stats_doc = _safe_summary(self._stats_summary, "stats")
@@ -1705,7 +1704,7 @@ class _FileExtraction:
     def _append_usage_rows(self, usage_doc: dict[str, Any]) -> None:
         event = UsageEvent(
             at=now_iso(),
-            operation=OPERATION_EXTRACT_VALUES,
+            operation=UsageOperation.EXTRACT_VALUES,
             model=self.config.values_model,
             cost_usd=usage_doc["cost_usd"],
             prompt_tokens=usage_doc["prompt_tokens"],
@@ -1978,7 +1977,6 @@ def extract_values_batch_pairs(
     Duplicate *pairs* raise :class:`ValueError`.
     """
     from .batch import Unit, UnitOutcome, run_stage
-    from .usage import TIER_BATCH
 
     if len(set(pairs)) != len(pairs):
         dupes = sorted({p for p in pairs if pairs.count(p) > 1})
@@ -2022,7 +2020,7 @@ def extract_values_batch_pairs(
                 config=config,
                 write_stats=write_stats,
                 record_usage=record_usage,
-                tier=TIER_BATCH,
+                tier=PricingTier.BATCH,
             )
         except Exception as exc:
             # Setup failure (no schema, no PDF, unset key env, …): raised before
@@ -2217,7 +2215,7 @@ def _write_extraction_stats(
 def _build_extraction_stats(
     *,
     model: str,
-    outcome: str,
+    outcome: UsageOutcome,
     error_msg: str | None,
     phase1_totals: dict[str, Any],
     phase3_totals: dict[str, Any],
@@ -2248,7 +2246,7 @@ def _build_extraction_stats(
     invariants_checked: int,
     invariant_violations: list[str],
     phase1_layout: dict[str, Any] | None,
-    phase1_tool_schema: str,
+    phase1_tool_schema: ToolSchemaMode,
     phase1_chunk_calls: int,
     phase1_truncated_retries: int,
     phase1_envelope_repairs: int,
@@ -2267,7 +2265,7 @@ def _build_extraction_stats(
     return {
         "completed_at": now_iso(),
         "model": model,
-        "outcome": outcome,
+        "outcome": str(outcome),
         "error": error_msg,
         "phases": {
             "phase1": {
@@ -2354,7 +2352,7 @@ def _build_extraction_stats(
         # provider rejected the inlined schema (Gemini "too many states")
         # and the retry ran with a bare object parameter + code-side
         # vocabulary pruning.
-        "phase1_tool_schema": phase1_tool_schema,
+        "phase1_tool_schema": str(phase1_tool_schema),
     }
 
 
@@ -3485,6 +3483,21 @@ def _append_entries_tool() -> dict[str, Any]:
     }
 
 
+class ToolSchemaMode(StrEnum):
+    """How phase 1 passed the docset schema to the model (``extraction_stats.json``
+    ``phase1_tool_schema``).
+
+    ``INLINED`` (the default) rides the schema inside the ``submit_values`` tool
+    parameter, so the provider enforces its shape. ``PERMISSIVE`` is the fallback
+    after a provider rejects the inlined schema as too large (Gemini's "too many
+    states"): a bare object parameter, with the vocabulary pruned code-side and
+    the full schema still in the user prompt.
+    """
+
+    INLINED = "inlined"
+    PERMISSIVE = "permissive"
+
+
 @dataclass
 class Phase1Result:
     """Phase-1 progress and outcome for one file.
@@ -3510,7 +3523,7 @@ class Phase1Result:
     it as :class:`ValuesExtractionFailed`.
     """
 
-    tool_schema_mode: str = "inlined"
+    tool_schema_mode: ToolSchemaMode = ToolSchemaMode.INLINED
     chunked: bool = False
     truncated_retries: int = 0
     chunk_calls: int = 0
@@ -3581,7 +3594,9 @@ def phase1_steps(
     def _run(pdf: bytes, part: _PdfPart | None) -> LLMSteps[_Phase1Run]:
         while True:
             values_param = (
-                _PERMISSIVE_VALUES_PARAM if run.tool_schema_mode == "permissive" else tool_schema
+                _PERMISSIVE_VALUES_PARAM
+                if run.tool_schema_mode == ToolSchemaMode.PERMISSIVE
+                else tool_schema
             )
             try:
                 return (
@@ -3612,11 +3627,14 @@ def phase1_steps(
                 run.chunked = True
                 run.truncated_retries += 1
             except ValuesExtractionFailed as exc:
-                if run.tool_schema_mode == "permissive" or not _is_tool_schema_too_large(exc):
+                if (
+                    run.tool_schema_mode == ToolSchemaMode.PERMISSIVE
+                    or not _is_tool_schema_too_large(exc)
+                ):
                     raise
                 # Gemini's constrained decoder rejected the inlined schema; the
                 # model still sees the full schema in the user prompt.
-                run.tool_schema_mode = "permissive"
+                run.tool_schema_mode = ToolSchemaMode.PERMISSIVE
 
     # The whole PDF goes in one request, as it always has. Only when the
     # provider refuses that request as too large is the document split into
@@ -3662,7 +3680,7 @@ def phase1_steps(
     # layer, and pruning it too would discard off-schema values *before*
     # phases 2/3 rather than at serialization — a behavior change beyond
     # what these fallbacks need.
-    if run.tool_schema_mode == "permissive" or run.chunked:
+    if run.tool_schema_mode == ToolSchemaMode.PERMISSIVE or run.chunked:
         args["values"] = kept
     run.values = args["values"]
     return run
@@ -4254,12 +4272,12 @@ def _normalize_leaf_provenance(values: Any) -> int:
         values.pop("locations", None)
         method = values.get("method")
         used = bool(inputs or evidence)
-        if method == METHOD_DEFAULTED:
+        if method == ValueMethod.DEFAULTED:
             values.pop("inputs", None)
             values.pop("evidence", None)
             return 0
         if used and method is None:
-            values["method"] = METHOD_INFERRED
+            values["method"] = ValueMethod.INFERRED.value
         elif not used and method is not None:
             del values["method"]
             return 1

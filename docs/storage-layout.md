@@ -1140,7 +1140,7 @@ One record:
 ```jsonc
 {
   "at": "2026-05-15T17:42:00Z",
-  "operation": "extract_values",     // classify | schema_generate | extract_values | transcribe | label | links | hybrid_merge | batch_unused
+  "operation": "extract_values",     // classify | cluster | schema_generate | extract_values | transcribe | label | links | hybrid_merge | style_annotate | batch_unused | llm_call (no operation named); a library caller's LLMConfig may name its own
   "model": "gemini/gemini-3-flash-preview",
   "cost_usd": 0.0123,                // null when litellm doesn't price the model
   "prompt_tokens": 12345,

@@ -22,6 +22,7 @@ from .configuration import Configuration, Identity, ProviderSpec, Storage
 from .conversion import (
     ConverterConfig,
     DocConverter,
+    FormatFamily,
     load_conversion_config,
     make_converter,
 )
@@ -47,6 +48,7 @@ from .errors import (
     ClassificationFailed,
     ClusteringConfigInvalid,
     ConflictError,
+    ConflictErrorKind,
     ConversionConfigInvalid,
     ConversionFailed,
     CorruptMetadata,
@@ -127,7 +129,7 @@ from .file_attestation import (
     verify_file_version,
     write_attestation,
 )
-from .files import AddFileResult, ConflictPolicy, FileStore
+from .files import AddFileResult, ConflictKind, ConflictPolicy, FileStore
 from .ids import RECORD_ID_SHAPE, is_record_id
 from .layout import Collection
 from .migrations import (
@@ -205,10 +207,11 @@ if TYPE_CHECKING:
         ClassificationConfig,
         ClassificationDecision,
         ClassifyMode,
+        DecisionKind,
         classify_file,
         load_classification_config,
     )
-    from .consistency import CheckReport, Issue, check_workspace
+    from .consistency import CheckReport, Issue, IssueKind, IssueTarget, check_workspace
     from .generation.link_stage import LinkOutcome, LinkStage, StagedDocument
     from .grounded import ExtractionResult, ManyExtraction, extract_values_many
 
@@ -237,8 +240,11 @@ _LAZY_SUBMODULES = {
     "ClassificationConfig": ".classification",
     "ClassificationDecision": ".classification",
     "ClassifyMode": ".classification",
+    "DecisionKind": ".classification",
     "ExtractionResult": ".grounded",
     "Issue": ".consistency",
+    "IssueKind": ".consistency",
+    "IssueTarget": ".consistency",
     "BulkClassifyBatch": ".auto_classification",
     "auto_classify": ".auto_classification",
     "classify_bulk_batch": ".auto_classification",
@@ -315,12 +321,15 @@ __all__ = [
     "Collection",
     "Configuration",
     "ConflictError",
+    "ConflictErrorKind",
+    "ConflictKind",
     "ConflictPolicy",
     "ConversionConfigInvalid",
     "ConversionFailed",
     "ConverterConfig",
     "CorruptMetadata",
     "CreateWorkspaceResult",
+    "DecisionKind",
     "DgmlDocument",
     "DgmlError",
     "DgmlNotFound",
@@ -339,6 +348,7 @@ __all__ = [
     "FileRecord",
     "FileStore",
     "FileVersion",
+    "FormatFamily",
     "GenerationConfigInvalid",
     "GenerationConfigMissing",
     "GenerationFailed",
@@ -352,6 +362,8 @@ __all__ = [
     "InvalidArgument",
     "InvalidPDF",
     "Issue",
+    "IssueKind",
+    "IssueTarget",
     "LabelModelUnreachable",
     "LegacyConfigPresent",
     "LinkOutcome",

@@ -113,7 +113,7 @@ from .text_extraction import (
     largest_image_coverage,
 )
 from .text_extraction_config import TextExtractionConfig, resolve_api_key
-from .usage import OPERATION_HYBRID_MERGE
+from .usage import UsageOperation
 
 logger = logging.getLogger(__name__)
 
@@ -773,7 +773,7 @@ def _call_merge_llm(
         max_tokens=config.max_tokens,
         workspace=workspace,
         record_usage=record_usage,
-        operation=OPERATION_HYBRID_MERGE,
+        operation=UsageOperation.HYBRID_MERGE,
         context={"file_id": file_id, "page": page_num},
     )
     user_content = build_user_content(instruction_text=json.dumps(payload, ensure_ascii=False))

@@ -36,13 +36,10 @@ from dgml_core.batch import (
 )
 from dgml_core.batch.executor import POLL_MARGIN_S
 from dgml_core.batch.jobs import (
-    RECORD_COLLECTED,
-    RECORD_DROPPED,
-    RECORD_OPEN,
-    RECORD_UNCERTAIN,
-    STATUS_FAILED,
     BatchJobStore,
     JobSession,
+    JobStatus,
+    RecordState,
 )
 from dgml_core.batch.types import BatchRejected, BatchSubmitUncertain
 from dgml_core.errors import BatchExecutionFailed, BatchJobInvalid, BatchPending
@@ -119,7 +116,7 @@ def test_job_mode_bisects_a_batch_rejected_at_submit(
     assert _text(out["x-1"]) == "reply:a" and _text(out["y-1"]) == "reply:b"
     assert [len(b) for b in backend.attempted] == [2, 1, 1]
     records = session.manifest.provider_batches
-    assert [r["state"] for r in records] == [RECORD_COLLECTED, RECORD_COLLECTED]
+    assert [r["state"] for r in records] == [RecordState.COLLECTED, RecordState.COLLECTED]
     assert ex.stats.to_json()["bisections"] == 1
     session.close(None)
 
@@ -138,7 +135,7 @@ def test_job_mode_bisects_an_accepted_batch_failed_at_batch_level(
     # 3 rejected → 1 + (2 rejected → 1 + 1).
     assert [len(b) for b in backend.submitted] == [3, 1, 2, 1, 1]
     assert ex.stats.bisections == 2
-    assert all(r["state"] == RECORD_COLLECTED for r in session.manifest.provider_batches)
+    assert all(r["state"] == RecordState.COLLECTED for r in session.manifest.provider_batches)
     session.close(None)
 
 
@@ -203,7 +200,7 @@ def test_job_mode_uncertain_create_is_recorded_and_fails_the_run(
     assert backend.canceled == ["fake_batch_0001"]
     stored = BatchJobStore(ws, session.job_id).load()
     states = [r["state"] for r in stored.provider_batches]
-    assert states == [RECORD_DROPPED, RECORD_UNCERTAIN]
+    assert states == [RecordState.DROPPED, RecordState.UNCERTAIN]
     uncertain = stored.provider_batches[1]
     assert "may exist" in uncertain["error"]
     assert uncertain["job"]["job_id"].startswith("uncertain_")
@@ -212,7 +209,7 @@ def test_job_mode_uncertain_create_is_recorded_and_fails_the_run(
     # Even when a caller soft-fails the stage, the run ends failed with it.
     session.close(None)
     manifest = BatchJobStore(ws, session.job_id).load()
-    assert manifest.status == STATUS_FAILED
+    assert manifest.status == JobStatus.FAILED
     assert manifest.error is not None and "may exist" in manifest.error
 
 
@@ -246,7 +243,7 @@ def test_a_paused_batch_is_not_cleaned_up_until_collected(ws: Workspace) -> None
         _executor(backend, session).run_wave(wave)
     _pause(session)
     assert backend.released == [("x-1",)] and backend.cleaned == []
-    assert [r["state"] for r in session.manifest.provider_batches] == [RECORD_OPEN]
+    assert [r["state"] for r in session.manifest.provider_batches] == [RecordState.OPEN]
 
     resumed = _open(ws, session.job_id)
     _executor(backend, resumed).run_wave(wave)
@@ -316,7 +313,7 @@ def test_an_acknowledged_uncertain_create_is_resubmitted_on_resume(ws: Workspace
     # What `dgml batch cancel` does to the record.
     store = BatchJobStore(ws, job_id)
     manifest = store.load()
-    manifest.provider_batches[0]["state"] = RECORD_DROPPED
+    manifest.provider_batches[0]["state"] = RecordState.DROPPED
     store.save(manifest, merge=False)
 
     healthy = FakeBackend(_answer, provider="anthropic")
@@ -357,7 +354,7 @@ def test_a_stage_outage_ends_the_job_failed_with_its_responses_kept(
     # ... yet the job ends failed, not completed: nothing trimmed, still resumable.
     session.close(None)
     manifest = BatchJobStore(ws, session.job_id).load()
-    assert manifest.status == STATUS_FAILED
+    assert manifest.status == JobStatus.FAILED
     assert manifest.error is not None and "a batch stage failed" in manifest.error
     assert manifest.provider_batches  # not trimmed to a summary
 

@@ -29,9 +29,12 @@ from unittest.mock import patch
 import pytest
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL
 from dgml_core import layout
-from dgml_core.classification import ClassificationDecision
+from dgml_core.classification import ClassificationDecision, DecisionKind
 from dgml_core.clustering import (
+    CLUSTER_MODES,
     DEFAULT_INCREMENTAL_NOVELTY_QUANTILE,
+    ClusterMethod,
+    ClusterMode,
     _resolve_mode,
     _with_incremental_novelty_default,
     clustering,
@@ -151,7 +154,7 @@ def test_workspace_file_dataset_iterates(workspace: Workspace) -> None:
 
 
 def test_clustering_internal_empty_workspace(workspace: Workspace) -> None:
-    result = clustering_internal(workspace, method="embedding")
+    result = clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
     assert result.clusters == {}
     assert result.render_skipped == []
     # No DocSets ⇒ auto resolves to fresh.
@@ -169,7 +172,7 @@ def test_clustering_internal_skips_files_without_page_image(workspace: Workspace
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"with_image": _dp("unknown_0")},
     ) as mock_run:
-        result = clustering_internal(workspace, method="embedding")
+        result = clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     assert result.clusters == {"with_image": "unknown_0"}
     assert result.render_skipped == ["no_image"]
@@ -190,7 +193,7 @@ def test_clustering_internal_threads_existing_docset_names(workspace: Workspace)
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("Contracts", 0.8)},
     ) as mock_run:
-        result = clustering_internal(workspace, method="embedding")
+        result = clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     assert sorted(mock_run.call_args.kwargs["known_categories"]) == ["Contracts", "Receipts"]
     # DocSets exist ⇒ auto resolves to incremental, and confidence is threaded.
@@ -226,7 +229,7 @@ def test_clustering_internal_builds_support_set_from_docset_members(workspace: W
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("Contracts", 0.7)},
     ) as mock_run:
-        clustering_internal(workspace, method="embedding")
+        clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     kwargs = mock_run.call_args.kwargs
     # Incremental reconstructs prototypes from all usable members; here the
@@ -253,7 +256,7 @@ def test_clustering_internal_skips_support_when_docsets_have_no_usable_files(
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace, method="embedding")
+        clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     kwargs = mock_run.call_args.kwargs
     assert "n_samples_per_category" not in kwargs
@@ -264,7 +267,7 @@ def test_clustering_internal_all_unusable_skips_clusterer(workspace: Workspace) 
     _seed_file(workspace, "no_image")
 
     with patch("dgml_core.clustering.run_clustering_detailed") as mock_run:
-        result = clustering_internal(workspace, method="embedding")
+        result = clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     assert result.clusters == {}
     assert result.render_skipped == ["no_image"]
@@ -285,7 +288,7 @@ def test_clustering_internal_forwards_workspace_overrides(workspace: Workspace) 
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace, method="embedding")
+        clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     forwarded = mock_run.call_args.kwargs["overrides"]
     assert forwarded["training"] == {"epochs": 7}
@@ -303,7 +306,7 @@ def test_clustering_internal_passes_empty_overrides_when_no_config(workspace: Wo
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace, method="embedding")
+        clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     assert mock_run.call_args.kwargs["overrides"] == {
         "encoder_text": {"extra": {"corpus_dir": str(workspace.files_dir)}}
@@ -350,7 +353,7 @@ def test_corpus_dir_is_materialized_for_a_non_local_blob_store(tmp_path: Path) -
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0"), "f2": _dp("unknown_1")},
     ) as mock_run:
-        clustering_internal(ws, method="embedding")
+        clustering_internal(ws, method=ClusterMethod.EMBEDDING)
 
     corpus_dir = Path(mock_run.call_args.kwargs["overrides"]["encoder_text"]["extra"]["corpus_dir"])
     # Not the (empty) local files/ dir — a materialized tree that actually has the text.
@@ -512,7 +515,7 @@ def test_corpus_covers_every_file_not_just_the_ones_being_clustered(tmp_path: Pa
         return {"candidate": _dp("unknown_0")}
 
     with patch("dgml_core.clustering.run_clustering_detailed", side_effect=_capture):
-        clustering_internal(ws, method="embedding")
+        clustering_internal(ws, method=ClusterMethod.EMBEDDING)
 
     assert seen == ["assigned", "candidate"]  # the assigned file is in the corpus
     assert not captured[0].exists()  # and the tree is cleaned up on exit
@@ -702,7 +705,7 @@ def test_clustering_internal_incremental_injects_novelty_default(workspace: Work
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("Contracts", 0.7)},
     ) as mock_run:
-        result = clustering_internal(workspace, method="embedding")
+        result = clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     assert result.mode == "incremental"
     scenario = mock_run.call_args.kwargs["overrides"]["scenario"]
@@ -719,7 +722,7 @@ def test_clustering_internal_fresh_does_not_inject_novelty_default(workspace: Wo
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("unknown_0")},
     ) as mock_run:
-        clustering_internal(workspace, mode="fresh", method="embedding")
+        clustering_internal(workspace, mode=ClusterMode.FRESH, method=ClusterMethod.EMBEDDING)
 
     scenario = mock_run.call_args.kwargs["overrides"].get("scenario", {})
     assert "threshold_quantile" not in scenario
@@ -736,7 +739,7 @@ def test_clustering_internal_incremental_respects_user_gate(workspace: Workspace
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("Contracts", 0.7)},
     ) as mock_run:
-        clustering_internal(workspace, method="embedding")
+        clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     scenario = mock_run.call_args.kwargs["overrides"]["scenario"]
     assert scenario["threshold_confidence"] == 0.5
@@ -799,18 +802,50 @@ def test_load_clustering_overrides_corrupt_toml_raises(workspace: Workspace) -> 
 
 
 def test_resolve_mode_auto_picks_by_docsets() -> None:
-    assert _resolve_mode("auto", has_docsets=False) == "fresh"
-    assert _resolve_mode("auto", has_docsets=True) == "incremental"
+    assert _resolve_mode(ClusterMode.AUTO, has_docsets=False) is ClusterMode.FRESH
+    assert _resolve_mode(ClusterMode.AUTO, has_docsets=True) is ClusterMode.INCREMENTAL
 
 
 def test_resolve_mode_forced_values_pass_through() -> None:
-    assert _resolve_mode("fresh", has_docsets=True) == "fresh"
-    assert _resolve_mode("incremental", has_docsets=True) == "incremental"
+    assert _resolve_mode(ClusterMode.FRESH, has_docsets=True) is ClusterMode.FRESH
+    assert _resolve_mode(ClusterMode.INCREMENTAL, has_docsets=True) is ClusterMode.INCREMENTAL
+
+
+def test_clustering_internal_returns_members_for_bare_strings(workspace: Workspace) -> None:
+    """A bare string from a caller is parsed at the entry point into the member."""
+    result = clustering_internal(workspace, mode="fresh", method="embedding")  # type: ignore[arg-type]
+    assert result.mode is ClusterMode.FRESH
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"mode": "sideways"}, "unknown clustering mode 'sideways'"),
+        ({"method": "telepathy"}, "unknown clustering method 'telepathy'"),
+    ],
+)
+def test_clustering_internal_rejects_unknown_values(
+    workspace: Workspace, kwargs: dict[str, str], message: str
+) -> None:
+    """An unknown mode or method fails at the entry point instead of reaching the
+    routing, where every ``!= FRESH`` / ``== INCREMENTAL`` test would treat it as
+    some value it is not."""
+    with pytest.raises(ClusteringConfigInvalid, match=message):
+        clustering_internal(workspace, **kwargs)  # type: ignore[arg-type]
+
+
+def test_clustering_rejects_unknown_mode(workspace: Workspace) -> None:
+    """The public entry point keeps its error class and message for a bad mode."""
+    expected = f"unknown clustering mode 'sideways'; choose one of {', '.join(CLUSTER_MODES)}."
+    assert expected.endswith("choose one of auto, fresh, incremental.")
+    with pytest.raises(ClusteringConfigInvalid) as excinfo:
+        clustering(workspace, mode="sideways")  # type: ignore[arg-type]
+    assert str(excinfo.value) == expected
 
 
 def test_resolve_mode_incremental_without_docsets_raises() -> None:
     with pytest.raises(IncrementalWithoutClusters, match="requires at least one existing DocSet"):
-        _resolve_mode("incremental", has_docsets=False)
+        _resolve_mode(ClusterMode.INCREMENTAL, has_docsets=False)
 
 
 def test_clustering_internal_fresh_mode_ignores_existing_docsets(workspace: Workspace) -> None:
@@ -824,7 +859,9 @@ def test_clustering_internal_fresh_mode_ignores_existing_docsets(workspace: Work
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"u1": _dp("unknown_0")},
     ) as mock_run:
-        result = clustering_internal(workspace, mode="fresh", method="embedding")
+        result = clustering_internal(
+            workspace, mode=ClusterMode.FRESH, method=ClusterMethod.EMBEDDING
+        )
 
     assert result.mode == "fresh"
     kwargs = mock_run.call_args.kwargs
@@ -836,7 +873,7 @@ def test_clustering_internal_incremental_without_docsets_raises(workspace: Works
     _seed_file(workspace, "u1")
     _seed_page_image(workspace, "u1")
     with pytest.raises(IncrementalWithoutClusters):
-        clustering_internal(workspace, mode="incremental", method="embedding")
+        clustering_internal(workspace, mode=ClusterMode.INCREMENTAL, method=ClusterMethod.EMBEDDING)
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +943,7 @@ def test_clustering_internal_threads_pooling_pages_to_dataset(
         "dgml_core.clustering.run_clustering_detailed",
         return_value={"f1": _dp("unknown_0")},
     ):
-        clustering_internal(workspace, method="embedding")
+        clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     assert captured["max_pages"] == expected
 
@@ -932,7 +969,7 @@ def test_clustering_internal_splits_noise_out_of_clusters(workspace: Workspace) 
             "noise2": _dp(UNKNOWN_NOISE_LABEL),
         },
     ):
-        result = clustering_internal(workspace, method="embedding")
+        result = clustering_internal(workspace, method=ClusterMethod.EMBEDDING)
 
     assert result.clusters == {"real": "unknown_0"}
     assert sorted(result.unclustered) == ["noise1", "noise2"]
@@ -949,7 +986,9 @@ def test_clustering_does_not_name_the_noise_bucket_into_a_docset(workspace: Work
         _seed_file(workspace, fid)
         _seed_page_image(workspace, fid)
 
-    decision = ClassificationDecision(decision="new", new_name="Invoices", new_description="")
+    decision = ClassificationDecision(
+        decision=DecisionKind.NEW, new_name="Invoices", new_description=""
+    )
     with (
         patch(
             "dgml_core.clustering.run_clustering_detailed",
@@ -963,7 +1002,7 @@ def test_clustering_does_not_name_the_noise_bucket_into_a_docset(workspace: Work
             "dgml_core.clustering.propose_new_docset_for_files", return_value=decision
         ) as mock_propose,
     ):
-        result = clustering(workspace, method="embedding")
+        result = clustering(workspace, method=ClusterMethod.EMBEDDING)
 
     # The noise documents are reported as unassigned — a partial success, the
     # same channel a failed page render uses — and are absent from `clusters`.
@@ -1002,7 +1041,7 @@ def test_clustering_logs_a_failed_naming_call(
             side_effect=ClassificationFailed("LLM call failed: RuntimeError: boom"),
         ),
     ):
-        result = clustering(workspace, method="embedding")
+        result = clustering(workspace, method=ClusterMethod.EMBEDDING)
 
     assert sorted(result["failed_file_ids"]) == ["a", "b"]
     [record] = [r for r in caplog.records if r.name == "dgml_core.clustering"]

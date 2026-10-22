@@ -75,6 +75,8 @@ _CONTENT_TYPE_BY_EXT: dict[str, str] = {
     "doc": "application/msword",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "xls": "application/vnd.ms-excel",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "ppt": "application/vnd.ms-powerpoint",
 }
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 

@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 from dgml_core.errors import (
     ConflictError,
+    ConflictErrorKind,
     DgmlError,
     InvalidArgument,
     MissingExtra,
@@ -64,7 +65,7 @@ def _keyword_errors() -> list[DgmlError]:
         WorkspaceNotInitialized("no config", workspace=Workspace(root=Path("/w"))),
         MissingExtra("need it", extra="azure", distribution="azure-identity"),
         MissingExtra("need it", extra="chain"),
-        ConflictError("taken", kind="workspace", existing_id="acme"),
+        ConflictError("taken", kind=ConflictErrorKind.WORKSPACE, existing_id="acme"),
     ]
 
 

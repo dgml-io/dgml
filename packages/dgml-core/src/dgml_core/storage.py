@@ -275,7 +275,7 @@ class Workspace:
         is never rewritten (``create`` never re-identifies a workspace, and neither
         does this); a changed ``organization`` re-organizes the workspace with a loud
         warning, exactly as ``create`` does, and a changed ``name`` is just updated."""
-        from .errors import ConflictError, InvalidArgument
+        from .errors import ConflictError, ConflictErrorKind, InvalidArgument
         from .migrations import stamp_schema_version
 
         configuration.identity.require_complete()
@@ -347,7 +347,7 @@ class Workspace:
                 f"the configured storage already holds workspace {held!r}; refusing to open it "
                 f"as {ident.workspace_id!r}. A workspace is never re-identified — point this "
                 f"Configuration at that workspace's own storage.",
-                kind="workspace",
+                kind=ConflictErrorKind.WORKSPACE,
                 existing_id=str(held),
             )
         recorded = meta.get("organization")

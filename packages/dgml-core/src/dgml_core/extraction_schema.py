@@ -171,7 +171,7 @@ EXTRACTED_VALUE: dict[str, Any] = {
         },
         "method": {
             "type": "string",
-            "enum": list(METHODS),
+            "enum": [m.value for m in METHODS],
             "description": (
                 "Only for a value with no locations: 'calculated' (a "
                 "deterministic calculation over inputs), 'inferred' (a judgment "

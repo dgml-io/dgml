@@ -74,11 +74,12 @@ from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
 from .usage import (
-    OUTCOME_ERROR,
-    OUTCOME_OK,
-    TIER_STANDARD,
+    PricingTier,
     UsageEvent,
+    UsageOperation,
+    UsageOutcome,
     add_partial,
+    as_pricing_tier,
     extract_cost_and_tokens,
     record_usage,
     scope_events,
@@ -420,12 +421,15 @@ class LLMConfig:
     # don't want telemetry.
     workspace: Workspace | None = None
     record_usage: bool = False
-    operation: str | None = None
+    #: A :class:`~dgml_core.usage.UsageOperation` for every call dgml makes; a
+    #: library caller may label its own calls with any string. ``None`` records
+    #: :attr:`~dgml_core.usage.UsageOperation.LLM_CALL`.
+    operation: UsageOperation | str | None = None
     context: dict[str, Any] | None = None
-    # Pricing tier recorded on the usage row (``usage.TIER_STANDARD`` /
-    # ``usage.TIER_BATCH``). The batch executor sets ``TIER_BATCH`` on the
-    # configs it drives; every synchronous call records standard.
-    tier: str = TIER_STANDARD
+    # Pricing tier recorded on the usage row. The batch executor sets
+    # ``PricingTier.BATCH`` on the configs it drives; every synchronous call
+    # records standard.
+    tier: PricingTier = PricingTier.STANDARD
     # Internal: set by an active :func:`record_usage_for` scope. While set,
     # the call functions fold their usage into it (one aggregated row for the
     # whole scope) instead of each writing its own row. Never set by callers.
@@ -1251,12 +1255,12 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
     totals = empty_usage_totals()
     started = time.monotonic()
     error_msg: str | None = None
-    outcome = OUTCOME_OK
+    outcome = UsageOutcome.OK
     try:
         yield totals
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        outcome = OUTCOME_ERROR
+        outcome = UsageOutcome.ERROR
         raise
     finally:
         if config._usage_sink is not None:
@@ -1264,7 +1268,7 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
         elif config.record_usage and config.workspace is not None:
             event = UsageEvent(
                 at=now_iso(),
-                operation=config.operation or "llm_call",
+                operation=config.operation or UsageOperation.LLM_CALL,
                 model=config.model,
                 cost_usd=totals["cost_usd"],
                 prompt_tokens=totals["prompt_tokens"],
@@ -1982,13 +1986,13 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
     totals = empty_usage_totals()
     started = time.monotonic()
     error_msg: str | None = None
-    outcome = OUTCOME_OK
+    outcome = UsageOutcome.OK
     config._usage_sink = totals
     try:
         yield
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        outcome = OUTCOME_ERROR
+        outcome = UsageOutcome.ERROR
         raise
     finally:
         config._usage_sink = None
@@ -1996,7 +2000,7 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
         if workspace is not None:
             event = UsageEvent(
                 at=now_iso(),
-                operation=config.operation or "llm_call",
+                operation=config.operation or UsageOperation.LLM_CALL,
                 model=config.model,
                 cost_usd=totals["cost_usd"],
                 prompt_tokens=totals["prompt_tokens"],
@@ -2008,7 +2012,7 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
                 outcome=outcome,
                 context=config.context or {},
                 error=error_msg,
-                tier=str(totals.get(SINK_TIER_KEY) or config.tier),
+                tier=as_pricing_tier(totals.get(SINK_TIER_KEY), config.tier),
             )
             # One row, or one per tier when the responses span tiers.
             for part in scope_events(event, totals):

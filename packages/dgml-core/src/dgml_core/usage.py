@@ -35,35 +35,74 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+from enum import StrEnum
 from typing import Any
 
 from . import layout
+from .enums import parse_enum
 from .storage import Workspace
 
-# Operation identifiers — keep these stable; the UX filters by them.
-OPERATION_CLASSIFY = "classify"
-OPERATION_CLUSTER = "cluster"
-OPERATION_SCHEMA_GENERATE = "schema_generate"
-OPERATION_EXTRACT_VALUES = "extract_values"
-OPERATION_HYBRID_MERGE = "hybrid_merge"
-OPERATION_STYLE_ANNOTATE = "style_annotate"
-OPERATION_TRANSCRIBE = "transcribe"
-OPERATION_LABEL = "label"
-OPERATION_LINKS = "links"
-#: A response a batch job paid for that no run of it ever used (see
-#: :mod:`dgml_core.batch.jobs`): written once, when the job completes, with
-#: ``context`` ``{"unused": true, "batch_job": <job id>}``.
-OPERATION_BATCH_UNUSED = "batch_unused"
 
-OUTCOME_OK = "ok"
-OUTCOME_ERROR = "error"
+class UsageOperation(StrEnum):
+    """The operation a usage row accounts for (its ``operation`` field).
 
-# Pricing tier the call was billed at. ``standard`` is the synchronous
-# Messages/Chat API; ``batch`` is a provider's asynchronous batch tier
-# (typically 50% of standard). Rows carry it so a run with and without
-# batching can be compared from ``usage.jsonl`` alone.
-TIER_STANDARD = "standard"
-TIER_BATCH = "batch"
+    Keep the values stable: external tooling that aggregates ``usage.jsonl``
+    filters by them. ``LLM_CALL`` labels a call whose :class:`~dgml_core.llm.LLMConfig`
+    names no operation. ``BATCH_UNUSED`` is a response a batch job paid for that
+    no run of it ever used (see :mod:`dgml_core.batch.jobs`): written once, when
+    the job completes, with ``context`` ``{"unused": true, "batch_job": <job id>}``.
+
+    Every operation dgml records is a member, but the field is not closed: a
+    library caller labels its own calls through ``LLMConfig.operation``, so
+    :attr:`UsageEvent.operation` also accepts a plain string.
+    """
+
+    CLASSIFY = "classify"
+    CLUSTER = "cluster"
+    SCHEMA_GENERATE = "schema_generate"
+    EXTRACT_VALUES = "extract_values"
+    HYBRID_MERGE = "hybrid_merge"
+    STYLE_ANNOTATE = "style_annotate"
+    TRANSCRIBE = "transcribe"
+    LABEL = "label"
+    LINKS = "links"
+    BATCH_UNUSED = "batch_unused"
+    LLM_CALL = "llm_call"
+
+
+class UsageOutcome(StrEnum):
+    """How the accounted operation ended: ``OK``, or ``ERROR`` (the row's
+    ``error`` says why)."""
+
+    OK = "ok"
+    ERROR = "error"
+
+
+class PricingTier(StrEnum):
+    """The pricing tier a call was billed at (a usage row's ``tier``).
+
+    ``STANDARD`` is the synchronous Messages/Chat API; ``BATCH`` is a
+    provider's asynchronous batch tier (typically 50% of standard). Rows carry
+    it so a run with and without batching can be compared from ``usage.jsonl``
+    alone. Not to be confused with :class:`dgml_core.models_config.Tier`, the
+    ``[models]`` *capability* tier (light/standard/advanced/expert).
+    """
+
+    STANDARD = "standard"
+    BATCH = "batch"
+
+
+def as_pricing_tier(raw: object, fallback: PricingTier | str) -> PricingTier | str:
+    """A persisted tier marker *raw* as the tier a usage row records.
+
+    A known tier becomes its :class:`PricingTier` member; an unknown one (a
+    response store written by a newer dgml) is kept verbatim, as its string,
+    so the row says what the store said. Only an absent or empty marker takes
+    *fallback* (the caller's own tier). Never raises."""
+    if not raw:
+        return fallback
+    return parse_enum(PricingTier, raw) or str(raw)
+
 
 #: Marker key on a response's ``_hidden_params``: the response was replayed
 #: from a batch job's store and its usage is already on a row an earlier run
@@ -82,14 +121,14 @@ class UsageEvent:
     """
 
     at: str
-    operation: str
+    operation: UsageOperation | str
     model: str
     cost_usd: float | None
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
     duration_s: float
-    outcome: str
+    outcome: UsageOutcome
     context: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     # Anthropic prompt-cache accounting. Default 0 rather than None so rows
@@ -98,13 +137,20 @@ class UsageEvent:
     # ``extract_cost_and_tokens``.
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
-    # Pricing tier (``TIER_STANDARD`` / ``TIER_BATCH``). Defaults to standard so
-    # rows written before the field existed — and events built without it —
-    # stay valid; readers do not backfill a missing key.
-    tier: str = TIER_STANDARD
+    # Pricing tier. Defaults to standard so rows written before the field
+    # existed — and events built without it — stay valid; readers do not
+    # backfill a missing key. A tier this version doesn't know, carried from a
+    # persisted marker (see :func:`as_pricing_tier`), stays its plain string.
+    tier: PricingTier | str = PricingTier.STANDARD
 
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        """The row as written: plain JSON values, so the enum fields are their
+        bare strings, not members."""
+        row = asdict(self)
+        row["operation"] = str(self.operation)
+        row["outcome"] = str(self.outcome)
+        row["tier"] = str(self.tier)
+        return row
 
 
 def record_usage(workspace: Workspace, event: UsageEvent) -> None:
@@ -310,24 +356,26 @@ TIER_MARKER = "dgml_tier"
 TIER_SPLIT_CONTEXT_KEY = "tier_split"
 
 
-def with_tier(usage: dict[str, Any], response: Any, default: str | None) -> dict[str, Any]:
+def with_tier(usage: dict[str, Any], response: Any, default: PricingTier | None) -> dict[str, Any]:
     """*usage* (from :func:`extract_cost_and_tokens` on *response*) with a
     one-tier breakdown attached, for :func:`add_partial` to carry upward.
 
-    The tier is the response's :data:`TIER_MARKER`, else *default* (the
-    driving config's tier); ``None`` leaves the response untiered (resolved to
-    the row's own tier when the row is written). A response already billed by
+    The tier is the response's :data:`TIER_MARKER` when it is a non-empty
+    string — kept verbatim, so a tier this version doesn't know still reaches
+    the row (see :func:`as_pricing_tier`) — else *default* (the driving
+    config's tier); ``None`` leaves the response untiered (resolved to the
+    row's own tier when the row is written). A response already billed by
     an earlier run (:data:`BILLED_MARKER`) contributes zero and no tier, so it
     never adds a zero-cost part to a scope. *usage* itself is not modified.
     """
+    tier: str = default or ""
     hidden = getattr(response, "_hidden_params", None)
     if isinstance(hidden, dict):
         if hidden.get(BILLED_MARKER):
             return usage
         marker = hidden.get(TIER_MARKER)
         if isinstance(marker, str) and marker:
-            default = marker
-    tier = default or ""
+            tier = marker
     out = dict(usage)
     out[TIERS_KEY] = {tier: {k: usage.get(k) for k in _USAGE_FIELDS}}
     return out
@@ -353,9 +401,9 @@ def scope_events(event: UsageEvent, totals: dict[str, Any]) -> list[UsageEvent]:
       the parts gives the scope's total. ``outcome`` and ``error`` are the
       scope's, on every part.
     """
-    breakdown: dict[str, dict[str, Any]] = {}
+    breakdown: dict[PricingTier | str, dict[str, Any]] = {}
     for tier, sub in (totals.get(TIERS_KEY) or {}).items():
-        resolved = tier or event.tier
+        resolved = as_pricing_tier(tier, event.tier)
         if resolved in breakdown:
             add_partial(breakdown[resolved], sub)
         else:

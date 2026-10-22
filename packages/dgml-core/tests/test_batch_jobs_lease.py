@@ -40,17 +40,16 @@ from dgml_core.batch import (
 )
 from dgml_core.batch import jobs as jobs_mod
 from dgml_core.batch.jobs import (
-    RECORD_COLLECTED,
-    RECORD_OPEN,
-    STATUS_COMPLETED,
-    STATUS_PENDING,
     JobSession,
+    JobStatus,
+    RecordState,
     unlock_job,
 )
 from dgml_core.errors import BatchJobBusy, BatchJobLeaseLost, BatchPending
 from dgml_core.storage import Workspace
 from dgml_core.usage import (
     UsageEvent,
+    UsageOutcome,
     extract_cost_and_tokens,
     read_events,
     record_usage,
@@ -144,7 +143,7 @@ def _row(ws: Workspace, response: Any) -> None:
             completion_tokens=totals["completion_tokens"],
             total_tokens=totals["total_tokens"],
             duration_s=0.0,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
         ),
     )
 
@@ -196,7 +195,7 @@ def test_unlock_mid_run_fences_the_runner_and_the_new_holder_finishes_the_job(
     _row(ws, b.run_wave({"w2-1": _kwargs("two")})["w2-1"])
     second.close(None)
     assert len(backend.submitted) == 2
-    assert store.load().status == STATUS_COMPLETED
+    assert store.load().status == JobStatus.COMPLETED
     assert [r["cost_usd"] for r in read_events(ws)] == [0.25, 0.25]  # each billed once
 
 
@@ -213,7 +212,7 @@ def test_the_heartbeat_notices_a_broken_lease_and_never_takes_it_back(
     assert session.lease_lost is not None
     assert store.lease_info() is None  # not re-created by the renewal
     session.close(None)
-    assert store.load().status == STATUS_PENDING  # the fenced close wrote nothing
+    assert store.load().status == JobStatus.PENDING  # the fenced close wrote nothing
 
 
 def test_a_blocking_wait_stops_when_the_lease_is_taken_and_leaves_the_batch_open(
@@ -235,7 +234,7 @@ def test_a_blocking_wait_stops_when_the_lease_is_taken_and_leaves_the_batch_open
     session.close(session.lease_lost)
     assert backend.canceled == []  # the holder's batch to collect, not canceled
     (record,) = store.load().provider_batches
-    assert record["state"] == RECORD_OPEN
+    assert record["state"] == RecordState.OPEN
     assert store.lease_info()["held_by"] == "another-process"  # type: ignore[index]
 
     store.break_lease()  # the other process is done with it
@@ -244,7 +243,7 @@ def test_a_blocking_wait_stops_when_the_lease_is_taken_and_leaves_the_batch_open
     resumed.close(None)
     assert str(out["x-1"].choices[0].message.content) == "reply:a"
     assert len(backend.submitted) == 1  # collected, never resubmitted
-    assert [r["state"] for r in store.load().provider_batches] == [RECORD_COLLECTED]
+    assert [r["state"] for r in store.load().provider_batches] == [RecordState.COLLECTED]
 
 
 def test_a_batch_created_as_the_lease_is_lost_is_still_recorded(ws: Workspace) -> None:
@@ -262,7 +261,7 @@ def test_a_batch_created_as_the_lease_is_lost_is_still_recorded(ws: Workspace) -
         _executor(backend, session).run_wave({"x-1": _kwargs("a"), "y-1": _kwargs("b")})
     session.close(session.lease_lost)
     (record,) = store.load().provider_batches
-    assert record["state"] == RECORD_OPEN and len(record["keys"]) == 2
+    assert record["state"] == RecordState.OPEN and len(record["keys"]) == 2
     assert len(backend.submitted) == 1
 
     resumed = _open(ws, session.job_id, wait=False)

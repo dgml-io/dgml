@@ -28,12 +28,14 @@ from dgml_core import layout, llm
 from dgml_core.grounded import _merge_totals
 from dgml_core.storage import Workspace
 from dgml_core.usage import (
-    TIER_BATCH,
     TIER_MARKER,
-    TIER_STANDARD,
     TIERS_KEY,
+    PricingTier,
     UsageEvent,
+    UsageOperation,
+    UsageOutcome,
     add_partial,
+    as_pricing_tier,
     public_totals,
     read_events,
     record_usage,
@@ -73,7 +75,7 @@ def _event(**overrides: Any) -> UsageEvent:
         completion_tokens=3,
         total_tokens=33,
         duration_s=2.0,
-        outcome="ok",
+        outcome=UsageOutcome.OK,
     )
     base.update(overrides)
     return UsageEvent(**base)
@@ -104,7 +106,8 @@ def _drive_one(cfg: llm.LLMConfig, reply: Any) -> None:
 def test_tier_is_additive_and_defaults_to_standard() -> None:
     row = _event().to_json()
     assert list(row) == ROW_KEYS  # every old key, same order, tier last
-    assert row["tier"] == TIER_STANDARD == "standard"
+    assert row["tier"] == "standard"
+    assert type(row["tier"]) is str  # the bare value, not a PricingTier member
 
 
 def test_rows_without_tier_still_read(tmp_path: Path) -> None:
@@ -118,6 +121,71 @@ def test_rows_without_tier_still_read(tmp_path: Path) -> None:
     rows = read_events(ws)
     assert "tier" not in rows[0]  # not backfilled
     assert rows[1]["tier"] == "standard"
+
+
+def test_enum_fields_write_the_bytes_an_older_dgml_wrote(tmp_path: Path) -> None:
+    """Members on the event, bare strings on the row: the line is byte-identical
+    to one built from plain strings, as before the enums."""
+    ws = Workspace(root=tmp_path)
+    event = _event(
+        operation=UsageOperation.LABEL, outcome=UsageOutcome.ERROR, tier=PricingTier.BATCH
+    )
+    record_usage(ws, event)
+    plain = {
+        **event.to_json(),
+        "operation": "label",
+        "outcome": "error",
+        "tier": "batch",
+    }
+    line = local_tree_path(ws, layout.USAGE_FILE).read_text(encoding="utf-8")
+    assert line == json.dumps(plain, separators=(",", ":"), ensure_ascii=False) + "\n"
+    row = event.to_json()
+    assert all(type(row[k]) is str for k in ("operation", "outcome", "tier"))
+    assert read_events(ws)[0]["operation"] == UsageOperation.LABEL
+
+
+def test_rows_with_unknown_values_still_read(tmp_path: Path) -> None:
+    """Rows are read back as plain dicts, so an operation, outcome or tier this
+    version doesn't know (a newer dgml wrote it) never fails the read."""
+    ws = Workspace(root=tmp_path)
+    path = local_tree_path(ws, layout.USAGE_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    future = {**_event().to_json(), "operation": "summarize", "outcome": "partial", "tier": "flex"}
+    path.write_text(json.dumps(future) + "\n", encoding="utf-8")
+    record_usage(ws, _event(at="t2"))
+    rows = read_events(ws)
+    assert (rows[0]["operation"], rows[0]["outcome"], rows[0]["tier"]) == (
+        "summarize",
+        "partial",
+        "flex",
+    )
+    assert rows[1]["operation"] == UsageOperation.TRANSCRIBE
+
+
+def test_a_library_callers_own_operation_is_recorded_verbatim(tmp_path: Path) -> None:
+    """``LLMConfig.operation`` is open to library callers; an unlabeled call
+    records ``llm_call``."""
+    ws = Workspace(root=tmp_path)
+    _drive_one(_cfg(ws, operation="my_app_summarize"), FakeLLMResponse("ok"))
+    _drive_one(_cfg(ws, operation=None), FakeLLMResponse("ok"))
+    rows = read_events(ws)
+    assert [r["operation"] for r in rows] == ["my_app_summarize", UsageOperation.LLM_CALL]
+
+
+def test_unknown_tier_marker_is_kept_verbatim() -> None:
+    """A stored response's marker this version doesn't know is not an error and
+    is not replaced: the row records it as written. Only an absent or empty
+    marker takes the driving tier."""
+    response = _marked("x", "flex", 0.5)
+    usage = with_tier({"cost_usd": 0.5}, response, PricingTier.BATCH)
+    assert list(usage[TIERS_KEY]) == ["flex"]
+    (part,) = scope_events(_event(tier=PricingTier.STANDARD), usage)
+    assert part.tier == "flex" and part.to_json()["tier"] == "flex"
+    assert list(with_tier({}, _marked("x", "", 0.5), PricingTier.BATCH)[TIERS_KEY]) == ["batch"]
+    assert as_pricing_tier("flex", PricingTier.BATCH) == "flex"
+    assert as_pricing_tier(None, PricingTier.BATCH) is PricingTier.BATCH
+    assert as_pricing_tier("", PricingTier.STANDARD) is PricingTier.STANDARD
+    assert as_pricing_tier("batch", PricingTier.STANDARD) is PricingTier.BATCH
 
 
 # ---- the synchronous path -----------------------------------------------------------
@@ -141,7 +209,7 @@ def test_sync_rows_are_standard_per_call_and_per_scope(tmp_path: Path) -> None:
 
 def test_config_tier_reaches_the_row(tmp_path: Path) -> None:
     ws = Workspace(root=tmp_path)
-    cfg = _cfg(ws, tier=TIER_BATCH)
+    cfg = _cfg(ws, tier=PricingTier.BATCH)
     _drive_one(cfg, FakeLLMResponse("x", cost=0.01))
     assert read_events(ws)[0]["tier"] == "batch"
 
@@ -153,9 +221,9 @@ def test_scope_spanning_tiers_writes_one_row_per_tier(tmp_path: Path) -> None:
     ws = Workspace(root=tmp_path)
     cfg = _cfg(ws, operation="label", context={"docset_id": "ds1"})
     with llm.record_usage_for(cfg):
-        _drive_one(cfg, _marked("a", TIER_BATCH, 0.01))
-        _drive_one(cfg, _marked("b", TIER_STANDARD, 0.25))
-        _drive_one(cfg, _marked("c", TIER_BATCH, 0.02))
+        _drive_one(cfg, _marked("a", PricingTier.BATCH, 0.01))
+        _drive_one(cfg, _marked("b", PricingTier.STANDARD, 0.25))
+        _drive_one(cfg, _marked("c", PricingTier.BATCH, 0.02))
     rows = read_events(ws)
     assert [(r["tier"], r["cost_usd"], r["prompt_tokens"]) for r in rows] == [
         ("batch", 0.03, 20),
@@ -167,9 +235,11 @@ def test_scope_spanning_tiers_writes_one_row_per_tier(tmp_path: Path) -> None:
 
 def test_split_puts_duration_on_the_first_part_and_error_on_all() -> None:
     totals: dict[str, Any] = {}
-    add_partial(totals, with_tier({"cost_usd": 0.5, "prompt_tokens": 5}, None, TIER_STANDARD))
-    add_partial(totals, with_tier({"cost_usd": 0.25, "prompt_tokens": 5}, None, TIER_BATCH))
-    event = _event(cost_usd=0.75, prompt_tokens=10, outcome="error", error="E: boom")
+    add_partial(
+        totals, with_tier({"cost_usd": 0.5, "prompt_tokens": 5}, None, PricingTier.STANDARD)
+    )
+    add_partial(totals, with_tier({"cost_usd": 0.25, "prompt_tokens": 5}, None, PricingTier.BATCH))
+    event = _event(cost_usd=0.75, prompt_tokens=10, outcome=UsageOutcome.ERROR, error="E: boom")
     parts = scope_events(event, totals)
     assert [(p.tier, p.cost_usd, p.duration_s) for p in parts] == [
         ("batch", 0.25, 2.0),
@@ -181,7 +251,7 @@ def test_split_puts_duration_on_the_first_part_and_error_on_all() -> None:
 def test_untiered_responses_take_the_rows_tier() -> None:
     totals: dict[str, Any] = {}
     add_partial(totals, with_tier({"cost_usd": 0.5}, None, None))
-    event = _event(tier=TIER_BATCH)
+    event = _event(tier=PricingTier.BATCH)
     assert scope_events(event, totals) == [event]
     assert event.tier == "batch"
 
@@ -192,8 +262,10 @@ def test_untiered_responses_take_the_rows_tier() -> None:
 def test_extraction_totals_merge_tiers_and_strip_them_for_stats() -> None:
     phase1: dict[str, Any] = {}
     phase3: dict[str, Any] = {}
-    add_partial(phase1, with_tier({"cost_usd": 0.5, "prompt_tokens": 5}, None, TIER_BATCH))
-    add_partial(phase3, with_tier({"cost_usd": 0.25, "prompt_tokens": 1}, None, TIER_STANDARD))
+    add_partial(phase1, with_tier({"cost_usd": 0.5, "prompt_tokens": 5}, None, PricingTier.BATCH))
+    add_partial(
+        phase3, with_tier({"cost_usd": 0.25, "prompt_tokens": 1}, None, PricingTier.STANDARD)
+    )
     merged = _merge_totals(
         {
             **dict.fromkeys(("cost_usd", "prompt_tokens", "completion_tokens", "total_tokens")),

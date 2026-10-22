@@ -1,6 +1,6 @@
 ---
 name: dgml
-description: Use when the user wants to manage a DGML workspace from the shell — initialize a workspace, add PDFs or Office documents (docx/xlsx, when a converter is configured) single or bulk from a directory, create or manage DocSets, assign files to DocSets, convert PDFs to DGML XML (grounded in place with dg:origin bounding boxes as part of generation), extract structured values against a schema (RNC schema generation, grounded value extraction to DGML), or run a consistency check. Triggers on phrases like "add these PDFs", "ingest these Word/Excel docs", "create a docset", "import documents into DGML", "ingest a folder of PDFs", "ground the DGML", "add bounding boxes", "extract values", "extraction schema", "generate a schema", "pull fields from these docs", "dgml workspace", "check the workspace".
+description: Use when the user wants to manage a DGML workspace from the shell — initialize a workspace, add PDFs or Office documents (docx/xlsx/pptx, when a converter is configured) single or bulk from a directory, create or manage DocSets, assign files to DocSets, convert PDFs to DGML XML (grounded in place with dg:origin bounding boxes as part of generation), extract structured values against a schema (RNC schema generation, grounded value extraction to DGML), or run a consistency check. Triggers on phrases like "add these PDFs", "ingest these Word/Excel docs", "create a docset", "import documents into DGML", "ingest a folder of PDFs", "ground the DGML", "add bounding boxes", "extract values", "extraction schema", "generate a schema", "pull fields from these docs", "dgml workspace", "check the workspace".
 ---
 
 # Using the `dgml` CLI
@@ -274,9 +274,9 @@ find "$DIR" -type f -iname '*.pdf' -print0 |
   done
 ```
 
-### Office documents (docx/xlsx)
+### Office documents (docx/xlsx/pptx)
 
-`file add` accepts not just `.pdf` but convertible sources — `.docx`/`.doc`/`.xlsx`/`.xls` — **when a converter is configured** for that format family in `<workspace>/config.toml`. The source is converted to PDF at add time, then ingested exactly like a PDF (same `page_images/`, `page_text/`, generation). With no converter configured for a non-PDF format, the add fails with `UNSUPPORTED_FILE_TYPE` — there is no default. Ready-made converters ship in the `translators-pdf` package (LibreOffice, Aspose.Words, an xlsx island-renderer, a generic command runner); or point a family at your own class. Minimal config:
+`file add` accepts not just `.pdf` but convertible sources — `.docx`/`.doc`/`.xlsx`/`.xls`/`.pptx`/`.ppt` — **when a converter is configured** for that format family in `<workspace>/config.toml`. The source is converted to PDF at add time, then ingested exactly like a PDF (same `page_images/`, `page_text/`, generation). With no converter configured for a non-PDF format, the add fails with `UNSUPPORTED_FILE_TYPE` — there is no default. Ready-made converters ship in the `translators-pdf` package (LibreOffice, Aspose.Words, an xlsx island-renderer, a generic command runner); or point a family at your own class. Minimal config:
 
 ```toml
 # <workspace>/config.toml
@@ -286,7 +286,7 @@ provider = "translators_pdf.libreoffice:LibreOfficeConverter"
 provider = "translators_pdf.xlsx:XlsxIslandsConverter"
 ```
 
-Install the providers you reference: `pip install translators-pdf` (LibreOffice needs `soffice` on PATH; `pip install translators-pdf[xlsx]` for the xlsx renderer). A convertible source that can't be converted (missing binary/SDK) is a *soft* fail — the File record is created with `conversion_error` set, like `page_render_error`. See [conversion.md](../../../docs/conversion.md).
+Install the providers you reference: `pip install translators-pdf` (LibreOffice needs `soffice` on PATH; `pip install translators-pdf[xlsx]` for the xlsx renderer). For `pptx`, use the LibreOffice converter: `[conversion.pptx]` with `provider = "translators_pdf.libreoffice:LibreOfficeConverter"`. A convertible source that can't be converted (missing binary/SDK) is a *soft* fail — the File record is created with `conversion_error` set, like `page_render_error`. See [conversion.md](../../../docs/conversion.md).
 
 ### Text extraction
 

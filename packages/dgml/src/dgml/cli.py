@@ -32,6 +32,7 @@ import tempfile
 import tomllib
 from collections import Counter
 from collections.abc import Callable, Mapping
+from enum import StrEnum
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -47,9 +48,15 @@ from dgml_core.classification import (
     ClassifyMode,
     load_classification_config,
 )
+from dgml_core.clustering_types import ClusterMethod, ClusterMode
 from dgml_core.concurrency import map_concurrent
 from dgml_core.consistency import check_workspace
-from dgml_core.conversion import FAMILY_BY_SUFFIX, load_conversion_config
+from dgml_core.conversion import (
+    CONVERTIBLE_SUFFIXES_TEXT,
+    FAMILY_BY_SUFFIX,
+    load_conversion_config,
+    require_converter,
+)
 from dgml_core.default_config import PROVIDER_API_KEYS, PROVIDER_MODELS
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
@@ -58,6 +65,7 @@ from dgml_core.errors import (
     BatchJobNondeterministic,
     BatchPending,
     ConflictError,
+    ConflictErrorKind,
     DgmlError,
     GenerationFailed,
     InvalidArgument,
@@ -464,8 +472,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ws_import.add_argument(
         "--on-conflict",
-        choices=("skip", "fail", "replace"),
-        default="skip",
+        choices=[p.value for p in ImportConflictPolicy],
+        default=ImportConflictPolicy.SKIP.value,
         help=(
             "What to do when the store already holds a workspace with the same id: "
             "skip it (default), fail the whole command, or replace the stored config."
@@ -540,8 +548,8 @@ def _build_parser() -> argparse.ArgumentParser:
     cluster_p.add_argument(
         "--mode",
         dest="mode",
-        choices=("auto", "fresh", "incremental"),
-        default="auto",
+        choices=[m.value for m in ClusterMode],
+        default=ClusterMode.AUTO.value,
         help="Clustering mode. 'auto' (default) runs incremental clustering "
         "when the workspace already has DocSets (assign new files to existing "
         "clusters, open new clusters for the rest) and fresh clustering "
@@ -551,8 +559,8 @@ def _build_parser() -> argparse.ArgumentParser:
     cluster_p.add_argument(
         "--method",
         dest="method",
-        choices=("auto", "embedding", "llm"),
-        default="auto",
+        choices=[m.value for m in ClusterMethod],
+        default=ClusterMethod.AUTO.value,
         help="How documents are grouped, orthogonal to --mode. 'auto' (default) "
         "picks 'llm' for a FRESH run of at most --small-corpus-threshold "
         "clusterable files, and 'embedding' for everything else, incremental "
@@ -648,7 +656,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "path",
         type=Path,
         help=(
-            "Path to a file (.pdf, or a convertible source .docx/.doc/.xlsx/.xls "
+            f"Path to a file (.pdf, or a convertible source {CONVERTIBLE_SUFFIXES_TEXT} "
             "when a converter is configured), or a directory. When PATH is a "
             "directory, every ingestible file (case-insensitive) in it is added "
             "in one run and a summary envelope is returned. Use --recursive to "
@@ -1875,13 +1883,40 @@ def _read_seed_config(args: argparse.Namespace) -> str | None:
     return text
 
 
+class ImportConflictPolicy(StrEnum):
+    """``dgml workspace import --on-conflict``: what to do when the store of
+    workspaces already holds the id being imported.
+
+    ``SKIP`` (the default) leaves the stored one alone and reports the row
+    skipped; ``FAIL`` aborts the command; ``REPLACE`` overwrites its stored config.
+    """
+
+    SKIP = "skip"
+    FAIL = "fail"
+    REPLACE = "replace"
+
+
+class ImportStatus(StrEnum):
+    """One workspace's outcome in ``dgml workspace import`` (a report row's ``status``).
+
+    ``IMPORTED`` was written to the store; ``WOULD_IMPORT`` is ``IMPORTED`` under
+    ``--dry-run``; ``SKIPPED`` was already in the store (``--on-conflict skip``);
+    ``FAILED`` could not be imported (the row's ``reason`` says why).
+    """
+
+    IMPORTED = "imported"
+    WOULD_IMPORT = "would-import"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
 def _import_one(
     root: Path,
     *,
     store: WorkspacesStore,
     move: bool,
     dry_run: bool,
-    on_conflict: str,
+    on_conflict: ImportConflictPolicy,
     legacy_row: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Import the workspace at ``root`` into ``store``. Returns one report row.
@@ -1894,7 +1929,7 @@ def _import_one(
 
     row: dict[str, Any] = {"root": str(root)}
     if not root.is_dir():
-        return {**row, "status": "failed", "reason": "directory does not exist"}
+        return {**row, "status": ImportStatus.FAILED.value, "reason": "directory does not exist"}
 
     source = Workspace(root=root)
     had_config = source.config_present
@@ -1916,7 +1951,7 @@ def _import_one(
     if text is None:
         return {
             **row,
-            "status": "failed",
+            "status": ImportStatus.FAILED.value,
             "reason": "no config.toml, and no workspace layout to infer a local one from",
         }
 
@@ -1930,7 +1965,7 @@ def _import_one(
         # *as*, and generating an id here would adopt an arbitrary directory as a workspace.
         return {
             **row,
-            "status": "failed",
+            "status": ImportStatus.FAILED.value,
             "reason": (
                 f"no workspace identity found — neither a [workspace] block, nor "
                 f"{root / layout.WORKSPACE_FILE}, nor a row in the legacy index records a "
@@ -1949,7 +1984,7 @@ def _import_one(
         # the one who can say what it should be.
         return {
             **row,
-            "status": "failed",
+            "status": ImportStatus.FAILED.value,
             "reason": (
                 f"workspace_id {workspace_id!r} is not well-formed — it must be "
                 f"{ID_SHAPE}, or nothing can address "
@@ -1960,13 +1995,17 @@ def _import_one(
         }
 
     if store.exists(workspace_id):
-        if on_conflict == "skip":
-            return {**row, "status": "skipped", "reason": "already in the store of workspaces"}
-        if on_conflict == "fail":
+        if on_conflict is ImportConflictPolicy.SKIP:
+            return {
+                **row,
+                "status": ImportStatus.SKIPPED.value,
+                "reason": "already in the store of workspaces",
+            }
+        if on_conflict is ImportConflictPolicy.FAIL:
             raise ConflictError(
                 f"{store.label()} already holds {workspace_id}. Pass --on-conflict "
                 f"replace to overwrite its stored config, or skip to leave it alone.",
-                kind="workspace",
+                kind=ConflictErrorKind.WORKSPACE,
                 existing_id=workspace_id,
             )
 
@@ -1981,7 +2020,7 @@ def _import_one(
     row["workspace_path_recorded"] = needs_path
 
     if dry_run:
-        return {**row, "status": "would-import"}
+        return {**row, "status": ImportStatus.WOULD_IMPORT.value}
 
     if move and root.resolve() != target.resolve():
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -2004,7 +2043,7 @@ def _import_one(
             )
 
     row["config_location"] = imported.config_location
-    return {**row, "status": "imported"}
+    return {**row, "status": ImportStatus.IMPORTED.value}
 
 
 def _workspace_import(args: argparse.Namespace, fmt: str) -> int:
@@ -2042,7 +2081,7 @@ def _workspace_import(args: argparse.Namespace, fmt: str) -> int:
             store=store,
             move=args.move,
             dry_run=args.dry_run,
-            on_conflict=args.on_conflict,
+            on_conflict=ImportConflictPolicy(args.on_conflict),
             legacy_row=legacy,
         )
         for root, legacy in roots
@@ -2050,12 +2089,16 @@ def _workspace_import(args: argparse.Namespace, fmt: str) -> int:
 
     payload: dict[str, Any] = {
         "workspaces_store": store.label(),
-        "imported": [r for r in rows if r["status"] in ("imported", "would-import")],
-        "skipped": [r for r in rows if r["status"] == "skipped"],
-        "failed": [r for r in rows if r["status"] == "failed"],
+        "imported": [
+            r for r in rows if r["status"] in (ImportStatus.IMPORTED, ImportStatus.WOULD_IMPORT)
+        ],
+        "skipped": [r for r in rows if r["status"] == ImportStatus.SKIPPED],
+        "failed": [r for r in rows if r["status"] == ImportStatus.FAILED],
         "dry_run": args.dry_run,
     }
-    assumed = [r for r in rows if r.get("assumed_local_storage") and r["status"] == "imported"]
+    assumed = [
+        r for r in rows if r.get("assumed_local_storage") and r["status"] == ImportStatus.IMPORTED
+    ]
     if assumed:
         # Loud, and not behind --verbose: this is an assumption about which backend holds
         # the workspace's data, and only the caller can confirm it.
@@ -2154,7 +2197,7 @@ def _requested_workspace_id(args: argparse.Namespace, ws: Workspace, *, listed: 
             f"{store.label()} already holds a workspace {requested}. If it is this "
             f"workspace, re-run addressed to it — dgml --workspace {requested} workspace "
             f"create … (create is safe to re-run). Otherwise pick another --id.",
-            kind="workspace",
+            kind=ConflictErrorKind.WORKSPACE,
             existing_id=requested,
         )
     return requested
@@ -2471,7 +2514,14 @@ def _left_behind(session: Any) -> dict[str, Any] | None:
     """The resumable job the just-closed *session* left in the workspace, as
     a payload block — or None when the run finished its job (completed, or a
     silent job deleted with the run)."""
-    if session is None or session.manifest.status != "failed":
+    if session is None:
+        return None
+    # A session exists only once ``dgml_core.batch.jobs`` is imported, so this
+    # import is free here — and litellm stays off the error path of a run
+    # that never opened one.
+    from dgml_core.batch.jobs import JobStatus
+
+    if session.manifest.status != JobStatus.FAILED:
         return None
     try:
         if not session.store.exists():
@@ -2480,7 +2530,7 @@ def _left_behind(session: Any) -> dict[str, Any] | None:
         return None
     return {
         "job_id": session.job_id,
-        "status": session.manifest.status,
+        "status": JobStatus.FAILED.value,
         "resume": f"dgml batch resume {session.job_id}",
     }
 
@@ -2911,8 +2961,8 @@ def _dispatch(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 ws,
                 skip_existing=getattr(args, "skip_existing", False),
                 config=getattr(args, "config", None),
-                mode=getattr(args, "mode", "auto"),
-                method=getattr(args, "method", "auto"),
+                mode=ClusterMode(getattr(args, "mode", ClusterMode.AUTO)),
+                method=ClusterMethod(getattr(args, "method", ClusterMethod.AUTO)),
                 small_corpus_threshold=getattr(args, "small_corpus_threshold", 8),
                 write_stats=args.debug,
                 record_usage=args.debug,
@@ -5164,19 +5214,10 @@ def _file_add_payload(result: AddFileResult) -> dict[str, Any]:
     """The standard ``dgml file add`` success payload for one File.
 
     Shared by the single-file path and each entry in a bulk run, so callers
-    parse the same shape either way (part of the public CLI contract).
+    parse the same shape either way (part of the public CLI contract). The
+    shape itself is :meth:`AddFileResult.to_json`.
     """
-    return {
-        "file": result.record.to_json(),
-        "created": result.created,
-        "conflict_kind": result.conflict_kind,
-        "page_render_error": result.page_render_error,
-        "page_count_error": result.page_count_error,
-        "text_extraction_error": result.text_extraction_error,
-        "conversion_error": result.conversion_error,
-        "text_extraction": result.text_extraction,
-        "note": result.note,
-    }
+    return result.to_json()
 
 
 def _ingestible_suffixes(ws: Workspace) -> frozenset[str]:
@@ -5185,9 +5226,15 @@ def _ingestible_suffixes(ws: Workspace) -> frozenset[str]:
     configured in the workspace. Unconfigured source types are skipped (not
     gathered), so a folder of PDFs with stray Office docs doesn't produce a
     pile of per-file failures. Raises ``ConversionConfigInvalid`` on a
-    malformed ``conversion`` config (a real error worth surfacing once)."""
+    malformed ``conversion`` config, or a family whose converter cannot be
+    resolved or does not handle the family's suffixes (a real error worth
+    surfacing once, up front, rather than once per gathered file)."""
     configured = load_conversion_config(ws)
-    extra = {sfx for sfx, family in FAMILY_BY_SUFFIX.items() if family in configured}
+    extra: set[str] = set()
+    for sfx, family in FAMILY_BY_SUFFIX.items():
+        if family in configured:
+            require_converter(sfx, configured)
+            extra.add(sfx)
     return frozenset({".pdf"} | extra)
 
 
@@ -5216,6 +5263,22 @@ def _require_existing_docsets(docsets: list[DocSet]) -> None:
             "no DocSets to assign to; create one with `dgml docset create`, "
             f"or use `--auto-classify {ClassifyMode.EXISTING_OR_NEW}`"
         )
+
+
+class FileAddStatus(StrEnum):
+    """One file's outcome in a directory ``dgml file add`` (an entry's ``status``,
+    and the matching ``summary`` count key).
+
+    ``ADDED`` created a record cleanly; ``SKIPPED`` returned an existing one (a
+    conflict under ``--on-conflict skip``/``replace``); ``SOFT_FAILED`` created a
+    record but page counting, rendering, text extraction or conversion failed;
+    ``HARD_FAILED`` raised, so no record was created.
+    """
+
+    ADDED = "added"
+    SKIPPED = "skipped"
+    SOFT_FAILED = "soft_failed"
+    HARD_FAILED = "hard_failed"
 
 
 def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fmt: str) -> int:
@@ -5284,7 +5347,7 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
     on_conflict = ConflictPolicy(args.on_conflict)
     text_mode = TextMode(args.text_mode)
 
-    counts = {"added": 0, "skipped": 0, "soft_failed": 0, "hard_failed": 0}
+    counts = {str(status): 0 for status in FileAddStatus}
     entries: list[dict[str, Any]] = []
     # A resumed job never ingests again: every file is already in, and adding
     # it a second time would report it "skipped" and skip its classification.
@@ -5319,10 +5382,10 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
                 record_usage=args.debug,
             )
         except DgmlError as exc:
-            counts["hard_failed"] += 1
+            counts[FileAddStatus.HARD_FAILED.value] += 1
             entries.append(
                 {
-                    "status": "hard_failed",
+                    "status": FileAddStatus.HARD_FAILED.value,
                     "path": str(pdf),
                     "error": {"code": exc.code, "message": str(exc)},
                 }
@@ -5330,19 +5393,23 @@ def _file_add_bulk(args: argparse.Namespace, ws: Workspace, store: FileStore, fm
             continue
 
         if not result.created:
-            status = "skipped"
+            status = FileAddStatus.SKIPPED
         elif (
             result.page_render_error
             or result.page_count_error
             or result.text_extraction_error
             or result.conversion_error
         ):
-            status = "soft_failed"
+            status = FileAddStatus.SOFT_FAILED
         else:
-            status = "added"
-        counts[status] += 1
+            status = FileAddStatus.ADDED
+        counts[str(status)] += 1
 
-        entry: dict[str, Any] = {"status": status, "path": str(pdf), **_file_add_payload(result)}
+        entry: dict[str, Any] = {
+            "status": str(status),
+            "path": str(pdf),
+            **_file_add_payload(result),
+        }
         if batch is not None:
             # Classified together once every file is in (see classify_bulk_batch).
             batch.pending.append((entry, result))

@@ -24,7 +24,9 @@ import pytest
 from dgml_core.conversion import (
     ConverterConfig,
     DocConverter,
+    FormatFamily,
     _strip_converter_suffix,
+    convert_to_pdf_bytes,
     converter_name_for_path,
     family_for_suffix,
     load_conversion_config,
@@ -54,6 +56,20 @@ class StubConverter(DocConverter):
         return b"%PDF-stub:" + Path(path).name.encode()
 
 
+class AnyFormatStub(StubConverter):
+    """Format-agnostic, like the command runner: an empty ``input_formats``."""
+
+    name: ClassVar[str] = "any-format-stub"
+    input_formats: ClassVar[frozenset[str]] = frozenset()
+
+
+class LooseFormatStub(StubConverter):
+    """Declares its formats the way a third-party converter might: no dot, mixed case."""
+
+    name: ClassVar[str] = "loose-format-stub"
+    input_formats: ClassVar[frozenset[str]] = frozenset({"DOCX", "Doc"})
+
+
 class NotAConverter:
     pass
 
@@ -61,10 +77,14 @@ class NotAConverter:
 # Register a fake importable module so dotted-path resolution can find the stub.
 _STUB_MODULE = types.ModuleType("conv_stub")
 _STUB_MODULE.StubConverter = StubConverter  # type: ignore[attr-defined]
+_STUB_MODULE.AnyFormatStub = AnyFormatStub  # type: ignore[attr-defined]
+_STUB_MODULE.LooseFormatStub = LooseFormatStub  # type: ignore[attr-defined]
 _STUB_MODULE.NotAConverter = NotAConverter  # type: ignore[attr-defined]
 sys.modules["conv_stub"] = _STUB_MODULE
 
 _STUB = "conv_stub:StubConverter"
+_ANY_STUB = "conv_stub:AnyFormatStub"
+_LOOSE_STUB = "conv_stub:LooseFormatStub"
 
 
 def test_resolve_and_instantiate_dotted_path() -> None:
@@ -94,10 +114,37 @@ def test_non_docconverter_raises() -> None:
 
 
 def test_family_for_suffix() -> None:
-    assert family_for_suffix(".DOCX") == "docx"
-    assert family_for_suffix(".xls") == "xlsx"
+    assert family_for_suffix(".DOCX") is FormatFamily.DOCX
+    assert family_for_suffix(".xls") is FormatFamily.XLSX
+    assert family_for_suffix(".PPTX") is FormatFamily.PPTX
+    assert family_for_suffix(".ppt") is FormatFamily.PPTX
     assert family_for_suffix(".pdf") is None
     assert family_for_suffix(".txt") is None
+    # A member is its TOML key, so a loaded config's string keys match it.
+    assert FormatFamily.DOCX.value == "docx"
+
+
+def test_converter_must_handle_the_suffix(tmp_path: Path) -> None:
+    """A family pointed at a converter whose ``input_formats`` excludes that
+    family's suffix is refused before the converter is built."""
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"junk")
+    converters = {FormatFamily.PPTX: ConverterConfig(provider=_STUB)}  # handles docx/xlsx
+    with pytest.raises(ConversionConfigInvalid, match=r"does not handle '\.pptx'"):
+        convert_to_pdf_bytes(deck, converters)
+    # An empty input_formats means any suffix.
+    converters = {FormatFamily.PPTX: ConverterConfig(provider=_ANY_STUB)}
+    assert convert_to_pdf_bytes(deck, converters) == b"%PDF-stub:deck.pptx"
+
+
+def test_input_formats_match_without_the_dot_and_case(tmp_path: Path) -> None:
+    """``input_formats`` was informational before it was enforced, so a converter
+    that spells its suffixes loosely (``"DOCX"``, ``"Doc"``) must keep working."""
+    converters = {FormatFamily.DOCX: ConverterConfig(provider=_LOOSE_STUB)}
+    for name in ("memo.docx", "MEMO.DOC"):
+        doc = tmp_path / name
+        doc.write_bytes(b"junk")
+        assert convert_to_pdf_bytes(doc, converters) == b"%PDF-stub:" + name.encode()
 
 
 def _write_config(ws: Workspace, conversion: dict[str, Any]) -> None:
@@ -121,8 +168,9 @@ def test_load_conversion_config_parses_families(tmp_path: Path) -> None:
         },
     )
     configs = load_conversion_config(ws)
-    assert set(configs) == {"docx", "xlsx"}
-    assert configs["xlsx"].options["foo"] == "bar"
+    assert set(configs) == {FormatFamily.DOCX, FormatFamily.XLSX}
+    assert all(isinstance(key, FormatFamily) for key in configs)
+    assert configs[FormatFamily.XLSX].options["foo"] == "bar"
 
 
 def test_unknown_field_raises_at_conversion_time(tmp_path: Path) -> None:
@@ -131,9 +179,9 @@ def test_unknown_field_raises_at_conversion_time(tmp_path: Path) -> None:
     ws = Workspace(root=tmp_path)
     _write_config(ws, {"xlsx": {"provider": _STUB, "bogus": 1}})
     configs = load_conversion_config(ws)  # shape-only validation: no raise
-    assert configs["xlsx"].options["bogus"] == 1
+    assert configs[FormatFamily.XLSX].options["bogus"] == 1
     with pytest.raises(ConversionConfigInvalid):
-        make_converter(configs["xlsx"])
+        make_converter(configs[FormatFamily.XLSX])
 
 
 def test_load_conversion_config_does_not_import_provider(tmp_path: Path) -> None:
@@ -142,10 +190,10 @@ def test_load_conversion_config_does_not_import_provider(tmp_path: Path) -> None
     ws = Workspace(root=tmp_path)
     _write_config(ws, {"docx": {"provider": "totally_absent_module:Thing"}})
     configs = load_conversion_config(ws)  # no ImportError, no raise
-    assert configs["docx"].provider == "totally_absent_module:Thing"
+    assert configs[FormatFamily.DOCX].provider == "totally_absent_module:Thing"
     # Resolution is deferred — it fails only when a converter is actually built.
     with pytest.raises(ConversionConfigInvalid):
-        make_converter(configs["docx"])
+        make_converter(configs[FormatFamily.DOCX])
 
 
 def test_load_conversion_config_missing_provider_raises(tmp_path: Path) -> None:
@@ -171,7 +219,7 @@ def test_dispatch_unconfigured_family_raises(tmp_path: Path) -> None:
 def test_dispatch_uses_configured_converter(tmp_path: Path) -> None:
     src = tmp_path / "x.docx"
     src.write_bytes(b"junk")
-    converters = {"docx": ConverterConfig(provider=_STUB)}
+    converters = {FormatFamily.DOCX: ConverterConfig(provider=_STUB)}
     assert document.load_document_as_pdf(src, converters=converters) == b"%PDF-stub:x.docx"
 
 
@@ -200,7 +248,7 @@ def test_converter_name_for_path_unconfigured_family_is_none(tmp_path: Path) -> 
 
 
 def test_converter_name_for_path_uses_converter_name() -> None:
-    converters = {"docx": ConverterConfig(provider=_STUB)}
+    converters = {FormatFamily.DOCX: ConverterConfig(provider=_STUB)}
     # StubConverter.name == "stub" (no suffix to strip).
     assert converter_name_for_path(Path("x.docx"), converters) == "stub"
 

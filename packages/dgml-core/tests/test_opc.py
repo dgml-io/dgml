@@ -17,6 +17,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
+import pytest
 from dgml_core.opc import (
     CONTENT_TYPES_FILENAME,
     PackageRelationship,
@@ -42,6 +43,23 @@ def test_content_type_for_ext_known_and_fallback() -> None:
     assert content_type_for_ext("png") == "image/png"
     assert content_type_for_ext("PNG") == "image/png"  # case-insensitive
     assert content_type_for_ext("wat") == "application/octet-stream"  # unknown → fallback
+
+
+@pytest.mark.parametrize(
+    ("ext", "content_type"),
+    [
+        ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("doc", "application/msword"),
+        ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("xls", "application/vnd.ms-excel"),
+        ("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        ("PPT", "application/vnd.ms-powerpoint"),
+    ],
+)
+def test_content_type_for_every_convertible_source(ext: str, content_type: str) -> None:
+    """Each original a bundle can hold gets its real MIME type, not the
+    octet-stream fallback a missing or misspelled table entry would produce."""
+    assert content_type_for_ext(ext) == content_type
 
 
 def test_write_content_types_one_default_per_extension(tmp_path: Path) -> None:

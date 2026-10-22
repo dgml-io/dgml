@@ -33,6 +33,7 @@ from typing import Any
 
 import pytest
 from dgml_core import layout, llm
+from dgml_core.batch import ItemErrorKind
 from dgml_core.models import FileRecord
 from dgml_core.storage import Workspace
 from dgml_core.usage import read_events
@@ -166,7 +167,7 @@ def anthropic_backend() -> Iterator[list[Any]]:
         try:
             return answer(request.kwargs)
         except RuntimeError as exc:
-            return BatchItemError(request.custom_id, "invalid", str(exc))
+            return BatchItemError(request.custom_id, ItemErrorKind.INVALID, str(exc))
 
     def factory(_cfg: Any) -> Any:
         backend = FakeBackend(script, provider="anthropic")

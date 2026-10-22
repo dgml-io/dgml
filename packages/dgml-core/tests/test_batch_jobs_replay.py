@@ -39,7 +39,7 @@ from dgml_core.batch import (
     fake_model_response,
     start_session,
 )
-from dgml_core.batch.jobs import RECORD_DROPPED, RECORD_OPEN, JobSession
+from dgml_core.batch.jobs import JobSession, RecordState
 from dgml_core.errors import BatchJobNondeterministic, BatchPending
 from dgml_core.generation import document as document_mod
 from dgml_core.generation import transcribe as transcribe_mod
@@ -224,9 +224,9 @@ def test_a_changed_request_cancels_the_batch_it_supersedes(ws: Workspace) -> Non
     by_ids = {tuple(r["keys"]): r["state"] for r in records}
     assert len(backend.submitted) == 3  # only the changed request is new
     assert backend.canceled == [records[0]["job"]["job_id"]]
-    assert by_ids[("a-1",)] in (RECORD_DROPPED, RECORD_OPEN)
-    assert sum(1 for r in records if r["state"] == RECORD_DROPPED) == 1
-    assert sum(1 for r in records if r["state"] == RECORD_OPEN) == 2  # b and new a
+    assert by_ids[("a-1",)] in (RecordState.DROPPED, RecordState.OPEN)
+    assert sum(1 for r in records if r["state"] == RecordState.DROPPED) == 1
+    assert sum(1 for r in records if r["state"] == RecordState.OPEN) == 2  # b and new a
 
 
 # ---- 3. the nondeterminism guard -----------------------------------------------------
@@ -251,7 +251,7 @@ def test_a_wave_that_matches_nothing_while_its_positions_are_in_flight_stops(
     assert not backend.canceled  # the in-flight batch is kept
     manifest = BatchJobStore(ws, session.job_id).load()
     assert manifest.status == "failed" and "BatchJobNondeterministic" in (manifest.error or "")
-    assert [r["state"] for r in manifest.provider_batches] == [RECORD_OPEN]
+    assert [r["state"] for r in manifest.provider_batches] == [RecordState.OPEN]
 
 
 def test_once_the_guard_fired_the_session_sends_nothing_more(ws: Workspace) -> None:
@@ -290,7 +290,7 @@ def test_the_documented_recovery_is_cancel_then_resume(ws: Workspace) -> None:
     _pause(session)
     store = BatchJobStore(ws, session.job_id)
     manifest = store.load()
-    manifest.provider_batches[0]["state"] = RECORD_DROPPED  # `dgml batch cancel`
+    manifest.provider_batches[0]["state"] = RecordState.DROPPED  # `dgml batch cancel`
     store.save(manifest, merge=False)
 
     fresh = FakeBackend(_answer, provider="anthropic")

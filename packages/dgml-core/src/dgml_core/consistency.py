@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from . import layout
@@ -53,18 +54,58 @@ from .text_extraction import (
 from .text_extraction_config import load_text_extraction_config
 
 
+class IssueTarget(StrEnum):
+    """What an :class:`Issue` is about (its ``target_type``): a File or a DocSet.
+
+    ``Issue.target_id`` is that entity's id.
+    """
+
+    FILE = "file"
+    DOCSET = "docset"
+
+
+class IssueKind(StrEnum):
+    """What an :class:`Issue` found (its ``kind``) — the ``kind`` field of
+    ``dgml check`` output. A ``*_permanent`` kind is a recorded error that
+    re-checking does not retry (see ``retry_errors``)."""
+
+    # File checks
+    MISSING_METADATA = "missing_metadata"
+    CORRUPT_METADATA = "corrupt_metadata"
+    MISSING_PDF = "missing_pdf"
+    HASH_MISMATCH = "hash_mismatch"
+    PDF_UNREADABLE = "pdf_unreadable"
+    PDF_UNREADABLE_PERMANENT = "pdf_unreadable_permanent"
+    PAGE_COUNT_MISMATCH = "page_count_mismatch"
+    PAGE_RENDER_FAILED = "page_render_failed"
+    PAGE_RENDER_FAILED_PERMANENT = "page_render_failed_permanent"
+    PAGE_TEXT_CORRUPT = "page_text_corrupt"
+    PAGE_TEXT_COUNT_MISMATCH = "page_text_count_mismatch"
+    TEXT_EXTRACTION_FAILED = "text_extraction_failed"
+    TEXT_EXTRACTION_FAILED_PERMANENT = "text_extraction_failed_permanent"
+    # DocSet checks
+    DANGLING_FILE_REFERENCE = "dangling_file_reference"
+    SEMLINK_DANGLING_HREF = "semlink_dangling_href"
+    SEMLINK_NESTED = "semlink_nested"
+    # Provenance (DGML 0.71), from :func:`dgml_core.extraction_xml.provenance_issues`
+    VALUE_UNSUPPORTED = "value_unsupported"
+    METHOD_MISPLACED = "method_misplaced"
+    INPUTS_DANGLING = "inputs_dangling"
+    INPUTS_CYCLE = "inputs_cycle"
+
+
 @dataclass
 class Issue:
-    kind: str
-    target_type: str  # "file" | "docset"
+    kind: IssueKind
+    target_type: IssueTarget
     target_id: str
     message: str
     repaired: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "kind": self.kind,
-            "target_type": self.target_type,
+            "kind": str(self.kind),
+            "target_type": str(self.target_type),
             "target_id": self.target_id,
             "message": self.message,
             "repaired": self.repaired,
@@ -163,8 +204,8 @@ def _check_file(
     except CorruptMetadata as exc:
         report.issues.append(
             Issue(
-                kind="corrupt_metadata",
-                target_type="file",
+                kind=IssueKind.CORRUPT_METADATA,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=str(exc),
             )
@@ -174,8 +215,8 @@ def _check_file(
     if record_data is None:
         report.issues.append(
             Issue(
-                kind="missing_metadata",
-                target_type="file",
+                kind=IssueKind.MISSING_METADATA,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message="file.json missing",
             )
@@ -191,8 +232,8 @@ def _check_file(
     if not original_filename:
         report.issues.append(
             Issue(
-                kind="corrupt_metadata",
-                target_type="file",
+                kind=IssueKind.CORRUPT_METADATA,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message="file.json is missing 'original_filename'",
             )
@@ -203,8 +244,8 @@ def _check_file(
     if not ws.blobs.blob_exists(source_key):
         report.issues.append(
             Issue(
-                kind="missing_pdf",
-                target_type="file",
+                kind=IssueKind.MISSING_PDF,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=f"PDF '{original_filename}' missing from file directory",
             )
@@ -216,8 +257,8 @@ def _check_file(
         if actual_sha != sha:
             report.issues.append(
                 Issue(
-                    kind="hash_mismatch",
-                    target_type="file",
+                    kind=IssueKind.HASH_MISMATCH,
+                    target_type=IssueTarget.FILE,
                     target_id=file_id,
                     message="stored sha256 does not match actual content",
                 )
@@ -241,8 +282,8 @@ def _check_file(
         # We previously failed to read the page count; don't keep retrying.
         report.issues.append(
             Issue(
-                kind="pdf_unreadable_permanent",
-                target_type="file",
+                kind=IssueKind.PDF_UNREADABLE_PERMANENT,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message="page count previously failed to read; not retried without --retry-errors",
             )
@@ -375,8 +416,8 @@ def _recover_missing_pages(
     if "render_pages" in permanent_ops:
         report.issues.append(
             Issue(
-                kind="page_render_failed_permanent",
-                target_type="file",
+                kind=IssueKind.PAGE_RENDER_FAILED_PERMANENT,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message="page rendering previously failed permanently; no pages on disk",
             )
@@ -398,8 +439,8 @@ def _recover_missing_pages(
         )
         report.issues.append(
             Issue(
-                kind="page_render_failed",
-                target_type="file",
+                kind=IssueKind.PAGE_RENDER_FAILED,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=str(exc),
             )
@@ -409,8 +450,8 @@ def _recover_missing_pages(
     if not actual:
         report.issues.append(
             Issue(
-                kind="pdf_unreadable",
-                target_type="file",
+                kind=IssueKind.PDF_UNREADABLE,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message="page count unavailable and the renderer produced no pages",
             )
@@ -419,8 +460,8 @@ def _recover_missing_pages(
 
     report.issues.append(
         Issue(
-            kind="page_count_mismatch",
-            target_type="file",
+            kind=IssueKind.PAGE_COUNT_MISMATCH,
+            target_type=IssueTarget.FILE,
             target_id=file_id,
             message=f"recovered {actual} pages (stored count was unavailable)",
             repaired=True,
@@ -448,8 +489,8 @@ def _check_page_rendering(
     if "render_pages" in permanent_ops:
         report.issues.append(
             Issue(
-                kind="page_render_failed_permanent",
-                target_type="file",
+                kind=IssueKind.PAGE_RENDER_FAILED_PERMANENT,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=(
                     f"page rendering previously failed permanently; have "
@@ -474,8 +515,8 @@ def _check_page_rendering(
         )
         report.issues.append(
             Issue(
-                kind="page_render_failed",
-                target_type="file",
+                kind=IssueKind.PAGE_RENDER_FAILED,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=str(exc),
             )
@@ -495,8 +536,8 @@ def _check_page_rendering(
         )
         report.issues.append(
             Issue(
-                kind="page_count_mismatch",
-                target_type="file",
+                kind=IssueKind.PAGE_COUNT_MISMATCH,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=f"rendered {actual} pages, expected {expected}",
             )
@@ -504,8 +545,8 @@ def _check_page_rendering(
     else:
         report.issues.append(
             Issue(
-                kind="page_count_mismatch",
-                target_type="file",
+                kind=IssueKind.PAGE_COUNT_MISMATCH,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=f"re-rendered {actual} pages",
                 repaired=True,
@@ -531,8 +572,8 @@ def _check_text_extraction(
     for k in corrupt:
         report.issues.append(
             Issue(
-                kind="page_text_corrupt",
-                target_type="file",
+                kind=IssueKind.PAGE_TEXT_CORRUPT,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=f"{k.rsplit('/', 1)[-1]} is not valid JSON",
             )
@@ -545,8 +586,8 @@ def _check_text_extraction(
     if "text_extraction" in permanent_ops:
         report.issues.append(
             Issue(
-                kind="text_extraction_failed_permanent",
-                target_type="file",
+                kind=IssueKind.TEXT_EXTRACTION_FAILED_PERMANENT,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=(
                     f"text extraction previously failed permanently; have "
@@ -574,8 +615,8 @@ def _check_text_extraction(
         )
         report.issues.append(
             Issue(
-                kind="text_extraction_failed",
-                target_type="file",
+                kind=IssueKind.TEXT_EXTRACTION_FAILED,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=str(exc),
             )
@@ -586,8 +627,8 @@ def _check_text_extraction(
     if outcome.message is None:
         report.issues.append(
             Issue(
-                kind="page_text_count_mismatch",
-                target_type="file",
+                kind=IssueKind.PAGE_TEXT_COUNT_MISMATCH,
+                target_type=IssueTarget.FILE,
                 target_id=file_id,
                 message=f"re-extracted text for {result.pages_written} pages",
                 repaired=True,
@@ -609,8 +650,10 @@ def _check_text_extraction(
     # add-time vocabulary); transient ones as page_text_count_mismatch.
     report.issues.append(
         Issue(
-            kind="text_extraction_failed" if outcome.permanent else "page_text_count_mismatch",
-            target_type="file",
+            kind=IssueKind.TEXT_EXTRACTION_FAILED
+            if outcome.permanent
+            else IssueKind.PAGE_TEXT_COUNT_MISMATCH,
+            target_type=IssueTarget.FILE,
             target_id=file_id,
             message=outcome.message,
         )
@@ -703,8 +746,8 @@ def _check_docset(ws: Workspace, docset_id: str, *, report: CheckReport) -> None
     except CorruptMetadata as exc:
         report.issues.append(
             Issue(
-                kind="corrupt_metadata",
-                target_type="docset",
+                kind=IssueKind.CORRUPT_METADATA,
+                target_type=IssueTarget.DOCSET,
                 target_id=docset_id,
                 message=str(exc),
             )
@@ -714,8 +757,8 @@ def _check_docset(ws: Workspace, docset_id: str, *, report: CheckReport) -> None
     if record_data is None:
         report.issues.append(
             Issue(
-                kind="missing_metadata",
-                target_type="docset",
+                kind=IssueKind.MISSING_METADATA,
+                target_type=IssueTarget.DOCSET,
                 target_id=docset_id,
                 message="docset.json missing",
             )
@@ -727,8 +770,8 @@ def _check_docset(ws: Workspace, docset_id: str, *, report: CheckReport) -> None
         if not _file_present(ws, file_id):
             report.issues.append(
                 Issue(
-                    kind="dangling_file_reference",
-                    target_type="docset",
+                    kind=IssueKind.DANGLING_FILE_REFERENCE,
+                    target_type=IssueTarget.DOCSET,
                     target_id=docset_id,
                     message=f"references missing file '{file_id}'",
                 )
@@ -777,14 +820,14 @@ def _check_provenance(
         found = provenance_issues(xml)
     except Exception:
         return
-    by_kind: dict[str, list[str]] = {}
+    by_kind: dict[IssueKind, list[str]] = {}
     for kind, tag, detail in found:
-        by_kind.setdefault(kind, []).append(f"{tag} ({detail})")
+        by_kind.setdefault(IssueKind(kind), []).append(f"{tag} ({detail})")
     for kind, entries in sorted(by_kind.items()):
         report.issues.append(
             Issue(
                 kind=kind,
-                target_type="docset",
+                target_type=IssueTarget.DOCSET,
                 target_id=docset_id,
                 message=f"file '{file_id}' {name}: {_PROVENANCE_MESSAGES[kind]}: "
                 + ", ".join(sorted(set(entries))),
@@ -793,10 +836,10 @@ def _check_provenance(
 
 
 _PROVENANCE_MESSAGES = {
-    "value_unsupported": 'value(s) with dg:origin="computed" that name no sources',
-    "method_misplaced": "dg:method that contradicts the element's other attributes",
-    "inputs_dangling": "dg:inputs target(s) with no element",
-    "inputs_cycle": "element(s) that are their own input",
+    IssueKind.VALUE_UNSUPPORTED: 'value(s) with dg:origin="computed" that name no sources',
+    IssueKind.METHOD_MISPLACED: "dg:method that contradicts the element's other attributes",
+    IssueKind.INPUTS_DANGLING: "dg:inputs target(s) with no element",
+    IssueKind.INPUTS_CYCLE: "element(s) that are their own input",
 }
 
 
@@ -826,8 +869,8 @@ def _check_semantic_links(
     if audit.dangling:
         report.issues.append(
             Issue(
-                kind="semlink_dangling_href",
-                target_type="docset",
+                kind=IssueKind.SEMLINK_DANGLING_HREF,
+                target_type=IssueTarget.DOCSET,
                 target_id=docset_id,
                 message=(
                     f"file '{file_id}' {name}: {audit.dangling} dg:href target(s) resolve to no "
@@ -838,8 +881,8 @@ def _check_semantic_links(
     if audit.nested:
         report.issues.append(
             Issue(
-                kind="semlink_nested",
-                target_type="docset",
+                kind=IssueKind.SEMLINK_NESTED,
+                target_type=IssueTarget.DOCSET,
                 target_id=docset_id,
                 message=(
                     f"file '{file_id}' {name}: {audit.nested} link(s) point at the subject's own "

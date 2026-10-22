@@ -42,6 +42,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+from .conversion import FormatFamily
 from .models_config import (
     ConfigSection,
     Model,
@@ -291,13 +292,13 @@ class TextExtraction:
 
 @dataclass(frozen=True)
 class Conversion:
-    """``[conversion]``: one :class:`ProviderSpec` per format family (``docx``,
-    ``xlsx``). Reads ``dgml_core.conversion.load_conversion_config``."""
+    """``[conversion]``: one :class:`ProviderSpec` per :class:`FormatFamily`. Reads
+    ``dgml_core.conversion.load_conversion_config``."""
 
-    families: Mapping[str, ProviderSpec] = field(default_factory=dict)
+    families: Mapping[FormatFamily, ProviderSpec] = field(default_factory=dict)
 
     def table(self) -> dict[str, Any]:
-        return {family: spec.table() for family, spec in self.families.items()}
+        return {str(family): spec.table() for family, spec in self.families.items()}
 
 
 @dataclass(frozen=True)

@@ -31,7 +31,7 @@ from typing import Any
 
 import pytest
 from dgml_core import layout
-from dgml_core.batch import BatchExecutor, BatchItemError, BatchRequest, FakeBackend
+from dgml_core.batch import BatchExecutor, BatchItemError, BatchRequest, FakeBackend, ItemErrorKind
 from dgml_core.errors import (
     BatchExecutionFailed,
     SchemaInvalid,
@@ -45,7 +45,7 @@ from dgml_core.grounded import (
     extract_values_batch,
 )
 from dgml_core.storage import Workspace
-from dgml_core.usage import TIER_BATCH, TIER_STANDARD, read_events
+from dgml_core.usage import PricingTier, read_events
 
 from .test_grounded import (
     _TITLE_RNC,
@@ -253,8 +253,8 @@ def test_batch_matches_sync_values_xml_stats_and_rows(
     # One row per file, identical but for the tier.
     assert len(batch_rows) == len(sync_rows) == 3
     for s_row, b_row in zip(sync_rows, batch_rows, strict=True):
-        assert s_row["tier"] == TIER_STANDARD and b_row["tier"] == TIER_BATCH
-        assert {**b_row, "tier": TIER_STANDARD} == s_row
+        assert s_row["tier"] == PricingTier.STANDARD and b_row["tier"] == PricingTier.BATCH
+        assert {**b_row, "tier": PricingTier.STANDARD} == s_row
     # Phase 3 really ran (one page + two pages), and the phase-3 cost is in the rows.
     assert sync_snapshot[f"stats:{TWO_PAGES}"]["phases"]["phase3"]["page_calls"] == 2
     assert sync_snapshot[f"stats:{ONE_PAGE}"]["phases"]["phase3"]["page_calls"] == 1
@@ -307,7 +307,7 @@ def test_batch_locates_a_page_without_words_on_the_grid_like_sync(
     assert _same(batch[ONE_PAGE], sync[ONE_PAGE])
     assert _snapshot(workspace, ds_id, fids) == sync_snapshot
     batch_rows = _rows(workspace)[len(sync_rows) :]
-    assert [{**r, "tier": TIER_STANDARD} for r in batch_rows] == sync_rows
+    assert [{**r, "tier": PricingTier.STANDARD} for r in batch_rows] == sync_rows
 
     batched = [req.kwargs for wave in backend.submitted for req in wave]
     phase3 = [kw for kw in batched if _tool_name(kw) == "submit_locations"]
@@ -424,7 +424,7 @@ def test_one_file_failing_phase1_is_isolated_with_the_sync_message(
     assert isinstance(batch[MATCHED], ExtractionResult)
     assert isinstance(batch[ONE_PAGE], ExtractionResult)
     # The failed file still wrote its error row, like the sync path.
-    rows = [r for r in _rows(workspace) if r["tier"] == TIER_BATCH]
+    rows = [r for r in _rows(workspace) if r["tier"] == PricingTier.BATCH]
     assert [r["outcome"] for r in rows if r["context"]["file_id"] == broken] == ["error"]
 
 
@@ -444,7 +444,7 @@ def test_executor_failure_on_a_request_gets_the_sync_message(
 
     def script(req: BatchRequest) -> Any:
         if _file_of(req.kwargs) == ONE_PAGE:
-            return BatchItemError(req.custom_id, "invalid", "rejected")
+            return BatchItemError(req.custom_id, ItemErrorKind.INVALID, "rejected")
         return _responder()(req.kwargs)
 
     executor = BatchExecutor(FakeBackend(script), min_wave_size=1, sleep=lambda _s: None)
@@ -602,7 +602,7 @@ def test_permissive_schema_fallback_under_batch(workspace: Workspace, capture_kw
 
     def script(req: BatchRequest) -> Any:
         if _file_of(req.kwargs) == wide and inlined(req.kwargs):
-            return BatchItemError(req.custom_id, "invalid", "too many states")
+            return BatchItemError(req.custom_id, ItemErrorKind.INVALID, "too many states")
         return sync_respond(req.kwargs)
 
     executor = BatchExecutor(FakeBackend(script), min_wave_size=1, sleep=lambda _s: None)
@@ -665,7 +665,7 @@ def test_usage_write_failure_is_isolated_to_its_file(
     assert _same(batch[ONE_PAGE], sync)
     rows = read_events(workspace)
     assert sorted(r["context"]["file_id"] for r in rows) == sorted([MATCHED, TWO_PAGES])
-    assert all(r["tier"] == TIER_BATCH for r in rows)
+    assert all(r["tier"] == PricingTier.BATCH for r in rows)
 
 
 def test_pairs_across_docsets_share_two_waves(workspace: Workspace, capture_kwargs: Any) -> None:
@@ -762,7 +762,7 @@ def test_envelope_repair_and_refusal_match_sync(workspace: Workspace, capture_kw
     by_file = {row["context"]["file_id"]: row for row in sync_rows}
     # Batch rows land in completion order; compare them per file.
     for b_row in batch_rows:
-        assert {**b_row, "tier": TIER_STANDARD} == by_file[b_row["context"]["file_id"]]
+        assert {**b_row, "tier": PricingTier.STANDARD} == by_file[b_row["context"]["file_id"]]
     # The refused run's row counts the get_page_words call phase 1 made.
     assert by_file[ONE_PAGE]["outcome"] == "error"
     assert by_file[ONE_PAGE]["context"]["tool_calls"] == 1

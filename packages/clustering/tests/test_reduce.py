@@ -18,6 +18,7 @@ import importlib.util
 
 import pytest
 import torch
+from clustering.config.schema import ReduceMethod
 from clustering.scenarios.clustering import reduce_embeddings
 
 _SKLEARN = importlib.util.find_spec("sklearn") is not None
@@ -26,24 +27,24 @@ _UMAP = importlib.util.find_spec("umap") is not None
 
 def test_reduce_none_is_passthrough() -> None:
     x = torch.randn(10, 16)
-    assert reduce_embeddings(x, method="none", n_components=4) is x
+    assert reduce_embeddings(x, method=ReduceMethod.NONE, n_components=4) is x
 
 
 def test_reduce_zero_components_is_passthrough() -> None:
     x = torch.randn(10, 16)
-    assert reduce_embeddings(x, method="pca", n_components=0) is x
+    assert reduce_embeddings(x, method=ReduceMethod.PCA, n_components=0) is x
 
 
 def test_reduce_components_geq_dim_is_passthrough() -> None:
     x = torch.randn(10, 16)
-    assert reduce_embeddings(x, method="pca", n_components=16) is x
-    assert reduce_embeddings(x, method="pca", n_components=99) is x
+    assert reduce_embeddings(x, method=ReduceMethod.PCA, n_components=16) is x
+    assert reduce_embeddings(x, method=ReduceMethod.PCA, n_components=99) is x
 
 
 def test_reduce_tiny_corpus_is_passthrough() -> None:
     # n < 3 — nothing meaningful to reduce.
     x = torch.randn(2, 16)
-    assert reduce_embeddings(x, method="pca", n_components=4) is x
+    assert reduce_embeddings(x, method=ReduceMethod.PCA, n_components=4) is x
 
 
 _SKLEARN_METHODS = [
@@ -74,7 +75,7 @@ def test_reduce_sklearn_methods_shape(method: str) -> None:
 def test_reduce_pca_clamps_components_to_n_minus_one() -> None:
     # 4 samples → at most 3 PCA components, even if more are requested.
     x = torch.randn(4, 16)
-    out = reduce_embeddings(x, method="pca", n_components=10, seed=0)
+    out = reduce_embeddings(x, method=ReduceMethod.PCA, n_components=10, seed=0)
     assert out.shape[0] == 4
     assert out.shape[1] <= 3
 
@@ -86,7 +87,7 @@ def test_reduce_umap_small_corpus_does_not_crash() -> None:
     # n_neighbors + random init must keep it working.
     torch.manual_seed(0)
     x = torch.randn(10, 256)
-    out = reduce_embeddings(x, method="umap", n_components=5, seed=0)
+    out = reduce_embeddings(x, method=ReduceMethod.UMAP, n_components=5, seed=0)
     assert out.shape == (10, 5)
 
 
@@ -109,5 +110,5 @@ def test_reduce_neighbour_based_falls_back_to_pca_on_failure(
 
     x = torch.randn(12, 16)
     with pytest.warns(RuntimeWarning, match="Falling back to PCA"):
-        out = reduce_embeddings(x, method="spectral", n_components=4, seed=0)
+        out = reduce_embeddings(x, method=ReduceMethod.SPECTRAL, n_components=4, seed=0)
     assert out.shape == (12, 4)

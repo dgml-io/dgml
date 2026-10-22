@@ -65,7 +65,16 @@ from __future__ import annotations
 
 import torch
 
-from clustering.config.schema import UNSUPERVISED_LOSSES
+from clustering.config.schema import (
+    UNSUPERVISED_LOSSES,
+    ClusterAlgorithm,
+    LossName,
+    ManifoldConfig,
+    ManifoldName,
+    ReduceMethod,
+    ScenarioName,
+    Supervision,
+)
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import CLUSTER_NOISE_LABEL, Scenario, ScenarioResult
 from clustering.scenarios.clustering import (
@@ -77,7 +86,7 @@ from clustering.scenarios.clustering import (
 
 
 class S1Unsupervised(Scenario):
-    name = "s1"
+    name = ScenarioName.S1
 
     # Fallback pseudo-label cluster count when neither
     # ``training.pseudo_k`` nor ``scenario.k_clusters`` is set.
@@ -88,7 +97,7 @@ class S1Unsupervised(Scenario):
     # ``--trainable-fusion``. ``cross_modal`` is excluded: its two modality
     # views must each flow through the trainable fusion, which the stacked
     # single-fusion wrapper can't express, so it stays fusion-frozen.
-    _JOINT_FUSION_UNSUP_LOSSES = frozenset({"pseudo_label", "knn_contrastive"})
+    _JOINT_FUSION_UNSUP_LOSSES = frozenset({LossName.PSEUDO_LABEL, LossName.KNN_CONTRASTIVE})
 
     def _trains_fusion_jointly(self) -> bool:
         """True when the unsupervised run should train fusion + projector jointly."""
@@ -127,7 +136,7 @@ class S1Unsupervised(Scenario):
             return self._train_unsupervised_with_fusion(unknown_dataset)
 
         views: tuple[torch.Tensor, torch.Tensor] | None = None
-        if tr.loss == "cross_modal":
+        if tr.loss == LossName.CROSS_MODAL:
             _, text_view, image_view = self.unimodal_views(unknown_dataset)
             views = (text_view, image_view)
 
@@ -195,7 +204,7 @@ class S1Unsupervised(Scenario):
             labels_t, _ = cluster_embeddings(
                 embeddings,
                 manifold=self.manifold,
-                algorithm="kmeans",
+                algorithm=ClusterAlgorithm.KMEANS,
                 k=k,
                 seed=self.config.seed + round_i,
             )
@@ -237,9 +246,9 @@ class S1Unsupervised(Scenario):
                 # The fusion weights changed, so the pre-training ``fused``
                 # above is stale — re-embed before the label-free clustering.
                 _, fused, _ = self.fused_embeddings(unknown_dataset)
-        elif supervision == "pseudo_labels":
+        elif supervision == Supervision.PSEUDO_LABELS:
             train_history = self._train_with_pseudo_labels(fused)
-        elif supervision == "cross_modal":
+        elif supervision == Supervision.CROSS_MODAL:
             train_history = self.maybe_train_projector_cross_modal(unknown_dataset)
         elif self.config.training.trainable_fusion:
             # "labels" supervision, fusion trained jointly with the projector.
@@ -260,7 +269,7 @@ class S1Unsupervised(Scenario):
         # K is required for k-means and ignored for hdbscan; only fall
         # back to the heuristic when we'll actually consume it.
         k = sc.k_clusters
-        if algorithm == "kmeans" and k is None:
+        if algorithm == ClusterAlgorithm.KMEANS and k is None:
             # Heuristic fallback: if the corpus carries labels, use that
             # count; otherwise default to 8.
             unique_labels = {label for label in true_labels if label is not None}
@@ -273,7 +282,7 @@ class S1Unsupervised(Scenario):
         # representation manifold. The stored ``embeddings`` stay original.
         cluster_input = embeddings
         cluster_manifold = self.manifold
-        if sc.reduce_method != "none" and sc.reduce_dim > 0:
+        if sc.reduce_method != ReduceMethod.NONE and sc.reduce_dim > 0:
             cluster_input = reduce_embeddings(
                 embeddings,
                 method=sc.reduce_method,
@@ -281,11 +290,10 @@ class S1Unsupervised(Scenario):
                 seed=self.config.seed,
             )
             if cluster_input is not embeddings:
-                from clustering.config.schema import ManifoldConfig
                 from clustering.manifolds import build_manifold
 
                 cluster_manifold = build_manifold(
-                    ManifoldConfig(name="euclidean", dim=int(cluster_input.shape[-1]))
+                    ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=int(cluster_input.shape[-1]))
                 )
 
         labels_t, centroids = cluster_embeddings(
@@ -406,8 +414,8 @@ class S1Unsupervised(Scenario):
                 "n_noise": n_noise,
                 "n_review": int(sum(review)),
                 "centroids_shape": tuple(centroids.shape),
-                "algorithm": algorithm,
-                "reduce_method": sc.reduce_method,
+                "algorithm": str(algorithm),
+                "reduce_method": str(sc.reduce_method),
                 "reduce_dim": (
                     int(cluster_input.shape[-1]) if cluster_input is not embeddings else 0
                 ),
@@ -417,7 +425,7 @@ class S1Unsupervised(Scenario):
                 "projector_trained": bool(train_history),
                 "projector_loss_history": train_history,
                 "projector_unsupervised": unsupervised_loss,
-                "projector_loss": self.config.training.loss,
-                "supervision": supervision,
+                "projector_loss": str(self.config.training.loss),
+                "supervision": str(supervision),
             },
         )

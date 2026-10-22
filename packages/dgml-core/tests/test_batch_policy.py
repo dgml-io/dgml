@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import openai
 import pytest
-from dgml_core.batch import BatchRequest
+from dgml_core.batch import BatchRequest, ItemErrorKind
 from dgml_core.batch._capture import EncodeCache
 from dgml_core.batch._http import HttpFailure, call_with_retries
 from dgml_core.batch._policy import (
@@ -225,7 +225,7 @@ def test_non_http_results_pass_through() -> None:
 
 
 def test_batch_rejected_items_are_not_retryable_by_default() -> None:
-    item = BatchItemError("a", "batch_rejected", "over the enqueued-token limit")
+    item = BatchItemError("a", ItemErrorKind.BATCH_REJECTED, "over the enqueued-token limit")
     assert not item.retryable
 
 

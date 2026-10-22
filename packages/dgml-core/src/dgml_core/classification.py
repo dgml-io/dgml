@@ -39,7 +39,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from .config import load_merged_config
 from .docsets import DocSetStore
@@ -61,7 +61,7 @@ from .llm import (
 from .models import DocSet
 from .models_config import ConfigSection, Tier, resolve_tiered_model
 from .storage import Workspace
-from .usage import OPERATION_CLASSIFY
+from .usage import UsageOperation
 from .utils import gather_file_pages, image_to_data_url
 
 if TYPE_CHECKING:
@@ -108,8 +108,21 @@ class ClassifyMode(StrEnum):
     EXISTING_OR_NEW = "existing-or-new"
 
 
-DecisionKind = Literal["existing", "new", "none"]
-"""What a :class:`ClassificationDecision` resolved to."""
+class DecisionKind(StrEnum):
+    """What a :class:`ClassificationDecision` resolved to.
+
+    ``EXISTING`` assigns the file to a DocSet that already exists. ``NEW``
+    proposes a DocSet to create for it, and is reachable only under
+    :attr:`ClassifyMode.EXISTING_OR_NEW`. ``NONE`` declines because no existing
+    DocSet fits, and is reachable only under :attr:`ClassifyMode.EXISTING`.
+
+    A ``StrEnum``, so a member is the literal ``decision`` value that
+    auto-classification's JSON output carries.
+    """
+
+    EXISTING = "existing"
+    NEW = "new"
+    NONE = "none"
 
 
 _NEW_DOCSET_INSTRUCTION_BULLETS = "\n".join(
@@ -272,7 +285,9 @@ def classify_file(
             )
         if mode == ClassifyMode.EXISTING_FORCED and len(docsets) == 1:
             # Only one possible answer, so there is nothing to decide.
-            decision = ClassificationDecision(decision="existing", existing_docset_id=docsets[0].id)
+            decision = ClassificationDecision(
+                decision=DecisionKind.EXISTING, existing_docset_id=docsets[0].id
+            )
             _log_decision(file_id, decision, docsets, mode=mode, by="the only docset, no LLM call")
             return decision
     response = _vision_tool_call(
@@ -304,13 +319,13 @@ def _log_decision(
     (``reason``, the docset's name) are checked for ``None`` before use. The
     rest is lazy ``%s`` arguments, which ``logging`` formats itself."""
     reason = f": {decision.reason}" if decision.reason else ""
-    if decision.decision == "existing":
+    if decision.decision == DecisionKind.EXISTING:
         name = next((d.name for d in docsets if d.id == decision.existing_docset_id), None)
         target = f"docset {decision.existing_docset_id}" + (f" ({name!r})" if name else "")
         logger.info(
             "file %s: classified into %s [mode %s, by %s]%s", file_id, target, mode, by, reason
         )
-    elif decision.decision == "new":
+    elif decision.decision == DecisionKind.NEW:
         logger.info(
             "file %s: classification proposes a new docset %r [mode %s, by %s]%s",
             file_id,
@@ -471,7 +486,7 @@ def classify_steps(
         max_tokens=None,
         workspace=workspace,
         record_usage=record_usage,
-        operation=OPERATION_CLASSIFY,
+        operation=UsageOperation.CLASSIFY,
         context={"file_ids": file_ids},
     )
     steps = steps_with_tools(
@@ -531,7 +546,9 @@ def classify_files_batch(
         dupes = sorted({f for f in file_ids if file_ids.count(f) > 1})
         raise ValueError(f"file_ids must be unique; duplicated: {dupes}")
     if mode == ClassifyMode.EXISTING_FORCED and len(docsets) == 1:
-        only = ClassificationDecision(decision="existing", existing_docset_id=docsets[0].id)
+        only = ClassificationDecision(
+            decision=DecisionKind.EXISTING, existing_docset_id=docsets[0].id
+        )
         return {fid: only for fid in file_ids}
 
     prompt = _build_prompt(docsets, mode=mode)
@@ -610,7 +627,9 @@ def classify_file_batch(
                 "classification to propose a new DocSet"
             )
         if mode == ClassifyMode.EXISTING_FORCED and len(docsets) == 1:
-            return ClassificationDecision(decision="existing", existing_docset_id=docsets[0].id)
+            return ClassificationDecision(
+                decision=DecisionKind.EXISTING, existing_docset_id=docsets[0].id
+            )
     llm_config, steps = classify_steps(
         workspace,
         [file_id],
@@ -1018,7 +1037,7 @@ def _parse_response(
                 f"{_TOOL_ASSIGN} returned unknown docset_id {docset_id!r}; "
                 f"valid ids: {sorted(valid_ids)}"
             )
-        return ClassificationDecision(decision="existing", existing_docset_id=docset_id)
+        return ClassificationDecision(decision=DecisionKind.EXISTING, existing_docset_id=docset_id)
 
     if name == _TOOL_CREATE:
         if mode != ClassifyMode.EXISTING_OR_NEW:
@@ -1036,7 +1055,7 @@ def _parse_response(
         reason = args.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise ClassificationFailed(f"{_TOOL_NO_MATCH} call missing a non-empty 'reason'")
-        return ClassificationDecision(decision="none", reason=reason.strip())
+        return ClassificationDecision(decision=DecisionKind.NONE, reason=reason.strip())
 
     raise ClassificationFailed(f"LLM returned unexpected tool name: {name!r}")
 
@@ -1118,7 +1137,7 @@ def _parse_new_docset_args(name: str | None, args: dict[str, Any]) -> Classifica
                 f"{_TOOL_CREATE} 'key_questions' contained no non-empty entries"
             )
         return ClassificationDecision(
-            decision="new",
+            decision=DecisionKind.NEW,
             new_name=new_name.strip(),
             new_description=new_description.strip(),
             new_key_questions=tuple(cleaned_questions),

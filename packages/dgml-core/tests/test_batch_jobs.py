@@ -36,6 +36,7 @@ from dgml_core.batch import (
     BatchItemError,
     BatchJobStore,
     FakeBackend,
+    ItemErrorKind,
     ReplayExecutor,
     active_session,
     fake_model_response,
@@ -45,21 +46,22 @@ from dgml_core.batch import (
 )
 from dgml_core.batch.executor import TIER_MARKER
 from dgml_core.batch.jobs import (
-    RECORD_COLLECTED,
-    RECORD_OPEN,
-    STATUS_COMPLETED,
-    STATUS_FAILED,
-    STATUS_PENDING,
     JobSession,
+    JobStatus,
+    RecordState,
     dump_response,
+    job_summary,
     load_response,
+    mark_dropped,
+    owed_cleanups,
 )
 from dgml_core.errors import BatchJobInvalid, BatchJobNotFound, BatchPending
 from dgml_core.storage import Workspace
 from dgml_core.usage import (
     BILLED_MARKER,
-    TIER_BATCH,
+    PricingTier,
     UsageEvent,
+    UsageOutcome,
     extract_cost_and_tokens,
     read_events,
     record_usage,
@@ -194,7 +196,7 @@ def test_fake_response_round_trips_with_tool_calls_cache_counters_and_markers() 
         },
         cost=0.5,
     )
-    response._hidden_params[TIER_MARKER] = TIER_BATCH
+    response._hidden_params[TIER_MARKER] = PricingTier.BATCH
     _assert_round_trip(response)
     assert (
         extract_cost_and_tokens(load_response(dump_response(response) or b""))["cache_read_tokens"]
@@ -213,7 +215,7 @@ def test_each_backends_decoded_shape_round_trips() -> None:
         anthropic.decode_message(TOOL_MESSAGE),
     ]
     for response in decoded:
-        response._hidden_params[TIER_MARKER] = TIER_BATCH
+        response._hidden_params[TIER_MARKER] = PricingTier.BATCH
         _assert_round_trip(response)
 
 
@@ -247,8 +249,8 @@ def test_no_wait_pends_after_submission_and_resume_collects_without_resubmitting
     assert pending.value.requests_in_flight == 2
     session.close(pending.value)
     manifest = BatchJobStore(ws, session.job_id).load()
-    assert manifest.status == STATUS_PENDING
-    assert [r["state"] for r in manifest.provider_batches] == [RECORD_OPEN]
+    assert manifest.status == JobStatus.PENDING
+    assert [r["state"] for r in manifest.provider_batches] == [RecordState.OPEN]
 
     resumed = _open(ws, session.job_id)
     assert resumed.resumed
@@ -258,8 +260,8 @@ def test_no_wait_pends_after_submission_and_resume_collects_without_resubmitting
     assert _texts(out) == {"u0_a-1": "reply:a", "u1_b-1": "reply:b"}
     assert len(backend.submitted) == 1  # collected, never resubmitted
     manifest = BatchJobStore(ws, session.job_id).load()
-    assert manifest.status == STATUS_COMPLETED
-    assert [r["state"] for r in manifest.provider_batches] == [RECORD_COLLECTED]
+    assert manifest.status == JobStatus.COMPLETED
+    assert [r["state"] for r in manifest.provider_batches] == [RecordState.COLLECTED]
 
 
 def test_stored_responses_replay_with_no_provider_call(ws: Workspace) -> None:
@@ -323,7 +325,7 @@ def test_a_blocking_run_killed_after_submit_resumes_onto_the_same_batch(ws: Work
     with pytest.raises(KeyboardInterrupt) as interrupted:
         _executor(backend, session).run_wave(wave)
     session.close(interrupted.value)
-    assert BatchJobStore(ws, session.job_id).load().status == STATUS_FAILED
+    assert BatchJobStore(ws, session.job_id).load().status == JobStatus.FAILED
 
     Dies.dead = False
     resumed = _open(ws, session.job_id, wait=True)
@@ -375,7 +377,7 @@ def test_expired_items_are_resubmitted_then_recorded(ws: Workspace) -> None:
         text = request.kwargs["messages"][0]["content"]
         seen[text] = seen.get(text, 0) + 1
         if seen[text] == 1:
-            return BatchItemError(request.custom_id, "expired", "24h passed")
+            return BatchItemError(request.custom_id, ItemErrorKind.EXPIRED, "24h passed")
         return _answer(request)
 
     backend = FakeBackend(expire_once, provider="anthropic")
@@ -417,7 +419,7 @@ def _row(ws: Workspace, response: Any) -> None:
             completion_tokens=totals["completion_tokens"],
             total_tokens=totals["total_tokens"],
             duration_s=0.0,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
         ),
     )
 
@@ -521,3 +523,90 @@ def test_list_jobs_newest_first(ws: Workspace) -> None:
     ids = [_completed_job(ws) for _ in range(2)]
     listed = [m.job_id for m in list_jobs(ws)]
     assert set(listed) == set(ids) and len(listed) == 2
+
+
+# ---- persisted enums: status and record states ---------------------------------
+
+
+def _stored_manifest(status: object, state: str, cleanup: str) -> dict[str, Any]:
+    """A ``job.json`` as an earlier dgml wrote it: plain strings, ``to_json`` order."""
+    return {
+        "job_id": "bj_000000000001",
+        "command": "test run",
+        "argv": ["test", "run"],
+        "cwd": None,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "status": status,
+        "error": None,
+        "runs": 1,
+        "provider_batches": [
+            {"state": state, "cleanup": cleanup, "job": {"provider": "fake"}, "keys": {}}
+        ],
+        "billed": [],
+        "inputs": {},
+        "state": {},
+        "run_stats": {},
+        "record_usage": True,
+    }
+
+
+def _put_manifest(ws: Workspace, doc: dict[str, Any]) -> bytes:
+    raw = json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8")
+    ws.blobs.put_blob(layout.batch_job_manifest_key(doc["job_id"]), raw)
+    return raw
+
+
+def test_stored_status_loads_as_a_member_and_writes_back_unchanged(ws: Workspace) -> None:
+    raw = _put_manifest(ws, _stored_manifest("failed", "dropped", "pending"))
+    manifest = BatchJobStore(ws, "bj_000000000001").load()
+    assert manifest.status is JobStatus.FAILED
+    assert owed_cleanups(manifest) == manifest.provider_batches  # dropped, cleanup owed
+    rewritten = json.dumps(manifest.to_json(), indent=2, ensure_ascii=False).encode("utf-8")
+    assert rewritten == raw
+    assert type(manifest.to_json()["status"]) is str
+
+
+def test_written_states_are_plain_strings(ws: Workspace) -> None:
+    _put_manifest(ws, _stored_manifest("pending", "open", "pending"))
+    store = BatchJobStore(ws, "bj_000000000001")
+    manifest = store.load()
+    manifest.status = JobStatus.FAILED
+    record = manifest.provider_batches[0]
+    mark_dropped(record, "test")
+    store.save(manifest, merge=False)
+    stored = json.loads(ws.blobs.get_blob(layout.batch_job_manifest_key("bj_000000000001")))
+    assert stored["status"] == "failed"
+    assert (stored["provider_batches"][0]["state"], record["cleanup"]) == ("dropped", "pending")
+    assert all(type(record[k]) is str for k in ("state", "cleanup"))
+    assert store.load().status is JobStatus.FAILED
+
+
+def test_unknown_stored_status_and_state_do_not_fail_the_read(ws: Workspace) -> None:
+    """A newer dgml's status or record state round-trips verbatim and matches
+    none of the known ones."""
+    raw = _put_manifest(ws, _stored_manifest("archived", "frozen", "deferred"))
+    manifest = BatchJobStore(ws, "bj_000000000001").load()
+    assert manifest.status == "archived"
+    assert not isinstance(manifest.status, JobStatus)
+    assert manifest.open_records() == []
+    assert manifest.uncertain_records() == []
+    assert owed_cleanups(manifest) == []
+    assert job_summary(manifest)["status"] == "archived"
+    rewritten = json.dumps(manifest.to_json(), indent=2, ensure_ascii=False).encode("utf-8")
+    assert rewritten == raw
+
+
+@pytest.mark.parametrize("status", [None, 3])
+def test_non_string_stored_status_round_trips_unchanged(ws: Workspace, status: object) -> None:
+    """A non-string ``status`` (``null``, a number) is kept as loaded, not
+    stringified (``"None"``), so a re-save writes back the stored bytes."""
+    raw = _put_manifest(ws, _stored_manifest(status, "collected", "done"))
+    store = BatchJobStore(ws, "bj_000000000001")
+    manifest = store.load()
+    assert manifest.status == status
+    rewritten = json.dumps(manifest.to_json(), indent=2, ensure_ascii=False).encode("utf-8")
+    assert rewritten == raw
+    store.save(manifest, merge=True)
+    stored = json.loads(ws.blobs.get_blob(layout.batch_job_manifest_key("bj_000000000001")))
+    assert stored["status"] == status and type(stored["status"]) is type(status)

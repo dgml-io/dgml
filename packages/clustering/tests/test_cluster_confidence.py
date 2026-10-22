@@ -26,7 +26,15 @@ from typing import Any
 
 import pytest
 import torch
-from clustering.config.schema import Config, ManifoldConfig, ScenarioConfig
+from clustering.config.schema import (
+    Auto,
+    ClusterAlgorithm,
+    Config,
+    ManifoldConfig,
+    ManifoldName,
+    ScenarioConfig,
+    ScenarioName,
+)
 from clustering.data.datasets import DocumentDataset, DocumentRecord
 from clustering.manifolds import build_manifold
 from clustering.scenarios import build_scenario
@@ -42,7 +50,7 @@ _DIM = 8
 
 
 def _euclidean(dim: int = _DIM) -> Any:
-    return build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    return build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
 
 
 def _three_blobs(dim: int = _DIM, per: int = 10) -> torch.Tensor:
@@ -56,7 +64,9 @@ def _three_blobs(dim: int = _DIM, per: int = 10) -> torch.Tensor:
 def test_confidence_matches_length_and_range() -> None:
     emb = _three_blobs()
     manifold = _euclidean()
-    labels, centroids = cluster_embeddings(emb, manifold=manifold, algorithm="kmeans", k=3)
+    labels, centroids = cluster_embeddings(
+        emb, manifold=manifold, algorithm=ClusterAlgorithm.KMEANS, k=3
+    )
 
     conf = cluster_confidence(emb, labels, centroids, manifold)
 
@@ -68,7 +78,9 @@ def test_confidence_matches_length_and_range() -> None:
 def test_well_separated_blobs_are_high_confidence() -> None:
     emb = _three_blobs()
     manifold = _euclidean()
-    labels, centroids = cluster_embeddings(emb, manifold=manifold, algorithm="kmeans", k=3)
+    labels, centroids = cluster_embeddings(
+        emb, manifold=manifold, algorithm=ClusterAlgorithm.KMEANS, k=3
+    )
 
     conf = cluster_confidence(emb, labels, centroids, manifold)
 
@@ -162,12 +174,14 @@ def test_auto_temperature_spreads_well_separated_blobs() -> None:
     # inter-centroid distance → a real spread appears.
     emb = _three_blobs()
     manifold = _euclidean()
-    labels, centroids = cluster_embeddings(emb, manifold=manifold, algorithm="kmeans", k=3)
+    labels, centroids = cluster_embeddings(
+        emb, manifold=manifold, algorithm=ClusterAlgorithm.KMEANS, k=3
+    )
 
     raw = [float(c) for c in cluster_confidence(emb, labels, centroids, manifold)]  # type: ignore[arg-type]
     auto = [
         float(c)  # type: ignore[arg-type]
-        for c in cluster_confidence(emb, labels, centroids, manifold, temperature="auto")
+        for c in cluster_confidence(emb, labels, centroids, manifold, temperature=Auto.AUTO)
     ]
 
     # T=1.0 saturates: no usable spread.
@@ -187,7 +201,7 @@ def test_auto_temperature_preserves_ordering() -> None:
 
     auto = [
         float(c)  # type: ignore[arg-type]
-        for c in cluster_confidence(emb, labels, centroids, manifold, temperature="auto")
+        for c in cluster_confidence(emb, labels, centroids, manifold, temperature=Auto.AUTO)
     ]
     assert auto[0] > auto[1]  # the point on top of its centroid is more confident
 
@@ -200,7 +214,7 @@ def test_auto_temperature_no_ops_on_coincident_centroids() -> None:
     emb = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
     centroids = torch.zeros((2, 2), dtype=torch.float32)
 
-    scores = cluster_scores(emb, centroids, manifold, temperature="auto")
+    scores = cluster_scores(emb, centroids, manifold, temperature=Auto.AUTO)
 
     assert torch.allclose(scores, torch.full((1, 2), 0.5), atol=1e-6)
 
@@ -208,9 +222,11 @@ def test_auto_temperature_no_ops_on_coincident_centroids() -> None:
 def test_cluster_scores_shape_and_normalization() -> None:
     emb = _three_blobs(per=5)
     manifold = _euclidean()
-    _, centroids = cluster_embeddings(emb, manifold=manifold, algorithm="kmeans", k=3)
+    _, centroids = cluster_embeddings(
+        emb, manifold=manifold, algorithm=ClusterAlgorithm.KMEANS, k=3
+    )
 
-    scores = cluster_scores(emb, centroids, manifold, temperature="auto")
+    scores = cluster_scores(emb, centroids, manifold, temperature=Auto.AUTO)
     assert tuple(scores.shape) == (emb.shape[0], centroids.shape[0])
     # Rows are softmax distributions.
     assert torch.allclose(scores.sum(dim=-1), torch.ones(emb.shape[0]), atol=1e-5)
@@ -220,12 +236,12 @@ def test_cluster_scores_shape_and_normalization() -> None:
 def test_config_rejects_non_positive_confidence_temperature() -> None:
     # Caught at config-validation time, not partway through a run.
     with pytest.raises(ValidationError, match="confidence_temperature"):
-        ScenarioConfig(name="s1", k_clusters=2, confidence_temperature=0.0)
+        ScenarioConfig(name=ScenarioName.S1, k_clusters=2, confidence_temperature=0.0)
 
 
 def test_config_accepts_auto_and_positive_float() -> None:
-    assert ScenarioConfig(name="s1", k_clusters=2).confidence_temperature == "auto"
-    pinned = ScenarioConfig(name="s1", k_clusters=2, confidence_temperature=2.5)
+    assert ScenarioConfig(name=ScenarioName.S1, k_clusters=2).confidence_temperature == "auto"
+    pinned = ScenarioConfig(name=ScenarioName.S1, k_clusters=2, confidence_temperature=2.5)
     assert pinned.confidence_temperature == 2.5
 
 

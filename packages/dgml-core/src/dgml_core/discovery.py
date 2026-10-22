@@ -33,6 +33,7 @@ import math
 import re
 from collections import Counter, deque
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,21 @@ ALL_FILTER_NAMES = ALGO_FILTER_NAMES | SEMANTIC_FILTER_NAMES
 # ---------------------------------------------------------------------------
 
 
+class TagRole(StrEnum):
+    """A tag type's structural role, from how often its elements carry direct
+    text versus child elements (see :func:`compute_tag_metrics`).
+
+    ``LEAF_VALUE`` is mostly text with few children; ``CONTAINER`` mostly
+    children with little text; ``HYBRID`` has a substantial share of either;
+    ``MIXED`` has neither.
+    """
+
+    LEAF_VALUE = "leaf-value"
+    CONTAINER = "container"
+    HYBRID = "hybrid"
+    MIXED = "mixed"
+
+
 @dataclass
 class SubtreeSample:
     """One representative element of a tag type."""
@@ -75,7 +91,7 @@ class SubtreeTag:
 
     tag: str  # local name, namespace stripped
     count: int
-    role: str  # "leaf-value" | "container" | "hybrid" | "mixed"
+    role: TagRole
     filters: list[str]
     samples: list[SubtreeSample]
 
@@ -84,7 +100,7 @@ class SubtreeTag:
             return {
                 "tag": self.tag,
                 "count": self.count,
-                "role": self.role,
+                "role": str(self.role),
                 "filters": self.filters,
                 "samples": [
                     {
@@ -119,7 +135,7 @@ class TagMetrics:
     anc_cov: float
     betweenness: float
     entropy: float
-    role: str
+    role: TagRole
 
 
 # ---------------------------------------------------------------------------
@@ -378,13 +394,13 @@ def compute_tag_metrics(root: _Element, *, include_structural: bool = False) -> 
         anc_cov = len(all_dt) / max(1, total_types - 1)
 
         if text_ratio >= 0.7 and child_ratio < 0.3:
-            role = "leaf-value"
+            role = TagRole.LEAF_VALUE
         elif child_ratio >= 0.7 and text_ratio < 0.3:
-            role = "container"
+            role = TagRole.CONTAINER
         elif text_ratio >= 0.3 or child_ratio >= 0.3:
-            role = "hybrid"
+            role = TagRole.HYBRID
         else:
-            role = "mixed"
+            role = TagRole.MIXED
 
         results.append(
             TagMetrics(
@@ -431,13 +447,13 @@ def apply_algo_filter(metrics: list[TagMetrics], filter_name: str) -> set[str]:
         return {
             m.name
             for m in metrics
-            if m.role == "leaf-value" or (m.text_ratio >= 0.5 and m.child_ratio < 0.3)
+            if m.role == TagRole.LEAF_VALUE or (m.text_ratio >= 0.5 and m.child_ratio < 0.3)
         }
 
     half = math.ceil(n / 2)
 
     if filter_name == "Sections":
-        non_leaf = [m for m in metrics if m.role != "leaf-value"]
+        non_leaf = [m for m in metrics if m.role != TagRole.LEAF_VALUE]
         by_betw = {
             m.name for m in sorted(non_leaf, key=lambda m: m.betweenness, reverse=True)[:half]
         }

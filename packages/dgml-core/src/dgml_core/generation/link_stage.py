@@ -45,7 +45,7 @@ from dgml_core.concurrency import map_concurrent
 from dgml_core.errors import short_error_message
 from dgml_core.generation import links as links_mod
 from dgml_core.storage import Workspace
-from dgml_core.usage import OPERATION_LINKS
+from dgml_core.usage import UsageOperation
 
 if TYPE_CHECKING:
     from dgml_core.batch.jobs import JobSession
@@ -123,7 +123,7 @@ class LinkStage:
             api_base=self.api_base,
             workspace=self.workspace,
             record_usage=self.record_usage,
-            operation=OPERATION_LINKS,
+            operation=UsageOperation.LINKS,
         )
         config.context = {"doc": doc_name}
         return config

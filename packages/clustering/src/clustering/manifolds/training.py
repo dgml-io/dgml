@@ -63,12 +63,12 @@ sampling can be slotted in later via the same loss interface.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any, assert_never, cast
 
 import torch
 from torch import nn
 
-from clustering.config.schema import UNSUPERVISED_LOSSES, TrainingConfig
+from clustering.config.schema import UNSUPERVISED_LOSSES, LossName, TrainingConfig
 from clustering.encoders.base import EncoderOutput
 from clustering.fusion.base import Fusion
 from clustering.manifolds.base import ManifoldHead
@@ -212,14 +212,21 @@ def train_projector(
         label_ids = torch.tensor([label_to_idx[lbl] for lbl in keep_labels], dtype=torch.long)
         x_train = fused[torch.tensor(keep, dtype=torch.long)].detach()
 
+    # Pydantic validates ``cfg.loss`` on construction, but ``model_construct``
+    # does not: an unknown name must fail with a ValueError, not reach the
+    # ``assert_never`` below as an AssertionError.
+    try:
+        LossName(cfg.loss)
+    except ValueError:
+        raise ValueError(f"Unknown loss: {cfg.loss!r}") from None
     # Build the loss against the projector's underlying manifold.
-    if cfg.loss == "contrastive":
+    if cfg.loss == LossName.CONTRASTIVE:
         loss_fn: torch.nn.Module = ContrastiveLoss(projector.manifold, temperature=cfg.temperature)
-    elif cfg.loss == "triplet":
+    elif cfg.loss == LossName.TRIPLET:
         loss_fn = TripletLoss(projector.manifold, margin=cfg.margin)
-    elif cfg.loss in ("prototypical", "pseudo_label"):
+    elif cfg.loss == LossName.PROTOTYPICAL or cfg.loss == LossName.PSEUDO_LABEL:
         loss_fn = PrototypicalLoss(projector.manifold)
-    elif cfg.loss == "knn_contrastive":
+    elif cfg.loss == LossName.KNN_CONTRASTIVE:
         k = _resolve_pseudo_k(pseudo_k, cfg, n=int(x_train.shape[0]))
         with torch.no_grad():
             out_dim = int(projector(x_train[:1]).shape[-1])
@@ -234,7 +241,7 @@ def train_projector(
         # Neighbors are mined ONCE in the frozen fused (input) space — the
         # supervision signal must not drift with the projector.
         knn_idx = _knn_indices(x_train, k=cfg.knn_k)
-    elif cfg.loss == "cross_modal":
+    elif cfg.loss == LossName.CROSS_MODAL:
         if views is None:
             raise ValueError(
                 "train_projector: loss='cross_modal' requires views=(text_view, "
@@ -244,7 +251,7 @@ def train_projector(
         view_a = views[0].detach()
         view_b = views[1].detach()
     else:
-        raise ValueError(f"Unknown loss: {cfg.loss!r}")
+        assert_never(cfg.loss)
 
     # ── On-manifold learnable prototypes (supervised prototypical only) ─────
     # When geoopt is available and the manifold supports `to_geoopt()`, the
@@ -285,7 +292,7 @@ def train_projector(
     for epoch in range(cfg.epochs):
         projector.train()
 
-        if cfg.loss == "pseudo_label":
+        if cfg.loss == LossName.PSEUDO_LABEL:
             # E-step: re-derive pseudo-labels from the CURRENT projected
             # space at epoch 0 and every ``pseudo_recluster_every`` epochs.
             if epoch % max(1, cfg.pseudo_recluster_every) == 0:
@@ -301,20 +308,20 @@ def train_projector(
             projected = projector(x_train)
             prototypes = _class_prototypes(projector, x_train, pseudo_ids)
             loss = loss_fn(projected, prototypes, pseudo_ids)
-        elif cfg.loss == "knn_contrastive":
+        elif cfg.loss == LossName.KNN_CONTRASTIVE:
             projected = projector(x_train)
             assert knn_idx is not None
             # Rotate deterministically through the k mined neighbors.
             neighbors = projected[knn_idx[:, epoch % knn_idx.shape[1]]]
             loss = loss_fn(projected, neighbors)
-        elif cfg.loss == "cross_modal":
+        elif cfg.loss == LossName.CROSS_MODAL:
             assert view_a is not None
             assert view_b is not None
             za = projector(view_a)
             zb = projector(view_b)
             projected = za  # for the (optional) VICReg term below
             loss = loss_fn(za, zb)
-        elif cfg.loss == "prototypical":
+        elif cfg.loss == LossName.PROTOTYPICAL:
             projected = projector(x_train)
             if prototypes_param is not None:
                 # Learnable on-manifold prototypes.
@@ -323,16 +330,16 @@ def train_projector(
                 # Fallback: recompute on-manifold prototypes each epoch.
                 prototypes = _class_prototypes(projector, x_train, label_ids)
             loss = loss_fn(projected, prototypes, label_ids)
-        elif cfg.loss == "contrastive":
+        elif cfg.loss == LossName.CONTRASTIVE:
             projected = projector(x_train)
             positives = _within_class_positives(projected, label_ids)
             loss = loss_fn(projected, positives)
-        elif cfg.loss == "triplet":
+        elif cfg.loss == LossName.TRIPLET:
             projected = projector(x_train)
             anchors, positives, negatives = _triplet_samples(projected, label_ids)
             loss = loss_fn(anchors, positives, negatives)
-        else:  # pragma: no cover — guarded above
-            raise ValueError(f"Unknown loss: {cfg.loss!r}")
+        else:
+            assert_never(cfg.loss)
 
         if vicreg is not None:
             loss = loss + vicreg(projected)
@@ -405,7 +412,7 @@ def train_fusion_projector(
     """
     if cfg.epochs <= 0:
         return []
-    if cfg.loss == "cross_modal":
+    if cfg.loss == LossName.CROSS_MODAL:
         raise ValueError(
             "train_fusion_projector: loss='cross_modal' cannot train the fusion jointly "
             "(its two modality views must each flow through the trainable fusion). Train "
@@ -602,7 +609,7 @@ def _maybe_build_prototypes(
     x_train: torch.Tensor,
     label_ids: torch.Tensor,
     n_classes: int,
-    loss_name: str,
+    loss_name: LossName,
 ) -> tuple[torch.Tensor | None, object | None]:
     """Build learnable on-manifold prototypes if conditions are met.
 
@@ -611,7 +618,7 @@ def _maybe_build_prototypes(
     not installed, the manifold doesn't expose ``to_geoopt``, or the loss
     isn't prototypical).
     """
-    if loss_name != "prototypical":
+    if loss_name != LossName.PROTOTYPICAL:
         return None, None
     try:
         import geoopt

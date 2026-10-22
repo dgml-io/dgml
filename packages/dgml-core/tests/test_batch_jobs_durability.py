@@ -44,10 +44,9 @@ from dgml_core.batch import (
 from dgml_core.batch import jobs as jobs_mod
 from dgml_core.batch import registry as batch_registry
 from dgml_core.batch.jobs import (
-    RECORD_COLLECTED,
-    RECORD_DROPPED,
-    STATUS_COMPLETED,
     JobSession,
+    JobStatus,
+    RecordState,
     unlock_job,
 )
 from dgml_core.batch.types import BatchJob, BatchNotFound, BatchRequest
@@ -58,7 +57,13 @@ from dgml_core.errors import (
     BatchPending,
 )
 from dgml_core.storage import Workspace
-from dgml_core.usage import UsageEvent, extract_cost_and_tokens, read_events, record_usage
+from dgml_core.usage import (
+    UsageEvent,
+    UsageOutcome,
+    extract_cost_and_tokens,
+    read_events,
+    record_usage,
+)
 
 _MODEL = "anthropic/claude-haiku-4-5"
 
@@ -164,7 +169,7 @@ def _row(ws: Workspace, response: Any) -> None:
             completion_tokens=totals["completion_tokens"],
             total_tokens=totals["total_tokens"],
             duration_s=0.0,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
         ),
     )
 
@@ -212,7 +217,7 @@ def test_j1_a_run_fenced_mid_wait_leaves_a_job_its_resume_can_finish(ws: Workspa
         "b-1": "reply:b",
     }
     assert len(backend.submitted) == 1  # nothing paid for twice
-    assert store.load().status == STATUS_COMPLETED
+    assert store.load().status == JobStatus.COMPLETED
 
 
 def test_j1_a_gone_open_batch_whose_responses_are_stored_counts_as_collected(
@@ -234,8 +239,8 @@ def test_j1_a_gone_open_batch_whose_responses_are_stored_counts_as_collected(
     session.close(None)
     assert set(served) == {"a-1", "b-1"}
     manifest = store.load()
-    assert manifest.status == STATUS_COMPLETED, manifest.error
-    assert manifest.provider_batches[0]["state"] == RECORD_COLLECTED
+    assert manifest.status == JobStatus.COMPLETED, manifest.error
+    assert manifest.provider_batches[0]["state"] == RecordState.COLLECTED
     assert len(backend.submitted) == 1
 
 
@@ -258,9 +263,9 @@ def test_j1_a_gone_open_batch_without_stored_responses_is_dropped_and_rerun(
     }
     assert len(backend.submitted) == 2  # re-run as a new batch
     manifest = store.load()
-    assert manifest.status == STATUS_COMPLETED, manifest.error
+    assert manifest.status == JobStatus.COMPLETED, manifest.error
     gone = next(r for r in manifest.provider_batches if r["job"]["job_id"] == gone_id)
-    assert gone["state"] == RECORD_DROPPED and gone["cleanup"] == "done"
+    assert gone["state"] == RecordState.DROPPED and gone["cleanup"] == "done"
 
 
 def test_j1_cancel_and_delete_force_accept_a_gone_open_batch(ws: Workspace) -> None:
@@ -271,7 +276,7 @@ def test_j1_cancel_and_delete_force_accept_a_gone_open_batch(ws: Workspace) -> N
     assert entry["done"] is True and entry["gone"] is True
     payload = cancel_job(ws, job_id)
     assert payload["canceled"] is True
-    assert payload["batches"][0]["state"] == RECORD_DROPPED
+    assert payload["batches"][0]["state"] == RecordState.DROPPED
 
     job_id = _paused(ws, backend)
     backend.forget(BatchJobStore(ws, job_id).load().provider_batches[0]["job"]["job_id"])
@@ -289,7 +294,7 @@ def test_j1_settling_a_gone_open_batch_at_close_does_not_fail_the_job(ws: Worksp
     session.close(None)
     manifest = store.load()
     (record,) = manifest.provider_batches
-    assert record["state"] == RECORD_DROPPED
+    assert record["state"] == RecordState.DROPPED
     assert "no longer exists" in record["dropped_reason"]
     assert backend.canceled == []
 
@@ -392,7 +397,7 @@ def test_j4_status_reports_an_owed_cleanup_but_never_deletes_the_batch(ws: Works
     before = BatchJobStore(ws, job_id).load().to_json()
     for _ in range(2):  # the cancel has settled by now: a cleanup would go through
         (entry,) = job_status(ws, job_id)["batches"]
-        assert entry["state"] == RECORD_DROPPED and entry["cleanup"] == "pending"
+        assert entry["state"] == RecordState.DROPPED and entry["cleanup"] == "pending"
     assert backend.cleaned == []  # nothing deleted at the provider
     assert BatchJobStore(ws, job_id).load().to_json() == before
     # The owed cleanup still happens, in cancel (or prune, or a resume).
@@ -455,9 +460,9 @@ def test_j6_a_completed_job_bills_the_responses_it_never_used(ws: Workspace, wai
     assert [r["cost_usd"] for r in rows] == [0.25, 0.25]
     used, unused = rows
     assert used["context"] == {}
-    assert unused["operation"] == usage.OPERATION_BATCH_UNUSED
+    assert unused["operation"] == usage.UsageOperation.BATCH_UNUSED
     assert unused["context"] == {"unused": True, "batch_job": session.job_id}
-    assert unused["tier"] == usage.TIER_BATCH
+    assert unused["tier"] == usage.PricingTier.BATCH
     assert unused["model"] == _MODEL
     assert unused["prompt_tokens"] == 10
 
@@ -502,7 +507,7 @@ def test_j7_cancel_bills_what_paused_runs_collected_once(ws: Workspace) -> None:
     cancel_job(ws, job_id)
     rows = read_events(ws)
     assert [r["cost_usd"] for r in rows] == [0.25, 0.25]
-    assert {r["operation"] for r in rows} == {usage.OPERATION_BATCH_UNUSED}
+    assert {r["operation"] for r in rows} == {usage.UsageOperation.BATCH_UNUSED}
     assert all(r["context"] == {"unused": True, "batch_job": job_id} for r in rows)
     delete_job(ws, job_id)
     assert len(read_events(ws)) == 2  # billed once, at cancel
@@ -529,7 +534,7 @@ def test_j7_prune_bills_what_a_failed_job_collected(ws: Workspace) -> None:
     assert read_events(ws) == []
     assert prune_jobs(ws)["deleted"] == [session.job_id]
     (row,) = read_events(ws)
-    assert row["operation"] == usage.OPERATION_BATCH_UNUSED and row["cost_usd"] == 0.25
+    assert row["operation"] == usage.UsageOperation.BATCH_UNUSED and row["cost_usd"] == 0.25
 
 
 def test_j7_a_job_that_records_no_usage_writes_no_unused_rows(ws: Workspace) -> None:
@@ -564,7 +569,7 @@ def test_j8_a_404_under_another_key_never_resubmits_or_drops(ws: Workspace) -> N
     assert cancel_job(ws, job_id)["canceled"] is False
     with pytest.raises(BatchExecutionFailed):
         delete_job(ws, job_id, force=True)
-    assert store.load().provider_batches[0]["state"] == jobs_mod.RECORD_OPEN
+    assert store.load().provider_batches[0]["state"] == jobs_mod.RecordState.OPEN
 
     # With the key that created it, a 404 means gone, as before.
     backend.key_fingerprint = "aaaaaaaaaaaa"

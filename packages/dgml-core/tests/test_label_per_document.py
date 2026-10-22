@@ -29,7 +29,14 @@ from typing import Any
 
 import pytest
 from dgml_core import llm
-from dgml_core.batch import BatchExecutor, BatchItemError, FakeBackend, Unit, run_stage
+from dgml_core.batch import (
+    BatchExecutor,
+    BatchItemError,
+    FakeBackend,
+    ItemErrorKind,
+    Unit,
+    run_stage,
+)
 from dgml_core.generation import label as label_mod
 from dgml_core.generation.blocks import Block
 from dgml_core.generation.label import RosterEntry
@@ -93,7 +100,7 @@ def _executor() -> tuple[FakeBackend, BatchExecutor]:
         try:
             return _answer(request.kwargs)
         except Exception as exc:  # pragma: no cover - the answer never raises
-            return BatchItemError(request.custom_id, "invalid", str(exc))
+            return BatchItemError(request.custom_id, ItemErrorKind.INVALID, str(exc))
 
     backend = FakeBackend(script, provider="anthropic")
     executor = BatchExecutor(backend, sleep=lambda _s: None, min_wave_size=1, sync_execute=_answer)

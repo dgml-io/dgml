@@ -38,7 +38,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from clustering.config.schema import FusionConfig
+from clustering.config.schema import FusionConfig, FusionName
 from clustering.encoders.base import EncoderOutput
 from clustering.fusion.base import Fusion, FusionOutput, register_fusion
 
@@ -64,6 +64,6 @@ class ConcatNormFusion(Fusion):
         return FusionOutput(pooled=fused)
 
 
-@register_fusion("concat_norm")
+@register_fusion(FusionName.CONCAT_NORM)
 def _factory(cfg: FusionConfig, *, text_dim: int, image_dim: int, **_: Any) -> Fusion:
     return ConcatNormFusion(cfg, text_dim=text_dim, image_dim=image_dim)

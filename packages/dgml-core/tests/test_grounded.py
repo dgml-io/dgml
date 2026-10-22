@@ -1813,6 +1813,7 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "phase1_tool_schema",
     }
     assert stats["phase1_tool_schema"] == "inlined"
+    assert type(stats["phase1_tool_schema"]) is str  # the wire string, not the enum member
     assert stats["outcome"] == "ok"
     assert stats["error"] is None
     # Phase 2 matched the only location; phase 3 not needed.

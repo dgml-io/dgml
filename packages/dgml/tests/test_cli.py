@@ -18,17 +18,19 @@ import shutil
 import sys
 import threading
 import tomllib
+import types
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
 from dgml.cli import main
 from dgml_core import layout
+from dgml_core.conversion import ConverterConfig, DocConverter
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import FileNotFound, InvalidArgument
 from dgml_core.migrations import (
@@ -1355,6 +1357,9 @@ def test_check_returns_two_when_issues(
     assert rc == 2
     report = _read_stdout(capsys)
     assert report["issue_count"] >= 1
+    assert {(i["target_type"], i["target_id"]) for i in report["issues"]} == {("file", fid)}
+    # ``kind`` is wire format (an ``IssueKind`` member renders as its value).
+    assert "missing_pdf" in {i["kind"] for i in report["issues"]}
 
 
 @needs_gs
@@ -1724,14 +1729,14 @@ def test_cluster_config_preset_name_passes_preset_overrides(
 def _llm_partition(fid: str) -> Any:
     """A one-cluster LLMClusteringResult that names its emergent bucket in the
     same call (so clustering() needs no second naming round-trip)."""
-    from dgml_core.classification import ClassificationDecision
+    from dgml_core.classification import ClassificationDecision, DecisionKind
     from dgml_core.llm_clustering import LLMClusteringResult
 
     return LLMClusteringResult(
         clusters={fid: "unknown_0"},
         proposals={
             "unknown_0": ClassificationDecision(
-                decision="new",
+                decision=DecisionKind.NEW,
                 new_name="Sample Documents",
                 new_description="test docs",
                 new_key_questions=("What is this document about?",),
@@ -3709,7 +3714,7 @@ def test_file_add_directory_clean_run(tmp_path: Path, capsys: pytest.CaptureFixt
 def test_file_add_directory_skips_unconfigured_sources(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """With no `conversion` config, convertible sources (docx/xlsx) in a bulk
+    """With no `conversion` config, convertible sources (docx/xlsx/pptx) in a bulk
     directory are silently skipped — not gathered, not counted as failures."""
     ws = tmp_path / "ws"
     _init_ws(ws)
@@ -3719,12 +3724,112 @@ def test_file_add_directory_skips_unconfigured_sources(
     src.mkdir()
     _write_text_pdf(src / "a.pdf", ["Alpha"])
     (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
 
     rc = main(_ws_args(ws) + ["file", "add", str(src)])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["summary"]["total"] == 1
     assert [e["path"] for e in payload["results"]] == [str(src / "a.pdf")]
+
+
+class _FixedPdfConverter(DocConverter):
+    """Returns the PDF named by its ``pdf`` option, whatever the source."""
+
+    name: ClassVar[str] = "fixed-pdf"
+    input_formats: ClassVar[frozenset[str]] = frozenset()
+    config_fields: ClassVar[frozenset[str]] = frozenset({"pdf"})
+
+    @classmethod
+    def parse_config(cls, section: Mapping[str, Any]) -> ConverterConfig:
+        cls._check_no_extra_fields(section)
+        return ConverterConfig(provider=str(section["provider"]), options={"pdf": section["pdf"]})
+
+    def __init__(self, config: ConverterConfig) -> None:
+        self._pdf = Path(config.options["pdf"])
+
+    def to_pdf(self, path: Path) -> bytes:
+        return self._pdf.read_bytes()
+
+
+@needs_gs
+def test_file_add_directory_gathers_configured_pptx(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `conversion.pptx` configured, a bulk add gathers `.pptx` and `.ppt` (any
+    case) and converts them, while a family with no converter is still skipped."""
+    stub = types.ModuleType("cli_stub_conv")
+    stub._FixedPdfConverter = _FixedPdfConverter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cli_stub_conv", stub)
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rendered = tmp_path / "rendered.pdf"
+    _write_text_pdf(rendered, ["Slide one"])
+    conversion = {"pptx": {"provider": "cli_stub_conv:_FixedPdfConverter", "pdf": str(rendered)}}
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+    src = tmp_path / "mixed"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha"])
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
+    (src / "OLD.PPT").write_bytes(b"\xd0\xcf\x11\xe0 not really a ppt")
+    (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    by_name = {Path(e["path"]).name: e for e in payload["results"]}
+    assert set(by_name) == {"a.pdf", "deck.pptx", "OLD.PPT"}  # notes.docx: no converter
+    for name in ("deck.pptx", "OLD.PPT"):
+        entry = by_name[name]
+        assert entry["status"] == "added"
+        assert entry["conversion_error"] is None
+        # The converted PDF is persisted beside the source (the uppercase suffix
+        # lowercased in its name) and the pages were rendered from it.
+        assert entry["file"]["page_count"] == 1
+        assert entry["file"]["pdf_converter"] == "fixed-pdf"
+        assert (ws / layout.file_pdf_key(entry["file"]["id"], name)).is_file()
+
+
+class _SpreadsheetOnlyConverter(_FixedPdfConverter):
+    name: ClassVar[str] = "spreadsheet-only"
+    input_formats: ClassVar[frozenset[str]] = frozenset({".xlsx", ".xls"})
+
+
+def test_file_add_directory_refuses_a_family_on_the_wrong_converter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`conversion.pptx` pointed at a converter that handles only spreadsheets is
+    one CONVERSION_CONFIG_INVALID up front, not a failed record per deck."""
+    stub = types.ModuleType("cli_stub_conv")
+    stub._SpreadsheetOnlyConverter = _SpreadsheetOnlyConverter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cli_stub_conv", stub)
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rendered = tmp_path / "rendered.pdf"
+    _write_text_pdf(rendered, ["Slide one"])
+    conversion = {
+        "pptx": {"provider": "cli_stub_conv:_SpreadsheetOnlyConverter", "pdf": str(rendered)}
+    }
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+    src = tmp_path / "decks"
+    src.mkdir()
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
+    (src / "other.pptx").write_bytes(b"PK\x03\x04 not really a pptx either")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc != 0
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "does not handle '.pptx'" in err["message"]
+    assert not (ws / "files").exists() or not any((ws / "files").iterdir())
 
 
 @needs_gs
@@ -3800,6 +3905,7 @@ def test_file_add_directory_skip_already_imported(
         "hard_failed": 0,
     }
     for entry in payload["results"]:
+        assert entry["status"] == "skipped"
         assert entry["created"] is False
         assert entry["conflict_kind"] == "hash"
 
@@ -5121,6 +5227,24 @@ def test_discover_page_from_origin(tmp_path: Path, capsys: pytest.CaptureFixture
     inv = next((t for t in payload["tags"] if t["tag"] == "InvoiceCycle"), None)
     assert inv is not None
     assert inv["samples"][0]["page"] == 4
+
+
+def test_discover_full_reports_structural_roles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--full`` emits each tag's structural ``role`` as its plain wire string."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    _seed_file_dir(ws, _DISC_FILE, pages=4)
+    _seed_discover_xml(ws, _DISC_FILE, _DISC_DS)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["discover", _DISC_FILE, "--docset", _DISC_DS, "--full"])
+    assert rc == 0
+    roles = {t["tag"]: t["role"] for t in _read_stdout(capsys)["tags"]}
+    assert roles["LiabilityCap"] == "leaf-value"
+    assert roles["IndemnificationClause"] == "container"
+    assert set(roles.values()) <= {"leaf-value", "container", "hybrid", "mixed"}
 
 
 def test_discover_depth_first_addressable(
@@ -6963,6 +7087,7 @@ def test_import_is_idempotent(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     payload = _read_stdout(capsys)
     assert payload["imported"] == []
     assert payload["skipped"][0]["workspace_id"] == wid
+    assert payload["skipped"][0]["status"] == "skipped"
 
 
 def test_import_on_conflict_fail_stops(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -7005,7 +7130,9 @@ def test_import_reports_a_bad_row_and_keeps_going(
     assert main(["workspace", "import"]) == 2  # partial success
     payload = _read_stdout(capsys)
     assert [r["workspace_id"] for r in payload["imported"]] == [wid]
+    assert payload["imported"][0]["status"] == "imported"
     assert payload["failed"][0]["root"] == str(tmp_path / "vanished")
+    assert payload["failed"][0]["status"] == "failed"
     assert "does not exist" in payload["failed"][0]["reason"]
 
 

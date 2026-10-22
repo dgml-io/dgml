@@ -18,7 +18,8 @@ exactly like a user's own converter — there is no privileged "built-in" path::
     {
       "conversion": {
         "docx": {"provider": "translators_pdf.libreoffice:LibreOfficeConverter"},
-        "xlsx": {"provider": "translators_pdf.xlsx:XlsxIslandsConverter"}
+        "xlsx": {"provider": "translators_pdf.xlsx:XlsxIslandsConverter"},
+        "pptx": {"provider": "translators_pdf.libreoffice:LibreOfficeConverter"}
       }
     }
 

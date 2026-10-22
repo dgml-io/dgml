@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders import build_encoder, encoder_fingerprint
 from clustering.encoders.base import Encoder, EncoderOutput
 from clustering.encoders.caching import CachingEncoder
@@ -48,7 +48,7 @@ class _CountingEncoder(Encoder[Any]):
 
 
 def _dummy(dim: int = 16, *, multi_vector: bool = False) -> EncoderConfig:
-    return EncoderConfig(name="dummy", embedding_dim=dim, multi_vector=multi_vector)
+    return EncoderConfig(name=EncoderName.DUMMY, embedding_dim=dim, multi_vector=multi_vector)
 
 
 def test_fingerprint_is_stable_and_config_sensitive() -> None:
@@ -57,7 +57,7 @@ def test_fingerprint_is_stable_and_config_sensitive() -> None:
     # Any output-determining field change → a different namespace.
     assert encoder_fingerprint(cfg) != encoder_fingerprint(_dummy(dim=32))
     assert encoder_fingerprint(cfg) != encoder_fingerprint(
-        EncoderConfig(name="dummy", embedding_dim=16, extra={"x": 1})
+        EncoderConfig(name=EncoderName.DUMMY, embedding_dim=16, extra={"x": 1})
     )
     # Human-readable: prefixed with the encoder name.
     assert encoder_fingerprint(cfg).startswith("dummy-")

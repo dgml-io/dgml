@@ -33,6 +33,7 @@ from unittest.mock import patch
 
 import pytest
 from dgml_core import layout
+from dgml_core.batch import ItemErrorKind
 from dgml_core.errors import SchemaGenerationFailed
 from dgml_core.grounded import GroundedConfig, generate_schema
 from dgml_core.models import FileRecord
@@ -188,7 +189,7 @@ def test_oversized_samples_are_trimmed_under_batch_like_sync(
     def script(req: BatchRequest) -> Any:
         sent.append(req.kwargs)
         if len(json.dumps(req.kwargs["messages"]).encode()) > _LIMIT:
-            return BatchItemError(req.custom_id, "invalid", "request_too_large")
+            return BatchItemError(req.custom_id, ItemErrorKind.INVALID, "request_too_large")
         return _schema_response()
 
     executor = BatchExecutor(FakeBackend(script), min_wave_size=1, sleep=lambda _s: None)

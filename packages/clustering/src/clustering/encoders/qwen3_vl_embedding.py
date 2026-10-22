@@ -61,7 +61,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 from clustering.encoders.mrl import mrl_truncate
 from clustering.utils import resolve_device
@@ -293,5 +293,5 @@ def _factory(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
 # MRL-truncatable). Registered under a size-explicit name each; the same name
 # works as ``encoder_text`` or ``encoder_image`` because the encoder embeds
 # both modalities into one shared space.
-register_encoder("qwen3_vl_embedding")(_factory)  # Qwen/Qwen3-VL-Embedding-8B
-register_encoder("qwen3_vl_embedding_2b")(_factory)  # Qwen/Qwen3-VL-Embedding-2B
+register_encoder(EncoderName.QWEN3_VL_EMBEDDING)(_factory)  # Qwen/Qwen3-VL-Embedding-8B
+register_encoder(EncoderName.QWEN3_VL_EMBEDDING_2B)(_factory)  # Qwen/Qwen3-VL-Embedding-2B
