@@ -250,8 +250,8 @@ def _not_found(job: BatchJob, what: str, exc: BaseException) -> BatchNotFound | 
 
 def _item_error(custom_id: str, status_code: int | None, message: str) -> BatchItemError:
     if status_code is not None and 400 <= status_code < 500 and status_code != 429:
-        return BatchItemError(custom_id, "invalid", message)
-    return BatchItemError(custom_id, "errored", message)
+        return BatchItemError(custom_id, ItemErrorKind.INVALID, message)
+    return BatchItemError(custom_id, ItemErrorKind.ERRORED, message)
 
 
 class OpenAIBatchBackend:
@@ -500,9 +500,9 @@ class OpenAIBatchBackend:
             # no response and one of these codes: it expired (retryable) or
             # was canceled, like an unanswered request of such a batch.
             if code == "batch_expired":
-                return custom_id, BatchItemError(custom_id, "expired", message)
+                return custom_id, BatchItemError(custom_id, ItemErrorKind.EXPIRED, message)
             if code in ("batch_cancelled", "batch_canceled"):
-                return custom_id, BatchItemError(custom_id, "canceled", message)
+                return custom_id, BatchItemError(custom_id, ItemErrorKind.CANCELED, message)
             return custom_id, _item_error(custom_id, status_code, message)
         if status_code != 200 or not isinstance(body, dict):
             detail = _get(_get(body, "error"), "message", "") if isinstance(body, dict) else ""
@@ -566,13 +566,13 @@ def _unanswered(status: str, batch: dict[str, Any]) -> tuple[ItemErrorKind, str]
     if status == "failed":
         detail = _batch_errors(batch)
         if _failed_at_batch_limit(batch):
-            return "batch_rejected", "batch refused at a batch-level limit: " + detail
-        return "invalid", "batch failed validation" + (f": {detail}" if detail else "")
+            return ItemErrorKind.BATCH_REJECTED, "batch refused at a batch-level limit: " + detail
+        return ItemErrorKind.INVALID, "batch failed validation" + (f": {detail}" if detail else "")
     if status == "expired":
-        return "expired", "batch expired before this request ran (24h window)"
+        return ItemErrorKind.EXPIRED, "batch expired before this request ran (24h window)"
     if status in ("cancelled", "cancelling"):
-        return "canceled", "batch canceled before this request ran"
-    return "errored", f"no result for this request (batch status {status!r})"
+        return ItemErrorKind.CANCELED, "batch canceled before this request ran"
+    return ItemErrorKind.ERRORED, f"no result for this request (batch status {status!r})"
 
 
 def _content_lines(content: Any) -> Iterator[str | bytes]:
