@@ -1388,8 +1388,14 @@ dimension rounding). They are `null` if a non-PDF source failed to convert
 
 `pdf_converter` names the converter that turned a non-PDF source into the
 PDF the pipeline ran on (the converter's name with any trailing
-`"converter"` suffix removed, e.g. `"libreoffice"`). It is `null` when the
-source was already a PDF.
+`"converter"` suffix removed, e.g. `"libreoffice"`). It is `null` only when
+DGML converted nothing: the source was already a PDF, or a library caller
+supplied the PDF (`FileStore.add(…, converted_pdf=)`; DGML did not check
+that it matches the source). So a convertible source (`.docx`, `.xlsx`, …)
+with a `null` `pdf_converter` is a supplied PDF — DGML names every converter
+it runs, and a failed conversion still names the one that was tried. That
+reading is an invariant: a future feature that produces no PDF at all must
+say so in a field of its own rather than by leaving this one `null`.
 
 ## `page_text/page_N.json`
 

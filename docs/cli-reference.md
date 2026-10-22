@@ -2635,7 +2635,9 @@ ordering) and the **provenance record**. It carries:
 - the **rendering provenance** from `file.json` — `page-image-dpi`,
   `page-image-renderer`, and (only for a non-PDF source converted to PDF)
   `pdf-converter`. A field absent from `file.json` is omitted, not emitted
-  empty;
+  empty. DGML names every converter it runs, so a non-PDF `<source>` with no
+  `pdf-converter` means the PDF was supplied by a library caller rather than
+  produced by DGML (see [conversion.md](conversion.md));
 - the `<artifacts>` **inventory** — each leaf's role mapped to its relative
   path, with per-page `number` attributes.
 
