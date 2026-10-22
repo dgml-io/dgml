@@ -5449,11 +5449,17 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         pinned: dict[str, str | bool] = {}  # resolved from config, recorded with the job
         # Only an extraction that will actually run needs the grounded config.
         extracting = want_extract and (has_schema or bool(args.schema_from))
-        grounded = load_grounded_config(ws) if extracting else None
-        if grounded is not None and args.schema_model:
-            grounded = replace(grounded, schema_model=args.schema_model)
-        if grounded is not None and args.values_model:
-            grounded = replace(grounded, values_model=args.values_model)
+        # The flag models go in as the loader's overrides, as the steps pass
+        # them: they satisfy resolution and carry their own credentials.
+        grounded = (
+            load_grounded_config(
+                ws,
+                schema_model=args.schema_model or None,
+                values_model=args.values_model or None,
+            )
+            if extracting
+            else None
+        )
         if grounded is not None and args.values_effort is not None:
             grounded = replace(grounded, values_reasoning_effort=values_effort)
         if grounded is not None and args.locations_effort is not None:
@@ -5473,8 +5479,11 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             from dgml_core.style_config import load_style_config
 
             style_section = load_style_config(ws)
-            if style_section is not None:
-                stages["generate.style"] = style_section.model  # OCR files' image style
+            if style_section is not None and _any_ocr_file(
+                FileStore(ws), ds_store.list_files(args.docset_id)
+            ):
+                # As `docset generate` gates it: only OCR files reach the style model.
+                stages["generate.style"] = style_section.model
             if not args.no_semlinks:
                 stages["generate.links"] = gen_cfg.label_model
             from dgml_core.generation import load_generation_batch_label

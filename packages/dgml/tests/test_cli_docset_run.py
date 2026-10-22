@@ -40,6 +40,7 @@ from dgml_core import layout
 from dgml_core.batch import jobs as jobs_mod
 from dgml_core.batch import list_jobs
 from dgml_core.docsets import DocSetStore
+from dgml_core.errors import BatchUnavailable
 from dgml_core.generation import transcribe as transcribe_mod
 from dgml_core.storage import Workspace
 
@@ -429,6 +430,66 @@ def test_batch_unavailable_names_the_offending_step(
         assert err["code"] == "BATCH_UNAVAILABLE"
         assert f"stage '{step}'" in err["message"]
     assert list_jobs(Workspace(root=ws)) == []  # rejected before any job existed
+
+
+def test_batch_checks_the_style_model_only_when_a_file_is_ocr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """As `docset generate` gates it: the image-style model is a batch stage
+    only when the docset has an OCR file, the only kind that reaches it."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    wsx = Workspace(root=ws)
+    with wsx.config_path.open("a", encoding="utf-8") as fh:
+        fh.write('\n[style]\nenabled = true\nmodel = "bedrock/anthropic.claude-3-5-sonnet"\n')
+    seen: list[set[str]] = []
+
+    def stop(stages: dict[str, Any]) -> None:
+        seen.append(set(stages))
+        raise BatchUnavailable("stop here")
+
+    with patch("dgml.cli._batch_preflight", side_effect=stop):
+        assert main(_run_argv(ws, did, "--batch")) == 1
+    assert "generate.style" not in seen[-1] and "generate.transcribe" in seen[-1]
+    _read_stderr(capsys)
+
+    record = wsx.docs.get_doc("files", _FIDS[0])
+    assert record is not None
+    wsx.docs.put_doc("files", _FIDS[0], {**record, "text_mode": "ocr"})
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        assert main(_run_argv(ws, did, "--batch")) == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "BATCH_UNAVAILABLE"
+    assert "stage 'generate.style'" in err["message"]
+    assert list_jobs(wsx) == []
+
+
+def test_batch_preflight_resolves_the_flag_models_as_the_steps_do(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--schema-model` / `--values-model` reach `load_grounded_config` as its
+    overrides (as `extraction generate-schema` and `extract` pass them), so a
+    flag model satisfies resolution and carries its own credentials."""
+    from dgml_core import grounded as grounded_mod
+
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    calls: list[dict[str, Any]] = []
+    real = grounded_mod.load_grounded_config
+
+    def spy(workspace: Workspace, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real(workspace, **kwargs)
+
+    stop = BatchUnavailable("stop here")
+    with (
+        patch.object(grounded_mod, "load_grounded_config", side_effect=spy),
+        patch("dgml.cli._batch_preflight", side_effect=stop),
+    ):
+        argv = _run_argv(
+            ws, did, "--schema-model", "anthropic/m1", "--values-model", "anthropic/m2"
+        )
+        assert main([*argv, "--batch"]) == 1
+    assert calls == [{"schema_model": "anthropic/m1", "values_model": "anthropic/m2"}]
+    _read_stderr(capsys)
 
 
 def test_unknown_values_effort_fails_the_run_before_any_step(
