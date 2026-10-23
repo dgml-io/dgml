@@ -1418,9 +1418,18 @@ workspace with many pages doesn't bloat on disk:
 
 - `width` / `height` — dimensions of the matching `page_images/page_N.{png,jpg}`.
 - `words[*].t` — word text (whitespace-separated run of non-whitespace chars).
+  On the digital path a page also carries the words of filled PDF form fields
+  (printable, non-hidden text fields and combo boxes, not password fields,
+  read from the field's appearance stream with true glyph boxes). The words of
+  a field come right after the page content word they follow in reading order:
+  the nearest label on the same line, else the nearest line above in the same
+  column, else the end of the page. The page content words keep their order; a
+  value the page content already prints in the field is not repeated.
 - `words[*].l` — `[left, top, right, bottom]` ints (top-left origin, pixels).
 - `words[*].s` — observed style facts, present only on the digital path (and
-  digital-derived `hybrid` words); absent on OCR words. `sz` is
+  digital-derived `hybrid` words); absent on OCR words and on the words of
+  form-field values, so a filled form has the same body-size baseline as the
+  blank one. `sz` is
   recorded for every word with sized glyphs — which is essentially every digital
   word — so `s` is present on nearly all of them; `b`/`i`/`c` appear only when
   that non-default formatting was seen. Keys: `b` (bold, `1`), `i` (italic, `1`),

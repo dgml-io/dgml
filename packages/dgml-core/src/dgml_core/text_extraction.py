@@ -37,6 +37,7 @@ hybrid`` is the mode that tells that apart from a baked OCR layer.
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -48,6 +49,8 @@ from typing import Any
 from .errors import TextExtractionFailed
 from .pages import DEFAULT_DPI, DEFAULT_PAGE_IMAGE_SPEC, PageImageSpec
 from .style import fontname_is_bold, fontname_is_italic, rgb_to_named
+
+logger = logging.getLogger(__name__)
 
 PAGE_TEXT_FILENAME = "page_{page}.json"
 PAGE_TEXT_GLOB = "page_*.json"
@@ -141,6 +144,12 @@ class ExtractDigitalResult:
     defects: dict[int, PageTextDefect] = field(default_factory=dict)
     # Pages a digital-mode extraction took from OCR instead.
     ocr_fallback_pages: list[int] = field(default_factory=list)
+    # Words added for the values of filled PDF form fields (see
+    # :mod:`dgml_core.form_fields`); included in ``total_words``.
+    form_field_words: int = 0
+    # The same count per page (1-based), so OCR fallback can drop the pages it
+    # replaces. Not in the summary.
+    form_field_words_by_page: dict[int, int] = field(default_factory=dict)
     # Why OCR fallback could not recover ``defects`` (no provider configured, a
     # provider failure), when it was attempted.
     ocr_fallback_error: str | None = None
@@ -154,6 +163,8 @@ class ExtractDigitalResult:
         }
         # Present only when something happened, so a healthy extraction's
         # summary is exactly what it always was.
+        if self.form_field_words:
+            summary["form_field_words"] = self.form_field_words
         if self.ocr_fallback_pages:
             summary["ocr_fallback_pages"] = sorted(self.ocr_fallback_pages)
         if self.defects:
@@ -313,6 +324,12 @@ def extract_text_digital(
     Scanned pages with little or no text (see :func:`page_text_defect`) are
     listed in ``defects``; their words are still written as extracted.
     :func:`dgml_core.ocr.recover_unusable_pages` is what acts on that.
+
+    The values of filled PDF form fields (text fields, combo boxes) are not
+    page content; their words are inserted into the page in reading order,
+    after the scan check (see :mod:`dgml_core.form_fields`). A form that
+    cannot be read costs only its values: a warning is logged and the page
+    keeps its content words.
     """
     # Lazy import so a missing pdfminer install fails with a clear, actionable
     # error path rather than a module-load-time ImportError.
@@ -332,8 +349,13 @@ def extract_text_digital(
     pages_with_words = 0
     total_words = 0
     defects: dict[int, PageTextDefect] = {}
+    form_words_added = 0
+    form_words_by_page: dict[int, int] = {}
 
     try:
+        from .form_fields import form_field_words, merge_form_field_words
+
+        form_fields = form_field_words(pdf_path)
         # ``all_texts=True`` makes pdfminer run line-grouping on text inside
         # Form XObjects (``LTFigure``) too. Without it, brochure-style PDFs that
         # lay body text inside figures yield only loose ``LTChar``s with no
@@ -390,6 +412,27 @@ def extract_text_digital(
             defect = page_text_defect(words, raster=raster)
             if defect is not None:
                 defects[page_num] = defect
+            if page_num in form_fields:
+                # The merge works on a copy: a failure there leaves the page
+                # content words as they are and costs only the form values.
+                merged = list(words)
+                try:
+                    added = merge_form_field_words(
+                        merged, form_fields[page_num], page_h_pts=page_h_pts, dpi=dpi
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "form field values not added to page %d of %s: %s: %s",
+                        page_num,
+                        pdf_path.name,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    added = 0
+                if added:
+                    words[:] = merged
+                    form_words_by_page[page_num] = added
+                    form_words_added += added
             out_path = output_dir / PAGE_TEXT_FILENAME.format(page=page_num)
             # Compact one-line JSON — `page_text/` is per-page so files stay
             # small; pretty-printing would bloat workspaces with thousands of
@@ -414,6 +457,8 @@ def extract_text_digital(
         pages_with_words=pages_with_words,
         total_words=total_words,
         defects=defects,
+        form_field_words=form_words_added,
+        form_field_words_by_page=form_words_by_page,
     )
 
 

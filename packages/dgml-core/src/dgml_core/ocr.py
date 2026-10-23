@@ -659,7 +659,15 @@ def recover_unusable_pages(
         format_pages(pages),
         config.provider,
     )
-    return replace(_tally(output_dir, result.pages_written), ocr_fallback_pages=pages)
+    # The OCR'd pages were rewritten from OCR words, so their form-field words
+    # are gone; keep the count of the other pages.
+    kept = {p: n for p, n in result.form_field_words_by_page.items() if p not in pages}
+    return replace(
+        _tally(output_dir, result.pages_written),
+        ocr_fallback_pages=pages,
+        form_field_words=sum(kept.values()),
+        form_field_words_by_page=kept,
+    )
 
 
 def _tally(output_dir: Path, pages_written: int) -> ExtractDigitalResult:

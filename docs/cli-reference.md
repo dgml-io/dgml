@@ -2074,9 +2074,11 @@ The `dgml file add` response also includes:
   still created and a permanent error is recorded.
 - `text_extraction` — summary object on success: `{ mode, pages_written,
   pages_with_words, total_words }`. `null` when extraction itself failed. A
-  digital-mode summary also carries `ocr_fallback_pages` (scanned pages taken
-  from OCR) and `unusable_pages` (`{page: reason}` for scanned pages OCR could
-  not recover; reasons `image_only`, `stray_text`), each only when non-empty.
+  digital-mode summary also carries `form_field_words` (words added for the
+  values of filled PDF form fields) when it is non-zero, and
+  `ocr_fallback_pages` (scanned pages taken from OCR) and `unusable_pages`
+  (`{page: reason}` for scanned pages OCR could not recover; reasons
+  `image_only`, `stray_text`), each only when non-empty.
 - `conversion_error` — set if a convertible source (docx/xlsx/…) could not be
   converted to PDF (missing converter binary/SDK, conversion failure). The
   File record is still created (with `page_count: null`) and a permanent error
