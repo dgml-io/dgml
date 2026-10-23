@@ -51,7 +51,7 @@ A request litellm serves through the **Responses API** (`/v1/responses`)
 instead cannot batch, so it is `BATCH_UNAVAILABLE` too, checked with the other
 models before any step runs (the same rule applies again when a request is
 built). That covers the Responses-only models (`gpt-5-pro`, `o3-pro`, the
-`codex` models, any `responses/…` model, or every model when
+`codex` models, any `responses/…` or `openai/responses/…` model, or every model when
 `litellm.route_all_chat_openai_to_responses` is set), and gpt-5.4 and later
 for schema generation and value extraction, which send tools together with a
 reasoning effort (a combination litellm routes to the Responses API; the same
@@ -59,7 +59,8 @@ model can still batch transcription, labeling and links). The extraction check
 uses the configured `grounded.values_reasoning_effort` (or `--values-effort`)
 for the value-extraction request; `default` sends no effort there, but location
 grounding always sends its own, so gpt-5.4+ extraction is refused either way
-(the error then names stage `extraction.locations`). Use a chat-mode model
+(the error then names stage `extraction.locations`, or `extract.locations` under
+`docset run`). Use a chat-mode model
 for those stages, or run without `--batch`. For example:
 
 ```text

@@ -47,7 +47,7 @@ file, 24-hour completion window.
 from __future__ import annotations
 
 import copy
-import io
+import hashlib
 import json
 import os
 import time
@@ -56,8 +56,19 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from dgml_core.batch._capture import OPENAI_SDK, CaptureFailed, EncodeCache, capture_sync_request
-from dgml_core.batch._http import HttpFailure, call_with_retries, uncertain_create
-from dgml_core.batch._policy import is_batch_limit_error
+from dgml_core.batch._http import (
+    HttpFailure,
+    call_with_retries,
+    iter_jsonl_lines,
+    uncertain_create,
+)
+from dgml_core.batch._policy import (
+    CreateOutcome,
+    classify_create_failure,
+    failure_of,
+    is_batch_limit_error,
+    is_enqueued_limit_error,
+)
 from dgml_core.batch.registry import BackendConfig, register_backend
 from dgml_core.batch.types import (
     BatchItemError,
@@ -152,7 +163,8 @@ def responses_routed(kwargs: Mapping[str, Any]) -> bool:
 
     It is litellm's own bridge check, fed the fields that decide it: the model
     (cost-map mode ``responses`` — gpt-5-pro, o3-pro, the codex models — a
-    ``responses/`` model, or ``litellm.route_all_chat_openai_to_responses``),
+    ``responses/`` or ``openai/responses/`` model, or
+    ``litellm.route_all_chat_openai_to_responses``),
     and ``tools`` + ``reasoning_effort`` (gpt-5.4+ bridges that combination).
     An unknown model answers ``False``; the encode capture still refuses any
     request that reaches ``/v1/responses`` anyway."""
@@ -162,8 +174,10 @@ def responses_routed(kwargs: Mapping[str, Any]) -> bool:
     try:
         from litellm.main import responses_api_bridge_check
 
+        # The check reads the bare model: with the provider prefix it misses
+        # ``openai/responses/<model>`` (it answers ``{}``, not ``responses``).
         info, _ = responses_api_bridge_check(
-            model=model,
+            model=model.removeprefix(f"{PROVIDER}/"),
             custom_llm_provider=PROVIDER,
             tools=kwargs.get("tools") or None,
             reasoning_effort=kwargs.get("reasoning_effort"),
@@ -248,10 +262,50 @@ def _not_found(job: BatchJob, what: str, exc: BaseException) -> BatchNotFound | 
     return BatchNotFound(f"openai batch {job.job_id} not found ({what}): {exc}")
 
 
+# Per-request statuses that say nothing is wrong with the request itself: a
+# timeout, a conflict or a rate limit is worth another try (``_policy``'s
+# transient statuses), not a synchronous fallback.
+_TRANSIENT_4XX = frozenset({408, 409, 429})
+
+
 def _item_error(custom_id: str, status_code: int | None, message: str) -> BatchItemError:
-    if status_code is not None and 400 <= status_code < 500 and status_code != 429:
+    if status_code is not None and 400 <= status_code < 500 and status_code not in _TRANSIENT_4XX:
         return BatchItemError(custom_id, ItemErrorKind.INVALID, message)
     return BatchItemError(custom_id, ItemErrorKind.ERRORED, message)
+
+
+def _upload_refusal(exc: BaseException) -> BatchRejected | BatchThrottled | None:
+    """The batch-level error for a refused input-file upload, or ``None`` to
+    let the SDK's own error through. The upload runs on the SDK's retries (a
+    resent upload is an unbilled orphan file), so a failure here has already
+    been retried; what is left to decide is how the executor should treat it,
+    as for a refused create: a size/limit refusal is :class:`BatchRejected`
+    (smaller batches may fit), quota or a rate limit that outlasted the
+    retries is :class:`BatchThrottled` (fail the wave loudly)."""
+    status, _ = failure_of(exc)
+    if status is None:
+        return None
+    detail = f"HTTP {status}: {exc}"
+    outcome = classify_create_failure(status_code=status, detail=detail)
+    if outcome is CreateOutcome.REJECTED or (status == 429 and is_enqueued_limit_error(detail)):
+        return BatchRejected(f"POST /v1/files refused the batch input: {detail}")
+    if outcome is CreateOutcome.THROTTLED or status == 429:
+        return BatchThrottled(
+            f"POST /v1/files refused the batch input at the account's quota: {detail}"
+        )
+    return None
+
+
+def _missing_result_files(batch: Mapping[str, Any]) -> bool:
+    """A batch that ended with answered requests but names no file to read
+    them from — one the provider has not finished describing. Reading it as
+    is would report billed work as unanswered and retryable."""
+    if batch.get("status") not in ("completed", "expired"):
+        return False
+    if batch.get("output_file_id") or batch.get("error_file_id"):
+        return False
+    counts = batch.get("request_counts") or {}
+    return int(counts.get("completed") or 0) + int(counts.get("failed") or 0) > 0
 
 
 class OpenAIBatchBackend:
@@ -279,6 +333,15 @@ class OpenAIBatchBackend:
         # litellm dry run serves both. ``submit`` drops what it spent.
         self._bodies: EncodeCache[dict[str, Any]] = EncodeCache()
 
+    def credential_fingerprint(self) -> str | None:
+        """The first 12 hex digits of the SHA-256 of the key this backend
+        sends, or ``None`` with no key: enough to tell two keys apart, never
+        enough to recover one. A batch job keeps it on each batch it creates:
+        OpenAI batches and files belong to one project, so a 404 under another
+        project's key does not mean the batch is gone."""
+        key = self._api_key
+        return hashlib.sha256(key.encode()).hexdigest()[:12] if key else None
+
     # ---- BatchBackend --------------------------------------------------
 
     def encode(self, request: BatchRequest) -> dict[str, Any]:
@@ -305,16 +368,23 @@ class OpenAIBatchBackend:
     def _submit(self, requests: Sequence[BatchRequest]) -> BatchJob:
         import litellm
 
+        if not requests:
+            raise ValueError("cannot submit an empty batch")
         lines = [json.dumps(self.encode(r), ensure_ascii=False) for r in requests]
         payload = ("\n".join(lines) + "\n").encode("utf-8")
         # An upload is safe to retry (a duplicate is an unbilled orphan file),
         # so it keeps the SDK's own retries.
-        file_obj = litellm.create_file(
-            file=("dgml-batch.jsonl", payload, "application/jsonl"),
-            purpose="batch",
-            custom_llm_provider=PROVIDER,
-            **self._credentials(),
-        )
+        try:
+            file_obj = litellm.create_file(
+                file=("dgml-batch.jsonl", payload, "application/jsonl"),
+                purpose="batch",
+                custom_llm_provider=PROVIDER,
+                **self._credentials(),
+            )
+        except Exception as exc:
+            if (refusal := _upload_refusal(exc)) is not None:
+                raise refusal from exc
+            raise
         input_file_id = str(_get(file_obj, "id"))
 
         def create() -> Any:
@@ -379,14 +449,13 @@ class OpenAIBatchBackend:
         completed = int(_get(counts, "completed", 0) or 0)
         failed = int(_get(counts, "failed", 0) or 0)
         processing = max(0, total - completed - failed) if state is BatchState.RUNNING else 0
-        expired = 0
-        if status == "expired":
-            expired = max(0, total - completed - failed)
+        unanswered = max(0, total - completed - failed)
         return BatchStatus(
             state=state,
             succeeded=completed,
             errored=failed,
-            expired=expired,
+            expired=unanswered if status == "expired" else 0,
+            canceled=unanswered if status == "cancelled" else 0,
             processing=processing,
             raw=raw,
         )
@@ -401,6 +470,14 @@ class OpenAIBatchBackend:
 
     def _results(self, job: BatchJob) -> Iterator[tuple[str, Any | BatchItemError]]:
         batch = job.extra.get("batch") or {}
+        if _missing_result_files(batch):
+            self.poll(job)
+            batch = job.extra.get("batch") or {}
+            if _missing_result_files(batch):
+                raise RuntimeError(
+                    f"openai batch {job.job_id} is {batch.get('status')} with answered "
+                    "requests but names no output or error file yet; collect it again later"
+                )
         seen: set[str] = set()
         for key in ("output_file_id", "error_file_id"):
             file_id = batch.get(key)
@@ -481,10 +558,8 @@ class OpenAIBatchBackend:
         content = litellm.file_content(
             file_id=file_id, custom_llm_provider=PROVIDER, **self._credentials()
         )
-        for raw in _content_lines(content):
-            raw = raw.strip()
-            if raw:
-                yield json.loads(raw)
+        for line in _content_lines(content):
+            yield json.loads(line)
 
     @staticmethod
     def _decode_line(line: dict[str, Any]) -> tuple[str, Any | BatchItemError]:
@@ -575,25 +650,22 @@ def _unanswered(status: str, batch: dict[str, Any]) -> tuple[ItemErrorKind, str]
     return ItemErrorKind.ERRORED, f"no result for this request (batch status {status!r})"
 
 
-def _content_lines(content: Any) -> Iterator[str | bytes]:
-    """The lines of a downloaded file, one at a time. A file can be as large
-    as its batch (200 MB): it is iterated where the object allows (the SDK's
-    binary content's ``iter_lines``), never decoded into one more whole-file
-    string and split into a list of every line."""
+def _content_lines(content: Any) -> Iterator[str]:
+    """The non-blank lines of a downloaded JSONL file, one at a time, split on
+    ``\n`` only (:func:`~dgml_core.batch._http.iter_jsonl_lines`). A file can be
+    as large as its batch (200 MB): it is read in chunks where the object
+    allows (the SDK's binary content's ``iter_bytes``), never decoded into one
+    more whole-file string and split into a list of every line."""
     if isinstance(content, bytes | bytearray):
-        yield from io.BytesIO(content)
-        return
+        return iter_jsonl_lines([bytes(content)])
     if isinstance(content, str):
-        yield from io.StringIO(content)
-        return
-    iter_lines = getattr(content, "iter_lines", None)
-    if callable(iter_lines):
-        yield from iter_lines()
-        return
+        return iter_jsonl_lines([content.encode("utf-8")])
+    iter_bytes = getattr(content, "iter_bytes", None)
+    if callable(iter_bytes):
+        return iter_jsonl_lines(iter_bytes())
     data = getattr(content, "content", None)
     if isinstance(data, bytes):
-        yield from io.BytesIO(data)
-        return
+        return iter_jsonl_lines([data])
     raise TypeError(f"unreadable file content object: {type(content).__name__}")
 
 

@@ -35,6 +35,7 @@ from dgml_core.batch import (
     BatchJob,
     BatchRequest,
     BatchState,
+    ItemErrorKind,
     registered_providers,
     resolve_backend,
 )
@@ -359,6 +360,8 @@ class _FakeLiteLLM:
         self.files: dict[str, str] = {}
         # Exceptions ``create_batch`` raises, one per call, before succeeding.
         self.create_errors: list[Exception] = []
+        # Exceptions ``create_file`` raises, one per call, before succeeding.
+        self.upload_errors: list[Exception] = []
         self.deleted: list[str] = []
         self.delete_error: Exception | None = None
         for name in ("create_file", "create_batch", "retrieve_batch", "file_content"):
@@ -368,6 +371,8 @@ class _FakeLiteLLM:
 
     def create_file(self, **kw: Any) -> OpenAIFileObject:
         self.calls.append(("create_file", kw))
+        if self.upload_errors:
+            raise self.upload_errors.pop(0)
         _, payload, _ = kw["file"]
         self.uploaded = payload
         return OpenAIFileObject(
@@ -455,6 +460,34 @@ def test_api_key_falls_back_to_environment(monkeypatch: pytest.MonkeyPatch) -> N
     assert fake.calls[0][1]["api_key"] == "sk-env"
 
 
+def test_the_credential_fingerprint_tells_keys_apart_and_hides_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenAI batches are project-scoped: a job must record which key made
+    each batch, or a 404 under another project's key reads as "gone"."""
+    import hashlib
+
+    from dgml_core.batch.jobs import key_fingerprint
+
+    def backend(key: str | None = None) -> ob.OpenAIBatchBackend:
+        return ob.OpenAIBatchBackend(BackendConfig(model="gpt-4o", api_key=key))
+
+    one = backend("sk-one").credential_fingerprint()
+    assert one == hashlib.sha256(b"sk-one").hexdigest()[:12]
+    assert backend("sk-two").credential_fingerprint() != one
+    assert backend().credential_fingerprint() is None
+    assert key_fingerprint(backend("sk-one")) == one
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-one")
+    assert backend().credential_fingerprint() == one  # the key it would send
+
+
+def test_an_empty_batch_is_refused_before_any_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeLiteLLM(monkeypatch)
+    with pytest.raises(ValueError, match="empty batch"):
+        _quiet_backend().submit([])
+    assert fake.calls == []
+
+
 @pytest.mark.parametrize(
     ("status", "state"),
     [
@@ -480,6 +513,7 @@ def test_poll_maps_status_and_counts(
     assert (got.succeeded, got.errored) == (1, 1)
     assert got.processing == (1 if state is BatchState.RUNNING else 0)
     assert got.expired == (1 if status == "expired" else 0)
+    assert got.canceled == (1 if status == "cancelled" else 0)
     assert fake.calls[-1] == (
         "retrieve_batch",
         {"batch_id": "batch_1", "custom_llm_provider": "openai"},
@@ -536,7 +570,10 @@ def test_results_decode_outputs_errors_and_missing(monkeypatch: pytest.MonkeyPat
     )
 
 
-@pytest.mark.parametrize(("status_code", "kind"), [(429, "errored"), (500, "errored")])
+@pytest.mark.parametrize(
+    ("status_code", "kind"),
+    [(408, "errored"), (409, "errored"), (429, "errored"), (500, "errored")],
+)
 def test_retryable_http_statuses(
     monkeypatch: pytest.MonkeyPatch, status_code: int, kind: str
 ) -> None:
@@ -636,6 +673,49 @@ def test_expired_batch_keeps_answered_results_and_expires_the_rest(
 
 
 # ---- create safety -------------------------------------------------------------
+
+
+def test_a_finished_batch_naming_no_result_file_is_polled_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Answered requests with no output file yet: re-poll, never report the
+    billed work as unanswered and retryable."""
+    fake = _FakeLiteLLM(monkeypatch)
+    backend = _quiet_backend()
+    job = backend.submit(_requests(1))
+    fake.batch.update(status="completed", request_counts={"total": 1, "completed": 1, "failed": 0})
+    backend.poll(job)
+    fake.files["file_out"] = _line("r0", _CHAT_BODY)
+    fake.batch["output_file_id"] = "file_out"  # filled in by the time of the re-poll
+    out = dict(backend.results(job))
+    assert not isinstance(out["r0"], BatchItemError)
+
+
+@pytest.mark.parametrize("status", ["completed", "expired"])
+def test_a_finished_batch_still_naming_no_result_file_raises(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    fake = _FakeLiteLLM(monkeypatch)
+    backend = _quiet_backend()
+    job = backend.submit(_requests(2))
+    fake.batch.update(status=status, request_counts={"total": 2, "completed": 1, "failed": 0})
+    backend.poll(job)
+    with pytest.raises(RuntimeError, match="names no output or error file"):
+        list(backend.results(job))
+
+
+def test_a_finished_batch_that_answered_nothing_needs_no_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeLiteLLM(monkeypatch)
+    backend = _quiet_backend()
+    job = backend.submit(_requests(1))
+    fake.batch.update(status="expired", request_counts={"total": 1, "completed": 0, "failed": 0})
+    backend.poll(job)
+    ((cid, outcome),) = list(backend.results(job))
+    assert cid == "r0"
+    assert isinstance(outcome, BatchItemError) and outcome.kind is ItemErrorKind.EXPIRED
+
 
 _REQ = httpx.Request("POST", "https://api.openai.com/v1/batches")
 
@@ -776,10 +856,13 @@ class _StreamedContent:
     def content(self) -> bytes:
         raise AssertionError("results must not read the whole file into one buffer")
 
-    def iter_lines(self) -> Any:
+    def iter_bytes(self) -> Any:
+        # Chunks that do not line up with the lines, as a real download's do.
         for line in self.lines:
             self.read += 1
-            yield line
+            data = (line + "\n").encode()
+            yield data[:7]
+            yield data[7:]
 
 
 def test_result_files_are_iterated_line_by_line(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -798,6 +881,38 @@ def test_result_files_are_iterated_line_by_line(monkeypatch: pytest.MonkeyPatch)
     assert next(results)[0] == "r0"
     assert content.read < len(lines)
     assert len(list(results)) == 29
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+@pytest.mark.parametrize("as_bytes", [False, True], ids=["sdk-content", "bytes"])
+def test_a_result_holding_a_unicode_line_separator_stays_one_line(
+    monkeypatch: pytest.MonkeyPatch, separator: str, as_bytes: bool
+) -> None:
+    """JSON leaves U+0085/U+2028/U+2029 unescaped; a text line splitter breaks
+    on them, cutting the record in two (NEL is common in mojibake PDF text)."""
+    fake = _FakeLiteLLM(monkeypatch)
+    text = f"Total{separator} due"
+    body = {**_CHAT_BODY, "choices": [{**_CHAT_BODY["choices"][0]}]}
+    body["choices"][0]["message"] = {"role": "assistant", "content": text}
+    blob = (
+        json.dumps(
+            {"custom_id": "r0", "response": {"status_code": 200, "body": body}}, ensure_ascii=False
+        )
+        + "\n"
+    )
+    assert separator in blob  # really unescaped on the wire
+    content: Any = blob.encode() if as_bytes else _file_content(blob)
+    monkeypatch.setattr(litellm, "file_content", lambda **_kw: content)
+    fake.batch.update(status="completed", output_file_id="file_out")
+    job = BatchJob(
+        provider="openai",
+        job_id="batch_1",
+        custom_ids=("r0",),
+        extra={"batch": dict(fake.batch)},
+    )
+    ((cid, outcome),) = list(_quiet_backend().results(job))
+    assert cid == "r0" and not isinstance(outcome, BatchItemError)
+    assert outcome.choices[0].message.content == text
 
 
 def test_result_files_as_bytes_still_decode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -894,6 +1009,42 @@ def test_create_refused_otherwise_reraises_the_sdk_error(monkeypatch: pytest.Mon
         _quiet_backend().submit(_requests(1))
     assert len(_creates(fake)) == 1
     assert fake.deleted == ["file_in"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (_status_error(openai.RateLimitError, 429, "slow down"), BatchThrottled),
+        (_status_error(openai.RateLimitError, 429, "insufficient_quota"), BatchThrottled),
+        (_status_error(openai.BadRequestError, 400, "billing hard limit reached"), BatchThrottled),
+        (_status_error(openai.BadRequestError, 400, "file too large"), BatchRejected),
+        (_status_error(openai.RateLimitError, 429, "enqueued token limit"), BatchRejected),
+    ],
+    ids=["rate-limit", "quota-429", "billing-400", "too-large", "enqueued"],
+)
+def test_a_refused_upload_is_classified_like_a_refused_create(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, expected: type[Exception]
+) -> None:
+    fake = _FakeLiteLLM(monkeypatch)
+    fake.upload_errors = [error]
+    with pytest.raises(expected, match="POST /v1/files"):
+        _quiet_backend().submit(_requests(1))
+    assert _creates(fake) == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_status_error(openai.AuthenticationError, 401, "bad key"), _connect_error()],
+    ids=["auth", "connect"],
+)
+def test_an_upload_failing_otherwise_reraises_the_sdk_error(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    fake = _FakeLiteLLM(monkeypatch)
+    fake.upload_errors = [error]
+    with pytest.raises(type(error)):
+        _quiet_backend().submit(_requests(1))
+    assert _creates(fake) == []
 
 
 def test_failed_batch_at_the_enqueued_token_limit_is_batch_rejected(
@@ -1297,6 +1448,7 @@ _BRIDGED: dict[str, dict[str, Any]] = {
     "gpt-5-pro": {"model": "openai/gpt-5-pro"},
     "o3-pro": {"model": "openai/o3-pro"},
     "gpt-5-codex": {"model": "openai/gpt-5-codex"},
+    "responses-prefix": {"model": "openai/responses/gpt-4o"},
     "gpt-5.4_tools_reasoning": {
         "model": "openai/gpt-5.4",
         "tools": _TOOLS,
