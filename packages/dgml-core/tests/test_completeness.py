@@ -7,6 +7,7 @@ from typing import Any
 
 from dgml_core.generation import completeness
 from dgml_core.generation.blocks import Block
+from dgml_core.generation.render import render_xml
 
 W, H = 1000, 1400
 LINE = 20  # word height
@@ -139,6 +140,25 @@ def test_ligatures_do_not_look_missing(tmp_path: Path) -> None:
     blocks = [_p("net profit rose significantly in the first quarter of the year")]
     _, rep = completeness.ensure_complete(blocks, d)
     assert rep["model_coverage_pct"] == 100.0 and rep["regions"] == []
+
+
+def test_text_layer_fill_is_xml_safe(tmp_path: Path) -> None:
+    """A font with no ToUnicode entry for a ligature extracts it as NUL. A page
+    filled from the text layer must come out without it, or rendering the
+    document raises (lxml refuses control characters in element text)."""
+    lost = [
+        ["the con\x00guration is de\x00ned in the o\x00cial speci\x00cation of the system"],
+        ["each modi\x00cation is veri\x00ed before the \x00nal certi\x00cation is issued"],
+        ["Pro\x00t", "1,267", "1,356"],
+    ]
+    pages = [_words(lost), _words(_prose(2))]
+    d = _write_pages(tmp_path, pages)
+    blocks = [_p(_page_text(pages[1]), "b2")]  # page 1 never transcribed
+    out, rep = completeness.ensure_complete(blocks, d)
+    assert rep["regions"] and rep["regions"][0]["source"] == "text-layer"
+    text = " ".join(b.flat_text() for b in out)
+    assert "\x00" not in text and "conguration" in text and "1,267" in text
+    render_xml(out, doc_name="example.pdf")  # raised ValueError before the fix
 
 
 def test_block_written_before_the_pages_first_paragraph_is_claimed(tmp_path: Path) -> None:

@@ -59,6 +59,7 @@ from typing import Any
 
 from dgml_core.generation.blocks import Block
 from dgml_core.textmatch import PageDims, Word, core_token, fuzzy_norm, reorder_words_by_cell
+from dgml_core.utils import xml_safe
 from dgml_core.xml_grounding import _align_window
 
 # A region smaller than this is page furniture (a page number, a running
@@ -568,7 +569,11 @@ def fallback_blocks(region: Region, prefix: str) -> list[Block]:
                 cells.append([t])
             else:
                 cells[-1].append(t)
-        texts = [" ".join(t.text for t in c) for c in cells]
+        # The text layer is not model output, so it never passed parse_block's
+        # xml_safe: a PDF whose fonts lack a ToUnicode entry for a ligature
+        # extracts it as NUL ("con\x00guration" for "configuration"), which lxml
+        # refuses to serialize -- and the render of the whole document fails.
+        texts = [xml_safe(" ".join(t.text for t in c)) for c in cells]
         if len(cells) >= 2 and any(_is_figure(t.core) for t in ln):
             flush()
             n += 1
