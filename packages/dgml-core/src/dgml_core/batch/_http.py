@@ -41,7 +41,7 @@ Outcomes:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any, TypeVar
 
 import httpx
@@ -198,7 +198,7 @@ def stream_request(
 ) -> Callable[[], httpx.Response]:
     """Like :func:`request`, but a successful response comes back with its
     body unread (``stream=True``), for results files too large to buffer:
-    the caller iterates it (``iter_lines``) and must close it. An error
+    the caller iterates it (:func:`iter_response_lines`) and must close it. An error
     response is read and closed at once, so its detail is still reported."""
 
     def call() -> httpx.Response:
@@ -213,13 +213,34 @@ def stream_request(
     return call
 
 
+def iter_jsonl_lines(chunks: Iterable[bytes]) -> Iterator[str]:
+    """The non-blank lines of a JSONL byte stream, stripped, split on ``\n``
+    only and read one chunk at a time.
+
+    JSON leaves U+0085, U+2028 and U+2029 unescaped, and a text decoder's line
+    splitting (``httpx``'s ``iter_lines``, ``str.splitlines``) breaks on all
+    three, cutting a record whose text holds one in two. A ``\n`` byte never
+    occurs inside a UTF-8 multibyte sequence, so each line decodes on its own."""
+    head: list[bytes] = []
+    for chunk in chunks:
+        if b"\n" not in chunk:
+            head.append(chunk)
+            continue
+        first, *rest = chunk.split(b"\n")
+        lines = [b"".join([*head, first]), *rest]
+        head = [lines.pop()]
+        for raw in lines:
+            if line := raw.strip():
+                yield line.decode("utf-8")
+    if line := b"".join(head).strip():
+        yield line.decode("utf-8")
+
+
 def iter_response_lines(response: httpx.Response) -> Iterator[str]:
-    """The non-blank lines of a streamed *response*, stripped, read one chunk
-    at a time; the response is closed when iteration ends or is abandoned."""
+    """The non-blank lines of a streamed JSONL *response* (see
+    :func:`iter_jsonl_lines`); the response is closed when iteration ends or is
+    abandoned."""
     try:
-        for line in response.iter_lines():
-            line = line.strip()
-            if line:
-                yield line
+        yield from iter_jsonl_lines(response.iter_bytes())
     finally:
         response.close()

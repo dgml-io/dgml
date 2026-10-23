@@ -21,7 +21,12 @@ import openai
 import pytest
 from dgml_core.batch import BatchRequest, ItemErrorKind
 from dgml_core.batch._capture import EncodeCache
-from dgml_core.batch._http import HttpFailure, call_with_retries
+from dgml_core.batch._http import (
+    HttpFailure,
+    call_with_retries,
+    iter_jsonl_lines,
+    iter_response_lines,
+)
 from dgml_core.batch._policy import (
     CreateOutcome,
     classify_create_failure,
@@ -240,3 +245,21 @@ def test_encode_cache_is_keyed_on_id_and_content() -> None:
     assert len(cache) == 1  # one entry per id: a stale encoding never accumulates
     cache.release(["a", "missing"])
     assert len(cache) == 0
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029", "\r"])
+def test_jsonl_lines_split_on_newline_only(separator: str) -> None:
+    """JSON leaves U+0085/U+2028/U+2029 unescaped; httpx's iter_lines (like
+    str.splitlines) breaks on them and would cut one record in two."""
+    record = f'{{"text": "Total{separator} due"}}'
+    data = f"{record}\n\n{record}\n".encode()
+    response = httpx.Response(200, content=data)
+    assert list(iter_response_lines(response)) == [record.strip(), record.strip()]
+    assert response.is_closed
+
+
+def test_jsonl_lines_join_chunks_that_split_a_line_or_a_character() -> None:
+    data = '{"a": "é"}\n{"b": "ü"}'.encode()  # no trailing newline
+    chunks = [data[i : i + 1] for i in range(len(data))]  # splits each 2-byte character
+    assert list(iter_jsonl_lines(chunks)) == ['{"a": "é"}', '{"b": "ü"}']
+    assert list(iter_jsonl_lines([b"", b"  \n", b"x\n\ny"])) == ["x", "y"]
