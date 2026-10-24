@@ -3393,9 +3393,13 @@ Re-verify an anchored record against the current workspace. Supply the
 record either by looking it up on-chain (`--registry` + `--checksum`) or
 from a saved `--record-json` (`-` for stdin). `prove file` re-exports
 the bundle and compares the recomputed Merkle root to the anchored
-checksum; `prove node` re-hashes the element and re-walks its proof
-against the recorded root. Exit codes mirror `dgmlx verify`: `0` proven,
-`2` mismatch (`valid: false`), `1` for structural errors.
+checksum; `prove node` re-hashes the element at the record's leaf index
+and re-walks its proof against the recorded root. Exit codes mirror
+`dgmlx verify`: `0` proven, `2` mismatch (`valid: false`), `1` for
+structural errors. Handing a command the other kind of record is a
+structural error, not a mismatch: `prove file` rejects a node URI
+(`#<leaf>`) and `prove node` rejects a bundle URI, both with
+`INVALID_ARGUMENT`.
 
 ## Error code reference
 
