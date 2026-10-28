@@ -47,7 +47,7 @@ Local providers like Ollama need no key at all — set only ``api_base``.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import load_merged_config
@@ -72,7 +72,7 @@ class TextExtractionConfig:
 
     model: str
     api_base: str | None = None
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     api_key_env: str | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     max_tokens: int | None = DEFAULT_MAX_TOKENS

@@ -33,12 +33,20 @@ consistent:
   continuation in those cases (see :func:`supports_assistant_prefill`), so a
   caller gets one coherent output on every provider.
 - **Usage telemetry.** The call functions record usage themselves: when a
-  config carries a ``workspace`` and ``debug`` is set, each call appends one
-  :class:`UsageEvent` to ``usage.jsonl`` (labelled by ``config.operation`` /
+  config carries a ``workspace`` and ``record_usage`` is set, each call appends
+  one :class:`UsageEvent` to ``usage.jsonl`` (labelled by ``config.operation`` /
   ``config.context``), on both success and failure. Callers don't wire this up
   per call. :func:`record_usage_for` is an optional scope that aggregates the
-  calls inside it into a single row for multi-call operations. All recording is
-  gated on ``--debug``.
+  calls inside it into a single row for multi-call operations. Recording is
+  independent of debug artifacts: the CLI turns it on under ``--debug``, a
+  library caller sets ``record_usage=True`` directly.
+- **One request protocol, two drivers.** Each wrapper is defined once as a
+  pure ``steps_*`` generator (yields the completion kwargs for a request,
+  receives the response, decides whether another request follows) and the
+  ``call*`` function is its synchronous driver via :func:`drive`, which owns
+  the usage accounting. An executor that defers requests — a provider batch
+  endpoint — runs the same generators, so request shaping and continuation
+  logic exist in exactly one place.
 
 Lives at the package root (:mod:`dgml_core.llm`) so generation and the
 non-generation call sites share one implementation.
@@ -48,15 +56,16 @@ from __future__ import annotations
 
 import base64
 import io
+import itertools
 import logging
 import re
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import litellm
 
@@ -65,12 +74,16 @@ from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
 from .usage import (
-    OUTCOME_ERROR,
-    OUTCOME_OK,
+    PricingTier,
     UsageEvent,
+    UsageOperation,
+    UsageOutcome,
     add_partial,
+    as_pricing_tier,
     extract_cost_and_tokens,
     record_usage,
+    scope_events,
+    with_tier,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,8 +139,13 @@ ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
 
 # Accepted values for `LLMConfig.thinking`, Anthropic's extended-thinking switch.
 #
-#   "disabled" — no thinking tokens.
-#   "adaptive" — the model decides per request (Claude 4.6+/5 only).
+#   "disabled"      — no thinking tokens.
+#   "adaptive"      — the model decides per request (Claude 4.6+/5 only).
+#   "between_tools" — thinking only between tool calls, i.e. off for a plain
+#                     text reply. This is how Claude Sonnet 5.5 turns thinking
+#                     off: it rejects `{"type": "disabled"}` with a 400 ("To turn
+#                     thinking off..."), and accepts "between_tools" at effort
+#                     high or below, with no other field beside `type`.
 #
 # OMITTING the field is not the same as "disabled": Claude 4.6+/5 models think
 # adaptively when a request carries no `thinking`, so a caller that never sets it
@@ -137,7 +155,7 @@ ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
 # `{"type": "enabled", "budget_tokens": N}` is deliberately not offered here:
 # claude-sonnet-5 rejects `budget_tokens`. A caller that needs it can pass the
 # whole dict through `LLMConfig.extra`.
-ANTHROPIC_THINKING_MODES = ("disabled", "adaptive")
+ANTHROPIC_THINKING_MODES = ("disabled", "adaptive", "between_tools")
 
 # OpenAI families that accept ONLY the default temperature (1). Prefix-matched
 # so future point releases are covered automatically; see
@@ -180,6 +198,59 @@ def is_model_reachability_error(exc: BaseException) -> bool:
     import openai  # transitive via litellm; its exception classes ARE litellm's
 
     return isinstance(exc, openai.APIError)
+
+
+def is_request_rejection(exc: BaseException) -> bool:
+    """True when the provider refused the request as invalid (HTTP 400/422)
+    for a reason that could lie in an optional request parameter.
+
+    Such a refusal comes back before any generation, so resending the request
+    with a parameter removed costs one fast round trip. Excluded are the
+    rejections no parameter change fixes and that callers handle on their own:
+    an input over the context window and a content-policy block (both of which
+    litellm also raises as 400s). Timeouts, auth, rate limits and 5xx are not
+    rejections of the request's shape and are never matched.
+    """
+    from litellm.exceptions import (
+        BadRequestError,
+        ContentPolicyViolationError,
+        ContextWindowExceededError,
+        UnprocessableEntityError,
+    )
+
+    if isinstance(exc, (ContextWindowExceededError, ContentPolicyViolationError)):
+        return False
+    return isinstance(exc, (BadRequestError, UnprocessableEntityError))
+
+
+# How providers word "this request body is too big". litellm does not keep the
+# HTTP 413: it maps Anthropic's to a BadRequestError (status 400) and Gemini's
+# to a ContextWindowExceededError, so the provider's own text is what survives.
+_REQUEST_TOO_LARGE_MARKERS = (
+    "request_too_large",  # Anthropic's error type for a body over its limit
+    "request entity too large",  # the HTTP 413 reason phrase (OpenAI, proxies)
+    "payload size exceeds",  # Gemini / Vertex: "Request payload size exceeds the limit"
+)
+
+
+def is_request_too_large(exc: BaseException) -> bool:
+    """True when the provider refused a request because the body was too big.
+
+    A caller can answer this by sending less (fewer PDF pages, say), which a
+    retry of the same request never fixes. Checks *exc* and every exception it
+    was raised from, so a provider error wrapped in one of ours still counts.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "status_code", None) == 413:
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _REQUEST_TOO_LARGE_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def is_anthropic_model(model: str) -> bool:
@@ -343,13 +414,22 @@ class LLMConfig:
     # Recording context carried on the config so the call functions log
     # ``usage.jsonl`` rows themselves rather than each caller wrapping the call.
     # ``workspace`` is where the row is written; recording is GATED on
-    # ``debug`` (no ``--debug`` → no rows, for every operation). ``operation``
-    # and ``context`` label the row. Leave ``workspace`` None (the default)
-    # for library callers that don't want telemetry.
+    # ``record_usage`` (off → no rows, for every operation). It is deliberately
+    # not tied to debug artifacts: a production host can account for cost
+    # without writing debug files. ``operation`` and ``context`` label the
+    # row. Leave ``workspace`` None (the default) for library callers that
+    # don't want telemetry.
     workspace: Workspace | None = None
-    debug: bool = False
-    operation: str | None = None
+    record_usage: bool = False
+    #: A :class:`~dgml_core.usage.UsageOperation` for every call dgml makes; a
+    #: library caller may label its own calls with any string. ``None`` records
+    #: :attr:`~dgml_core.usage.UsageOperation.LLM_CALL`.
+    operation: UsageOperation | str | None = None
     context: dict[str, Any] | None = None
+    # Pricing tier recorded on the usage row. The batch executor sets
+    # ``PricingTier.BATCH`` on the configs it drives; every synchronous call
+    # records standard.
+    tier: PricingTier = PricingTier.STANDARD
     # Internal: set by an active :func:`record_usage_for` scope. While set,
     # the call functions fold their usage into it (one aggregated row for the
     # whole scope) instead of each writing its own row. Never set by callers.
@@ -387,22 +467,35 @@ class CallResult:
     duration_s: float
 
 
+#: Name sent with an inline PDF: OpenAI's Responses API rejects inline file
+#: data without one, and litellm's Chat→Responses bridge adds no default.
+#: A constant, not the file's own name: values come from the pages.
+_PDF_FILENAME = "document.pdf"
+
+
 def _pdf_content_block(pdf_bytes: bytes) -> dict[str, Any]:
-    """Unified LiteLLM content block for an inline base64 PDF."""
+    """Unified LiteLLM content block for an inline base64 PDF.
+
+    litellm normalizes it per provider: Anthropic gets a ``document`` block,
+    Gemini ``inline_data``, OpenAI a ``file`` or Responses ``input_file``.
+    """
     b64 = base64.b64encode(pdf_bytes).decode("ascii")
     return {
         "type": "file",
         "file": {
             "file_data": f"data:application/pdf;base64,{b64}",
+            "filename": _PDF_FILENAME,
         },
     }
 
 
-def _image_content_block(png_bytes: bytes) -> dict[str, Any]:
-    b64 = base64.b64encode(png_bytes).decode("ascii")
+def _image_content_block(image_bytes: bytes) -> dict[str, Any]:
+    # A page image is a JPEG or a PNG, whichever encoding was smaller.
+    mime = "image/jpeg" if image_bytes.startswith(b"\xff\xd8\xff") else "image/png"
+    b64 = base64.b64encode(image_bytes).decode("ascii")
     return {
         "type": "image_url",
-        "image_url": {"url": f"data:image/png;base64,{b64}"},
+        "image_url": {"url": f"data:{mime};base64,{b64}"},
     }
 
 
@@ -563,36 +656,19 @@ def call_with_refinement(
     With ``cache=True`` on Anthropic, the system prefix and the last block of
     ``user_content`` are marked cacheable, so request 2 replays the shared
     prefix at ~10% token cost (within the 5-min TTL).
+
+    Sync driver over :func:`steps_with_refinement`.
     """
-    is_anthropic = is_anthropic_model(config.model)
-    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
-    user_blocks = (
-        _mark_last_block_cacheable(user_content) if (cache and is_anthropic) else user_content
+    return drive(
+        steps_with_refinement(
+            config,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            refine_instruction=refine_instruction,
+            cache=cache,
+        ),
+        config,
     )
-    user_msg = {"role": "user", "content": user_blocks}
-
-    # Both requests fold into one aggregated row. Route through
-    # _completion_with_retry so an empty/transient response is retried rather
-    # than crashing on choices[0] (same guard as every other call site).
-    with _record_call(config) as totals:
-        draft_resp = _completion_with_retry(
-            _build_completion_kwargs(config, messages=[sys_msg, user_msg])
-        )
-        add_partial(totals, extract_cost_and_tokens(draft_resp))
-        draft = cast(str, draft_resp["choices"][0]["message"]["content"])
-
-        refine_msgs: list[dict[str, Any]] = [
-            sys_msg,
-            user_msg,
-            {"role": "assistant", "content": draft},
-            {"role": "user", "content": refine_instruction},
-        ]
-        refined_resp = _completion_with_retry(
-            _build_completion_kwargs(config, messages=refine_msgs)
-        )
-        add_partial(totals, extract_cost_and_tokens(refined_resp))
-        refined = cast(str, refined_resp["choices"][0]["message"]["content"])
-    return draft, refined
 
 
 def _is_tool_choice_forced(tool_choice: Any) -> bool:
@@ -779,16 +855,19 @@ class _StdoutToLog(io.TextIOBase):
     """File-like sink turning a dependency's stray stdout into WARNING records.
 
     ``write`` buffers until a newline so one log record is one printed line,
-    however the writes were chunked; the last guard out empties the buffer via
-    :meth:`drain`. ``flush`` is deliberately the inherited no-op — flushing
-    means "push to the OS" and there is no OS buffer here, so a dependency's
-    mid-line ``flush()`` must not split its line into two records.
+    however the writes were chunked; the guard that created it empties the
+    buffer via :meth:`drain` on exit. ``flush`` is deliberately the inherited
+    no-op — flushing means "push to the OS" and there is no OS buffer here, so
+    a dependency's mid-line ``flush()`` must not split its line into two
+    records.
 
-    One instance is shared by every concurrently active guard, so buffer
-    updates take a lock. It is a *leaf* lock — records are emitted only after
-    it is released — and lines carrying :data:`_CAPTURE_MARKER` are dropped,
-    so a handler that itself writes to the live ``sys.stdout`` can neither
-    deadlock against the sink nor echo through it unboundedly."""
+    Each thread inside :func:`_quiet_stdout` gets its own sink, so partial
+    lines from different threads never splice together. Buffer updates still
+    take a lock because a handler may write back into the sink. It is a
+    *leaf* lock — records are emitted only after it is released — and lines
+    carrying :data:`_CAPTURE_MARKER` are dropped, so a handler that itself
+    writes to the live ``sys.stdout`` can neither deadlock against the sink
+    nor echo through it unboundedly."""
 
     # TextIOBase declares no codec; a dependency probing ``sys.stdout.encoding``
     # before printing non-ASCII expects a real name (the old target, a stream,
@@ -817,28 +896,58 @@ class _StdoutToLog(io.TextIOBase):
         return len(s)
 
     def drain(self) -> None:
-        """Emit any trailing partial line; the last guard out calls this."""
+        """Emit any trailing partial line; the owning guard calls this on exit."""
         with self._lock:
             tail, self._buf = self._buf, ""
         if tail.strip() and _CAPTURE_MARKER not in tail:
             logger.warning("%s %s", _CAPTURE_MARKER, tail)
 
 
-# State for _quiet_stdout: overlapping guards (LLM calls run in thread pools,
-# and sys.stdout is process-global) share ONE sink, refcounted — the first
-# guard in saves the real stdout, the last one out restores it. A per-call
-# ``redirect_stdout`` breaks under non-LIFO exits: A enters (saves real), B
-# enters (saves A's sink), A exits (restores real), B exits (re-installs A's
-# dead sink) — leaving every later print swallowed for the rest of the process.
-_stdout_guard_lock = threading.Lock()
-_stdout_guard_depth = 0
-_stdout_guard_saved: Any = None
-_stdout_guard_sink: _StdoutToLog | None = None
+class _ThreadAwareStdout:
+    """A ``sys.stdout`` stand-in that routes writes per thread.
+
+    Writes from a thread inside :func:`_quiet_stdout` go to that thread's
+    :class:`_StdoutToLog` sink; every other thread's writes go to the stream
+    this proxy wraps. Everything else (``fileno``, ``encoding``, ``isatty`` …)
+    delegates to whichever of the two the calling thread would write to, so a
+    guarded thread cannot reach the real fd."""
+
+    def __init__(self, target: Any) -> None:
+        self._target = target
+
+    def _stream(self) -> Any:
+        sink = getattr(_QUIET, "sink", None)
+        return sink if sink is not None else self._target
+
+    def write(self, s: str) -> int:
+        return cast(int, self._stream().write(s))
+
+    def writelines(self, lines: Any) -> None:
+        self._stream().writelines(lines)
+
+    def flush(self) -> None:
+        self._stream().flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream(), name)
+
+
+# State for _quiet_stdout. ``sys.stdout`` is process-global but LLM calls run
+# in thread pools, so overlapping guards share ONE proxy, refcounted: the first
+# guard in installs it over the real stdout, the last one out restores it. A
+# per-call ``redirect_stdout`` breaks under non-LIFO exits (B re-installs A's
+# dead sink) and, like any process-wide sink, also captures the main thread's
+# CLI JSON while a worker is mid-call. Per-thread depth and sink live in
+# ``_QUIET``.
+_QUIET = threading.local()
+_QUIET_LOCK = threading.Lock()
+_QUIET_USERS = 0
+_QUIET_PROXY: _ThreadAwareStdout | None = None
 
 
 @contextmanager
 def _quiet_stdout() -> Iterator[None]:
-    """Capture anything written to stdout and re-log it at WARNING.
+    """Capture whatever *this thread* writes to stdout and re-log it at WARNING.
 
     Guards the JSON-on-stdout CLI contract against dependencies (LiteLLM in
     particular) that ``print`` directly to stdout — raw prints bypass
@@ -848,31 +957,181 @@ def _quiet_stdout() -> Iterator[None]:
     WARNING: visible by default in the CLI, and routed — or silenced — by a
     library caller like any other ``dgml_core`` record. dgml's own output is
     unaffected — ``_emit`` writes the JSON payload after the completion call
-    returns, outside this block.
+    returns, outside this block, and other threads' writes are never captured.
 
-    Safe for overlapping calls across threads (see the guard-state comment
-    above); the swap itself remains process-global, as ``sys.stdout`` is.
+    A single thread-aware proxy is installed while any thread is inside the
+    block, and only the entering thread's writes are diverted. It is removed
+    when the last one leaves, unless something else replaced ``sys.stdout``
+    meanwhile, in which case that replacement is left alone.
     """
-    global _stdout_guard_depth, _stdout_guard_saved, _stdout_guard_sink
-    with _stdout_guard_lock:
-        if _stdout_guard_depth == 0:
-            _stdout_guard_saved = sys.stdout
-            _stdout_guard_sink = _StdoutToLog()
-            sys.stdout = _stdout_guard_sink
-        _stdout_guard_depth += 1
+    global _QUIET_USERS, _QUIET_PROXY
+    with _QUIET_LOCK:
+        if _QUIET_USERS == 0:
+            _QUIET_PROXY = _ThreadAwareStdout(sys.stdout)
+            sys.stdout = cast(Any, _QUIET_PROXY)
+        _QUIET_USERS += 1
+    depth = getattr(_QUIET, "depth", 0)
+    if depth == 0:
+        _QUIET.sink = _StdoutToLog()
+    _QUIET.depth = depth + 1
     try:
         yield
     finally:
-        last_sink: _StdoutToLog | None = None
-        with _stdout_guard_lock:
-            _stdout_guard_depth -= 1
-            if _stdout_guard_depth == 0:
-                last_sink = _stdout_guard_sink
-                sys.stdout = _stdout_guard_saved
-                _stdout_guard_saved = None
-                _stdout_guard_sink = None
-        if last_sink is not None:
-            last_sink.drain()
+        _QUIET.depth -= 1
+        own_sink: _StdoutToLog | None = None
+        if _QUIET.depth == 0:
+            own_sink, _QUIET.sink = _QUIET.sink, None
+        with _QUIET_LOCK:
+            _QUIET_USERS -= 1
+            if _QUIET_USERS == 0:
+                if sys.stdout is _QUIET_PROXY and _QUIET_PROXY is not None:
+                    sys.stdout = _QUIET_PROXY._target
+                _QUIET_PROXY = None
+        if own_sink is not None:
+            own_sink.drain()
+
+
+# Set on an exception :func:`_completion_with_retry` raises: how many calls it
+# made before giving up. Read back by :func:`provider_error_context`.
+_ATTEMPTS_ATTR = "dgml_attempts"
+
+# Response headers providers put their request id in, most specific first:
+# OpenAI, Anthropic, Azure API Management.
+_REQUEST_ID_HEADERS = ("x-request-id", "request-id", "apim-request-id")
+
+
+def _set_attempts(exc: BaseException, attempts: int) -> None:
+    # Best effort: an exception class can refuse a new attribute (a __setattr__
+    # override), and failing here would replace the provider's error. The count
+    # then just goes unreported.
+    try:
+        setattr(exc, _ATTEMPTS_ATTR, attempts)
+    except Exception:
+        pass
+
+
+def _redacted_api_base(api_base: str) -> str:
+    """``scheme://host[:port]`` of *api_base*. The rest is dropped because it
+    can carry credentials: userinfo, a key in the query string, or a token in
+    the path of some gateways."""
+    from urllib.parse import urlsplit
+
+    # urlsplit raises ValueError on a malformed IPv6 host ("http://[::1"), and
+    # .port on a port that is not a number in range ("https://h:abc").
+    try:
+        parts = urlsplit(api_base)
+        port = parts.port
+    except ValueError:
+        return "<unparseable api_base>"
+    if not parts.hostname:
+        return "<unparseable api_base>"
+    return f"{parts.scheme}://{parts.hostname}" + (f":{port}" if port else "")
+
+
+def _provider_request_id(exc: BaseException) -> str | None:
+    request_id = getattr(exc, "request_id", None)
+    if isinstance(request_id, str) and request_id:
+        return request_id
+    # LiteLLM keeps the provider's real headers on ``litellm_response_headers``
+    # (set after it maps the error); its ``exc.response`` is often a stand-in it
+    # builds with no headers, as on Anthropic and Gemini errors. A provider SDK's
+    # own error carries them on its response. Anything else has no id to read.
+    for headers in (
+        getattr(exc, "litellm_response_headers", None),
+        getattr(getattr(exc, "response", None), "headers", None),
+    ):
+        if not isinstance(headers, Mapping):
+            continue
+        for name in _REQUEST_ID_HEADERS:
+            value = headers.get(name)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+class _Unreported:
+    """Type of :data:`_UNREPORTED`."""
+
+
+#: ``api_key`` default of :func:`provider_error_context`: the caller does not
+#: know the key, so its state is left out (distinct from ``None``, no key).
+_UNREPORTED = _Unreported()
+
+
+def _api_key_state(api_key: str | None) -> str:
+    """Whether a key was passed — never any part of the key itself. An empty
+    key is not sent (see :func:`_build_completion_kwargs`), so it and ``None``
+    both leave LiteLLM to find one in the provider's environment variable
+    (``OPENAI_API_KEY`` and the like), which may not be the key intended — and
+    both read the same, since the request kwargs cannot tell them apart."""
+    return "api key passed" if api_key else "api key not passed"
+
+
+def provider_error_context(
+    exc: BaseException,
+    *,
+    model: str | None = None,
+    api_base: str | None = None,
+    api_key: str | None | _Unreported = _UNREPORTED,
+) -> str:
+    """Identifiers for tracing a failed model call, safe to log.
+
+    ``model 'm' at https://host, api key passed, HTTP 500, request id req_…,
+    3 attempts`` — each part only when known, ``""`` when none is. The request
+    id is what a provider's support needs to look a failure up. ``api_base`` is
+    cut to scheme and host (see :func:`_redacted_api_base`); ``api_key`` is
+    reported only as passed or not passed (see :func:`_api_key_state`).
+    Deliberately absent: the exception's message (callers already carry it) and
+    LiteLLM's ``litellm_debug_info``, which embeds the request's messages, i.e.
+    document content. The HTTP status is LiteLLM's mapped one (its
+    ``InternalServerError`` always says 500).
+    """
+    # It runs inside ``except`` blocks (the retry log, the phase-1/phase-3
+    # failure message), where an error of its own would abort the retries or
+    # replace the provider's error. So every value read off *exc* is
+    # type-checked before use rather than assumed, and *api_base* is parsed
+    # only when it is a string.
+    parts: list[str] = []
+    if model:
+        at = f" at {_redacted_api_base(api_base)}" if isinstance(api_base, str) and api_base else ""
+        parts.append(f"model {model!r}{at}")
+    if not isinstance(api_key, _Unreported):
+        parts.append(_api_key_state(api_key))
+    # getattr's default absorbs only AttributeError, and a provider exception's
+    # property can raise anything (httpx's RuntimeError for a missing request,
+    # say). Keep what was read before it rather than lose the whole context.
+    try:
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int):
+            parts.append(f"HTTP {status}")
+        request_id = _provider_request_id(exc)
+        if request_id:
+            parts.append(f"request id {request_id}")
+        attempts = getattr(exc, _ATTEMPTS_ATTR, None)
+        if isinstance(attempts, int) and attempts > 1:
+            parts.append(f"{attempts} attempts")
+    except Exception:
+        pass
+    return ", ".join(parts)
+
+
+def describe_call_failure(exc: BaseException, config: LLMConfig) -> str:
+    """``"<Type>: <message> (<context>)"`` for a model call made with *config*
+    that raised *exc*: the text every "… call failed" error carries. The context
+    is :func:`provider_error_context`, since a provider's own message is often
+    no more than "Internal Server Error". Like it, safe inside ``except``."""
+    context = provider_error_context(
+        exc, model=config.model, api_base=config.api_base, api_key=config.api_key
+    )
+    return f"{type(exc).__name__}: {exc}" + (f" ({context})" if context else "")
+
+
+#: Optional seam over every synchronous completion: ``recorder(kwargs, call)``
+#: returns the response, where ``call(kwargs)`` performs the real request. Set
+#: only while a batch job session is active (:mod:`dgml_core.batch.jobs`), which
+#: uses it to record synchronous responses and replay them on a resumed run;
+#: ``None`` — the default — leaves every call exactly as it was.
+_SYNC_RECORDER: Callable[[dict[str, Any], Callable[[dict[str, Any]], Any]], Any] | None = None
 
 
 def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
@@ -887,6 +1146,16 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
     retried like any other transient failure, and only raises
     :class:`EmptyModelResponse` once it persists across every attempt.
     """
+    recorder = _SYNC_RECORDER
+    if recorder is not None:
+        return recorder(kwargs, lambda kw: _completion_attempts(kw, max_retries=max_retries))
+    return _completion_attempts(kwargs, max_retries=max_retries)
+
+
+def _completion_attempts(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
+    """The retry loop behind :func:`_completion_with_retry`, without the
+    recorder seam (a batch job's own synchronous fallback calls this directly,
+    having already accounted for the request)."""
     import litellm
 
     delay = 2.0
@@ -896,6 +1165,7 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
             with _quiet_stdout():
                 response = litellm.completion(**kwargs)
         except Exception as exc:
+            _set_attempts(exc, attempt + 1)
             msg = str(exc).lower()
             # Retry on transient network/server errors only. Rate limits count:
             # they say "not now", not "never", and the pipeline runs documents
@@ -921,6 +1191,22 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
             if not transient or attempt == max_retries - 1:
                 raise
             last_exc = exc
+            # A retry that then succeeds leaves no trace in the result, so say
+            # it here; INFO, since nothing is degraded yet. Identifiers only —
+            # never the exception's debug info, which carries the prompt.
+            logger.info(
+                "model call failed (%s, %s); retry %d of %d in %.0fs",
+                type(exc).__name__,
+                provider_error_context(
+                    exc,
+                    model=kwargs.get("model"),
+                    api_base=kwargs.get("api_base"),
+                    api_key=kwargs.get("api_key"),
+                ),
+                attempt + 1,
+                max_retries - 1,
+                delay,
+            )
             time.sleep(delay)
             delay *= 2
             continue
@@ -936,15 +1222,24 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
                 f"model returned no choices after {max_retries} attempts "
                 f"(model={kwargs.get('model')!r})"
             )
+        # Logged like a raised error's retry: one that then succeeds leaves no
+        # trace in the result, yet costs a paid call and the backoff.
+        logger.info(
+            "model returned no choices (model %r); retry %d of %d in %.0fs",
+            kwargs.get("model"),
+            attempt + 1,
+            max_retries - 1,
+            delay,
+        )
         time.sleep(delay)
         delay *= 2
     raise last_exc  # type: ignore[misc]
 
 
 def _usage_enabled(config: LLMConfig) -> bool:
-    """Usage recording happens only under ``--debug`` and only when a
+    """Usage recording happens only when ``record_usage`` is set and a
     workspace to write to is set on the config."""
-    return config.debug and config.workspace is not None
+    return config.record_usage and config.workspace is not None
 
 
 @contextmanager
@@ -957,45 +1252,569 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
     - If an aggregation scope is active (``config._usage_sink`` set by
       :func:`record_usage_for`), fold the totals into it and write nothing —
       the scope emits one combined row.
-    - Otherwise, append one :class:`UsageEvent` (gated on ``--debug`` +
-      workspace). A single call therefore yields a single row.
+    - Otherwise, append one :class:`UsageEvent` (gated on ``record_usage`` +
+      workspace). A single call therefore yields a single row — or one row
+      per tier when its responses were served by more than one (see
+      :func:`dgml_core.usage.scope_events`).
 
     Exceptions propagate after the totals are recorded, so a failed call
     still leaves a row (or contributes its partial usage to the scope).
+    ``BaseException`` is classified, not just ``Exception``, so an interrupted
+    call (``KeyboardInterrupt``, ``SystemExit``) never leaves an ``ok`` row.
     The write itself can never break the caller (see :func:`record_usage`).
     """
     totals = empty_usage_totals()
     started = time.monotonic()
     error_msg: str | None = None
-    outcome = OUTCOME_OK
+    outcome = UsageOutcome.OK
     try:
         yield totals
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        outcome = OUTCOME_ERROR
+        outcome = UsageOutcome.ERROR
         raise
     finally:
         if config._usage_sink is not None:
             add_partial(config._usage_sink, totals)
-        elif config.debug and config.workspace is not None:
-            record_usage(
-                config.workspace,
-                UsageEvent(
-                    at=now_iso(),
-                    operation=config.operation or "llm_call",
-                    model=config.model,
-                    cost_usd=totals["cost_usd"],
-                    prompt_tokens=totals["prompt_tokens"],
-                    completion_tokens=totals["completion_tokens"],
-                    total_tokens=totals["total_tokens"],
-                    cache_read_tokens=totals["cache_read_tokens"],
-                    cache_creation_tokens=totals["cache_creation_tokens"],
-                    duration_s=round(time.monotonic() - started, 3),
-                    outcome=outcome,
-                    context=config.context or {},
-                    error=error_msg,
-                ),
+        elif config.record_usage and config.workspace is not None:
+            event = UsageEvent(
+                at=now_iso(),
+                operation=config.operation or UsageOperation.LLM_CALL,
+                model=config.model,
+                cost_usd=totals["cost_usd"],
+                prompt_tokens=totals["prompt_tokens"],
+                completion_tokens=totals["completion_tokens"],
+                total_tokens=totals["total_tokens"],
+                cache_read_tokens=totals["cache_read_tokens"],
+                cache_creation_tokens=totals["cache_creation_tokens"],
+                duration_s=round(time.monotonic() - started, 3),
+                outcome=outcome,
+                context=config.context or {},
+                error=error_msg,
+                tier=config.tier,
             )
+            # One row, or one per tier when the responses span tiers.
+            for part in scope_events(event, totals):
+                record_usage(config.workspace, part)
+
+
+# ---------------------------------------------------------------------------
+# Step forms: the request/response protocol behind every wrapper
+# ---------------------------------------------------------------------------
+#
+# Each wrapper below exists in two shapes. The ``steps_*`` generator is the
+# protocol: it yields the completion kwargs for one request (exactly the dict
+# :func:`_build_completion_kwargs` produces), receives the litellm response the
+# caller obtained for it, and either yields the next request or returns the
+# wrapper's result. The ``call*`` function is the sync driver: it hands each
+# yielded step to :func:`_completion_with_retry` and sends the response back.
+#
+# The split lets a different executor — one that submits a whole wave of
+# requests to a provider's batch endpoint and delivers the responses later —
+# run the very same request-shaping and continuation logic without a second
+# copy of it. Everything a step contains is decided inside the generator, so
+# the wire request is identical whichever driver runs it.
+#
+# The generators are PURE: they build requests and parse responses, nothing
+# else. Usage accounting belongs to the driver — ``drive`` opens the
+# ``_record_call`` scope, folds each response's usage in before handing it to
+# the generator, and closes the generator when it stops driving it. A sync
+# call therefore still yields exactly one usage row with the same fields, and
+# any other driver gets the same row by following the same three rules.
+
+T = TypeVar("T")
+
+#: One request: the kwargs dict for ``litellm.completion`` as built by
+#: :func:`_build_completion_kwargs`.
+LLMStep = dict[str, Any]
+
+
+class FanOut:
+    """Fork independent child step generators and join on their results.
+
+    Yielded by an :data:`LLMSteps` generator in place of a request (structured
+    concurrency: the children cannot outlive the yield). The yield evaluates to
+    ``[result_0, result_1, ...]`` — each child's return value, in *child*
+    order, whatever order they finished in. The contract every driver honours:
+
+    - **The children must be independent**: no child's requests may depend on
+      another child's responses or side effects. The parent applies any
+      order-sensitive side effects itself, after the join, in child order —
+      that is what keeps the outcome identical whichever driver runs it.
+    - **Sync** (:func:`drive`): the children run one after another, to
+      completion, in child order — so the request sequence and every request
+      byte are exactly those of ``yield from child_0; yield from child_1; ...``,
+      failures included: the first child that fails stops the run there, and
+      the children after it are closed without making a request.
+    - **Batch** (:func:`dgml_core.batch.run_stage`): the children's pending
+      requests are extra in-flight requests of the same unit, sharing each wave
+      with every other unit's; the parent resumes once every child has
+      returned. Within one child, requests stay strictly ordered.
+    - **Failures, per child as for a unit**: a request a driver could not serve
+      is thrown into *that child* at its pending ``yield``; only an exception
+      escaping the child fails it. In batch every child runs to the end even
+      when an earlier one failed (their requests share waves, so they are
+      already in flight); in sync the first failure stops the run (above).
+      Either way the first failed child's exception, in child order, is
+      thrown into the parent at the ``FanOut`` yield instead of sending the
+      results. An interrupt (a non-``Exception``
+      ``BaseException``) closes every child and propagates.
+    - **Usage folds in child order**: each child's per-wrapper subtotals are
+      folded, after the parent's preceding ones, in child order — exactly the
+      sequence the sync driver produces — so sums associate bit for bit across
+      drivers (see :class:`_UsageFold`).
+    - **Determinism**: children are primed in child order and a batch driver
+      assigns request ids in that order, so a job's replay (keyed by request
+      occurrence) meets the same requests in the same order on every run.
+
+    Children may yield ``FanOut`` themselves (nesting). An empty ``FanOut``
+    joins at once with ``[]`` and makes no request.
+    """
+
+    __slots__ = ("children",)
+
+    def __init__(self, children: Iterable[Generator[Any, Any, Any]]) -> None:
+        self.children: tuple[Generator[Any, Any, Any], ...] = tuple(children)
+
+    def __repr__(self) -> str:
+        return f"FanOut({len(self.children)} children)"
+
+
+#: A wrapper's request/response protocol. Contract:
+#:
+#: - The generator is **pure**: it yields :data:`LLMStep` values, receives the
+#:   litellm ``ModelResponse`` obtained for each one (what
+#:   :func:`_completion_with_retry` returns), validates it with
+#:   :func:`_require_choices`, parses it, and returns the wrapper's result. It
+#:   performs no usage accounting and no I/O.
+#: - The **driver owns accounting**: it runs the generator inside one
+#:   :func:`_record_call` scope and folds every response's usage in *before*
+#:   sending the response in, through a :class:`_UsageFold` so the sums
+#:   associate per wrapper call exactly as the inline wrappers' did (see
+#:   :func:`drive`).
+#: - The driver **must close** the generator when it stops driving it for any
+#:   reason (``steps.close()``), so an abandoned request never leaves a
+#:   suspended generator behind.
+#: - A driver **delivers request failures with** ``throw()``: when a request
+#:   cannot be served, the driver throws the ``Exception`` into the generator
+#:   at the pending ``yield``. Generators that want retry semantics catch
+#:   around ``yield from llm.steps_*(...)`` exactly as sync code catches
+#:   around ``llm.call(...)`` — and may yield a new step (retry), return, or
+#:   re-raise. Only an exception escaping ``throw()`` fails the run. A
+#:   ``BaseException`` that is not an ``Exception`` (an interrupt) is never
+#:   thrown in; it propagates straight out of the driver.
+LLMSteps = Generator[LLMStep, Any, T]
+
+#: An :data:`LLMSteps` generator that may also yield a :class:`FanOut` of
+#: child generators (each an ``LLMSteps`` or ``LLMFlow`` itself) in place of a
+#: request: the driver runs the children and sends their return values back as
+#: a list in child order (see :class:`FanOut` for the join contract). Every
+#: driver — :func:`drive` and :func:`dgml_core.batch.run_stage` — accepts
+#: either; the ``steps_*`` primitives are plain ``LLMSteps``. Kept a separate
+#: alias so code that hand-drives a primitive still sees only requests.
+LLMFlow = Generator[LLMStep | FanOut, Any, T]
+
+
+def _require_choices(response: Any) -> None:
+    """Reject a response with no ``choices`` (missing or empty).
+
+    Mirrors the guard in :func:`_completion_with_retry`, which retries such
+    responses from the default executor. A custom executor — or a batch result
+    that arrived empty — reaches the generators without that retry, so the
+    generators check every response themselves and fail with a clear
+    :class:`EmptyModelResponse` instead of an ``IndexError`` on ``choices[0]``.
+    """
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
+    if not choices:
+        raise EmptyModelResponse("model response carries no choices")
+
+
+# ---------------------------------------------------------------------------
+# Wrapper-ordered usage folding
+# ---------------------------------------------------------------------------
+#
+# Before the step split, every wrapper call (``call``, ``call_continued``, ...)
+# opened its own ``_record_call`` scope: its responses summed into that call's
+# subtotal, and on exit the subtotal folded into the enclosing
+# ``record_usage_for`` sink — or became the row. A driver that summed a whole
+# multi-wrapper generator into one scope total first and folded *that* into the
+# sink would compute ``sink + (w1 + w2)`` where the inline code computed
+# ``(sink + w1) + w2``: the same number except in the last float digit. Rows
+# are compared bit for bit (and against rows recorded before the split), so
+# every driver folds through :class:`_UsageFold`, which reproduces the inline
+# association exactly. The primitives tag each step they yield with the id of
+# their invocation (:class:`_WrapperStep`) so a driver can see where one
+# wrapper call ends and the next begins without any change to the request.
+
+_wrapper_ids = itertools.count(1)
+
+
+def _next_wrapper_id() -> int:
+    """A fresh id for one ``steps_*`` primitive invocation."""
+    return next(_wrapper_ids)
+
+
+class _WrapperStep(dict[str, Any]):
+    """An :data:`LLMStep` carrying the id of the primitive invocation that
+    built it (``wrapper_id``).
+
+    It *is* the completion-kwargs dict — equal to, unpacked and serialized
+    exactly as the plain dict — so the tag never reaches the wire; drivers
+    read it off the step object they were handed.
+    """
+
+    wrapper_id: int
+
+
+def _wrapper_step(wrapper_id: int, kwargs: dict[str, Any]) -> LLMStep:
+    step = _WrapperStep(kwargs)
+    step.wrapper_id = wrapper_id
+    return step
+
+
+def _fold_target(config: LLMConfig, totals: dict[str, Any]) -> dict[str, Any]:
+    """Where a finished wrapper subtotal goes: the enclosing
+    :func:`record_usage_for` sink when one is open (as the inline wrappers'
+    ``_record_call`` exit did), else the driving scope's own row totals."""
+    return config._usage_sink if config._usage_sink is not None else totals
+
+
+class _UsageFold:
+    """Sum responses into per-wrapper-call subtotals and hand each finished
+    subtotal to *fold*, in the order the inline wrappers folded them.
+
+    :meth:`add` takes each response's usage together with the step it
+    answered; a step from a different primitive invocation than the previous
+    one (or an untagged step, which counts as its own call) closes the
+    running subtotal first. :meth:`flush` closes the last one; drivers call
+    it before their accounting scope exits.
+    """
+
+    def __init__(self, fold: Callable[[dict[str, Any]], None]) -> None:
+        self._fold = fold
+        self._wrapper: int | None = None
+        self._sub: dict[str, Any] | None = None
+
+    def add(self, step: Any, usage: dict[str, Any]) -> None:
+        wrapper = getattr(step, "wrapper_id", None)
+        if self._sub is not None and (wrapper is None or wrapper != self._wrapper):
+            self.flush()
+        if self._sub is None:
+            self._sub = empty_usage_totals()
+            self._wrapper = wrapper
+        add_partial(self._sub, usage)
+
+    def flush(self) -> None:
+        if self._sub is not None:
+            sub, self._sub, self._wrapper = self._sub, None, None
+            self._fold(sub)
+
+    def emit(self, sub: dict[str, Any]) -> None:
+        """Hand an already-finished subtotal on, after the running one: how a
+        batch driver folds a :class:`FanOut` child's subtotals into its
+        parent's at the join, in the sequence the sync driver produces."""
+        self.flush()
+        self._fold(sub)
+
+
+def drive(
+    steps: LLMFlow[T],
+    config: LLMConfig,
+    execute: Callable[[LLMStep], Any] | None = None,
+) -> T:
+    """Run a ``steps_*`` generator to completion and return its result.
+
+    The sync driver, and the reference for any other: it owns the usage
+    accounting the generators deliberately do not do. One :func:`_record_call`
+    scope on *config* wraps the whole run; each response's usage is folded in
+    *before* the response is sent into the generator — summed per wrapper call
+    and each call's subtotal folded into the enclosing :func:`record_usage_for`
+    sink (else the scope's row) in order, the inline wrappers' exact float
+    association (see :class:`_UsageFold`) — so a failure
+    while parsing still leaves the row carrying what was spent; an
+    ``Exception`` from ``execute`` is thrown into the generator at its pending
+    ``yield`` (see :data:`LLMSteps`) — a generator that catches it and yields
+    again keeps the run going, one that does not re-raises it out of the
+    scope, which records the error row exactly as the inline wrappers did;
+    and the generator is closed on every exit. A failed request contributes
+    no usage (there was no response). A :class:`FanOut` runs its children
+    here one after another, in child order, under the same scope and fold.
+
+    ``execute`` turns one step into a response; it defaults to
+    :func:`_completion_with_retry` (resolved at call time, so a test that
+    patches the module attribute still intercepts every request).
+    """
+    run = execute if execute is not None else _completion_with_retry
+    with _record_call(config) as totals:
+        fold = _UsageFold(lambda sub: add_partial(_fold_target(config, totals), sub))
+        try:
+            return cast(T, _drive_steps(steps, config, run, fold))
+        finally:
+            # Before the scope exits, so its row (or its fold into an
+            # enclosing sink) sees the last wrapper's subtotal.
+            fold.flush()
+
+
+def _drive_steps(
+    steps: LLMFlow[Any],
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> Any:
+    """:func:`drive`'s loop over one generator (a whole run, or one
+    :class:`FanOut` child): every response folded into *fold* before it is
+    sent in, every request failure thrown in, the generator closed on exit.
+
+    A ``FanOut`` runs its children here, one after another in child order,
+    through the same *fold* — so the request sequence and the usage folding
+    are exactly those of ``yield from`` over each child in turn."""
+    try:
+        try:
+            step = next(steps)
+        except StopIteration as done:
+            return done.value
+        while True:
+            if isinstance(step, FanOut):
+                results, failure = _drive_fanout(step, config, run, fold)
+                try:
+                    step = steps.send(results) if failure is None else steps.throw(failure)
+                except StopIteration as done:
+                    return done.value
+                continue
+            try:
+                response = run(step)
+            except Exception as exc:
+                # Deliver the failure at the pending yield. An uncaught
+                # exception re-raises out of throw() and leaves the scope
+                # as the error row; a caught one may yield a retry step.
+                try:
+                    step = steps.throw(exc)
+                except StopIteration as done:
+                    return done.value
+                continue
+            fold.add(step, with_tier(extract_cost_and_tokens(response), response, config.tier))
+            try:
+                step = steps.send(response)
+            except StopIteration as done:
+                return done.value
+    finally:
+        steps.close()
+
+
+def _drive_fanout(
+    fan: FanOut,
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> tuple[list[Any], Exception | None]:
+    """Run the children of *fan* one after another, in child order (the sync
+    side of the :class:`FanOut` contract), as ``yield from`` would: the first
+    child whose ``Exception`` escapes stops the run, and the children after it
+    are closed without making a request. Returns the results in child order
+    and that ``Exception`` (or ``None``); an interrupt closes the children not
+    yet run and propagates."""
+    results: list[Any] = []
+    unrun = list(fan.children)
+    try:
+        while unrun:
+            child = unrun.pop(0)
+            try:
+                results.append(_drive_steps(child, config, run, fold))
+            except Exception as exc:
+                return results, exc
+    finally:
+        for child in unrun:  # after a failure or an interrupt
+            child.close()
+    return results, None
+
+
+def steps_call(
+    config: LLMConfig,
+    *,
+    system_prompt: str | tuple[str, str],
+    user_content: list[dict[str, Any]],
+    cache: bool = False,
+) -> LLMSteps[str]:
+    """Step form of :func:`call`: one request, returns the assistant text."""
+    is_anthropic = is_anthropic_model(config.model)
+    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
+    user_blocks = (
+        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    )
+    messages: list[dict[str, Any]] = [
+        sys_msg,
+        {"role": "user", "content": user_blocks},
+    ]
+    response = yield _wrapper_step(
+        _next_wrapper_id(), _build_completion_kwargs(config, messages=messages)
+    )
+    _require_choices(response)
+    content = response["choices"][0]["message"]["content"]
+    if content is None:
+        # Casting None to str used to push the failure downstream, where it
+        # surfaced as an unparseable payload with no hint of the cause.
+        raise EmptyModelResponse(
+            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
+        )
+    return cast(str, content)
+
+
+def steps_continued(
+    config: LLMConfig,
+    *,
+    system_prompt: str | tuple[str, str],
+    user_content: list[dict[str, Any]],
+    cache: bool = False,
+    max_rounds: int = 4,
+) -> LLMSteps[str]:
+    """Step form of :func:`call_continued`: one request per round, a further
+    round only while the reply is length-truncated; returns the stitched text."""
+    is_anthropic = is_anthropic_model(config.model)
+    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
+    user_blocks = (
+        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    )
+    base: list[dict[str, Any]] = [sys_msg, {"role": "user", "content": user_blocks}]
+    # Extended thinking and assistant prefill are mutually exclusive on
+    # Anthropic: with reasoning enabled the API rejects a prefilled turn
+    # ("This model does not support assistant message prefill"). That is the
+    # other half of the truncation-path breakage — it cost ~13% of calls on one
+    # model — so gate on the request shape, not just the provider.
+    prefill = (
+        supports_assistant_prefill(config.model)
+        and config.reasoning_effort is None
+        # `thinking="disabled"` is what makes prefill usable again on these
+        # models, so only an ENABLED mode has to suppress it.
+        and config.thinking != "adaptive"
+    )
+    acc = ""
+    # Held for the failure path below, so a caller that set max_rounds=0 gets
+    # the same error as one whose rounds all came back textless.
+    response: Any = None
+    wrapper_id = _next_wrapper_id()
+    for _ in range(max_rounds):
+        # On continuation rounds the accumulated text becomes an assistant
+        # prefill; the provider resumes from its exact end (a length cut lands
+        # mid-token, so there is no trailing whitespace to trip Anthropic).
+        # Where prefill isn't honoured (OpenAI) the partial is still shown as
+        # the assistant turn, but a final user turn has to ask for the
+        # continuation explicitly — otherwise the model restarts the reply.
+        messages = list(base)
+        if acc:
+            messages.append({"role": "assistant", "content": acc})
+            if not prefill:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": prompt(PromptKey.CONTINUE_TRUNCATED),
+                    }
+                )
+        response = yield _wrapper_step(
+            wrapper_id, _build_completion_kwargs(config, messages=messages)
+        )
+        _require_choices(response)
+        choice = response.choices[0]
+        acc += cast(str, choice.message.content or "")
+        if getattr(choice, "finish_reason", None) != "length":
+            break
+    if not acc:
+        # Every round returned reasoning, or nothing at all. Returning "" here
+        # sent an empty transcription window downstream, where it read as a
+        # document the model could not transcribe rather than a call that never
+        # produced text.
+        raise EmptyModelResponse(
+            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
+        )
+    return acc
+
+
+def steps_with_refinement(
+    config: LLMConfig,
+    *,
+    system_prompt: str | tuple[str, str],
+    user_content: list[dict[str, Any]],
+    refine_instruction: list[dict[str, Any]],
+    cache: bool = False,
+) -> LLMSteps[tuple[str, str]]:
+    """Step form of :func:`call_with_refinement`: the draft request, then the
+    grounded refine request; returns ``(draft, refined)``."""
+    is_anthropic = is_anthropic_model(config.model)
+    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
+    user_blocks = (
+        _mark_last_block_cacheable(user_content) if (cache and is_anthropic) else user_content
+    )
+    user_msg = {"role": "user", "content": user_blocks}
+
+    # Both requests fold into one aggregated row (the driver's). The default
+    # executor retries an empty/transient response; _require_choices covers
+    # any other executor so choices[0] never IndexErrors.
+    wrapper_id = _next_wrapper_id()
+    draft_resp = yield _wrapper_step(
+        wrapper_id, _build_completion_kwargs(config, messages=[sys_msg, user_msg])
+    )
+    _require_choices(draft_resp)
+    draft = cast(str, draft_resp["choices"][0]["message"]["content"])
+
+    refine_msgs: list[dict[str, Any]] = [
+        sys_msg,
+        user_msg,
+        {"role": "assistant", "content": draft},
+        {"role": "user", "content": refine_instruction},
+    ]
+    refined_resp = yield _wrapper_step(
+        wrapper_id, _build_completion_kwargs(config, messages=refine_msgs)
+    )
+    _require_choices(refined_resp)
+    refined = cast(str, refined_resp["choices"][0]["message"]["content"])
+    return draft, refined
+
+
+def steps_with_tools(
+    config: LLMConfig,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_choice: str | dict[str, Any] | None = None,
+    cache: bool = False,
+) -> LLMSteps[CallResult]:
+    """Step form of :func:`call_with_tools`: one request, returns the
+    :class:`CallResult`.
+
+    ``duration_s`` is measured from just before the request is yielded to just
+    after the generator resumes with the response. Under the sync driver that
+    is the call's wall time; under a deferred (batch) driver it also includes
+    the time the request waited in the queue, which is acceptable and expected.
+    """
+    if cache and is_anthropic_model(config.model):
+        messages = _mark_system_message_cacheable(messages)
+    kwargs = _build_completion_kwargs(
+        config,
+        messages=messages,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+    started = time.monotonic()
+    response = yield _wrapper_step(_next_wrapper_id(), kwargs)
+    duration_s = round(time.monotonic() - started, 3)
+    _require_choices(response)
+    usage = extract_cost_and_tokens(response)
+
+    message = response.choices[0].message
+    tool_calls = list(getattr(message, "tool_calls", None) or [])
+    content = getattr(message, "content", None)
+    finish_reason = getattr(response.choices[0], "finish_reason", None)
+
+    return CallResult(
+        response=response,
+        message=message,
+        content=content,
+        tool_calls=tool_calls,
+        finish_reason=finish_reason,
+        usage=usage,
+        duration_s=duration_s,
+    )
 
 
 def _no_text_detail(response: Any) -> str:
@@ -1038,29 +1857,13 @@ def call(
     prefix and the last attached document. For other providers caching is
     implicit (Gemini/OpenAI cache stable prefixes automatically) so the flag
     is a no-op there.
+
+    Sync driver over :func:`steps_call`.
     """
-    is_anthropic = is_anthropic_model(config.model)
-    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
-    user_blocks = (
-        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    return drive(
+        steps_call(config, system_prompt=system_prompt, user_content=user_content, cache=cache),
+        config,
     )
-    messages: list[dict[str, Any]] = [
-        sys_msg,
-        {"role": "user", "content": user_blocks},
-    ]
-    kwargs = _build_completion_kwargs(config, messages=messages)
-    with _record_call(config) as totals:
-        response = _completion_with_retry(kwargs)
-        add_partial(totals, extract_cost_and_tokens(response))
-        content = response["choices"][0]["message"]["content"]
-        if content is None:
-            # Casting None to str used to push the failure downstream, where it
-            # surfaced as an unparseable payload with no hint of the cause.
-            raise EmptyModelResponse(
-                f"model returned no message content (model={config.model!r}"
-                f"{_no_text_detail(response)})"
-            )
-        return cast(str, content)
 
 
 def call_continued(
@@ -1079,63 +1882,19 @@ def call_continued(
     the chunks are concatenated into one coherent output. Loops until the reply
     finishes for another reason or ``max_rounds`` is reached. An untruncated
     reply costs exactly one call, identical to :func:`call`.
+
+    Sync driver over :func:`steps_continued`.
     """
-    is_anthropic = is_anthropic_model(config.model)
-    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
-    user_blocks = (
-        _mark_document_cacheable(user_content) if (cache and is_anthropic) else user_content
+    return drive(
+        steps_continued(
+            config,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            cache=cache,
+            max_rounds=max_rounds,
+        ),
+        config,
     )
-    base: list[dict[str, Any]] = [sys_msg, {"role": "user", "content": user_blocks}]
-    # Extended thinking and assistant prefill are mutually exclusive on
-    # Anthropic: with reasoning enabled the API rejects a prefilled turn
-    # ("This model does not support assistant message prefill"). That is the
-    # other half of the truncation-path breakage — it cost ~13% of calls on one
-    # model — so gate on the request shape, not just the provider.
-    prefill = (
-        supports_assistant_prefill(config.model)
-        and config.reasoning_effort is None
-        # `thinking="disabled"` is what makes prefill usable again on these
-        # models, so only an ENABLED mode has to suppress it.
-        and config.thinking != "adaptive"
-    )
-    acc = ""
-    # Held for the failure path below, so a caller that set max_rounds=0 gets
-    # the same error as one whose rounds all came back textless.
-    response: Any = None
-    # One aggregated row for the whole continuation (all rounds summed).
-    with _record_call(config) as totals:
-        for _ in range(max_rounds):
-            # On continuation rounds the accumulated text becomes an assistant
-            # prefill; the provider resumes from its exact end (a length cut lands
-            # mid-token, so there is no trailing whitespace to trip Anthropic).
-            # Where prefill isn't honoured (OpenAI) the partial is still shown as
-            # the assistant turn, but a final user turn has to ask for the
-            # continuation explicitly — otherwise the model restarts the reply.
-            messages = list(base)
-            if acc:
-                messages.append({"role": "assistant", "content": acc})
-                if not prefill:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": prompt(PromptKey.CONTINUE_TRUNCATED),
-                        }
-                    )
-            response = _completion_with_retry(_build_completion_kwargs(config, messages=messages))
-            add_partial(totals, extract_cost_and_tokens(response))
-            choice = response.choices[0]
-            acc += cast(str, choice.message.content or "")
-            if getattr(choice, "finish_reason", None) != "length":
-                break
-    if not acc:
-        # Every round returned reasoning, or nothing at all. Returning "" here
-        # sent an empty transcription window downstream, where it read as a
-        # document the model could not transcribe rather than a call that never
-        # produced text.
-        raise EmptyModelResponse(
-            f"model returned no message content (model={config.model!r}{_no_text_detail(response)})"
-        )
-    return acc
 
 
 def call_with_tools(
@@ -1177,35 +1936,14 @@ def call_with_tools(
     latency — the request the model sees, and hence its output, are
     unaffected. For non-Anthropic providers caching is implicit and the flag
     is a no-op.
+
+    Sync driver over :func:`steps_with_tools`.
     """
-    if cache and is_anthropic_model(config.model):
-        messages = _mark_system_message_cacheable(messages)
-    kwargs = _build_completion_kwargs(
+    return drive(
+        steps_with_tools(
+            config, messages=messages, tools=tools, tool_choice=tool_choice, cache=cache
+        ),
         config,
-        messages=messages,
-        tools=tools,
-        tool_choice=tool_choice,
-    )
-    started = time.monotonic()
-    with _record_call(config) as totals:
-        response = _completion_with_retry(kwargs)
-        usage = extract_cost_and_tokens(response)
-        add_partial(totals, usage)
-    duration_s = round(time.monotonic() - started, 3)
-
-    message = response.choices[0].message
-    tool_calls = list(getattr(message, "tool_calls", None) or [])
-    content = getattr(message, "content", None)
-    finish_reason = getattr(response.choices[0], "finish_reason", None)
-
-    return CallResult(
-        response=response,
-        message=message,
-        content=content,
-        tool_calls=tool_calls,
-        finish_reason=finish_reason,
-        usage=usage,
-        duration_s=duration_s,
     )
 
 
@@ -1224,20 +1962,30 @@ def empty_usage_totals() -> dict[str, Any]:
     }
 
 
+#: Key a batch driver sets on an open :func:`record_usage_for` sink to mark the
+#: scope's row with its tier (the scope config's own ``tier`` otherwise).
+SINK_TIER_KEY = "_tier"
+
+
 @contextmanager
 def record_usage_for(config: LLMConfig) -> Iterator[None]:
     """Aggregate every LLM call made with *config* inside this block into ONE
     ``usage.jsonl`` row, instead of one row per call.
 
     Recording context (``workspace``, ``operation``, ``context``) is read off
-    the config, and the whole scope is gated on ``config.debug`` — with
-    ``--debug`` off (or no workspace) this is a transparent no-op. Use it only
+    the config, and the whole scope is gated on ``config.record_usage`` — with
+    recording off (or no workspace) this is a transparent no-op. Use it only
     for a genuinely multi-call operation (e.g. a per-page extraction loop);
     single-call sites need no wrapper — the call records its own row.
 
     While the scope is open, the entry functions fold their per-call usage into
     a shared accumulator rather than each writing a row; on exit — success or
-    exception — one combined :class:`UsageEvent` is appended. Nesting is safe:
+    exception — one combined :class:`UsageEvent` is appended. Its ``tier`` is
+    the one that served the scope's responses (each response's tier marker,
+    else the driving config's tier); a scope with no responses falls back to
+    the scope config's tier, or batch when a batch driver marked the sink via
+    ``totals[SINK_TIER_KEY]``. A scope whose responses span tiers appends one
+    row per tier instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
     an inner scope defers to the outer one. The write can never break the
     caller (see :func:`record_usage`); exceptions propagate after the row.
     """
@@ -1249,54 +1997,67 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
     totals = empty_usage_totals()
     started = time.monotonic()
     error_msg: str | None = None
-    outcome = OUTCOME_OK
+    outcome = UsageOutcome.OK
     config._usage_sink = totals
     try:
         yield
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        outcome = OUTCOME_ERROR
+        outcome = UsageOutcome.ERROR
         raise
     finally:
         config._usage_sink = None
         workspace = config.workspace
         if workspace is not None:
-            record_usage(
-                workspace,
-                UsageEvent(
-                    at=now_iso(),
-                    operation=config.operation or "llm_call",
-                    model=config.model,
-                    cost_usd=totals["cost_usd"],
-                    prompt_tokens=totals["prompt_tokens"],
-                    completion_tokens=totals["completion_tokens"],
-                    total_tokens=totals["total_tokens"],
-                    cache_read_tokens=totals["cache_read_tokens"],
-                    cache_creation_tokens=totals["cache_creation_tokens"],
-                    duration_s=round(time.monotonic() - started, 3),
-                    outcome=outcome,
-                    context=config.context or {},
-                    error=error_msg,
-                ),
+            event = UsageEvent(
+                at=now_iso(),
+                operation=config.operation or UsageOperation.LLM_CALL,
+                model=config.model,
+                cost_usd=totals["cost_usd"],
+                prompt_tokens=totals["prompt_tokens"],
+                completion_tokens=totals["completion_tokens"],
+                total_tokens=totals["total_tokens"],
+                cache_read_tokens=totals["cache_read_tokens"],
+                cache_creation_tokens=totals["cache_creation_tokens"],
+                duration_s=round(time.monotonic() - started, 3),
+                outcome=outcome,
+                context=config.context or {},
+                error=error_msg,
+                tier=as_pricing_tier(totals.get(SINK_TIER_KEY), config.tier),
             )
+            # One row, or one per tier when the responses span tiers.
+            for part in scope_events(event, totals):
+                record_usage(workspace, part)
 
 
 __all__ = [
     "ANTHROPIC_MODEL_PATTERNS",
     "OPENAI_MODEL_PATTERNS",
     "PDF_NATIVE_MODEL_PATTERNS",
+    "SINK_TIER_KEY",
     "CallResult",
+    "FanOut",
     "LLMConfig",
+    "LLMFlow",
+    "LLMStep",
+    "LLMSteps",
     "add_partial",
     "build_user_content",
     "call",
+    "call_continued",
+    "call_with_refinement",
     "call_with_tools",
+    "drive",
     "empty_usage_totals",
     "is_anthropic_model",
     "is_gemini_model",
     "is_openai_model",
     "is_openai_reasoning_model",
     "record_usage_for",
+    "steps_call",
+    "steps_continued",
+    "steps_with_refinement",
+    "steps_with_tools",
     "supports_assistant_prefill",
     "supports_native_pdf",
     "supports_vision",

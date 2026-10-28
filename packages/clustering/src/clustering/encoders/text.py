@@ -46,7 +46,7 @@ from typing import Any
 
 import torch
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 from clustering.utils import resolve_device
 
@@ -148,9 +148,9 @@ def _factory_st(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
 # ── Registry ────────────────────────────────────────────────────────────
 # All five new families share the wrapper above; their Hydra YAMLs
 # provide the canonical ``model_id`` / ``doc_prefix`` / ``query_prefix``.
-register_encoder("st_minilm")(_factory_st)
-register_encoder("e5")(_factory_st)
-register_encoder("bge")(_factory_st)
-register_encoder("gte")(_factory_st)
-register_encoder("stella")(_factory_st)
-register_encoder("jina")(_factory_st)
+register_encoder(EncoderName.ST_MINILM)(_factory_st)
+register_encoder(EncoderName.E5)(_factory_st)
+register_encoder(EncoderName.BGE)(_factory_st)
+register_encoder(EncoderName.GTE)(_factory_st)
+register_encoder(EncoderName.STELLA)(_factory_st)
+register_encoder(EncoderName.JINA)(_factory_st)

@@ -47,14 +47,17 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import os
 import shutil
 import tempfile
+import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from .errors import CorruptMetadata, InvalidArgument, StorageConfigInvalid
 from .layout import (
+    BATCHES_DIR,
     CACHE_DIR,
     DOC_LAYOUTS,
     DOCSET_FILES_DIR,
@@ -118,6 +121,10 @@ def _matches(doc: Mapping[str, Any], query: Mapping[str, Any]) -> bool:
     return all(doc.get(k) == v for k, v in query.items())
 
 
+#: Top-level directories that are removed once emptied (see ``_prune_empty_dirs``).
+_EPHEMERAL_TOP_DIRS = frozenset({BATCHES_DIR})
+
+
 class LocalStore(BlobStore, DocStore):
     """Local-disk store over today's workspace layout.
 
@@ -164,6 +171,21 @@ class LocalStore(BlobStore, DocStore):
             )
         return dataclasses.replace(config, root=path)
 
+    # One appender at a time, process-wide. Python's append mode is not an
+    # atomic append on Windows: two handles opened on the same file each seek
+    # to the end they saw and the later write lands on the earlier one, so a
+    # thread pool writing usage rows lost some of them with no error (8
+    # workers, 24 rows: 20 to 23 arrived). POSIX O_APPEND is atomic for rows
+    # this size, which is why Linux CI never saw it. The lock is one per
+    # process rather than per store because ``functools.cached_property`` no
+    # longer serializes first access (3.12+): two threads touching
+    # ``Workspace.docs`` at once can each build a store, and per-instance
+    # locks would not see each other. Appends are tiny, so one lock for every
+    # store in the process costs nothing. Concurrent processes are not covered.
+    # A forked child gets a fresh lock (below), as ``logging`` does, so a fork
+    # taken while another thread holds it does not inherit it held.
+    _append_lock = threading.Lock()
+
     def __init__(self, config: StorageConfig) -> None:
         self._root = Path(config.root)
 
@@ -183,8 +205,8 @@ class LocalStore(BlobStore, DocStore):
         the two namespaces apart and needs no such check.
 
         No caller can currently reach this: every reserved basename ends in
-        ``.json``/``.jsonl`` and no ingestable source suffix does
-        (``.pdf``/``.doc``/``.docx``/``.xls``/``.xlsx``), so this is
+        ``.json``/``.jsonl`` and no ingestable source suffix does (``.pdf``, or a
+        convertible suffix in ``conversion.FAMILY_BY_SUFFIX``), so this is
         defence-in-depth rather than a fix for a live bug. It earns its place by
         making the *next* document filename or accepted extension fail loudly
         here instead of silently clobbering a manifest."""
@@ -357,7 +379,11 @@ class LocalStore(BlobStore, DocStore):
         No directory is load-bearing: every record is a document, so pruning an
         empty directory can never destroy one. (It could when an assignment *was*
         an empty ``docsets/<did>/files/<fid>/``, which is why this used to need a
-        guard against removing them.)"""
+        guard against removing them.)
+
+        ``batches/`` is the exception among top-level directories: it holds only
+        batch-job state, so once its last job is deleted it goes too, rather
+        than lingering empty after every finished ``--batch`` run."""
         if base.is_dir():
             subdirs = sorted(
                 (p for p in base.rglob("*") if p.is_dir()),
@@ -368,7 +394,9 @@ class LocalStore(BlobStore, DocStore):
                 with contextlib.suppress(OSError):
                     sub.rmdir()
         directory = base
-        while directory != self._root and directory.parent != self._root:
+        while directory != self._root and (
+            directory.parent != self._root or directory.name in _EPHEMERAL_TOP_DIRS
+        ):
             try:
                 parent = directory.parent
                 directory.rmdir()
@@ -410,7 +438,7 @@ class LocalStore(BlobStore, DocStore):
         # newline="" as in the atomic writers: a log this code creates or
         # rewrites uses LF on every platform. An existing CRLF log is not
         # normalized for an append; the appended row is LF.
-        with path.open("a", encoding="utf-8", newline="") as fh:
+        with self._append_lock, path.open("a", encoding="utf-8", newline="") as fh:
             fh.write(line + "\n")
 
     def get_doc(self, collection: str, doc_id: str) -> dict[str, Any] | None:
@@ -508,3 +536,11 @@ class LocalStore(BlobStore, DocStore):
         if not isinstance(obj, dict):
             raise ValueError(f"document {path} is not a JSON object")
         return obj
+
+
+def _reset_append_lock() -> None:
+    LocalStore._append_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only; Windows has no fork
+    os.register_at_fork(after_in_child=_reset_append_lock)

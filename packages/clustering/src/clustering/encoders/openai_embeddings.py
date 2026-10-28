@@ -53,7 +53,7 @@ from typing import Any
 
 import torch
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 
 _DEFAULT_MODEL = "openai/text-embedding-3-large"
@@ -186,4 +186,4 @@ def _factory(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return OpenAIEncoder(cfg, device=device)
 
 
-register_encoder("openai")(_factory)
+register_encoder(EncoderName.OPENAI)(_factory)

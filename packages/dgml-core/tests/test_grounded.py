@@ -12,14 +12,18 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
+import logging
+import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
-from dgml_core import layout
+from dgml_core import layout, llm
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     AuthError,
@@ -33,15 +37,22 @@ from dgml_core.errors import (
     ValuesExtractionFailed,
     append_recorded_error,
 )
-from dgml_core.extraction_schema import parse_rnc
+from dgml_core.extraction_schema import EXTRACTED_VALUE, parse_rnc
 from dgml_core.extraction_xml import dgml_xml_to_values
 from dgml_core.files import FileStore
 from dgml_core.grounded import (
+    _MAX_NO_TOOL_CALL_RETRIES,
     _SCHEMA_TREE_MAX_DEPTH,
     DEFAULT_MAX_TOOL_ITERS,
     GroundedConfig,
+    _describe_run,
+    _drop_bboxes_from_schema,
+    _empty_totals,
     _field_node_schema,
     _pdf_bytes,
+    _phase1_attempt_steps,
+    _phase1_llm_config,
+    _repair_submit_values_args,
     _submit_schema_tool,
     _to_page_pixels,
     extract_values,
@@ -205,9 +216,14 @@ def _truncated_response() -> SimpleNamespace:
     )
 
 
-def _no_tool_call_response() -> SimpleNamespace:
-    msg = SimpleNamespace(content="I have no tools.", tool_calls=[])
-    return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+def _no_tool_call_response(
+    content: str | None = "I have no tools.",
+    finish_reason: str | None = None,
+    *,
+    reasoning_content: str | None = None,
+) -> SimpleNamespace:
+    msg = SimpleNamespace(content=content, tool_calls=[], reasoning_content=reasoning_content)
+    return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=finish_reason)])
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +298,41 @@ def test_load_config_section_overrides_tier(workspace: Workspace) -> None:
     assert config.values_model == "openai/gpt-5"  # override wins
 
 
+def test_load_config_call_override_resolves_like_section(workspace: Workspace) -> None:
+    # A per-call override is a layer above [grounded]: it wins over the section and
+    # the tier, and brings no credentials of its own — the section's key and
+    # endpoint were written beside `openai/gpt-5` and must not follow another model.
+    from .conftest import write_config
+
+    write_config(
+        workspace,
+        {
+            "models": {"advanced": "gemini/gemini-2.5-pro", "expert": "anthropic/claude-opus-4-8"},
+            "grounded": {
+                "values_model": "openai/gpt-5",
+                "values_api_key_env": "MY_KEY",
+                "values_api_base": "https://proxy.example",
+            },
+        },
+    )
+    config = load_grounded_config(
+        workspace, values_model="anthropic/claude-sonnet-5", schema_model="openai/gpt-5.4"
+    )
+    assert config.values_model == "anthropic/claude-sonnet-5"
+    assert (config.values_api_key, config.values_api_key_env) == (None, None)
+    assert config.values_api_base is None
+    assert config.schema_model == "openai/gpt-5.4"
+    assert (config.schema_api_key, config.schema_api_key_env, config.schema_api_base) == (
+        None,
+        None,
+        None,
+    )
+
+    # An empty override is a config error, not a silent fallback.
+    with pytest.raises(GroundedConfigInvalid):
+        load_grounded_config(workspace, values_model="")
+
+
 def test_load_config_rejects_non_positive_max_iters(workspace: Workspace) -> None:
     _write_grounded_config(
         workspace,
@@ -308,6 +359,40 @@ def test_load_config_defaults(workspace: Workspace) -> None:
     assert config.max_tool_iters == DEFAULT_MAX_TOOL_ITERS
     # Unset, the values reasoning effort is the module's measured default.
     assert config.values_reasoning_effort == "medium"
+    assert config.locations_reasoning_effort == "high"
+
+
+def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> None:
+    # Tier credentials belong to the tier's model: an override to another model
+    # takes nothing from the tier — not its key, not its api_base. The provider key
+    # on [models] serves an override of its own provider, as it serves a tier.
+    from .conftest import write_config
+
+    write_config(
+        workspace,
+        {
+            "models": {
+                "anthropic_api_key": "sk-ant",
+                "advanced": "azure/gpt-4o",
+                "advanced_api_key": "azure-secret",
+                "advanced_api_base": "https://acme.openai.azure.com",
+                "expert": "azure/gpt-4o",
+                "expert_api_key_env": "AZURE_KEY",
+                "expert_api_base": "https://acme.openai.azure.com",
+            }
+        },
+    )
+    config = load_grounded_config(
+        workspace, values_model="anthropic/claude-sonnet-5", schema_model="openai/gpt-5.4"
+    )
+    assert (config.values_api_key, config.values_api_key_env) == ("sk-ant", None)
+    assert config.values_api_base is None
+    # No openai_api_key, and the tier's Azure key is not the override's.
+    assert (config.schema_api_key, config.schema_api_key_env, config.schema_api_base) == (
+        None,
+        None,
+        None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -769,12 +854,102 @@ def test_values_effort_default_sends_no_reasoning_effort(workspace: Workspace) -
     assert phase3.kwargs["reasoning_effort"] == "high"
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("low", "low"), ("none", "none"), ("default", None)],
+)
+def test_load_config_reads_locations_reasoning_effort(
+    workspace: Workspace, raw: str, expected: str | None
+) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "locations_reasoning_effort": raw,
+        },
+    )
+    assert load_grounded_config(workspace).locations_reasoning_effort == expected
+
+
+def test_load_config_rejects_unknown_locations_reasoning_effort(workspace: Workspace) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "locations_reasoning_effort": "turbo",
+        },
+    )
+    with pytest.raises(GroundedConfigInvalid, match="locations_reasoning_effort"):
+        load_grounded_config(workspace)
+
+
+def test_configured_locations_effort_reaches_location_grounding_only(
+    workspace: Workspace,
+) -> None:
+    """``locations_reasoning_effort`` sets the budget of the location-grounding
+    call and nothing else: value extraction keeps its own setting. A Gemini
+    values model makes both calls observable."""
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        locations_reasoning_effort="low",
+    )
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert phase1.kwargs["reasoning_effort"] == "medium"
+    assert phase3.kwargs["reasoning_effort"] == "low"
+
+
+def test_locations_effort_default_sends_no_reasoning_effort(workspace: Workspace) -> None:
+    """``None`` (the config's ``"default"``) leaves the grounding budget to the
+    provider: the field is absent from that request and still present on value
+    extraction."""
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        locations_reasoning_effort=None,
+    )
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert phase1.kwargs["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in phase3.kwargs
+
+
+@pytest.mark.parametrize("locations_effort", ["low", None])
+def test_locations_effort_does_not_reach_the_grid_path(
+    workspace: Workspace, locations_effort: str | None
+) -> None:
+    """A page on the no-words grid path keeps its own measured budget whatever
+    ``locations_reasoning_effort`` says, "default" (None) included."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300, words=[])
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 50, 200, 60]]}]}
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        locations_reasoning_effort=locations_effort,
+    )
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as m:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert m.call_args_list[1].kwargs["reasoning_effort"] == "medium"
+
+
 def test_configured_values_effort_reaches_anthropic_value_extraction(
     workspace: Workspace,
 ) -> None:
-    """Value extraction runs with ``tool_choice`` auto, so an Anthropic values
-    model receives the configured effort too (the wrapper only drops it on a
-    forced tool call)."""
+    """Value extraction leaves an Anthropic values model on ``tool_choice``
+    auto (other providers get ``"required"``), so it receives the configured
+    effort too (the wrapper only drops it on a forced tool call)."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)
@@ -932,6 +1107,34 @@ def test_extract_values_direct_submit(workspace: Workspace) -> None:
     assert dgml_xml_to_values(xml, vocab=vocab) == result.values
 
 
+def test_extract_values_unassigned_during_llm_phase_writes_nothing(workspace: Workspace) -> None:
+    """A `docset remove-file` that lands while the LLM phases run must not be
+    undone by the final writes: neither the XML blob nor the stats doc
+    (`write_stats=True`, as under `--debug`) comes back under the pair."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": phase1_values})
+
+    def unassign_then_answer(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        DocSetStore(workspace).remove_file(ds_id, fid)
+        return response
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=unassign_then_answer):
+        with pytest.raises(FileNotFound, match="no longer assigned"):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    assert not workspace.blobs.blob_exists(layout.dgml_xml_key(ds_id, fid, "doc"))
+    assert (
+        workspace.docs.get_doc(layout.Collection.EXTRACTION_STATS, layout.pair_id(ds_id, fid))
+        is None
+    )
+
+
 def test_extract_values_full_extraction_embeds_in_existing_tree(workspace: Workspace) -> None:
     """When the file's core <stem>.dgml.xml already exists (generate ran),
     extraction embeds a dg:extraction sibling and preserves the tree."""
@@ -1004,6 +1207,97 @@ def test_extract_values_phase3_resolves_unmatched_via_llm(workspace: Workspace) 
     assert title["locations"] == [{"page_number": 1, "bounding_box": [100, 56, 200, 76]}]
 
 
+def _phase_log(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The run's INFO lines, with durations masked so they compare exactly."""
+    return [
+        re.sub(r"\d+\.\ds", "Ns", r.getMessage())
+        for r in caplog.records
+        if r.name == "dgml_core.grounded" and r.levelno == logging.INFO
+    ]
+
+
+def test_extract_values_logs_each_phase(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ):
+        extract_values(workspace, ds_id, fid, config=config)
+
+    assert _phase_log(caplog) == [
+        f"file {fid}: extracting values into docset {ds_id} with {DEFAULT_VALUES_MODEL}",
+        f"file {fid}: phase 1 (values) starting",
+        f"file {fid}: phase 1 (values) done in Ns",
+        f"file {fid}: phase 2 (OCR matching, no LLM) matched 0 of 1 locations in Ns",
+        f"file {fid}: phase 3 (locations) starting: 1 items on 1 pages",
+        f"file {fid}: phase 3 (locations) matched 1 more locations in Ns; 0 still unmatched",
+        f"file {fid}: extracted values into docset {ds_id} (0 tool calls, Ns)",
+    ]
+
+
+def test_describe_run_skips_figures_it_does_not_have() -> None:
+    """It runs after the values are stored, so it must not raise: a cost the
+    provider did not report is None, and usage is {} when it could not be built."""
+    assert _describe_run(2, {"duration_s": 1.25, "cost_usd": 0.5}) == "2 tool calls, 1.2s, $0.5000"
+    assert _describe_run(2, {"duration_s": 1.25, "cost_usd": None}) == "2 tool calls, 1.2s"
+    assert _describe_run(2, {}) == "2 tool calls"
+
+
+def test_extract_values_logs_no_start_for_a_refused_file(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unassigned file is refused before the run starts, so nothing reads as
+    started; reporting the refusal is the caller's."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    DocSetStore(workspace).remove_file(ds_id, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with pytest.raises(FileNotFound):
+        extract_values(workspace, ds_id, fid, config=config)
+
+    assert _phase_log(caplog) == []
+
+
+def test_extract_values_logs_phase3_not_needed(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ):
+        extract_values(workspace, ds_id, fid, config=config)
+
+    assert _phase_log(caplog)[-3:-1] == [
+        f"file {fid}: phase 2 (OCR matching, no LLM) matched 1 of 1 locations in Ns",
+        f"file {fid}: phase 3 (locations) not needed",
+    ]
+
+
 def test_extract_values_phase3_words_are_toon_encoded(
     workspace: Workspace,
 ) -> None:
@@ -1067,7 +1361,7 @@ def test_extract_values_phase3_page_without_words_uses_the_grid(workspace: Works
             _tool_call_response("submit_locations", phase3_args, call_id="p3"),
         ],
     ) as mock_completion:
-        result = extract_values(workspace, ds_id, fid, config=config)
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
     kwargs = mock_completion.call_args_list[1].kwargs
     messages = kwargs["messages"]
@@ -1083,6 +1377,142 @@ def test_extract_values_phase3_page_without_words_uses_the_grid(workspace: Works
     assert stats is not None
     phase3 = stats["phases"]["phase3"]
     assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (1, 0)
+
+
+def test_extract_values_rejects_a_phase3_box_on_the_wrong_words(workspace: Workspace) -> None:
+    """Phase 3 boxes "Goodnight" on the words "Hello world". The text layer
+    says the box is wrong, so it is stripped, and with no box left the value
+    is dropped rather than written pointing at the wrong span."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1, width=2550, height=3300)  # "Hello", "world"
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 210, 290, 242]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ):
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    assert "title" not in result.values
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["matched_phase3"] == 1
+    assert stats["matching"]["rejected_boxes"] == 1
+    assert stats["matching"]["dropped_unboxed_values"] == 1
+
+
+def _word(idx: int, text: str, box: list[int]) -> dict[str, Any]:
+    return {"idx": idx, "text": text, "location": {"page_number": 1, "bounding_box": box}}
+
+
+_RANGE_WORDS = {
+    w["idx"]: w
+    for w in [
+        _word(0, "Gas", [100, 100, 150, 130]),
+        _word(1, "Delivery", [160, 100, 330, 130]),
+        _word(2, "Charge", [100, 140, 190, 170]),  # next line
+        _word(3, "$", [400, 100, 410, 130]),
+        _word(4, "318", [410, 100, 460, 130]),
+        _word(5, ".", [460, 100, 465, 130]),
+        _word(6, "40", [465, 100, 490, 130]),
+    ]
+}
+
+
+def test_word_ranges_become_one_box_per_line() -> None:
+    from dgml_core.grounded import _boxes_from_word_ranges
+
+    assert _boxes_from_word_ranges([[3, 6]], _RANGE_WORDS) == [[400, 100, 490, 130]]
+    # A value wrapping onto a second line: two ranges, two boxes.
+    assert _boxes_from_word_ranges([[0, 1], [2, 2]], _RANGE_WORDS) == [
+        [100, 100, 330, 130],
+        [100, 140, 190, 170],
+    ]
+
+
+@pytest.mark.parametrize("ranges", [[], [[6, 3]], [[3]], [[3, 99]], [["3", "4"]], "3-6"])
+def test_malformed_or_unknown_word_ranges_locate_nothing(ranges: Any) -> None:
+    from dgml_core.grounded import _boxes_from_word_ranges
+
+    assert _boxes_from_word_ranges(ranges, _RANGE_WORDS) is None
+
+
+def test_extract_values_phase3_locates_by_word_ranges(workspace: Workspace) -> None:
+    """On a page with words, phase 3 names the value's words and code builds
+    the box from them: the model never writes a coordinate."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    # "286" printed twice, with nothing to tell phase 2 which is the value.
+    _seed_page_text(
+        workspace,
+        fid,
+        page=1,
+        width=2550,
+        height=3300,
+        words=[
+            {"t": "286", "l": [2366, 1163, 2415, 1192]},
+            {"t": "286", "l": [1544, 1592, 1600, 1625]},
+        ],
+    )
+    workspace.blobs.put_blob(layout.file_page_image_key(fid, 1), _png_header(2550, 3300))
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "286", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "words": [[1, 1]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 2
+    tool = mock_completion.call_args_list[1].kwargs["tools"][0]["function"]
+    entry = tool["parameters"]["properties"]["locations"]["items"]
+    assert set(entry["properties"]) == {"id", "words"}
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [1544, 1592, 1600, 1625]}
+    ]
+
+
+def test_extract_values_grounds_a_value_phase1_left_without_locations(
+    workspace: Workspace,
+) -> None:
+    """Phase 1 reads "Hello world" but leaves out where. Bare, it would be
+    dropped as unverifiable; placed on the page that prints it, phase 2
+    grounds it."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    phase1_values = {"title": {"text": "Hello world"}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    assert mock_completion.call_count == 1  # phase 2 grounded it; no phase 3
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 210, 290, 242]}
+    ]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["located_pageless"] == 1
+    assert stats["matching"]["unsupported_values"] == 0
 
 
 def test_extract_values_phase3_states_the_image_size(workspace: Workspace) -> None:
@@ -1107,7 +1537,10 @@ def test_extract_values_phase3_states_the_image_size(workspace: Workspace) -> No
         result = extract_values(workspace, ds_id, fid, config=config)
 
     kwargs = mock_completion.call_args_list[1].kwargs
-    assert "IMAGE PIXELS" in kwargs["messages"][0]["content"]
+    # Pages with words are answered with word ranges, not pixels; the size
+    # line stays to give the table's pixel positions a frame.
+    assert "WORD CONTRACT" in kwargs["messages"][0]["content"]
+    assert "IMAGE PIXELS" not in kwargs["messages"][0]["content"]
     assert "2550 x 3300 pixels (width x height)" in kwargs["messages"][1]["content"][0]["text"]
     # pages with words keep the default budget; only the grid path is lowered
     assert kwargs["reasoning_effort"] == "high"
@@ -1135,13 +1568,16 @@ def test_extract_values_phase3_drops_a_box_off_the_page(workspace: Workspace) ->
             _tool_call_response("submit_locations", phase3_args, call_id="p3"),
         ],
     ):
-        result = extract_values(workspace, ds_id, fid, config=config)
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
-    assert result.values["title"]["locations"] == [{"page_number": 1}]
+    # The only box was off the page, so the value has none: it is dropped
+    # rather than written with no dg:origin.
+    assert "title" not in result.values
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None
     phase3 = stats["phases"]["phase3"]
     assert (phase3["grid_pages"], phase3["boxes_dropped"]) == (0, 1)
+    assert stats["matching"]["dropped_unboxed_values"] == 1
 
 
 @pytest.mark.parametrize(
@@ -1287,7 +1723,7 @@ def test_extract_values_phase3_merges_costs_across_parallel_pages(
             ),
         ],
     ) as mock_completion:
-        extract_values(workspace, ds_id, fid, config=config)
+        extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 3
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
@@ -1302,9 +1738,53 @@ def test_extract_values_phase3_merges_costs_across_parallel_pages(
     assert stats["phases"]["phase1"]["cost_usd"] == pytest.approx(0.01)
 
 
+_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar("test_job_id", default="-")
+
+
+def test_extract_values_phase3_page_calls_run_in_the_callers_context(
+    workspace: Workspace,
+) -> None:
+    """Phase 3's page calls run on a thread pool; each must see what the caller
+    bound (a job id its log handler stamps on every record), so the page
+    workers' retry and failure lines carry it like the main thread's."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=2)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_text(workspace, fid, page=2)
+    _seed_page_image(workspace, fid, 1)
+    _seed_page_image(workspace, fid, 2)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {
+        "title": {"text": "Goodnight", "locations": [{"page_number": 1}]},
+        "subtitle": {"text": "Farewell", "locations": [{"page_number": 2}]},
+    }
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
+    seen: list[tuple[str, bool]] = []  # (job id, on the main thread?)
+
+    def completion(**kwargs: Any) -> Any:
+        seen.append((_JOB_ID.get(), threading.current_thread() is threading.main_thread()))
+        offered = {t["function"]["name"] for t in kwargs.get("tools") or []}
+        if "submit_values" in offered:
+            return _tool_call_response("submit_values", {"values": phase1_values})
+        return _tool_call_response("submit_locations", phase3_args)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    token = _JOB_ID.set("job-42")
+    try:
+        with patch("litellm.completion", side_effect=completion):
+            extract_values(workspace, ds_id, fid, config=config)
+    finally:
+        _JOB_ID.reset(token)
+
+    # Phase 1 on the caller's thread, then the two page calls on workers.
+    assert seen[0] == ("job-42", True)
+    assert sorted(seen[1:]) == [("job-42", False), ("job-42", False)]
+
+
 def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
-    """Every successful extract_values writes extraction_stats.json with
-    per-phase timings and match counts. The UX reads this directly."""
+    """A successful extract_values with write_stats=True (what the CLI passes
+    under --debug) stores extraction_stats.json with per-phase timings and
+    match counts. The UX reads this directly."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)
@@ -1316,7 +1796,7 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "litellm.completion",
         return_value=_tool_call_response("submit_values", {"values": phase1_values}),
     ):
-        extract_values(workspace, ds_id, fid, config=config)
+        extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None
@@ -1333,6 +1813,7 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "phase1_tool_schema",
     }
     assert stats["phase1_tool_schema"] == "inlined"
+    assert type(stats["phase1_tool_schema"]) is str  # the wire string, not the enum member
     assert stats["outcome"] == "ok"
     assert stats["error"] is None
     # Phase 2 matched the only location; phase 3 not needed.
@@ -1341,8 +1822,16 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "matched_phase2": 1,
         "matched_phase3": 0,
         "unmatched": 0,
-        "computed_fields": 0,
-        "dropped_refs": 0,
+        "unprinted_fields": 0,
+        "partly_printed_fields": 0,
+        "dropped_inputs": 0,
+        "unsupported_values": 0,
+        "repaired_inputs": 0,
+        "located_pageless": 0,
+        "dropped_unboxed_values": 0,
+        "dropped_unboxed": [],
+        "rejected_boxes": 0,
+        "snapped_boxes": 0,
         "unnormalized_enum_values": 0,
         "derivations_checked": 0,
         "derivations_mismatched": 0,
@@ -1356,6 +1845,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "duration_s",
         "chunk_calls",
         "truncated_retries",
+        "envelope_repairs",
+        "no_tool_call_retries",
         "cost_usd",
         "prompt_tokens",
         "completion_tokens",
@@ -1365,6 +1856,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
     }
     assert stats["phases"]["phase1"]["chunk_calls"] == 1
     assert stats["phases"]["phase1"]["truncated_retries"] == 0
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 0
+    assert stats["phases"]["phase1"]["no_tool_call_retries"] == 0
     assert set(stats["phases"]["phase2"].keys()) == {"duration_s"}
     assert set(stats["phases"]["phase3"].keys()) == {
         "duration_s",
@@ -1384,9 +1877,10 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
     assert stats["phases"]["phase3"]["page_calls"] == 0
 
 
-def test_extract_values_write_stats_false_suppresses_file(workspace: Workspace) -> None:
-    """write_stats=False (set by the CLI unless --debug) skips the
-    extraction_stats.json sidecar; extracted.dgml.xml is still written."""
+def test_extract_values_write_stats_defaults_off(workspace: Workspace) -> None:
+    """The default (write_stats=False, what the CLI passes unless --debug)
+    skips the extraction_stats.json document; extracted.dgml.xml is still
+    written and the caller still gets the numbers on the result."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)
@@ -1398,10 +1892,32 @@ def test_extract_values_write_stats_false_suppresses_file(workspace: Workspace) 
         "litellm.completion",
         return_value=_tool_call_response("submit_values", {"values": phase1_values}),
     ):
-        extract_values(workspace, ds_id, fid, config=config, write_stats=False)
+        result = extract_values(workspace, ds_id, fid, config=config)
 
     assert workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}") is None
     assert workspace.blobs.blob_exists(layout.dgml_xml_key(ds_id, fid, "doc"))
+    # Nothing persisted, but the caller still gets the numbers on the result.
+    assert result.stats["outcome"] == "ok"
+    assert result.stats["matching"]["matched_phase2"] == 1
+    assert set(result.usage) == {
+        "cost_usd",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "duration_s",
+    }
+
+
+# Phase 1 leaves only Anthropic on auto tool choice, so the text-only retry
+# path is exercised with an Anthropic values model.
+ANTHROPIC_VALUES_MODEL = DEFAULT_SCHEMA_MODEL
+
+
+def _submit_hello_title() -> SimpleNamespace:
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    return _tool_call_response("submit_values", {"values": phase1_values})
 
 
 def test_extract_values_no_tool_call_errors(workspace: Workspace) -> None:
@@ -1410,10 +1926,375 @@ def test_extract_values_no_tool_call_errors(workspace: Workspace) -> None:
     _seed_page_text(workspace, fid, page=1)
     ds_id, _ = _seed_docset_with_schema(workspace, fid)
 
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=ANTHROPIC_VALUES_MODEL)
+    reply = _no_tool_call_response("Here are the values: title is Hello world.", "stop")
+    with patch("litellm.completion", return_value=reply) as mock_completion:
+        with pytest.raises(ValuesExtractionFailed) as excinfo:
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    # The first reply plus one retry per allowed text-only turn, then the error
+    # names the stop reason and quotes the reply so the cause is visible.
+    assert mock_completion.call_count == 1 + _MAX_NO_TOOL_CALL_RETRIES
+    message = str(excinfo.value)
+    assert "model returned no tool call" in message
+    assert f"after {_MAX_NO_TOOL_CALL_RETRIES} retries on this attempt" in message
+    assert "finish_reason='stop'" in message
+    assert "title is Hello world" in message
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["outcome"] == "error"
+    assert stats["phases"]["phase1"]["no_tool_call_retries"] == _MAX_NO_TOOL_CALL_RETRIES
+
+
+def test_extract_values_retries_after_a_text_only_reply(workspace: Workspace) -> None:
+    """A reply with no tool call is answered with a reminder and the model is
+    asked again under auto tool choice; a submission on that turn completes."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    responses = [
+        _no_tool_call_response("The title is Hello world.", "stop"),
+        _submit_hello_title(),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=ANTHROPIC_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    assert mock_completion.call_count == 2
+    _, retry_kwargs = mock_completion.call_args_list[1]
+    assert "tool_choice" not in retry_kwargs
+    # The history list is shared and grows after the call, so read the retry
+    # turns by position after the system + user prefix rather than from the end.
+    reply, nudge = retry_kwargs["messages"][2:4]
+    assert reply == {"role": "assistant", "content": "The title is Hello world."}
+    assert nudge["role"] == "user"
+    assert "submit_values" in nudge["content"]
+    # Phase 1 offers no other tool, so the reminder must not name one.
+    assert "get_page_words" not in nudge["content"]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["outcome"] == "ok"
+    assert stats["phases"]["phase1"]["no_tool_call_retries"] == 1
+    assert workspace.blobs.blob_exists(layout.dgml_xml_key(ds_id, fid, "doc"))
+
+
+def test_extract_values_never_forces_a_retry_on_anthropic(workspace: Workspace) -> None:
+    """Retries stay on auto (a forced choice would switch off Claude's
+    thinking), and an empty reply is not kept in the history (some providers
+    reject an empty assistant turn)."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    responses = [
+        *[_no_tool_call_response(None, "stop") for _ in range(_MAX_NO_TOOL_CALL_RETRIES)],
+        _submit_hello_title(),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=ANTHROPIC_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        extract_values(workspace, ds_id, fid, config=config)
+
+    calls = mock_completion.call_args_list
+    assert len(calls) == 1 + _MAX_NO_TOOL_CALL_RETRIES
+    for _, kwargs in calls:
+        assert "tool_choice" not in kwargs
+    assert not any(
+        m["role"] == "assistant" and not m.get("tool_calls") for m in calls[-1][1]["messages"]
+    )
+
+
+def test_extract_values_requires_a_tool_call_off_anthropic(workspace: Workspace) -> None:
+    """Providers that keep their reasoning under a forced choice get
+    ``tool_choice="required"`` on every phase-1 call."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
-    with patch("litellm.completion", return_value=_no_tool_call_response()):
-        with pytest.raises(ValuesExtractionFailed):
+    with patch("litellm.completion", return_value=_submit_hello_title()) as mock_completion:
+        extract_values(workspace, ds_id, fid, config=config)
+
+    phase1_calls = _phase1_calls(mock_completion)
+    assert phase1_calls
+    assert all(kwargs["tool_choice"] == "required" for kwargs in phase1_calls)
+
+
+def _rejection(message: str) -> Exception:
+    import litellm.exceptions
+
+    return litellm.exceptions.BadRequestError(
+        message, model="gemini-2.5-pro", llm_provider="gemini"
+    )
+
+
+def _phase1_calls(mock_completion: Any) -> list[dict[str, Any]]:
+    return [
+        kwargs
+        for _, kwargs in mock_completion.call_args_list
+        if any(t["function"]["name"] == "submit_values" for t in kwargs.get("tools", []))
+    ]
+
+
+def test_extract_values_falls_back_to_auto_when_required_is_rejected(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An endpoint that rejects ``tool_choice="required"`` is resent on auto,
+    stays on auto for the rest of the attempt (a later text-only turn gets the
+    reminder retry), and is warned about once."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    responses = [
+        _rejection("tool_choice 'required' is not supported by this endpoint"),
+        _no_tool_call_response("The title is Hello world.", "stop"),
+        _submit_hello_title(),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with caplog.at_level(logging.WARNING, logger="dgml_core.grounded"):
+        with patch("litellm.completion", side_effect=responses) as mock_completion:
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    calls = _phase1_calls(mock_completion)
+    assert [c.get("tool_choice") for c in calls] == ["required", None, None]
+    warnings = [r for r in caplog.records if "rejected tool_choice='required'" in r.message]
+    assert len(warnings) == 1
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["outcome"] == "ok"
+    assert stats["phases"]["phase1"]["no_tool_call_retries"] == 1
+
+
+def test_required_rejection_is_remembered_per_endpoint(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Once "required" is shown to be the cause (the auto resend succeeded),
+    later extractions against the same endpoint start on auto instead of
+    re-sending a doomed request, and the warning is emitted once."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    responses = [
+        _rejection("tool_choice unsupported"),
+        _submit_hello_title(),
+        _submit_hello_title(),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with caplog.at_level(logging.WARNING, logger="dgml_core.grounded"):
+        with patch("litellm.completion", side_effect=responses) as mock_completion:
             extract_values(workspace, ds_id, fid, config=config)
+            extract_values(workspace, ds_id, fid, config=config)
+
+    calls = _phase1_calls(mock_completion)
+    assert [c.get("tool_choice") for c in calls] == ["required", None, None]
+    warnings = [r for r in caplog.records if "rejected tool_choice='required'" in r.message]
+    assert len(warnings) == 1
+
+
+def test_unrelated_rejection_fails_with_the_auto_attempts_error(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 400 that is not about tool choice fails on the auto resend too, and the
+    error reported is that resend's, the request ``main`` would have sent."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    responses = [
+        _rejection("could not process document (first)"),
+        _rejection("could not process document (auto)"),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        with pytest.raises(ValuesExtractionFailed) as excinfo:
+            extract_values(workspace, ds_id, fid, config=config)
+
+    assert mock_completion.call_count == 2
+    message = str(excinfo.value)
+    assert message.startswith("extraction call failed: BadRequestError")
+    assert "(auto)" in message
+    assert "(first)" not in message
+    # The auto resend failed too, so "required" was not shown to be the cause:
+    # nothing is warned about or remembered, and the next run probes it again.
+    assert not any("rejected tool_choice='required'" in r.message for r in caplog.records)
+    with patch("litellm.completion", return_value=_submit_hello_title()) as again:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert _phase1_calls(again)[0]["tool_choice"] == "required"
+
+
+@pytest.mark.parametrize("kind", ["timeout", "context_window", "content_policy", "auth"])
+def test_non_rejection_errors_do_not_fall_back(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Errors that no tool-choice change can fix are never resent on auto:
+    every phase-1 call carries ``"required"`` and the run fails as before."""
+    import litellm.exceptions
+
+    # A timeout is retried with backoff inside the wrapper; skip the sleeps.
+    monkeypatch.setattr("dgml_core.llm.time.sleep", lambda _s: None)
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    m, p = "gemini-2.5-pro", "gemini"
+    exc = {
+        "timeout": litellm.exceptions.Timeout("request timed out", model=m, llm_provider=p),
+        "context_window": litellm.exceptions.ContextWindowExceededError(
+            "too long", model=m, llm_provider=p
+        ),
+        "content_policy": litellm.exceptions.ContentPolicyViolationError(
+            "blocked", model=m, llm_provider=p
+        ),
+        "auth": litellm.exceptions.AuthenticationError("bad key", model=m, llm_provider=p),
+    }[kind]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=exc) as mock_completion:
+        with pytest.raises(ValuesExtractionFailed, match="extraction call failed"):
+            extract_values(workspace, ds_id, fid, config=config)
+
+    calls = _phase1_calls(mock_completion)
+    assert calls
+    assert all(c["tool_choice"] == "required" for c in calls)
+
+
+def test_schema_overflow_rejection_keeps_the_permissive_fallback(workspace: Workspace) -> None:
+    """Gemini's "too many states" 400 is not resent on auto; it still reaches
+    the caller's permissive-schema retry, which keeps "required"."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    responses = [
+        _rejection("The specified schema produces too many states for serving"),
+        _submit_hello_title(),
+    ]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    calls = _phase1_calls(mock_completion)
+    assert [c["tool_choice"] for c in calls] == ["required", "required"]
+    submit_tool = next(t for t in calls[1]["tools"] if t["function"]["name"] == "submit_values")
+    assert "properties" not in submit_tool["function"]["parameters"]["properties"]["values"]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["phase1_tool_schema"] == "permissive"
+
+
+def test_anthropic_rejection_is_not_resent(workspace: Workspace) -> None:
+    """Anthropic never gets "required", so a 400 there has nothing to fall back
+    from and fails on the first call, as before."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=ANTHROPIC_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=_rejection("bad request")) as mock_completion:
+        with pytest.raises(ValuesExtractionFailed, match="bad request"):
+            extract_values(workspace, ds_id, fid, config=config)
+    assert mock_completion.call_count == 1
+
+
+@pytest.mark.parametrize("finish_reason", ["content_filter", "refusal"])
+def test_extract_values_does_not_retry_an_abnormal_stop(
+    workspace: Workspace, finish_reason: str | None
+) -> None:
+    """A text-only turn that did not stop normally fails at once: a content
+    filter or refusal would end the same way again."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=ANTHROPIC_VALUES_MODEL)
+    reply = _no_tool_call_response("I can't help with that.", finish_reason)
+    with patch("litellm.completion", return_value=reply) as mock_completion:
+        with pytest.raises(ValuesExtractionFailed, match="after 0 retries"):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    assert mock_completion.call_count == 1
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["phases"]["phase1"]["no_tool_call_retries"] == 0
+
+
+def test_extract_values_retries_a_text_reply_with_no_finish_reason(workspace: Workspace) -> None:
+    """OpenAI-compatible servers often report no ``finish_reason``; that is not
+    an abnormal stop, so the turn gets the reminder retry."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    responses = [_no_tool_call_response("Here you go.", None), _submit_hello_title()]
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=ANTHROPIC_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        extract_values(workspace, ds_id, fid, config=config)
+    assert mock_completion.call_count == 2
+
+
+def test_extract_values_reports_a_reasoning_only_reply(workspace: Workspace) -> None:
+    """A reply whose only content is reasoning (the budget went to thinking)
+    is told apart from a truly empty one in the error."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=ANTHROPIC_VALUES_MODEL)
+    reply = _no_tool_call_response(None, "stop", reasoning_content="Let me think about...")
+    with patch("litellm.completion", return_value=reply):
+        with pytest.raises(ValuesExtractionFailed) as excinfo:
+            extract_values(workspace, ds_id, fid, config=config)
+
+    message = str(excinfo.value)
+    assert "no text" in message
+    assert "reasoning only" in message
+
+
+def test_run_extract_loop_retries_do_not_spend_the_turn_budget(workspace: Workspace) -> None:
+    """With ``max_tool_iters=1`` a text-only turn is still retried, and the
+    submission on the retry completes rather than exhausting the budget."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    responses = [
+        _no_tool_call_response("One moment.", "stop"),
+        _tool_call_response("submit_values", {"values": _hello_title()}),
+    ]
+    counters = {"envelope_repairs": 0, "no_tool_call_retries": 0}
+    with patch("litellm.completion", side_effect=responses):
+        args, _, chunk_calls = llm.drive(
+            _phase1_attempt_steps(
+                workspace=workspace,
+                file_id=fid,
+                messages=[{"role": "user", "content": "extract"}],
+                tools=[],
+                model=ANTHROPIC_VALUES_MODEL,
+                api_key=None,
+                api_base=None,
+                max_tool_iters=1,
+                totals=_empty_totals(),
+                vocab=_TITLE_VOCAB,
+                counters=counters,
+            ),
+            _phase1_llm_config(ANTHROPIC_VALUES_MODEL, None, None, None),
+        )
+
+    assert args["values"] == _hello_title()
+    assert chunk_calls == 1
+    assert counters["no_tool_call_retries"] == 1
 
 
 def test_extract_values_unknown_tool_errors(workspace: Workspace) -> None:
@@ -1478,7 +2359,9 @@ def test_generate_schema_records_usage_on_success(workspace: Workspace) -> None:
     response._hidden_params = {"response_cost": 0.012}
     response.usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
     with patch("litellm.completion", return_value=response):
-        generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D", debug=True)
+        generate_schema(
+            workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D", record_usage=True
+        )
 
     events = read_events(workspace)
     assert len(events) == 1
@@ -1499,7 +2382,9 @@ def test_generate_schema_records_usage_on_provider_exception(workspace: Workspac
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", side_effect=RuntimeError("network down")):
         with pytest.raises(SchemaGenerationFailed):
-            generate_schema(workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D", debug=True)
+            generate_schema(
+                workspace, ["f1aaaaaaaaaa"], config=config, docset_name="D", record_usage=True
+            )
 
     events = read_events(workspace)
     assert len(events) == 1
@@ -1555,7 +2440,9 @@ def test_extract_values_records_one_event_summing_across_turns(workspace: Worksp
 
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", side_effect=[p1, p3]):
-        extract_values(workspace, ds_id, fid, config=config, debug=True)
+        result = extract_values(
+            workspace, ds_id, fid, config=config, record_usage=True, write_stats=True
+        )
 
     events = read_events(workspace)
     assert len(events) == 1
@@ -1569,6 +2456,14 @@ def test_extract_values_records_one_event_summing_across_turns(workspace: Worksp
     assert e["outcome"] == "ok"
     assert e["context"]["file_id"] == fid
     assert e["context"]["docset_id"] == ds_id
+    # The result carries the same accounting the row does, plus the stats
+    # document, so a library caller needs neither file.
+    assert result.usage["cost_usd"] == 0.005
+    assert result.usage["prompt_tokens"] == 800
+    assert result.usage["total_tokens"] == 910
+    assert result.usage["duration_s"] == e["duration_s"]
+    assert result.stats == workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert result.stats["phases"]["phase3"]["page_calls"] == 1
 
 
 def test_extract_values_records_error_event_when_max_iters_exceeded(
@@ -1592,13 +2487,197 @@ def test_extract_values_records_error_event_when_max_iters_exceeded(
     )
     with patch("litellm.completion", side_effect=[r, r, r]):
         with pytest.raises(ValuesExtractionFailed, match="max_tool_iters"):
-            extract_values(workspace, ds_id, fid, config=config, debug=True)
+            extract_values(workspace, ds_id, fid, config=config, record_usage=True)
     events = read_events(workspace)
     assert len(events) == 1
     e = events[0]
     assert e["outcome"] == "error"
     assert e["cost_usd"] == 0.003  # 3 phase-1 calls x 0.001 — partial cost still recorded
     assert "max_tool_iters" in (e["error"] or "")
+
+
+def test_extract_values_failure_carries_usage_and_stats_on_the_error(
+    workspace: Workspace,
+) -> None:
+    """A failed run hands its partial accounting to the caller on the
+    exception, so a host that persists no telemetry still sees what it spent."""
+    from dgml_core.usage import read_events
+
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    r = _tool_call_response("get_page_words", {"page": 1}, call_id="cX")
+    r._hidden_params = {"response_cost": 0.001}
+    r.usage = SimpleNamespace(prompt_tokens=100, completion_tokens=5, total_tokens=105)
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        max_tool_iters=3,
+    )
+    with patch("litellm.completion", side_effect=[r, r, r]):
+        with pytest.raises(ValuesExtractionFailed, match="max_tool_iters") as excinfo:
+            extract_values(workspace, ds_id, fid, config=config)
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage["cost_usd"] == 0.003
+    assert excinfo.value.usage["prompt_tokens"] == 300
+    assert excinfo.value.stats is not None and excinfo.value.stats["outcome"] == "error"
+    # Nothing persisted: both switches were off.
+    assert read_events(workspace) == []
+    assert workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}") is None
+
+
+def test_extract_values_usage_write_failure_does_not_mask_the_extraction_error(
+    workspace: Workspace,
+) -> None:
+    """A storage failure appending the usage row is logged, not raised: the
+    caller still sees the real extraction error, and the stats doc is still
+    written."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    r = _tool_call_response("get_page_words", {"page": 1}, call_id="cX")
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        max_tool_iters=3,
+    )
+    with (
+        patch("litellm.completion", side_effect=[r, r, r]),
+        patch("dgml_core.grounded._append_usage_event", side_effect=OSError("disk full")),
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="max_tool_iters"):
+            extract_values(
+                workspace, ds_id, fid, config=config, record_usage=True, write_stats=True
+            )
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+
+
+def test_extract_values_succeeds_when_building_stats_fails(workspace: Workspace) -> None:
+    """The values are stored before telemetry is built, so a telemetry bug
+    must not turn a finished extraction into a failed one."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    p1 = _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1")
+    p3 = _tool_call_response(
+        "submit_locations",
+        {"locations": [{"id": "a", "bounding_boxes": [[1, 2, 3, 4]]}]},
+        call_id="p3",
+    )
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with (
+        patch("litellm.completion", side_effect=[p1, p3]),
+        patch("dgml_core.grounded._build_extraction_stats", side_effect=TypeError("boom")),
+    ):
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    assert result.stats == {}
+    assert result.usage["duration_s"] >= 0
+    assert workspace.blobs.blob_exists(result.xml_key)
+    assert workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}") is None
+
+
+def test_extract_values_phase3_failure_still_counts_every_pages_spend(
+    workspace: Workspace,
+) -> None:
+    """A failing phase-3 page must not drop phase 3 from the accounting: the
+    completed page's cost and the failing page's own (billed) call both reach
+    exc.usage, the usage row and the stats. Pages run in parallel, so which
+    page fails is not fixed — the totals are the same either way."""
+    from dgml_core.usage import read_events
+
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=2)
+    for page in (1, 2):
+        _seed_page_text(workspace, fid, page=page)
+        _seed_page_image(workspace, fid, page)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {
+        "title": {"text": "Goodnight", "locations": [{"page_number": 1}]},
+        "subtitle": {"text": "Farewell", "locations": [{"page_number": 2}]},
+    }
+    p1 = _tool_call_response(
+        "submit_values", {"values": phase1_values}, call_id="p1", cost_usd=0.01, prompt_tokens=100
+    )
+    ok = _tool_call_response(
+        "submit_locations",
+        {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]},
+        call_id="ok",
+        cost_usd=0.02,
+        prompt_tokens=200,
+    )
+    # Billed, then rejected: an unknown tool fails the page after its usage counts.
+    bad = _tool_call_response("bogus_tool", {}, call_id="bad", cost_usd=0.04, prompt_tokens=400)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=[p1, ok, bad]):
+        with pytest.raises(ValuesExtractionFailed, match=r"phase 3 page [12]") as excinfo:
+            extract_values(
+                workspace, ds_id, fid, config=config, record_usage=True, write_stats=True
+            )
+
+    usage = excinfo.value.usage
+    assert usage is not None
+    assert usage["cost_usd"] == pytest.approx(0.07)  # phase 1 + both phase-3 pages
+    assert usage["prompt_tokens"] == 700
+    (row,) = read_events(workspace)
+    assert row["outcome"] == "error"
+    assert row["cost_usd"] == pytest.approx(0.07)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["phases"]["phase3"]["cost_usd"] == pytest.approx(0.06)
+    assert stats == excinfo.value.stats
+
+
+def test_extract_values_attaches_usage_to_any_dgml_error(workspace: Workspace) -> None:
+    """Not only ValuesExtractionFailed: a FileNotFound raised after the LLM
+    phases (the file was unassigned mid-run) still carries what they cost."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": phase1_values}, cost_usd=0.03)
+
+    def unassign_then_answer(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        DocSetStore(workspace).remove_file(ds_id, fid)
+        return response
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", side_effect=unassign_then_answer):
+        with pytest.raises(FileNotFound, match="no longer assigned") as excinfo:
+            extract_values(workspace, ds_id, fid, config=config)
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage["cost_usd"] == 0.03
+    assert excinfo.value.stats is not None and excinfo.value.stats["outcome"] == "error"
+
+
+def test_extract_values_telemetry_failure_warns_once_per_process(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A broken docstore fails every file the same way; a bulk run logs the
+    first failure as a WARNING with its traceback and the rest at DEBUG."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    response = _tool_call_response("submit_values", {"values": phase1_values})
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.DEBUG, logger="dgml_core.grounded")
+    with (
+        patch("litellm.completion", return_value=response),
+        patch("dgml_core.grounded._write_extraction_stats", side_effect=OSError("disk full")),
+    ):
+        for _ in range(3):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    stats_records = [r for r in caplog.records if "could not write extraction stats" in r.message]
+    assert [r.levelno for r in stats_records] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+    assert stats_records[0].exc_info is not None
 
 
 def test_expand_refs_inlines_definitions(workspace: Workspace) -> None:
@@ -1727,6 +2806,33 @@ def test_expand_refs_chained_definitions() -> None:
     assert expanded["properties"]["a"]["properties"]["v"] == {"type": "string"}
 
 
+def test_phase1_schema_strips_bbox_and_keeps_evidence_flat() -> None:
+    """Phase 1 must not demand bounding boxes, even when the schema has been
+    through JSON (no shared ``locations`` object left to alias). Evidence
+    items carry only a page_number: they ride on every leaf, so a nested
+    locations array there would grow the constrained-decoding state count."""
+    schema = json.loads(json.dumps({"definitions": {"extracted_value": EXTRACTED_VALUE}}))
+    leaf = _drop_bboxes_from_schema(schema)["definitions"]["extracted_value"]["properties"]
+    assert "bounding_box" not in leaf["locations"]["items"]["properties"]
+    assert leaf["locations"]["items"]["required"] == ["page_number"]
+    item = leaf["evidence"]["items"]
+    assert set(item["properties"]) == {"text", "page_number"}
+
+
+def test_normalize_leaf_provenance_turns_evidence_page_into_locations() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "End": {
+            "text": "x",
+            "method": "calculated",
+            "evidence": [{"text": "24 months", "page_number": 2}],
+        }
+    }
+    _normalize_leaf_provenance(values)
+    assert values["End"]["evidence"] == [{"text": "24 months", "locations": [{"page_number": 2}]}]
+
+
 def test_extract_values_phase1_submit_tool_strips_bbox(workspace: Workspace) -> None:
     """Phase 1's ``submit_values`` tool inlines the expanded docset schema
     with ``bounding_box`` stripped from ``extracted_value.locations`` — the
@@ -1758,11 +2864,12 @@ def test_extract_values_phase1_submit_tool_strips_bbox(workspace: Workspace) -> 
     # Schema is expanded and self-contained — no $ref left.
     assert "definitions" not in values_param
     assert "$ref" not in json.dumps(values_param)
-    # The leaf is the merged extracted_value shape — grounded and computed
-    # provenance share one object (no anyOf union).
+    # The leaf is the merged extracted_value shape — every provenance case
+    # (printed, printed in part, unprinted) shares one object (no anyOf union).
     leaf = values_param["properties"]["title"]
-    assert "derived_from" in leaf["properties"]
-    assert "computed" in leaf["properties"]
+    assert "inputs" in leaf["properties"]
+    assert leaf["properties"]["method"]["enum"] == ["calculated", "inferred", "defaulted"]
+    assert "derived_from" not in leaf["properties"] and "computed" not in leaf["properties"]
     assert "value" in leaf["properties"]
     # And crucially: bounding_box is gone from the leaf's locations[].
     location_props = leaf["properties"]["locations"]["items"]["properties"]
@@ -1786,7 +2893,7 @@ def test_extract_values_propagates_schema_not_found(workspace: Workspace) -> Non
 
 
 # ---------------------------------------------------------------------------
-# computed (reasoned) fields — spec §7/§13
+# values the page doesn't print: inputs + method (DGML 0.71)
 
 
 _COMPUTED_RNC = """\
@@ -1811,11 +2918,11 @@ word_count =
 """
 
 
-def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
-    """A computed leaf flows through untouched by phases 2/3 (it carries no
-    locations to ground), serializes with the spec's computed attribute set
-    (dg:origin="computed", dg:value, dg:itemprop/dg:href + xml:id on the
-    source), and is counted separately in extraction_stats.json."""
+def test_extract_values_calculated_field_end_to_end(workspace: Workspace) -> None:
+    """A calculated leaf flows through untouched by phases 2/3 (it carries no
+    locations to ground), serializes with dg:value, dg:inputs (+ xml:id on the
+    input) and dg:method — no dg:origin — and is counted separately in
+    extraction_stats.json."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
@@ -1829,8 +2936,8 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
         "word_count": {
             "text": "2",
             "value": "2",
-            "computed": True,
-            "derived_from": ["title"],
+            "inputs": ["title"],
+            "method": "calculated",
         },
     }
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
@@ -1838,18 +2945,16 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
         "litellm.completion",
         return_value=_tool_call_response("submit_values", {"values": phase1_values}),
     ) as mock_completion:
-        result = extract_values(workspace, ds.id, fid, config=config)
+        result = extract_values(workspace, ds.id, fid, config=config, write_stats=True)
 
-    # One LLM call: phase 2 matched the grounded leaf; the computed leaf
+    # One LLM call: phase 2 matched the grounded leaf; the calculated leaf
     # never became an unmatched item, so no phase 3.
     assert mock_completion.call_count == 1
     assert result.values["word_count"] == phase1_values["word_count"]
 
     xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
-    assert 'dg:origin="computed"' in xml
-    assert 'xsi:type="integer" dg:value="2"' in xml
-    assert 'dg:itemprop="computedFrom"' in xml
-    assert 'dg:href="#title"' in xml
+    assert 'xsi:type="integer" dg:value="2" dg:inputs="#title" dg:method="calculated"' in xml
+    assert "computed" not in xml and "dg:href" not in xml
     assert 'xml:id="title"' in xml
     # Round-trip through the persisted XML reproduces the values tree.
     vocab = parse_rnc(DocSetStore(workspace).get_schema(ds.id))
@@ -1862,8 +2967,16 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
         "matched_phase2": 1,
         "matched_phase3": 0,
         "unmatched": 0,
-        "computed_fields": 1,
-        "dropped_refs": 0,
+        "unprinted_fields": 1,
+        "partly_printed_fields": 0,
+        "dropped_inputs": 0,
+        "unsupported_values": 0,
+        "repaired_inputs": 0,
+        "located_pageless": 0,
+        "dropped_unboxed_values": 0,
+        "dropped_unboxed": [],
+        "rejected_boxes": 0,
+        "snapped_boxes": 0,
         "unnormalized_enum_values": 0,
         "derivations_checked": 0,
         "derivations_mismatched": 0,
@@ -1873,10 +2986,11 @@ def test_extract_values_computed_field_end_to_end(workspace: Workspace) -> None:
     }
 
 
-def test_extract_values_counts_dropped_refs_in_stats(workspace: Workspace) -> None:
-    """A computed leaf whose derived_from references values that were never
+def test_extract_values_counts_dropped_inputs_in_stats(workspace: Workspace) -> None:
+    """An unprinted leaf whose inputs reference values that were never
     extracted still lands in the XML, but the unresolvable entries are
-    counted in stats so the incomplete provenance is visible."""
+    counted in stats so the incomplete provenance is visible. The 0.7 leaf
+    keys (computed/derived_from) are still accepted from the model."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1)
@@ -1900,33 +3014,234 @@ def test_extract_values_counts_dropped_refs_in_stats(workspace: Workspace) -> No
         "litellm.completion",
         return_value=_tool_call_response("submit_values", {"values": phase1_values}),
     ):
-        extract_values(workspace, ds.id, fid, config=config)
+        extract_values(workspace, ds.id, fid, config=config, write_stats=True)
 
     stats = workspace.docs.get_doc("extraction_stats", f"{ds.id}/{fid}")
     assert stats is not None
-    assert stats["matching"]["computed_fields"] == 1
-    assert stats["matching"]["dropped_refs"] == 2
+    assert stats["matching"]["unprinted_fields"] == 1
+    assert stats["matching"]["dropped_inputs"] == 2
+
+
+def test_extract_values_grounds_evidence_into_chunks(workspace: Workspace) -> None:
+    """Evidence (printed text no schema field extracts) is grounded by phase 2
+    like any leaf and lands as a dg:chunk the value names in dg:inputs."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _COMPUTED_RNC)
+    store.add_file(ds.id, fid)
+
+    phase1_values = {
+        "word_count": {
+            "text": "2",
+            "value": "2",
+            "method": "calculated",
+            "evidence": [{"text": "Hello world", "page_number": 1}],
+        },
+    }
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ) as mock_completion:
+        result = extract_values(workspace, ds.id, fid, config=config, write_stats=True)
+
+    assert mock_completion.call_count == 1  # phase 2 boxed the evidence
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert '<dg:chunk xml:id="word_count--in-0" dg:origin="1 ' in xml
+    assert ">Hello world</dg:chunk>" in xml
+    assert 'dg:inputs="#word_count--in-0" dg:method="calculated"' in xml
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds.id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["unprinted_fields"] == 1
+    assert stats["matching"]["dropped_inputs"] == 0
+    assert stats["matching"]["matched_phase2"] == 1
+
+
+def test_normalize_leaf_provenance_keeps_only_groundable_evidence() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "End": {
+            "text": "2028-01-14",
+            "evidence": [
+                {"text": "a term of 24 months", "locations": [{"page_number": 1}]},
+                {"text": "", "locations": [{"page_number": 1}]},  # nothing to match
+                {"text": "no page", "locations": []},  # nowhere to ground it
+                "not an object",
+            ],
+        },
+        # defaulted forbids evidence as it forbids inputs
+        "Grace": {
+            "text": "0",
+            "method": "defaulted",
+            "evidence": [{"text": "x", "locations": [{"page_number": 1}]}],
+        },
+    }
+    _normalize_leaf_provenance(values)
+    assert values["End"] == {
+        "text": "2028-01-14",
+        "evidence": [{"text": "a term of 24 months", "locations": [{"page_number": 1}]}],
+        "method": "inferred",
+    }
+    assert values["Grace"] == {"text": "0", "method": "defaulted"}
+
+
+def test_normalize_leaf_provenance_flat_page_survives_empty_locations() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "End": {
+            "text": "2028-01-14",
+            "method": "calculated",
+            "evidence": [{"text": "a term of 24 months", "page_number": 2, "locations": []}],
+        },
+    }
+    assert _normalize_leaf_provenance(values) == 0
+    assert values["End"]["evidence"] == [
+        {"text": "a term of 24 months", "locations": [{"page_number": 2}]}
+    ]
+
+
+def test_normalize_leaf_provenance_wraps_a_lone_input_path() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "Currency": {"text": "CAD", "method": "inferred", "inputs": "PremisesAddress"},
+    }
+    assert _normalize_leaf_provenance(values) == 0
+    assert values["Currency"] == {
+        "text": "CAD",
+        "method": "inferred",
+        "inputs": ["PremisesAddress"],
+    }
+
+
+def test_extract_values_repairs_a_miscounted_input(workspace: Workspace) -> None:
+    """The slip: the model names the right value at the wrong index.
+    Its cited text points at the one entry that matches, so the input is
+    re-pointed there before serialization and counted as repaired."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(
+        workspace,
+        fid,
+        page=1,
+        words=[
+            {"t": "12.75", "l": [100, 100, 160, 120]},
+            {"t": "58.20", "l": [100, 200, 160, 220]},
+        ],
+    )
+    store = DocSetStore(workspace)
+    ds = store.create(name="Test")
+    store.set_schema(ds.id, _CHARGES_RNC)
+    store.add_file(ds.id, fid)
+
+    phase1_values = {
+        "Bill": {
+            "Items": [
+                {"Amount": {"text": "12.75", "locations": [{"page_number": 1}]}},
+                {"Amount": {"text": "58.20", "locations": [{"page_number": 1}]}},
+            ],
+            "Tax": {
+                "text": "58.20",
+                "value": "58.20",
+                "method": "calculated",
+                "inputs": ["Bill.Items[0].Amount=58.20"],  # right text, wrong index
+            },
+        }
+    }
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ):
+        result = extract_values(workspace, ds.id, fid, config=config, write_stats=True)
+
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert 'dg:inputs="#bill-items-1-amount" dg:method="calculated"' in xml
+    assert result.values["Bill"]["Tax"]["inputs"] == ["Bill.Items[1].Amount"]
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds.id}/{fid}")
+    assert stats is not None
+    assert stats["matching"]["repaired_inputs"] == 1
+    assert stats["matching"]["dropped_inputs"] == 0
+    assert stats["matching"]["derivations_mismatched"] == 0
+
+
+_CHARGES_RNC = """\
+namespace docset = "http://www.dgml.io/ws/Test"
+
+Bill =
+  element docset:Bill {
+    (text | Items | Tax)*
+  }
+
+Items =
+  element docset:Items {
+    Item*
+  }
+
+Item =
+  element docset:Item {
+    (text | Amount)*
+  }
+
+Amount =
+  element docset:Amount {
+    xsd:decimal
+  }
+
+## Prompt: Compute as the sum of the tax line amounts
+Tax =
+  element docset:Tax {
+    xsd:decimal
+  }
+"""
 
 
 # ── Merged-leaf provenance normalization & enum tool-schema specialization ───
 
 
-def test_normalize_leaf_provenance_grounded_wins_over_computed_markers() -> None:
+def test_normalize_leaf_provenance_boxes_plus_inputs_is_partly_printed() -> None:
+    """Locations and inputs together are a value printed in part: both are
+    kept, and the method goes — a boxed value never carries one."""
     from dgml_core.grounded import _normalize_leaf_provenance
 
     values = {
+        "Start": {
+            "text": "3/1",
+            "value": "2026-03-01",
+            "inputs": ["CommencementDate"],
+            "method": "inferred",
+            "locations": [{"page_number": 1}],
+        },
+        # The 0.7 keys read the same way.
         "Title": {
             "text": "hi",
             "computed": True,
             "derived_from": ["Other"],
             "locations": [{"page_number": 1}],
-        }
+        },
     }
     _normalize_leaf_provenance(values)
-    assert values["Title"] == {"text": "hi", "locations": [{"page_number": 1}]}
+    assert values["Start"] == {
+        "text": "3/1",
+        "value": "2026-03-01",
+        "inputs": ["CommencementDate"],
+        "locations": [{"page_number": 1}],
+    }
+    assert values["Title"] == {
+        "text": "hi",
+        "inputs": ["Other"],
+        "locations": [{"page_number": 1}],
+    }
 
 
-def test_normalize_leaf_provenance_computed_drops_empty_locations() -> None:
+def test_normalize_leaf_provenance_unprinted_drops_empty_locations() -> None:
+    """No usable location: the locations key goes, and inputs with no method
+    read as inferred (the safe reading)."""
     from dgml_core.grounded import _normalize_leaf_provenance
 
     values = {
@@ -1936,9 +3251,28 @@ def test_normalize_leaf_provenance_computed_drops_empty_locations() -> None:
     assert values["Total"] == {
         "text": "$5",
         "value": "5",
-        "computed": True,
-        "derived_from": ["Items[0].Amount"],
+        "inputs": ["Items[0].Amount"],
+        "method": "inferred",
     }
+
+
+def test_normalize_leaf_provenance_enforces_method_rules() -> None:
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        # defaulted forbids inputs
+        "Grace": {"text": "0", "method": "defaulted", "inputs": ["Notes"]},
+        # calculated requires inputs: without them the claim is unsupported
+        "Months": {"text": "12", "method": "calculated", "inputs": []},
+        # an unknown method is dropped
+        "Region": {"text": "EMEA", "method": "guessed", "inputs": ["Hq"]},
+        "Kept": {"text": "12", "method": "calculated", "inputs": ["Start", "End"]},
+    }
+    assert _normalize_leaf_provenance(values) == 1  # Months: a claim naming nothing
+    assert values["Grace"] == {"text": "0", "method": "defaulted"}
+    assert values["Months"] == {"text": "12"}
+    assert values["Region"] == {"text": "EMEA", "inputs": ["Hq"], "method": "inferred"}
+    assert values["Kept"] == {"text": "12", "method": "calculated", "inputs": ["Start", "End"]}
 
 
 def test_normalize_leaf_provenance_filters_and_defaults() -> None:
@@ -1952,9 +3286,23 @@ def test_normalize_leaf_provenance_filters_and_defaults() -> None:
     }
     _normalize_leaf_provenance(values)
     assert values["A"] == {"text": "x", "locations": [{"page_number": 1}]}
-    assert values["B"] == {"text": "y", "computed": True, "derived_from": ["ok"]}
+    assert values["B"] == {"text": "y", "inputs": ["ok"], "method": "inferred"}
     assert values["C"] == {"text": "z"}
     assert values["Nested"][0]["D"]["locations"] == [{"page_number": 2}]
+
+
+def test_normalize_leaf_provenance_empty_inputs_keep_legacy_refs() -> None:
+    """A model mixing shapes (``inputs: []`` or ``null`` beside 0.7
+    ``derived_from``) keeps the legacy paths rather than losing them."""
+    from dgml_core.grounded import _normalize_leaf_provenance
+
+    values: dict[str, Any] = {
+        "A": {"text": "x", "inputs": [], "derived_from": ["B"], "computed": True},
+        "C": {"text": "y", "inputs": None, "derived_from": ["B"]},
+    }
+    assert _normalize_leaf_provenance(values) == 0
+    assert values["A"] == {"text": "x", "inputs": ["B"], "method": "inferred"}
+    assert values["C"] == {"text": "y", "inputs": ["B"], "method": "inferred"}
 
 
 def test_expand_refs_specializes_value_enum_and_carries_annotations() -> None:
@@ -2112,7 +3460,7 @@ def test_extract_values_permissive_fallback_on_too_many_states(workspace: Worksp
             _tool_call_response("submit_values", {"values": phase1_values}),
         ],
     ) as mock_completion:
-        result = extract_values(workspace, ds.id, fid, config=config)
+        result = extract_values(workspace, ds.id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 2
     # Retry used the permissive values parameter (no inlined properties).
@@ -2336,7 +3684,7 @@ def test_extract_values_chunked_submission_merges_and_prunes(workspace: Workspac
     ]
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", side_effect=responses) as mock_completion:
-        result = extract_values(workspace, ds.id, fid, config=config)
+        result = extract_values(workspace, ds.id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 4  # truncated attempt + 3 chunked calls
     items = result.values["Bill"]["Items"]
@@ -2418,7 +3766,7 @@ def test_extract_values_truncation_retries_with_chunk_directive(workspace: Works
     ]
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with patch("litellm.completion", side_effect=responses) as mock_completion:
-        result = extract_values(workspace, ds.id, fid, config=config)
+        result = extract_values(workspace, ds.id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 3
 
@@ -2474,7 +3822,7 @@ def test_chunking_tools_are_offered_only_after_truncation(workspace: Workspace) 
         extract_values(workspace, ds.id, fid, config=config)
     call = mock_completion.call_args_list[0]
     # NOTE: get_page_words is never offered — see the dead-dispatch finding in
-    # _run_extract_loop; phase 1 currently exposes submit_values alone.
+    # _phase1_attempt_steps; phase 1 currently exposes submit_values alone.
     assert tool_names(call) == {"submit_values"}
     assert submit_params(call) == {"values", "layout"}  # no `done`
 
@@ -2711,7 +4059,9 @@ def _seed_two_leaves_one_missing_page(
     return ds_id, phase1_values
 
 
-def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Workspace) -> None:
+def test_extract_values_phase3_skips_a_page_the_file_does_not_have(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
     """Phase 1 cited page 2 of a one-page file. Phase 3 still runs for page
     1 (and patches its leaf), makes no call for page 2, keeps the whole
     tree with that leaf unmatched, and counts the page in the stats."""
@@ -2719,6 +4069,7 @@ def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Wo
     ds_id, phase1_values = _seed_two_leaves_one_missing_page(workspace, fid, page_count=1)
     phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
     with patch(
         "litellm.completion",
         side_effect=[
@@ -2726,25 +4077,33 @@ def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Wo
             _tool_call_response("submit_locations", phase3_args, call_id="p3"),
         ],
     ) as mock_completion:
-        result = extract_values(workspace, ds_id, fid, config=config)
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 2  # phase 1, then phase 3 for page 1 only
     assert result.values["title"]["locations"] == [
         {"page_number": 1, "bounding_box": [10, 20, 30, 40]}
     ]
-    assert result.values["subtitle"]["text"] == "Farewell"
-    assert result.values["subtitle"]["locations"] == [{"page_number": 2}]
+    # Cited on a page the file doesn't have, so never boxed: dropped.
+    assert "subtitle" not in result.values
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None and stats["outcome"] == "ok"
     assert stats["phases"]["phase3"]["page_calls"] == 1
     assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
     assert stats["matching"]["matched_phase3"] == 1
     assert stats["matching"]["unmatched"] == 1
+    assert stats["matching"]["dropped_unboxed_values"] == 1
+    assert [line for line in _phase_log(caplog) if "phase 3 (locations)" in line][:2] == [
+        f"file {fid}: phase 3 (locations) skipping 1 items on 1 pages the file does not "
+        "have (it has 1); they stay unmatched",
+        f"file {fid}: phase 3 (locations) starting: 1 items on 1 pages",
+    ]
 
 
 def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
-    workspace: Workspace,
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Every unmatched item is on a page the file lacks, so phase 3 is skipped,
+    and the log says so rather than calling it "not needed"."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid, page_count=1)
     _seed_page_text(workspace, fid, page=1)
@@ -2752,23 +4111,29 @@ def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
     ds_id, _ = _seed_docset_with_schema(workspace, fid)
     phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 3}]}}
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
     with patch(
         "litellm.completion",
         return_value=_tool_call_response("submit_values", {"values": phase1_values}),
     ) as mock_completion:
-        result = extract_values(workspace, ds_id, fid, config=config)
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 1
-    assert result.values["title"]["locations"] == [{"page_number": 3}]
-    # Persisted like any other unresolved leaf: the text is kept, a location
-    # without a box is not written, so it reads back with no locations.
+    # Like any printed value grounding couldn't box, it is dropped rather
+    # than written with no dg:origin.
+    assert "title" not in result.values
     xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
-    assert dgml_xml_to_values(xml)["title"] == {"text": "Hello world", "locations": []}
+    assert dgml_xml_to_values(xml) == {}
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None and stats["outcome"] == "ok"
     assert stats["phases"]["phase3"]["page_calls"] == 0
     assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
     assert stats["matching"]["unmatched"] == 1
+    phase3_log = [line for line in _phase_log(caplog) if "phase 3 (locations)" in line]
+    assert phase3_log == [
+        f"file {fid}: phase 3 (locations) skipping 1 items on 1 pages the file does not "
+        "have (it has 1); they stay unmatched",
+    ]
 
 
 def test_extract_values_phase3_counts_the_dropped_page_even_when_a_page_call_fails(
@@ -2787,7 +4152,7 @@ def test_extract_values_phase3_counts_the_dropped_page_even_when_a_page_call_fai
         ],
     ):
         with pytest.raises(ValuesExtractionFailed, match="phase 3 page 1 call failed"):
-            extract_values(workspace, ds_id, fid, config=config)
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None and stats["outcome"] == "error"
     assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
@@ -2810,7 +4175,7 @@ def test_extract_values_phase3_still_calls_a_page_the_file_has(workspace: Worksp
             _tool_call_response("submit_locations", phase3_args, call_id="p3b"),
         ],
     ) as mock_completion:
-        result = extract_values(workspace, ds_id, fid, config=config)
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 3
     assert result.values["subtitle"]["locations"] == [
@@ -2842,7 +4207,7 @@ def test_extract_values_phase3_still_calls_a_rendered_page_past_a_stale_page_cou
             _tool_call_response("submit_locations", phase3_args, call_id="p3b"),
         ],
     ) as mock_completion:
-        result = extract_values(workspace, ds_id, fid, config=config)
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 3
     assert result.values["subtitle"]["locations"] == [
@@ -2875,7 +4240,7 @@ def test_extract_values_phase3_treats_a_non_positive_page_count_as_unknown(
         return_value=_tool_call_response("submit_values", {"values": phase1_values}),
     ):
         with pytest.raises(ValuesExtractionFailed, match=r"no page image .* page 3"):
-            extract_values(workspace, ds_id, fid, config=config)
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None and stats["outcome"] == "error"
     assert stats["phases"]["phase3"]["pages_out_of_range"] == 0
@@ -3025,6 +4390,552 @@ def test_extract_values_repeats_the_latest_conversion_error(workspace: Workspace
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
     with pytest.raises(ConversionFailed, match=r"converting it failed: second attempt$"):
         extract_values(workspace, ds_id, fid, config=config)
+
+
+# ---------------------------------------------------------------------------
+# submit_values envelope repair (dgml-io/dgml#154, #150)
+# ---------------------------------------------------------------------------
+
+_TITLE_LAYOUT = {"title": {"kind": "free_form"}}
+_TITLE_VOCAB = parse_rnc(_TITLE_RNC)
+# The same schema with its root named after the envelope's own key.
+_VALUES_ROOT_RNC = """\
+namespace dg = "http://dgml.io/ns/dg#"
+namespace docset = "http://www.dgml.io/ws/Test"
+
+start =
+  element dg:chunk {
+    (text | values)*
+  }
+
+values =
+  element docset:values {
+    text
+  }
+"""
+_VALUES_ROOT_VOCAB = parse_rnc(_VALUES_ROOT_RNC)
+
+
+def _hello_title() -> dict[str, Any]:
+    return {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+
+
+def _extract_with_submit_args(
+    workspace: Workspace, args: dict[str, Any]
+) -> tuple[Any, dict[str, Any] | None]:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch("litellm.completion", return_value=_tool_call_response("submit_values", args)):
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    return result, workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(
+            {"values": {"values": _hello_title(), "layout": _TITLE_LAYOUT}},
+            id="envelope-repeated-under-values",
+        ),
+        pytest.param(
+            {"values": {"values": _hello_title()}, "layout": _TITLE_LAYOUT},
+            id="values-nested-layout-beside",
+        ),
+        pytest.param(
+            {
+                "values": json.dumps({"values": _hello_title()})
+                + ', "layout": '
+                + json.dumps(_TITLE_LAYOUT)
+                + " }"
+            },
+            id="values-as-json-string-with-trailing-layout",
+        ),
+    ],
+)
+def test_extract_values_repairs_a_mis_shaped_submit_values(
+    workspace: Workspace, args: dict[str, Any]
+) -> None:
+    """The three envelope shapes seen from Anthropic models carry a complete
+    tree one level down or inside a string. Each is repaired before the tree
+    is read: the value is grounded by phase 2 exactly as a well-formed call
+    would be, the repair is counted in the stats sidecar, and the layout
+    survives wherever the model left it."""
+    result, stats = _extract_with_submit_args(workspace, args)
+    assert result.values["title"]["text"] == "Hello world"
+    assert result.values["title"]["locations"] == [
+        {"page_number": 1, "bounding_box": [100, 210, 290, 242]}
+    ]
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert "<dg:extraction>" in xml and "<dg:extraction/>" not in xml
+    assert stats is not None
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 1
+    assert stats["phase1_layout"] == _TITLE_LAYOUT
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param({"values": {"values": {}, "layout": _TITLE_LAYOUT}}, id="nested-empty"),
+        pytest.param({"values": json.dumps({"values": {}})}, id="string-empty"),
+    ],
+)
+def test_extract_values_unwraps_an_empty_tree_from_an_envelope(
+    workspace: Workspace, args: dict[str, Any]
+) -> None:
+    """An empty tree fits nothing, so the envelope around it is recognized
+    by its keys instead; "nothing found" stays legal inside a mis-shaped call."""
+    result, stats = _extract_with_submit_args(workspace, args)
+    assert result.values == {}
+    assert stats is not None
+    assert stats["outcome"] == "ok"
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 1
+
+
+def test_extract_values_keeps_an_all_null_tree_as_a_legal_outcome(workspace: Workspace) -> None:
+    """A null root is "not extracted" to the serializer, the same as an
+    absent one; it is not a tree that fits nothing."""
+    result, stats = _extract_with_submit_args(workspace, {"values": {"title": None}})
+    assert result.values == {"title": None}
+    assert stats is not None
+    assert stats["outcome"] == "ok"
+
+
+def test_extract_values_does_not_continue_a_single_shot_call_over_a_stray_done(
+    workspace: Workspace,
+) -> None:
+    """``done`` belongs to the chunked protocol; a ``done: false`` the model
+    left inside a nested envelope must not buy it a second turn."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    args = {"values": {"values": _hello_title(), "done": False}}
+    with patch(
+        "litellm.completion", return_value=_tool_call_response("submit_values", args)
+    ) as completion:
+        result = extract_values(workspace, ds_id, fid, config=config)
+    assert result.values["title"]["text"] == "Hello world"
+    assert completion.call_count == 1
+
+
+def test_extract_values_records_a_repair_even_when_the_run_fails_later(
+    workspace: Workspace,
+) -> None:
+    """The count lives in a counter the caller owns, so the error stats of a
+    run that fails after phase 1 still show the repair."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=2)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    # A leaf on page 2, which has no image: phase 3 fails after the repair.
+    tree = {"title": {"text": "Goodnight", "locations": [{"page_number": 2}]}}
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": {"values": tree}}),
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="no page image"):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None
+    assert stats["outcome"] == "error"
+    assert stats["phases"]["phase1"]["envelope_repairs"] == 1
+
+
+def test_phase1_attempt_keeps_the_repair_count_when_a_later_turn_fails(
+    workspace: Workspace,
+) -> None:
+    """The counter the caller owns survives a loop that fails after the
+    repair: a chunked first batch arrives in a nested envelope (repaired,
+    ``done: false`` carried), and the next turn is an unknown tool."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    counters = {"envelope_repairs": 0}
+    first = _tool_call_response(
+        "submit_values", {"values": {"values": _hello_title(), "done": False}}, call_id="p1"
+    )
+    second = _tool_call_response("not_a_tool", {}, call_id="p2")
+    with patch("litellm.completion", side_effect=[first, second]):
+        with pytest.raises(ValuesExtractionFailed):
+            llm.drive(
+                _phase1_attempt_steps(
+                    workspace=workspace,
+                    file_id=fid,
+                    messages=[{"role": "user", "content": "extract"}],
+                    tools=[],
+                    model=DEFAULT_VALUES_MODEL,
+                    api_key=None,
+                    api_base=None,
+                    max_tool_iters=3,
+                    totals=_empty_totals(),
+                    vocab=_TITLE_VOCAB,
+                    counters=counters,
+                    chunked=True,
+                ),
+                _phase1_llm_config(DEFAULT_VALUES_MODEL, None, None, None),
+            )
+    assert counters["envelope_repairs"] == 1
+
+
+def test_run_extract_loop_mid_chunk_text_reply_continues_without_forcing(
+    workspace: Workspace,
+) -> None:
+    """A text-only turn after a recorded ``done: false`` submission is told to
+    continue with ``append_entries`` and is never forced to ``submit_values``:
+    lists merge by concatenation, so a forced full resend would duplicate the
+    entries already recorded."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    counters = {"envelope_repairs": 0, "no_tool_call_retries": 0}
+    first_entry = {"A": {"text": "1"}}
+    second_entry = {"A": {"text": "2"}}
+    responses = [
+        _tool_call_response(
+            "submit_values",
+            {"values": {**_hello_title(), "Items": [first_entry]}, "done": False},
+            call_id="p1",
+        ),
+        *[
+            _no_tool_call_response("Still working.", "stop")
+            for _ in range(_MAX_NO_TOOL_CALL_RETRIES)
+        ],
+        _tool_call_response(
+            "append_entries",
+            {"path": "Items", "entries": [second_entry], "done": True},
+            call_id="p2",
+        ),
+    ]
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
+        args, _, chunk_calls = llm.drive(
+            _phase1_attempt_steps(
+                workspace=workspace,
+                file_id=fid,
+                messages=[{"role": "user", "content": "extract"}],
+                tools=[],
+                model=ANTHROPIC_VALUES_MODEL,
+                api_key=None,
+                api_base=None,
+                max_tool_iters=6,
+                totals=_empty_totals(),
+                vocab=_TITLE_VOCAB,
+                counters=counters,
+                chunked=True,
+            ),
+            _phase1_llm_config(ANTHROPIC_VALUES_MODEL, None, None, None),
+        )
+
+    for _, kwargs in mock_completion.call_args_list:
+        assert "tool_choice" not in kwargs
+    nudges = [
+        m["content"]
+        for m in mock_completion.call_args_list[-1][1]["messages"]
+        if m["role"] == "user" and m["content"] != "extract"
+    ]
+    assert len(nudges) == _MAX_NO_TOOL_CALL_RETRIES
+    assert all("append_entries" in n and "do not resubmit" in n for n in nudges)
+    assert args["values"]["Items"] == [first_entry, second_entry]
+    assert chunk_calls == 2
+    assert counters["no_tool_call_retries"] == _MAX_NO_TOOL_CALL_RETRIES
+
+
+def test_extract_values_records_the_phase1_duration_on_the_refusal(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The duration is captured before the refusal raises, so the error
+    stats carry the phase-1 time (the clock here advances one second per
+    reading)."""
+    import itertools
+    import time
+
+    ticks = itertools.count(start=100.0, step=1.0)
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    bogus = {"values": {"Bogus": {"text": "x", "locations": [{"page_number": 1}]}}}
+    with patch("litellm.completion", return_value=_tool_call_response("submit_values", bogus)):
+        with pytest.raises(ValuesExtractionFailed, match="nothing that fits the schema"):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert stats["phases"]["phase1"]["duration_s"] >= 1.0
+
+
+def test_extract_values_records_phase1_tool_calls_and_layout_on_the_refusal(
+    workspace: Workspace,
+) -> None:
+    """A refused run still reports what phase 1 did: the ``get_page_words``
+    calls it made reach the ``--debug`` usage row, and the layout it
+    submitted reaches the stats sidecar. Both were counted after the refusal
+    raised, so a refused run read ``tool_calls: 0`` and no layout."""
+    from dgml_core.usage import read_events
+
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    bogus = {
+        "values": {"Bogus": {"text": "x", "locations": [{"page_number": 1}]}},
+        "layout": {"pages": [{"page_number": 1, "orientation": "portrait"}]},
+    }
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("get_page_words", {"page": 1}, call_id="c1"),
+            _tool_call_response("get_page_words", {"page": 1}, call_id="c2"),
+            _tool_call_response("submit_values", bogus, call_id="c3"),
+        ],
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="nothing that fits the schema"):
+            extract_values(
+                workspace, ds_id, fid, config=config, record_usage=True, write_stats=True
+            )
+    (event,) = read_events(workspace)
+    assert event["outcome"] == "error"
+    assert event["context"]["tool_calls"] == 2
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert stats["phase1_layout"] == bogus["layout"]
+
+
+def test_extract_values_names_the_keys_it_refused_and_how_many_more(workspace: Workspace) -> None:
+    values = {f"Bogus{i}": {"text": "x", "locations": [{"page_number": 1}]} for i in range(8)}
+    with pytest.raises(ValuesExtractionFailed, match=r"'Bogus5' and 2 more, expected roots"):
+        _extract_with_submit_args(workspace, {"values": values})
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param({"Bogus": {"text": "x", "locations": [{"page_number": 1}]}}, id="no-root"),
+        pytest.param({"title": "Hello world"}, id="root-with-wrong-shape"),
+    ],
+)
+def test_extract_values_refuses_a_tree_nothing_of_which_fits_the_schema(
+    workspace: Workspace, values: dict[str, Any]
+) -> None:
+    """A key that names no root, or a root whose value has the wrong shape,
+    is dropped at serialization; a tree made only of those would be written
+    as an empty extraction reported as success, the silent failure behind
+    #154. Refuse it by name instead, on the ordinary inlined path too, and
+    record the error in the stats sidecar."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    response = _tool_call_response("submit_values", {"values": values})
+    with patch("litellm.completion", return_value=response):
+        with pytest.raises(ValuesExtractionFailed, match=r"nothing that fits the schema.*'title'"):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert workspace.blobs.blob_exists(layout.dgml_xml_key(ds_id, fid, "doc")) is False
+
+
+def test_extract_values_refuses_a_tree_pruned_to_nothing_in_permissive_mode(
+    workspace: Workspace,
+) -> None:
+    """Permissive mode prunes code-side; the same refusal applies there."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            Exception("BadRequestError: The specified schema produces too many states for serving"),
+            _tool_call_response("submit_values", {"values": {"title": "Hello world"}}),
+        ],
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="nothing that fits the schema"):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+
+
+def test_extract_values_keeps_an_empty_tree_as_a_legal_outcome(workspace: Workspace) -> None:
+    """A model that finds nothing submits an empty object; that is not the
+    failure above and must still write the (empty) extraction."""
+    result, stats = _extract_with_submit_args(workspace, {"values": {}})
+    assert result.values == {}
+    assert stats is not None and stats["outcome"] == "ok"
+
+
+def test_extract_values_still_fails_loudly_on_a_string_it_cannot_decode(
+    workspace: Workspace,
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    bad = {"values": '{"title": {"text": "Hello world"}} trailing prose'}
+    with patch("litellm.completion", return_value=_tool_call_response("submit_values", bad)):
+        with pytest.raises(ValuesExtractionFailed, match="without a 'values' object"):
+            extract_values(workspace, ds_id, fid, config=config)
+
+
+def test_repair_never_touches_a_tree_the_schema_keeps() -> None:
+    """The decision is by shape. A tree that fits is left alone even when its
+    root is literally called ``values``; the same object under a schema it
+    does not fit is the nested envelope."""
+    leaf = {"text": "x", "locations": [{"page_number": 1}]}
+    args = {"values": {"values": leaf}}
+    assert _repair_submit_values_args(args, _VALUES_ROOT_VOCAB) == (args, None)
+    nested = {"values": {"values": {"title": leaf}}}
+    assert _repair_submit_values_args(nested, _TITLE_VOCAB)[1] == "nested"
+
+
+def test_repair_reads_a_string_bare_tree_rooted_at_values_as_the_tree() -> None:
+    args = {"values": '{"values": {"text": "x", "locations": [{"page_number": 1}]}}'}
+    repaired, label = _repair_submit_values_args(args, _VALUES_ROOT_VOCAB)
+    assert label == "string"
+    assert repaired["values"] == {"values": {"text": "x", "locations": [{"page_number": 1}]}}
+
+
+_VALUES_AND_CHILD_RNC = """\
+namespace dg = "http://dgml.io/ns/dg#"
+namespace docset = "http://www.dgml.io/ws/Test"
+
+start =
+  element dg:chunk {
+    (text | values | title)*
+  }
+
+values =
+  element docset:values {
+    (text | title)*
+  }
+
+title =
+  element docset:title {
+    text
+  }
+"""
+
+
+def test_repair_refuses_a_string_both_readings_of_which_fit() -> None:
+    """A schema that names both a ``values`` container and its child as
+    roots makes a stringified bare ``values`` tree ambiguous: the whole
+    object fits, and so does its ``values`` member. No guess is made; the
+    call fails loudly as it does today."""
+    vocab = parse_rnc(_VALUES_AND_CHILD_RNC)
+    assert {tag.name for tag in vocab.roots} == {"values", "title"}
+    args = {"values": '{"values": {"title": {"text": "x", "locations": [{"page_number": 1}]}}}'}
+    assert _repair_submit_values_args(args, vocab) == (args, None)
+
+
+def test_repair_leaves_a_string_that_is_not_an_object_alone() -> None:
+    args = {"values": "not json at all"}
+    assert _repair_submit_values_args(args, _TITLE_VOCAB) == (args, None)
+
+
+def test_repair_refuses_a_string_envelope_it_cannot_fully_decode() -> None:
+    args = {"values": '{"values": {"title": {"text": "x"}}} and then some prose'}
+    assert _repair_submit_values_args(args, _TITLE_VOCAB) == (args, None)
+
+
+def test_repair_keeps_the_done_flag_that_trails_a_string_envelope() -> None:
+    """A chunked first batch serialized as a string, closed one brace early:
+    the trailing ``done: false`` must survive or the loop would stop after
+    the first batch and silently drop the append_entries that follow."""
+    args = {"values": '{"values": {"title": {"text": "1"}}}, "done": false }'}
+    repaired, label = _repair_submit_values_args(args, _TITLE_VOCAB, chunked=True)
+    assert label == "string"
+    assert repaired == {"values": {"title": {"text": "1"}}, "done": False}
+
+
+def test_repair_prefers_the_call_s_own_layout_over_the_string_s() -> None:
+    args = {
+        "values": '{"values": {"title": {"text": "x"}}, "layout": {"title": {"kind": "list"}}}',
+        "layout": _TITLE_LAYOUT,
+    }
+    repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert repaired["layout"] == _TITLE_LAYOUT
+
+
+def test_repair_carries_envelope_fields_by_validity() -> None:
+    """An outer field of the wrong type does not shadow a valid inner one:
+    ``done: "false"`` is a truthy string that would end a chunked run."""
+    args = {
+        "values": {"values": {"title": {"text": "x"}}, "done": False, "layout": _TITLE_LAYOUT},
+        "done": "false",
+        "layout": None,
+    }
+    repaired, label = _repair_submit_values_args(args, _TITLE_VOCAB, chunked=True)
+    assert label == "nested"
+    assert repaired == {"values": {"title": {"text": "x"}}, "done": False, "layout": _TITLE_LAYOUT}
+
+
+def test_repair_prefers_a_valid_inner_layout_over_an_invalid_outer_one() -> None:
+    """Validity, not presence, decides: an outer ``layout`` of unknown
+    descriptors must not shadow the usable one inside the envelope."""
+    inner_layout = {"Items": {"kind": "table", "columns": ["Amount"]}}
+    args = {
+        "values": {"values": _hello_title(), "layout": inner_layout},
+        "layout": {"Items": {"kind": "scalar"}},
+    }
+    repaired, label = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert label == "nested"
+    assert repaired["layout"] == inner_layout
+
+
+def test_repair_prefers_a_populated_inner_layout_over_an_empty_outer_one() -> None:
+    """An empty ``layout: {}`` describes no array, so it does not shadow the
+    populated layout inside the envelope; phase 2 would otherwise lose the
+    table's column order."""
+    inner_layout = {"Items": {"kind": "table", "columns": ["Amount"]}}
+    args = {"values": {"values": _hello_title(), "layout": inner_layout}, "layout": {}}
+    repaired, label = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert label == "nested"
+    assert repaired["layout"] == inner_layout
+
+
+def test_repair_carries_no_layout_when_both_copies_are_empty() -> None:
+    args = {"values": {"values": _hello_title(), "layout": {}}, "layout": {}}
+    repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert "layout" not in repaired
+
+
+def test_repair_carries_a_string_bare_tree_s_layout_out_as_an_envelope_field() -> None:
+    text = json.dumps({**_hello_title(), "layout": _TITLE_LAYOUT})
+    repaired, label = _repair_submit_values_args({"values": text}, _TITLE_VOCAB)
+    assert label == "string"
+    assert repaired["values"]["title"] == _hello_title()["title"]
+    assert repaired["layout"] == _TITLE_LAYOUT
+
+
+def test_repair_carries_done_only_under_the_chunked_protocol() -> None:
+    args = {"values": {"values": _hello_title(), "done": False}}
+    repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB)
+    assert "done" not in repaired
+    repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB, chunked=True)
+    assert repaired["done"] is False
+
+
+def test_repair_rejects_a_layout_whose_descriptor_has_the_wrong_shape() -> None:
+    """A descriptor with a string ``columns`` or an unknown key is not a
+    layout, so it does not shadow the valid one inside the envelope."""
+    inner = {"Items": {"kind": "table", "columns": ["Amount"]}}
+    for outer in (
+        {"Items": {"kind": "table", "columns": "Amount"}},
+        {"Items": {"kind": "table", "columns": ["Amount"], "rows": 3}},
+        {"Items": "table"},
+    ):
+        args = {"values": {"values": _hello_title(), "layout": inner}, "layout": outer}
+        repaired, _ = _repair_submit_values_args(args, _TITLE_VOCAB)
+        assert repaired["layout"] == inner, outer
 
 
 def test_pdf_bytes_reads_a_source_stored_with_an_uppercase_suffix(

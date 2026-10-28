@@ -24,7 +24,7 @@ from typing import cast
 
 import torch
 
-from clustering.config.schema import ManifoldConfig
+from clustering.config.schema import ManifoldConfig, ManifoldName
 from clustering.manifolds.base import ManifoldHead, register_manifold
 
 _EPS = 1e-6
@@ -100,6 +100,6 @@ class SphericalHead(ManifoldHead):
         return origin
 
 
-@register_manifold("spherical")
+@register_manifold(ManifoldName.SPHERICAL)
 def _factory(cfg: ManifoldConfig) -> ManifoldHead:
     return SphericalHead(cfg)

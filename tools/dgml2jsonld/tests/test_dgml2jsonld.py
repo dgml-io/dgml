@@ -202,6 +202,67 @@ def test_itemprop_href_multi_valued() -> None:
     ]
 
 
+def test_itemprop_href_semicolon_list() -> None:
+    """A "#a; #b" list is two targets, not "#a;" and "#b" (spec §8)."""
+    result = parse("""\
+        <dg:chunk xmlns:dg="http://dgml.io/ns/dg#"
+                  xmlns:docset="http://dgml.io/x/y#">
+          <docset:QuarterlyRevenue
+              dg:itemprop="aggregates"
+              dg:href="#monthly-1; #monthly-2;#monthly-3">$300,000</docset:QuarterlyRevenue>
+        </dg:chunk>
+    """)
+    quarterly = result["@graph"][0]["children"][0]
+    assert quarterly["aggregates"] == [
+        {"@id": "#monthly-1"},
+        {"@id": "#monthly-2"},
+        {"@id": "#monthly-3"},
+    ]
+
+
+def test_inputs_export_as_a_list_of_ids() -> None:
+    """dg:inputs becomes "dg:inputs": [{"@id": ...}, ...] — a list even for
+    one input — and stays out of attributes; dg:method stays an attribute
+    (spec Appendix A.2)."""
+    result = parse("""\
+        <dg:chunk xmlns:dg="http://dgml.io/ns/dg#"
+                  xmlns:docset="http://dgml.io/x/y#">
+          <docset:InvoiceTotal dg:value="349.85"
+              dg:inputs="#ln1-qty; #ln1-price; 5kqt9r5fowno#ln2-qty"
+              dg:method="calculated">$349.85</docset:InvoiceTotal>
+          <docset:PeriodStart dg:value="2026-03-01" dg:origin="2 410 980 520 1025"
+              dg:inputs="#commencement-date">3/1</docset:PeriodStart>
+        </dg:chunk>
+    """)
+    total, start = result["@graph"][0]["children"]
+    assert total["dg:inputs"] == [
+        {"@id": "#ln1-qty"},
+        {"@id": "#ln1-price"},
+        {"@id": "5kqt9r5fowno#ln2-qty"},
+    ]
+    assert total["attributes"] == {"dg:value": "349.85", "dg:method": "calculated"}
+    assert start["dg:inputs"] == [{"@id": "#commencement-date"}]
+    assert start["attributes"]["dg:origin"] == "2 410 980 520 1025"
+
+
+def test_legacy_computed_element_reads_as_inputs() -> None:
+    """A 0.7 dg:origin="computed" element exports in its 0.71 reading: no
+    origin, its dg:href targets as dg:inputs, no computedFrom link (spec
+    Appendix C)."""
+    result = parse("""\
+        <dg:chunk xmlns:dg="http://dgml.io/ns/dg#"
+                  xmlns:docset="http://dgml.io/x/y#">
+          <docset:DSCRCheck dg:origin="computed" dg:value="1.71"
+              dg:itemprop="computedFrom"
+              dg:href="#noi; #debt-service">1.71</docset:DSCRCheck>
+        </dg:chunk>
+    """)
+    check = result["@graph"][0]["children"][0]
+    assert check["dg:inputs"] == [{"@id": "#noi"}, {"@id": "#debt-service"}]
+    assert "computedFrom" not in check
+    assert check["attributes"] == {"dg:value": "1.71"}
+
+
 def test_itemprop_href_empty_element() -> None:
     result = parse("""\
         <dg:chunk xmlns:dg="http://dgml.io/ns/dg#"

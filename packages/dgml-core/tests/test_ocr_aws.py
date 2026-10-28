@@ -149,7 +149,7 @@ def test_aws_extract_writes_per_page_json(
 
 
 def test_aws_extract_requires_page_images(
-    aws_config: Workspace, text_pdf: Path, tmp_path: Path
+    aws_config: Workspace, text_pdf: Path, tmp_path: Path, offline_aws: None
 ) -> None:
     cfg = OcrConfig(provider=OcrProviderName.AWS, options={"region": "us-east-1"})
     with pytest.raises(OcrFailed, match="no page images"):

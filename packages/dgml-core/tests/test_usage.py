@@ -19,6 +19,7 @@ from dgml_core import layout
 from dgml_core.storage import Workspace
 from dgml_core.usage import (
     UsageEvent,
+    UsageOutcome,
     add_partial,
     extract_cost_and_tokens,
     read_events,
@@ -44,7 +45,7 @@ def test_record_usage_appends_and_read_back(workspace: Workspace) -> None:
             completion_tokens=20,
             total_tokens=120,
             duration_s=0.5,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
             context={"file_id": "abc"},
         ),
     )
@@ -59,7 +60,7 @@ def test_record_usage_appends_and_read_back(workspace: Workspace) -> None:
             completion_tokens=None,
             total_tokens=None,
             duration_s=2.1,
-            outcome="error",
+            outcome=UsageOutcome.ERROR,
             context={"from_file_ids": ["a", "b"]},
             error="ValueError: nope",
         ),
@@ -119,7 +120,7 @@ def test_record_usage_swallows_write_errors(workspace: Workspace) -> None:
             completion_tokens=None,
             total_tokens=None,
             duration_s=0.0,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
         ),
     )
 
@@ -281,7 +282,7 @@ def test_cache_tokens_round_trip_to_usage_jsonl(workspace: Workspace) -> None:
             completion_tokens=100,
             total_tokens=2100,
             duration_s=1.0,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
             cache_read_tokens=1500,
             cache_creation_tokens=500,
         ),
@@ -297,7 +298,7 @@ def test_cache_tokens_round_trip_to_usage_jsonl(workspace: Workspace) -> None:
             completion_tokens=None,
             total_tokens=None,
             duration_s=0.2,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
         ),
     )
     events = read_events(workspace)
@@ -395,3 +396,56 @@ def test_add_partial_leaves_none_when_all_contributions_none() -> None:
     )
     assert acc["cost_usd"] is None
     assert acc["prompt_tokens"] is None
+
+
+def test_concurrent_appends_keep_every_row(workspace: Workspace) -> None:
+    """Rows appended from a thread pool all reach ``usage.jsonl``. Before the
+    store serialized its appends, Windows lost one to four of 24 on every run
+    here (append mode is not an atomic append there); POSIX hides the race."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(i: int) -> None:
+        record_usage(
+            workspace,
+            UsageEvent(
+                at="2026-10-04T00:00:00Z",
+                operation="probe",
+                model="m",
+                cost_usd=0.0,
+                prompt_tokens=i,
+                completion_tokens=0,
+                total_tokens=i,
+                duration_s=0.0,
+                outcome=UsageOutcome.OK,
+                context={"i": i},
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(one, range(48)))
+
+    events = read_events(workspace)
+    assert sorted(e["context"]["i"] for e in events) == list(range(48))
+
+
+def test_concurrent_appends_through_separate_stores_keep_every_row(workspace: Workspace) -> None:
+    """Two store instances on one workspace root append at once and lose
+    nothing. This is what concurrent first access to ``Workspace.docs`` can
+    produce: ``functools.cached_property`` no longer serializes it (3.12+),
+    so two threads can each build a store, and a lock per instance would not
+    cover the pair. The lock is per process."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dgml_core.storage_local import LocalStore
+    from dgml_core.storage_service import StorageConfig
+
+    config = StorageConfig(provider="dgml_core.storage_local:LocalStore", root=workspace.root)
+    stores = [LocalStore(config) for _ in range(2)]
+
+    def one(i: int) -> None:
+        stores[i % 2].append_doc(layout.Collection.USAGE, {"i": i})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(one, range(48)))
+
+    assert sorted(e["i"] for e in read_events(workspace)) == list(range(48))

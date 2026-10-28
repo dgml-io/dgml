@@ -42,7 +42,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
-from clustering.config.schema import ConsolidationConfig, ConsolidationSelectorConfig
+from clustering.config.schema import (
+    ConsolidationApply,
+    ConsolidationConfig,
+    ConsolidationMode,
+    ConsolidationSelectorConfig,
+    SelectorStrategy,
+)
 from clustering.scenarios.base import ScenarioResult
 
 if TYPE_CHECKING:
@@ -103,7 +109,7 @@ class Adjudicator(Protocol):
         dataset: DocumentDataset,
         requests: list[AdjudicationRequest],
         *,
-        mode: str,
+        mode: ConsolidationMode,
         batch_size: int,
     ) -> dict[str, AdjudicationVerdict]: ...
 
@@ -168,7 +174,7 @@ class TailSelection:
     """
 
     indices: list[int]
-    strategy: str
+    strategy: SelectorStrategy
     notes: list[str] = field(default_factory=list)
 
 
@@ -199,13 +205,17 @@ def select_low_confidence_tail(
     notes: list[str] = []
     strategy = cfg.strategy
 
-    if strategy == "noise":
+    if strategy == SelectorStrategy.NOISE:
         # Nothing to add: the include_noise union below *is* this strategy.
         pass
-    elif strategy == "confidence" and cfg.confidence_threshold is not None:
+    elif strategy == SelectorStrategy.CONFIDENCE and cfg.confidence_threshold is not None:
         thr = float(cfg.confidence_threshold)
         selected.update(i for i in range(n) if _conf_or_low(conf, i) < thr)
-    elif strategy == "margin" and cfg.margin_threshold is not None and result.scores is not None:
+    elif (
+        strategy == SelectorStrategy.MARGIN
+        and cfg.margin_threshold is not None
+        and result.scores is not None
+    ):
         selected.update(_margin_selected(result.scores, float(cfg.margin_threshold)))
     else:
         # Bottom-quantile by confidence — the default, and where a 'margin'
@@ -219,9 +229,9 @@ def select_low_confidence_tail(
         # still enters the tail. A full cut (``quantile >= 1``) selects every
         # document deterministically, so it is exempt: nothing arbitrary about
         # "adjudicate all".
-        if strategy == "margin":
+        if strategy == SelectorStrategy.MARGIN:
             notes.append(_MARGIN_DEGRADED_NOTE)
-        strategy = "quantile"
+        strategy = SelectorStrategy.QUANTILE
         q = float(cfg.quantile)
         if q >= 1.0 or _confidence_spread(conf, n) >= _MIN_CONFIDENCE_SPREAD:
             selected.update(_quantile_selected(result, q))
@@ -358,7 +368,7 @@ def consolidate(
             result,
             {
                 "enabled": True,
-                "strategy": tail.strategy,
+                "strategy": str(tail.strategy),
                 "n_selected": 0,
                 "notes": tail.notes or ["empty tail"],
             },
@@ -384,7 +394,7 @@ def consolidate(
             result,
             {
                 "enabled": True,
-                "strategy": tail.strategy,
+                "strategy": str(tail.strategy),
                 "n_selected": len(requests),
                 "notes": tail.notes,
                 "error": f"{type(exc).__name__}: {exc}",
@@ -450,7 +460,7 @@ def _apply_verdicts(
                 "rationale": verdict.rationale,
             }
         )
-        if cfg.apply == "auto":
+        if cfg.apply == ConsolidationApply.AUTO:
             corrections[req.doc_id] = new_label
             if verdict.confidence is not None:
                 new_conf[i] = verdict.confidence
@@ -468,9 +478,9 @@ def _apply_verdicts(
 
     meta: dict[str, Any] = {
         "enabled": True,
-        "mode": cfg.mode,
-        "apply": cfg.apply,
-        "strategy": tail.strategy,
+        "mode": str(cfg.mode),
+        "apply": str(cfg.apply),
+        "strategy": str(tail.strategy),
         "consolidated_by": "llm",
         "model": cfg.model,
         "n_selected": len(requests),
@@ -480,7 +490,7 @@ def _apply_verdicts(
         "verdicts": records,
     }
 
-    if cfg.apply == "auto" and corrections:
+    if cfg.apply == ConsolidationApply.AUTO and corrections:
         # ``refine`` applies the {doc_id: label} corrections — scenarios may
         # override it to do more (e.g. recompute prototypes) — and copies
         # confidence/review verbatim, so the updated columns are layered on top

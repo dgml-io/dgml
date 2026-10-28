@@ -10,7 +10,7 @@ The third is **document order with graph semantics**. Most graph formats treat d
 
 The fourth is **attestation**: **Proof of Origin at the data-element level**. Every DGMLX package is tamper-evident — any alteration to its content breaks its cryptographic hash. The deeper innovation is that this hashing isn't limited to the whole document: because the semantic tree is structured, any XML element subtree — a single data point, a payment term, a liability cap — can be hashed and anchored on an external chain independently, proving its origin without producing the entire document.
 
-This repository is the **Python reference implementation**: the CLI, the PDF→DGML pipeline, ML clustering, on-chain attestation, DOCX/XLSX→PDF translators, and evaluation tooling. The format specification itself lives in the parallel [`dgml-spec`](https://github.com/dgml-io/dgml-spec) repo.
+This repository is the **Python reference implementation**: the CLI, the PDF→DGML pipeline, ML clustering, on-chain attestation, DOCX/XLSX/PPTX→PDF translators, and evaluation tooling. The format specification itself lives in the parallel [`dgml-spec`](https://github.com/dgml-io/dgml-spec) repo.
 
 License: **Apache 2.0**.
 
@@ -39,15 +39,20 @@ will work too.)
 
 See [CLAUDE.md](CLAUDE.md) for the full workspace/package layout and contributor conventions.
 
+For bulk and overnight runs, `docset generate --batch` sends model calls
+through the provider's batch API at half price, with results within 24 hours
+(Anthropic). See [`docs/batch-mode.md`](docs/batch-mode.md) for what batches,
+what doesn't, and when to use it.
+
 ## Repository layout
 
 | Path | What's there |
 |---|---|
 | [`get-started/`](get-started) | Hands-on walkthrough guide — **start here**. |
-| [`packages/`](packages) | UV workspace members: `dgml` (the CLI), `dgml-core` (the library — PDF→DGML pipeline, OCR, rendering, generation, grounding, storage), `clustering` (`dgml-clustering`, ML document clustering), `dgml-chain` (blockchain staking/attestation), `translators-pdf` (translates other formats, e.g. DOCX, XLSX, to PDF so they can flow through the same PDF→DGML pipeline). |
+| [`packages/`](packages) | UV workspace members: `dgml` (the CLI), `dgml-core` (the library — PDF→DGML pipeline, OCR, rendering, generation, grounding, storage), `clustering` (`dgml-clustering`, ML document clustering), `dgml-chain` (blockchain staking/attestation), `translators-pdf` (translates other formats, e.g. DOCX, XLSX, PPTX, to PDF so they can flow through the same PDF→DGML pipeline). |
 | [`tools/`](tools) | Standalone, dependency-light CLIs for working with DGML XML directly: [`dgml2html`](tools/dgml2html) (render as styled HTML), [`dgml2jsonld`](tools/dgml2jsonld) (convert to JSON-LD/XAST), [`dgml4models`](tools/dgml4models) (strip layout attributes before sending to an LLM), [`rnc2jsonld`](tools/rnc2jsonld) (convert a docset's RNC schema to a JSON-LD vocabulary). |
 | [`docs/`](docs) | Long-form docs: CLI reference, on-disk storage layout, conversion, OCR providers, Merkle attestation, blockchain chaining quickstart, clustering quickstarts. |
-| [`app-sample/`](app-sample) | Single-file sample web app for browsing and rendering DGML documents. |
+| [`samples/`](samples) | Samples built on DGML: [`app-sample`](samples/app-sample) (single-file web app for browsing and rendering DGML documents) and [`dgml-sample-service`](samples/dgml-sample-service) (multi-tenant FastAPI + Postgres + S3 service that embeds `dgml-core` as a library, with a React frontend). |
 | [`scripts/`](scripts) | Repo-wide dev scripts — `verify.sh` mirrors what CI runs; also rendering/grounding utilities. |
 | [`.github/workflows/`](.github/workflows) | CI: lint, type-check, test, license audit. |
 

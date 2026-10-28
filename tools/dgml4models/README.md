@@ -22,6 +22,10 @@ No dependencies beyond the Python standard library.
 
 These attributes are for grounding and rendering — not for reasoning. Removing them reduces token count without losing any semantic content.
 
+The stripped file is for reasoning, not verification: without `dg:origin`, a
+value printed in part (boxes plus `dg:inputs`) reads like an inferred one, and a
+printed value like an unsupported one. Keep the original for checking provenance.
+
 ## What Is Preserved
 
 Everything a model needs to reason over the document:
@@ -30,6 +34,7 @@ Everything a model needs to reason over the document:
 - `dg:value` — normalized machine-readable values
 - `xsi:type` — type annotations (`date`, `decimal`, `integer`, …)
 - `dg:itemprop` / `dg:href` — named semantic links between elements
+- `dg:inputs` / `dg:method` — what a value was produced from, and how (DGML 0.71)
 - `xml:id` — element identifiers used by cross-references
 - All text content
 - All namespace declarations

@@ -25,6 +25,7 @@ import re
 from . import layout
 from .docsets import DocSetStore
 from .files import FileStore
+from .pages import page_number_from_image_name
 from .storage import Workspace
 
 # Every code point XML 1.0 forbids in character data, as lxml enforces it:
@@ -75,15 +76,52 @@ def xml_safe(text: str) -> str:
 
 
 def gather_file_pages(workspace: Workspace, file_id: str, max_pages: int) -> list[bytes]:
-    """Read up to ``max_pages`` rendered page-image PNG bytes for ``file_id``.
+    """Read up to ``max_pages`` rendered page-image bytes (each a JPEG or a
+    PNG) for ``file_id``.
 
     Returns an empty list when the page-images directory is missing or empty.
     Callers decide what that means in their context (e.g. classification
     soft-fails; a future OCR helper may treat it as a precondition).
     """
     prefix = layout.file_pages_prefix(file_id)
-    keys = workspace.blobs.list_blobs(prefix)[:max_pages]
+    # Page order, not key order: keys sort 'page_10' before 'page_2'.
+    numbered = [
+        (number, key)
+        for key in workspace.blobs.list_blobs(prefix)
+        if (number := page_number_from_image_name(key.rsplit("/", 1)[-1])) is not None
+    ]
+    keys = [key for _, key in sorted(numbered)][:max_pages]
     return [workspace.blobs.get_blob(k) for k in keys]
+
+
+def page_image_key(workspace: Workspace, file_id: str, page: int) -> str | None:
+    """The key of page ``page``'s stored image, or ``None`` when there is none.
+
+    A page is stored as a JPEG or a PNG, whichever was smaller, so this probes
+    both extensions. PNG is probed first: text pages (the common case) encode
+    smaller as PNG, and a file added before that change is all PNG, so most
+    lookups cost one existence check — a round trip on a remote store. A caller
+    that goes on to read the image should use :func:`read_page_image` instead.
+    """
+    for ext in layout.PAGE_IMAGE_EXTS:
+        key = layout.file_page_image_key(file_id, page, ext)
+        if workspace.blobs.blob_exists(key):
+            return key
+    return None
+
+
+def read_page_image(workspace: Workspace, file_id: str, page: int) -> tuple[str, bytes] | None:
+    """``(key, bytes)`` of page ``page``'s stored image, or ``None`` when there
+    is none. Probes in :func:`page_image_key`'s order, but by reading each
+    candidate rather than checking that it exists first, so a caller that needs
+    the bytes saves a round trip per lookup on a remote store."""
+    for ext in layout.PAGE_IMAGE_EXTS:
+        key = layout.file_page_image_key(file_id, page, ext)
+        try:
+            return key, workspace.blobs.get_blob(key)
+        except FileNotFoundError:
+            continue
+    return None
 
 
 def page_text_keys(workspace: Workspace, file_id: str, text_view: str) -> list[str]:

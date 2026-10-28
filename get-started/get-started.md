@@ -205,7 +205,8 @@ uv run dgml file add "dgml-spec/samples/1-NonTraded-NAV-REITs/files" --recursive
 Behind the scenes, DGML performs the following tasks per PDF:
 1. Copies the file into `<workspace>/files/<file_id>/`.
 2. Computes the SHA-256 hash of the bytes.
-3. Renders each page into a high-resolution (300 DPI) PNG under `page_images/`.
+3. Renders each page at 300 DPI and stores it under `page_images/` as a PNG or a JPEG,
+   whichever is smaller, with the longest edge fit between 1000 and 3508 pixels.
 4. Extracts per-page text layout word boxes using `pdfminer.six` and stores them as JSON under `page_text/`.
 
 *Tip: on a large corpus, rendering is the slowest step. Add `--dpi 150` to halve
@@ -342,7 +343,7 @@ Before anchoring anything, it helps to understand the two LLM-backed processing 
 
 **Generation** (`dgml docset generate`, used in Phase 1) transcribes the *whole* document into a semantic XML tree — every clause, table, and value typed, labeled with the DocSet's shared vocabulary, and grounded to its source-page position (`dg:origin`). Use it when the full document needs to stay queryable and verifiable.
 
-**Extraction** (`dgml extraction …`) pulls a *defined set of fields* out of a document against an extraction schema, and grounds each value back to the source page. The schema can be proposed by an LLM (`dgml extraction generate-schema <docset_id>`) or supplied by you (`set-schema`); `dgml extraction extract <docset_id> <file_id>` then writes the values as a `dg:extraction` element **inside the file's core `<stem>.dgml.xml`** — there is no separate values file. It uses the `grounded` config section (§1.4). See the [extraction commands](../docs/cli-reference.md#extraction-commands) for details.
+**Extraction** (`dgml extraction …`) pulls a *defined set of fields* out of a document against an extraction schema, and grounds each value back to the source page. The schema can be proposed by an LLM (`dgml extraction generate-schema <docset_id>`) or supplied by you (`set-schema`); `dgml extraction extract <docset_id> <file_id>` (for a file already assigned to that DocSet) then writes the values as a `dg:extraction` element **inside the file's core `<stem>.dgml.xml`** — there is no separate values file. It uses the `grounded` config section (§1.4). See the [extraction commands](../docs/cli-reference.md#extraction-commands) for details.
 
 When to use which:
 

@@ -190,7 +190,7 @@ def run_clustering_detailed(
     overrides: dict[str, Any] | None = None,
     cache_dir: Path | None = None,
     classification_config: ClassificationConfig | None = None,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> dict[str, DocPrediction]:
     """Cluster ``dataset`` and return ``{doc_id: DocPrediction}``.
 
@@ -219,8 +219,8 @@ def run_clustering_detailed(
     over the low-confidence tail (see :mod:`dgml_core.consolidation`). It is
     only consulted when the resolved config also sets
     ``scenario.consolidation.enabled``; without it — or without a usable model
-    / API key — the run stays purely embedding-based. ``debug`` is forwarded to
-    that pass's LLM calls and is otherwise unused.
+    / API key — the run stays purely embedding-based. ``record_usage`` is
+    forwarded to that pass's LLM calls and is otherwise unused.
     """
     if n_samples_per_category < 0:
         raise ValueError(f"n_samples_per_category must be >= 0; got {n_samples_per_category}.")
@@ -260,7 +260,7 @@ def run_clustering_detailed(
                 classification_config,
                 model=consolidation.model or classification_config.model,
             ),
-            debug=debug,
+            record_usage=record_usage,
         )
         result = scenario.consolidate(result, dataset, adjudicator)
 

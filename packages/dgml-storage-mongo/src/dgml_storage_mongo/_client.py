@@ -41,6 +41,15 @@ WORKSPACES_URI_ENV = "DGML_WORKSPACES_MONGO_URI"
 #: database — never a credential.
 IDENTITY_FIELDS = frozenset({"mongo_host", "mongo_port", "mongo_database"})
 
+#: What the **workspace-data** stores accept: the identity, plus ``mongo_uri`` — a full
+#: connection string passed **by value** for a workspace configured in memory
+#: (``dgml_core.configuration``), where nothing is written to disk. Its name ends in
+#: ``uri``, which the storage seal treats as a secret, so rotating it never reads as "the
+#: store moved". Not accepted by the store of *workspaces*: its ``[workspaces]`` table is
+#: read from the user's ``config.toml``, where a URI would be a password in a file — and a
+#: workspace configured in memory never consults that store.
+DATA_FIELDS = IDENTITY_FIELDS | {"mongo_uri"}
+
 #: Outer part of every workspace-data collection name when the config sets no
 #: ``prefix`` — see :func:`workspace_namespace`.
 DEFAULT_PREFIX = "dgml"
@@ -122,15 +131,19 @@ def validate_identity(
     # bool is an int subclass, and `mongo_port = true` is a typo, not a port.
     if port is not None and (isinstance(port, bool) or not isinstance(port, int)):
         raise error("'mongo_port' must be an integer")
+    uri = options.get("mongo_uri")
+    if uri is not None and (not isinstance(uri, str) or not uri.strip()):
+        raise error("'mongo_uri' must be a non-empty string")
 
 
 def connect(options: Mapping[str, Any], *, uri_env: str | None = None) -> Any:
     """The configured database handle.
 
-    Authentication is all-or-nothing via the environment: ``DGML_MONGO_URI`` is
-    used verbatim when set (credentials, TLS, replica set and all), otherwise
-    ``mongo_host``:``mongo_port`` is contacted with no auth. There is
-    deliberately no username/password config key — see :mod:`.store`.
+    Authentication is all-or-nothing via one connection string: the ``mongo_uri``
+    option when set (passed by value — a workspace configured in memory), else
+    ``DGML_MONGO_URI`` from the environment; either is used verbatim (credentials, TLS,
+    replica set and all). Otherwise ``mongo_host``:``mongo_port`` is contacted with no
+    auth. There is deliberately no username/password config key — see :mod:`.store`.
 
     ``uri_env`` names a variable checked first, so one process can hold separate
     credentials for a workspace's data and for the store of workspaces.
@@ -146,7 +159,8 @@ def connect(options: Mapping[str, Any], *, uri_env: str | None = None) -> Any:
     except ImportError as exc:  # pragma: no cover - depends on install extras
         raise DgmlError("the mongo backend needs pymongo: pip install dgml-storage-mongo") from exc
 
-    uri = os.environ.get(uri_env or "") or os.environ.get(MONGO_URI_ENV)
+    uri = str(options.get("mongo_uri") or "") or os.environ.get(uri_env or "")
+    uri = uri or os.environ.get(MONGO_URI_ENV)
     if not uri:
         host = str(options.get("mongo_host") or "localhost")
         port = int(options.get("mongo_port") or 27017)

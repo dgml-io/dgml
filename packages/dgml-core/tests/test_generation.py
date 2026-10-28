@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,41 @@ from dgml_core.generation.transcribe import (
 )
 from dgml_core.generation.vocab import OPEN_VOCAB, TagVocab
 from lxml import etree  # type: ignore[import-untyped]
+
+from .conftest import FakeLLMResponse
+
+_ORIGINAL_LLM_CALL = llm.call
+
+
+@pytest.fixture(autouse=True)
+def _route_label_steps_to_patched_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the ``monkeypatch.setattr(llm, "call", fake)`` stubs in this module
+    working now that labeling issues its requests as ``steps_call`` generators
+    driven by ``llm.drive`` rather than through ``llm.call``.
+
+    While a test has replaced ``llm.call``, every request reaching the executor
+    seam (``_completion_with_retry``) is answered by that stub — rebuilt from the
+    request's system and user messages — and a stub that raises raises from the
+    seam, exactly where a provider error would. With ``llm.call`` untouched the
+    seam is left as it was. ``capture_kwargs`` installs its own seam and wins.
+    """
+    original_seam = llm._completion_with_retry
+
+    def seam(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
+        if llm.call is _ORIGINAL_LLM_CALL:
+            return original_seam(kwargs, max_retries=max_retries)
+        from .conftest import FakeLLMResponse
+
+        system, user = kwargs["messages"][0]["content"], kwargs["messages"][1]["content"]
+        system_prompt = system if isinstance(system, str) else "\n".join(b["text"] for b in system)
+        text = llm.call(
+            llm.LLMConfig(model=kwargs["model"]),
+            system_prompt=system_prompt,
+            user_content=list(user),
+        )
+        return FakeLLMResponse(text)
+
+    monkeypatch.setattr(llm, "_completion_with_retry", seam)
 
 
 def _patch_roster(monkeypatch: pytest.MonkeyPatch, roster: dict[str, str]) -> dict[str, str]:
@@ -362,6 +399,48 @@ def test_parse_window_compact_drops_only_malformed_lines() -> None:
     assert [b["structure"] for b in decoded["blocks"]] == ["p", "heading"]
 
 
+def test_parse_window_compact_repairs_literal_tab_placeholder() -> None:
+    # Models sometimes copy the grammar's "<TAB>" placeholder instead of a real
+    # tab, for a whole window; those lines must decode, not be dropped.
+    text = "\n".join(
+        [
+            "C<TAB>end of the previous item.",
+            "H2<TAB>1.<TAB>Safe Deposit Boxes",
+            "I<TAB><TAB>Customer visits a safe deposit box unusually often.",
+            "P<TAB>Plain paragraph.",
+            "R<TAB>cell a<TAB>cell b",
+            "F<TAB><TAB>Total<TAB>1,000",
+        ]
+    )
+    decoded, dropped = _parse_window_compact(text)
+    assert dropped == 0
+    assert decoded["continues"] == "end of the previous item."
+    assert decoded["blocks"] == [
+        {"structure": "heading", "level": 2, "lim": "1.", "text": "Safe Deposit Boxes"},
+        {
+            "structure": "item",
+            "lim": "",
+            "text": "Customer visits a safe deposit box unusually often.",
+        },
+        {"structure": "p", "text": "Plain paragraph."},
+        {"structure": "row", "cells": ["cell a", "cell b"]},
+        {"structure": "field", "lim": "", "label": "Total", "value": "1,000"},
+    ]
+
+
+def test_parse_window_compact_keeps_literal_placeholder_beside_real_tabs() -> None:
+    # A line with a real tab is well-formed; "<TAB>" in its text is content.
+    decoded, dropped = _parse_window_compact("P\tPress <TAB> to indent.")
+    assert dropped == 0
+    assert decoded["blocks"] == [{"structure": "p", "text": "Press <TAB> to indent."}]
+
+
+def test_parse_window_compact_still_drops_prose_mentioning_placeholder() -> None:
+    # Only a sigil followed by the placeholder is repaired.
+    _decoded, dropped = _parse_window_compact("Press <TAB> to indent.")
+    assert dropped == 1
+
+
 def test_parse_window_any_sniffs_json_and_compact() -> None:
     payload = {"continues": "", "blocks": [{"structure": "p", "text": "plain"}]}
     bare = json.dumps(payload)
@@ -403,7 +482,7 @@ def test_transcribe_document_is_unconditionally_compact(
         seen.append(dict(kwargs))
         return reply
 
-    monkeypatch.setattr(llm, "call_continued", fake_call_continued)
+    _route_window_calls(monkeypatch, fake_call_continued)
     monkeypatch.setattr(transcribe_mod, "_count_pages", lambda _b: 1)
     monkeypatch.setattr(document_mod, "slice_pdf", lambda b, _pages, **_kw: b)
 
@@ -794,7 +873,7 @@ def test_transcribe_document_reuses_cached_blocks(
     def boom(*args: object, **kwargs: object) -> str:
         raise AssertionError("must not transcribe when the blocks cache exists")
 
-    monkeypatch.setattr(llm, "call_continued", boom)
+    _route_window_calls(monkeypatch, boom)
     blocks = transcribe_document(
         b"not-even-a-pdf",  # never parsed: the cache short-circuits before page counting
         doc_name="doc.pdf",
@@ -932,6 +1011,53 @@ def test_convert_batch_skips_failed_document(
     )
     assert set(out) == {"good.pdf"}  # bad.pdf dropped; the batch did not abort
     assert "hello" in out["good.pdf"]
+
+
+_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar("test_job_id", default="-")
+
+
+@pytest.mark.parametrize("max_parallel_docs", [1, 2])
+def test_convert_batch_transcribes_in_the_callers_context(
+    monkeypatch: pytest.MonkeyPatch, max_parallel_docs: int
+) -> None:
+    """Each document is transcribed in its own copy of the caller's context, on
+    a thread pool or (one worker) inline: it sees what the caller bound (a job
+    id its log handler stamps on every record), and what one document binds
+    reaches neither the next document nor the caller."""
+    from dgml_core.generation import pipeline as pl
+
+    monkeypatch.setattr(
+        "dgml_core.generation.document.load_document_as_pdf",
+        lambda path, *, converters: b"%PDF-",
+    )
+    seen: dict[str, tuple[str, bool]] = {}
+
+    def fake_transcribe(pdf_bytes: bytes, *, doc_name: str, **kw: object) -> list[Block]:
+        on_main = threading.current_thread() is threading.main_thread()
+        seen[doc_name] = (_JOB_ID.get(), on_main)
+        _JOB_ID.set(doc_name)
+        return [Block(id="b1", structure="p", text="hello", concept="Greeting")]
+
+    monkeypatch.setattr(pl, "transcribe_document", fake_transcribe)
+    monkeypatch.setattr(pl, "label_documents", lambda docs, **kw: [])
+
+    token = _JOB_ID.set("job-42")
+    try:
+        pl.convert_batch(
+            ["a.pdf", "b.pdf"],
+            options=pl.ConvertOptions(
+                model="anthropic/claude-haiku-4-5",
+                label_model="anthropic/claude-sonnet-4-6",
+                dgml_header="<dg:chunk>",
+                max_parallel_docs=max_parallel_docs,
+            ),
+        )
+        assert _JOB_ID.get() == "job-42"
+    finally:
+        _JOB_ID.reset(token)
+
+    inline = max_parallel_docs == 1
+    assert seen == {"a.pdf": ("job-42", inline), "b.pdf": ("job-42", inline)}
 
 
 def test_convert_batch_streams_to_sink_without_accumulating(
@@ -2089,6 +2215,28 @@ def test_all_text_table_keeps_its_first_row() -> None:
     assert rows[0].cell_concepts == ["PartyName", "PartyCity"]  # untouched
 
 
+def _route_window_calls(monkeypatch: pytest.MonkeyPatch, fake: Any) -> None:
+    """Serve Pass A window requests from *fake* at the completion seam.
+
+    Pass A composes ``llm.steps_continued`` inside ``transcribe_steps`` rather
+    than calling ``llm.call_continued``, so these tests mock the single request
+    seam every driver uses (``_completion_with_retry``). The adapter hands
+    *fake* the same ``system_prompt`` / ``user_content`` keyword shape it used
+    to receive, so each test's fake and assertions stay as they were.
+    """
+
+    def execute(kwargs: dict[str, Any]) -> FakeLLMResponse:
+        messages = kwargs["messages"]
+        system = messages[0]["content"]
+        if not isinstance(system, str):  # cache-marked system blocks
+            system = "".join(str(block["text"]) for block in system)
+        return FakeLLMResponse(
+            fake(None, system_prompt=system, user_content=messages[1]["content"])
+        )
+
+    monkeypatch.setattr(llm, "_completion_with_retry", execute)
+
+
 def _fake_window_json(words: list[str]) -> str:
     return json.dumps({"continues": "", "blocks": [{"structure": "p", "text": " ".join(words)}]})
 
@@ -2124,7 +2272,7 @@ def test_transcribe_window_gate_retries_early_stopped_window(
             return _fake_window_json(words[:8])  # early stop: 8 of 60 words
         return _fake_window_json(words)
 
-    monkeypatch.setattr(llm, "call_continued", fake_call)
+    _route_window_calls(monkeypatch, fake_call)
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
@@ -2160,7 +2308,7 @@ def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
         calls.append(1)
         return _fake_window_json(words)
 
-    monkeypatch.setattr(llm, "call_continued", complete)
+    _route_window_calls(monkeypatch, complete)
     transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
@@ -2176,7 +2324,7 @@ def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
         calls.append(1)
         return _fake_window_json(words[:8])
 
-    monkeypatch.setattr(llm, "call_continued", sparse)
+    _route_window_calls(monkeypatch, sparse)
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
@@ -2269,7 +2417,7 @@ def test_transcribe_window_gate_splits_stubborn_window(
             return _fake_window_json(page1)
         return _fake_window_json(page2)  # half B: complete
 
-    monkeypatch.setattr(llm, "call_continued", fake_call)
+    _route_window_calls(monkeypatch, fake_call)
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
@@ -2424,7 +2572,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 ) -> None:
     """A chunk whose JSON reply is unparseable is bisected until each block is
     labeled, instead of dropping the whole chunk."""
-    from dgml_core.generation.label import _label_chunk
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause number {i}") for i in range(4)]
     calls = {"n": 0}
@@ -2438,21 +2586,24 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
         return json.dumps({"labels": {ids[0]: {"concept": "Revenue"}}})
 
     monkeypatch.setattr(llm, "call", fake_call)
-    warnings: list[str] = []
-    err = _label_chunk(
-        "doc.pdf",
-        chunk,
-        {},
-        [],
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
-        cache_dir=None,
-        debug=False,
-        log=lambda *_: None,
-        stem="doc",
-        label_tag="c01",
-        warnings=warnings,
-        vocab=OPEN_VOCAB,
-        off_schema=[],
+    effects = _ChunkEffects()
+    warnings = effects.warnings
+    config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    err = llm.drive(
+        _label_chunk_steps(
+            "doc.pdf",
+            chunk,
+            [],
+            config=config,
+            cache_dir=None,
+            debug=False,
+            log=lambda *_: None,
+            stem="doc",
+            label_tag="c01",
+            effects=effects,
+            vocab=OPEN_VOCAB,
+        ),
+        config,
     )
     assert err is None
     assert all(b.concept == "Revenue" for b in chunk)  # every block recovered
@@ -2463,7 +2614,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A call-level error must not split (it fails at any size) — retry once and
     warn, bounding calls to 2."""
-    from dgml_core.generation.label import _label_chunk
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause {i}") for i in range(8)]
     calls = {"n": 0}
@@ -2473,25 +2624,96 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(llm, "call", boom)
-    warnings: list[str] = []
-    err = _label_chunk(
-        "doc.pdf",
-        chunk,
-        {},
-        [],
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
-        cache_dir=None,
-        debug=False,
-        log=lambda *_: None,
-        stem="doc",
-        label_tag="c01",
-        warnings=warnings,
-        vocab=OPEN_VOCAB,
-        off_schema=[],
+    effects = _ChunkEffects()
+    warnings = effects.warnings
+    config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    err = llm.drive(
+        _label_chunk_steps(
+            "doc.pdf",
+            chunk,
+            [],
+            config=config,
+            cache_dir=None,
+            debug=False,
+            log=lambda *_: None,
+            stem="doc",
+            label_tag="c01",
+            effects=effects,
+            vocab=OPEN_VOCAB,
+        ),
+        config,
     )
     assert err is None  # RuntimeError is soft, not a reachability error
     assert calls["n"] == 2  # retried once, never split
     assert sum("labeling failed" in w for w in warnings) == 1
+
+
+def _label_fresh_then_replay(
+    blocks: list[Block], fake_call: Any, monkeypatch: pytest.MonkeyPatch, cache: Path
+) -> tuple[list[Block], list[Block]]:
+    """Label *blocks* as a default (non-debug) run does, then rebuild them from
+    the cache the way the next incremental ``docset generate`` does."""
+    from dgml_core.generation.label import _label_one_document
+    from dgml_core.generation.pipeline import load_labeled_docs_from_cache
+    from dgml_core.generation.transcribe import blocks_to_json
+
+    cache.mkdir()
+    (cache / "doc_blocks.json").write_text(blocks_to_json(blocks), encoding="utf-8")
+    monkeypatch.setattr(llm, "call", fake_call)
+    _label_one_document(
+        "doc.pdf",
+        blocks,
+        {},
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        cache_dir=cache,
+        debug=False,
+        log=lambda *_: None,
+        vocab=OPEN_VOCAB,
+    )
+    return blocks, load_labeled_docs_from_cache(cache, ["doc"])["doc"]
+
+
+def test_replay_after_a_bisected_chunk_matches_the_fresh_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bisected chunk's unparseable reply used to stay in the cache as a
+    functional ``label_<stem>_cNN_raw.json``, so the next incremental run died
+    with JSONDecodeError replaying it. Only parsed replies are kept under that
+    name now."""
+
+    def fake_call(config: llm.LLMConfig, **kw: Any) -> str:
+        ids = re.findall(r"(?m)^(\w+) ", kw["user_content"][-1]["text"])
+        if len(ids) != 1:
+            return "{ not valid json ,,,"
+        return json.dumps({"labels": {ids[0]: {"concept": "Revenue"}}})
+
+    cache = tmp_path / "cache"
+    blocks = [_b("p", f"p{i}", text=f"clause number {i}") for i in range(4)]
+    fresh, replayed = _label_fresh_then_replay(blocks, fake_call, monkeypatch, cache)
+
+    assert [b.concept for b in fresh] == ["Revenue"] * 4
+    assert [b.concept for b in replayed] == [b.concept for b in fresh]
+    for f in cache.glob("label_doc_*_raw.json"):
+        json.loads(f.read_text(encoding="utf-8"))  # every functional file parses
+
+
+def test_replay_skips_an_unparseable_reply_left_by_an_older_run(tmp_path: Path) -> None:
+    """Caches written before the fix can still hold a bisected chunk's
+    unparseable reply. A fresh run applied nothing from it, so the loader
+    skips it instead of crashing."""
+    from dgml_core.generation.pipeline import load_labeled_docs_from_cache
+
+    (tmp_path / "doc_blocks.json").write_text(
+        json.dumps([{"id": "b1", "structure": "p", "text": "Acme owes $5"}]),
+        encoding="utf-8",
+    )
+    (tmp_path / "label_doc_c01_raw.json").write_text("{ not valid json ,,,", encoding="utf-8")
+    (tmp_path / "label_doc_c01a_raw.json").write_text(
+        json.dumps({"labels": {"b1": {"concept": "PaymentObligation"}}}),
+        encoding="utf-8",
+    )
+    docs = load_labeled_docs_from_cache(tmp_path, ["doc"])
+    assert docs["doc"][0].concept == "PaymentObligation"
 
 
 # ---------------------------------------------------------------------------
@@ -3301,3 +3523,24 @@ def test_loads_tolerant_still_rejects_genuine_garbage() -> None:
 
     with _pytest.raises(json.JSONDecodeError):
         loads_tolerant('{"labels": [{"concept": "Buyer", "quote": "trunc')
+
+
+def test_debug_without_record_usage_warns_once(
+    workspace: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`debug=True` with a workspace used to write usage rows and now does not;
+    unlike every other old `debug=` caller (a TypeError) this one would go quiet,
+    so it says so — once per process, and never when record_usage is set."""
+    caplog.set_level("WARNING", logger="dgml_core.generation.pipeline")
+
+    def warn(**kw: Any) -> None:
+        opts = pipeline_mod.ConvertOptions(model="m", label_model="m", workspace=workspace, **kw)
+        pipeline_mod._warn_if_debug_without_usage(opts)
+
+    warn(debug=True, record_usage=True)
+    warn(debug=False)
+    assert not caplog.records
+    warn(debug=True)
+    warn(debug=True)
+    (record,) = caplog.records
+    assert "record_usage=True" in record.message

@@ -330,12 +330,101 @@ def reorder_words_by_cell(words: list[Word]) -> list[Word]:
         banded.append((band_idx, left, cell))
     banded.sort(key=lambda t: (t[0], t[1]))
 
+    gutter = column_gutter(words)
     out: list[Word] = []
-    for _band, _left, cell in banded:
+    if gutter is None:
+        for _band, _left, cell in banded:
+            cell_words = [words[i] for i in cell]
+            for line in line_groups(cell_words):
+                out.extend(sorted(line, key=lambda w: w.left))
+        return out
+    # Two-column page: cells wholly left of the gutter are read before cells
+    # wholly right of it, for each run of bands between full-width cells
+    # (headings, tables spanning both columns), which keep their place.
+    lefts: list[list[int]] = []
+    rights: list[list[int]] = []
+
+    def emit(cell: list[int]) -> None:
         cell_words = [words[i] for i in cell]
         for line in line_groups(cell_words):
             out.extend(sorted(line, key=lambda w: w.left))
+
+    def flush() -> None:
+        for c in lefts:
+            emit(c)
+        for c in rights:
+            emit(c)
+        lefts.clear()
+        rights.clear()
+
+    for _band, _left, cell in banded:
+        left_edge = min(words[i].left for i in cell)
+        right_edge = max(words[i].right for i in cell)
+        if right_edge <= gutter:
+            lefts.append(cell)
+        elif left_edge >= gutter:
+            rights.append(cell)
+        else:
+            flush()
+            emit(cell)
+    flush()
     return out
+
+
+# Two-column prose: a visual line with ONE gap at least this many word
+# heights wide, at least this many words on each side and prose (not
+# figures) on the right, reads across both columns; when enough of a page's
+# long lines share such a gap at one x, that x is a gutter.
+_GUTTER_GAP_HEIGHTS = 2.0
+_GUTTER_MIN_WORDS_EACH_SIDE = 4
+_GUTTER_MIN_SHARE = 0.3
+
+
+def column_gutter(words: list[Word]) -> float | None:
+    """The x of a two-column gutter on this page, or None.
+
+    Conservative on purpose: a table row has several wide gaps and figures
+    on the right, a heading or a caption has too few words on a side, and a
+    page needs the same gap on 30% of its long lines before it counts."""
+    lines = line_groups(words)
+    long_lines = [
+        sorted(ln, key=lambda w: w.left)
+        for ln in lines
+        if len(ln) >= 2 * _GUTTER_MIN_WORDS_EACH_SIDE
+    ]
+    if len(long_lines) < 4:
+        return None
+    spans: list[tuple[float, float]] = []
+    for ln in long_lines:
+        heights = sorted(w.height for w in ln if w.height > 0)
+        h = heights[len(heights) // 2] if heights else 12.0
+        wide = [
+            (i, ln[i - 1].right, ln[i].left)
+            for i in range(1, len(ln))
+            if ln[i].left - ln[i - 1].right > _GUTTER_GAP_HEIGHTS * h
+        ]
+        if len(wide) != 1:
+            continue
+        i, a, b = wide[0]
+        right_ws = ln[i:]
+        figures = sum(1 for w in right_ws if any(ch.isdigit() for ch in w.text))
+        if (
+            i >= _GUTTER_MIN_WORDS_EACH_SIDE
+            and len(right_ws) >= _GUTTER_MIN_WORDS_EACH_SIDE
+            and figures * 2 < len(right_ws)
+        ):
+            spans.append((a, b))
+    need = max(4, _GUTTER_MIN_SHARE * len(long_lines))
+    if len(spans) < need:
+        return None
+    best_x: float | None = None
+    best_n = 0
+    for lo, hi in spans:
+        x = (lo + hi) / 2
+        n = sum(1 for a2, b2 in spans if a2 <= x <= b2)
+        if n > best_n:
+            best_x, best_n = x, n
+    return best_x if best_n >= need else None
 
 
 # ---- Span search ----------------------------------------------------------
@@ -686,7 +775,8 @@ def find_fuzzy_spans(
 
     To stay fast on pages of repetitive prose (where every window has a
     similar character *and* common-word profile), candidate spans are
-    seeded by **anchor**: the target's rarest word-token on this page.
+    seeded by **anchor**: the target's rarest word-token on this page (ties: longest, then
+    first in the target).
     Only spans positioned so that anchor lines up (± a little slack) get
     the O(len²) distance computed — typically a handful per page. A
     mangled boundary token (``party:`` vs ``party``) just isn't chosen as
@@ -712,10 +802,19 @@ def find_fuzzy_spans(
     target_cores = [core_token(t) for t in target_tokens]
 
     # Anchor = the target token present on the page that occurs least
-    # often (ties broken toward the longest, most distinctive token). If
-    # no target token appears on the page at all there is nothing to seed
-    # from — defer.
-    present = {c for c in target_cores if c and c in positions}
+    # often, ties broken toward the longest, most distinctive token, then
+    # toward the token that comes first in the target. If no target token
+    # appears on the page at all there is nothing to seed from — defer.
+    #
+    # The last tie-break must be an explicit order, not set iteration:
+    # string hashes are salted per process (PYTHONHASHSEED), so picking
+    # from a set gave a different anchor — different start positions,
+    # sometimes a different match or none — between identical runs.
+    # ``dict.fromkeys`` keeps target order and ``min`` keeps the first
+    # minimum. First-in-target is also the better seed: fewer tokens sit
+    # before it that the page could split or merge, which would push the
+    # real start outside the ±_FUZZY_ANCHOR_SLACK window.
+    present = [c for c in dict.fromkeys(target_cores) if c and c in positions]
     if not present:
         return []
     anchor = min(present, key=lambda c: (len(positions[c]), -len(c)))
@@ -723,6 +822,8 @@ def find_fuzzy_spans(
         return []  # no distinctive anchor — can't localize cheaply or confidently
     anchor_word_idx = target_cores.index(anchor)
 
+    # Scan starts in page order. Int sets are already stable and the sort
+    # below is total, so this only makes the order explicit.
     starts: set[int] = set()
     for pos in positions[anchor]:
         base = pos - anchor_word_idx
@@ -732,7 +833,7 @@ def find_fuzzy_spans(
                 starts.add(s)
 
     scored: list[tuple[float, tuple[int, int]]] = []
-    for start in starts:
+    for start in sorted(starts):
         for end in range(max(start, start + lo_words - 1), min(n, start + hi_words)):
             acc = "".join(norms[start : end + 1])
             la = len(acc)
@@ -794,3 +895,17 @@ def line_groups(words: list[Word]) -> list[list[Word]]:
     if current:
         groups.append(current)
     return groups
+
+
+def line_boxes(words: list[Word]) -> list[list[int]]:
+    """One ``[left, top, right, bottom]`` box per visual line of *words* (see
+    :func:`line_groups`), in reading order: the union of that line's words."""
+    return [
+        [
+            min(w.left for w in line),
+            min(w.top for w in line),
+            max(w.right for w in line),
+            max(w.bottom for w in line),
+        ]
+        for line in line_groups(words)
+    ]

@@ -14,14 +14,14 @@ Open [`dgml-app-sample.html`](dgml-app-sample.html) directly in a browser — `f
 1. **Semantic** — explore the semantic elements discovered in each document, and how files were grouped into docsets.
 2. **Spatial** — see how every element shows exactly where it came from on the source page (`dg:origin`).
 3. **Attestation** — click an element to see how it could be anchored on-chain — a simple, concrete illustration of element-level Proof of Origin.
-4. **Readable** — for the plainest illustration of this layer, try [`tools/dgml2html`](../tools/dgml2html) instead: a tiny standalone script that renders a `.dgml.xml` file as a styled HTML page.
+4. **Readable** — for the plainest illustration of this layer, try [`tools/dgml2html`](../../tools/dgml2html) instead: a tiny standalone script that renders a `.dgml.xml` file as a styled HTML page.
 
 ## Run the server for the full pipeline
 
 `dgml-app-sample-server.py` turns the same page into a driver for the whole toolchain:
 
 ```bash
-python app-sample/dgml-app-sample-server.py [--workspace /path/to/workspace] [--port 5173]
+python samples/app-sample/dgml-app-sample-server.py [--workspace /path/to/workspace] [--port 5173]
 ```
 
 Then open `http://localhost:5173`. Workspace root resolution: `--workspace` flag → `DGML_HOME` env var → `./dgml-workspace`. The server resolves that root itself and always passes `--workspace` to the CLI, so it always creates a workspace *at a path*; launched with neither flag nor env var it uses `./dgml-workspace` relative to its own working directory, which `dgml workspace list` will not show. Pass `--workspace` explicitly if you want a workspace you can also address by id.
@@ -31,9 +31,9 @@ From the UI you can:
 - Pick a source folder of PDFs and a workspace folder (native OS directory picker)
 - Set an LLM model and API key for classification/generation
 - Run the pipeline end to end — `init` → `file add` → `cluster` → assign any unclustered files to their own docset → `docset generate` for each docset — and watch live step/log events
-- Exercise chain anchoring for real: stake a document or a single element on an actual chain (e.g. the NVNM testnet, see [`get-started`](../get-started)) and verify the resulting proof, not just simulate the click
+- Exercise chain anchoring for real: stake a document or a single element on an actual chain (e.g. the NVNM testnet, see [`get-started`](../../get-started)) and verify the resulting proof, not just simulate the click
 
-The server shells out to the `dgml` CLI (`uv run dgml` by default; override with the `DGML_CMD` env var), so it expects to be run from an environment where the workspace is set up per the main [`README`](../README.md) / [`get-started`](../get-started) instructions.
+The server shells out to the `dgml` CLI (`uv run dgml` by default; override with the `DGML_CMD` env var), so it expects to be run from an environment where the workspace is set up per the main [`README`](../../README.md) / [`get-started`](../../get-started) instructions.
 
 ## Not for production
 

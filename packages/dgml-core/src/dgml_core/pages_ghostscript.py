@@ -31,6 +31,7 @@ from .errors import PageRenderFailed, PdfSliceFailed
 from .pages import (
     GS_TIMEOUT_SECONDS,
     PAGE_FILENAME_TEMPLATE,
+    PageImageSpec,
     PageRenderer,
     PdfConfig,
     PdfSlicer,
@@ -77,7 +78,13 @@ class GhostscriptRenderer(PageRenderer):
         # installed to serve one.
         self._gs = ghostscript_path()
 
-    def render(self, pdf_path: Path, output_dir: Path, *, dpi: int) -> None:
+    def render(
+        self, pdf_path: Path, output_dir: Path, *, dpi: int, image_spec: PageImageSpec
+    ) -> None:
+        # One process renders every page at one resolution, so pages are
+        # written at the nominal size and render_pages fits them afterwards.
+        # Rendering an out-of-bounds page at its own resolution would mean a
+        # separate gs run per page size; see PageRenderer.render.
         _run_gs(
             self._gs,
             [

@@ -29,6 +29,8 @@ from clustering.config.schema import (
     ConsolidationConfig,
     ConsolidationSelectorConfig,
     ManifoldConfig,
+    ManifoldName,
+    SelectorStrategy,
 )
 from clustering.consolidation import (
     AdjudicationRequest,
@@ -77,7 +79,9 @@ def test_quantile_selects_least_confident_plus_noise() -> None:
         [0.9, 0.2, 0.8, 0.0],
         torch.randn(4, _DIM),
     )
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=0.5, include_noise=True)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.QUANTILE, quantile=0.5, include_noise=True
+    )
     selected = set(_selected(res, cfg))
     assert 1 in selected  # 0.2 — lowest real cluster
     assert 3 in selected  # noise bucket
@@ -87,14 +91,14 @@ def test_quantile_selects_least_confident_plus_noise() -> None:
 def test_confidence_threshold_strategy() -> None:
     res = _result(["a", "b", "c"], [0.95, 0.4, 0.1], torch.randn(3, _DIM))
     cfg = ConsolidationSelectorConfig(
-        strategy="confidence", confidence_threshold=0.5, include_noise=False
+        strategy=SelectorStrategy.CONFIDENCE, confidence_threshold=0.5, include_noise=False
     )
     assert set(_selected(res, cfg)) == {1, 2}
 
 
 def test_max_docs_caps_the_tail_and_says_so() -> None:
     res = _result(["a"] * 10, [i / 10 for i in range(10)], torch.randn(10, _DIM))
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=1.0, max_docs=3)
+    cfg = ConsolidationSelectorConfig(strategy=SelectorStrategy.QUANTILE, quantile=1.0, max_docs=3)
     selection = select_low_confidence_tail(res, cfg)
     # The cap keeps the *least* confident first.
     assert selection.indices == [0, 1, 2]
@@ -104,7 +108,9 @@ def test_max_docs_caps_the_tail_and_says_so() -> None:
 
 def test_none_confidence_is_maximally_uncertain() -> None:
     res = _result(["a", "b", "c"], [None, 0.9, 0.8], torch.randn(3, _DIM))
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=0.34, include_noise=False)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.QUANTILE, quantile=0.34, include_noise=False
+    )
     assert _selected(res, cfg) == [0]
 
 
@@ -113,7 +119,7 @@ def test_noise_strategy_selects_only_noise() -> None:
     # confident real clusters must stay out of the tail even though one of them
     # is the least confident document in the run.
     res = _result(["a", "b", "cluster_noise"], [0.1, 0.9, 0.5], torch.randn(3, _DIM))
-    cfg = ConsolidationSelectorConfig(strategy="noise", include_noise=True)
+    cfg = ConsolidationSelectorConfig(strategy=SelectorStrategy.NOISE, include_noise=True)
     selection = select_low_confidence_tail(res, cfg)
     assert selection.indices == [2]
     assert selection.strategy == "noise"
@@ -124,7 +130,9 @@ def test_margin_selects_narrow_top_two_gaps() -> None:
     # doc 0 is contested (gap 0.05), doc 1 is decisive (gap 0.8).
     scores = torch.tensor([[0.50, 0.45, 0.05], [0.90, 0.10, 0.00]], dtype=torch.float32)
     res = _result(["a", "a"], [0.5, 0.9], torch.randn(2, _DIM), scores=scores)
-    cfg = ConsolidationSelectorConfig(strategy="margin", margin_threshold=0.2, include_noise=False)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.MARGIN, margin_threshold=0.2, include_noise=False
+    )
     selection = select_low_confidence_tail(res, cfg)
     assert selection.indices == [0]
     assert selection.strategy == "margin"
@@ -137,7 +145,7 @@ def test_margin_degrades_to_quantile_and_reports_it() -> None:
     # rule is exactly the kind of thing that only shows up on the invoice.
     res = _result(["a", "b", "c", "d"], [0.1, 0.4, 0.7, 0.9], torch.randn(4, _DIM))
     cfg = ConsolidationSelectorConfig(
-        strategy="margin", margin_threshold=0.2, quantile=0.25, include_noise=False
+        strategy=SelectorStrategy.MARGIN, margin_threshold=0.2, quantile=0.25, include_noise=False
     )
     selection = select_low_confidence_tail(res, cfg)
     assert selection.indices == [0]  # the quantile cut ran instead
@@ -148,7 +156,9 @@ def test_margin_degrades_to_quantile_and_reports_it() -> None:
 def test_margin_needs_at_least_two_classes() -> None:
     scores = torch.tensor([[0.9], [0.8]], dtype=torch.float32)
     res = _result(["a", "a"], [0.9, 0.8], torch.randn(2, _DIM), scores=scores)
-    cfg = ConsolidationSelectorConfig(strategy="margin", margin_threshold=1.0, include_noise=False)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.MARGIN, margin_threshold=1.0, include_noise=False
+    )
     # A one-column score matrix has no top1-top2 gap to measure.
     assert _selected(res, cfg) == []
 
@@ -158,7 +168,9 @@ def test_flat_confidence_suppresses_partial_quantile() -> None:
     # Every document tied at 1.0 (the saturated-softmax case). A partial
     # bottom-quantile cut would pick an arbitrary subset, so it is suppressed.
     res = _result(["a", "b", "c", "d"], [1.0, 1.0, 1.0, 1.0], torch.randn(4, _DIM))
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=0.5, include_noise=False)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.QUANTILE, quantile=0.5, include_noise=False
+    )
     selection = select_low_confidence_tail(res, cfg)
     assert selection.indices == []
     assert any("no confidence spread" in note for note in selection.notes)
@@ -169,7 +181,9 @@ def test_flat_real_confidence_still_adjudicates_noise() -> None:
     # doc gives the column genuine spread, so the guard does not fire here —
     # and the noise document must always be adjudicated via include_noise.
     res = _result(["a", "b", "cluster_noise"], [1.0, 1.0, 0.0], torch.randn(3, _DIM))
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=0.5, include_noise=True)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.QUANTILE, quantile=0.5, include_noise=True
+    )
     assert 2 in _selected(res, cfg)
 
 
@@ -177,7 +191,9 @@ def test_fully_flat_with_noise_flag_selects_only_noise() -> None:
     # When *every* document (noise included) ties, the quantile cut is
     # suppressed and only the noise-flagged documents are adjudicated.
     res = _result(["a", "b", "cluster_noise"], [1.0, 1.0, 1.0], torch.randn(3, _DIM))
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=0.5, include_noise=True)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.QUANTILE, quantile=0.5, include_noise=True
+    )
     assert set(_selected(res, cfg)) == {2}
 
 
@@ -190,7 +206,9 @@ def test_near_tied_saturated_confidence_is_suppressed() -> None:
         [1.0000, 1.0001, 0.9999, 1.0002],
         torch.randn(4, _DIM),
     )
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=0.25, include_noise=False)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.QUANTILE, quantile=0.25, include_noise=False
+    )
     assert _selected(res, cfg) == []
 
 
@@ -198,7 +216,9 @@ def test_flat_confidence_full_quantile_is_exempt() -> None:
     # quantile >= 1.0 means "adjudicate everything" — deterministic, not
     # arbitrary — so the guard does not apply even with a flat signal.
     res = _result(["a", "b", "c"], [1.0, 1.0, 1.0], torch.randn(3, _DIM))
-    cfg = ConsolidationSelectorConfig(strategy="quantile", quantile=1.0, include_noise=False)
+    cfg = ConsolidationSelectorConfig(
+        strategy=SelectorStrategy.QUANTILE, quantile=1.0, include_noise=False
+    )
     assert set(_selected(res, cfg)) == {0, 1, 2}
 
 
@@ -208,10 +228,10 @@ def test_flat_confidence_absolute_threshold_still_works() -> None:
     # everything; below it selects nothing.
     res = _result(["a", "b", "c"], [1.0, 1.0, 1.0], torch.randn(3, _DIM))
     hit = ConsolidationSelectorConfig(
-        strategy="confidence", confidence_threshold=1.0, include_noise=False
+        strategy=SelectorStrategy.CONFIDENCE, confidence_threshold=1.0, include_noise=False
     )
     miss = ConsolidationSelectorConfig(
-        strategy="confidence", confidence_threshold=0.5, include_noise=False
+        strategy=SelectorStrategy.CONFIDENCE, confidence_threshold=0.5, include_noise=False
     )
     assert set(_selected(res, hit)) == set()  # strict <, so a tie at the cutoff is kept
     assert _selected(res, miss) == []
@@ -254,7 +274,7 @@ def test_consolidation_is_off_by_default() -> None:
 
 # ── candidate assembly ────────────────────────────────────────────────────────
 def _euclidean_scenario() -> SimpleNamespace:
-    manifold = build_manifold(ManifoldConfig(name="euclidean", dim=2, curvature=0.0))
+    manifold = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=2, curvature=0.0))
     return SimpleNamespace(manifold=manifold)
 
 

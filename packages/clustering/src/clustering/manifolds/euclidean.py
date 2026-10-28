@@ -18,7 +18,7 @@ from typing import cast
 
 import torch
 
-from clustering.config.schema import ManifoldConfig
+from clustering.config.schema import ManifoldConfig, ManifoldName
 from clustering.manifolds.base import ManifoldHead, register_manifold
 
 
@@ -50,6 +50,6 @@ class EuclideanHead(ManifoldHead):
         return geoopt.Euclidean()
 
 
-@register_manifold("euclidean")
+@register_manifold(ManifoldName.EUCLIDEAN)
 def _factory(cfg: ManifoldConfig) -> ManifoldHead:
     return EuclideanHead(cfg)

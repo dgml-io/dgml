@@ -37,6 +37,7 @@ from typing import Any
 from lxml import etree  # type: ignore[import-untyped]
 
 from dgml_core import llm
+from dgml_core.dg_refs import is_legacy_computed, parse_ref, split_refs
 from dgml_core.errors import LinkPlanFailed
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.generation.transcribe import loads_tolerant, strip_fences
@@ -241,11 +242,13 @@ def _idx_resolver(n: int) -> Callable[[object], int | None]:
     return _idx
 
 
-def _propose(elements: list[etree._Element], config: llm.LLMConfig) -> list[_Candidate]:
-    # call_continued, not call: a length-truncated proposal resumes from where
-    # it stopped instead of being lost whole. Headroom is comfortable today, so
-    # this normally costs exactly one call.
-    raw = llm.call_continued(
+def _propose_steps(
+    elements: list[etree._Element], config: llm.LLMConfig
+) -> llm.LLMSteps[list[_Candidate]]:
+    # steps_continued, not steps_call: a length-truncated proposal resumes from
+    # where it stopped instead of being lost whole. Headroom is comfortable
+    # today, so this normally costs exactly one request.
+    raw = yield from llm.steps_continued(
         config,
         system_prompt=SYSTEM_PROMPT,
         user_content=[{"type": "text", "text": _listing(elements)}],
@@ -277,9 +280,9 @@ def _snip(el: etree._Element) -> str:
     return " ".join("".join(el.itertext()).split())[:90]
 
 
-def _verify(
+def _verify_steps(
     elements: list[etree._Element], cands: list[_Candidate], config: llm.LLMConfig
-) -> list[_Candidate]:
+) -> llm.LLMSteps[list[_Candidate]]:
     lines = []
     for i, c in enumerate(cands):
         subj = f'<{etree.QName(elements[c.subject]).localname}> "{_snip(elements[c.subject])}"'
@@ -288,7 +291,7 @@ def _verify(
         )
         val = f" value={c.value}" if c.value else ""
         lines.append(f"L{i}: {subj} --{c.predicate}{val}--> {objs}")
-    raw = llm.call_continued(
+    raw = yield from llm.steps_continued(
         config,
         system_prompt=VERIFY_SYSTEM_PROMPT,
         user_content=[{"type": "text", "text": "\n".join(lines)}],
@@ -357,12 +360,18 @@ def audit_links(xml: str | bytes) -> LinkAudit:
     dangling_hrefs: list[str] = []
     for subject_idx, subject in enumerate(elements):
         href = subject.get(f"{{{_DG}}}href")
-        if not href:
+        if not href or is_legacy_computed(subject):
+            # A 0.7 dg:origin="computed" element's dg:href names its inputs
+            # (see dgml_core.dg_refs), not a semantic link.
             continue
         links += 1
-        for token in href.split():
+        for token in split_refs(href):
+            ref = parse_ref(token)
+            if ref is not None and not ref.local:
+                # A cross-file reference can't be resolved against this tree.
+                continue
             pairs += 1
-            object_idx = position_of.get(token.lstrip("#"))
+            object_idx = position_of.get(ref.xml_id if ref is not None else token)
             if object_idx is None:
                 dangling += 1
                 dangling_hrefs.append(token)
@@ -425,13 +434,29 @@ def plan_links(xml: str, config: llm.LLMConfig, *, verify: bool = True) -> list[
     read an answer out of raises :class:`LinkPlanFailed` rather than returning
     one, so a caller that caches the result never stores a failure as a fact.
     """
+    # Propose + verify fold into one usage row (gated on ``record_usage`` via
+    # the config).
+    with llm.record_usage_for(config):
+        return llm.drive(plan_links_steps(xml, config, verify=verify), config)
+
+
+def plan_links_steps(
+    xml: str, config: llm.LLMConfig, *, verify: bool = True
+) -> llm.LLMSteps[list[dict[str, Any]]]:
+    """:func:`plan_links` as a request/response generator (see ``llm.LLMSteps``).
+
+    Yields the propose request (and its continuation rounds, if truncated),
+    then — only when *verify* is set and the proposal named any candidate —
+    the verify request, and returns the plan :func:`plan_links` returns. Pure:
+    no usage is recorded here; the driver owns accounting. A batch driver runs
+    the propose step of many documents as one wave and their verify steps as
+    the next.
+    """
     root = etree.fromstring(xml.encode())
     elements = _elements(root)
-    # Propose + verify fold into one usage row (gated on --debug via the config).
-    with llm.record_usage_for(config):
-        cands = _propose(elements, config)
-        if verify and cands:
-            cands = _verify(elements, cands, config)
+    cands = yield from _propose_steps(elements, config)
+    if verify and cands:
+        cands = yield from _verify_steps(elements, cands, config)
     return [
         {
             "subject": c.subject,

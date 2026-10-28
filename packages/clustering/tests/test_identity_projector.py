@@ -28,13 +28,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from clustering.config.schema import ManifoldConfig, TrainingConfig
+from clustering.config.schema import ManifoldConfig, ManifoldName, TrainingConfig
 from clustering.manifolds import ManifoldProjector, build_manifold
 from torch import nn
 
 
 def test_force_identity_uses_parameter_free_identity() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, force_identity=True)
     assert isinstance(p.linear, nn.Identity)
     # No trainable parameters anywhere on the projector.
@@ -43,20 +43,20 @@ def test_force_identity_uses_parameter_free_identity() -> None:
 
 
 def test_force_identity_forward_equals_expmap0() -> None:
-    m = build_manifold(ManifoldConfig(name="spherical", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.SPHERICAL, dim=8, curvature=1.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, force_identity=True)
     x = torch.randn(4, 8) * 0.1
     assert torch.allclose(p(x), m.expmap0(x), atol=1e-6)
 
 
 def test_force_identity_rejects_trainable() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
     with pytest.raises(ValueError, match="incompatible with"):
         ManifoldProjector(m, input_dim=8, output_dim=8, force_identity=True, trainable=True)
 
 
 def test_force_identity_rejects_dim_mismatch() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
     with pytest.raises(ValueError, match="input_dim == output_dim"):
         ManifoldProjector(m, input_dim=16, output_dim=8, force_identity=True)
 

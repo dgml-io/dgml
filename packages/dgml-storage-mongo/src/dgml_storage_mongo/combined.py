@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from dgml_core.storage_service import StorageConfig
 
-from ._client import IDENTITY_FIELDS, connect, workspace_namespace
+from ._client import DATA_FIELDS, connect, workspace_namespace
 from .gridfs_store import MongoGridFSBlobStore
 from .store import MongoDocStore
 
@@ -58,7 +58,7 @@ class MongoGridFSStore(MongoGridFSBlobStore, MongoDocStore):
     """
 
     name = "mongo-gridfs"
-    config_fields = IDENTITY_FIELDS | {"mongo_bucket", "prefix"}
+    config_fields = DATA_FIELDS | {"mongo_bucket", "prefix"}
 
     @classmethod
     def parse_config(cls, config: StorageConfig) -> StorageConfig:

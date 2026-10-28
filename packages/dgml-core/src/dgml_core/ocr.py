@@ -57,12 +57,13 @@ an actionable message.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import struct
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -72,7 +73,7 @@ from .concurrency import map_concurrent
 from .config import load_merged_config
 from .errors import DgmlError, OcrConfigInvalid, OcrConfigMissing, OcrFailed
 from .models_config import ConfigSection
-from .pages import PAGE_GLOB
+from .pages import list_page_images, page_number_from_image_name
 from .provider import ProviderConfigFields, import_provider_class
 from .rotation import deskew_page, should_rotate
 from .storage import Workspace
@@ -80,6 +81,7 @@ from .text_extraction import (
     PAGE_TEXT_FILENAME,
     PAGE_TEXT_GLOB,
     ExtractDigitalResult,
+    format_pages,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +151,15 @@ class OcrConfig:
     options: Mapping[str, Any] = field(default_factory=dict)
     # Universal: number of pages OCR'd concurrently (in-flight provider calls).
     max_concurrency: int = DEFAULT_OCR_CONCURRENCY
+
+    def __repr__(self) -> str:
+        """Credential-named options (an Azure ``api_key``) print as ``***``."""
+        from .redaction import redacted
+
+        return (
+            f"OcrConfig(provider={self.provider!r}, options={redacted(self.options)!r}, "
+            f"max_concurrency={self.max_concurrency!r})"
+        )
 
 
 def resolve_provider_class(provider: str) -> type[OcrProvider]:
@@ -427,17 +438,24 @@ def extract_text_ocr(
     page_images_dir: Path,
     config: OcrConfig,
     max_concurrency: int | None = None,
+    pages: Collection[int] | None = None,
 ) -> ExtractDigitalResult:
     """Run OCR using the configured provider and write per-page JSONs.
 
-    All providers operate per rendered page image (``page_images/page_N.png``):
+    ``pages`` (1-based) limits the run to those pages and leaves every other
+    ``page_N.json`` in ``output_dir`` as it is: the digital path's per-page
+    fallback (see :func:`recover_unusable_pages`). A requested page with no
+    page image raises :class:`OcrFailed`. Without it, every page is OCR'd and
+    stale page JSONs are cleared first.
+
+    All providers operate per rendered page image (``page_images/page_N.{png,jpg}``):
     one provider call per page, no whole-PDF dispatch. This keeps the
     code path symmetric, sidesteps Azure's per-file page ceilings, and
     lets a single bad page surface with a clear page number. Output
     shape matches :func:`extract_text_digital` so consumers and the
     consistency check don't special-case OCR-derived text.
 
-    Page dimensions are read directly from each PNG's IHDR chunk —
+    Page dimensions are read directly from each image's header —
     these are the dimensions Textract's normalized bboxes are
     referenced against by definition, so there's no chance of drift
     from a hypothetical mismatch between the PDF's mediabox and what
@@ -465,26 +483,41 @@ def extract_text_ocr(
     provider = make_ocr_provider(config)
     workers = config.max_concurrency if max_concurrency is None else max_concurrency
 
-    page_image_paths = sorted(page_images_dir.glob(PAGE_GLOB))
+    page_image_paths = list_page_images(page_images_dir)
+    if pages is not None:
+        wanted = set(pages)
+        page_image_paths = [
+            p for p in page_image_paths if page_number_from_image_name(p.name) in wanted
+        ]
+        found = {page_number_from_image_name(p.name) for p in page_image_paths}
+        missing = wanted - found
+        if missing:
+            raise OcrFailed(
+                f"no page image for {format_pages(missing)} under {page_images_dir}; "
+                "OCR requires rendered page images"
+            )
     if not page_image_paths:
         raise OcrFailed(
             f"no page images found under {page_images_dir}; OCR requires rendered page images"
         )
 
-    _clear_page_text(output_dir)
+    if pages is None:
+        _clear_page_text(output_dir)
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     def _process_one_page(path: Path) -> list[dict[str, Any]] | None:
         """Read one page image, derive its pixel dims, call the provider, and
         write its page JSON — deskewing the image and word boxes first when the
         provider reports a significant page skew."""
-        page_num = _page_num_from_image_name(path.name)
+        page_num = page_number_from_image_name(path.name)
         if page_num is None:
             return None
         image_bytes = path.read_bytes()
         try:
             dims = _image_dimensions(image_bytes)
         except ValueError as exc:
-            raise OcrFailed(f"page {page_num}: invalid PNG at {path}: {exc}") from exc
+            raise OcrFailed(f"page {page_num}: invalid page image at {path}: {exc}") from exc
         page = _as_page_result(provider.analyze_image(image_bytes, dims, page_num))
         words = page.words
         rotation: float | None = None
@@ -525,41 +558,132 @@ def extract_text_ocr(
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE = b"\xff\xd8\xff"
 
 
 def _image_dimensions(data: bytes) -> tuple[int, int]:
-    """Parse ``(width, height)`` in pixels from a PNG's IHDR chunk.
+    """Parse ``(width, height)`` in pixels from a page image's header.
 
     Reading dims from the image bytes (rather than computing them from
     PDF mediabox times DPI) ensures we match exactly what's on disk —
     immune to mediabox/CropBox/rotation mismatches between the PDF
-    parser and the renderer.
+    parser and the renderer, and to the page-edge fit applied at render.
 
-    PNG layout: 8-byte signature, then a chunk with 4-byte big-endian
-    length, 4-byte type ("IHDR"), then payload starting with width
-    (uint32 BE) at byte offset 16 and height (uint32 BE) at offset 20.
+    A PNG is read straight from its IHDR chunk: 8-byte
+    signature, then a chunk with 4-byte big-endian length, 4-byte type
+    ("IHDR"), then width (uint32 BE) at byte offset 16 and height at 20. A
+    JPEG is read by Pillow, which parses the header without decoding pixels.
 
-    Raises ``ValueError`` if the bytes don't start with the PNG
-    signature or the IHDR chunk is missing/truncated.
+    Raises ``ValueError`` if the bytes are neither, or the header is
+    missing/truncated.
     """
-    if not data.startswith(_PNG_SIGNATURE):
-        raise ValueError("not a PNG: missing signature")
-    if len(data) < 24:
-        raise ValueError("truncated PNG: header less than 24 bytes")
-    if data[12:16] != b"IHDR":
-        raise ValueError("PNG IHDR chunk missing or not first")
-    width, height = struct.unpack(">II", data[16:24])
-    return width, height
+    if data.startswith(_PNG_SIGNATURE):
+        if len(data) < 24:
+            raise ValueError("truncated PNG: header less than 24 bytes")
+        if data[12:16] != b"IHDR":
+            raise ValueError("PNG IHDR chunk missing or not first")
+        width, height = struct.unpack(">II", data[16:24])
+        return width, height
+    if data.startswith(_JPEG_SIGNATURE):
+        from PIL import Image
+
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                return im.size
+        except Exception as exc:
+            raise ValueError(f"unreadable JPEG header: {exc}") from exc
+    raise ValueError("not a PNG or JPEG: missing signature")
 
 
-def _page_num_from_image_name(name: str) -> int | None:
-    """Parse ``page_<N>.png`` → ``N``; return None if the name doesn't match."""
-    if not name.startswith("page_") or not name.endswith(".png"):
-        return None
+def recover_unusable_pages(
+    workspace: Workspace,
+    pdf_path: Path,
+    output_dir: Path,
+    result: ExtractDigitalResult,
+    *,
+    file_id: str,
+    pages_prefix: str,
+) -> ExtractDigitalResult:
+    """OCR the pages a digital extraction flagged as unusable.
+
+    ``result`` is what :func:`~dgml_core.text_extraction.extract_text_digital`
+    returned for ``output_dir``. The pages in its ``defects`` (scans with little
+    or no text), and only those, are OCR'd with the workspace's provider,
+    resolved exactly as ``--text-mode ocr`` resolves it (:func:`load_ocr_config`:
+    ``[ocr]`` in config.toml, or the on-device default on macOS), from the page
+    images under ``pages_prefix``. A healthy result is returned untouched
+    without reading any OCR config.
+
+    When OCR cannot run (no provider, a bad ``[ocr]`` table, a missing extra, a
+    provider failure) the add still lands with the digital words as extracted.
+    One WARNING per file names the pages and the remedy, and the returned
+    ``defects`` / ``ocr_fallback_error`` let
+    :func:`~dgml_core.text_extraction.classify_extraction_outcome` record it.
+    """
+    if not result.defects:
+        return result
+    pages = sorted(result.defects)
+    # Read before OCR runs: a provider failure part way through can leave some
+    # of these pages already rewritten.
+    originals = {
+        page: (output_dir / PAGE_TEXT_FILENAME.format(page=page)).read_bytes() for page in pages
+    }
     try:
-        return int(name[len("page_") : -len(".png")])
-    except ValueError:
-        return None
+        config = load_ocr_config(workspace)
+        with workspace.blobs.materialize_dir(pages_prefix) as pages_dir:
+            extract_text_ocr(
+                pdf_path,
+                output_dir,
+                file_id=file_id,
+                page_images_dir=pages_dir,
+                config=config,
+                pages=pages,
+            )
+    except DgmlError as exc:
+        for page, raw in originals.items():
+            (output_dir / PAGE_TEXT_FILENAME.format(page=page)).write_bytes(raw)
+        logger.warning(
+            "file_id=%s: %s/%s pages are scanned images with little or no text (%s) and "
+            "OCR could not run: %s. Configure an OCR provider and run `dgml check "
+            "--retry-errors`, or re-add the file with --text-mode ocr",
+            file_id,
+            len(pages),
+            result.pages_written,
+            format_pages(pages),
+            exc,
+        )
+        return replace(result, ocr_fallback_error=str(exc))
+    logger.info(
+        "notice: file_id=%s: %s are scanned images with little or no text; took them from OCR (%s)",
+        file_id,
+        format_pages(pages),
+        config.provider,
+    )
+    # The OCR'd pages were rewritten from OCR words, so their form-field words
+    # are gone; keep the count of the other pages.
+    kept = {p: n for p, n in result.form_field_words_by_page.items() if p not in pages}
+    return replace(
+        _tally(output_dir, result.pages_written),
+        ocr_fallback_pages=pages,
+        form_field_words=sum(kept.values()),
+        form_field_words_by_page=kept,
+    )
+
+
+def _tally(output_dir: Path, pages_written: int) -> ExtractDigitalResult:
+    """Recount words over the page JSONs in ``output_dir``."""
+    pages_with_words = 0
+    total_words = 0
+    for path in output_dir.glob(PAGE_TEXT_GLOB):
+        words = json.loads(path.read_text(encoding="utf-8")).get("words") or []
+        if words:
+            pages_with_words += 1
+            total_words += len(words)
+    return ExtractDigitalResult(
+        pages_written=pages_written,
+        pages_with_words=pages_with_words,
+        total_words=total_words,
+    )
 
 
 def _clear_page_text(output_dir: Path) -> None:

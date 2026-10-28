@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders import build_encoder
 from clustering.encoders.openai_embeddings import OpenAIEncoder
 
@@ -27,7 +27,7 @@ MODEL = "openai/text-embedding-3-large"
 
 def _cfg(*, max_length: int | None = None, **extra: Any) -> EncoderConfig:
     return EncoderConfig(
-        name="openai",
+        name=EncoderName.OPENAI,
         model_id=MODEL,
         embedding_dim=3,
         max_length=max_length,
@@ -204,7 +204,7 @@ def test_openai_resolves_key_from_env_then_defers_when_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # No literal api_key: read the named env var, else leave None for litellm.
-    cfg_no_key = EncoderConfig(name="openai", model_id=MODEL, embedding_dim=3, extra={})
+    cfg_no_key = EncoderConfig(name=EncoderName.OPENAI, model_id=MODEL, embedding_dim=3, extra={})
     monkeypatch.setenv("OPENAI_API_KEY", "from-env")
     assert OpenAIEncoder(cfg_no_key).api_key == "from-env"
 

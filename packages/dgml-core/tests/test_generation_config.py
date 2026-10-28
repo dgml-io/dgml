@@ -144,15 +144,33 @@ def test_tier_models_carry_no_credentials(workspace: Workspace) -> None:
     assert (cfg.label_api_key, cfg.label_api_key_env, cfg.label_api_base) == (None, None, None)
 
 
-def test_per_task_credentials_apply_to_tier_models(workspace: Workspace) -> None:
-    # Credentials live on the task section, independent per model, and apply even
-    # when the models themselves come from the tiers.
+def test_section_credentials_without_a_section_model_are_rejected(workspace: Workspace) -> None:
+    # A key is written beside the model it is for. Credentials on [generation] with
+    # no [generation] model would pair with a tier's model — a group split across
+    # two tables — so they are refused when generation runs. Name the model here, or
+    # move the key to [models] as `standard_api_key_env` / `advanced_api_key_env`.
     write_config(
         workspace,
         {
             "models": {"standard": MODEL, "advanced": "gemini/gemini-2.5-pro"},
             "generation": {
                 "api_key_env": "MY_ANTH",
+                "label_api_key_env": "MY_GEM",
+            },
+        },
+    )
+    with pytest.raises(GenerationConfigInvalid, match=r"same config layer as 'generation\.model'"):
+        load_generation_config(workspace)
+
+
+def test_per_task_credentials_sit_beside_their_models(workspace: Workspace) -> None:
+    write_config(
+        workspace,
+        {
+            "generation": {
+                "model": MODEL,
+                "api_key_env": "MY_ANTH",
+                "label_model": "gemini/gemini-2.5-pro",
                 "label_api_key_env": "MY_GEM",
             },
         },
@@ -412,14 +430,110 @@ def test_resolve_partial_flag_falls_back_to_tier(workspace: Workspace) -> None:
     assert source == "override"
 
 
-def test_resolve_overlay_preserves_unnamed_keys(workspace: Workspace) -> None:
-    # A profile/file overrides the keys it names; a workspace credential the
-    # overlay is silent about survives the run.
-    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "api_key_env": "MY_KEY"})
+def test_resolve_overlay_replaces_the_models_credentials_with_them(workspace: Workspace) -> None:
+    # A profile overrides the models it names, and a model's credentials move with
+    # it: the workspace's key was written beside the old models and does not follow
+    # the profile's. A key outside any model group survives the overlay.
+    _write(
+        workspace,
+        {
+            "model": MODEL,
+            "label_model": LABEL_MODEL,
+            "api_key_env": "MY_KEY",
+            "thinking": "adaptive",
+        },
+    )
     cfg, source = resolve_generation_config(workspace, config="fast")
     assert cfg.label_model != LABEL_MODEL  # profile replaced the models...
-    assert cfg.api_key_env == "MY_KEY"  # ...but not the credentials
+    assert cfg.api_key_env is None  # ...and the credentials written beside them
+    assert cfg.thinking == "adaptive"  # ...but not a key outside the group
     assert source == "profile:fast"
+
+
+def test_resolve_flag_drops_the_files_credentials_for_the_model_it_replaces(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    # The file's key and proxy were written beside the file's models; a flag's model
+    # must not inherit them. A model no flag replaces keeps its own.
+    path = tmp_path / "gen.json"
+    path.write_text(
+        json.dumps(
+            {
+                "model": MODEL,
+                "api_key_env": "ANT_KEY",
+                "api_base": "https://anthropic-proxy",
+                "label_model": LABEL_MODEL,
+                "label_api_key_env": "ANT_KEY2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg, _ = resolve_generation_config(workspace, config=str(path), model="openai/gpt-5")
+    assert (cfg.model, cfg.api_key_env, cfg.api_base) == ("openai/gpt-5", None, None)
+    assert (cfg.label_model, cfg.label_api_key_env) == (LABEL_MODEL, "ANT_KEY2")
+
+    cfg, _ = resolve_generation_config(workspace, config=str(path), label_model="openai/gpt-5")
+    assert (cfg.model, cfg.api_key_env) == (MODEL, "ANT_KEY")
+    assert (cfg.label_model, cfg.label_api_key_env) == ("openai/gpt-5", None)
+
+
+def test_override_models_take_the_configs_provider_key(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A profile or flag names only models; each takes the configured key of its own
+    provider, as a tier would, so the run does not fall back to the process env."""
+    write_config(workspace, {"models": {"family": "anthropic", "anthropic_api_key_env": "ORG"}})
+    cfg, _ = resolve_generation_config(workspace, config="fast")
+    assert (cfg.api_key_env, cfg.label_api_key_env) == ("ORG", "ORG")
+    cfg, _ = resolve_generation_config(workspace, label_model=LABEL_MODEL)
+    assert (cfg.api_key_env, cfg.label_api_key_env) == ("ORG", "ORG")
+    # Another provider's model takes none.
+    cfg, _ = resolve_generation_config(workspace, model="openai/gpt-5")
+    assert (cfg.api_key, cfg.api_key_env) == (None, None)
+    assert "does not reach" not in caplog.text
+
+
+def test_override_model_with_its_own_credentials_takes_no_provider_key(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    """A file model's own key wins, and one at a custom endpoint gets no provider key:
+    `openai/llama3` behind vLLM is not OpenAI."""
+    write_config(workspace, {"models": {"anthropic_api_key": "org", "openai_api_key": "sk-real"}})
+    path = tmp_path / "gen.json"
+    path.write_text(
+        json.dumps(
+            {
+                "model": MODEL,
+                "api_key_env": "FILE_KEY",
+                "label_model": "openai/llama3",
+                "label_api_base": "http://vllm:8000",
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg, _ = resolve_generation_config(workspace, config=str(path))
+    assert (cfg.api_key, cfg.api_key_env) == (None, "FILE_KEY")
+    assert (cfg.label_api_key, cfg.label_api_base) == (None, "http://vllm:8000")
+    # A flag replacing the file's model drops the file's key but takes the provider's.
+    cfg, _ = resolve_generation_config(workspace, config=str(path), model=MODEL)
+    assert (cfg.api_key, cfg.api_key_env) == ("org", None)
+
+
+def test_override_takes_the_highest_layers_provider_key(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dgml_core.storage import user_config_path
+
+    up = user_config_path()
+    up.parent.mkdir(parents=True, exist_ok=True)
+    up.write_text(
+        dump_toml({"models": {"family": "anthropic", "anthropic_api_key_env": "USER"}}),
+        encoding="utf-8",
+    )
+    write_config(workspace, {"models": {"anthropic_api_key_env": "WS"}})
+    assert resolve_generation_config(workspace, model=MODEL)[0].api_key_env == "WS"
+    monkeypatch.setenv("DGML_MODELS__ANTHROPIC_API_KEY_ENV", "ENV")
+    assert resolve_generation_config(workspace, model=MODEL)[0].api_key_env == "ENV"
 
 
 # ── [generation] thinking ───────────────────────────────────────────────────
@@ -438,6 +552,12 @@ def test_thinking_can_be_set_back_to_adaptive(workspace: Workspace) -> None:
     assert load_generation_config(workspace).thinking == "adaptive"
 
 
+def test_thinking_between_tools_is_accepted(workspace: Workspace) -> None:
+    """The off switch for Claude Sonnet 5.5, which rejects "disabled"."""
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "between_tools"})
+    assert load_generation_config(workspace).thinking == "between_tools"
+
+
 def test_invalid_thinking_mode_is_a_config_error(workspace: Workspace) -> None:
     """Caught at load time, where the message can name the file, rather than as
     a provider 400 after transcription has already been paid for."""
@@ -452,3 +572,22 @@ def test_thinking_survives_a_model_override(workspace: Workspace) -> None:
     _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "thinking": "adaptive"})
     cfg, _source = resolve_generation_config(workspace, model=MODEL, label_model=LABEL_MODEL)
     assert cfg.thinking == "adaptive"
+
+
+# ── [generation] transcription ──────────────────────────────────────────────
+
+
+def test_transcription_defaults_to_text(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL})
+    assert load_generation_config(workspace).transcription == "text"
+
+
+def test_transcription_can_be_lines(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "transcription": "lines"})
+    assert load_generation_config(workspace).transcription == "lines"
+
+
+def test_invalid_transcription_mode_is_a_config_error(workspace: Workspace) -> None:
+    _write(workspace, {"model": MODEL, "label_model": LABEL_MODEL, "transcription": "ids"})
+    with pytest.raises(GenerationConfigInvalid, match=r"generation\.transcription"):
+        load_generation_config(workspace)

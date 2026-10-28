@@ -93,7 +93,7 @@ warning had to be obeyed by whoever created the collection.
 There is a confidentiality argument too, but it is **narrower than it first appears, and
 worth stating accurately** because the obvious version of it is wrong. ``storage_resolve``
 does support third-party providers carrying an inline credential in ``config.toml`` (that
-is what its ``_SECRET_HINTS`` list is for), so a config may hold a secret — and a hashed
+is what ``dgml_core.redaction.SECRET_HINTS`` is for), so a config may hold a secret — and a hashed
 filter does keep it out of query-*shape* telemetry: ``$queryStats``, ``explain`` output,
 plan-cache keys. What it does **not** do is keep the config out of ``system.profile``,
 ``db.currentOp()`` or the slow-query log: those capture the whole command, and the ``$set``

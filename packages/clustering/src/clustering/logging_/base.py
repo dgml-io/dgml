@@ -18,6 +18,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from clustering.config.schema import LoggerName
+
 
 class Logger(ABC):
     """Common interface for experiment-tracker backends.
@@ -27,7 +29,7 @@ class Logger(ABC):
     crash a run because a metric couldn't be flushed.
     """
 
-    name: str
+    name: LoggerName
 
     @abstractmethod
     def log_params(self, params: dict[str, Any]) -> None:
@@ -60,7 +62,7 @@ class Logger(ABC):
 class NoopLogger(Logger):
     """No-op logger. The default fallback when no backend is configured."""
 
-    name = "none"
+    name = LoggerName.NONE
 
     def log_params(self, params: dict[str, Any]) -> None:
         del params

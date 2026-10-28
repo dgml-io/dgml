@@ -552,7 +552,7 @@ def test_ground_records_style_usage_under_debug(tmp_path: Path, monkeypatch) -> 
         lambda **k: _PricedResp('{"styles": [{"index": 0, "style": "font-weight: bold"}]}'),
     )
 
-    ground_dgml_xml(ws, fid, src, output_path=src, force=True, write_stats=False, debug=True)
+    ground_dgml_xml(ws, fid, src, output_path=src, force=True, write_stats=False, record_usage=True)
 
     events = read_events(ws)
     assert len(events) == 1
@@ -956,7 +956,7 @@ def test_ground_records_one_style_usage_row_per_page(tmp_path: Path, monkeypatch
         lambda **k: _PricedResp('{"styles": [{"index": 0, "style": "font-weight: bold"}]}'),
     )
 
-    ground_dgml_xml(ws, fid, src, output_path=src, force=True, write_stats=False, debug=True)
+    ground_dgml_xml(ws, fid, src, output_path=src, force=True, write_stats=False, record_usage=True)
 
     events = read_events(ws)
     assert len(events) == n_pages

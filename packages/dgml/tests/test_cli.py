@@ -18,16 +18,21 @@ import shutil
 import sys
 import threading
 import tomllib
+import types
 from collections import Counter
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
 from dgml.cli import main
 from dgml_core import layout
+from dgml_core.conversion import ConverterConfig, DocConverter
+from dgml_core.docsets import DocSetStore
+from dgml_core.errors import FileNotFound, InvalidArgument
 from dgml_core.migrations import (
     WORKSPACE_SCHEMA_VERSION,
     pending_migrations,
@@ -1352,6 +1357,9 @@ def test_check_returns_two_when_issues(
     assert rc == 2
     report = _read_stdout(capsys)
     assert report["issue_count"] >= 1
+    assert {(i["target_type"], i["target_id"]) for i in report["issues"]} == {("file", fid)}
+    # ``kind`` is wire format (an ``IssueKind`` member renders as its value).
+    assert "missing_pdf" in {i["kind"] for i in report["issues"]}
 
 
 @needs_gs
@@ -1721,14 +1729,14 @@ def test_cluster_config_preset_name_passes_preset_overrides(
 def _llm_partition(fid: str) -> Any:
     """A one-cluster LLMClusteringResult that names its emergent bucket in the
     same call (so clustering() needs no second naming round-trip)."""
-    from dgml_core.classification import ClassificationDecision
+    from dgml_core.classification import ClassificationDecision, DecisionKind
     from dgml_core.llm_clustering import LLMClusteringResult
 
     return LLMClusteringResult(
         clusters={fid: "unknown_0"},
         proposals={
             "unknown_0": ClassificationDecision(
-                decision="new",
+                decision=DecisionKind.NEW,
                 new_name="Sample Documents",
                 new_description="test docs",
                 new_key_questions=("What is this document about?",),
@@ -1969,6 +1977,61 @@ def test_file_add_auto_classify_creates_new_docset(
 
 
 @needs_gs
+def test_file_add_auto_classify_new_docset_rolled_back_when_assign_fails(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A DocSet created for a file that then can't be assigned to it is deleted
+    rather than left behind empty, and the block reports no DocSet."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    write_classification_config(Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite"})
+    response = _tool_response(
+        "create_new_docset",
+        {"name": "Receipts", "description": "expense receipts", "key_questions": ["Who?"]},
+    )
+
+    with (
+        patch("litellm.completion", return_value=response),
+        patch.object(DocSetStore, "add_file", side_effect=FileNotFound("gone")),
+    ):
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify"])
+    assert rc == 0
+    cls = _read_stdout(capsys)["classification"]
+    assert cls["docset_id"] is None
+    assert cls["docset_created"] is False
+    assert cls["error"] is not None
+
+    rc = main(_ws_args(ws) + ["docset", "list"])
+    assert rc == 0
+    assert _read_stdout(capsys)["docsets"] == []
+
+
+@needs_gs
+def test_file_add_auto_classify_reports_assignment_that_landed_before_failure(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If the assignment is stored and a later step fails, the block still
+    names the DocSet — so a bulk run doesn't count the file as unassigned."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    existing_id = _seed_docset_and_config(ws, capsys)
+    response = _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
+
+    with (
+        patch("litellm.completion", return_value=response),
+        patch.object(DocSetStore, "has_schema", side_effect=InvalidArgument("boom")),
+    ):
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify"])
+    assert rc == 0
+    cls = _read_stdout(capsys)["classification"]
+    assert cls["docset_id"] == existing_id
+    assert cls["decision"] == "existing"
+    assert cls["error"] is not None
+
+
+@needs_gs
 def test_file_add_auto_classify_assigns_existing_docset(
     tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2113,12 +2176,7 @@ def test_file_add_without_auto_classify_omits_block(
 def _seed_docset_and_config(
     ws: Path, capsys: pytest.CaptureFixture[str], name: str = "Contracts"
 ) -> str:
-    """One DocSet plus a classification config; returns the DocSet id.
-
-    Note `--auto-classify existing` skips the LLM against a single-DocSet
-    workspace — use :func:`_seed_two_docsets_and_config` for tests that need
-    the model path.
-    """
+    """One DocSet plus a classification config; returns the DocSet id."""
     main(
         _ws_args(ws)
         + [
@@ -2140,8 +2198,8 @@ def _seed_docset_and_config(
 
 
 def _seed_two_docsets_and_config(ws: Path, capsys: pytest.CaptureFixture[str]) -> tuple[str, str]:
-    """Two DocSets plus a classification config, so assign-only classification
-    has a real choice to make and actually calls the LLM. Returns both ids."""
+    """Two DocSets plus a classification config, so existing-only
+    classification has more than one DocSet to choose from. Returns both ids."""
     first = _seed_docset_and_config(ws, capsys)
     main(
         _ws_args(ws)
@@ -2186,9 +2244,9 @@ def test_file_add_auto_classify_explicit_existing_or_new_matches_bare(
 def test_file_add_auto_classify_existing_assigns(
     tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The assign tool is the *only* one offered, so the LLM has no way to
-    create a DocSet and no way to decline — the file lands in the curated set
-    and that set never grows."""
+    """Assign and decline are the only tools offered, so the LLM has no way to
+    create a DocSet — a fitting file lands in the curated set and that set
+    never grows."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
@@ -2204,9 +2262,10 @@ def test_file_add_auto_classify_existing_assigns(
     assert cls["decision"] == "existing"
     assert cls["docset_id"] == existing_id
     assert cls["docset_created"] is False
+    assert cls["decline_reason"] is None
     assert cls["error"] is None
     offered = [t["function"]["name"] for t in mock_completion.call_args.kwargs["tools"]]
-    assert offered == ["assign_to_existing_docset"]
+    assert offered == ["assign_to_existing_docset", "no_matching_docset"]
 
     rc = main(_ws_args(ws) + ["docset", "list-files", existing_id])
     assert rc == 0
@@ -2221,42 +2280,54 @@ def test_file_add_auto_classify_existing_assigns(
 
 
 @needs_gs
-def test_file_add_auto_classify_existing_single_docset_skips_llm(
+def test_file_add_auto_classify_existing_leaves_off_type_file_unassigned(
     tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """One DocSet and no option to decline means one possible answer, so the
-    file is assigned without a vision call. The payload is the same one the
-    model would have produced."""
+    """When no DocSet fits, the file is added but left unassigned, the block
+    reports decision "none", and nothing is extracted — so a host's own
+    unknown-type handling can take over. The model is asked even with a single
+    DocSet, since declining is a possible answer."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
     only_id = _seed_docset_and_config(ws, capsys)
+    response = _tool_response("no_matching_docset", {"reason": "A lease, not a contract."})
 
-    with patch("litellm.completion") as mock_completion:
+    with (
+        patch("litellm.completion", return_value=response) as mock_completion,
+        patch("dgml_core.extraction.add_file_and_extract") as mock_extract,
+    ):
         rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
     assert rc == 0
-    mock_completion.assert_not_called()
+    mock_completion.assert_called_once()
+    mock_extract.assert_not_called()
 
     payload = _read_stdout(capsys)
     cls = payload["classification"]
     assert cls["performed"] is True
-    assert cls["decision"] == "existing"
-    assert cls["docset_id"] == only_id
+    assert cls["decision"] == "none"
+    assert cls["decline_reason"] == "A lease, not a contract."
+    assert cls["docset_id"] is None
+    assert cls["docset_name"] is None
     assert cls["docset_created"] is False
     assert cls["error"] is None
+    assert "extraction" not in cls
 
-    # The assignment is real, not just reported.
+    # The file record is kept; it just isn't in any DocSet.
+    rc = main(_ws_args(ws) + ["file", "list"])
+    assert rc == 0
+    assert [f["id"] for f in _read_stdout(capsys)["files"]] == [payload["file"]["id"]]
     rc = main(_ws_args(ws) + ["docset", "list-files", only_id])
     assert rc == 0
-    assert _read_stdout(capsys)["file_ids"] == [payload["file"]["id"]]
+    assert _read_stdout(capsys)["file_ids"] == []
 
 
 @needs_gs
 def test_file_add_auto_classify_default_mode_single_docset_still_calls_llm(
     tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The shortcut is assign-only. With creation allowed, one DocSet is not
-    one answer — the LLM still decides whether the file belongs in it."""
+    """With creation allowed, one DocSet is not one answer — the LLM still
+    decides whether the file belongs in it."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
@@ -2271,13 +2342,13 @@ def test_file_add_auto_classify_default_mode_single_docset_still_calls_llm(
 
 
 @needs_gs
+@pytest.mark.parametrize("mode", ["existing", "existing-forced"])
 def test_file_add_auto_classify_existing_errors_when_no_docsets(
-    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str], mode: str
 ) -> None:
     """Nothing to assign to → hard error (exit 1) and no LLM call. The mode
-    must place the file in an existing DocSet, so with none there is no
-    outcome; silently leaving the file unassigned is what it exists to
-    prevent."""
+    only routes into existing DocSets, so with none there is nothing to ask;
+    erroring surfaces the misconfiguration instead of declining every file."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
@@ -2286,7 +2357,7 @@ def test_file_add_auto_classify_existing_errors_when_no_docsets(
     )
 
     with patch("litellm.completion") as mock_completion:
-        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
+        rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", mode])
     assert rc == 1
     err = _read_stderr(capsys)
     assert err["error"]["code"] == "NO_EXISTING_DOCSETS"
@@ -2294,7 +2365,7 @@ def test_file_add_auto_classify_existing_errors_when_no_docsets(
     mock_completion.assert_not_called()
 
     # The precondition is checked before ingesting: a failed run must not
-    # leave behind the unassigned file this mode exists to prevent.
+    # leave a stray file behind.
     rc = main(_ws_args(ws) + ["file", "list"])
     assert rc == 0
     assert _read_stdout(capsys)["files"] == []
@@ -2380,6 +2451,18 @@ def test_file_add_auto_classify_before_path_is_rejected(
     ):
         rc = main(_ws_args(ws) + ["file", "add", str(sample_pdf), "--auto-classify", "existing"])
     assert rc == 0
+
+
+@pytest.fixture
+def no_link_model() -> Iterator[None]:
+    """Run the semantic-link pass without a model: an empty plan per document.
+
+    ``docset generate`` links every document it writes. A test that mocks the
+    conversion but not the link pass sent that pass to the real provider and
+    passed only because the call failed. Tests about the link pass itself mock
+    it explicitly instead."""
+    with patch("dgml_core.generation.links.plan_links", return_value=[]):
+        yield
 
 
 def _init_with_docset(ws: Path, capsys: pytest.CaptureFixture[str], name: str = "X") -> str:
@@ -2532,6 +2615,7 @@ def test_docset_generate_skips_already_converted(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_happy_path(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2592,12 +2676,14 @@ def test_docset_generate_happy_path(
     assert opts.label_model == "anthropic/claude-sonnet-4-6"
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_cache_dir_and_debug_threading(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The cache dir is always set (it holds functional files the next run
-    reloads); --debug only flips ConvertOptions.debug, which gates the
-    debug-only artifacts. An explicit --cache-dir always wins."""
+    reloads); --debug flips ConvertOptions.debug, which gates the debug-only
+    artifacts, and ConvertOptions.record_usage, which gates the usage rows.
+    An explicit --cache-dir always wins."""
     ws = tmp_path / "ws"
     did = _init_with_docset(ws, capsys)
     main(_ws_args(ws) + ["file", "add", str(text_pdf)])
@@ -2632,10 +2718,12 @@ def test_docset_generate_cache_dir_and_debug_threading(
     default_opts = _run([], [])
     assert default_opts.cache_dir == cache_dir
     assert default_opts.debug is False
+    assert default_opts.record_usage is False
     # --debug: same cache dir, debug on (debug-only files also written).
     debug_opts = _run(["--debug"], [])
     assert debug_opts.cache_dir == cache_dir
     assert debug_opts.debug is True
+    assert debug_opts.record_usage is True
     # Explicit --cache-dir always wins.
     explicit = tmp_path / "mycache"
     assert _run([], ["--cache-dir", str(explicit)]).cache_dir == explicit
@@ -2693,6 +2781,7 @@ def test_docset_generate_missing_config_errors(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_models_from_config(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2738,6 +2827,48 @@ def test_docset_generate_models_from_config(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
+def test_docset_generate_threads_both_models_credentials(
+    tmp_path: Path,
+    text_pdf: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The labeling model's key and api_base reach ConvertOptions beside the
+    transcription model's — otherwise every labeling-side call (roster planning,
+    labeling, descriptions) silently runs on litellm's env-var key instead."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    monkeypatch.setenv("T_KEY", "t-key")
+    monkeypatch.setenv("L_KEY", "l-key")
+    Workspace(root=ws).config_path.write_text(
+        dump_toml(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-4-5",
+                    "api_key_env": "T_KEY",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                    "label_api_key_env": "L_KEY",
+                    "label_api_base": "https://proxy.example",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    with patch("dgml_core.generation.convert_batch", return_value={}) as mock_batch:
+        assert main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"]) == 0
+    opts = mock_batch.call_args.kwargs["options"]
+    assert (opts.api_key, opts.api_base) == ("t-key", None)
+    assert (opts.label_api_key, opts.label_api_base) == ("l-key", "https://proxy.example")
+
+
+@needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_model_flags_override_config(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2792,6 +2923,7 @@ def test_docset_generate_model_flags_override_config(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_profile_without_config(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2825,6 +2957,7 @@ def test_docset_generate_profile_without_config(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_schema_path_seeds_roster(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2876,6 +3009,7 @@ def test_docset_generate_schema_path_seeds_roster(
     assert kwargs["options"].parent_map == {"DueDate": "PaymentTerms"}
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_writes_schema_rnc(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2913,6 +3047,7 @@ def test_docset_generate_writes_schema_rnc(
     assert '# Description: "a synthetic role"' in text
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reuses_docset_roster_by_default(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2948,6 +3083,7 @@ def test_docset_generate_reuses_docset_roster_by_default(
     assert mock_batch.call_args.kwargs["options"].roster_seed is None
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reuse_prefers_schema_json(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3032,6 +3168,7 @@ def _docset_with_one_file(ws: Path, text_pdf: Path, capsys: pytest.CaptureFixtur
     return did
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_schema_path_closes_the_vocabulary(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3048,6 +3185,7 @@ def test_docset_generate_schema_path_closes_the_vocabulary(
     assert vocab.closed and vocab.names == {"PaymentTerms", "DueDate"}
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_closes_only_on_an_authored_vocabulary(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3090,6 +3228,7 @@ def test_docset_generate_closes_only_on_an_authored_vocabulary(
     assert options.vocab.closed
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_extend_schema_keeps_the_vocabulary_open(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3126,6 +3265,7 @@ def test_docset_generate_extend_schema_requires_a_schema(
     assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reports_added_concepts_under_extend_schema(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3156,6 +3296,7 @@ def test_docset_generate_reports_added_concepts_under_extend_schema(
         assert len([k for k in entry if k.endswith("_concepts")]) == 1
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_protects_the_authored_schema_from_its_own_output(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3197,6 +3338,7 @@ def test_docset_generate_protects_the_authored_schema_from_its_own_output(
     assert json.loads((docset_dir / "authored-schema.json").read_text(encoding="utf-8")) == authored
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_reports_unmatched_concepts_per_file(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3230,6 +3372,7 @@ def test_docset_generate_reports_unmatched_concepts_per_file(
     }
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_omits_unmatched_concepts_when_nothing_was_refused(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3275,6 +3418,7 @@ def test_docset_generate_missing_source_is_per_file_failure(
 
 
 @needs_gs
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_mixed_converted_and_failed(
     tmp_path: Path, text_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3545,7 +3689,7 @@ def test_file_add_directory_clean_run(tmp_path: Path, capsys: pytest.CaptureFixt
 def test_file_add_directory_skips_unconfigured_sources(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """With no `conversion` config, convertible sources (docx/xlsx) in a bulk
+    """With no `conversion` config, convertible sources (docx/xlsx/pptx) in a bulk
     directory are silently skipped — not gathered, not counted as failures."""
     ws = tmp_path / "ws"
     _init_ws(ws)
@@ -3555,12 +3699,112 @@ def test_file_add_directory_skips_unconfigured_sources(
     src.mkdir()
     _write_text_pdf(src / "a.pdf", ["Alpha"])
     (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
 
     rc = main(_ws_args(ws) + ["file", "add", str(src)])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["summary"]["total"] == 1
     assert [e["path"] for e in payload["results"]] == [str(src / "a.pdf")]
+
+
+class _FixedPdfConverter(DocConverter):
+    """Returns the PDF named by its ``pdf`` option, whatever the source."""
+
+    name: ClassVar[str] = "fixed-pdf"
+    input_formats: ClassVar[frozenset[str]] = frozenset()
+    config_fields: ClassVar[frozenset[str]] = frozenset({"pdf"})
+
+    @classmethod
+    def parse_config(cls, section: Mapping[str, Any]) -> ConverterConfig:
+        cls._check_no_extra_fields(section)
+        return ConverterConfig(provider=str(section["provider"]), options={"pdf": section["pdf"]})
+
+    def __init__(self, config: ConverterConfig) -> None:
+        self._pdf = Path(config.options["pdf"])
+
+    def to_pdf(self, path: Path) -> bytes:
+        return self._pdf.read_bytes()
+
+
+@needs_gs
+def test_file_add_directory_gathers_configured_pptx(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `conversion.pptx` configured, a bulk add gathers `.pptx` and `.ppt` (any
+    case) and converts them, while a family with no converter is still skipped."""
+    stub = types.ModuleType("cli_stub_conv")
+    stub._FixedPdfConverter = _FixedPdfConverter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cli_stub_conv", stub)
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rendered = tmp_path / "rendered.pdf"
+    _write_text_pdf(rendered, ["Slide one"])
+    conversion = {"pptx": {"provider": "cli_stub_conv:_FixedPdfConverter", "pdf": str(rendered)}}
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+    src = tmp_path / "mixed"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha"])
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
+    (src / "OLD.PPT").write_bytes(b"\xd0\xcf\x11\xe0 not really a ppt")
+    (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    by_name = {Path(e["path"]).name: e for e in payload["results"]}
+    assert set(by_name) == {"a.pdf", "deck.pptx", "OLD.PPT"}  # notes.docx: no converter
+    for name in ("deck.pptx", "OLD.PPT"):
+        entry = by_name[name]
+        assert entry["status"] == "added"
+        assert entry["conversion_error"] is None
+        # The converted PDF is persisted beside the source (the uppercase suffix
+        # lowercased in its name) and the pages were rendered from it.
+        assert entry["file"]["page_count"] == 1
+        assert entry["file"]["pdf_converter"] == "fixed-pdf"
+        assert (ws / layout.file_pdf_key(entry["file"]["id"], name)).is_file()
+
+
+class _SpreadsheetOnlyConverter(_FixedPdfConverter):
+    name: ClassVar[str] = "spreadsheet-only"
+    input_formats: ClassVar[frozenset[str]] = frozenset({".xlsx", ".xls"})
+
+
+def test_file_add_directory_refuses_a_family_on_the_wrong_converter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`conversion.pptx` pointed at a converter that handles only spreadsheets is
+    one CONVERSION_CONFIG_INVALID up front, not a failed record per deck."""
+    stub = types.ModuleType("cli_stub_conv")
+    stub._SpreadsheetOnlyConverter = _SpreadsheetOnlyConverter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cli_stub_conv", stub)
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rendered = tmp_path / "rendered.pdf"
+    _write_text_pdf(rendered, ["Slide one"])
+    conversion = {
+        "pptx": {"provider": "cli_stub_conv:_SpreadsheetOnlyConverter", "pdf": str(rendered)}
+    }
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+    src = tmp_path / "decks"
+    src.mkdir()
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
+    (src / "other.pptx").write_bytes(b"PK\x03\x04 not really a pptx either")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc != 0
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "does not handle '.pptx'" in err["message"]
+    assert not (ws / "files").exists() or not any((ws / "files").iterdir())
 
 
 @needs_gs
@@ -3636,6 +3880,7 @@ def test_file_add_directory_skip_already_imported(
         "hard_failed": 0,
     }
     for entry in payload["results"]:
+        assert entry["status"] == "skipped"
         assert entry["created"] is False
         assert entry["conflict_kind"] == "hash"
 
@@ -3732,9 +3977,8 @@ def test_file_add_directory_auto_classify_amortizes_docsets(
 def test_file_add_directory_auto_classify_existing_assigns_every_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Bulk run in `existing` mode: every file is assigned within the curated
-    set — including one the LLM only picks as the closest available — and the
-    set never grows."""
+    """Bulk run in `existing` mode: fitting files are assigned within the
+    curated set and the set never grows."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
@@ -3746,18 +3990,22 @@ def test_file_add_directory_auto_classify_existing_assigns_every_file(
     _write_text_pdf(src / "b.pdf", ["Bravo page one", "Bravo page two"])
 
     def fake_completion(**kwargs: Any) -> SimpleNamespace:
-        # The assign tool is the only one offered, on every call — that is
-        # what leaves the LLM no way to create a DocSet or decline.
-        assert [t["function"]["name"] for t in kwargs["tools"]] == ["assign_to_existing_docset"]
+        # The create tool is never offered, on any call — that is what leaves
+        # the LLM no way to create a DocSet.
+        assert [t["function"]["name"] for t in kwargs["tools"]] == [
+            "assign_to_existing_docset",
+            "no_matching_docset",
+        ]
         return _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
 
     with patch("litellm.completion", side_effect=fake_completion) as mock_completion:
         rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing"])
     assert rc == 0
-    assert mock_completion.call_count == 2  # per file; no shortcut with two DocSets
+    assert mock_completion.call_count == 2  # per file
     payload = _read_stdout(capsys)
     assert payload["summary"]["added"] == 2
     assert payload["summary"]["soft_failed"] == 0
+    assert payload["summary"]["unassigned"] == 0
 
     for entry in payload["results"]:
         assert entry["classification"]["decision"] == "existing"
@@ -3774,12 +4022,12 @@ def test_file_add_directory_auto_classify_existing_assigns_every_file(
     assert len(_read_stdout(capsys)["file_ids"]) == 2
 
 
-def test_file_add_directory_auto_classify_existing_single_docset_skips_llm(
+def test_file_add_directory_auto_classify_existing_mixes_assign_and_none(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The shortcut holds for every file in a bulk run: assign-only mode never
-    creates a DocSet, so a single-DocSet workspace stays single-DocSet and no
-    file ever has a choice to make."""
+    """A bulk run routes each file independently: one that fits is assigned,
+    an off-type one is left unassigned with decision "none", and neither
+    creates a DocSet."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
@@ -3790,25 +4038,38 @@ def test_file_add_directory_auto_classify_existing_single_docset_skips_llm(
     _write_text_pdf(src / "a.pdf", ["Alpha page one"])
     _write_text_pdf(src / "b.pdf", ["Bravo page one"])
 
-    with patch("litellm.completion") as mock_completion:
+    responses = [
+        _tool_response("assign_to_existing_docset", {"docset_id": only_id}),
+        _tool_response("no_matching_docset", {"reason": "Not a contract."}),
+    ]
+    with patch("litellm.completion", side_effect=responses) as mock_completion:
         rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing"])
     assert rc == 0
-    mock_completion.assert_not_called()
+    assert mock_completion.call_count == 2
 
     payload = _read_stdout(capsys)
     assert payload["summary"]["added"] == 2
-    for entry in payload["results"]:
-        assert entry["classification"]["decision"] == "existing"
-        assert entry["classification"]["docset_id"] == only_id
-        assert entry["classification"]["docset_created"] is False
-        assert entry["classification"]["error"] is None
+    # Declined files still count as added; `unassigned` is what flags them.
+    assert payload["summary"]["unassigned"] == 1
+    first, second = (entry["classification"] for entry in payload["results"])
+    assert first["decision"] == "existing"
+    assert first["docset_id"] == only_id
+    assert second["decision"] == "none"
+    assert second["decline_reason"] == "Not a contract."
+    assert second["docset_id"] is None
+    for cls in (first, second):
+        assert cls["docset_created"] is False
+        assert cls["error"] is None
 
+    main(_ws_args(ws) + ["docset", "list"])
+    assert [d["id"] for d in _read_stdout(capsys)["docsets"]] == [only_id]
     main(_ws_args(ws) + ["docset", "list-files", only_id])
-    assert len(_read_stdout(capsys)["file_ids"]) == 2
+    assert _read_stdout(capsys)["file_ids"] == [payload["results"][0]["file"]["id"]]
 
 
+@pytest.mark.parametrize("mode", ["existing", "existing-forced"])
 def test_file_add_directory_auto_classify_existing_aborts_before_adding(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: str
 ) -> None:
     """The no-DocSets precondition is checked once up front, so a bulk run
     aborts before any file is added rather than on the first one."""
@@ -3825,7 +4086,7 @@ def test_file_add_directory_auto_classify_existing_aborts_before_adding(
     _write_text_pdf(src / "b.pdf", ["Bravo page one"])
 
     with patch("litellm.completion") as mock_completion:
-        rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing"])
+        rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", mode])
     assert rc == 1
     assert _read_stderr(capsys)["error"]["code"] == "NO_EXISTING_DOCSETS"
     mock_completion.assert_not_called()
@@ -3834,6 +4095,63 @@ def test_file_add_directory_auto_classify_existing_aborts_before_adding(
     rc = main(_ws_args(ws) + ["file", "list"])
     assert rc == 0
     assert _read_stdout(capsys)["files"] == []
+
+
+def test_file_add_directory_auto_classify_existing_forced_always_assigns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`existing-forced` keeps the pre-decline behavior: the assign tool is the
+    only one offered, so every file lands in an existing DocSet."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    existing_id, _ = _seed_two_docsets_and_config(ws, capsys)
+
+    src = tmp_path / "pdfs"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha page one"])
+    _write_text_pdf(src / "b.pdf", ["Bravo page one"])
+
+    def fake_completion(**kwargs: Any) -> SimpleNamespace:
+        assert [t["function"]["name"] for t in kwargs["tools"]] == ["assign_to_existing_docset"]
+        return _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
+
+    with patch("litellm.completion", side_effect=fake_completion) as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing-forced"])
+    assert rc == 0
+    assert mock_completion.call_count == 2
+    payload = _read_stdout(capsys)
+    assert payload["summary"]["unassigned"] == 0
+    for entry in payload["results"]:
+        assert entry["classification"]["decision"] == "existing"
+        assert entry["classification"]["docset_id"] == existing_id
+
+
+def test_file_add_directory_auto_classify_existing_forced_single_docset_skips_llm(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With one DocSet `existing-forced` has one possible answer, so every file
+    is assigned without a vision call."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    only_id = _seed_docset_and_config(ws, capsys)
+
+    src = tmp_path / "pdfs"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha page one"])
+    _write_text_pdf(src / "b.pdf", ["Bravo page one"])
+
+    with patch("litellm.completion") as mock_completion:
+        rc = main(_ws_args(ws) + ["file", "add", str(src), "--auto-classify", "existing-forced"])
+    assert rc == 0
+    mock_completion.assert_not_called()
+    payload = _read_stdout(capsys)
+    for entry in payload["results"]:
+        assert entry["classification"]["decision"] == "existing"
+        assert entry["classification"]["docset_id"] == only_id
+    main(_ws_args(ws) + ["docset", "list-files", only_id])
+    assert len(_read_stdout(capsys)["file_ids"]) == 2
 
 
 def test_file_add_directory_auto_classify_hard_fails_without_config(
@@ -3976,6 +4294,7 @@ def _generate_with_xml(
         return main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage", *extra])
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_grounds_in_place(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4012,6 +4331,7 @@ def test_docset_generate_grounds_in_place(
     assert not ws.blobs.blob_exists(f"{_out_dir}contract.dgml.grounding_stats.json")
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_debug_writes_grounding_stats(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4030,6 +4350,7 @@ def test_docset_generate_debug_writes_grounding_stats(
     )
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_leaves_file_ungrounded_without_page_text(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4054,6 +4375,7 @@ def test_docset_generate_leaves_file_ungrounded_without_page_text(
     assert "dg:origin" not in ws.blobs.get_blob(out_xml_key).decode("utf-8")
 
 
+@pytest.mark.usefixtures("no_link_model")
 def test_docset_generate_surfaces_label_error_but_still_converts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4324,7 +4646,7 @@ def test_dgmlx_verify_detects_tamper(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     capsys.readouterr()
 
-    (out_dir / "page_images" / "page_1.png").write_bytes(b"TAMPERED")
+    (out_dir / "page_images" / "page_1.jpg").write_bytes(b"TAMPERED")
     rc = main(_ws_args(ws) + ["dgmlx", "verify", str(out_dir)])
     assert rc == 2  # mirrors `check`: verified-but-failed
     payload = _read_stdout(capsys)
@@ -4882,6 +5204,24 @@ def test_discover_page_from_origin(tmp_path: Path, capsys: pytest.CaptureFixture
     assert inv["samples"][0]["page"] == 4
 
 
+def test_discover_full_reports_structural_roles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--full`` emits each tag's structural ``role`` as its plain wire string."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    _seed_file_dir(ws, _DISC_FILE, pages=4)
+    _seed_discover_xml(ws, _DISC_FILE, _DISC_DS)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["discover", _DISC_FILE, "--docset", _DISC_DS, "--full"])
+    assert rc == 0
+    roles = {t["tag"]: t["role"] for t in _read_stdout(capsys)["tags"]}
+    assert roles["LiabilityCap"] == "leaf-value"
+    assert roles["IndemnificationClause"] == "container"
+    assert set(roles.values()) <= {"leaf-value", "container", "hybrid", "mixed"}
+
+
 def test_discover_depth_first_addressable(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -5196,8 +5536,18 @@ def test_extraction_get_guidance_missing(
     assert _read_stderr(capsys)["error"]["code"] == "GUIDANCE_NOT_FOUND"
 
 
+def _assigned_file(ws: Path, ds_id: str, pdf: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    """Add *pdf* and assign it to *ds_id* (before any schema is set, so the
+    assignment doesn't fire auto-extraction). Returns the file id."""
+    main(_ws_args(ws) + ["file", "add", str(pdf)])
+    fid: str = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", ds_id])
+    capsys.readouterr()
+    return fid
+
+
 def test_extraction_get_values_json_and_xml(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """get-values projects the dg:extraction in the core dgml file to values
     JSON (default) or returns the raw XML with --as xml."""
@@ -5208,6 +5558,7 @@ def test_extraction_get_values_json_and_xml(
     _init_ws(ws)
     capsys.readouterr()
     ds_id = _new_docset(ws, capsys)
+    fid = _assigned_file(ws, ds_id, sample_pdf, capsys)
 
     schema_file = tmp_path / "schema.rnc"
     schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
@@ -5215,7 +5566,7 @@ def test_extraction_get_values_json_and_xml(
     capsys.readouterr()
 
     # Drop a core <stem>.dgml.xml (with a dg:extraction element) where
-    # extraction would have written it — get-values globs *.dgml.xml.
+    # extraction would have written it.
     wsx = Workspace(root=ws)
     vocab = parse_rnc(_RNC_SCHEMA)
     values = {
@@ -5225,18 +5576,18 @@ def test_extraction_get_values_json_and_xml(
         }
     }
     wsx.blobs.put_blob(
-        layout.dgml_xml_key(ds_id, "fileabc", "doc"),
+        layout.dgml_xml_key(ds_id, fid, sample_pdf.stem),
         standalone_extraction_doc(values, vocab=vocab).encode(),
     )
 
-    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "fileabc"])
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["format"] == "values"
     assert payload["values"]["VendorName"]["text"] == "Acme"
     assert payload["values"]["VendorName"]["locations"][0]["bounding_box"] == [10, 20, 30, 40]
 
-    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "fileabc", "--as", "xml"])
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid, "--as", "xml"])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["format"] == "xml"
@@ -5244,16 +5595,63 @@ def test_extraction_get_values_json_and_xml(
     assert "<docset:VendorName" in payload["xml"]
 
 
+@pytest.mark.parametrize("as_form", ["values", "xml"])
 def test_extraction_get_values_not_found(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str], as_form: str
+) -> None:
+    """Assigned with nothing generated or extracted → DGML_NOT_FOUND; a generated
+    tree with no dg:extraction → VALUES_NOT_FOUND. Same in both output forms."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    ds_id = _new_docset(ws, capsys)
+    fid = _assigned_file(ws, ds_id, sample_pdf, capsys)
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid, "--as", as_form])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "DGML_NOT_FOUND"
+
+    Workspace(root=ws).blobs.put_blob(
+        layout.dgml_xml_key(ds_id, fid, sample_pdf.stem),
+        b'<dg:chunk xmlns:dg="http://dgml.io/ns/dg#" xmlns:docset="http://dgml.io/ns/dgml/t">'
+        b"<docset:Header>tree only</docset:Header></dg:chunk>",
+    )
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid, "--as", as_form])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "VALUES_NOT_FOUND"
+
+
+def test_extraction_get_values_unassigned_file(
+    tmp_path: Path, sample_pdf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file that exists but isn't in the docset is FILE_NOT_FOUND, not
+    VALUES_NOT_FOUND — and an unknown id is too."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    ds_id = _new_docset(ws, capsys)
+    main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, fid])
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "FILE_NOT_FOUND"
+    assert "not assigned" in err["message"]
+
+    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "nofile"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "FILE_NOT_FOUND"
+
+
+def test_extraction_get_values_unknown_docset(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
-    ds_id = _new_docset(ws, capsys)
-    rc = main(_ws_args(ws) + ["extraction", "get-values", ds_id, "nofile"])
+    rc = main(_ws_args(ws) + ["extraction", "get-values", "nodocset", "nofile"])
     assert rc == 1
-    assert _read_stderr(capsys)["error"]["code"] == "VALUES_NOT_FOUND"
+    assert _read_stderr(capsys)["error"]["code"] == "DOCSET_NOT_FOUND"
 
 
 def test_extraction_generate_schema_no_files(
@@ -5416,6 +5814,9 @@ def test_extraction_extract_values_effort_overrides_config(
     values = {"VendorName": {"text": "Acme", "locations": []}}  # empty locs → no phase 3
     response = _tool_response("submit_values", {"values": values})
     wsx = Workspace(root=ws)
+    # `extract` requires the assignment; the plain store call avoids the
+    # auto-extract `docset add-file` would run now that the schema is set.
+    DocSetStore(wsx).add_file(ds_id, fid)
 
     def _extract(*flags: str) -> dict[str, Any]:
         if wsx.blobs.blob_exists(layout.dgml_xml_key(ds_id, fid, "doc")):
@@ -5428,6 +5829,53 @@ def test_extraction_extract_values_effort_overrides_config(
     assert _extract()["reasoning_effort"] == "medium"
     assert _extract("--values-effort", "low")["reasoning_effort"] == "low"
     assert "reasoning_effort" not in _extract("--values-effort", "default")
+
+
+def test_extraction_extract_locations_effort_overrides_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--locations-effort` replaces `grounded.locations_reasoning_effort` for
+    one call. The flag reaches the config the extraction runs with; the
+    grounding call itself is pinned in the core tests."""
+    from dgml_core import grounded
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    seen: list[grounded.GroundedConfig] = []
+
+    def fake_extract(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["config"])
+        raise SystemExit(0)
+
+    with patch("dgml_core.grounded.extract_values", side_effect=fake_extract):
+        for flags in ([], ["--locations-effort", "low"], ["--locations-effort", "default"]):
+            with pytest.raises(SystemExit):
+                main(_ws_args(ws) + ["extraction", "extract", ds_id, "somefile", *flags])
+            capsys.readouterr()
+    assert [c.locations_reasoning_effort for c in seen] == ["high", "low", None]
+
+
+def test_extraction_extract_refuses_unknown_locations_effort(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    with patch("litellm.completion") as mock_completion:
+        rc = main(
+            _ws_args(ws)
+            + ["extraction", "extract", ds_id, "somefile", "--locations-effort", "turbo"]
+        )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "GROUNDED_CONFIG_INVALID"
+    assert "--locations-effort" in err["message"]
+    mock_completion.assert_not_called()
 
 
 def test_extraction_extract_refuses_unknown_values_effort(
@@ -5453,9 +5901,10 @@ def test_extraction_extract_refuses_unknown_values_effort(
 def test_extraction_extract_records_usage_under_debug(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`extraction extract --debug` forwards debug into extract_values, so the
-    LLM cost/token row lands in usage.jsonl — same gating as every other LLM
-    op and the auto-extract path. Without --debug, no row is written."""
+    """`extraction extract --debug` turns on usage recording and the stats
+    document in extract_values, so the LLM cost/token row lands in usage.jsonl
+    and extraction_stats.json is stored — same gating as every other LLM op and
+    the auto-extract path. Without --debug, neither is written."""
     from dgml_core.usage import read_events
 
     ws = tmp_path / "ws"
@@ -5470,6 +5919,8 @@ def test_extraction_extract_records_usage_under_debug(
 
     def _fresh_file() -> str:
         _seed_file_dir(ws, "fileusage0001", pages=1)
+        # Plain assignment (no auto-extract): `extract` requires it.
+        DocSetStore(Workspace(root=ws)).add_file(ds_id, "fileusage0001")
         return "fileusage0001"
 
     values = {"VendorName": {"text": "Acme", "locations": []}}  # empty locs → no phase 3
@@ -5477,13 +5928,15 @@ def test_extraction_extract_records_usage_under_debug(
     response._hidden_params = {"response_cost": 0.004}
     response.usage = SimpleNamespace(prompt_tokens=300, completion_tokens=40, total_tokens=340)
 
-    # Without --debug: no usage row.
+    # Without --debug: no usage row and no stats document.
     fid = _fresh_file()
     with patch("litellm.completion", return_value=response):
         assert main(_ws_args(ws) + ["extraction", "extract", ds_id, fid]) == 0
     assert read_events(Workspace(root=ws)) == []
+    assert Workspace(root=ws).docs.get_doc("extraction_stats", f"{ds_id}/{fid}") is None
 
-    # With --debug (global flag, precedes the subcommand): one extract_values row.
+    # With --debug (global flag, precedes the subcommand): one extract_values
+    # row, and the stats document.
     _wsx = Workspace(root=ws)
     _wsx.blobs.delete_blob(layout.dgml_xml_key(ds_id, fid, "doc"))  # re-extract cleanly
     with patch("litellm.completion", return_value=response):
@@ -5492,6 +5945,8 @@ def test_extraction_extract_records_usage_under_debug(
     assert len(events) == 1
     assert events[0]["operation"] == "extract_values"
     assert events[0]["cost_usd"] == 0.004
+    stats = Workspace(root=ws).docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "ok"
 
 
 def test_docset_add_file_auto_extracts_when_schema_set(
@@ -5511,9 +5966,12 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     capsys.readouterr()
     _seed_file_dir(ws, "fileauto0001", pages=1)
 
-    # Empty locations → phase 2 has nothing to match, no phase-3 call needed.
-    values = {"VendorName": {"text": "Acme", "locations": []}}
+    # An unprinted (defaulted) value → phase 2 has nothing to match, no
+    # phase-3 call needed. (A bare value with no box and no method would be
+    # dropped as unverifiable.)
+    values = {"VendorName": {"text": "Acme", "method": "defaulted"}}
     response = _tool_response("submit_values", {"values": values})
+    response._hidden_params = {"response_cost": 0.03}
     with patch("litellm.completion", return_value=response):
         rc = main(_ws_args(ws) + ["docset", "add-file", "fileauto0001", "--docset", ds_id])
     assert rc == 0
@@ -5522,6 +5980,17 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     assert payload["extraction"]["performed"] is True
     assert payload["extraction"]["error"] is None
     assert payload["extraction"]["model"] == "gemini/gemini-2.5-pro"
+    # The run's cost is reported without --debug, so no usage.jsonl is needed.
+    assert payload["extraction"]["usage"]["cost_usd"] == 0.03
+    assert set(payload["extraction"]["usage"]) == {
+        "cost_usd",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "duration_s",
+    }
 
     _wsx = Workspace(root=ws)
     xml = _wsx.blobs.get_blob(layout.dgml_xml_key(ds_id, "fileauto0001", "doc")).decode("utf-8")
@@ -5569,9 +6038,39 @@ def test_docset_add_file_extraction_failure_is_soft(
     payload = _read_stdout(capsys)
     assert payload["assigned"] is True
     assert "GROUNDED_CONFIG_MISSING" in payload["extraction"]["error"]
+    # Nothing was spent before the config error.
+    assert payload["extraction"]["usage"] is None
     # Assignment is on disk despite the failed extraction.
     main(_ws_args(ws) + ["docset", "list-files", ds_id])
     assert "fileauto0003" in _read_stdout(capsys)["file_ids"]
+
+
+def test_docset_add_file_failed_extraction_reports_what_it_spent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A soft extraction failure after an LLM call still reports that call's
+    cost in `extraction.usage`, without --debug."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    schema_file = tmp_path / "schema.rnc"
+    schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
+    main(_ws_args(ws) + ["extraction", "set-schema", ds_id, "--schema-file", str(schema_file)])
+    capsys.readouterr()
+    _seed_file_dir(ws, "fileauto0004", pages=1)
+
+    # A tree that fits no schema root is refused after the call was billed.
+    bogus = {"Bogus": {"text": "x", "locations": [{"page_number": 1}]}}
+    response = _tool_response("submit_values", {"values": bogus})
+    response._hidden_params = {"response_cost": 0.05}
+    with patch("litellm.completion", return_value=response):
+        rc = main(_ws_args(ws) + ["docset", "add-file", "fileauto0004", "--docset", ds_id])
+    assert rc == 0
+    extraction = _read_stdout(capsys)["extraction"]
+    assert "VALUES_EXTRACTION_FAILED" in extraction["error"]
+    assert extraction["usage"]["cost_usd"] == 0.05
 
 
 @needs_gs
@@ -5723,12 +6222,28 @@ def test_link_usage_is_recorded_per_document(
 
     both_proposing = threading.Barrier(2, timeout=10)
 
-    def fake_call(config: Any, **kwargs: Any) -> str:
-        if "reviewer" in str(kwargs["system_prompt"]):
-            return json.dumps({"verdicts": [{"i": 0, "keep": True}]})
-        both_proposing.wait()  # exactly one propose call per document
-        return json.dumps(
-            {"links": [{"subject": "e0001", "object": "e0002", "predicate": "references"}]}
+    from litellm import ModelResponse
+
+    # Mocked at litellm, below every call path the link pass may take (it
+    # drives request steps now, so a mock of llm.call_continued would let the
+    # pass reach the real provider unnoticed).
+    def fake_completion(**kwargs: Any) -> Any:
+        reply: dict[str, Any]
+        if "reviewer" in json.dumps(kwargs["messages"]):
+            reply = {"verdicts": [{"i": 0, "keep": True}]}
+        else:
+            both_proposing.wait()  # exactly one propose call per document
+            reply = {"links": [{"subject": "e0001", "object": "e0002", "predicate": "references"}]}
+        return ModelResponse(
+            choices=[
+                {
+                    "message": {"role": "assistant", "content": json.dumps(reply)},
+                    "finish_reason": "stop",
+                    "index": 0,
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            model="fake/model",
         )
 
     def fake_convert(paths: Any, *, options: Any, on_output: Any, **_kw: Any) -> dict[str, str]:
@@ -5740,7 +6255,7 @@ def test_link_usage_is_recorded_per_document(
 
     with (
         patch("dgml_core.generation.convert_batch", side_effect=fake_convert),
-        patch("dgml_core.llm.call_continued", side_effect=fake_call),
+        patch("litellm.completion", side_effect=fake_completion),
     ):
         rc = main(_ws_args(ws) + ["--debug", "docset", "generate", did, "--no-coverage"])
     assert rc == 0
@@ -5748,6 +6263,9 @@ def test_link_usage_is_recorded_per_document(
     rows = [e for e in read_events(Workspace(root=ws)) if e["operation"] == "links"]
     assert len(rows) == 2  # one per document, not one covering both
     assert {r["context"]["doc"] for r in rows} == {"one.pdf", "two.pdf"}
+    # Each row is its own document's answered pass, not a failed call's row.
+    assert [r["outcome"] for r in rows] == ["ok", "ok"]
+    assert all(r["total_tokens"] > 0 for r in rows)
 
 
 @needs_gs
@@ -6407,6 +6925,7 @@ def test_import_is_idempotent(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     payload = _read_stdout(capsys)
     assert payload["imported"] == []
     assert payload["skipped"][0]["workspace_id"] == wid
+    assert payload["skipped"][0]["status"] == "skipped"
 
 
 def test_import_on_conflict_fail_stops(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -6449,7 +6968,9 @@ def test_import_reports_a_bad_row_and_keeps_going(
     assert main(["workspace", "import"]) == 2  # partial success
     payload = _read_stdout(capsys)
     assert [r["workspace_id"] for r in payload["imported"]] == [wid]
+    assert payload["imported"][0]["status"] == "imported"
     assert payload["failed"][0]["root"] == str(tmp_path / "vanished")
+    assert payload["failed"][0]["status"] == "failed"
     assert "does not exist" in payload["failed"][0]["reason"]
 
 

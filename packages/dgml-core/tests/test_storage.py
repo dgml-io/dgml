@@ -366,7 +366,7 @@ def test_rendered_family_expands_to_the_provider_defaults() -> None:
     for provider, tiers in PROVIDER_MODELS.items():
         models = tomllib.loads(render_config_toml(provider))["models"]
         cfg = load_models_config({ConfigSection.MODELS: expand_family(models)})
-        assert {t: getattr(cfg, t) for t in tiers} == tiers
+        assert {t: getattr(cfg, t).model for t in tiers} == tiers
 
 
 def test_default_models_are_recognized_by_the_provider_router() -> None:

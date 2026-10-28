@@ -48,15 +48,16 @@ from typing import Any
 from .classification import (
     ClassificationConfig,
     ClassificationDecision,
+    DecisionKind,
     _resolve_api_key,
 )
 from .errors import ClassificationFailed
-from .llm import LLMConfig, call_with_tools
+from .llm import LLMConfig, call_with_tools, describe_call_failure
 from .models import DocSet
 from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
-from .usage import OPERATION_CLUSTER
+from .usage import UsageOperation
 from .utils import MANY_IMAGE_MAX_EDGE, gather_file_pages, image_to_data_url
 
 _TOOL_GROUP = "group_documents"
@@ -120,7 +121,7 @@ def llm_cluster_files(
     config: ClassificationConfig,
     docsets: list[DocSet] | None = None,
     max_files: int = DEFAULT_MAX_FILES,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> LLMClusteringResult:
     """Cluster ``file_ids`` in one vision-LLM call and return the partition.
 
@@ -196,8 +197,8 @@ def llm_cluster_files(
         # models (temperature is never sent there — see _build_completion_kwargs).
         temperature=0.0,
         workspace=workspace,
-        debug=debug,
-        operation=OPERATION_CLUSTER,
+        record_usage=record_usage,
+        operation=UsageOperation.CLUSTER,
         context={"file_ids": usable},
     )
     try:
@@ -208,7 +209,9 @@ def llm_cluster_files(
             tool_choice="required",
         )
     except Exception as exc:
-        raise ClassificationFailed(f"LLM call failed: {type(exc).__name__}: {exc}") from exc
+        raise ClassificationFailed(
+            f"LLM call failed: {describe_call_failure(exc, llm_config)}"
+        ) from exc
 
     groups = _extract_groups(result.response)
     return _assemble_result(groups, labels, usable, no_pages + overflow, docsets)
@@ -369,7 +372,7 @@ def _new_group_decision(group: dict[str, Any]) -> ClassificationDecision | None:
             if isinstance(q, str) and q.strip():
                 questions.append(q.strip())
     return ClassificationDecision(
-        decision="new",
+        decision=DecisionKind.NEW,
         new_name=name.strip(),
         new_description=description,
         new_key_questions=tuple(questions),

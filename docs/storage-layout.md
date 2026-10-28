@@ -9,8 +9,9 @@ Every bounding box DGML stores — in `page_text/page_N.json` and in the
 `dg:origin` attributes of `<stem>.dgml.xml` (both the generated document tree
 and the `dg:extraction` element) — uses **one**
 convention: integer **image pixels** `[left, top, right, bottom]`,
-top-left origin, at 300 dpi relative to the page's
-`page_images/page_N.png`. Page is carried in a sibling `page_number`
+top-left origin, relative to the page's `page_images/page_N.{png,jpg}` (rendered
+at 300 dpi by default, then fit to the page-edge bounds; see
+[Page images](#page-images-jpeg-edge-bounds)). Page is carried in a sibling `page_number`
 field for structured forms, or as a leading integer inside each
 `dg:origin` box (`<page> <x1> <y1> <x2> <y2>`, space-separated) since one
 element can span pages.
@@ -74,6 +75,12 @@ at all — see [storage services](#storage-services-storage).
 ├── workspace.json                    # { name, organization, workspace_id, schema_version } — written by `workspace create`
 ├── config.toml                       # storage binding + settings — REQUIRED
 ├── usage.jsonl                       # LLM call event log (optional)
+├── batches/                          # batch job state (optional; any --batch run; removed once empty)
+│   └── <job_id>/                     #   bj_<12 hex>
+│       ├── job.json                  #   manifest (see "batches/<job_id>/" below)
+│       ├── lease.json                #   which process holds the job right now
+│       ├── responses/<key>.json      #   one received response per request key
+│       └── inputs/<name>             #   inputs a resumed run restores
 ├── docsets/
 │   └── <docset_id>/                  # generated: 12-char base-36 ID
 │       ├── docset.json               # { id, name, description, key_questions }
@@ -98,8 +105,9 @@ at all — see [storage services](#storage-services-storage).
         │                             #   not already a PDF; what pages/text and
         │                             #   generation use (see docs/conversion.md)
         ├── file.json                 # metadata (see schema below)
-        ├── page_images/              # PNG page renders at page_image_dpi
-        │                             #   (300 by default; cacheable, see below)
+        ├── page_images/              # JPEG/PNG page renders at page_image_dpi
+        │                             #   (300 by default), fit to the page-edge
+        │                             #   bounds (see below; cacheable)
         │   ├── page_1.png
         │   └── page_2.png
         ├── page_text/                # one JSON of word boxes per page
@@ -119,14 +127,41 @@ everywhere an ID appears.
 
 DocSet IDs are always generated today.
 
+## Page images (JPEG, edge bounds)
+
+Each page is rendered at the file's dpi (`page_image_dpi`, 300 by default) and
+then stored with its **longest edge between 1000 and 3508 pixels**, as a PNG
+(`page_N.png`) or a JPEG at quality 90 (`page_N.jpg`), whichever is smaller for
+that page — a crisp text page is usually far smaller as a PNG, a photo or scan
+far smaller as a JPEG, so one file's pages can mix the two. A page whose render already falls in that range — Letter (2550 ×
+3300) and A4 (2480 × 3508) at 300 dpi — is stored at exactly its render size; a
+large-format sheet is scaled down to a 3508-pixel long edge, and a small page
+(or a low `--dpi`) is scaled up to a 1000-pixel one. The scale is uniform, so
+the aspect ratio is kept.
+
+The bounds decide the pixel space every box is in: digital text extraction
+applies the same fit, so `page_text/` and `dg:origin` boxes always match the
+stored image, refit or not. The bounds are not recorded per file; `dgml check`
+repairs with the current ones.
+
+Files added before the edge bounds have **full-size PNG** renders
+(`page_N.png`). They stay valid — their boxes are in those PNGs' pixels — and
+every reader accepts either extension. If `dgml check` has to re-render such a
+file's pages, it writes bounded images: identical geometry for a page already
+inside the bounds, but a page outside them (a large-format sheet, or a
+`--dpi` low enough to fall under the min edge) no longer matches its stored
+`page_text/` boxes. Delete and re-add such a file instead, which re-extracts
+its text against the new images.
+
 ## Page-image render cache (`$DGML_PAGE_CACHE`, optional)
 
 Rendering `page_images/` runs the configured renderer (the system
 ghostscript binary by default, or PDFium via `[pdf] provider =
 "pypdfium2"`), which dominates the cost of `dgml file add`. The render is a
-pure function of the PDF bytes, the renderer, and the dpi, so when the
-**`DGML_PAGE_CACHE`** environment variable names a directory, the renderer
-keys each render by a hash of all three and reuses it:
+pure function of the PDF bytes, the renderer, the dpi, and the stored-image
+format and edge bounds, so when the **`DGML_PAGE_CACHE`** environment
+variable names a directory, the renderer keys each render by a hash of them
+all and reuses it:
 
 - **Hit** — an identical PDF rendered before is copied from the cache and
   the render backend is not invoked (it need not even be installed).
@@ -138,7 +173,7 @@ The cache is **off by default**; unset, rendering is unchanged. It is keyed by
 content, not by workspace — so it pays off when the same PDFs are ingested into
 many workspaces (e.g. the clustering sweep's per-cell workspaces in
 [evaluation/clustering/](../evaluation/clustering/), which sets it automatically;
-`--no-page-cache` opts out). Entries are plain `<hash>/page_*.png` directories
+`--no-page-cache` opts out). Entries are plain `<hash>/page_*.{jpg,png}` directories
 and are safe to delete at any time.
 
 ## Staging scratch space (`$TMPDIR`)
@@ -463,7 +498,7 @@ mongo_database = "dgml"
   *is* the `default` service, and no `[storage]` at all is the zero-config local
   store for both roles.
 - **Secrets vs. identity.** Secret-hinted options (keys containing `key`, `secret`,
-  `token`, `password`, `credential`) are excluded from the
+  `token`, `password`, `credential`, or the word `uri` as in `mongo_uri`) are excluded from the
   [seal fingerprint](#the-storage-seal-storage_fingerprint), so rotating a credential
   never reads as "the store moved". Every in-tree provider takes its credentials from
   the **environment** instead of config — S3 via the boto3 chain, Mongo via
@@ -533,11 +568,83 @@ explicit tiers in the user config, while tiers set in the same layer as the
 family, or a higher one, still override it. To drop a user-level pin in one
 workspace, restate the family there.
 
-Tiers name only models — they carry no credentials. Credentials are configured
-per task on the task's own section (e.g. `generation.api_key_env`,
-`grounded.schema_api_key`); a model sourced from a tier uses its task section's
-credentials, or falls back to litellm's per-provider env var when the section
-sets none.
+A model and its credentials are **one group, written together in one config
+layer**: a tier's are the `<tier>_*` keys beside it, a task's are the keys on its
+own section, and a credential in a layer that does not set its model is refused
+(`*_CONFIG_INVALID`) by the task that would have used it — the merge itself never
+fails, so commands that call no model are unaffected. A group never borrows from
+another tier, another section or another layer, and a key can never be separated
+from the model it was written beside.
+
+```toml
+[models]
+family = "anthropic_google"
+anthropic_api_key_env = "ANTHROPIC_API_KEY"   # onto every keyless anthropic/… model
+google_api_key_env    = "GEMINI_API_KEY"      # … and every keyless gemini/… one
+expert          = "anthropic/claude-opus-5"
+expert_api_key_env = "OPUS_KEY"               # this tier's own key …
+expert_api_base = "https://proxy.example"     # … and endpoint
+```
+
+- **Per task**, on the task's own section (`generation.api_key_env`,
+  `grounded.schema_api_key`, `classification.api_base`, …) — for the model that
+  section names in the same layer. Credentials in a layer whose section names no
+  model are refused when that task runs: a key beside no model has no model it was
+  meant for.
+- **Per tier**: `<tier>_api_key` / `<tier>_api_key_env` / `<tier>_api_base` next
+  to the tier, taken whole by every task that gets its model from that tier. They
+  require the tier to be set **in the same layer** (a `family` there counts), else
+  every task that reads the tiers is refused, and they move with it: a layer that
+  sets `expert` replaces `expert`'s whole group, so a workspace `config.toml` that
+  overrides `expert` does **not** inherit a user-level `expert_api_key_env`.
+
+  Because a `family` sets every tier in its layer, a tier credential may sit
+  beside the family alone, with no explicit tier:
+
+  ```toml
+  [models]
+  family = "anthropic"
+  expert_api_key_env = "OPUS_KEY"   # sent to whatever model the family picks for expert
+  ```
+
+  The key then goes to the family's default model for that tier, which **may
+  change across dgml upgrades** — and in a mixed family may belong to another
+  provider (in `anthropic_google`, `light` is a Gemini model, so `light_api_key`
+  there must be a Google key). To know which model a key is sent to, pin the tier
+  beside it (`expert = "anthropic/claude-opus-5"`).
+- **Per provider**: `anthropic_api_key`, `google_api_key`, `openai_api_key` (or
+  the `_env` form) merges like any other setting — the highest layer that sets
+  either form wins, so a key in `DGML_MODELS__ANTHROPIC_API_KEY_ENV` overrides one
+  in a config file, and one form in the user config never clashes with the other in
+  the workspace config. After the merge it is written onto every model of that
+  provider (by model-id prefix: `anthropic/`, `gemini/`, `openai/`) that has no key
+  of its own and no `api_base`: tiers, task sections, and per-call overrides
+  (`--model` / `--label-model`, a `--generation-config` profile or file,
+  `--values-model` / `--schema-model`) alike, whichever layer set the model. One
+  key per provider covers a mixed family such as `anthropic_google`. A model
+  pointed at a custom `api_base` never receives it; dgml warns there, because
+  litellm would send its own env-var key to that host instead.
+
+**Secrets injected through the environment** follow the same rules. The
+environment is a layer like any other, so `DGML_GENERATION__API_KEY_ENV` alone makes
+generation fail with `GENERATION_CONFIG_INVALID` — it names no model — and
+`DGML_GENERATION__MODEL` alone replaces the file's `generation` model group whole,
+`api_base` and key included.
+For an `anthropic/`, `gemini/` or `openai/` model, inject the provider key
+(`DGML_MODELS__ANTHROPIC_API_KEY_ENV=…`): it reaches every keyless model of that
+provider, whichever layer set the model. For any other model, or one at a custom
+`api_base`, set the whole group in the environment (`DGML_GENERATION__MODEL`,
+`DGML_GENERATION__API_BASE`, `DGML_GENERATION__API_KEY_ENV`).
+
+A model with no credentials falls back to litellm's per-provider env var — the one
+fallback there is. A tier that is unset borrows its fallback tier's model and
+credentials together.
+
+For an `openai/`, `anthropic/` or `gemini/` model at a custom `api_base`, set
+`api_key` (or `api_key_env`) beside it — the server's real key, or any placeholder
+such as `"EMPTY"` if it checks none. litellm requires a key for these providers, and
+without one it reads the provider's own environment variable and sends that to the
+custom host. `ollama/` models need no key and have no such fallback.
 
 `dgml init --provider {anthropic,anthropic_google,google,openai}` writes a
 family-only `[models]` block; omit `--provider` to auto-detect from the API-key
@@ -561,7 +668,7 @@ any settings across.
 ### `classification` (optional, required for `dgml file add --auto-classify`)
 
 The model defaults to the `[models].light` tier; add this section only to
-override it or set classification-specific credentials.
+override it (with that model's own credentials, if any).
 
 ```toml
 [classification]
@@ -575,8 +682,10 @@ Field rules:
 - `max_pages` — optional positive int, default `3`. First-N pages shown to the
   classifier.
 - `api_key` / `api_key_env` / `api_base` — optional; mutually-exclusive key /
-  env-var name, plus an optional endpoint. Apply whether the model is set here or
-  comes from the `light` tier; when unset, litellm uses its per-provider env var.
+  env-var name, plus an optional endpoint, for the `model` set here. They require
+  `model` in the same config layer (else `CLASSIFICATION_CONFIG_INVALID` when the
+  classifier runs); a model from the `light` tier takes the tier's own
+  `light_api_key` and friends. When unset, litellm uses its per-provider env var.
 
 ### `ocr` (optional, required for `--text-mode ocr`)
 
@@ -642,8 +751,10 @@ Field rules:
   mutually exclusive with the matching `*_env` field.
 - `schema_api_key_env` / `values_api_key_env` — optional env var names per side.
 - `schema_api_base` / `values_api_base` — optional endpoint per side.
-  These per-side credentials apply whether the model is set here or comes from
-  its tier; when unset, litellm uses its per-provider env var.
+  These per-side credentials are for the model set here and require it in the
+  same config layer (else `GROUNDED_CONFIG_INVALID` when that side runs); a model
+  from its tier takes the tier's credentials. When unset, litellm uses its
+  per-provider env var.
 - `max_tool_iters` — optional positive int, default 20. Cap on
   `get_page_words` tool calls per extraction.
 - `values_reasoning_effort` — optional, default `"medium"`. The reasoning budget
@@ -652,6 +763,16 @@ Field rules:
   `"default"` to send no reasoning effort and take the provider's own default.
   It is the largest cost and latency dial on extraction, and the right setting
   differs by model. Location grounding is not affected.
+- `locations_reasoning_effort` — optional, default `"high"`. The reasoning
+  budget of the location-grounding call on pages with OCR words, same values as
+  above. Anthropic models never receive it (that call forces its tool, and the
+  wrapper drops the budget); every other provider does, and at the default it is
+  the larger half of a Gemini values model's extraction latency. A page that
+  goes through the no-words grid path (no OCR words and a known image size)
+  keeps its own `"medium"`, which this field does not change. The value is
+  checked by name, not against what the model supports: one the provider
+  refuses fails in phase 3, after the values call has been paid for, on the
+  first page that needs grounding.
 
 ### `generation` (required for `dgml docset generate`)
 
@@ -685,9 +806,13 @@ Field rules:
 - Labeling credentials: `label_api_key` / `label_api_key_env` /
   `label_api_base`. The two models carry **independent** credentials because
   they may name different providers (e.g. the `anthropic_google` family blends
-  Gemini and Anthropic models). These apply whether the models are set here
-  or come from their tiers; when unset, litellm uses its per-provider env var.
-- `thinking` — optional; `"disabled"` (default) or `"adaptive"`. Anthropic
+  Gemini and Anthropic models). Each set is for the model set here and requires
+  it in the same config layer (else `GENERATION_CONFIG_INVALID` when generation
+  runs); a model from its tier takes the tier's credentials. When unset, litellm
+  uses its per-provider env var.
+- `thinking` — optional; `"disabled"` (default), `"adaptive"`, or
+  `"between_tools"` (Claude Sonnet 5.5 rejects `"disabled"`; this is its off
+  switch, thinking only between tool calls). Anthropic
   extended thinking, applied to **both** passes; ignored for non-Anthropic
   models. Omitting the field on the wire is not the same as turning thinking
   off: Claude 4.6+/5 models think adaptively unless told not to, so generation
@@ -734,7 +859,10 @@ Field rules:
   litellm model id. A local [Ollama](https://ollama.com/) model
   (`ollama/<name>`) keeps the merge on-device; any litellm-supported model works.
 - `api_base` — optional. The endpoint URL. Required for Ollama
-  (`http://localhost:11434`); omit for hosted providers.
+  (`http://localhost:11434`); omit for hosted providers. Like `api_key`, it
+  belongs to a `model` set in the same config layer (else
+  `TEXT_EXTRACTION_CONFIG_INVALID` when the feature runs); a model from the tier
+  takes the tier's own credentials.
 - `api_key` / `api_key_env` — optional literal key / env-var name,
   mutually exclusive. Local providers need neither; when both are unset,
   litellm falls back to its provider-default env var.
@@ -782,7 +910,10 @@ Field rules:
 - `model` — optional; falls back to the `light` tier. Provider-prefixed litellm
   model id; must be vision-capable (it is shown page images). A model alone does
   **not** enable the feature.
-- `api_base` — optional endpoint URL (e.g. for a local Ollama vision model).
+- `api_base` — optional endpoint URL (e.g. for a local Ollama vision model). Like
+  `api_key`, it belongs to a `model` set in the same config layer (else
+  `STYLE_CONFIG_INVALID` when the feature runs); a model from the tier takes the
+  tier's own credentials.
 - `api_key` / `api_key_env` — optional literal key / env-var name,
   mutually exclusive; when both unset, litellm falls back to its
   provider-default env var.
@@ -887,7 +1018,7 @@ converted to the engine's `extracted_value` JSON Schema, whose leaf values
 carry `{ "text", "value"?, "locations": [{ "page_number", "bounding_box":
 [left, top, right, bottom] }] }` — verbatim text, optional normalized value
 (enum token, ISO date, plain number), and locations in integer image pixels
-(top-left origin, 300 dpi, relative to `page_images/page_N.png`) — so every
+(top-left origin, relative to `page_images/page_N.{png,jpg}`) — so every
 extracted value traces back to one or more regions of the source PDF.
 
 When present, `extraction-schema.rnc` is one of the artifacts captured in a
@@ -930,7 +1061,8 @@ governs the generated full-document tree; the extraction schema governs the
 (`full-extraction`). The body is the planner's `Schema` document
 (canonical tag names plus per-tag metadata). Generation also writes a
 `cache/` at the docset root. It holds **functional** files the next
-`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json`,
+`generate` run reloads — `*_blocks.json`, `label_*_cNN_raw.json` (one per
+chunk whose reply parsed; a bisected chunk's halves are `cNNa`/`cNNb`),
 `concept_roster.json` (the flat legacy vocabulary; incremental reuse prefers
 the docset's `authored-schema.json`, then its `schema.json`, and falls back to
 this file), and
@@ -992,9 +1124,13 @@ workspace — classification, clustering's DocSet-naming, transcription
 (`transcribe`), labeling (`label`), semantic links (`links`), schema
 generation, value extraction, and hybrid text-merge (`hybrid_merge`).
 
-**Recording is gated on `--debug`.** Without `--debug`, no rows are
-written for any operation; pass `--debug` to log cost/token telemetry
-alongside the other debug artifacts. One JSON object per line; readers
+**Recording is opt-in.** The CLI turns it on under `--debug`: without
+`--debug`, no rows are written for any operation; pass `--debug` to log
+cost/token telemetry alongside the other debug artifacts. A library caller
+sets `record_usage=True` on the operation (or on its `LLMConfig`) instead,
+which records rows without writing any debug artifact; `extract_values`
+also returns the same totals on `ExtractionResult.usage` for callers that
+keep telemetry out of the workspace. One JSON object per line; readers
 tolerate corrupt tail lines from a crashed mid-write append. The CLI
 never reads this file; it exists for introspection and cost accounting
 by external tooling that aggregates and renders it.
@@ -1004,7 +1140,7 @@ One record:
 ```jsonc
 {
   "at": "2026-05-15T17:42:00Z",
-  "operation": "extract_values",     // classify | schema_generate | extract_values | transcribe | label | links | hybrid_merge
+  "operation": "extract_values",     // classify | cluster | schema_generate | extract_values | transcribe | label | links | hybrid_merge | style_annotate | batch_unused | llm_call (no operation named); a library caller's LLMConfig may name its own
   "model": "gemini/gemini-3-flash-preview",
   "cost_usd": 0.0123,                // null when litellm doesn't price the model
   "prompt_tokens": 12345,
@@ -1026,6 +1162,115 @@ required multiple internal turns; the per-call costs and token counts
 are summed before recording. Partial cost (LLM calls made before a
 later failure) is preserved on `outcome=error` rows.
 
+Under a [batch job](#batchesjob_id-optional) the rows of a run that ends
+paused (`--no-wait`) are not written; the run that completes the job writes
+the rows a blocking run would. A response a later run replays after an
+interrupted run already counted it contributes zero cost and tokens, so every
+response is billed exactly once across the job's rows. A response the job paid
+for that no run of it ever used (a superseded batch's results, a request the
+command stopped asking for, a batch collected only as the run ended) is still
+shown: when the job completes it writes one `batch_unused` row per such
+response, at the tier that served it, with `context`
+`{"unused": true, "batch_job": "<job id>"}`. No command's own row counts it.
+A job no run will finish writes them too: `dgml batch cancel` for every
+response its runs collected and no row counted yet (a paused run's included),
+and `dgml batch delete` / `prune` for any left before the job is removed. These
+rows follow the command's own setting: a job whose command records no usage
+(run without `--debug`) writes none.
+
+## `batches/<job_id>/` (optional)
+
+State of one batch job — see
+[Batch jobs](cli-reference.md#batch-jobs---no-wait-and-dgml-batch). Written by
+any `--batch` run (a plain blocking run keeps one silently, for crash
+recovery, deleted when that run finishes — unless it ends leaving the job
+`failed`, when the payload names it in `batch.job`). A completed job keeps only
+its summarized `job.json`; `dgml batch prune` and `dgml batch delete` remove
+jobs. Deleting the last job also removes the then-empty `batches/` directory
+itself, so a workspace whose batch runs all finished has no `batches/`.
+
+- **`job.json`** — the manifest:
+
+  ```jsonc
+  {
+    "job_id": "bj_3f9a1c07d2e4",
+    "command": "docset generate",          // docset generate | extraction extract |
+                                           // extraction generate-schema | file add
+    "argv": ["docset", "generate", "…", "--batch", "--no-wait"],  // replayed by `batch resume`
+    "cwd": "/home/me/project",              // replayed from here (relative paths)
+    "created_at": "…", "updated_at": "…",
+    "status": "pending",                   // pending | completed | failed (`batch status`
+                                           // derives `ready` when asked; never stored)
+    "error": null,
+    "runs": 3,                             // runs of the command under this job so far
+    "provider_batches": [                  // every provider batch the job submitted
+      {"job": {"provider": "anthropic", "job_id": "msgbatch_…", "custom_ids": ["…"],
+               "submitted_at": "…", "extra": {}},
+       "model": "anthropic/claude-haiku-4-5", "api_base": null,
+       "stage": "transcribe",               // the pipeline stage the batch served
+       "credential": {"section": "generation", "field": "transcribe",
+                      "env": "MY_ANTHROPIC_KEY"},   // where the key comes from; never the key
+       "key_fingerprint": "3f9a1c07d2e4",   // first 12 hex digits of sha256(key) the batch
+                                           // was created with (null if the backend cannot
+                                           // tell); a 404 under a different key is not
+                                           // "gone": the run stops, the record stays open
+       "keys": {"<custom_id>": "<request key>"},
+       "state": "collected",               // open | collected | dropped (canceled) |
+                                           // uncertain (create outcome unknown; has "error"
+                                           // and a placeholder "uncertain_…" job_id) |
+                                           // settling (canceled at --batch-deadline, cancel
+                                           // not settled; has "settling_reason" and
+                                           // "possibly_double_billed", and "collected" (the
+                                           // custom_ids already stored, when a collection
+                                           // failed part-way: never counted late); once it
+                                           // ends it gets "late_billed": {"requests",
+                                           // "cost_usd"}, "settled_at", and becomes dropped)
+       "last_status": {"state": "ended", "succeeded": 12, "errored": 0, "expired": 0,
+                       "canceled": 0, "processing": 0},
+       "cleanup": "done"}                   // dropped batches only: provider-side delete
+                                           // "pending" (cancel not settled) | "done"
+                                           // A record may also carry "gone": true — the
+                                           // provider answered 404 (batch deleted or never
+                                           // existed); closed out as collected (every
+                                           // response stored) or dropped, no cleanup owed
+    ],
+    "billed": ["<request key>", "…"],      // responses already counted on a usage row
+    "inputs": {"generate/schema.json": true, "presence:generate/blocks/a.pdf": false},
+    "state": {},                           // command-specific (file add: its ingest results)
+    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}},
+                                           // per executor, per run: summed for the payload
+    "record_usage": true,                  // the command writes usage rows (`--debug`);
+                                           // the job's own `batch_unused` rows follow it
+    "deadline": {"at": "2026-09-30T18:00:00Z", "seconds": 21600.0,
+                 "runs": {"1": {"canceled_batches": 0, "…": 0}}}
+                                           // only with --batch-deadline: the absolute UTC
+                                           // instant every run honors, the duration it was
+                                           // set from, and each run's deadline counters
+  }
+  ```
+
+- **`lease.json`** — `{"owner", "expires"}` (epoch seconds): the process running
+  the job. Renewed every minute, expires 10 minutes after the last renewal;
+  `dgml batch unlock` removes it. A runner never re-creates a lease it finds
+  gone or held by another owner: it stops (`BATCH_JOB_BUSY`).
+- **`responses/<key>.json`** — one received response. The key is
+  `<sha256 of the request>-<occurrence>`: the digest is taken over the litellm
+  request as canonical JSON, leaving out the API key, the timeout and any
+  credential header, and the occurrence number keeps two identical requests in
+  one run apart. The file holds the litellm response and only the hidden fields
+  accounting needs (`response_cost`, `dgml_tier`) — no provider headers and never
+  a credential.
+- **`inputs/slices/<source sha>/<engine>/<first>-<last>-<pages sha>.pdf`** — each
+  PDF slice sent to a model (a transcription window, a schema sample trimmed to
+  fit, an extraction page range; page numbers 1-based), recorded the first time it is cut and
+  reused by every resume, because slicing is not byte-reproducible; and
+  `inputs/generate/converted/<name>.pdf` for a document converted on demand.
+  Deleted with the responses when the job completes.
+- **`inputs/<name>`** — the content an input had when the job started, restored
+  by every resumed run (`docset generate`'s `schema.json` and
+  `concept_roster.json`). Inputs recorded only by presence (a document's
+  `_blocks.json`) have no file here; their flag is in `job.json` `inputs`.
+
 ## `docsets/<id>/files/<file_id>/<stem>.dgml.xml` (optional)
 
 The DGML for this (docset, file) pair — the single per-file DGML artifact.
@@ -1036,7 +1281,13 @@ things under its root `dg:chunk`:
 - a **`dg:extraction`** element (`dgml extraction extract`) — a direct child of
   the root holding the docset schema's extracted fields as `docset:` elements,
   each with its text content, a normalized `dg:value`/`xsi:type` where the text
-  is a recognizable typed value, and a `dg:origin` grounding it to the page:
+  is a recognizable typed value, and its provenance (DGML 0.71): `dg:origin`
+  boxes for its printed text, `dg:inputs` naming the elements the value used,
+  and `dg:method` (`calculated` | `inferred` | `defaulted`) on a value the
+  page doesn't print. Printed text a value used that no schema field extracts
+  is an anonymous `<dg:chunk xml:id dg:origin>` next to the field. A 0.7
+  `dg:origin="computed"` element still reads, with its `dg:href` targets as
+  its inputs:
 
 ```xml
 <dg:chunk xmlns:dg="http://dgml.io/ns/dg#"
@@ -1044,7 +1295,9 @@ things under its root `dg:chunk`:
           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <!-- generated document tree, if `generate` ran (full-extraction mode) -->
   <dg:extraction>
-    <docset:Title dg:origin="1 220 475 919 539">Health and Wellness, BAS</docset:Title>
+    <docset:Title xml:id="title" dg:origin="1 220 475 919 539">Health and Wellness, BAS</docset:Title>
+    <docset:Credits xsi:type="integer" dg:value="120" dg:inputs="#title"
+        dg:method="inferred">120</docset:Credits>
   </dg:extraction>
 </dg:chunk>
 ```
@@ -1053,7 +1306,7 @@ When `generate` ran first, `extract` adds the `dg:extraction` element alongside
 the tree (`full-extraction`); otherwise it writes a minimal `dg:chunk` holding
 only the `dg:extraction` element (`extraction`). `dgml extraction get-values`
 projects the `dg:extraction` element back to values-shape JSON
-(`{tag: {text, value?, locations}}`). Placing this file in the pair directory
+(`{tag: {text, value?, locations?, inputs?, evidence?, method?}}`). Placing this file in the pair directory
 (rather than at the docset root) makes the artifact path deterministic
 and unique per file, which is what file attestation
 ([packages/dgml/src/dgml/file_attestation.py](../packages/dgml/src/dgml/file_attestation.py))
@@ -1068,8 +1321,8 @@ rendered tree is aligned against the file's `page_text/` OCR and a
 onto every element whose subtree grounded — so `<stem>.dgml.xml`
 carries page positions directly, with no separate grounded artifact. Each
 attribute is a `"; "`-separated box list, each box `<page> <x1> <y1> <x2>
-<y2>` (space-separated) in integer image pixels (top-left origin, 300
-dpi, relative to `page_images/page_N.png`). Elements with text-node
+<y2>` (space-separated) in integer image pixels (top-left origin,
+relative to `page_images/page_N.{png,jpg}`). Elements with text-node
 children (leaves and mixed-content parents) carry one box per visual
 line on each page (a parent's lines cover its whole subtree); pure
 containers (all-element children — sections, lists, tables, rows, the
@@ -1135,31 +1388,48 @@ dimension rounding). They are `null` if a non-PDF source failed to convert
 
 `pdf_converter` names the converter that turned a non-PDF source into the
 PDF the pipeline ran on (the converter's name with any trailing
-`"converter"` suffix removed, e.g. `"libreoffice"`). It is `null` when the
-source was already a PDF.
+`"converter"` suffix removed, e.g. `"libreoffice"`). It is `null` only when
+DGML converted nothing: the source was already a PDF, or a library caller
+supplied the PDF (`FileStore.add(…, converted_pdf=)`; DGML did not check
+that it matches the source). So a convertible source (`.docx`, `.xlsx`, …)
+with a `null` `pdf_converter` is a supplied PDF — DGML names every converter
+it runs, and a failed conversion still names the one that was tried. That
+reading is an invariant: a future feature that produces no PDF at all must
+say so in a field of its own rather than by leaving this one `null`.
 
 ## `page_text/page_N.json`
 
 One per page, written regardless of `text_mode` (`"digital"`, `"ocr"`,
 or `"hybrid"` all share this shape). Word locations are
-in **image-pixel space** matching the corresponding `page_images/page_N.png`
+in **image-pixel space** matching the corresponding `page_images/page_N.{png,jpg}`
 render — i.e. ints with the top-left origin, computed as
 `round(pdf_pts * dpi / 72)` where `dpi` is the file's `page_image_dpi` — the
-same value `render_pages` used, 300 unless `--dpi` said otherwise. Consumers
-of these coordinates should read `page_image_dpi` off `file.json` rather than
-assuming 300: the boxes in a File added with `--dpi 150` are half the size of
-the same File's at 300. Files are compact (one line, no pretty-printing) so a
+same value `render_pages` used, 300 unless `--dpi` said otherwise — and then
+scaled by the same fit to the edge bounds as the stored image, when the page
+falls outside them. Consumers of these coordinates should take the page's
+`width` / `height` here (or the image's own size) rather than assuming 300
+dpi: the boxes in a File added with `--dpi 150` are half the size of the same
+File's at 300, and a large-format sheet's are scaled to its 3508-pixel image. Files are compact (one line, no pretty-printing) so a
 workspace with many pages doesn't bloat on disk:
 
 ```json
 {"file_id":"ab55kdjs93kk","page":1,"width":2550,"height":3300,"words":[{"t":"Hello","l":[100,210,182,242],"s":{"b":1,"sz":24.0,"c":"red"}},{"t":"world","l":[190,210,290,242],"s":{"sz":12.0}}]}
 ```
 
-- `width` / `height` — dimensions of the matching `page_images/page_N.png`.
+- `width` / `height` — dimensions of the matching `page_images/page_N.{png,jpg}`.
 - `words[*].t` — word text (whitespace-separated run of non-whitespace chars).
+  On the digital path a page also carries the words of filled PDF form fields
+  (printable, non-hidden text fields and combo boxes, not password fields,
+  read from the field's appearance stream with true glyph boxes). The words of
+  a field come right after the page content word they follow in reading order:
+  the nearest label on the same line, else the nearest line above in the same
+  column, else the end of the page. The page content words keep their order; a
+  value the page content already prints in the field is not repeated.
 - `words[*].l` — `[left, top, right, bottom]` ints (top-left origin, pixels).
 - `words[*].s` — observed style facts, present only on the digital path (and
-  digital-derived `hybrid` words); absent on OCR words. `sz` is
+  digital-derived `hybrid` words); absent on OCR words and on the words of
+  form-field values, so a filled form has the same body-size baseline as the
+  blank one. `sz` is
   recorded for every word with sized glyphs — which is essentially every digital
   word — so `s` is present on nearly all of them; `b`/`i`/`c` appear only when
   that non-default formatting was seen. Keys: `b` (bold, `1`), `i` (italic, `1`),
@@ -1196,6 +1466,15 @@ When a File is assigned to a DocSet, an `assignment.json` is written to
 `<workspace>/docsets/<docset_id>/files/<file_id>/`, holding
 `{ docset_id, file_id, assigned_at }`. The pair directory also holds that
 pair's generated artifacts (`<stem>.dgml.xml`, `extraction_stats.json`).
+
+Library callers look assignments up in either direction through `DocSetStore`
+rather than the store directly: `list_files(docset_id)` gives a DocSet's files,
+and `docsets_for_file(file_id)` gives a File's DocSets, each with its
+`assigned_at` (`null` for assignments carried over by a layout migration).
+`docsets_for_file` tolerates a bad manifest the way `list_all()` does: a DocSet
+whose `docset.json` is missing or cannot be parsed is left out (with a warning)
+rather than raised, and only files assigned to that DocSet are affected;
+`dgml check` reports it.
 
 Earlier revisions recorded the assignment as the *bare existence* of that
 directory, with no file inside. That could not survive its own deletion —

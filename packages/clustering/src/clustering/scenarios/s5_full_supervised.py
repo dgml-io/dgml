@@ -24,13 +24,14 @@ from collections.abc import Callable
 import torch
 
 from clustering.calibration import fit_support_calibrator
+from clustering.config.schema import ManifoldName, ScenarioName
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes
 
 
 class S5FullSupervised(Scenario):
-    name = "s5"
+    name = ScenarioName.S5
     # If ``config.scenario.n_shots`` is unset, take at most this many
     # support samples per category when building prototypes.
     DEFAULT_N_SHOTS = 8
@@ -105,10 +106,10 @@ class S5FullSupervised(Scenario):
             # operands live in different spaces (one on-manifold, one ambient)
             # and averaging them is meaningless. It is also the only manifold the
             # gain was measured on — so require it rather than misbehave silently.
-            if self.config.manifold.name != "euclidean":
+            if self.config.manifold.name != ManifoldName.EUCLIDEAN:
                 raise ValueError(
                     "scenario.name_prototype_blend is only supported with a euclidean "
-                    f"manifold; got manifold.name={self.config.manifold.name!r}."
+                    f"manifold; got manifold.name='{self.config.manifold.name}'."
                 )
             name_protos = self.encode_texts(list(cats))
             alpha = blend

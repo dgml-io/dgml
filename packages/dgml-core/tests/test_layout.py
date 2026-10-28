@@ -28,7 +28,8 @@ from .conftest import local_store
 
 def test_keys_are_root_relative_posix() -> None:
     assert layout.file_source_key("f1", "a.pdf") == "files/f1/a.pdf"
-    assert layout.file_page_image_key("f1", 3) == "files/f1/page_images/page_3.png"
+    assert layout.file_page_image_key("f1", 3) == "files/f1/page_images/page_3.jpg"
+    assert layout.file_page_image_key("f1", 3, "png") == "files/f1/page_images/page_3.png"
     assert layout.file_page_text_key("f1", 3) == "files/f1/page_text/page_3.json"
     assert layout.docset_extraction_schema_key("d1") == "docsets/d1/extraction-schema.rnc"
     assert layout.docset_full_schema_key("d1") == "docsets/d1/full-schema.rnc"
@@ -242,3 +243,27 @@ def test_pdf_filename_keeps_a_pdf_source_as_stored_and_converts_others() -> None
     assert layout.pdf_filename("Q1.final.XLSX") == "Q1.final.pdf"
     assert layout.file_pdf_key("f1", "INVOICE.PDF") == "files/f1/INVOICE.PDF"
     assert layout.file_pdf_key("f1", "report.docx") == "files/f1/report.pdf"
+
+
+def test_page_image_key_prefers_jpeg_and_falls_back_to_a_legacy_png(workspace: Workspace) -> None:
+    """A file added before page images moved to JPEG keeps resolving: its PNG
+    renders are what its page_text boxes were written against."""
+    from dgml_core.utils import page_image_key
+
+    workspace.blobs.put_blob(layout.file_page_image_key("new", 1), b"jpeg")
+    workspace.blobs.put_blob(layout.file_page_image_key("old", 1, "png"), b"png")
+    assert page_image_key(workspace, "new", 1) == "files/new/page_images/page_1.jpg"
+    assert page_image_key(workspace, "old", 1) == "files/old/page_images/page_1.png"
+    assert page_image_key(workspace, "old", 2) is None
+
+
+def test_read_page_image_returns_the_key_and_bytes_of_either_extension(
+    workspace: Workspace,
+) -> None:
+    from dgml_core.utils import read_page_image
+
+    workspace.blobs.put_blob(layout.file_page_image_key("f", 1), b"jpeg")
+    workspace.blobs.put_blob(layout.file_page_image_key("f", 2, "png"), b"png")
+    assert read_page_image(workspace, "f", 1) == ("files/f/page_images/page_1.jpg", b"jpeg")
+    assert read_page_image(workspace, "f", 2) == ("files/f/page_images/page_2.png", b"png")
+    assert read_page_image(workspace, "f", 3) is None

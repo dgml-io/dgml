@@ -1,0 +1,52 @@
+# Backing services for the DGML sample service.
+#
+#   scripts/start.sh     # brings these up, then the API and the web app
+#   scripts/stop.sh      # stops everything (data volumes are kept)
+#
+# Neither image is redistributed by DGML; both are services the sample talks to over
+# the network. PostgreSQL is under the permissive PostgreSQL License; SeaweedFS is
+# Apache-2.0.
+#
+# Host ports are deliberately off the defaults (55432, 18333) so this stack can run
+# beside a local Postgres and beside the dgml-storage-s3 test stack (port 9000).
+name: dgml-sample-service
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: dgml
+      POSTGRES_PASSWORD: dgml
+      POSTGRES_DB: dgml_sample
+    ports: ["${DGML_SAMPLE_PG_PORT:-55432}:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dgml -d dgml_sample"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # S3-compatible object storage. `server -s3` runs master, volume server, filer and
+  # the S3 gateway in one process. No identity config is supplied, so the gateway
+  # accepts any signature; the service still sends dummy credentials because boto3
+  # refuses to sign anonymously. The filer UI (browse the stored blobs) is on 18888.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47
+    command: server -s3 -dir=/data
+    ports:
+      - "${DGML_SAMPLE_S3_PORT:-18333}:8333"
+      - "${DGML_SAMPLE_FILER_PORT:-18888}:8888"
+    volumes: ["seaweedfs-data:/data"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O - http://localhost:8333/ >/dev/null 2>&1 ||
+          curl -sf http://localhost:8333/ >/dev/null 2>&1
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
+  seaweedfs-data:

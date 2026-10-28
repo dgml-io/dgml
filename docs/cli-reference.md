@@ -28,7 +28,9 @@ flag-driven (no interactive prompts) and idempotent where reasonable.
 - Exit codes:
   - `0` — success
   - `1` — error (anything in the `error` envelope)
-  - `2` — `dgml check` ran but found issues
+  - `2` — the command ran and printed its payload, but the outcome is not
+    clean: `dgml check` found issues, or a multi-file `extraction extract`
+    (or the extract step of `docset run`) failed on every file
 
 `--format text` switches to a basic key/value text format if a human is
 driving the CLI directly.
@@ -57,7 +59,7 @@ or after a command group (`dgml docset --format text list`).
 | `--workspace-config` | **Removed.** Still accepted so an existing caller gets a JSON error envelope instead of an argparse usage dump; passing it (or setting `$DGML_CONFIG`) fails with `INVALID_ARGUMENT` naming the replacement. It only ever worked as an address because the per-machine index recorded the location and handed it back on the next open. To start a workspace from a config you authored, use `dgml workspace create --from-config <path>`. |
 | `--format`       | `json` (default) or `text`. |
 | `--verbose`      | Emit informational diagnostics (INFO-level log lines) to stderr: hybrid text-mode warnings (digital/OCR conflicts, OCR misses) and the per-page merge summary, per-page style-annotation failures, workspace-upgrade notices, and the `docset generate` pipeline's progress lines. Off by default, so stderr carries only error envelopes and warnings. `DGML_DEBUG=1` in the environment has the same effect (plus the full traceback on an uncaught error, which `--verbose` also shows). |
-| `--debug`        | Keep intermediate debug files in the workspace **and** record LLM cost/token telemetry to `<workspace>/usage.jsonl`. Off by default, so only final files (and the small functional cache the next run reloads) are kept. With `--debug` off: no `usage.jsonl` rows are written for **any** operation (classify, cluster, transcribe, label, links, schema/value extraction, hybrid merge); `docset generate` skips the debug-only `cache/` artifacts (raw LLM dumps, `*.concept.xml`/`*.semantic.xml`, prompt listings) and `coverage_report.json`; and the in-place grounding pass skips the `<stem>.dgml.grounding_stats.json` sidecar. The functional `cache/` files (`*_blocks.json`, `label_*_cNN_raw.json`, `concept_roster.json`) are **always** written — incremental generation reloads them. Pass `--debug` to retain the debug artifacts and log usage. (Coverage summaries still print on stderr under `--verbose` either way.) `--debug` does not change log output — log verbosity is `--verbose` / `DGML_DEBUG=1`. |
+| `--debug`        | Keep intermediate debug files in the workspace **and** record LLM cost/token telemetry to `<workspace>/usage.jsonl`. Off by default, so only final files (and the small functional cache the next run reloads) are kept. With `--debug` off: no `usage.jsonl` rows are written for **any** operation (classify, cluster, transcribe, label, links, schema/value extraction, hybrid merge); `docset generate` skips the debug-only `cache/` artifacts (raw LLM dumps, `*.concept.xml`/`*.semantic.xml`, prompt listings) and `coverage_report.json`; the in-place grounding pass skips the `<stem>.dgml.grounding_stats.json` sidecar; and a value extraction skips the per-file `extraction_stats.json`. The functional `cache/` files (`*_blocks.json`, `label_*_cNN_raw.json`, `concept_roster.json`) are **always** written — incremental generation reloads them. Pass `--debug` to retain the debug artifacts and log usage. (Coverage summaries still print on stderr under `--verbose` either way.) `--debug` does not change log output — log verbosity is `--verbose` / `DGML_DEBUG=1`. In the library these are separate switches, all off by default: `debug` keeps the generation artifacts, `write_stats` the stats files, and `record_usage` logs usage. |
 
 ## Workspace commands
 
@@ -436,7 +438,7 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `hash_mismatch` | file | Stored sha256 doesn't match current PDF bytes |
 | `pdf_unreadable` | file | pypdf can't parse the PDF (records a permanent error so the next check skips re-parsing) |
 | `pdf_unreadable_permanent` | file | A previous parse recorded a permanent failure; not retried without `--retry-errors` |
-| `page_count_mismatch` | file | `page_images/` has the wrong number of PNGs (`repaired: true` if rerendered successfully) |
+| `page_count_mismatch` | file | `page_images/` has the wrong number of page images (`repaired: true` if rerendered successfully) |
 | `page_render_failed` | file | the configured page renderer failed during rerender |
 | `page_render_failed_permanent` | file | A previous render recorded a permanent failure; not retried without `--retry-errors` |
 | `page_text_count_mismatch` | file | `page_text/` has the wrong number of per-page JSONs (`repaired: true` if re-extracted successfully) |
@@ -444,12 +446,17 @@ Walk the workspace and report inconsistencies. Issue kinds emitted today:
 | `text_extraction_failed` | file | pdfminer.six failed to extract any words (records a permanent error so future checks skip retry) |
 | `text_extraction_failed_permanent` | file | A previous extraction recorded a permanent failure; not retried without `--retry-errors` |
 | `dangling_file_reference` | docset | DocSet references a File ID that doesn't exist |
-| `computed_field_unattributed` | docset | A `dg:origin="computed"` element in a file's DGML XML has no `dg:href` sources — the derivation can't be audited (spec §13 requires computed fields to name their sources) |
+| `value_unsupported` | docset | A 0.7 `dg:origin="computed"` element in a file's DGML XML has no `dg:href` sources, so it claims a derivation and names nothing a verifier can check. This replaces `computed_field_unattributed`. A 0.71 value with no `dg:origin`, `dg:inputs` or `dg:method` isn't flagged here; extraction doesn't write one (it drops it and counts it as `unsupported_values` in `extraction_stats.json`) |
+| `method_misplaced` | docset | A `dg:method` that contradicts the element: on an element with `dg:origin`, an unknown method, `defaulted` with `dg:inputs`, or `calculated`/`inferred` without them |
+| `inputs_dangling` | docset | A `dg:inputs` target (`#id`) names an `xml:id` no element in the file carries. Cross-file (`fileid#id`) inputs are not checked |
+| `inputs_cycle` | docset | An element is its own input, directly or through other inputs |
 | `semlink_dangling_href` | docset | A semantic link's `dg:href` names an `xml:id` no element in the document carries |
 | `semlink_nested` | docset | A semantic link points at the subject's own ancestor or descendant, stating a relationship the tree's nesting already states. Newly generated files can't carry one — re-generating clears it |
 
 `--retry-errors` clears recorded permanent errors and re-attempts the
-failed operations.
+failed operations. A cleared error for scanned pages OCR could not recover
+re-runs text extraction even though every `page_text/` file is present, so
+an OCR provider configured since then is used.
 
 > **Note:** `check` validates the stored **original** for each file (the
 > `original_filename` named in `file.json` — its presence and sha256). For a
@@ -692,6 +699,7 @@ dgml docset add-file <file_id> --docset <docset_id>   # auto-extracts when the
 dgml docset remove-file <file_id> --docset <docset_id>
 dgml docset list-files <docset_id>
 dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <id>] [--label-model <id>] [--window-size <n>] [--max-tokens <n>] [...]
+dgml docset run <docset_id> [--schema-from <file_id> ...] [--no-generate] [--no-extract] [generate flags] [--batch] [--no-wait] [--batch-deadline <duration>]
 ```
 
 `docset delete` removes the DocSet and its file-assignment markers, but
@@ -701,12 +709,21 @@ dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <
 **Auto-extract on assignment.** When the target DocSet has an extraction
 schema set (`extraction-schema.rnc`), every assignment path fires value
 extraction on the newly-assigned file: `docset add-file`, `file add
---auto-classify` (existing-DocSet decisions, which is every decision under
-`--auto-classify existing`), and `cluster` (existing-DocSet
+--auto-classify` (existing-DocSet decisions only — never a `"none"`
+decision under `--auto-classify existing`, which leaves the file
+unassigned), and `cluster` (existing-DocSet
 matches — a DocSet created mid-run can't have a schema yet). The payload
 gains an `extraction` block; extraction failures are **soft** (the error
 lands in `extraction.error`, the assignment stands, exit stays 0). No schema
 → plain assignment, no block.
+
+`extraction.usage` is the run's cost and token totals — the same numbers the
+`extract_values` row in `usage.jsonl` carries — reported with or without
+`--debug`, so a caller can account for auto-extraction cost without reading
+`usage.jsonl`. A failed extraction reports what it spent before failing;
+`usage` is `null` when nothing was spent (e.g. a config error).
+`cost_usd` and the token counts are `null` when the provider did not report
+them.
 
 ```json
 {
@@ -717,6 +734,15 @@ lands in `extraction.error`, the assignment stands, exit stays 0). No schema
     "performed": true,
     "model": "gemini/gemini-2.5-pro",
     "tool_calls": 0,
+    "usage": {
+      "cost_usd": 0.0123,
+      "prompt_tokens": 12345,
+      "completion_tokens": 234,
+      "total_tokens": 12579,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "duration_s": 15.2
+    },
     "error": null
   }
 }
@@ -791,8 +817,8 @@ is written but left ungrounded, with a warning — it does not fail the run.
 the `dg` prefix to (the open `dgml.io` scheme on generated DGML; plain
 `origin` on namespace-free XML). Its value is a `"; "`-separated list of
 boxes, each `<page> <x1> <y1> <x2> <y2>` (space-separated) in integer image
-pixels — top-left origin, 300 dpi, relative to the page's
-`page_images/page_N.png`:
+pixels — top-left origin, relative to the page's
+`page_images/page_N.{png,jpg}`:
 
 ```xml
 <docset:Body structure="h3"
@@ -847,25 +873,40 @@ with the deterministic digital/hybrid path. A malformed `style` section fails
 `generate` up front with `STYLE_CONFIG_INVALID`.
 
 Requires only the base `dgml` install — the generation pipeline reuses
-the workspace's pre-rendered `page_images/page_N.png` files at LLM
+the workspace's pre-rendered `page_images/page_N.{png,jpg}` files at LLM
 input time, so no extra rasterizer is needed at run time (and no
 GPL/poppler escape hatch). For non-workspace inputs (library callers
 passing arbitrary paths), the pipeline renders to a tempdir via the
 same canonical `pages.render_pages` (the configured engine — ghostscript by
 default; see [PDF engine configuration](#pdf-engine-configuration)).
 
-The models are **not** CLI flags — like every other model-consuming command
-(`extraction generate-schema`, `extraction extract`, `discover`), `generate` reads them
-solely from the merged config, so each is one visible, deliberate choice. Each
-model resolves from its per-task field (`generation.model`,
+Each model resolves from its per-task field (`generation.model`,
 `generation.label_model`) or, when unset, the `standard` `[models]` tier — for
 both tasks, since measurement did not support paying the `advanced` tier for
 labeling. There is no code default: if neither a
 field nor a tier names a model it fails with `GENERATION_CONFIG_MISSING`, a
-malformed one with `GENERATION_CONFIG_INVALID`. The two models carry independent
+malformed one with `GENERATION_CONFIG_INVALID`. Each model carries its own
 credentials (`api_key`/`api_key_env`/`api_base` for transcription,
-`label_api_key`/`label_api_key_env`/`label_api_base` for labeling) since they may
-name different providers. Anthropic extended thinking is off for both passes
+`label_api_key`/`label_api_key_env`/`label_api_base` for labeling), written beside
+it — a section credential in a layer that sets no section model is
+`GENERATION_CONFIG_INVALID` when generation runs (other commands are unaffected),
+and a tier model takes its tier's credentials.
+
+`--generation-config <profile|file>` and `--model` / `--label-model` override the
+models for one run (precedence: flags > `--generation-config` > the merged
+config). A model's credentials move with it, so a model a flag names takes none
+of the file's, the workspace's or a tier's key or `api_base`, and a model the
+file names takes only the file's credentials.
+
+A profile's, flag's or file's model that carries no credentials of its own takes
+the `[models]` provider key for its provider (`anthropic_api_key_env`, …, from
+the highest config layer that sets one), as a tier does; a model at a custom
+`api_base` never does. With no such key it reads LiteLLM's per-provider env var
+(`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, …). To run a model with a different key
+or a custom endpoint, write the model and its credentials together in
+`[generation]` or in the `--generation-config` file.
+
+Anthropic extended thinking is off for both passes
 unless `generation.thinking = "adaptive"` says otherwise — a Claude 4.6+/5 model
 thinks adaptively when a request omits the field, so the mode is stated rather
 than inherited. See the [`generation` config
@@ -873,7 +914,7 @@ section](storage-layout.md#generation-required-for-dgml-docset-generate).
 | `--window-size <n>` | `10` | Pages per transcription window. |
 | `--temperature <f>` | `0.0` | LLM temperature. |
 | `--max-tokens <n>` | `64000` | LLM max output tokens per call, clamped to each model's own ceiling. A long document produces *more* calls rather than bigger ones (transcription is windowed, labeling is chunked), so this is headroom rather than a target — the largest reply measured across 1,884 cached calls was ~29.9K tokens, from the roster-sized `describe_concepts` call. Raising the ceiling costs nothing on calls that don't use it, since billing is on tokens actually produced. |
-| `--thinking <mode>` | from config | Anthropic extended thinking for both generation passes: `disabled` or `adaptive`. Overrides `generation.thinking`, whose default is `disabled`. Omitting the field on the wire is **not** the same as turning thinking off — Claude 4.6+/5 models reason adaptively unless told not to, so the mode is stated rather than inherited. Ignored for non-Anthropic models. |
+| `--thinking <mode>` | from config | Anthropic extended thinking for both generation passes: `disabled`, `adaptive`, or `between_tools` (Claude Sonnet 5.5's off switch: it rejects `disabled`). Overrides `generation.thinking`, whose default is `disabled`. Omitting the field on the wire is **not** the same as turning thinking off — Claude 4.6+/5 models reason adaptively unless told not to, so the mode is stated rather than inherited. Ignored for non-Anthropic models. |
 | `--no-coverage` | off | Skip word-coverage metrics (unique-lexicon recall, ROUGE-1/2) computed against the workspace `page_text/`. |
 | `--cache-dir <dir>` | `<docset-dir>/cache` | Directory for the generation cache (functional `*_blocks.json` / `label_*_cNN_raw.json` / `concept_roster.json`, always written; plus per-window debug snapshots when `--debug` is set). |
 
@@ -888,6 +929,11 @@ into `<stem>.dgml.xml` regardless.
 | `--no-semlinks` | off | Skip the final semantic-link pass. By default each grounded `<stem>.dgml.xml` gets semantic links added in place — relationships the tree's nesting can't capture, written as `dg:itemprop` (predicate) + `dg:href` (`#id`, or space-separated `#id`s) on the subject, with `xml:id`s assigned to both ends. Covers references (`references`, `incorporates`, `signatoryOf`, …), relative dates (`relativeTo`/`effectiveOn`, ISO-8601 offset in `dg:value`), and derived values (`greaterOf`/`lesserOf` formulas, `escalates`, `valueFrom`). The model proposes links on the labeling model (`generation.label_model`), then a skeptical pass verifies them. Each converted file's `results` entry carries a `links` count. |
 | `--no-semlink-cache` | off | Always call the model for the semantic-link pass. By default the pass is cached on what the model actually reads — tag names and text, plus the labeling model, the link prompts, and whether the review pass runs. Attributes are deliberately excluded, because the prompt never shows them: grounding a document or renaming a namespace prefix does not change its links, so those runs replay the cache instead of paying again. The cache stores the links themselves, not a second copy of the XML, and they are written onto whatever the current render produced. This flag forces a fresh call — use it when something the key cannot see has changed, such as a provider-side model update behind a stable model id. |
 | `--no-semlink-verify` | off | Skip the second, skeptical pass that reviews each proposed link. The link pass then makes one model call per document instead of two, which cuts its wall-clock time by about 60%, and keeps roughly twice as many links — including the weaker ones the review would have dropped. Use it when you want breadth and speed over precision. Reviewed and unreviewed results are cached separately. |
+| `--batch` / `--no-batch` | `[generation] batch`, else off | Send the batchable model calls through the provider's batch API: half the price per token, but results can take up to 24 hours. See **Batch mode** below and [batch-mode.md](batch-mode.md). `--no-batch` forces the synchronous pipeline even when the config enables batch mode. |
+| `--no-batch-label` / `--batch-label` | `[generation] batch_label`, else on | Under `--batch`, labeling batches by default: every document at once under a closed vocabulary, otherwise (open or `--extend-schema`) one document at a time in the synchronous order, so the output is byte-identical at batch price but each document waits about one batch round trip (pair it with `--no-wait`). `--no-batch-label` labels with ordinary synchronous calls instead, under every vocabulary; everything else still batches. `--batch-label` forces batch labeling over `batch_label = false`. Requires batch mode (`BATCH_JOB_INVALID` without it). |
+| `--batch-poll-interval <seconds>` | `30` | Seconds between batch status checks under `--batch`. Must be positive. |
+| `--no-wait` / `--job <job_id>` | off | Batch job mode (requires batch mode): `--no-wait` submits a wave and exits with a `batch_job` payload; `--job` continues a job. See [Batch jobs](#batch-jobs---no-wait-and-dgml-batch). |
+| `--batch-deadline <duration>` | none | Stop waiting on the provider's batches this long after the run (or job) starts: `90m`, `6h`, `1d`, or seconds. Past it, open batches are canceled, results already produced are kept, and the rest of the run runs synchronously. Requires batch mode. See [Batch deadline](#batch-deadline---batch-deadline). |
 
 **Document-level resume.** If a file's per-(docset, file)
 `<stem>.dgml.xml` already holds a generated document tree, that file is
@@ -933,6 +979,101 @@ the run and a `source` recording where they came from — `config` (workspace
 `override` (from `--model`/`--label-model`), or a combination such as
 `profile:fast+override`. This keeps the model choice visible/recorded in the
 run's own output, not just in `config.json`.
+
+**Batch mode.** `--batch` (or `batch = true` under `[generation]` in
+`config.toml`, or `DGML_GENERATION__BATCH=true`; the flag wins, `--no-batch`
+turns it off, and anything but a boolean is `GENERATION_CONFIG_INVALID`) runs
+the batchable stages through the provider's batch endpoint. The requests are
+the same bytes the synchronous run sends, so the output is the same; what
+changes is the price and the wall-clock time.
+
+- **Transcription** batches one wave per window position: window 1 of every
+  document together, then window 2 of the documents that have one, and so on.
+- **Roster planning, gap planning and concept descriptions** batch under every
+  vocabulary, each as its own one-request stage over the labeling model:
+  planning's draft, then its refine turn (`plan`, two waves);
+  `--extend-schema`'s gap planning (`plan_gaps`, one wave); the descriptions of
+  concepts coined during labeling (`describe`, one wave).
+- **Labeling** batches by default. Under a closed `--schema-path`
+  vocabulary, where no document's labels can change the next document's
+  prompt: every document at once (`mode: "all-at-once"`). Under an open or
+  `--extend-schema` vocabulary each document is labeled against what earlier
+  documents added, so each document is its own batch stage, in the
+  synchronous order (`mode: "per-document"`): its chunks share a wave, the
+  roster is updated once it is done, and every request is the synchronous
+  run's. Latency is about one queue round trip per document; for more than a
+  few documents run with `--no-wait` and `dgml batch resume`.
+  `--no-batch-label` (or `batch_label = false` under `[generation]`; anything
+  but a boolean is `GENERATION_CONFIG_INVALID`) labels synchronously instead
+  (`mode: "sync"`).
+- **Image style** (OCR files, when the workspace's `style` section is
+  enabled): every OCR page's vision request in one wave (`style`), after
+  grounding and before the link pass.
+- **Semantic links**: every document's propose request in one wave, then the
+  verify requests. The link cache works as usual, and documents that would
+  share a cache entry share one request.
+- Batch backends exist for `anthropic/` models (Message Batches),
+  `gemini/` models (Gemini Developer API Batch API) and `openai/` models
+  (Batch API; a model litellm serves through the Responses API, such as
+  `gpt-5-pro`, is refused, see [batch-mode.md](batch-mode.md#providers)). The
+  transcription, labeling, link and (when enabled) style models are checked
+  before any model call; one with no batch backend fails the command with
+  `BATCH_UNAVAILABLE`, naming the stage and model. The labeling model is
+  checked under every vocabulary, because planning and links batch over it.
+  Batch mode never quietly falls back to full price.
+- The batch backend supports litellm `>=1.85,<1.86` only, because it reuses
+  litellm internals to send exactly the synchronous request. With another
+  version installed, `--batch` fails with `BATCH_UNAVAILABLE`.
+- A request the provider could not serve is retried once in the next wave,
+  then sent synchronously at full price (`sync_fallbacks`). `usage.jsonl` rows
+  record which tier each operation used (`tier`); an operation served by both
+  tiers writes one row per tier, marked `context.tier_split: true`.
+
+Under batch mode the payload gains a `batch` block. It is absent otherwise,
+so a synchronous run's payload is unchanged. Each stage reports its wave
+counters and cost, or why it did not batch:
+
+```json
+"batch": {
+  "enabled": true,
+  "stages": {
+    "transcribe": {"waves": 3, "batches": 3, "requests": 5, "batch_ok": 5, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.021, "standard_cost_usd": 0.042, "saved_usd": 0.021},
+    "plan": {"waves": 2, "batches": 2, "requests": 2, "batch_ok": 2, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.004, "standard_cost_usd": 0.008, "saved_usd": 0.004},
+    "label": {"mode": "per-document", "documents": 2, "waves": 2, "batches": 2, "requests": 2, "batch_ok": 2, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.012, "standard_cost_usd": 0.024, "saved_usd": 0.012},
+    "links": {"waves": 2, "batches": 2, "requests": 4, "batch_ok": 4, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0, "batch_ids": ["msgbatch_…"], "cost_usd": 0.021, "standard_cost_usd": 0.042, "saved_usd": 0.021}
+  }
+}
+```
+
+The counters are `waves` (round trips), `batches`, `requests`, `batch_ok`,
+`sync_fallbacks`, `resubmitted`, `failed` and `batch_ids` (plus `bisections`
+when a batch was split after a batch-level rejection). The cost fields:
+
+| Field | Meaning |
+|---|---|
+| `cost_usd` | What this stage's responses were billed at, at the tier actually used: a batch result at the batch price, a synchronous fallback at the standard price. |
+| `standard_cost_usd` | What the same responses cost at the standard price. |
+| `saved_usd` | `standard_cost_usd − cost_usd`. |
+
+All three are `null` when a response came back without a price. They cover
+the batched stages only; a stage that ran synchronously (labeling under
+`--no-batch-label`) has its cost in `usage.jsonl` under `--debug`.
+
+`label` reads `{"mode": "all-at-once", <counters>, <cost fields>}` under a
+closed vocabulary, `{"mode": "per-document", "documents": <n>, <counters>,
+<cost fields>}` under any other (counters summed over every document's
+stage), and `{"skipped": "batch labeling is off (batch_label = false)",
+"mode": "sync"}` under `--no-batch-label`. When a per-document labeling stage
+fails as a whole, that document and every later one get a `label_error`; the
+run's job ends `failed`, and `dgml batch resume` relabels from the failed
+document onward, replaying everything served before it.
+`links` reads `{"skipped": "--no-semlinks"}` when the pass is off, and
+`{"skipped": "every link plan was cached"}` when no request was needed.
+`plan`, `plan_gaps`, `describe` and `style` appear only when that call ran
+(planning is skipped under a supplied schema; descriptions when no concept was
+coined), except that `style` reads `{"skipped": "no OCR document with a page
+to style"}` when the `style` section is enabled but nothing needed it.
+Wherever `skipped` appears it is a string reason, never a boolean.
 
 `summary` counts always sum to `total`: every assigned file lands in exactly
 one of `converted` / `skipped` / `failed`. A per-file problem does not abort
@@ -1188,6 +1329,113 @@ a supplied schema behaves exactly as before.
 > operation outside the public CLI), use `scripts/ground.py`:
 > `uv run python scripts/ground.py --docset <id> [--file <id>] [--debug]`.
 
+### `dgml docset run <docset_id> [flags]`
+
+The whole docset pipeline in one command. It runs three steps in order, each
+exactly as its standalone command would:
+
+1. **Extraction schema** — `extraction generate-schema <docset_id>
+   --from-file ...` from the `--schema-from` samples, but only when the docset
+   has no extraction schema yet. A docset that already has one reuses it. With
+   no schema and no `--schema-from`, schema generation and extraction are both
+   skipped (the payload says why; the samples are never guessed).
+2. **DGML** — `docset generate <docset_id>`.
+3. **Values** — `extraction extract <docset_id> --all`.
+
+| Flag | Meaning |
+|---|---|
+| `--schema-from FILE_ID` | Sample file for the schema step. Repeatable. Used only when the docset has no extraction schema. |
+| `--no-generate` | Skip step 2. |
+| `--no-extract` | Skip steps 1 and 3. |
+| `--generation-config`, `--model`, `--label-model`, `--window-size`, `--temperature`, `--max-tokens`, `--transcription`, `--thinking`, `--no-coverage`, `--cache-dir`, `--max-parallel-calls`, `--schema-path`, `--extend-schema`, `--no-roster`, `--no-semlinks`, `--no-semlink-cache`, `--no-semlink-verify`, `--batch-label` / `--no-batch-label` | Passed to `docset generate` unchanged. |
+| `--schema-model M` | Passed to `extraction generate-schema`. |
+| `--values-model M`, `--values-effort E`, `--locations-effort E` | Passed to `extraction extract`. |
+| `--batch` / `--no-batch` | Every step through the provider's batch API, under **one** batch job. Defaults to `[generation] batch`. |
+| `--batch-poll-interval S` | Seconds between batch status polls (default 30). |
+| `--no-wait`, `--job ID` | Batch job mode for the whole run (see [Batch jobs](#batch-jobs---no-wait-and-dgml-batch)). |
+| `--batch-deadline DURATION` | One deadline for the whole run (and its job), not one per step: once it passes, the step waiting on a batch cancels and collects it, and every later step runs synchronously (see [`--batch-deadline`](#batch-deadline---batch-deadline)). |
+
+Payload: each step's normal payload, or a `skipped` reason, under `steps`:
+
+```json
+{
+  "docset_id": "o8vr8rs488vg",
+  "steps": {
+    "schema":   {"docset_id": "o8vr8rs488vg", "schema_format": "rnc", "schema": "...", "from_file_ids": ["..."], "model": "anthropic/claude-opus-5"},
+    "generate": {"docset_id": "o8vr8rs488vg", "summary": {"total": 12, "converted": 12, "skipped": 0, "failed": 0}, "...": "the docset generate payload"},
+    "extract":  {"docset_id": "o8vr8rs488vg", "summary": {"total": 12, "ok": 12, "failed": 0}, "...": "the multi-file extraction payload"}
+  }
+}
+```
+
+A skipped step is `{"skipped": "<reason>"}` — for example `"--no-extract"`,
+`"--no-generate"`, `"the docset already has an extraction schema"`, or `"the
+docset has no extraction schema and no --schema-from sample files were given"`.
+
+Under `--batch` every step keeps its own `batch` block, and the run adds a
+top-level summary summed across steps (a skipped or unbatched step appears as
+`{"skipped": "<reason>"}`: the step's own skip reason, such as `"--no-generate"`,
+or `"the step ran no batch"`):
+
+```json
+"batch": {
+  "enabled": true, "waves": 9, "batches": 9, "requests": 21, "batch_ok": 21,
+  "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+  "cost_usd": 0.19, "standard_cost_usd": 0.38, "saved_usd": 0.19,
+  "steps": {"schema": {"waves": 1, "...": "..."}, "generate": {"waves": 7, "...": "..."}, "extract": {"waves": 1, "...": "..."}}
+}
+```
+
+**Exit code.** `0` when every step completed; per-file failures stay per file,
+as in the standalone commands. A step that fails on **every** file (as a
+multi-file `extraction extract` exits `2`) ends the run there: the full payload
+is printed on stdout, each file's error in its entry, any later step is
+`skipped` naming it, and the run exits `2`. A step that fails as a whole (an
+empty docset, a missing configuration) fails the run: the step's own error code
+(or `INTERNAL_ERROR` for an unexpected error), with `details` naming it either
+way — plus any details of the step's own error, `completed_steps` (the steps
+that ran, in run order) and `skipped_steps`:
+
+```json
+{"error": {"code": "EMPTY_DOCSET", "message": "docset run: step 'generate' failed: ...",
+           "details": {"step": "generate", "completed_steps": [], "skipped_steps": ["schema"]}}}
+```
+
+**Pass-through options are checked up front.** Every step that may run is
+parsed with its own command's parser before the first step starts (and before
+any batch job is created), so a bad value — `--window-size abc`,
+`--thinking sometimes` — fails the run at once with `INVALID_ARGUMENT` naming
+the step and the flag, instead of argparse usage text (exit 2) from the
+generate step after the schema step has already paid. A bad `--values-effort`
+or `--locations-effort` is refused up front too (`GROUNDED_CONFIG_INVALID`), and
+so is a missing `grounded` config when the extract step will run
+(`GROUNDED_CONFIG_MISSING`), with or without `--batch`.
+
+```json
+{"error": {"code": "INVALID_ARGUMENT",
+           "message": "docset run: invalid option for step 'generate': argument --window-size: invalid int value: 'abc'"}}
+```
+
+**Batch pre-flight.** Under `--batch`, every model a planned step will send to
+a batch is checked before any work: the schema model (when a schema will be
+generated), the transcription, labeling, link and (OCR files) style models, and
+the values model. A model with no batch backend fails with `BATCH_UNAVAILABLE`
+naming the stage (`stage 'extract' (model '...')`, `stage 'generate.transcribe'
+...`), and no job is created.
+
+**One job for the whole run.** With `--batch --no-wait`, the run pauses at
+whichever step first has a wave in flight, and `dgml batch resume <job_id>`
+continues the pipeline from there. A resume re-runs every step: steps that
+already finished replay their responses from the job at no cost, so each
+response is billed exactly once. What a job works on is fixed when it starts —
+whether it generates the schema, which files it converts, which semantic-link
+plans count as cached — so a step's own writes never change a later run.
+`dgml batch status` shows the step the job is on. A resume that trips the drift
+guard (`BATCH_JOB_NONDETERMINISTIC`, see
+[Batch jobs](#batch-jobs---no-wait-and-dgml-batch)) stops the run at that
+step: no later step runs or submits anything, and the error's `details.step`
+names the step.
+
 ## Extraction commands
 
 Schema-driven value extraction pulls a defined set of fields out of a document
@@ -1216,10 +1464,10 @@ Two formats are involved:
 
 The LLM is configurable like every other model-using command — via the
 `grounded` section of the workspace `config.toml` (`schema_model`,
-`values_model`, `values_reasoning_effort`, API keys, `max_tool_iters`), with
-per-call overrides on the commands below.
+`values_model`, `values_reasoning_effort`, `locations_reasoning_effort`, API
+keys, `max_tool_iters`), with per-call overrides on the commands below.
 
-### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M]`
+### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M] [--batch]`
 
 Ask the configured `schema_model` to propose an extraction schema from one or
 more sample PDFs, then store it as `extraction-schema.rnc`. `--from-file` is repeatable and
@@ -1233,6 +1481,15 @@ etc.). There is no grounded-field JSON Schema intermediate; datatypes are native
 to the generated schema, and downstream extraction normalizes each typed value
 to a `dg:value`/`xsi:type`. The output shape is unchanged.
 
+All samples go in one request. If the provider refuses it as too large
+(Anthropic's `request_too_large`, an HTTP 413, Gemini's "payload size
+exceeds"), every sample stays in the request but the largest are cut to their
+leading pages, sharing half the bytes of the refused request fairly, and the
+model is told which samples are partial. This repeats until the request is
+accepted. A sample whose first page alone does not fit its share is left out,
+and each cut or left-out sample is logged as a warning. `from_file_ids` still
+lists every requested file.
+
 ```json
 {
   "docset_id": "o8vr8rs488vg",
@@ -1242,6 +1499,29 @@ to a `dg:value`/`xsi:type`. The output shape is unchanged.
   "model": "anthropic/claude-opus-5"
 }
 ```
+
+`--batch [--batch-poll-interval SECONDS]` sends the one schema request through
+the provider's batch API (about half price; one batch round trip, usually
+minutes, at most 24 hours). The request is identical to the synchronous one and
+so is the stored schema; the payload gains a top-level `batch` block with the
+wave stats (`provider`, `waves`, `batches`, `requests`, `batch_ok`,
+`sync_fallbacks`, `resubmitted`, `failed`, `batch_ids`) and the cost fields
+(`cost_usd` billed, `standard_cost_usd` what the same responses cost
+synchronously, `saved_usd`; `null` when a response carried no price), and the
+usage row carries `tier: "batch"`:
+
+```json
+"batch": {"provider": "anthropic", "waves": 1, "batches": 1, "requests": 1,
+          "batch_ok": 1, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+          "batch_ids": ["msgbatch_..."],
+          "cost_usd": 0.12, "standard_cost_usd": 0.24, "saved_usd": 0.12}
+```
+
+A `schema_model` whose provider has no batch backend fails with
+`BATCH_UNAVAILABLE` before any PDF is read or request sent, as does an OpenAI
+model litellm serves through the Responses API for this request (gpt-5.4 and
+later, which get tools with a reasoning effort here). See
+[batch-mode.md](batch-mode.md).
 
 ### `dgml extraction set-schema <docset_id> --schema-file PATH`
 
@@ -1261,10 +1541,11 @@ Accepted JSON dialects (all convert to the same RNC):
   system): a root `$ref`, local `$defs`/`definitions` `$ref`s (sibling
   annotation keys merge over the target), `title` as the DGML element name,
   and leaves recognized *structurally* — an object whose properties are a
-  subset of `{text, value, locations, derived_from, computed}` with `text`
-  present is a leaf, its `value` subschema mapped to the field type
-  (`enum` list → value enumeration; `format: date` / `type: integer` /
-  `boolean` / `number` / a plain-decimal `pattern` → the XSD datatype).
+  subset of `{text, value, locations, inputs, evidence, method}` (or the 0.7
+  `derived_from`/`computed`) with `text` present is a leaf, its `value`
+  subschema mapped to the field type (`enum` list → value enumeration;
+  `format: date` / `type: integer` / `boolean` / `number` / a plain-decimal
+  `pattern` → the XSD datatype).
 
 Same-named tags must share one identical definition; two definitions with the
 same name but different content or annotations are rejected with
@@ -1276,9 +1557,10 @@ rendered RNC carries an explicit `start` rule so the field stays a root.
 
 Return the DocSet's schema as canonical RNC (default) or as the engine's
 JSON Schema projection (`--schema-format json`), whose leaves are
-`extracted_value` refs (`{text, value?, locations?, computed?, derived_from?}`
-— note: projections exported before the merged leaf shape used a
-`grounded_field`/`computed_field` union; both are still accepted on
+`extracted_value` refs (`{text, value?, locations?, inputs?, evidence?, method?}`
+— note: projections exported before DGML 0.71 carried `computed?` /
+`derived_from?` instead of `inputs?` / `method?`, and older ones a
+`grounded_field`/`computed_field` union; all are still accepted on
 `set-schema` input). Errors `SCHEMA_NOT_FOUND` if none is set.
 
 ### `dgml extraction set-guidance <docset_id> --guidance-file PATH`
@@ -1299,20 +1581,45 @@ fields, prompts for where to find one value. Returns
 Return the DocSet's extraction guidance as `{docset_id, guidance}`. Errors
 `GUIDANCE_NOT_FOUND` if none is set.
 
-### `dgml extraction extract <docset_id> <file_id> [--values-model M] [--values-effort E]`
+### `dgml extraction extract <docset_id> <file_id>... [--all] [--values-model M] [--values-effort E] [--locations-effort E] [--batch]`
 
 Extract values from a file against the DocSet schema and write a `dg:extraction`
 element into the file's core `<stem>.dgml.xml`. Runs a three-phase pipeline
-(LLM text+pages → code OCR matching → per-page LLM bbox). If the file already has
+(LLM text+pages → code OCR matching → per-page LLM location for what matching
+couldn't place). On a page with OCR words, phase 3 names the value's words by
+index and code builds the boxes from them; on a page without, it draws boxes on
+a 0-1000 grid of the page image. If the file already has
 a generated document tree the extraction is added alongside it
 (`mode: full-extraction`); otherwise a minimal core file is created
-(`mode: extraction`). `extraction_stats.json` is written only under the global
-`--debug` flag. Errors `SCHEMA_NOT_FOUND` if the DocSet has no schema.
+(`mode: extraction`). `extraction_stats.json` (per-phase timings, cost and match
+counts) and the `usage.jsonl` row are written only under the global `--debug`
+flag. Errors `SCHEMA_NOT_FOUND` if the DocSet has no schema, and
+`FILE_NOT_FOUND` if the file is not assigned to the DocSet — assign it first with
+`docset add-file` (the schema and the assignment can be set in either order; only
+this command needs both in place).
+
+`--values-model` overrides `grounded.values_model` for this call. A model's
+credentials move with it, so the override takes none of
+`grounded.values_api_key` / `values_api_key_env` / `values_api_base` and nothing
+from the `advanced` tier. It takes the `[models]` provider key for its provider
+(`anthropic_api_key_env`, …), as a tier does; with none, it reads LiteLLM's
+per-provider env var (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`,
+…). There is no flag for credentials: to run a model with a different key or a
+custom endpoint, set it in `[grounded]` instead. `--schema-model` on
+`generate-schema` works the same way.
 
 `--values-effort` overrides `grounded.values_reasoning_effort` for this call:
 `none`, `minimal`, `low`, `medium` (the default), `high`, `xhigh`, or `default`
 to send no reasoning effort and take the provider's own default. Any other value
-is refused before the model is called.
+is refused before the model is called. `--locations-effort` does the same for
+`grounded.locations_reasoning_effort`, the budget of the location-grounding call
+on pages with OCR words (default `high`; a page that goes through the no-words
+grid path keeps its own `medium`). Anthropic models never receive it, since that
+call forces its tool; every other provider does. Both efforts are checked by
+name, not against what the model supports: a values budget the provider
+refuses fails on the first call, but a locations budget it refuses fails in
+phase 3, after the values call has been paid for, on the first page that
+needs grounding.
 
 ```json
 {
@@ -1331,12 +1638,68 @@ is refused before the model is called.
 > embeds the extraction alongside the existing tree. Both end at
 > `full-extraction`.
 
+#### Several files, and `--batch`
+
+`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--batch] [--batch-poll-interval SECONDS] [--no-wait] [--job JOB_ID] [--batch-deadline DURATION]`
+
+With more than one file id, or `--all` (every file in the DocSet), the command
+extracts each file independently and returns one entry per file. A file that
+fails is reported in its entry (`status: failed` with an `{code, message}`
+error) and the others still run. The command exits `0` once the run completes
+— unless **every** file failed, when it exits `2` with the same payload on
+stdout, so a script can detect a total failure from the exit code alone. A
+partial failure exits `0` (read `.summary.failed`), and so does `--all` on a
+DocSet with no files.
+A single file id keeps the single-file output above, with or without `--batch`:
+under `--batch` it gains only the `batch` block below, and a failure is the
+same top-level error envelope a synchronous single-file run gives. Passing both
+ids and `--all`, or neither, is `INVALID_ARGUMENT`.
+
+`--batch` submits both LLM phases through the values model's batch API — phase
+1 for every file as one wave, phase 3 for every file's unresolved pages as a
+second — at about half price, with results usually within an hour and at most
+24h (`--batch-poll-interval` sets the seconds between status polls, default
+30). A file whose phase 1 takes extra turns (chunked output, a truncation
+retry, the permissive-schema fallback) rides extra waves. A request the batch
+cannot serve is retried or run synchronously for that request only. Values,
+the XML written and `extraction_stats` are the same as a synchronous run; the
+`usage.jsonl` rows (under `--debug`) carry `"tier": "batch"`. A values model
+whose provider has no batch backend (Anthropic, Gemini and OpenAI have one),
+or an OpenAI model litellm serves through the Responses API, is refused with
+`BATCH_UNAVAILABLE` before any request. Without `--batch` there is no `batch`
+block.
+
+```json
+{
+  "docset_id": "o8vr8rs488vg",
+  "model": "anthropic/claude-sonnet-4-6",
+  "summary": {"total": 2, "ok": 1, "failed": 1},
+  "results": [
+    {"file_id": "5kqt9r5fowno", "status": "ok", "mode": "extraction",
+     "tool_calls": 0, "field_count": 7,
+     "xml_key": "docsets/o8vr8rs488vg/files/5kqt9r5fowno/Invoice 2025.dgml.xml"},
+    {"file_id": "9mzn2c4q1abx", "status": "failed",
+     "error": {"code": "FILE_NOT_FOUND", "message": "..."}}
+  ],
+  "batch": {"provider": "anthropic", "waves": 2, "batches": 2, "requests": 5,
+            "batch_ok": 5, "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+            "batch_ids": ["msgbatch_...", "msgbatch_..."],
+            "cost_usd": 0.041, "standard_cost_usd": 0.082, "saved_usd": 0.041}
+}
+```
+
+`batch` totals cover both phases of the run.
+
 ### `dgml extraction get-values <docset_id> <file_id> [--as values|xml]`
 
 Return previously extracted values from the file's core `<stem>.dgml.xml`.
 `--as values` (default) projects the `dg:extraction` element to values-shape
-JSON; `--as xml` returns the core DGML document. Errors `VALUES_NOT_FOUND` if the
-file has no `dg:extraction` element yet (extraction not run).
+JSON; `--as xml` returns the core DGML document. Errors: `DOCSET_NOT_FOUND` for
+an unknown DocSet, `FILE_NOT_FOUND` for an unknown file or one not assigned to
+the DocSet, `DGML_NOT_FOUND` if the file has no `<stem>.dgml.xml` yet (neither
+generated nor extracted), and `VALUES_NOT_FOUND` if it has one with no
+`dg:extraction` element (generated, but extraction not run). Library callers get
+the same reads from `dgml_core.get_extracted_values` and `dgml_core.read_dgml`.
 
 ```json
 {
@@ -1353,35 +1716,134 @@ file has no `dg:extraction` element yet (extraction not run).
 }
 ```
 
-A leaf whose schema `## Prompt:` describes a derivation rule (spec §13) comes
-back **computed** instead of grounded: `computed: true`, no `locations`, and
-`derived_from` listing the dotted paths of the values it was derived from
-(cross-file or unresolvable `dg:href` targets stay as raw references):
+#### Value provenance (DGML 0.71)
+
+Every leaf says where its value came from, with up to three keys that mirror
+three XML attributes:
+
+| JSON | XML | Question it answers |
+| --- | --- | --- |
+| `locations` | `dg:origin` | Where is the element's own text printed? (boxes only) |
+| `inputs` (+ `evidence`) | `dg:inputs` | Which elements did the value use? |
+| `method` | `dg:method` | How was a value the page doesn't print produced? `calculated`, `inferred` or `defaulted` |
+
+That gives four cases:
+
+| | No inputs | Has inputs |
+| --- | --- | --- |
+| **Has `locations`** | Read from its printed text ("$4,200.00" → `4200.00`) | Printed in part, completed from the inputs ("3/1" + the commencement year) |
+| **No `locations`** | `method: "defaulted"`: the field's stated default. Without a method: unsupported, and extraction doesn't write it (`matching.unsupported_values`) | `method: "calculated"` (recomputable) or `"inferred"` (a judgment). Without a method: read as `inferred` |
+
+Where the page has a text layer, every box is checked against it: the words
+inside a box must read as its value (a piece of a wrapped value, a loose box
+that also takes in the label, and OCR noise all pass). A box that also takes in
+other words (a label, or the whole row) shrinks to the words that spell the
+value. A value printed in several places at once (a line-item name made of a
+section heading and a tier column header) is kept when its boxes, read in
+order, spell it through a run of words each, and each box shrinks to its run. Choosing words within a box, or snapping it,
+respects capitalization when the value has letters: a box over "Gas
+Delivery Charges" in a sentence doesn't locate the "GAS DELIVERY
+CHARGES" heading. When nothing on the box's own line matches, it moves to the
+nearest exact copy of the value elsewhere on the page. The text of every box
+is checked against the page; when a value is printed several times, which
+copy it gets is not. A box
+holding nothing but the value is kept whatever its capitalization. A box drawn on the wrong span, such as a total boxed on a neighbouring
+number, moves to the nearest span
+whose words match the value exactly, preferring its own line (or lines)
+(`matching.snapped_boxes`). When the page prints no such span, or two are
+equally near, the box is stripped (`matching.rejected_boxes`).
+
+A value phase 1 returns as bare text, with no locations (a model sometimes
+reads a value off the page and leaves out where), is first placed on the first
+page that prints its exact text, so phase 2 can ground it
+(`matching.located_pageless`).
+
+Every value extraction writes can be verified, so two kinds are **dropped**,
+not written:
+
+- a printed value (in full or in part) left with no bounding box: without
+  `dg:origin` it would read as unsupported, or, if it named inputs, as an
+  inferred judgment (`matching.dropped_unboxed_values`);
+- a value with no box, no default and nothing it used: the model returned it
+  bare, or claimed a calculation or inference and named nothing that
+  resolves (`matching.unsupported_values`).
+
+Inputs that named a dropped value are dropped too, and array indices after it
+are renumbered; a value left with nothing it used is dropped in turn. Each
+dropped value is listed as `"path=text"` in `matching.dropped_unboxed`
+(unsupported ones marked `(unsupported)`).
+
+A value printed in part keeps its boxes **and** names its inputs, so one
+element holds the whole fact:
 
 ```json
 {
+  "PeriodStart": {
+    "text": "3/1",
+    "value": "2026-03-01",
+    "locations": [{"page_number": 2, "bounding_box": [410, 980, 520, 1025]}],
+    "inputs": ["CommencementDate"]
+  },
   "InvoiceTotal": {
     "text": "$349.85",
     "value": "349.85",
-    "computed": true,
-    "derived_from": ["LineItems[0].Quantity", "LineItems[0].UnitPrice"]
+    "method": "calculated",
+    "inputs": ["LineItems[0].Amount", "LineItems[1].Amount"]
   }
 }
 ```
 
-In the XML form (`--as xml`), the same field carries `dg:origin="computed"`,
-`dg:value`, and `dg:itemprop="computedFrom"`/`dg:href` pointing at the source
-elements, which are stamped with matching `xml:id` attributes.
+`inputs` are dotted paths of other extracted values (cross-file or
+unresolvable targets stay as raw references). The paths are positional, and a
+model miscounting its own array entries would name a real but wrong element,
+which no check could catch. So the model cites the text it read with each
+input (`"LineItems[6].Amount=$58.20"`), and extraction checks every citation
+before writing. A matching target is kept. A mismatch is re-pointed
+(`matching.repaired_inputs`) when the cited text matches the same path under
+one of the value's own ancestors (a path written relative to the value) or at
+exactly one sibling index (a miscounted index). Otherwise it is dropped
+(`matching.dropped_inputs`). The citation
+text itself is not stored. When a value used printed text
+that **no schema field extracts**, that text comes back in `evidence` —
+`[{text, locations}]` — instead, so the schema doesn't need a field per piece
+of evidence.
 
-**Schema-authoring rule for derivations:** every input a `## Prompt:`
-derivation rule mentions must itself be an extracted field in the schema.
-The model can fold any page content into its arithmetic, but `dg:href` can
-only point at extracted elements — an un-extracted input leaves the computed
-value unverifiable. A `derived_from` entry that doesn't resolve is dropped
-from `dg:href` and counted in `extraction_stats.json` under
-`matching.dropped_refs` (written under `--debug`); a computed field that ends
-up with no `dg:href` at all is flagged by `dgml check` as
-`computed_field_unattributed`.
+In the XML form (`--as xml`) the same fields read:
+
+```xml
+<docset:PeriodStart xsi:type="date" dg:value="2026-03-01"
+    dg:origin="2 410 980 520 1025" dg:inputs="#commencement-date">3/1</docset:PeriodStart>
+<docset:InvoiceTotal xsi:type="decimal" dg:value="349.85"
+    dg:inputs="#line-items-0-amount; #line-items-1-amount"
+    dg:method="calculated">$349.85</docset:InvoiceTotal>
+
+<dg:chunk xml:id="end-date--in-0" dg:origin="1 300 410 620 450">January 15, 2026</dg:chunk>
+<dg:chunk xml:id="end-date--in-1" dg:origin="1 300 520 980 560">a term of twenty-four (24) months</dg:chunk>
+<docset:EndDate xsi:type="date" dg:value="2028-01-14"
+    dg:inputs="#end-date--in-0; #end-date--in-1" dg:method="calculated">2028-01-14</docset:EndDate>
+```
+
+Every element an input names gets a matching `xml:id`. An `evidence` item
+becomes an anonymous `dg:chunk` (its boxes and printed text) just ahead of the
+field that uses it. `dg:itemprop`/`dg:href` are semantic links only and never
+carry provenance.
+
+**Reading 0.7 files.** DGML 0.7 wrote an unprinted value as
+`dg:origin="computed"` plus `dg:itemprop="computedFrom"`/`dg:href`. Those
+files still read: the `"computed"` origin is ignored and the `dg:href`
+targets read as `inputs` (with `method: "inferred"`, the safe reading), so
+the values JSON no longer carries 0.7's `computed`/`derived_from` keys. New extractions
+write only the 0.71 form, and since rewriting an element changes its hash,
+re-anchor any attested file you re-extract. There is no JSON-LD export yet.
+
+**Schema-authoring rule for derivations:** prefer making every input a
+`## Prompt:` derivation rule mentions an extracted field in the schema, so
+`dg:inputs` can point at it. An input the schema doesn't extract can only be
+recorded as `evidence` text. An `inputs` entry that doesn't resolve is
+dropped from `dg:inputs`, and so is `evidence` that phases 2/3 couldn't box.
+Both are counted in `extraction_stats.json` under `matching.dropped_inputs`
+(written under `--debug`). A calculated or inferred value left with nothing
+it used is dropped, and counted under `matching.unsupported_values`.
 
 Extraction asks each model for its own maximum output (128K on current
 frontier Claude/Gemini, 64K on Haiku 4.5 — read from the provider's model
@@ -1394,11 +1856,54 @@ on the last — merged and vocabulary-checked code-side, transparent in the CLI
 payloads. Chunking is strictly that escalation: an ordinary run is never
 offered the continuation tool or the `done` flag, so it can't split output
 that fits in one call. `extraction_stats.json` records both under
-`phases.phase1`: `chunk_calls` (1 = ordinary single submission) and
-`truncated_retries`. `phases.phase3.pages_out_of_range` counts the pages
+`phases.phase1`: `chunk_calls` (1 = ordinary single submission),
+`truncated_retries`, `envelope_repairs`, and `no_tool_call_retries`.
+`envelope_repairs` counts `submit_values`
+calls that arrived with the tool's argument envelope repeated one level down,
+or serialized as a JSON string, and were unwrapped before the tree was read.
+`no_tool_call_retries` counts the reminder retries given to phase-1 turns that
+ended with plain text and no tool call (the turn that finally fails a run is
+not counted). Phase 1 sends `tool_choice="required"` to every provider except
+Anthropic, so these occur only where phase 1 runs on auto: on Claude models,
+which stay on auto because a forced tool choice switches off their extended
+thinking; where litellm silently drops the parameter for a provider it
+believes lacks it; and on an endpoint that rejects `"required"` as an invalid
+request (HTTP 400/422). Such a call is resent once on auto; when the resend
+succeeds, the endpoint is remembered for the rest of the process (later
+attempts start on auto) and a warning names the model once. Timeouts, auth,
+rate-limit, context-window and content-policy errors are never resent this way.
+A text-only turn that stopped normally is answered with a reminder to call `submit_values` (or,
+for a chunked run that already recorded part of its submission, to continue
+with `append_entries`, since a resent full tree would duplicate its entries)
+and the model is asked again. Retries are never forced, so the turn that
+produces the values keeps its thinking budget, and they do not count against
+`max_tool_iters`. A third text-only turn in one attempt, or any text-only turn
+that did not stop normally (a content filter or refusal stop; a missing
+`finish_reason` counts as normal), fails the run;
+the error quotes the reply's opening text, its `finish_reason`, and whether it
+was reasoning only. The counter totals every attempt of the run (a truncation
+or schema retry starts a new attempt), so it can exceed the per-attempt limit
+the error reports.
+A submission of which the vocabulary keeps nothing (no key names a schema
+root, or every named root carries a value of the wrong kind) is refused as an
+extraction error rather than written as an empty result; an empty tree, or
+one whose roots are all null, is still "nothing found". Leaf internals are
+not checked here.
+
+`phases.phase3.pages_out_of_range` counts the pages
 phase 1 cited that the file does not have (outside `1..page_count`, with no
 page image): their items make no phase-3 call and stay unmatched, like any
 other leaf phase 3 could not resolve, and the run still writes the tree.
+
+Phase 1 sends the whole PDF in one request. If the provider refuses that
+request as too large (Anthropic's `request_too_large`, an HTTP 413, Gemini's
+"payload size exceeds"), the PDF is sliced in half with the workspace's PDF
+engine and each half is sent on its own, halving again until every part is
+accepted. The parts' values are merged in page order: arrays concatenate,
+page numbers refer to the full document, and a field found in more than one
+part keeps the first non-empty value. `phases.phase1.pdf_parts` lists the
+`[first_page, last_page]` of each part, and appears only when a split happened.
+A single page the provider still refuses fails the file.
 
 **Schema-declared invariants.** A field may carry a `## Invariant:` annotation
 naming a checkable relation against the rest of the submission — the
@@ -1446,9 +1951,20 @@ instead of never running.
 `unnormalized_enum_values` (enum-field leaves whose returned value wasn't one
 of the schema's tokens — those serialize text-only, never guessed) and a
 report-only derivation recompute: `derivations_checked` /
-`derivations_mismatched` (computed leaves whose numeric inputs all resolve
-are recomputed; a leaf mismatches when its value agrees with neither the sum,
-the count, nor any single input within $0.05). The top-level
+`derivations_mismatched` (`calculated` leaves whose numeric inputs all
+resolve are recomputed; a leaf mismatches when its value agrees with neither
+the sum, the count, nor any single input within $0.05; `inferred` values and
+values calculated from `evidence` text are not recomputed). It also counts
+`unprinted_fields` (values with no `locations`), `partly_printed_fields`
+(`locations` plus `inputs`), `dropped_inputs` and `unsupported_values`
+(values with no box, no default and nothing they used, which are not
+written), and
+`repaired_inputs` (inputs re-pointed to where their cited text matched), and
+`dropped_unboxed_values` (printed values no box was found for, which are not
+written; `dropped_unboxed` lists each as `"path=text"`), `snapped_boxes` and `rejected_boxes` (boxes whose words on the text
+layer didn't read as their value: moved to the exact match on their line, or
+stripped). The first four replace 0.7's
+`computed_fields` and `dropped_refs`. The top-level
 `phase1_tool_schema` field records whether the docset schema rode inside the
 `submit_values` tool parameter (`"inlined"`, provider-enforced shape) or
 extraction fell back to a permissive parameter with code-side vocabulary
@@ -1457,20 +1973,23 @@ inlined schema, e.g. Gemini's "too many states for serving").
 
 Errors across the group: `DOCSET_NOT_FOUND`, `FILE_NOT_FOUND`,
 `SCHEMA_NOT_FOUND`, `SCHEMA_INVALID`, `GUIDANCE_NOT_FOUND`, `NO_FILES`,
-`VALUES_NOT_FOUND`, `GROUNDED_CONFIG_MISSING`, `GROUNDED_CONFIG_INVALID`,
+`DGML_NOT_FOUND`, `VALUES_NOT_FOUND`, `GROUNDED_CONFIG_MISSING`, `GROUNDED_CONFIG_INVALID`,
 and `CONVERSION_FAILED` when the file has no PDF because its conversion
 failed at `file add` (the message repeats the converter's error).
 
 ## File commands
 
-### `dgml file add <path> [--id FILE_ID] [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify [MODE]]`
+### `dgml file add <path> [--id FILE_ID] [--recursive] [--on-conflict POLICY] [--text-mode MODE] [--dpi N] [--auto-classify [MODE]] [--batch]`
 
 Add a File. The source is copied into the workspace, hashed, its pages
-are rendered to PNGs via `gs` (300 dpi by default — see `--dpi`), and
-per-page word boxes are written to `page_text/` according to `--text-mode`.
+are rendered via `gs` (300 dpi by default — see `--dpi`) and stored, each as
+the smaller of PNG and JPEG, with the longest edge fit between 1000 and 3508
+pixels (see
+[Page images](storage-layout.md#page-images-jpeg-edge-bounds)), and per-page
+word boxes are written to `page_text/` according to `--text-mode`.
 
-`<path>` is a `.pdf`, or a convertible source (`.docx`/`.doc`/`.xlsx`/`.xls`)
-when a converter is configured for its format family in the workspace
+`<path>` is a `.pdf`, or a convertible source
+(`.docx`/`.doc`/`.xlsx`/`.xls`/`.pptx`/`.ppt`) when a converter is configured for its format family in the workspace
 `conversion` config. A convertible source is converted to PDF at add time and
 the result is **persisted** alongside the stored original at
 `files/<file_id>/<stem>.pdf`; pages are rendered from it and generation reuses
@@ -1506,7 +2025,7 @@ existing record that does not carry the requested id.
 
 | `--text-mode` | Behavior |
 |---|---|
-| `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). |
+| `digital` (default) | Extract digital text from the PDF with `pdfminer.six`. A permanent text-extraction error is recorded for files with no digital text — the File record is still created (soft fail). A page that is a full-page image with no text, or fewer than 10 words (a stamp, a page number), is taken from OCR instead, with the provider `--text-mode ocr` would use (the `ocr` config, or Apple Vision on macOS). Other pages keep their digital text, and a file with no such page never reads the OCR config. With no OCR provider, a warning names the pages and a permanent error is recorded; configure a provider and run `dgml check --retry-errors` to recover them. |
 | `ocr` | Send each rendered page image to the provider configured in `<workspace>/config.toml` (a bundled one, or your own — see [ocr-providers.md](ocr-providers.md)). The bundled cloud providers require the `azure` or `aws` extra (`uv sync --extra azure` / `uv sync --extra aws` from a repo checkout; `pip install dgml[azure]`/`dgml[aws]` once DGML is published to PyPI). See "OCR configuration" below. |
 | `hybrid` | Run `digital` then `ocr` and merge the two per-page results by grouping words covering the same area into overlap regions (boxes overlap on IoU > 0.5 *or* one mostly contained in the other, so split/merge tokenization is resolved as a unit). Each region is resolved as a whole: OCR-only regions are kept; digital-only regions (no overlapping OCR) are assumed invisible to the human eye and dropped; mixed regions compare both sides' concatenated text by dash-normalized Levenshtein distance — if they agree (distance ≤ 2) digital wins (its characters come straight from the PDF font, more reliable than OCR even when OCR's tokenization is finer), and if they disagree OCR wins. A page whose digital text is mostly unresolved glyphs (pdfminer `(cid:N)` sentinels) falls back to OCR entirely. Default is silent — pass the global `--verbose` flag to surface per-page warnings and the merge summary on stderr. Requires the same `ocr` workspace config as `--text-mode ocr`. Optionally, an LLM can make the per-region decision instead of this heuristic — declare a `text_extraction` section in `config.toml` (e.g. a local Ollama model); see [storage-layout.md](storage-layout.md#text_extraction-optional). Any LLM failure falls back to the heuristic for that page. |
 
@@ -1521,10 +2040,15 @@ rather than the current default, so a repair reproduces the file's existing
 geometry.
 
 Note that `--dpi` also governs `page_text/` word boxes, which are expressed
-in **page-image pixel space** (`round(pdf_pts * dpi / 72)`) rather than PDF
-points — so the coordinates in a File added with `--dpi 150` are half those
-of the same File added at 300. Anything consuming `dg:origin` boxes should
-read `page_image_dpi` off the File record rather than assuming 300.
+in **page-image pixel space** (`round(pdf_pts * dpi / 72)`, refit with the
+image when the page falls outside the edge bounds) rather than PDF points — so
+the coordinates in a File added with `--dpi 150` are half those of the same
+File added at 300. Anything consuming `dg:origin` boxes should take the page's
+size from its `page_text/` `width` / `height` (or the image itself) rather
+than assuming 300 dpi. The edge bounds override `--dpi`: one low enough to put
+a page's long edge under 1000 pixels is brought back up to 1000, and one high
+enough to put it over 3508 is brought down (ghostscript resizes its render;
+the `pypdfium2` engine rasterizes such a page straight at the fitted size).
 
 Conflict types recorded in the success payload as `conflict_kind`:
 
@@ -1549,14 +2073,21 @@ The `dgml file add` response also includes:
   the PDF had no extractable digital text on any page. The File record is
   still created and a permanent error is recorded.
 - `text_extraction` — summary object on success: `{ mode, pages_written,
-  pages_with_words, total_words }`. `null` when extraction itself failed.
+  pages_with_words, total_words }`. `null` when extraction itself failed. A
+  digital-mode summary also carries `form_field_words` (words added for the
+  values of filled PDF form fields) when it is non-zero, and
+  `ocr_fallback_pages` (scanned pages taken from OCR) and `unusable_pages`
+  (`{page: reason}` for scanned pages OCR could not recover; reasons
+  `image_only`, `stray_text`), each only when non-empty.
 - `conversion_error` — set if a convertible source (docx/xlsx/…) could not be
   converted to PDF (missing converter binary/SDK, conversion failure). The
   File record is still created (with `page_count: null`) and a permanent error
   is recorded. `null` for PDFs and successful conversions.
 - `classification` — present **only** when `--auto-classify` is passed.
-  `decision` is `"existing"` or `"new"` (always `"existing"` under
-  `--auto-classify existing`). See "Auto-classification" below.
+  `decision` is `"existing"` or `"new"`; under `--auto-classify existing` it
+  is `"existing"` or `"none"` (no DocSet fits; file left unassigned); under
+  `--auto-classify existing-forced` it is always `"existing"`. See
+  "Auto-classification" below.
 
 Error codes that can come back on `file add`:
 
@@ -1572,13 +2103,13 @@ Error codes that can come back on `file add`:
 | `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
 | `CLASSIFICATION_CONFIG_INVALID` | The `classification` section exists but a required field is missing or malformed. |
-| `NO_EXISTING_DOCSETS` | `--auto-classify existing` was passed but the workspace has no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | `--auto-classify existing` (or `existing-forced`) was passed but the workspace has no DocSets to assign to. |
 
 The classification config is a precondition for `--auto-classify`, so a
 missing/invalid one is a **hard** error (exit 1) rather than a per-file
 soft error — every file would otherwise report the same thing. Having at
 least one DocSet is the same kind of precondition for `--auto-classify
-existing`, and is treated the same way. For a bulk directory add both are
+existing` and `existing-forced`, and is treated the same way. For a bulk directory add both are
 checked once up front, so the run aborts before any file is added.
 
 Soft-fail codes recorded on the File rather than returned as an envelope (OCR/hybrid-specific):
@@ -1596,7 +2127,8 @@ When `<path>` is a directory, `dgml file add` walks it for ingestible
 files, lex-sorts them, and runs the same per-file pipeline on each — one
 subprocess, one config load, one DocSet-store read for the whole batch
 instead of per file. "Ingestible" means `.pdf` always, plus the convertible
-source extensions (`.docx`/`.doc`/`.xlsx`/`.xls`, case-insensitive) **whose
+source extensions (`.docx`/`.doc`/`.xlsx`/`.xls`/`.pptx`/`.ppt`,
+case-insensitive) **whose
 format family has a converter configured** in the workspace `conversion`
 config. Convertible sources with no configured converter are skipped, not
 gathered — so a folder of PDFs with stray Office docs doesn't produce a pile
@@ -1610,8 +2142,58 @@ bulk flag — it makes re-runs idempotent. With `--auto-classify`, a
 DocSet created for one file becomes visible to the files processed
 after it, so similar PDFs in the batch cluster into the same DocSet.
 Under `--auto-classify existing` no DocSets are created, so that in-run
-growth doesn't happen: every file is assigned within the same curated set
-the run started with.
+growth doesn't happen: each file is either assigned within the same curated
+set the run started with or left unassigned (`decision: "none"`).
+`existing-forced` likewise creates nothing, but assigns every file.
+
+`--batch` (with `--batch-poll-interval SECONDS`, default 30) submits the
+directory's classifications through the classification model's batch API once
+every file is added, then runs the auto-extraction of the files assigned to a
+DocSet with a schema as one more batch run (a phase-1 wave and, when needed, a
+phase-3 wave), however many DocSets the files land in. How the classifications
+go out depends on the mode:
+
+- **`--auto-classify existing`** / **`existing-forced`**: one wave for every
+  file. No file can create a DocSet, so every request is built from the same
+  DocSet list.
+- **The default mode** (`--auto-classify`, `existing-or-new`): the files are
+  classified **in order, one wave per file**. Any reply may create a DocSet,
+  and each later file's request lists it (by id), exactly as the synchronous
+  run's file-by-file loop does. No two files can share a wave without changing
+  what the later one is offered, so a directory of *N* files takes *N*
+  classification round trips. A file that makes no request (no rendered page)
+  takes none. Use `existing` mode for a large curated ingest where that latency
+  matters.
+
+`--batch` requires `--auto-classify` (refused with `INVALID_ARGUMENT`
+otherwise: classification is what a directory add batches). It is also refused
+for a single-file add, and with `BATCH_UNAVAILABLE` when the classification
+model (or the values model, when a DocSet already has an extraction schema) has
+no batch backend — in every case before any file is added. Anthropic and
+Gemini models have one, so an `anthropic_google` workspace (Gemini light tier)
+classifies in batch too. Ingest itself
+(including `--text-mode hybrid`'s optional LLM merge, see below) stays
+synchronous. Each entry's `classification` block is the one a synchronous run
+writes; the payload gains a top-level `batch` block:
+
+```json
+"batch": {
+  "classification": {"provider": "anthropic", "waves": 1, "batches": 1, "requests": 12,
+                     "batch_ok": 12, "sync_fallbacks": 0, "resubmitted": 0,
+                     "failed": 0, "batch_ids": ["msgbatch_..."],
+                     "cost_usd": 0.006, "standard_cost_usd": 0.012, "saved_usd": 0.006},
+  "extraction": {"provider": "anthropic", "docset_ids": ["o8vr8rs488vg", "k2p0x9w3mm7q"],
+                 "waves": 2, "batches": 2, "requests": 14, "batch_ok": 14,
+                 "sync_fallbacks": 0, "resubmitted": 0, "failed": 0,
+                 "batch_ids": ["msgbatch_...", "msgbatch_..."],
+                 "cost_usd": 0.11, "standard_cost_usd": 0.22, "saved_usd": 0.11}
+}
+```
+
+`extraction` is present only when a batch auto-extraction ran. A credential
+failure (an unset `api_key_env`) never aborts the command: as in a run without
+`--batch`, each file's `classification.error` / `extraction.error` carries it
+and the command exits `0`. `--verbose` streams batch progress to stderr.
 
 Each file commits independently: a single bad PDF (or a conflict under
 `--on-conflict error`) is recorded in its entry and the run continues.
@@ -1663,7 +2245,7 @@ carries the same fields as a single `file add` response (plus `path`, and
 `classification` when `--auto-classify` is set). A hard-failed entry
 has `status`, `path`, and an `error` object instead of a `file` record.
 
-`summary` counts (they sum to `total`):
+`summary` counts (`added` through `hard_failed` sum to `total`):
 
 | Field | Meaning |
 |---|---|
@@ -1672,6 +2254,7 @@ has `status`, `path`, and an `error` object instead of a `file` record.
 | `skipped` | Existing records returned via `--on-conflict skip`/`replace` (`created: false`). |
 | `soft_failed` | Added, but with a `page_render_error`, `page_count_error`, `text_extraction_error`, or `conversion_error` recorded. |
 | `hard_failed` | The add raised (bad PDF, conflict under `--on-conflict error`, …); the entry carries an `error` object. |
+| `unassigned` | Present only with `--auto-classify`. Files this run classified (`classification.performed: true`) that still sit in no DocSet — a `"none"` decision under `existing`, or a soft-failed classification (`classification.error`). An overlay on the counts above, not a bucket of its own: a declined file is still counted as `added`. Non-zero means some files need routing. Files skipped as duplicates are not counted, since they were not classified this run. |
 
 Run `dgml check` afterward as the authoritative health signal for the
 whole workspace.
@@ -1688,19 +2271,35 @@ The flag takes an optional `MODE`:
 |---|---|
 | `--auto-classify` | Same as `existing-or-new` — the historical default. |
 | `--auto-classify existing-or-new` | Assign to an existing DocSet if one fits; otherwise create one. |
-| `--auto-classify existing` | Always assign to an existing DocSet — the best-fitting one. Never creates a DocSet, and never declines. |
+| `--auto-classify existing` | Assign to an existing DocSet if one fits; otherwise leave the file unassigned (`decision: "none"`). Never creates a DocSet. |
+| `--auto-classify existing-forced` | Always assign to the closest existing DocSet, even when the fit is poor. Never creates a DocSet and never declines. |
+
+> **Changed behavior.** Before `existing-forced` existed, `existing` meant
+> what `existing-forced` means now: every file was assigned and `decision`
+> was always `"existing"`. `existing` can now return `decision: "none"` with
+> `docset_id: null`. Callers that relied on forced assignment should switch
+> to `existing-forced`. It also changes cost: `existing` against a
+> one-DocSet workspace used to make no LLM call, and now makes one per file
+> (declining is a possible answer, so the model has to look). A file whose
+> pages failed to render, which used to be assigned there, now gets
+> `classification.error` instead. `existing-forced` keeps the old
+> no-call path for a single DocSet.
 
 Use `existing` when the workspace's DocSets are curated and an ingest run
 must not grow new ones — otherwise one odd file anchors a one-document
 DocSet that someone has to notice and clean up.
 
-> **`existing` assumes the files belong.** The LLM is required to return a
-> DocSet, so a document whose type isn't represented in the workspace is
-> assigned to the closest one anyway rather than flagged. Only pass
-> `existing` when you already know each file fits one of the DocSets; for a
-> mixed or unknown batch use `existing-or-new`, or `dgml cluster`. With no
-> DocSets to choose from the command fails with `NO_EXISTING_DOCSETS`
-> (exit 1) instead of guessing.
+> **`existing` as a fallback router.** A document whose type isn't
+> represented in the workspace comes back with `decision: "none"`: the File
+> is kept but sits in no DocSet and is not extracted, so a caller's own
+> unknown-type handling can take over. With no DocSets to choose from the
+> command fails with `NO_EXISTING_DOCSETS` (exit 1) — there is nothing to
+> route into.
+
+Use `existing-forced` only when every file is known to belong in one of the
+workspace's DocSets: an off-type document is assigned to the closest DocSet
+anyway, not flagged. With exactly one DocSet it makes no LLM call — there is
+only one possible answer.
 
 > **Argument order matters.** `MODE` is optional, so the parser takes the
 > *next* token as its value. Put `<path>` **before** the flag —
@@ -1725,7 +2324,7 @@ Configure the model via the `classification` section in
 | Field | Required | Meaning |
 |---|---|---|
 | `model` | yes | `<provider>/<model>` in [litellm](https://docs.litellm.ai/docs/providers) form — e.g. `gemini/gemini-flash-lite-latest`, `anthropic/claude-opus-5`, `openai/gpt-4o`. |
-| `max_pages` | no (default `3`) | How many rendered page images (`page_images/page_1.png` …) to send to the LLM. Cap is per-classification cost: 1 is the cheap setting, 4+ is the thorough one. |
+| `max_pages` | no (default `3`) | How many rendered page images (`page_images/page_1.{png,jpg}` …) to send to the LLM. Cap is per-classification cost: 1 is the cheap setting, 4+ is the thorough one. |
 | `naming_attempts` | no (default `1`) | How many independent proposals to request when naming a *newly clustered* DocSet (`dgml cluster`, not per-file `--auto-classify`). At `1` the single proposal is used as-is. At `2`+ the name the plurality of attempts agreed on wins, and that share is reported as the file's `naming_confidence` — a 3-of-3 agreement is safe to accept unreviewed, a 2-1 split is worth a look. Costs tokens linearly, so raise it only for runs where a wrong DocSet name is expensive to undo. |
 | `api_key` | no | Optional literal API key. Use only on per-developer workspaces (config.toml isn't checked in). Mutually exclusive with `api_key_env`. |
 | `api_key_env` | no | Optional name of the env var to read the API key from. Mutually exclusive with `api_key`. When neither is set, litellm uses its built-in per-provider lookup (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …). When `api_key_env` references an unset env var, `AUTH_ERROR` is raised. |
@@ -1745,23 +2344,26 @@ The LLM is forced to pick exactly one of two tools:
   document type can answer. The `key_questions` are persisted on the
   new DocSet and shown to future classifications.
 
-`--auto-classify existing` offers only `assign_to_existing_docset`, so
-with `tool_choice="required"` a choice is forced: the LLM is told a
-perfect fit isn't required and to return the closest DocSet. `decision`
-is therefore always `"existing"`. A model that calls `create_new_docset`
-anyway is refused with `CLASSIFICATION_FAILED`.
+`--auto-classify existing` swaps `create_new_docset` for
+`no_matching_docset(reason)`: the LLM assigns when a DocSet is the new
+file's document type, and otherwise declines, giving `decision: "none"` and
+a one-sentence `decline_reason`. Fit is judged by each DocSet's description, or by
+its name alone when it has none. Key questions only break ties between
+DocSets that both fit, so a DocSet created with just a `--name` is still a
+candidate. The model is called even when the workspace holds a single DocSet,
+since declining is a possible answer.
 
-Two cases skip the LLM entirely, since neither leaves anything to decide:
+`--auto-classify existing-forced` offers `assign_to_existing_docset` alone,
+so the LLM must pick the closest DocSet.
 
-- **Exactly one DocSet** — the file is assigned to it, with the same
-  payload the model would have returned. This mode creates no DocSets,
-  so a whole bulk run over a one-DocSet workspace costs no LLM calls.
-  (`existing-or-new` still calls here — it may need a new DocSet.)
-- **No DocSets** — the command fails with `NO_EXISTING_DOCSETS`
-  (exit 1). Both preconditions (config, and at least one DocSet) are
-  checked *before* the file is ingested, single and bulk alike, so a
-  failed run adds nothing — erroring after the add would leave behind
-  the unassigned file this mode exists to avoid.
+A model that calls a tool its mode didn't offer (`create_new_docset`
+outside the default mode, `no_matching_docset` outside `existing`) is
+refused with `CLASSIFICATION_FAILED`.
+
+With **no DocSets** the command fails with `NO_EXISTING_DOCSETS` (exit 1)
+and makes no LLM call. Both preconditions (config, and at least one
+DocSet) are checked *before* the file is ingested, single and bulk alike,
+so a failed run adds nothing.
 
 Classification runs **after** the file is added, and only when `created`
 is `true`. Re-runs on a duplicate (`--on-conflict skip`) skip the LLM
@@ -1783,18 +2385,43 @@ The `classification` payload block:
     "What is the invoice total?",
     "What is the invoice date?"
   ],
+  "decline_reason": null,
   "error": null
 }
 ```
+
+`docset_id` is set only once the file is actually stored in that DocSet, so
+a block with an `error` and a non-null `docset_id` means the assignment
+landed and a later step failed; a `null` one means the file is in no DocSet.
+If a newly created DocSet can't take the file, the DocSet is deleted again
+rather than left behind empty.
 
 `docset_key_questions` echoes the assigned DocSet's `key_questions`
 (empty list for DocSets created without them). When `decision`
 is `"new"`, this is the list the LLM just proposed and that has been
 persisted on the freshly-created DocSet.
 
-Under `--auto-classify existing` the block looks the same as the
-`"existing"` example above; `decision` is never `"new"` and never
-anything else, since the assign tool is the only one offered.
+Under `--auto-classify existing` `decision` is never `"new"`. When no
+DocSet fits it is `"none"`, the File is left unassigned, no `extraction`
+block is added, the DocSet fields stay empty, and `decline_reason` carries
+the LLM's one-sentence explanation. `decline_reason` is present on every
+performed block and `null` unless `decision` is `"none"`; a decline that
+comes back without a reason is treated as a malformed response
+(`CLASSIFICATION_FAILED` in `error`), so a `"none"` always says why:
+
+```json
+"classification": {
+  "performed": true,
+  "model": "gemini/gemini-flash-lite-latest",
+  "decision": "none",
+  "docset_id": null,
+  "docset_created": false,
+  "docset_name": null,
+  "docset_key_questions": [],
+  "decline_reason": "This is a commercial lease, not a vendor invoice or a safety datasheet.",
+  "error": null
+}
+```
 
 When the file already existed (`created: false`):
 
@@ -2015,7 +2642,9 @@ ordering) and the **provenance record**. It carries:
 - the **rendering provenance** from `file.json` — `page-image-dpi`,
   `page-image-renderer`, and (only for a non-PDF source converted to PDF)
   `pdf-converter`. A field absent from `file.json` is omitted, not emitted
-  empty;
+  empty. DGML names every converter it runs, so a non-PDF `<source>` with no
+  `pdf-converter` means the PDF was supplied by a library caller rather than
+  produced by DGML (see [conversion.md](conversion.md));
 - the `<artifacts>` **inventory** — each leaf's role mapped to its relative
   path, with per-page `number` attributes.
 
@@ -2318,6 +2947,354 @@ filter was requested, `dgml discover` warns on stderr and falls back to
 `FILE_NOT_FOUND`, `DOCSET_NOT_FOUND`, `NOT_FOUND` (no generated DGML XML),
 `INVALID_ARGUMENT` (bad filter name or empty ids).
 
+## Batch jobs (`--no-wait` and `dgml batch`)
+
+A `--batch` run blocks until every wave has come back, and a wave can take up
+to 24 hours. A **batch job** lets the command stop as soon as a wave is
+submitted, and be continued later: by hand, from a cron entry, or by an agent.
+Every command that takes `--batch` (`dgml docset generate`, `dgml docset run`
+(one job for all its steps), `dgml extraction generate-schema`, `dgml
+extraction extract` and `dgml file add <dir> --auto-classify`) also takes:
+
+| Flag | Meaning |
+|---|---|
+| `--no-wait` | Submit the current wave, check it once, and exit if it is still running. |
+| `--job <job_id>` | Continue an existing job (normally passed by `dgml batch resume`). |
+| `--batch-deadline <duration>` | Stop waiting on the provider this long after the job starts (`90m`, `6h`, `1d`, or plain seconds). See [Batch deadline](#batch-deadline---batch-deadline). Also works on a blocking `--batch` run. |
+
+All three require batch mode; without it they fail with `BATCH_JOB_INVALID`.
+
+**A paused run is not an error.** It prints this payload on stdout and exits
+`0`:
+
+```json
+{
+  "batch_job": {
+    "job_id": "bj_3f9a1c07d2e4",
+    "status": "pending",
+    "command": "docset generate",
+    "submitted_batches": 1,
+    "requests_in_flight": 12,
+    "resume": "dgml batch resume bj_3f9a1c07d2e4"
+  }
+}
+```
+
+A job with a `--batch-deadline` also carries `deadline: {at, expired}` after
+`resume`, the same object `dgml batch status` shows, so a scheduler
+sees when the job stops waiting without a separate status call:
+
+```json
+{"batch_job": {"job_id": "bj_3f9a1c07d2e4", "status": "pending", "...": "as above",
+  "resume": "dgml batch resume bj_3f9a1c07d2e4",
+  "deadline": {"at": "2027-01-15T14:00:00Z", "expired": false}}}
+```
+
+A job without a deadline has no `deadline` key: its payload is exactly the one
+above. A `docset run` job's block ends with `step`, the step it paused in
+(`schema`, `generate` or `extract`), as `dgml batch status` reports it.
+
+A run that finishes prints the command's normal payload. Its `batch` block
+gains a `replayed` count (requests served from the job's store) when it is not
+zero.
+
+**A job left behind is named in the payload.** When a run ends but leaves a
+failed, resumable job (a stage outage, a batch it had to cancel, an uncertain
+create), including the silent job of a plain blocking `--batch` run, its
+`batch` block gains a `job` entry (created if the payload has no `batch`
+block):
+
+```json
+"batch": {"...": "the command's counters",
+          "job": {"job_id": "bj_3f9a1c07d2e4", "status": "failed",
+                  "resume": "dgml batch resume bj_3f9a1c07d2e4"}}
+```
+
+A run that fails with an error envelope carries the same object as
+`error.details.batch.job` (and, for a job with a `--batch-deadline`, the
+`deadline` block as `error.details.batch.deadline`). The entry is absent whenever the run finished its
+job, so a successful run's payload is unchanged.
+
+**How resuming works.** A job never saves the pipeline's in-flight state. It
+saves every response it receives, keyed by a digest of the request, and a
+resume re-runs the whole command:
+
+- a request already answered is served from the store, with no provider call;
+- a request inside a provider batch that is still open is collected from that
+  batch, never resubmitted;
+- anything else is submitted as a new batch.
+
+The pipeline's requests are deterministic, so the re-run reaches exactly where
+the paused run stopped, then polls the open batches once. If they are still
+running, it pauses again with nothing new submitted. Once they have ended, it
+collects them, submits the next wave and pauses on it. Synchronous calls the
+command makes (labeling under `--no-batch-label`) are recorded and replayed
+the same way, so they are paid for once.
+
+- **Same result as a blocking run.** A job driven to completion leaves the same
+  DGML, cache files and `usage.jsonl` rows as one blocking `--batch` run. Runs
+  that end paused write no DGML and no usage rows; the run that completes the
+  job writes each document's row once, billing every response exactly once.
+- **Inputs are pinned.** `docset generate` rewrites some of its own inputs
+  mid-run (`schema.json`, `concept_roster.json`, each document's
+  `_blocks.json`); a resumed run restores them to what the job started from.
+  `file add` ingests the directory on the first run only. PDF page slices and
+  documents converted on demand are not byte-reproducible, so a job records
+  each one the first time it is made and replays those exact bytes.
+- **Changed inputs are detected.** A request whose content changed since the
+  job started gets a new digest, so it is submitted afresh rather than served
+  a stale response. Its superseded provider batch, if still open, is canceled.
+- **Never paying twice for drifted inputs.** If a resume's requests for a
+  stage match nothing the job stored or has in flight while open provider
+  batches still cover those positions, the resume stops with
+  `BATCH_JOB_NONDETERMINISTIC` before submitting anything, and the open
+  batches are kept. The run's only output is that error envelope (exit 1);
+  `details.batch.job` names the job, left `failed`. If an input really did
+  change, run `dgml batch cancel <job_id>` and then `dgml batch resume
+  <job_id>`.
+- **Job-wide totals.** The `batch` block of the run that completes a job
+  counts provider work over every run of the job: `batches`, `batch_ids`,
+  `batch_ok`, `sync_fallbacks`, `resubmitted` and `failed` are summed, while
+  `waves`, `requests` and `replayed` are the final run's. A job that took more
+  than one run adds `runs` and `this_run` (that run's counters alone).
+- **Every `--batch` run is a job.** A plain blocking `--batch` run records its
+  responses under a job too, silently: its payload is unchanged, and if it
+  crashes mid-wave, `dgml batch resume` picks up the submitted batches instead
+  of paying again. Under `--verbose` the run names its job on stderr when it
+  starts; otherwise find it with `dgml batch list`. When the blocking run
+  finishes, its job is deleted.
+- **No batch is left running.** When a run ends for any reason other than
+  pausing or an interrupt, every provider batch the job still has open is
+  collected if it has finished, otherwise canceled so it stops billing; the
+  job then ends `failed` and a resume submits those requests again. An
+  interrupt (Ctrl-C, a crash) leaves batches open for the resume to collect.
+- **Relative paths replay from the original directory.** `batch resume` runs
+  the command from the directory it was first run in. Batch mode is recorded
+  explicitly (`--batch`), even when it came from `[generation] batch = true`;
+  so is `docset generate`'s labeling choice (`--batch-label` or
+  `--no-batch-label`), so editing `[generation] batch_label` between resumes
+  cannot switch a job half-way.
+- **One process at a time.** Running a job (its command with `--job`, `batch
+  resume`, `cancel`, `delete`) takes the job's lease. A second process fails
+  fast with `BATCH_JOB_BUSY`. `batch status` and `batch list` are read-only and
+  take no lease. A running command renews the lease every minute; it expires
+  10 minutes after the last renewal. A live run whose lease is broken (`batch
+  unlock`) or taken over stops at its next submission, model call or manifest
+  write with `BATCH_JOB_BUSY` (`error.details.lease_lost: true`), billing
+  nothing more.
+- **Retention.** A completed job keeps only a small manifest summary. A run
+  that asked the provider for nothing leaves no job. Remove finished jobs with
+  `dgml batch prune`, and one job with `dgml batch delete`.
+- **What is stored**: see `batches/` in [storage-layout.md](storage-layout.md).
+  Never an API key: requests are stored only as digests, a provider batch
+  records where its key came from (config section, environment variable name),
+  and a stored response keeps no provider headers.
+
+### Batch deadline (`--batch-deadline`)
+
+A provider batch usually ends within an hour but may run for its whole
+lifetime (24 hours), and one slow wave holds the whole run. `--batch-deadline
+<duration>` (at most `30d`; the deadline is rounded up to the whole second)
+bounds that; without it nothing changes. Once the deadline has
+passed:
+
+- every open provider batch of the current wave is canceled; the run waits a
+  bounded, per-provider time for each cancel to settle (the backend's
+  `cancel_settle_s`: Anthropic 450 s, Gemini 60 s, OpenAI 660 s; 180 s for a backend that declares none;
+  polled every 10 s; see [Batch mode](batch-mode.md#batch-deadline)) and
+  collects the results the provider had already produced. A `--no-wait` run
+  never waits out a cancel: it checks once, and keeps what has not settled as
+  `settling` at once; Those requests keep
+  their batch result, at batch price;
+- every other request of that wave, and every request of every later wave of
+  the run, runs synchronously at standard price. Nothing new is submitted;
+- one `WARNING` is logged (the run's cost is degraded).
+
+A request is never answered twice. A batch whose cancel had not settled when
+the wait ended (or whose cancel failed, or whose results could not be read) is
+recorded `settling`: its requests run synchronously, and because the provider
+may still process them (OpenAI does, while `cancelling`), each counts in
+`possibly_double_billed` and a `WARNING` names the batch. A late result never
+replaces the one the run used. Once the batch has ended, the job's next run,
+`dgml batch cancel`, `delete` or `prune` records what it billed (the batch
+entry's `late_billed: {"requests", "cost_usd"}`), cleans it up and marks it
+`dropped`; `dgml batch status` only polls it (reporting `done` once it has
+ended) and never downloads its results. `dgml batch delete`
+refuses a job whose batch is still settling (`BATCH_JOB_INVALID`: its late cost
+would be lost) unless `--force`. A batch that ended just before its cancel (the
+provider then refuses the cancel) is collected like any ended batch, not run
+again. When both apply, the
+earlier of the deadline and the polling deadline (the provider's batch
+lifetime plus an hour) wins.
+
+The deadline belongs to the **job**: the run that creates it stores it as an
+absolute UTC time (wall clock), and every resume (`dgml batch resume` or
+`--job`) honors that instant. A resume after the deadline cancels and collects
+the open batches and finishes synchronously (the resume short-circuit is off
+once the deadline has passed), and the synchronous responses are recorded like
+any other, so a later replay serves them. Passing `--batch-deadline` on a
+resume is accepted when it is the same duration the job was created with (what
+`dgml batch resume` replays) and changes nothing; a different duration fails
+with `BATCH_JOB_INVALID`, since a job's deadline cannot be moved. On a job
+created without one, the first resume that passes `--batch-deadline` sets it,
+from that moment. A resume that starts after the deadline says so on stderr
+(`[batch-job] … its batch deadline … has already passed`).
+
+When a deadline is set, the run's payload `batch` block gains `deadline`
+(job-wide counts, over every run of the job):
+
+```json
+"deadline": {"at": "2026-09-30T18:00:00Z", "expired": true,
+             "canceled_batches": 1, "collected_after_cancel": 40,
+             "sync_after_deadline": 12, "possibly_double_billed": 0}
+```
+
+`expired` says whether the deadline has passed; `canceled_batches` counts the
+provider batches canceled because it did, `collected_after_cancel` the
+requests collected from them anyway (batch price), and `sync_after_deadline`
+the requests run synchronously because of it (standard price, counted in the
+block's `sync_fallbacks` and cost fields like any fallback).
+`possibly_double_billed` counts the requests among those whose canceled batch
+had not settled when the wait ended. The provider may still process them, so
+they may be billed twice. It is an upper bound, and `0` whenever every cancel
+settled in time. A payload without a deadline has no `deadline` key.
+
+A job that ever had an unsettled cancel also reports, in the same block:
+
+```json
+"settling_batches": 0, "late_billed": 7, "late_billed_usd": 0.0042
+```
+
+`settling_batches` counts the batches still canceling. `late_billed` counts
+the results canceled batches billed after their requests had already run
+synchronously, recorded once each batch ended. `late_billed_usd` is their
+batch-priced cost, or `null` if any result was unpriced. This cost is **not**
+in the block's `cost_usd`, which covers only the responses the run used: what
+the job actually cost is `cost_usd + late_billed_usd`. These keys are absent
+when no cancel ever failed to settle in time. A blocking run's silent job is
+kept (not deleted when the run finishes) while one of its cancels is still
+settling, so that cost can be recorded; while any is, the block also names it
+(`"job_id": "bj_…"`), for `dgml batch cancel` or `prune` to close out.
+
+### `dgml batch resume <job_id>`
+
+Re-run the job's command, as it was first invoked (abbreviated flags stored in
+full), from the directory it was first run in, continuing the job. Prints the
+command's own output: another `batch_job` payload if it paused again, the
+normal payload if it finished. Fails with `BATCH_JOB_INVALID` when the job
+already completed, when its stored command line no longer parses, when its
+original directory no longer exists, or when it has an unacknowledged
+`uncertain` batch create.
+
+**Short-circuit while nothing has ended.** For a `--no-wait` job whose open
+provider batches are all still running, `batch resume` does not re-run the
+command: it polls those batches once (read-only, as `batch status` does) and
+returns the same pending `batch_job` payload a pausing run prints, exit 0. Any
+other state re-runs the command, as does a job whose `--batch-deadline` has
+passed (the run cancels, collects and finishes synchronously).
+
+### `dgml batch status <job_id>`
+
+Poll each of the job's open provider batches once and report their state,
+without running the command. **Read-only**: it takes no lease and writes
+nothing, so it works while another process runs the job and right after a
+crash. `status` is `ready` when the job is pending and every open batch has
+ended (a resume will make progress without waiting).
+
+```json
+{
+  "job_id": "bj_3f9a1c07d2e4", "command": "docset generate", "status": "ready",
+  "created_at": "2026-09-25T02:00:00Z", "updated_at": "2026-09-25T03:10:00Z",
+  "runs": 2, "requests_in_flight": 12, "error": null,
+  "lease": {"held_by": "48213-1f0c9a2e", "expires_at": "2026-09-25T03:14:00Z",
+            "stale": true},
+  "batches": [
+    {"batch_id": "msgbatch_01...", "provider": "anthropic", "requests": 12,
+     "state": "open", "done": true,
+     "last_status": {"state": "ended", "succeeded": 12, "errored": 0,
+                     "expired": 0, "canceled": 0, "processing": 0}}
+  ]
+}
+```
+
+A batch's `state` is `open`, `collected`, `dropped` (canceled), `settling`
+(canceled at the batch deadline, cancel not yet settled; see
+[Batch deadline](#batch-deadline---batch-deadline)), or `uncertain`: a batch
+create whose outcome is unknown, so the batch may exist and be billing.
+An `uncertain` batch has a placeholder `batch_id` (`uncertain_…`) and an
+`error`; the job refuses to run again until `dgml batch cancel` acknowledges
+it. A `dropped` batch reports `cleanup`: `done` once deleted at the provider,
+`pending` while its cancel has not settled. A batch that cannot be polled
+reports an `error`; one the provider no longer knows (404) reports `"done":
+true, "gone": true`. `lease` is `null` when no process holds the job;
+`stale: true` means the holder is gone.
+
+A job created with `--batch-deadline` also reports `deadline`: `{"at":
+"2026-09-30T18:00:00Z", "expired": false}`, when the deadline is and whether it
+has passed (a resume after it cancels, collects and finishes synchronously).
+Jobs without one have no `deadline` field. A job with a `settling` batch adds
+`settling_batches`, `late_billed` and `late_billed_usd` to it, as recorded so
+far: status polls each settling batch (its entry's `done`) but never
+downloads its results, so a late cost appears once a later run, `cancel`,
+`delete` or `prune` has recorded it. Nothing is written.
+
+A `docset run` job also reports `step` (here and in `dgml batch list`): the
+step the job is on (`schema`, `generate` or `extract`), or `completed` once the
+run has finished. Jobs of other commands have no `step` field.
+
+### `dgml batch list`
+
+Every job in the workspace, newest first: `{"jobs": [...]}`, each entry the
+fields of `status` above without `batches` and `lease` (with the stored
+`status`: `pending`, never `ready`). Read-only.
+
+### `dgml batch cancel <job_id>`
+
+Cancel the job's open provider batches, acknowledge every `uncertain` batch
+(its entry gets `"acknowledged": true`), and mark the job `failed`. A later
+`batch resume` submits those requests again at batch price. Prints the
+`status` payload plus `"canceled": true|false`; a batch the provider would not
+cancel stays `open` with an `error` and `canceled` is `false`. A batch that
+had already ended is collected instead (its responses kept for a resume).
+
+### `dgml batch delete <job_id> [--force]`
+
+Delete the job's stored state. Refused with `BATCH_JOB_INVALID` while the job
+has open provider batches; `--force` cancels them first, and if any cancel
+fails nothing is deleted (`BATCH_EXECUTION_FAILED`). Also refused while a batch
+canceled at the `--batch-deadline` is still settling (after one attempt to
+record its late cost); `--force` deletes it without that cost. Prints `{"job_id",
+"deleted": true, "batches": [...]}`.
+
+### `dgml batch prune [--older-than DAYS]`
+
+Delete every finished job: completed, or failed with no open provider batch
+and no unacknowledged `uncertain` batch. Jobs another process holds are kept.
+`--older-than` keeps jobs updated within the last DAYS days (default `0`).
+Prints `{"deleted": [...], "kept": [...]}`, plus `"cleanup_pending": [...]`
+for a job kept because a canceled batch of it still awaits deletion at the
+provider, and `"settling": [...]` for a job kept because a batch canceled at
+its `--batch-deadline` has not settled yet (its late cost is recorded first).
+
+### `dgml batch unlock <job_id>`
+
+Break the job's lease, whoever holds it. Use it when the process that held it
+is gone (`batch status` shows `lease.stale: true`). Prints `{"job_id",
+"unlocked": true|false}`.
+
+**Overnight pattern:**
+
+```bash
+job=$(dgml docset generate "$DOCSET" --batch --no-wait | jq -r .batch_job.job_id)
+# cron, every 30 minutes: resume only when it will make progress.
+case "$(dgml batch status "$job" | jq -r .status)" in
+  ready) dgml batch resume "$job" ;;
+  pending) ;;                                     # the provider is still working
+  completed) ;;                                   # done: remove the cron entry
+  failed) dgml batch status "$job" | jq .error ;; # read why before resuming
+esac
+```
+
 ## Chain attestation commands
 
 Anchor a DGMLX bundle's Merkle root, or a single node's hash, directly
@@ -2434,7 +3411,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 |---|---|---|
 | `WORKSPACE_NOT_INITIALIZED` | hard | A command that needs a workspace ran against a directory that has no workspace **config** — which is what makes a directory a workspace, since the config names the storage backend and cannot be reconstructed. This covers both "never a workspace" and "a workspace whose `config.toml` was deleted"; nothing on disk distinguishes them for a remote-backed workspace, so one error carries all the remedies. The message names the resolved path and offers remedies that work against *that* workspace: `dgml workspace create <path> --organization <org>` to make one there, `dgml workspace list` to find one you already have, or restoring the config from backup. (It deliberately does not say a bare `dgml workspace create`, which would create a workspace elsewhere and leave the command failing identically.) |
 | `LEGACY_CONFIG_PRESENT` | hard | A pre-migration `<workspace>/config.toml` is the only config present; the format is now TOML. Run `dgml init` to write `~/.config/dgml/config.toml`, then migrate any settings. |
-| `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier or `family` set to a non-string or empty value, or `family` naming an unknown provider family). |
+| `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier, `family` or credential set to a non-string or empty value, `family` naming an unknown provider family, both `*_api_key` and `*_api_key_env` set for one tier or provider, or a tier credential in a layer that does not set its tier). Raised by the commands that read the tiers, not by the merge, so `file add` and `file list` still run. |
 | `MISSING_EXTRA` | hard | A command needs an optional extra that isn't installed (e.g. `dgml[clustering]`). |
 | `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`, a `file add --id` that is malformed, passed with a directory, or unsatisfiable under the chosen `--on-conflict`). |
 | `INTERNAL_ERROR` | hard | Unexpected exception; the message is a short, single-line `<ExcType>: <msg>` (capped, whitespace collapsed). Pass `--verbose` (or set `DGML_DEBUG=1`) for the full stderr traceback. |
@@ -2445,8 +3422,8 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `UNSUPPORTED_FILE_TYPE` | hard | `file add` path is neither a PDF nor a convertible source. |
 | `INVALID_PDF` | hard | File does not start with the `%PDF-` magic. |
 | `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
-| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed. |
-| `CONVERSION_FAILED` | hard / soft | A docx/xlsx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
+| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed, or a family's converter cannot be resolved or does not handle that family's file types (checked before a file is added or gathered, so a misconfigured family is one error, not one per file). |
+| `CONVERSION_FAILED` | hard / soft | A docx/xlsx/pptx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
 | `OCR_CONFIG_MISSING` | hard | `--text-mode ocr`/`hybrid` with no `ocr` config section. |
 | `OCR_CONFIG_INVALID` | hard | The `ocr` config section has invalid fields, or names a provider that cannot be resolved. |
 | `OCR_FAILED` | soft | Provider API failure during `--text-mode ocr`/`hybrid`; recorded on the File (`text_extraction_error`). |
@@ -2457,7 +3434,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `CLASSIFICATION_CONFIG_MISSING` | hard | `--auto-classify` with no `classification` config. |
 | `CLASSIFICATION_CONFIG_INVALID` | hard | The `classification` config has a missing/invalid field. |
 | `CLASSIFICATION_FAILED` | soft | The classification LLM call failed; lands in `classification.error`. |
-| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` in a workspace with no DocSets to assign to. |
+| `NO_EXISTING_DOCSETS` | hard | `--auto-classify existing` or `existing-forced` in a workspace with no DocSets to assign to. |
 | `CLUSTERING_CONFIG_INVALID` | hard | The optional `clustering` config section failed validation. |
 | `GROUNDING_FAILED` | soft | Grounding a file failed; surfaces as `grounded: false` with a `grounding_error` on that file's `docset generate` result entry. |
 | `LABEL_MODEL_UNREACHABLE` | soft | A file's labeling could not reach the `label_model` at all (auth / bad model id / network); surfaces as a `label_error` on that file's `docset generate` result entry. The file still converts, unlabeled. |
@@ -2465,7 +3442,8 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `SCHEMA_NOT_FOUND` | hard | An `extraction` command needs an `extraction-schema.rnc` the DocSet doesn't have. |
 | `SCHEMA_INVALID` | hard | A schema passed to `extraction set-schema` is not valid RNC (within the supported subset) or not a JSON object. |
 | `NO_FILES` | hard | `extraction generate-schema` has no sample files (empty DocSet and no `--from-file`). |
-| `VALUES_NOT_FOUND` | hard | `extraction get-values` ran before `extraction extract` for that file. |
+| `DGML_NOT_FOUND` | hard | The file is assigned to the DocSet but has no `<stem>.dgml.xml` yet: neither `docset generate` nor `extraction extract` has run for it. From `extraction get-values` and `dgml_core.read_dgml`. |
+| `VALUES_NOT_FOUND` | hard | The file's `<stem>.dgml.xml` has no `dg:extraction` element: `docset generate` ran but `extraction extract` has not. From `extraction get-values`. |
 | `GENERATION_CONFIG_MISSING` | hard | A generation model can't be resolved — neither the per-task field (`generation.model` / `generation.label_model`) nor its `[models]` tier (`standard` / `advanced`) is set in the merged config. |
 | `GENERATION_CONFIG_INVALID` | hard | The `generation` config section has a missing/invalid field. |
 | `GROUNDED_CONFIG_MISSING` | hard | An `extraction` command needs a `grounded` config section that is absent. |
@@ -2494,6 +3472,12 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `WORKSPACES_UNAVAILABLE` | hard | The store of workspaces could not be reached — it is what *finds* a workspace, so this fails every command, not just the one that touches the backing store. The message names the host, port and driver error. |
 | `WORKSPACE_MIGRATION_FAILED` | hard | An automatic in-place workspace upgrade could not complete; the workspace is left as it was, and the message names the migration that stopped. |
 | `EMPTY_MODEL_RESPONSE` | hard | An LLM call returned no content at all (as distinct from content that failed to parse). |
+| `BATCH_UNAVAILABLE` | hard | Batch mode was requested for a model it cannot serve: the model's provider (as litellm resolves it) has no batch backend, the backend's optional dependency is not installed, or the installed litellm is outside the range the batch backends support. Raised before any request is sent, naming the stage and model; batch mode never falls back to a full-price synchronous run. Every `--batch` command checks every stage it would batch up front. |
+| `BATCH_EXECUTION_FAILED` | hard | A submitted batch could not be brought to completion: the provider accepted none of a wave's batches, a batch create was refused at the account's rate limit or quota, a batch create's outcome was unknown (the batch may exist; it is never resubmitted), a batch was still unfinished at the polling deadline (it is cancelled first), or, under a batch job, a batch was not found (404) with an API key other than the one that created it (it may still exist under that key's account; nothing is resubmitted, and its record stays open for a run with the right key). Per-request failures inside a delivered batch are retried or run synchronously instead. Within a `docset generate` stage, only the documents still in flight are affected (a document still transcribing is dropped, one still labeling gets a `label_error` with code `LABEL_MODEL_UNREACHABLE` and this failure as its message, a failed link stage gives each document a `link_error`); the command still exits 0. |
+| `BATCH_JOB_NOT_FOUND` | hard | `--job` or a `dgml batch` subcommand named a job id with no job in this workspace. |
+| `BATCH_JOB_BUSY` | hard | Another process holds the batch job's lease (it is running, polling or canceling that job). Retry when it finishes, or once the lease expires 10 minutes after its last renewal; `dgml batch unlock <job_id>` breaks a lease left by a process that died. Also the outcome of a run that lost its lease mid-run (broken by `unlock`, or taken over): it stops before submitting anything more, with `details.lease_lost: true`. |
+| `BATCH_JOB_NONDETERMINISTIC` | hard | A resumed batch job's requests for a stage matched nothing it stored or has in flight while open provider batches still cover those positions: an input was rebuilt differently, and submitting would pay for the same wave again. Nothing was submitted and the open batches were kept. Fatal to the run: it is the run's only output (no success payload, exit 1), nothing further is sent to the provider, and `docset run` stops at that step (`details.step`); `details.batch.job` names the job, left `failed`. If an input changed on purpose, `dgml batch cancel <job_id>` then `dgml batch resume <job_id>`. |
+| `BATCH_JOB_INVALID` | hard | A batch job cannot be used as asked: `--no-wait`/`--job`/`--batch-deadline` without batch mode, a resume passing a `--batch-deadline` different from the job's, resuming a job that already completed, continuing a job with a different command than the one that created it, running a job again while it has an unacknowledged `uncertain` batch create (check the provider's console, then `dgml batch cancel <job_id>`), or resuming a job whose stored command line no longer parses or whose original working directory no longer exists. |
 | `INCREMENTAL_WITHOUT_CLUSTERS` | hard | `cluster --skip-existing` in a workspace that has no existing clusters to build on. |
 | `LINK_PLAN_FAILED` | soft | The semantic-link pass failed for a document during `docset generate`; the document still converts, unlinked. |
 | `GUIDANCE_NOT_FOUND` | hard | An `extraction` command needs DocSet guidance that has not been set. |

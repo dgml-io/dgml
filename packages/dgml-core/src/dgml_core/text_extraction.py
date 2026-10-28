@@ -15,30 +15,56 @@
 Walks pdfminer.six's page layout, groups characters into whitespace-separated
 words, and emits one compact JSON file per page in the file's ``page_text/``
 directory. Coordinates are converted from PDF points (origin bottom-left) to
-image pixels matching the corresponding ``page_images/page_N.png`` render.
+image pixels matching the corresponding ``page_images/page_N.{png,jpg}`` render.
 
 OCR and hybrid extraction live in :mod:`dgml.ocr` and :mod:`dgml.hybrid` and
 share the per-page JSON shape emitted here so downstream consumers don't have
 to care which mode produced the words.
+
+**Scanned pages.** A page that is a full-page image (see
+:data:`RASTER_PAGE_COVERAGE`) with no words, or fewer than
+:data:`MIN_SCAN_TEXT_WORDS` (a Bates stamp, a page number), has no text layer
+that stands for what is printed on it. Each page is checked as it is extracted
+(see :func:`page_text_defect`) and the verdict lands on
+:attr:`ExtractDigitalResult.defects`; the words themselves are written as
+pdfminer produced them. :func:`dgml_core.ocr.recover_unusable_pages` acts on
+the verdict. On the eval corpus (587 PDFs) 674 raster pages have no words and
+none has 1-9; the rest carry 18 or more and are not touched. A sparse
+*visible* overlay on a scan (a 26-word watermark) is not flagged; ``--text-mode
+hybrid`` is the mode that tells that apart from a baked OCR layer.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from statistics import median
 from typing import Any
 
 from .errors import TextExtractionFailed
-from .pages import DEFAULT_DPI
+from .pages import DEFAULT_DPI, DEFAULT_PAGE_IMAGE_SPEC, PageImageSpec
 from .style import fontname_is_bold, fontname_is_italic, rgb_to_named
+
+logger = logging.getLogger(__name__)
 
 PAGE_TEXT_FILENAME = "page_{page}.json"
 PAGE_TEXT_GLOB = "page_*.json"
+
+# A page whose largest placed image covers at least this fraction of the page
+# area is a scan: a picture of a document rather than a document. Scanned
+# pages run 0.8-0.99 here (the margin the scanner trimmed is the difference);
+# a born-digital page's own artwork - a logo, an icon, a masthead - is orders
+# of magnitude below it, in the low percents. Shared with the hybrid merge's
+# scan guard.
+RASTER_PAGE_COVERAGE = 0.8
+# A scanned page with fewer digital words than this has no real text layer:
+# what is there is a stamp or a page number, not the page's content.
+MIN_SCAN_TEXT_WORDS = 10
 
 
 def split_word_into_tokens(
@@ -95,19 +121,103 @@ class TextMode(StrEnum):
     HYBRID = "hybrid"
 
 
+class PageTextDefect(StrEnum):
+    """Why a page's digital text layer cannot stand for the page.
+
+    ``IMAGE_ONLY``: a scanned page with no text layer. ``STRAY_TEXT``: a
+    scanned page whose text layer is a few stray words (a stamp, a page
+    number). See the module docstring.
+    """
+
+    IMAGE_ONLY = "image_only"
+    STRAY_TEXT = "stray_text"
+
+
 @dataclass
 class ExtractDigitalResult:
     pages_written: int
     pages_with_words: int
     total_words: int
+    # Pages (1-based) whose digital text layer is unusable and was not replaced,
+    # with the reason. Only the digital path fills it; OCR fallback removes every
+    # page it recovers (see :func:`dgml_core.ocr.recover_unusable_pages`).
+    defects: dict[int, PageTextDefect] = field(default_factory=dict)
+    # Pages a digital-mode extraction took from OCR instead.
+    ocr_fallback_pages: list[int] = field(default_factory=list)
+    # Words added for the values of filled PDF form fields (see
+    # :mod:`dgml_core.form_fields`); included in ``total_words``.
+    form_field_words: int = 0
+    # The same count per page (1-based), so OCR fallback can drop the pages it
+    # replaces. Not in the summary.
+    form_field_words_by_page: dict[int, int] = field(default_factory=dict)
+    # Why OCR fallback could not recover ``defects`` (no provider configured, a
+    # provider failure), when it was attempted.
+    ocr_fallback_error: str | None = None
 
     def to_summary(self) -> dict[str, Any]:
-        return {
+        summary: dict[str, Any] = {
             "mode": TextMode.DIGITAL.value,
             "pages_written": self.pages_written,
             "pages_with_words": self.pages_with_words,
             "total_words": self.total_words,
         }
+        # Present only when something happened, so a healthy extraction's
+        # summary is exactly what it always was.
+        if self.form_field_words:
+            summary["form_field_words"] = self.form_field_words
+        if self.ocr_fallback_pages:
+            summary["ocr_fallback_pages"] = sorted(self.ocr_fallback_pages)
+        if self.defects:
+            summary["unusable_pages"] = {
+                str(page): reason.value for page, reason in sorted(self.defects.items())
+            }
+        return summary
+
+
+def page_text_defect(words: list[dict[str, Any]], *, raster: bool) -> PageTextDefect | None:
+    """Classify one page's digital words; ``None`` when the layer is usable.
+
+    ``raster`` says whether the page is a full-page image (see
+    :data:`RASTER_PAGE_COVERAGE`). A non-raster page with no words is left
+    alone: it is blank (or its text is drawn as outlines), not a scan, and the
+    existing "no extractable digital text" outcome already reports it."""
+    if not raster:
+        return None
+    if not words:
+        return PageTextDefect.IMAGE_ONLY
+    if len(words) < MIN_SCAN_TEXT_WORDS:
+        return PageTextDefect.STRAY_TEXT
+    return None
+
+
+def largest_image_coverage(container: Any, page_area: float) -> float:
+    """Largest fraction of ``page_area`` one placed image covers, searching
+    ``container`` (a pdfminer layout node) and the figures nested in it."""
+    from pdfminer.layout import LTFigure, LTImage
+
+    best = 0.0
+    for item in container:
+        if isinstance(item, LTImage):
+            x0, y0, x1, y1 = item.bbox
+            best = max(best, max(0.0, x1 - x0) * max(0.0, y1 - y0) / page_area)
+        elif isinstance(item, LTFigure):
+            best = max(best, largest_image_coverage(item, page_area))
+    return best
+
+
+def format_pages(pages: Iterable[int]) -> str:
+    """``[1, 2, 3, 5]`` -> ``"pages 1-3, 5"``; ``[4]`` -> ``"page 4"``."""
+    nums = sorted(set(pages))
+    parts: list[str] = []
+    i = 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        parts.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    noun = "page" if len(nums) == 1 else "pages"
+    return f"{noun} {', '.join(parts)}"
 
 
 @dataclass
@@ -125,6 +235,13 @@ class ExtractionOutcome:
     permanent: bool = False
 
 
+# Names the recorded error :func:`classify_extraction_outcome` writes for
+# scanned pages OCR could not recover. ``dgml check --retry-errors`` looks for
+# it: digital mode writes every page_text file before judging them, so that
+# error leaves no missing file behind to trigger re-extraction.
+SCANNED_PAGES_ERROR = "are scanned images with no usable text layer"
+
+
 def classify_extraction_outcome(
     result: ExtractDigitalResult, expected_page_count: int | None
 ) -> ExtractionOutcome:
@@ -132,7 +249,27 @@ def classify_extraction_outcome(
 
     Used by both :func:`FileStore._extract_text` at add time and the
     consistency check at re-extract time so the two paths stay aligned.
+
+    Unrecovered scanned pages (``result.defects``) come first and are
+    permanent: re-running pdfminer reads the same page, so only OCR changes
+    the outcome.
     """
+    if result.defects:
+        why = (
+            f"OCR fallback failed: {result.ocr_fallback_error}"
+            if result.ocr_fallback_error
+            else "no OCR fallback was attempted"
+        )
+        return ExtractionOutcome(
+            message=(
+                f"{len(result.defects)}/{result.pages_written} pages {SCANNED_PAGES_ERROR} "
+                f"({format_pages(result.defects)}); {why}. "
+                "Configure an OCR provider and run `dgml check --retry-errors`, or "
+                "re-add the file with --text-mode ocr or --text-mode hybrid"
+            ),
+            permanent=True,
+        )
+
     if result.pages_written == 0 or result.pages_with_words == 0:
         msg = (
             f"no digital text found on any of {result.pages_written} pages"
@@ -165,21 +302,34 @@ def extract_text_digital(
     *,
     file_id: str,
     dpi: int = DEFAULT_DPI,
+    image_spec: PageImageSpec = DEFAULT_PAGE_IMAGE_SPEC,
 ) -> ExtractDigitalResult:
     """Extract digital text from each PDF page and write per-page JSON.
 
     One ``page_N.json`` is written per page, where ``N`` is 1-based to align
-    with ``page_images/page_N.png``. Stale ``page_*.json`` files in
+    with ``page_images/page_N.{png,jpg}``. Stale ``page_*.json`` files in
     ``output_dir`` are removed first so retries don't leave orphans.
 
-    ``dpi`` must be the resolution the matching ``page_images/`` were rendered
-    at, because word boxes are written in that render's *pixel* space. Passing a
-    different value silently misaligns every box against its page image — and
-    against the OCR boxes the hybrid merge compares them to.
+    ``dpi`` and ``image_spec`` must be what the matching ``page_images/`` were
+    rendered with, because word boxes are written in that render's *pixel*
+    space: ``round(pts * dpi / 72)``, refit by :meth:`PageImageSpec.fit` when
+    the page falls outside its edge bounds. Passing a different value silently
+    misaligns every box against its page image — and against the OCR boxes
+    the hybrid merge compares them to.
 
     Raises :class:`TextExtractionFailed` if pdfminer.six cannot parse the PDF.
     A successful run with zero words on every page returns a result with
     ``pages_with_words == 0`` — the caller decides how to treat that.
+
+    Scanned pages with little or no text (see :func:`page_text_defect`) are
+    listed in ``defects``; their words are still written as extracted.
+    :func:`dgml_core.ocr.recover_unusable_pages` is what acts on that.
+
+    The values of filled PDF form fields (text fields, combo boxes) are not
+    page content; their words are inserted into the page in reading order,
+    after the scan check (see :mod:`dgml_core.form_fields`). A form that
+    cannot be read costs only its values: a warning is logged and the page
+    keeps its content words.
     """
     # Lazy import so a missing pdfminer install fails with a clear, actionable
     # error path rather than a module-load-time ImportError.
@@ -198,8 +348,14 @@ def extract_text_digital(
     pages_written = 0
     pages_with_words = 0
     total_words = 0
+    defects: dict[int, PageTextDefect] = {}
+    form_words_added = 0
+    form_words_by_page: dict[int, int] = {}
 
     try:
+        from .form_fields import form_field_words, merge_form_field_words
+
+        form_fields = form_field_words(pdf_path)
         # ``all_texts=True`` makes pdfminer run line-grouping on text inside
         # Form XObjects (``LTFigure``) too. Without it, brochure-style PDFs that
         # lay body text inside figures yield only loose ``LTChar``s with no
@@ -212,12 +368,19 @@ def extract_text_digital(
             x0, y0, x1, y1 = page_layout.bbox
             page_w_pts = float(x1 - x0)
             page_h_pts = float(y1 - y0)
-            width_px = max(0, round(page_w_pts * dpi / 72))
-            height_px = max(0, round(page_h_pts * dpi / 72))
+            rendered_w = max(0, round(page_w_pts * dpi / 72))
+            rendered_h = max(0, round(page_h_pts * dpi / 72))
+            width_px, height_px = image_spec.fit(rendered_w, rendered_h)
+            # Per axis, so a box lands where the stored image's own rounding
+            # put that edge. Exactly ``dpi / 72`` when the page was not refit.
+            scale_x = dpi / 72 * (width_px / rendered_w if rendered_w else 1.0)
+            scale_y = dpi / 72 * (height_px / rendered_h if rendered_h else 1.0)
 
             words: list[dict[str, Any]] = []
             for text, (x0, y0, x1, y1), style in _iter_words(page_layout):
-                box = _pts_box_to_pixel_lt_rb(x0, y0, x1, y1, page_h_pts=page_h_pts, dpi=dpi)
+                box = _pts_box_to_pixel_lt_rb(
+                    x0, y0, x1, y1, page_h_pts=page_h_pts, scale_x=scale_x, scale_y=scale_y
+                )
                 if box is None:
                     continue
                 word: dict[str, Any] = {"t": text, "l": list(box)}
@@ -239,6 +402,41 @@ def extract_text_digital(
                 "height": height_px,
                 "words": words,
             }
+            # The image probe reads the layout pdfminer already built for this
+            # page, so classifying it costs no second pass over the PDF.
+            page_area = page_w_pts * page_h_pts
+            raster = (
+                page_area > 0
+                and largest_image_coverage(page_layout, page_area) >= RASTER_PAGE_COVERAGE
+            )
+            defect = page_text_defect(words, raster=raster)
+            if defect is not None:
+                defects[page_num] = defect
+            if page_num in form_fields:
+                # The merge works on a copy: a failure there leaves the page
+                # content words as they are and costs only the form values.
+                merged = list(words)
+                try:
+                    added = merge_form_field_words(
+                        merged,
+                        form_fields[page_num],
+                        page_h_pts=page_h_pts,
+                        scale_x=scale_x,
+                        scale_y=scale_y,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "form field values not added to page %d of %s: %s: %s",
+                        page_num,
+                        pdf_path.name,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    added = 0
+                if added:
+                    words[:] = merged
+                    form_words_by_page[page_num] = added
+                    form_words_added += added
             out_path = output_dir / PAGE_TEXT_FILENAME.format(page=page_num)
             # Compact one-line JSON — `page_text/` is per-page so files stay
             # small; pretty-printing would bloat workspaces with thousands of
@@ -262,6 +460,9 @@ def extract_text_digital(
         pages_written=pages_written,
         pages_with_words=pages_with_words,
         total_words=total_words,
+        defects=defects,
+        form_field_words=form_words_added,
+        form_field_words_by_page=form_words_by_page,
     )
 
 
@@ -340,18 +541,19 @@ def _pts_box_to_pixel_lt_rb(
     y1: float,
     *,
     page_h_pts: float,
-    dpi: int,
+    scale_x: float,
+    scale_y: float,
 ) -> tuple[int, int, int, int] | None:
     """Convert a PDF-points bbox (origin bottom-left) to image-pixel
-    ``(left, top, right, bottom)`` ints (origin top-left). Returns ``None``
-    if the resulting box is degenerate (zero width or height).
+    ``(left, top, right, bottom)`` ints (origin top-left), at ``scale_x`` /
+    ``scale_y`` pixels per point. Returns ``None`` if the resulting box is
+    degenerate (zero width or height).
     """
-    scale = dpi / 72.0
-    left = round(x0 * scale)
-    right = round(x1 * scale)
+    left = round(x0 * scale_x)
+    right = round(x1 * scale_x)
     # PDF y is bottom-up; image y is top-down. y1 (PDF top) -> image top.
-    top = round((page_h_pts - y1) * scale)
-    bottom = round((page_h_pts - y0) * scale)
+    top = round((page_h_pts - y1) * scale_y)
+    bottom = round((page_h_pts - y0) * scale_y)
     left = max(0, left)
     top = max(0, top)
     right = max(left, right)

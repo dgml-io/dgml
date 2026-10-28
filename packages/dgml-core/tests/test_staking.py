@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from dgml_chain import ChainConfig
-from dgml_core.errors import ChainTxReverted, RecordNotFound
+from dgml_core import staking
+from dgml_core.errors import ChainConfigError, ChainTxReverted, InvalidArgument, RecordNotFound
 from dgml_core.staking import (
     _default_bundle_dir,
     _fetch_record,
@@ -27,8 +29,14 @@ from dgml_core.staking import (
     _finish_stake,
     _wait_for_receipt,
     _wei_to_eth,
+    chain_add,
+    chain_list,
+    resolve_chain_config_path,
+    stake_node,
 )
 from dgml_core.storage import Workspace
+
+from .conftest import scratch_configuration
 
 
 @pytest.mark.parametrize(
@@ -164,3 +172,69 @@ def test_default_bundle_dir_does_not_collide(tmp_path: Path) -> None:
     assert a != b
     # Without a docset the path stays a single segment under the bundles dir.
     assert _default_bundle_dir(ws, "report-v2", None) == ws.root / "dgmlx-bundles" / "report-v2"
+
+
+def test_scratch_workspace_writes_nothing_lasting_under_its_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scratch root is removed with the workspace: the bundle (reported output)
+    needs an explicit dir, and custom chains have nowhere to live but a named path."""
+    ws = Workspace.open(configuration=scratch_configuration(monkeypatch))
+    with pytest.raises(InvalidArgument, match="pass output_dir"):
+        _default_bundle_dir(ws, "report", None)
+    monkeypatch.delenv("DGML_CHAINS", raising=False)
+    assert resolve_chain_config_path(ws, None) is None
+    # Built-ins still resolve; adding a custom chain is refused, not written somewhere.
+    assert chain_list(ws, None)["chains"]
+    with pytest.raises(ChainConfigError, match="pass config_path"):
+        chain_add(
+            ws,
+            name="mine",
+            rpc_url="http://x",
+            chain_id=1,
+            anchor_address="0x" + "1" * 40,
+            explorer=None,
+            native_token=None,
+            config_path=None,
+        )
+    # An explicit location still wins; the environment is not read on this path.
+    assert resolve_chain_config_path(ws, tmp_path / "c.json") == tmp_path / "c.json"
+    monkeypatch.setenv("DGML_CHAINS", str(tmp_path / "env.json"))
+    assert resolve_chain_config_path(ws, None) is None
+    assert resolve_chain_config_path(Workspace(root=tmp_path), None) == tmp_path / "env.json"
+
+
+def test_stake_node_dry_run_needs_no_bundle_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dry run stops after signing and writes nothing, so a scratch root — which
+    has no bundle dir to offer — is no obstacle. A broadcast still needs one up front."""
+    ws = Workspace.open(configuration=scratch_configuration(monkeypatch))
+    chain = ChainConfig(name="t", rpc_url="http://x", chain_id=1)
+    att = SimpleNamespace(
+        leaf_index=1, leaf_count=2, xpath="/a", root_hash="r", node_hash="n", proof=[]
+    )
+    signed = {"from": "0x1", "signed_tx": "0x02", "tx_hash": "0xtx"}
+    monkeypatch.setattr(staking, "get_chain", lambda *_: chain)
+    monkeypatch.setattr(staking, "_resolve_from", lambda *_: "0x1")
+    monkeypatch.setattr(staking, "_clients", lambda _: (object(), object()))
+    monkeypatch.setattr(staking, "export_node", lambda *a, **k: att)
+    monkeypatch.setattr(staking, "_resolve_registry_id", lambda *_: 7)
+    monkeypatch.setattr(staking, "_prepare_and_sign", lambda *a, **k: ({"nonce": 0}, signed))
+    monkeypatch.setattr(staking, "proof_to_json", lambda _: {})
+    monkeypatch.setattr(staking, "node_metadata", lambda *_: "{}")
+    common: dict[str, Any] = dict(
+        file_id="f",
+        docset_id="d",
+        leaf_index=1,
+        xpath=None,
+        chain_name="t",
+        registry="reg",
+        from_address=None,
+        output_dir=None,
+        config_path=None,
+        legacy=False,
+    )
+    out = stake_node(ws, dry_run=True, **common)
+    assert out["broadcast"] is False and out["signed_tx"] == "0x02"
+    assert list(ws.root.iterdir()) == []
+    with pytest.raises(InvalidArgument, match="pass output_dir"):
+        stake_node(ws, dry_run=False, **common)

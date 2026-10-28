@@ -86,6 +86,16 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
     },
 }
 
+# Provider → the litellm model-id prefixes it serves. `[models] <provider>_api_key`
+# is written onto the keyless models whose id carries a prefix listed here (see
+# `apply_provider_keys`). `anthropic_google` is a family that mixes two
+# of these, not a provider, so it has no key of its own.
+PROVIDERS: dict[str, tuple[str, ...]] = {
+    "anthropic": ("anthropic",),
+    "google": ("gemini",),
+    "openai": ("openai",),
+}
+
 # Per family, the API-key env var(s) its tiers need at runtime (the standard
 # names litellm reads). Same keys as PROVIDER_MODELS — a test pins that.
 PROVIDER_API_KEYS: dict[str, tuple[str, ...]] = {

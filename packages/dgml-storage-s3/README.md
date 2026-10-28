@@ -44,6 +44,12 @@ it is not written into `prefix`. So with no `prefix` a workspace's objects are u
 
 ## Credentials
 
+**By value, for an in-memory configuration.** A workspace configured in code
+(`dgml_core.configuration`, nothing written to disk) may pass `aws_access_key_id`,
+`aws_secret_access_key` and `aws_session_token` as options; they go straight to the
+boto3 client and take precedence over its chain. The storage seal ignores them by
+name. Do not put them in a `config.toml`.
+
 **Never put credentials in DGML config.** S3 uses boto3's default chain
 (`AWS_ACCESS_KEY_ID`, `~/.aws/credentials`, IAM role).
 

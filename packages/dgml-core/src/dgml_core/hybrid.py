@@ -107,11 +107,13 @@ from .rotation import rotate_word_boxes
 from .storage import Workspace
 from .text_extraction import (
     PAGE_TEXT_GLOB,
+    RASTER_PAGE_COVERAGE,
     ExtractDigitalResult,
     extract_text_digital,
+    largest_image_coverage,
 )
 from .text_extraction_config import TextExtractionConfig, resolve_api_key
-from .usage import OPERATION_HYBRID_MERGE
+from .usage import UsageOperation
 
 logger = logging.getLogger(__name__)
 
@@ -131,12 +133,8 @@ LEVENSHTEIN_THRESHOLD = 2
 # glyph IDs to Unicode — we treat the page's digital output as unusable
 # and fall back to OCR for that page.
 MAX_CID_WORDS_PER_PAGE = 10
-# A page whose largest placed image covers at least this fraction of the page
-# area is a scan: a picture of a document rather than a document. Scanned
-# pages run 0.8-0.99 here (the margin the scanner trimmed is the difference);
-# a born-digital page's own artwork - a logo, an icon, a masthead - is orders
-# of magnitude below it, in the low percents.
-RASTER_PAGE_COVERAGE = 0.8
+# RASTER_PAGE_COVERAGE (the scan guard's threshold) is shared with the digital
+# path, which OCRs scanned pages with no text layer; it lives in text_extraction.
 # Regions needing an LLM decision go out in batches of this many per request.
 # One call for the whole page can overrun the model's output-token limit (or a
 # local model's num_ctx) on dense pages — the reply is truncated mid-JSON and
@@ -176,7 +174,7 @@ def extract_text_hybrid(
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
     dpi: int = DEFAULT_DPI,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> ExtractDigitalResult:
     """Run digital extraction then OCR and merge the per-page results.
 
@@ -235,7 +233,7 @@ def extract_text_hybrid(
             raster_pages=raster_pages,
             text_extraction_config=text_extraction_config,
             workspace=workspace,
-            debug=debug,
+            record_usage=record_usage,
         )
 
 
@@ -248,7 +246,7 @@ def _merge_into(
     raster_pages: set[int] | None = None,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> ExtractDigitalResult:
     """Merge per-page JSONs from ``digital_dir`` and ``ocr_dir`` into ``output_dir``."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -266,8 +264,8 @@ def _merge_into(
         d_payload = _read_page(digital_pages.get(page_num))
         o_payload = _read_page(ocr_pages.get(page_num))
 
-        # Prefer OCR's reported dimensions — the PNG IHDR is the source of
-        # truth they were measured against. Digital fills in only when OCR
+        # Prefer OCR's reported dimensions — the page image's header is the
+        # source of truth they were measured against. Digital fills in only when OCR
         # didn't process this page.
         rotation: float | None = None
         if o_payload is not None:
@@ -302,7 +300,7 @@ def _merge_into(
             raster_page=page_num in (raster_pages or set()),
             text_extraction_config=text_extraction_config,
             workspace=workspace,
-            debug=debug,
+            record_usage=record_usage,
         )
 
         _write_page_json(output_dir, page_num, file_id, width, height, merged, rotation=rotation)
@@ -327,7 +325,7 @@ def _merge_words(
     raster_page: bool = False,
     text_extraction_config: TextExtractionConfig | None = None,
     workspace: Workspace | None = None,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply the merge rules described in the module docstring.
 
@@ -377,7 +375,7 @@ def _merge_words(
                 page_num=page_num,
                 config=text_extraction_config,
                 workspace=workspace,
-                debug=debug,
+                record_usage=record_usage,
             )
         except Exception as exc:
             # Safety net: per-batch failures are handled (and logged) inside
@@ -584,7 +582,7 @@ def _llm_emit_plan(
     page_num: int,
     config: TextExtractionConfig,
     workspace: Workspace | None,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> dict[int, list[dict[str, Any]]]:
     """Resolve regions with the configured LLM, batched across requests.
 
@@ -652,7 +650,7 @@ def _llm_emit_plan(
                 workspace=workspace,
                 file_id=file_id,
                 page_num=page_num,
-                debug=debug,
+                record_usage=record_usage,
             )
             # Resolve into a fragment first: a malformed entry raises before
             # any of the batch's decisions touch emit_plan, so the heuristic
@@ -760,12 +758,12 @@ def _call_merge_llm(
     workspace: Workspace | None,
     file_id: str,
     page_num: int,
-    debug: bool = False,
+    record_usage: bool = False,
 ) -> dict[str, Any]:
     """Send one page's regions to the LLM and return the parsed JSON object.
 
-    The call records its own usage row (gated on ``--debug``) from the context
-    carried on the config.
+    The call records its own usage row (gated on ``record_usage``) from the
+    context carried on the config.
     """
     llm_config = LLMConfig(
         model=config.model,
@@ -774,8 +772,8 @@ def _call_merge_llm(
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         workspace=workspace,
-        debug=debug,
-        operation=OPERATION_HYBRID_MERGE,
+        record_usage=record_usage,
+        operation=UsageOperation.HYBRID_MERGE,
         context={"file_id": file_id, "page": page_num},
     )
     user_content = build_user_content(instruction_text=json.dumps(payload, ensure_ascii=False))
@@ -985,19 +983,8 @@ def _raster_page_numbers(pdf_path: Path) -> set[int]:
     """
     try:
         from pdfminer.high_level import extract_pages
-        from pdfminer.layout import LTFigure, LTImage
     except ImportError:
         return set()
-
-    def largest_image_coverage(container: Any, page_area: float) -> float:
-        best = 0.0
-        for item in container:
-            if isinstance(item, LTImage):
-                x0, y0, x1, y1 = item.bbox
-                best = max(best, max(0.0, x1 - x0) * max(0.0, y1 - y0) / page_area)
-            elif isinstance(item, LTFigure):
-                best = max(best, largest_image_coverage(item, page_area))
-        return best
 
     raster: set[int] = set()
     try:

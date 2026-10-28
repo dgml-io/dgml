@@ -22,15 +22,18 @@ from typing import Any
 
 from . import layout
 from .conversion import (
+    CONVERTIBLE_SUFFIXES_TEXT,
     convert_to_pdf_bytes,
     converter_name_for_path,
     family_for_suffix,
     load_conversion_config,
+    require_converter,
 )
 from .errors import (
     CONVERT_TO_PDF_OPERATION,
     AuthError,
     ConflictError,
+    ConflictErrorKind,
     DgmlError,
     EngineNotAvailable,
     FileNotFound,
@@ -48,7 +51,7 @@ from .errors import (
 from .hashing import sha256_file
 from .ids import RECORD_ID_SHAPE, is_record_id, new_id
 from .models import FileRecord
-from .ocr import extract_text_ocr, load_ocr_config
+from .ocr import extract_text_ocr, load_ocr_config, recover_unusable_pages
 from .pages import (
     DEFAULT_DPI,
     PdfConfig,
@@ -73,17 +76,45 @@ class ConflictPolicy(StrEnum):
     DUPLICATE = "duplicate"  # Always create a new record.
 
 
+class ConflictKind(StrEnum):
+    """Which existing record :meth:`FileStore.add` matched (``AddFileResult.conflict_kind``).
+
+    ``HASH`` is a record with identical content; ``PATH`` is a different file
+    added from the same source path. A hash match wins when both apply. No
+    conflict at all is ``None``, not a member.
+    """
+
+    HASH = "hash"
+    PATH = "path"
+
+
 @dataclass
 class AddFileResult:
     record: FileRecord
     created: bool  # False if an existing record was returned.
-    conflict_kind: str | None = None  # "hash" | "path" | None.
+    conflict_kind: ConflictKind | None = None
     page_render_error: str | None = None
     page_count_error: str | None = None
     text_extraction_error: str | None = None
     conversion_error: str | None = None
     text_extraction: dict[str, Any] | None = field(default=None)
     note: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        """The ``dgml file add`` payload for this result (part of the CLI's JSON
+        contract): the record plus how the add went. ``conflict_kind`` is a plain
+        ``str`` (or ``None``) whatever the caller constructed the result with."""
+        return {
+            "file": self.record.to_json(),
+            "created": self.created,
+            "conflict_kind": None if self.conflict_kind is None else str(self.conflict_kind),
+            "page_render_error": self.page_render_error,
+            "page_count_error": self.page_count_error,
+            "text_extraction_error": self.text_extraction_error,
+            "conversion_error": self.conversion_error,
+            "text_extraction": self.text_extraction,
+            "note": self.note,
+        }
 
 
 def _validate_pdf(path: Path) -> None:
@@ -94,9 +125,32 @@ def _validate_pdf(path: Path) -> None:
     converter path; this only guards against a mislabeled/corrupt PDF.
     """
     with path.open("rb") as fh:
-        magic = fh.read(len(PDF_MAGIC))
-    if magic != PDF_MAGIC:
+        head = fh.read(len(PDF_MAGIC))
+    _check_pdf_magic(head, path)
+
+
+def _check_pdf_magic(head: bytes, path: Path) -> None:
+    """Raise :class:`InvalidPDF` unless ``head`` (the file's first bytes, or the
+    whole file) starts with the PDF magic header."""
+    if not head.startswith(PDF_MAGIC):
         raise InvalidPDF(f"{path} does not start with the PDF magic header")
+
+
+def _read_supplied_pdf(path: Path) -> bytes:
+    """The bytes of a caller-supplied PDF, checked as read.
+
+    :func:`_validate_pdf` already looked at the file's header at the add gate, but
+    the bytes stored are these, read later; checking them too closes the gap in
+    which the file could have been rewritten in between (a converter writing in
+    place, say), so what is stored is always what was checked. A file gone since
+    the gate is :class:`FileNotFound`, as it would have been there.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise FileNotFound(f"converted PDF could not be read: {path} ({exc})") from exc
+    _check_pdf_magic(data, path)
+    return data
 
 
 class FileStore:
@@ -150,8 +204,22 @@ class FileStore:
         on_conflict: ConflictPolicy = ConflictPolicy.ERROR,
         text_mode: TextMode = TextMode.DIGITAL,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
+        converted_pdf: Path | None = None,
     ) -> AddFileResult:
+        """Add ``source_path`` to the workspace.
+
+        ``converted_pdf`` is a PDF the caller already made from a convertible
+        source (docx/xlsx/…). It is stored as that file's PDF in place of running a
+        converter, so the source's family needs no converter configured, and the
+        record's ``pdf_converter`` is ``None`` — nothing was converted, which for a
+        convertible source is how a supplied PDF is told apart (DGML names every
+        converter it runs; see ``docs/storage-layout.md``). DGML cannot check that the
+        PDF matches the source; the caller vouches for it. It is rejected for a
+        ``.pdf`` source, and unused when ``on_conflict`` returns an existing record —
+        the result's ``created`` is ``False`` then, as for any add that stores nothing
+        (its ``note`` says so too).
+        """
         # Validated here, alongside the OCR-config check below, so a rejected
         # add leaves the workspace untouched rather than half-built.
         if dpi <= 0:
@@ -175,7 +243,13 @@ class FileStore:
         source_path = Path(source_path).expanduser().resolve()
         if not source_path.is_file():
             raise FileNotFound(f"source file does not exist: {source_path}")
-        self._validate_source(source_path)
+        if converted_pdf is not None:
+            converted_pdf = Path(converted_pdf).expanduser().resolve()
+        self._validate_source(source_path, converted_pdf=converted_pdf)
+        # The supplied PDF's bytes, read once a record is going to be created (so
+        # a `skip` or a conflict error never reads it) and checked as read — the
+        # bytes stored are the bytes checked (see _read_supplied_pdf).
+        supplied_pdf: bytes | None = None
 
         digest = sha256_file(source_path)
         original_path = self._relative_original_path(source_path)
@@ -206,7 +280,7 @@ class FileStore:
                         f"content (added from '{held.original_path}'). Pick an unused id, "
                         f"or delete '{file_id}' first. No --on-conflict policy overrides "
                         f"this: reusing the id would destroy that record.",
-                        kind="id",
+                        kind=ConflictErrorKind.ID,
                         existing_id=file_id,
                     )
                 if held.sha256 == digest:
@@ -215,7 +289,7 @@ class FileStore:
                             f"duplicate creates a second record, but file id '{file_id}' "
                             f"is already taken (by this same content). Omit the id to "
                             f"generate one, or pick an unused id.",
-                            kind="id",
+                            kind=ConflictErrorKind.ID,
                             existing_id=file_id,
                         )
                     # An idempotent re-add of *this* record. Pin the hash conflict
@@ -229,7 +303,7 @@ class FileStore:
             if on_conflict is ConflictPolicy.ERROR:
                 raise ConflictError(
                     f"a file with identical content already exists as '{same_hash.id}'",
-                    kind="hash",
+                    kind=ConflictErrorKind.HASH,
                     existing_id=same_hash.id,
                 )
             if on_conflict is ConflictPolicy.SKIP:
@@ -237,16 +311,18 @@ class FileStore:
                     same_hash,
                     file_id,
                     on_conflict,
-                    conflict_kind="hash",
+                    conflict_kind=ConflictKind.HASH,
                     note="existing record returned (identical content)",
+                    unused_pdf=converted_pdf is not None,
                 )
             if on_conflict is ConflictPolicy.REPLACE:
                 return self._existing_result(
                     same_hash,
                     file_id,
                     on_conflict,
-                    conflict_kind="hash",
+                    conflict_kind=ConflictKind.HASH,
                     note="replace is a no-op when content is identical; existing record returned",
+                    unused_pdf=converted_pdf is not None,
                 )
             # DUPLICATE — fall through and create a new record.
         elif same_path is not None:
@@ -254,7 +330,7 @@ class FileStore:
                 raise ConflictError(
                     f"a different file with the same source path already exists as "
                     f"'{same_path.id}'",
-                    kind="path",
+                    kind=ConflictErrorKind.PATH,
                     existing_id=same_path.id,
                 )
             if on_conflict is ConflictPolicy.SKIP:
@@ -262,22 +338,32 @@ class FileStore:
                     same_path,
                     file_id,
                     on_conflict,
-                    conflict_kind="path",
+                    conflict_kind=ConflictKind.PATH,
                     note="existing record returned (same source path, different content)",
+                    unused_pdf=converted_pdf is not None,
                 )
             if on_conflict is ConflictPolicy.REPLACE:
+                # Read before the delete: the caller's PDF may be stored under the
+                # record being replaced.
+                if converted_pdf is not None:
+                    supplied_pdf = _read_supplied_pdf(converted_pdf)
                 self.delete(same_path.id)
             # DUPLICATE — fall through.
 
+        if converted_pdf is not None and supplied_pdf is None:
+            supplied_pdf = _read_supplied_pdf(converted_pdf)
         return self._create_record(
             source_path,
             digest,
             file_id=file_id,
             original_path=original_path,
-            conflict_kind=("hash" if same_hash else "path" if same_path else None),
+            conflict_kind=(
+                ConflictKind.HASH if same_hash else ConflictKind.PATH if same_path else None
+            ),
             text_mode=text_mode,
             dpi=dpi,
-            debug=debug,
+            record_usage=record_usage,
+            supplied_pdf=supplied_pdf,
         )
 
     def _existing_result(
@@ -286,11 +372,13 @@ class FileStore:
         requested_id: str | None,
         on_conflict: ConflictPolicy,
         *,
-        conflict_kind: str,
+        conflict_kind: ConflictKind,
         note: str,
+        unused_pdf: bool = False,
     ) -> AddFileResult:
         """Hand back a record dedup already matched — unless the caller named a
-        different id.
+        different id. ``unused_pdf`` says the caller passed ``converted_pdf``; the
+        existing record keeps its own PDF, and the note says so.
 
         Every "return the existing one" path routes through here deliberately. The
         caller said the result must be called X; returning a record called Y is not
@@ -305,9 +393,13 @@ class FileStore:
             raise InvalidArgument(
                 f"file id {requested_id!r} cannot be honoured: this content is already "
                 f"in the workspace as '{record.id}' ({conflict_kind} match), and "
-                f"--on-conflict {on_conflict.value} returns that record instead of "
+                f"--on-conflict {on_conflict} returns that record instead of "
                 f"creating one. Use --on-conflict duplicate to add a second record as "
                 f"{requested_id!r}, delete '{record.id}', or omit the id."
+            )
+        if unused_pdf:
+            note += (
+                "; converted_pdf was not used — delete the file and add it again to change its PDF"
             )
         return AddFileResult(record=record, created=False, conflict_kind=conflict_kind, note=note)
 
@@ -321,36 +413,57 @@ class FileStore:
         different drive on Windows), which ``os.path.relpath`` signals with
         ``ValueError``.
         """
+        if self.ws.configuration is not None:
+            # The root is not where the workspace lives (a scratch dir, or a `root=`
+            # the next open may change), so nothing is portable relative to it; the
+            # absolute path is the truthful record, and `original_filename` has the name.
+            return str(source_path)
         try:
             return os.path.relpath(source_path, self.ws.root)
         except ValueError:
             return str(source_path)
 
-    def _validate_source(self, source_path: Path) -> None:
+    def _validate_source(self, source_path: Path, *, converted_pdf: Path | None = None) -> None:
         """Reject a source the workspace can't ingest, before any filesystem work.
 
         A ``.pdf`` must have the PDF magic header. A convertible source
         (docx/xlsx/…) is accepted only if its format family has a converter
         configured in the workspace ``conversion`` config; otherwise it is an
-        :class:`UnsupportedFileType`. There is no default converter.
+        :class:`UnsupportedFileType`. There is no default converter. A configured
+        converter that cannot be resolved or does not handle the suffix is a
+        :class:`ConversionConfigInvalid` — a config error, refused before any write
+        rather than recorded per file.
+
+        A ``converted_pdf`` the caller supplies stands in for that converter, so it
+        is checked instead — after the source's type, so an unsupported source is
+        reported as such. It is refused for a ``.pdf`` source, which needs no
+        converting.
         """
         suffix = source_path.suffix.lower()
         if suffix == ".pdf":
+            if converted_pdf is not None:
+                raise InvalidArgument(
+                    f"converted_pdf is for a source that needs converting; {source_path.name} "
+                    "is already a PDF"
+                )
             _validate_pdf(source_path)
             return
         family = family_for_suffix(suffix)
         if family is None:
             raise UnsupportedFileType(
                 f"unsupported file type '{suffix or '<no extension>'}' "
-                "(supported: .pdf, plus .docx/.doc/.xlsx/.xls with a converter configured)"
+                f"(supported: .pdf, plus {CONVERTIBLE_SUFFIXES_TEXT} with a converter "
+                "configured)"
             )
-        # Resolving the config validates it and proves a converter is wired up
-        # for this family — but does not yet construct it (no binary/SDK touch).
-        if family not in load_conversion_config(self.ws):
-            raise UnsupportedFileType(
-                f"no converter configured for '{suffix}'; set conversion.{family}.provider "
-                "in config.toml (see the translators-pdf package for ready-made converters)"
-            )
+        if converted_pdf is not None:
+            if not converted_pdf.is_file():
+                raise FileNotFound(f"converted PDF does not exist: {converted_pdf}")
+            _validate_pdf(converted_pdf)
+            return
+        # Proves a converter is wired up for this family and handles the suffix.
+        # That resolves the converter class (an import) but does not construct it
+        # (no binary/SDK touch); _ensure_pdf imports the same module anyway.
+        require_converter(suffix, load_conversion_config(self.ws))
 
     def _create_record(
         self,
@@ -358,11 +471,12 @@ class FileStore:
         digest: str,
         *,
         original_path: str,
-        conflict_kind: str | None,
+        conflict_kind: ConflictKind | None,
         text_mode: TextMode,
         file_id: str | None = None,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
+        supplied_pdf: bytes | None = None,
     ) -> AddFileResult:
         file_id = file_id or new_id()
         # The store owns container creation (upload_blob writes the source blob),
@@ -377,7 +491,9 @@ class FileStore:
         source_key = layout.file_source_key(file_id, source_path.name)
         self.ws.blobs.upload_blob(source_key, source_path)
 
-        pdf_key, conversion_error, pdf_converter = self._ensure_pdf(source_key, file_id)
+        pdf_key, conversion_error, pdf_converter = self._ensure_pdf(
+            source_key, file_id, supplied_pdf=supplied_pdf
+        )
         if pdf_key is None:
             record = FileRecord(
                 id=file_id,
@@ -412,7 +528,7 @@ class FileStore:
                 text_mode=text_mode,
                 page_count=page_count,
                 dpi=dpi,
-                debug=debug,
+                record_usage=record_usage,
             )
 
         record = FileRecord(
@@ -439,7 +555,7 @@ class FileStore:
         )
 
     def _ensure_pdf(
-        self, source_key: str, file_id: str
+        self, source_key: str, file_id: str, *, supplied_pdf: bytes | None = None
     ) -> tuple[str | None, str | None, str | None]:
         """Return ``(pdf_key, error, converter_name)`` for the stored source.
 
@@ -461,10 +577,19 @@ class FileStore:
         On conversion failure a permanent error is recorded and
         ``(None, message, converter_name)`` is returned so the file record is
         still created (consistent with the page-render / text soft-fail pattern).
+
+        A PDF the caller supplied (``supplied_pdf``, the bytes of ``add``'s
+        ``converted_pdf``) is persisted at that same key in place of running a
+        converter, with no converter name: ``None`` here means DGML converted
+        nothing, and a convertible source with none named is how a supplied PDF
+        is recognised, so no conversion DGML performs may ever leave it ``None``.
         """
         pdf_key = layout.file_pdf_key(file_id, PurePosixPath(source_key).name)
         if pdf_key == source_key:
             return source_key, None, None
+        if supplied_pdf is not None:
+            self.ws.blobs.put_blob(pdf_key, supplied_pdf)
+            return pdf_key, None, None
 
         converters = load_conversion_config(self.ws)
         with self.ws.blobs.materialize(source_key) as src:
@@ -564,7 +689,7 @@ class FileStore:
         text_mode: TextMode,
         page_count: int | None,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """Run text extraction for ``text_mode`` and record any failure.
 
@@ -583,7 +708,7 @@ class FileStore:
             return self._extract_text_ocr(pdf_path, file_id, page_count=page_count)
         if text_mode is TextMode.HYBRID:
             return self._extract_text_hybrid(
-                pdf_path, file_id, page_count=page_count, dpi=dpi, debug=debug
+                pdf_path, file_id, page_count=page_count, dpi=dpi, record_usage=record_usage
             )
         return None, None
 
@@ -599,6 +724,16 @@ class FileStore:
         try:
             with self.ws.blobs.staged_write(text_prefix) as text_dir:
                 result = extract_text_digital(pdf_path, text_dir, file_id=file_id, dpi=dpi)
+                # Scanned pages with little or no text are OCR'd when a
+                # provider is available.
+                result = recover_unusable_pages(
+                    self.ws,
+                    pdf_path,
+                    text_dir,
+                    result,
+                    file_id=file_id,
+                    pages_prefix=layout.file_pages_prefix(file_id),
+                )
         except TextExtractionFailed as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None
         return self._classify_and_record(result, file_id, page_count, mode_label="digital")
@@ -650,7 +785,7 @@ class FileStore:
         *,
         page_count: int | None,
         dpi: int = DEFAULT_DPI,
-        debug: bool = False,
+        record_usage: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         # Imported HERE, not at module scope: ``.hybrid`` reaches ``.llm`` →
         # ``litellm``, ~1.4s of the package's ~1.66s import cost, and this is the
@@ -680,7 +815,7 @@ class FileStore:
                     text_extraction_config=text_extraction_config,
                     workspace=self.ws,
                     dpi=dpi,
-                    debug=debug,
+                    record_usage=record_usage,
                 )
         except (OcrFailed, AuthError, MissingExtra) as exc:
             return self._record_text_failure(file_id, str(exc), permanent=True), None

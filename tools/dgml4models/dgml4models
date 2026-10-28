@@ -4,7 +4,7 @@
 Removes dg:origin, dg:structure, and dg:style attributes before sending
 DGML to a language model. Strips 20-40% of token volume on typical documents
 while preserving all semantic content: element tags, dg:value, xsi:type,
-dg:itemprop, dg:href, xml:id, and text.
+dg:itemprop, dg:href, dg:inputs, dg:method, xml:id, and text.
 
 Usage:
     dgml4models input.dgml.xml                  # writes to stdout

@@ -58,7 +58,7 @@ from dgml_core.layout import Collection
 from dgml_core.storage_service import DocStore, StorageConfig
 
 from ._client import (
-    IDENTITY_FIELDS,
+    DATA_FIELDS,
     MONGO_URI_ENV,
     connect,
     prefixed,
@@ -79,7 +79,7 @@ class MongoDocStore(DocStore):
     workspaces, and other applications, can share one database."""
 
     name = "mongo"
-    config_fields = IDENTITY_FIELDS | {"prefix"}
+    config_fields = DATA_FIELDS | {"prefix"}
 
     # ---- configuration ----
 

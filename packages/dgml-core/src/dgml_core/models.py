@@ -51,6 +51,20 @@ class DocSet:
 
 
 @dataclass
+class DocSetAssignment:
+    """A DocSet a file is assigned to, as returned by
+    :meth:`DocSetStore.docsets_for_file`."""
+
+    docset: DocSet
+    # When the file was (last) assigned. ``None`` for assignments created by the
+    # layout migration, which had no timestamp to carry over.
+    assigned_at: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {"docset": self.docset.to_json(), "assigned_at": self.assigned_at}
+
+
+@dataclass
 class FileRecord:
     id: str
     # Where the source was added from, stored relative to the workspace root

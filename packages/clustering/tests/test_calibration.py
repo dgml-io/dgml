@@ -38,7 +38,15 @@ from clustering.calibration import (
     fit_support_calibrator,
     support_loo_logits,
 )
-from clustering.config.schema import CalibrationConfig, ManifoldConfig, ScenarioConfig
+from clustering.config.schema import (
+    CalibrationConfig,
+    CalibrationMethod,
+    ManifoldConfig,
+    ManifoldName,
+    ScenarioConfig,
+    ScenarioName,
+    SupportSelection,
+)
 from clustering.manifolds import build_manifold
 from clustering.scenarios.clustering import assign_to_prototypes
 from pydantic import ValidationError
@@ -47,7 +55,7 @@ _DIM = 4
 
 
 def _euclidean(dim: int = _DIM) -> Any:
-    return build_manifold(ManifoldConfig(name="euclidean", dim=dim, curvature=0.0))
+    return build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=dim, curvature=0.0))
 
 
 def _labeled_support(per: int = 4, dim: int = _DIM) -> tuple[torch.Tensor, list[str | None]]:
@@ -87,7 +95,9 @@ def test_default_calibrator_is_the_identity() -> None:
 
 
 def test_apply_on_empty_batch_returns_empty() -> None:
-    cal, abstain = Calibrator(method="temperature", temperature=2.0).apply(torch.zeros((0, 3)))
+    cal, abstain = Calibrator(method=CalibrationMethod.TEMPERATURE, temperature=2.0).apply(
+        torch.zeros((0, 3))
+    )
     assert cal.shape == (0,)
     assert abstain.shape == (0,)
 
@@ -95,9 +105,9 @@ def test_apply_on_empty_batch_returns_empty() -> None:
 def test_apply_output_stays_in_unit_range() -> None:
     logits, _ = _mixed_logits()
     for c in (
-        Calibrator(method="temperature", temperature=0.1),
-        Calibrator(method="temperature", temperature=50.0),
-        Calibrator(method="platt", platt_a=12.0, platt_b=-9.0),
+        Calibrator(method=CalibrationMethod.TEMPERATURE, temperature=0.1),
+        Calibrator(method=CalibrationMethod.TEMPERATURE, temperature=50.0),
+        Calibrator(method=CalibrationMethod.PLATT, platt_a=12.0, platt_b=-9.0),
     ):
         cal, _ = c.apply(logits)
         assert float(cal.min()) >= 0.0
@@ -112,7 +122,13 @@ def test_absolute_floor_flags_only_documents_below_it() -> None:
 
 
 def test_as_dict_round_trips_the_operating_point() -> None:
-    c = Calibrator(method="platt", platt_a=2.0, platt_b=-1.0, coverage=0.9, conformal_threshold=0.3)
+    c = Calibrator(
+        method=CalibrationMethod.PLATT,
+        platt_a=2.0,
+        platt_b=-1.0,
+        coverage=0.9,
+        conformal_threshold=0.3,
+    )
     d = c.as_dict()
     assert d["method"] == "platt"
     assert d["coverage"] == 0.9
@@ -120,10 +136,22 @@ def test_as_dict_round_trips_the_operating_point() -> None:
     assert Calibrator(**d) == c  # provenance is enough to rebuild the calibrator
 
 
+def test_as_dict_survives_a_rebuilt_calibrator_holding_a_plain_string() -> None:
+    # ``Calibrator(**c.as_dict())`` rebuilds with ``method="platt"`` — a plain
+    # ``str``, since the dataclass does not coerce. ``as_dict`` must not assume
+    # a member (``.value`` would raise ``AttributeError`` here).
+    c = Calibrator(method=CalibrationMethod.PLATT, platt_a=2.0, platt_b=-1.0)
+    rebuilt = Calibrator(**c.as_dict())
+    d = rebuilt.as_dict()
+    assert d["method"] == "platt"
+    assert type(d["method"]) is str
+    assert d == c.as_dict()
+
+
 # ── fit_calibrator ─────────────────────────────────────────────────────────
 def test_temperature_fit_improves_log_likelihood() -> None:
     logits, labels = _mixed_logits()
-    fitted = fit_calibrator(logits, labels, method="temperature")
+    fitted = fit_calibrator(logits, labels, method=CalibrationMethod.TEMPERATURE)
 
     def nll(t: float) -> float:
         logp = torch.log_softmax(logits / t, dim=-1)
@@ -135,7 +163,7 @@ def test_temperature_fit_improves_log_likelihood() -> None:
 
 def test_platt_fit_is_monotone_in_the_raw_score() -> None:
     logits, labels = _mixed_logits()
-    fitted = fit_calibrator(logits, labels, method="platt")
+    fitted = fit_calibrator(logits, labels, method=CalibrationMethod.PLATT)
     assert fitted.method == "platt"
 
     # Platt is a 1-D logistic map on top1, so it must preserve the ranking:
@@ -149,7 +177,7 @@ def test_platt_fit_is_monotone_in_the_raw_score() -> None:
 def test_conformal_threshold_achieves_requested_coverage() -> None:
     logits, labels = _mixed_logits(m=200)
     coverage = 0.9
-    fitted = fit_calibrator(logits, labels, method="temperature", coverage=coverage)
+    fitted = fit_calibrator(logits, labels, method=CalibrationMethod.TEMPERATURE, coverage=coverage)
     assert fitted.conformal_threshold is not None
 
     # The kept set is everything whose nonconformity is within q̂; by
@@ -172,7 +200,7 @@ def test_conformal_calibrates_the_statistic_it_thresholds() -> None:
     errors the two q̂ values differ, and only the top1 one reproduces here.
     """
     logits, labels = _mixed_logits(m=200)
-    fitted = fit_calibrator(logits, labels, method="temperature", coverage=0.9)
+    fitted = fit_calibrator(logits, labels, method=CalibrationMethod.TEMPERATURE, coverage=0.9)
     assert fitted.conformal_threshold is not None
 
     probs = torch.softmax(logits / max(fitted.temperature, 1e-2), dim=-1)
@@ -193,14 +221,17 @@ def test_conformal_rejects_out_of_range_coverage() -> None:
     logits, labels = _mixed_logits(m=8)
     for bad in (0.0, 1.0, 1.5, -0.1):
         with pytest.raises(ValueError, match="coverage"):
-            fit_calibrator(logits, labels, method="none", coverage=bad)
+            fit_calibrator(logits, labels, method=CalibrationMethod.NONE, coverage=bad)
 
 
 def test_too_few_points_degrades_to_identity() -> None:
     # One calibration point cannot support a temperature fit — degrade rather
     # than raise, so a two-document DocSet does not take the run down.
     fitted = fit_calibrator(
-        torch.tensor([[1.0, 0.0]]), torch.tensor([0]), method="temperature", coverage=0.9
+        torch.tensor([[1.0, 0.0]]),
+        torch.tensor([0]),
+        method=CalibrationMethod.TEMPERATURE,
+        coverage=0.9,
     )
     assert fitted.method == "none"
     assert fitted.temperature == 1.0
@@ -218,7 +249,7 @@ def test_platt_on_an_all_correct_set_is_the_identity_map() -> None:
     # back to a pass-through rather than diverge; an easy corpus is the norm.
     logits = torch.tensor([[9.0, 0.0], [0.0, 9.0], [8.0, 0.0], [0.0, 8.0]], dtype=torch.float32)
     labels = torch.tensor([0, 1, 0, 1])
-    fitted = fit_calibrator(logits, labels, method="platt")
+    fitted = fit_calibrator(logits, labels, method=CalibrationMethod.PLATT)
     assert fitted.platt_identity is True
 
     # The bug this guards: (a, b) = (1, 0) is NOT a pass-through — `apply` would
@@ -305,8 +336,12 @@ def test_loo_honours_central_selection() -> None:
     )
     labels: list[str | None] = ["A", "A", "A", "A", "B", "B"]
 
-    order = support_loo_logits(emb, labels, ["A", "B"], manifold, n_shots=2, selection="order")
-    central = support_loo_logits(emb, labels, ["A", "B"], manifold, n_shots=2, selection="central")
+    order = support_loo_logits(
+        emb, labels, ["A", "B"], manifold, n_shots=2, selection=SupportSelection.ORDER
+    )
+    central = support_loo_logits(
+        emb, labels, ["A", "B"], manifold, n_shots=2, selection=SupportSelection.CENTRAL
+    )
     assert order is not None and central is not None
     assert not torch.allclose(order[0], central[0])
 
@@ -396,7 +431,7 @@ def test_support_calibrator_is_none_when_nothing_asked_for() -> None:
             labels,
             ["A", "B"],
             _euclidean(),
-            method="none",
+            method=CalibrationMethod.NONE,
             coverage=None,
             abstain_threshold=0.5,
         )
@@ -413,7 +448,7 @@ def test_support_calibrator_is_none_when_support_too_small() -> None:
             ["A", "B"],
             ["A", "B"],
             manifold,
-            method="temperature",
+            method=CalibrationMethod.TEMPERATURE,
             coverage=0.9,
             abstain_threshold=None,
         )
@@ -428,7 +463,7 @@ def test_support_calibrator_carries_the_abstain_floor_through() -> None:
         labels,
         ["A", "B"],
         _euclidean(),
-        method="temperature",
+        method=CalibrationMethod.TEMPERATURE,
         coverage=0.8,
         abstain_threshold=0.6,
     )
@@ -474,7 +509,9 @@ def test_abstention_never_changes_the_predicted_label() -> None:
         embeddings,
         prototypes,
         manifold,
-        calibrator=Calibrator(method="temperature", temperature=5.0, abstain_threshold=0.99),
+        calibrator=Calibrator(
+            method=CalibrationMethod.TEMPERATURE, temperature=5.0, abstain_threshold=0.99
+        ),
         abstain_threshold=None,
     )
 
@@ -493,7 +530,9 @@ def test_calibrator_and_explicit_floor_compose_with_or() -> None:
         embeddings,
         prototypes,
         manifold,
-        calibrator=Calibrator(method="none", conformal_threshold=1.0, abstain_threshold=0.9),
+        calibrator=Calibrator(
+            method=CalibrationMethod.NONE, conformal_threshold=1.0, abstain_threshold=0.9
+        ),
     )
     assert result.abstain is not None
     assert result.abstain.tolist() == [False, False, True, False]
@@ -503,7 +542,7 @@ def test_calibrator_and_explicit_floor_compose_with_or() -> None:
 
 # ── config validation ──────────────────────────────────────────────────────
 def test_calibration_defaults_are_off() -> None:
-    cal = ScenarioConfig(name="s1", k_clusters=2).calibration
+    cal = ScenarioConfig(name=ScenarioName.S1, k_clusters=2).calibration
     assert cal.method == "none"
     assert cal.coverage is None
     assert cal.abstain_threshold is None
@@ -511,7 +550,7 @@ def test_calibration_defaults_are_off() -> None:
 
 def test_calibration_config_rejects_out_of_range_values() -> None:
     with pytest.raises(ValidationError, match="coverage"):
-        CalibrationConfig(method="temperature", coverage=1.0)
+        CalibrationConfig(method=CalibrationMethod.TEMPERATURE, coverage=1.0)
     with pytest.raises(ValidationError, match="abstain_threshold"):
         CalibrationConfig(abstain_threshold=1.5)
 

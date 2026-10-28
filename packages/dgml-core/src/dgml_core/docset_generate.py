@@ -26,16 +26,17 @@ returned :class:`GenerateReport`, never as text to parse.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import logging
+import tempfile
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import layout
+from .concurrency import map_concurrent
 from .conversion import load_conversion_config
 from .docsets import DocSetStore
 from .errors import (
@@ -43,17 +44,20 @@ from .errors import (
     EmptyDocSet,
     GenerationFailed,
     InvalidArgument,
-    short_error_message,
 )
 from .files import FileStore
 from .models import DocSet
 from .pages import load_pdf_config
-from .storage import Workspace
+from .storage import Workspace, write_json_atomic
+from .text_extraction import TextMode
 
 if TYPE_CHECKING:
+    from .batch.jobs import JobSession
+    from .generation.pipeline import BatchOptions
     from .generation.schema import Schema
+    from .style_config import StyleConfig
 
-__all__ = ["GenerateFileResult", "GenerateReport", "generate_docset"]
+__all__ = ["GenerateFileResult", "GenerateReport", "any_ocr_file", "generate_docset"]
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +170,11 @@ class GenerateReport:
     #: decides if off-schema concepts render as ``added_concepts`` (coined and
     #: used) or ``unmatched_concepts`` (refused).
     schema_extended: bool
+    #: Under batch mode, one entry per stage — a batched stage's
+    #: ``WaveStats.to_json()`` or ``{"skipped": "<reason>"}`` for one that ran
+    #: synchronously (see :class:`~dgml_core.generation.BatchOptions.stats`).
+    #: None for a synchronous run.
+    batch_stages: dict[str, dict[str, Any]] | None = None
 
     @property
     def results(self) -> list[GenerateFileResult]:
@@ -175,7 +184,7 @@ class GenerateReport:
     def to_json(self) -> dict[str, Any]:
         """The single ``docset generate`` envelope, built the same way whether
         or not any file actually needed converting (so the paths can't drift)."""
-        return {
+        payload: dict[str, Any] = {
             "docset_id": self.docset.id,
             "docset_name": self.docset.name,
             "summary": {
@@ -194,6 +203,14 @@ class GenerateReport:
             "results": [r.to_json(extend_schema=self.schema_extended) for r in self.results],
             "rerendered": list(self.rerendered),
         }
+        if self.batch_stages is not None:
+            # Additive, and present only under batch mode: without it the
+            # payload is exactly what a synchronous run has always emitted.
+            payload["batch"] = {
+                "enabled": True,
+                "stages": {name: dict(stats) for name, stats in self.batch_stages.items()},
+            }
+        return payload
 
 
 def _load_schema_roster(path: Path) -> dict[str, str]:
@@ -320,6 +337,98 @@ def _has_generated_tree(xml_text: str) -> bool:
         return False
 
 
+def any_ocr_file(file_store: FileStore, file_ids: list[str]) -> bool:
+    """Whether any of *file_ids* is an OCR file, the only kind grounding sends
+    to the image-style model (``text_mode == "ocr"``; an unreadable record
+    counts as not OCR, as it does there). Batch pre-flight uses it to decide
+    whether a run reaches the style model at all."""
+    for fid in file_ids:
+        try:
+            if file_store.get(fid).text_mode == TextMode.OCR.value:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+#: ``batch_stages["style"]`` when the workspace enables image style but no
+#: document of the run had a page to style (none is an OCR file, say).
+_STYLE_NOTHING_TO_STYLE = "no OCR document with a page to style"
+
+
+def _style_staged(
+    staged: dict[str, dict[str, Any]],
+    style_config: StyleConfig | None,
+    batch: BatchOptions,
+    log: Callable[[str], None],
+) -> None:
+    """Run the image-style passes a batch run deferred while grounding (OCR
+    files under an enabled ``style`` section) as one batch stage, and put each
+    styled document's final grounded XML in its held-back writes. Documents
+    are taken in name order (the staging pool fills *staged* in completion
+    order); the stage's stats land in ``batch.stats["style"]``."""
+    pending = {
+        name: item["pending_style"]
+        for name, item in sorted(staged.items())
+        if item.get("pending_style") is not None
+    }
+    if not pending:
+        if style_config is not None:
+            batch.stats["style"] = {"skipped": _STYLE_NOTHING_TO_STYLE}
+        return
+    from .style_llm import style_batch_executor, style_documents_batch
+
+    assert style_config is not None  # a pending style pass needs the section that configured it
+    executor = style_batch_executor(style_config, poll_interval_s=batch.poll_interval_s, log=log)
+    try:
+        finished = style_documents_batch(pending, executor, log=log)
+    finally:
+        batch.stats["style"] = executor.stats.to_json()
+    for name, data in finished.items():
+        item = staged[name]
+        item["deferred"][item["xml_key"]] = data
+
+
+def _rewind_generate_inputs(
+    job: JobSession,
+    *,
+    cache_dir: Path,
+    seed_files: Mapping[str, Path],
+    doc_names: list[str],
+) -> None:
+    """Put back, on a resumed job run, what generation wrote to its own inputs
+    during earlier runs of the job.
+
+    Two kinds of input feed back into generate's requests: the roster seeds
+    (``schema.json``, ``concept_roster.json`` — labeling rewrites both, and the
+    next run would seed from them) and each document's transcription cache
+    (``<stem>_blocks.json`` — a cached document makes no transcription request,
+    so its responses would never be replayed and never billed). On the job's
+    first run their state is recorded; on every later run it is restored, so
+    the run makes exactly the requests the job started with and replays them.
+    Everything else generate writes is output, written only once the job's
+    last wave has come back."""
+    from .generation.transcribe import blocks_cache_path
+
+    def _reader(path: Path) -> Callable[[], bytes | None]:
+        return lambda: path.read_bytes() if path.exists() else None
+
+    for name, path in seed_files.items():
+        data = job.rewind_input(f"generate/{name}", _reader(path))
+        if job.resumed:
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+    for doc_name in doc_names:
+        blocks = blocks_cache_path(cache_dir, doc_name)
+        cached_at_start = job.rewind_presence(f"generate/blocks/{doc_name}", blocks.exists())
+        if job.resumed and not cached_at_start:
+            blocks.unlink(missing_ok=True)
+    job.persist()  # once for every input recorded above
+
+
 def generate_docset(
     ws: Workspace,
     docset_id: str,
@@ -331,6 +440,7 @@ def generate_docset(
     temperature: float = 0.0,
     max_tokens: int = 64000,
     thinking: str | None = None,
+    transcription: str | None = None,
     max_parallel_docs: int = 4,
     cache_dir: Path | None = None,
     schema_path: Path | None = None,
@@ -341,6 +451,8 @@ def generate_docset(
     semlink_cache: bool = True,
     semlink_verify: bool = True,
     debug: bool = False,
+    batch: BatchOptions | None = None,
+    job: JobSession | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> GenerateReport:
     """Convert every file in a DocSet to DGML XML via the typed-block pipeline.
@@ -372,8 +484,16 @@ def generate_docset(
     this module's logger unless ``on_progress`` is passed, which then receives
     them instead — every fact a caller should branch on is on the report,
     never only in these strings.
+
+    ``batch`` runs the batchable stages (transcription, labeling, the link
+    pass, OCR files' image-style pass) through the providers' batch endpoints
+    (see :class:`~dgml_core.generation.BatchOptions`; its ``stats`` come back
+    as the report's ``batch_stages``). Under batch mode nothing is written
+    until the link pass is past its last wave, so a run interrupted while it
+    waits on a provider leaves every output as it found it. ``job`` is the
+    batch job session the run is under, if any: a resumed run converts what
+    the job STARTED with and replays the job's stored responses.
     """
-    from . import llm
     from .extraction_xml import carry_extraction_over, has_extraction
     from .generation import (
         ConvertOptions,
@@ -384,14 +504,12 @@ def generate_docset(
         validate_generation_models,
     )
     from .generation import coverage as cov_mod
-    from .generation import links as links_mod
     from .generation.blocks import Block, block_concept_labels
-    from .generation.links import apply_plan, plan_links
+    from .generation.link_stage import LinkOutcome, LinkStage, StagedDocument
     from .generation.pipeline import load_labeled_docs_from_cache
     from .generation.rnc import write_docset_rnc
     from .generation.to_semantic import build_header
     from .generation.vocab import TagVocab
-    from .usage import OPERATION_LINKS
     from .xml_grounding import ground_dgml_xml
 
     log: Callable[[str], None] = on_progress if on_progress is not None else logger.info
@@ -449,25 +567,22 @@ def generate_docset(
     # config pre-flight above.
     validate_generation_models(gen_cfg, gen_api_key, label_api_key)
 
-    # The semantic-link pass runs on the labeling model (and its credentials).
-    # One config per DOCUMENT, never one shared by all of them. Documents are
-    # linked concurrently on the emit pool, and `llm.record_usage_for` marks the
-    # open aggregation scope on the config object itself — so a shared config
-    # means the second document to start folds its tokens into whichever scope
-    # opened first, and the row that lands names one document while covering
-    # several. Per-document configs also give each row a `doc` context, so the
-    # pass can be read per file rather than only in aggregate.
-    def _link_config(doc_name: str) -> llm.LLMConfig:
-        config = llm.LLMConfig(
-            model=resolved_label_model,
-            api_key=label_api_key,
-            api_base=label_api_base,
-            workspace=ws,
-            debug=debug,
-            operation=OPERATION_LINKS,
-        )
-        config.context = {"doc": doc_name}
-        return config
+    # The semantic-link pass runs on the labeling model (and its credentials):
+    # its sync driver runs per document in the sink below, its batch driver
+    # over every staged document at once.
+    link_stage = LinkStage(
+        workspace=ws,
+        docset_id=docset_id,
+        model=resolved_label_model,
+        api_key=label_api_key,
+        api_base=label_api_base,
+        enabled=semlinks,
+        verify=semlink_verify,
+        use_cache=semlink_cache,
+        record_usage=debug,
+        job=job,
+        log=log,
+    )
 
     # The docset prefix is always the output base — schema.json,
     # coverage_report.json, cache/, and semantic/ live under it. Each file's
@@ -525,9 +640,16 @@ def generate_docset(
             log(f"Source missing for {name} (file '{fid}') — reported as failed")
             continue
         out_xml_key = layout.dgml_xml_key(docset_id, fid, stem)
-        if ws.blobs.blob_exists(out_xml_key) and _has_generated_tree(
+        generated = ws.blobs.blob_exists(out_xml_key) and _has_generated_tree(
             ws.blobs.get_blob(out_xml_key).decode("utf-8")
-        ):
+        )
+        if job is not None:
+            # A job run decides what to convert from the state the job STARTED
+            # in: a file an earlier run of this job converted is converted
+            # again, replaying the job's stored responses (billed once, when
+            # the job completes), rather than skipped as already done.
+            generated = job.rewind_presence(f"generate/output/{fid}", generated)
+        if generated:
             # Skip only when a generated document tree is present. An
             # extraction-only file (`extraction extract` ran before
             # `generate`) falls through and gets its tree built; _on_output
@@ -544,6 +666,9 @@ def generate_docset(
         candidates.setdefault(name, []).append(
             (fid, out_xml_key, pt_prefix if ws.blobs.list_blobs(pt_prefix) else None)
         )
+
+    if job is not None:
+        job.persist()  # the output presences recorded above, once
 
     # Same-basename collision: the typed-block pipeline keys documents by
     # filename, so it can't tell two same-named files apart in one batch.
@@ -645,30 +770,14 @@ def generate_docset(
             "examples": [concept for concept, _n in tally.most_common(_UNMATCHED_EXAMPLES)],
         }
 
-    def _semlink_cache_key(xml_text: str) -> str:
-        """Cache address for one document's semantic links.
+    def _ground_output(name: str, xml: str) -> dict[str, Any]:
+        """First half of a document's sink: write the render and ground it.
 
-        Keyed on what the plan depends on — the document's text and shape, via
-        links.listing_digest — plus the labeling model, both link prompts, and
-        whether the review pass runs. Attributes and tag names are deliberately
-        not part of it (see links.listing_digest), so grounding a document or
-        renaming its concepts hits rather than paying for the pass again. Parts
-        are length-prefixed so two different inputs cannot concatenate to the
-        same key.
+        Returns what the rest of the sink needs. Split from the link pass and
+        the reporting so batch mode can ground every document, run all their
+        link plans as one batch stage, then finish each; the sync sink below
+        runs the three halves back to back.
         """
-        digest = hashlib.sha256()
-        for part in (
-            links_mod.listing_digest(xml_text).encode("utf-8"),
-            resolved_label_model.encode("utf-8"),
-            links_mod.SYSTEM_PROMPT.encode("utf-8"),
-            links_mod.VERIFY_SYSTEM_PROMPT.encode("utf-8") if semlink_verify else b"",
-        ):
-            digest.update(len(part).to_bytes(8, "big"))
-            digest.update(part)
-        prefix = layout.generation_cache_prefix(docset_id)
-        return f"{prefix}semlinks/{digest.hexdigest()}"
-
-    def _on_output(name: str, xml: str) -> None:
         xml_key = dgml_xml_keys[name]
         # A blob already at this key may carry extracted values — an
         # extraction-only file getting its tree now, or a full-extraction
@@ -682,7 +791,14 @@ def generate_docset(
                     prior_with_extraction = prior_text
             except Exception:
                 prior_with_extraction = None  # unparseable prior — nothing to carry
-        ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
+        # Under batch mode nothing is written yet: the link pass runs after
+        # every document is grounded, so the grounded tree is held and written
+        # only once that pass is past its last wave (see
+        # LinkStage.link_documents). A run interrupted while it waits on the
+        # provider therefore leaves every output exactly as it found it.
+        deferred: dict[str, bytes] = {}
+        if batch is None:
+            ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
         # Ground in place: re-parse the just-written tree, align it against the
         # file's page OCR, and rewrite <stem>.dgml.xml with dg:origin boxes.
         # Deterministic and free; a file with no page_text is left ungrounded.
@@ -694,8 +810,15 @@ def generate_docset(
         matched_token_pct: float | None = None
         elements_annotated: int | None = None
         grounding_error: dict[str, str] | None = None
+        pending_style: Any = None
         try:
-            with ws.blobs.materialize(xml_key) as gpath:
+            with contextlib.ExitStack() as gstack:
+                if batch is None:
+                    gpath = gstack.enter_context(ws.blobs.materialize(xml_key))
+                else:
+                    gdir = Path(gstack.enter_context(tempfile.TemporaryDirectory()))
+                    gpath = gdir / xml_key.rsplit("/", 1)[-1]
+                    gpath.write_bytes(xml.encode("utf-8"))
                 res = ground_dgml_xml(
                     ws,
                     name_to_fid[name],
@@ -703,14 +826,28 @@ def generate_docset(
                     output_path=gpath,
                     force=True,
                     write_stats=debug,
-                    debug=debug,
+                    record_usage=debug,
+                    # Under batch mode an OCR file's image-style pass joins one
+                    # batch stage with every other document's (see below).
+                    defer_style=batch is not None,
                 )
-                ws.blobs.put_blob(xml_key, gpath.read_bytes())
+                pending_style = res.pending_style
+                writes = {xml_key: gpath.read_bytes()}
                 if res.stats_path is not None and res.stats_path.exists():
-                    ws.blobs.put_blob(
-                        layout.pair_artifact_key(docset_id, name_to_fid[name], res.stats_path.name),
-                        res.stats_path.read_bytes(),
-                    )
+                    if batch is not None:
+                        # gpath is a scratch copy deleted on exit; name the
+                        # blob the tree is written to instead.
+                        stats = json.loads(res.stats_path.read_bytes())
+                        stats["source"] = stats["output"] = xml_key
+                        write_json_atomic(res.stats_path, stats)
+                    writes[
+                        layout.pair_artifact_key(docset_id, name_to_fid[name], res.stats_path.name)
+                    ] = res.stats_path.read_bytes()
+                if batch is None:
+                    for key, data in writes.items():
+                        ws.blobs.put_blob(key, data)
+                else:
+                    deferred.update(writes)
         except DgmlError as exc:
             grounded = False
             grounding_error = {"code": exc.code, "message": str(exc)}
@@ -723,49 +860,26 @@ def generate_docset(
                 f"[ground] {name}: {res.stats['elements_annotated']} element(s), "
                 f"{res.stats['matched_token_pct']}% tokens matched"
             )
-        # Final step: add semantic links in place (dg:itemprop/dg:href). Runs on
-        # re-rendered priors too — their fresh XML would otherwise lose the links.
-        # The pass is a pure function of (grounded XML, labeling model, link
-        # prompts), so it is content-addressed: a hit replays the exact bytes the
-        # model call would have written, making a repeat run free rather than
-        # merely cheaper. The applied-link count is cached alongside so the
-        # reported `links` is identical on both paths.
-        links_added = 0
-        if semlinks:
-            source = ws.blobs.get_blob(xml_key).decode("utf-8")
-            plan_key = f"{_semlink_cache_key(source)}.json"
-            try:
-                cached = (
-                    ws.blobs.get_blob(plan_key)
-                    if semlink_cache and ws.blobs.blob_exists(plan_key)
-                    else None
-                )
-                if cached is not None:
-                    plan = json.loads(cached)
-                    hit = " (cached)"
-                else:
-                    plan = plan_links(source, _link_config(name), verify=semlink_verify)
-                    ws.blobs.put_blob(plan_key, json.dumps(plan).encode("utf-8"))
-                    hit = ""
-                # The plan is applied to the CURRENT tree either way, so a cache
-                # hit and a fresh call write the same links onto whatever the
-                # render and grounding just produced.
-                linked, applied = apply_plan(source, plan)
-                ws.blobs.put_blob(xml_key, linked.encode("utf-8"))
-                # `applied` is what the XML actually carries, so the reported
-                # count matches the document. What the plan asked for and did
-                # not get is diagnosed separately — chiefly links discarded
-                # because dg:itemprop/dg:href are attributes on the subject, so
-                # a second link on one subject overwrites the first.
-                links_added = len(applied)
-                losses = links_mod.plan_losses(source, plan)
-                folded = f", {losses.merged} merged" if losses.merged else ""
-                lost = f", {losses.displaced} displaced" if losses.displaced else ""
-                nested = f", {losses.nested} nested dropped" if losses.nested else ""
-                log(f"[semlinks] {name}: {links_added} link(s){folded}{lost}{nested}{hit}")
-            except Exception as exc:  # a link-pass failure must not lose the DGML
-                link_errors[name] = short_error_message(exc)
-                log(f"[semlinks] {name}: skipped ({exc})")
+        if batch is not None and xml_key not in deferred:
+            # Not grounded: the sync path leaves the plain render in the blob.
+            deferred[xml_key] = xml.encode("utf-8")
+        return {
+            "xml": xml,
+            "xml_key": xml_key,
+            "prior_with_extraction": prior_with_extraction,
+            "grounded": grounded,
+            "matched_token_pct": matched_token_pct,
+            "elements_annotated": elements_annotated,
+            "grounding_error": grounding_error,
+            "deferred": deferred,
+            "pending_style": pending_style,
+        }
+
+    def _finish_output(name: str, staged: dict[str, Any], links_added: int) -> None:
+        """Last half of a document's sink: re-embed extraction, then report."""
+        xml = staged["xml"]
+        xml_key = staged["xml_key"]
+        prior_with_extraction = staged["prior_with_extraction"]
         # Re-embed the prior dg:extraction last, after grounding + semlinks
         # have finished rewriting the tree, so the extraction subtree is
         # spliced in verbatim and never run through those passes.
@@ -812,14 +926,34 @@ def generate_docset(
             source=name,
             output=xml_key,
             links=links_added,
-            grounded=grounded,
-            matched_token_pct=matched_token_pct,
-            elements_annotated=elements_annotated,
-            grounding_error=grounding_error,
+            grounded=staged["grounded"],
+            matched_token_pct=staged["matched_token_pct"],
+            elements_annotated=staged["elements_annotated"],
+            grounding_error=staged["grounding_error"],
             label_error=label_errors.get(name),
             link_error=link_errors.get(name),
             off_schema_concepts=off_schema_concepts.get(name),
         )
+
+    def _links_added(name: str, outcome: LinkOutcome) -> int:
+        if outcome.error is not None:
+            link_errors[name] = outcome.error
+        return outcome.links
+
+    def _on_output(name: str, xml: str) -> None:
+        # The synchronous sink: ground, link, finish — one document at a time.
+        staged = _ground_output(name, xml)
+        outcome = link_stage.link_document(name, staged["xml_key"])
+        _finish_output(name, staged, _links_added(name, outcome))
+
+    # Batch mode grounds each document as it is rendered and holds it here;
+    # the link pass then runs over all of them as one batch stage, and each is
+    # finished after (see LinkStage.link_documents). Distinct keys per
+    # document, so the render pool's concurrent writes never collide.
+    staged_outputs: dict[str, dict[str, Any]] = {}
+
+    def _stage_output(name: str, xml: str) -> None:
+        staged_outputs[name] = _ground_output(name, xml)
 
     if convert_names:
         # The cache always exists — it holds functional files the next run
@@ -848,6 +982,16 @@ def generate_docset(
                     if not dest.exists() and ws.blobs.blob_exists(key):
                         ws.blobs.download_blob(key, dest)
             roster_path = Path(cache) / "concept_roster.json"
+            if job is not None:
+                # A resumed job run must read the inputs the job STARTED from:
+                # generation writes its own seeds and transcription caches
+                # mid-run, and reading them back would change its requests.
+                _rewind_generate_inputs(
+                    job,
+                    cache_dir=Path(cache),
+                    seed_files={"schema.json": schema_json_local, "roster": roster_path},
+                    doc_names=convert_names,
+                )
             schema_seed = None
             roster_seed: dict[str, str] | None = None
             parent_map_seed: dict[str, str] = {}
@@ -982,13 +1126,17 @@ def generate_docset(
                     label_model=resolved_label_model,
                     api_key=gen_api_key,
                     api_base=gen_api_base,
+                    label_api_key=label_api_key,
+                    label_api_base=label_api_base,
                     window_size=window_size,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     thinking=thinking or gen_cfg.thinking,
+                    transcription=transcription or gen_cfg.transcription,
                     max_parallel_docs=max_parallel_docs,
                     cache_dir=cache,
                     debug=debug,
+                    record_usage=debug,
                     page_text_dirs=page_text_dirs,
                     workspace=ws,
                     dgml_header=build_header(ws.organization, ds.name),
@@ -999,17 +1147,41 @@ def generate_docset(
                     parent_map=parent_map_seed or None,
                     vocab=vocab,
                     progress=log,
+                    batch=batch,
                 )
                 convert_batch(
                     pdf_paths,
                     options=options,
-                    on_output=_on_output,
+                    on_output=_on_output if batch is None else _stage_output,
                     on_error=_on_error,
                     on_label_error=_on_label_error,
                     on_off_schema=_on_off_schema,
                     prior_docs=prior_docs,
                     prior_outputs=prior_outputs,
                 )
+                if batch is not None:
+                    # OCR files' image-style passes, deferred by grounding: ONE
+                    # batch stage over every document's pages, before the link
+                    # pass (which reads the styled tree, as in the sync run).
+                    _style_staged(staged_outputs, style_config, batch, log)
+                    # Still inside the page_text materialization: finishing a
+                    # document computes its coverage against those pages.
+                    link_outcomes = link_stage.link_documents(
+                        {
+                            name: StagedDocument(item["xml_key"], item["deferred"])
+                            for name, item in staged_outputs.items()
+                        },
+                        batch=batch,
+                        max_workers=max_parallel_docs,
+                    )
+                    batch_links = {n: _links_added(n, o) for n, o in link_outcomes.items()}
+                    # On the document pool, like the sync sink; the results are
+                    # folded in queued order below, so the report order holds.
+                    map_concurrent(
+                        lambda item: _finish_output(item[0], item[1], batch_links[item[0]]),
+                        list(staged_outputs.items()),
+                        max_workers=max_parallel_docs,
+                    )
             # Documents were converted on a pool, so fold the per-document
             # results back in a fixed order — queued order for converted files,
             # docset order for re-rendered priors — and the report stays
@@ -1082,6 +1254,12 @@ def generate_docset(
     except Exception as exc:
         log(f"[schema] full-schema.rnc skipped ({exc})")
 
+    batch_stages: dict[str, dict[str, Any]] | None = None
+    if batch is not None:
+        batch_stages = dict(batch.stats)
+        if not semlinks:
+            batch_stages["links"] = {"skipped": "--no-semlinks"}
+
     return GenerateReport(
         docset=ds,
         total=len(file_ids),
@@ -1096,4 +1274,5 @@ def generate_docset(
         label_model=resolved_label_model,
         model_source=gen_model_source,
         schema_extended=extend_schema,
+        batch_stages=batch_stages,
     )

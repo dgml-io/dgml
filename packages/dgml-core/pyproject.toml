@@ -20,6 +20,10 @@ dependencies = [
     # Layered config assembly (user/workspace TOML + env vars) — MIT.
     # `pydantic` itself already resolves transitively via litellm.
     "pydantic-settings>=2.4",
+    # Page images: fits each render to the page-edge bounds and encodes it as
+    # JPEG, deskews OCR'd pages, and downscales images sent to vision models.
+    # MIT-CMU (HPND), permissive.
+    "Pillow>=10.2",
 ]
 
 [tool.uv.sources]
@@ -28,14 +32,11 @@ dgml-chain = { workspace = true }
 
 [project.optional-dependencies]
 # Install with `pip install dgml-core[aws]` to enable OCR via AWS Textract.
-# Pillow (HPND, permissive) deskews page images when OCR reports page skew.
-aws = ["boto3>=1.34", "Pillow>=10.0"]
+aws = ["boto3>=1.34"]
 # Install with `pip install dgml-core[azure]` to enable OCR via Azure Document Intelligence.
-# Pillow (HPND, permissive) deskews page images when Azure reports page skew.
 azure = [
     "azure-ai-documentintelligence>=1.0",
     "azure-identity>=1.15",
-    "Pillow>=10.0",
 ]
 # Install with `pip install dgml-core[macos]` to enable on-device OCR via Apple
 # Vision (macOS only; the default provider when no OCR config is set).
@@ -47,11 +48,8 @@ macos = [
 # Install with `pip install dgml-core[pdfium]` for page rendering and slicing
 # with PDFium (`[pdf] provider = "pypdfium2"`) instead of the system
 # ghostscript binary. pypdfium2 is (Apache-2.0 OR BSD-3-Clause) and PDFium is
-# BSD-3-Clause; Pillow (MIT-CMU) writes the PNGs.
-pdfium = [
-    "pypdfium2>=4.30",
-    "pillow>=10.2",
-]
+# BSD-3-Clause.
+pdfium = ["pypdfium2>=4.30"]
 # Install with `pip install dgml-core[clustering]` to enable the clustering
 # pipelines (S1/S2 scenario pipelines, embedding models, networkx, scipy,
 # sklearn — a heavyweight ML stack that not all users need).
