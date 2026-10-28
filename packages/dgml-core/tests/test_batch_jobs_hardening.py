@@ -45,7 +45,7 @@ from dgml_core.batch.types import BatchRejected, BatchSubmitUncertain
 from dgml_core.errors import BatchExecutionFailed, BatchJobInvalid, BatchPending
 from dgml_core.storage import Workspace
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 
 
 def _kwargs(text: str) -> dict[str, Any]:

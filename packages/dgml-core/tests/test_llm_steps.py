@@ -30,7 +30,9 @@ from dgml_core.usage import read_events
 
 from .conftest import FakeLLMResponse
 
-HAIKU = "anthropic/claude-haiku-4-5"
+HAIKU = "anthropic/claude-haiku-5-5"
+# Haiku 5.5 refuses prefill (llm.ANTHROPIC_NO_PREFILL_PATTERNS); Sonnet 4.6 still takes it.
+PREFILL_MODEL = "anthropic/claude-sonnet-4-6"
 EPHEMERAL = {"type": "ephemeral"}
 PDF = b"%PDF-1.4\n%%EOF"
 TOOLS = [{"type": "function", "function": {"name": "submit", "parameters": {"type": "object"}}}]
@@ -95,7 +97,7 @@ def test_continued_prefills_the_partial_on_anthropic(capture_kwargs: Any) -> Non
     captured = capture_kwargs(
         [FakeLLMResponse("part-1", finish_reason="length"), FakeLLMResponse("part-2")]
     )
-    cfg = llm.LLMConfig(model=HAIKU, max_tokens=32000)
+    cfg = llm.LLMConfig(model=PREFILL_MODEL, max_tokens=32000)
     content = llm.build_user_content(instruction_text="transcribe", pdf_bytes=PDF)
     out = llm.call_continued(cfg, system_prompt="SYS", user_content=content, cache=True)
 
@@ -113,7 +115,9 @@ def test_continued_prefills_the_partial_on_anthropic(capture_kwargs: Any) -> Non
         llm.LLMConfig(model="openai/gpt-5.4"),
         llm.LLMConfig(model="gemini/gemini-2.5-pro"),
         # Extended thinking rejects prefill, so Anthropic asks explicitly too.
-        llm.LLMConfig(model=HAIKU, reasoning_effort="medium"),
+        llm.LLMConfig(model=PREFILL_MODEL, reasoning_effort="medium"),
+        # Haiku 5.5 refuses prefill outright.
+        llm.LLMConfig(model=HAIKU),
     ],
 )
 def test_continued_asks_in_a_user_turn_where_prefill_is_unsupported(

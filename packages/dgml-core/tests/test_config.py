@@ -538,7 +538,7 @@ def test_the_workspaces_provider_key_wins_over_the_user_configs(
     _write_user_config({"models": {"family": "anthropic", "anthropic_api_key_env": "PERSONAL"}})
     write_config(workspace, {"models": {"anthropic_api_key_env": "TEAM"}})
     assert load_merged_config(workspace)[ConfigSection.MODELS]["standard_api_key_env"] == "TEAM"
-    cfg, _ = resolve_generation_config(workspace, model="anthropic/claude-haiku-4-5")
+    cfg, _ = resolve_generation_config(workspace, model="anthropic/claude-haiku-5-5")
     assert (cfg.api_key_env, cfg.label_api_key_env) == ("TEAM", "TEAM")
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 

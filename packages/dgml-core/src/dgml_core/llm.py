@@ -133,9 +133,11 @@ GEMINI_MODEL_PATTERNS = [r"gemini", r"vertex_ai", r"google"]
 # the documented thinking/prefill incompatibility, it is the model. It cost
 # 17-25% of documents in every claude-sonnet-5 transcriber draw, and because F1
 # is computed over the survivors the arm then scored *highest* of the sweep.
-# claude-haiku-4-5 prefills fine across thousands of calls, so this stays a
-# narrow list rather than a blanket rule.
-ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
+# claude-haiku-5-5 refuses it the same way (litellm's metadata agrees:
+# `supports_assistant_prefill: False`). Older Claude models such as
+# claude-sonnet-4-6 still prefill, so this stays a narrow list rather than a
+# blanket rule.
+ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5", r"claude-haiku-5"]
 
 # Accepted values for `LLMConfig.thinking`, Anthropic's extended-thinking switch.
 #
@@ -336,7 +338,7 @@ def supports_assistant_prefill(model: str) -> bool:
     restarting the reply.
 
     **Some Anthropic models refuse it too**, which is why this is not simply
-    "is it Anthropic". ``claude-sonnet-5`` returns the same shape of 400 as
+    "is it Anthropic". ``claude-sonnet-5`` and ``claude-haiku-5-5`` return the same shape of 400 as
     Gemini on a path that sets no ``reasoning_effort``, so it is the model and
     not the thinking/prefill incompatibility — see
     ``ANTHROPIC_NO_PREFILL_PATTERNS``.
@@ -718,7 +720,7 @@ def model_max_output_tokens(model: str, api_base: str | None = None) -> int | No
 
     Read from litellm's model metadata so callers can ask for a model's real
     ceiling instead of hardcoding one number across a fleet whose limits
-    differ (frontier Claude/Gemini allow 128K; Haiku 4.5 caps at 64K).
+    differ (current Claude and Gemini Pro allow 128K; Gemini Flash caps at 64K).
     ``None`` for a custom ``api_base`` (self-hosted/proxy — no metadata) or an
     id litellm doesn't know, in which case callers keep their own default.
     """

@@ -33,7 +33,7 @@ from dgml_core.generation.vocab import OPEN_VOCAB
 
 from .conftest import FakeLLMResponse
 
-HAIKU = "anthropic/claude-haiku-4-5"
+HAIKU = "anthropic/claude-haiku-5-5"
 EPHEMERAL = {"type": "ephemeral"}
 
 

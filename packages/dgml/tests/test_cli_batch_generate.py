@@ -49,7 +49,7 @@ from .test_cli import _init_ws, _read_stderr, _read_stdout, _seed_file_dir, _wri
 _PAGES = {"alpha.pdf": 1, "bravo.pdf": 3}
 _HEADER_RE = re.compile(r"pages (\d+)-(\d+) of (\d+)")
 _BLOCK_ID_RE = re.compile(r"\bb\d{4}\b")
-_MODELS = {"model": "anthropic/claude-haiku-4-5", "label_model": "anthropic/claude-sonnet-4-6"}
+_MODELS = {"model": "anthropic/claude-haiku-5-5", "label_model": "anthropic/claude-sonnet-4-6"}
 
 
 def _system(kwargs: dict[str, Any]) -> str:
@@ -392,7 +392,7 @@ def test_no_semlinks_reports_the_link_stage_skipped(
 
 _STYLE_CONFIG = {
     "generation": _MODELS,
-    "style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"},
+    "style": {"enabled": True, "model": "anthropic/claude-haiku-5-5"},
 }
 
 

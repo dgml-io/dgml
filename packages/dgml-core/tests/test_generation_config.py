@@ -36,7 +36,7 @@ from dgml_core.storage import Workspace
 
 from .conftest import dump_toml, write_config
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 LABEL_MODEL = "anthropic/claude-sonnet-4-6"
 
 

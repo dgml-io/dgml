@@ -40,7 +40,7 @@ _REPLY: dict[str, Any] = {
 }
 
 _KWARGS: dict[str, Any] = {
-    "model": "anthropic/claude-haiku-4-5",
+    "model": "anthropic/claude-haiku-5-5",
     "messages": [
         {"role": "system", "content": "Answer briefly."},
         {"role": "user", "content": [{"type": "text", "text": "Say hello."}]},
@@ -54,7 +54,7 @@ def test_capture_returns_the_body_litellm_would_post_and_sends_nothing() -> None
         _KWARGS, seam=HTTPX_HANDLER, reply=_REPLY, api_key="test-key", expect_path="/v1/messages"
     )
     assert captured.url.endswith("/v1/messages")
-    assert captured.body["model"] == "claude-haiku-4-5"
+    assert captured.body["model"] == "claude-haiku-5-5"
     assert captured.body["max_tokens"] == 16
     assert captured.body["system"] == [{"type": "text", "text": "Answer briefly."}]
     assert captured.body["messages"] == [

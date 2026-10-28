@@ -35,7 +35,7 @@ from dgml_core.batch import registry as batch_registry
 from dgml_core.batch.compat import IncompatibleDependency, require_supported_litellm
 from dgml_core.errors import BatchUnavailable
 
-_MODEL = "anthropic/claude-haiku-4-5"
+_MODEL = "anthropic/claude-haiku-5-5"
 
 
 @pytest.fixture

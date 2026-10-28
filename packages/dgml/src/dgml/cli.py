@@ -3884,7 +3884,7 @@ def _add_generate_subparser(
         default=None,
         help=(
             "Override the per-page transcription model for this run (e.g. "
-            "'anthropic/claude-haiku-4-5'). Layers on top of --generation-config / "
+            "'anthropic/claude-haiku-5-5'). Layers on top of --generation-config / "
             "the workspace config. It takes the configured [models] provider key "
             "for its provider, else LiteLLM's per-provider env var (e.g. "
             "ANTHROPIC_API_KEY); no other configured key or api_base carries over."

@@ -962,7 +962,7 @@ per-item `results`, each carrying a `status`), matching the bulk `file add`:
   "docset_id": "p9pjusnwg50l",
   "docset_name": "Q2 contracts",
   "summary": { "total": 3, "converted": 2, "skipped": 1, "failed": 0 },
-  "models": { "model": "anthropic/claude-haiku-4-5", "label_model": "anthropic/claude-sonnet-4-6", "source": "config" },
+  "models": { "model": "anthropic/claude-haiku-5-5", "label_model": "anthropic/claude-sonnet-4-6", "source": "config" },
   "rerendered": [],
   "output_key": "docsets/p9pjusnwg50l",
   "coverage_report": "docsets/p9pjusnwg50l/coverage_report.json",
@@ -1846,7 +1846,7 @@ Both are counted in `extraction_stats.json` under `matching.dropped_inputs`
 it used is dropped, and counted under `matching.unsupported_values`.
 
 Extraction asks each model for its own maximum output (128K on current
-frontier Claude/Gemini, 64K on Haiku 4.5 — read from the provider's model
+Claude and Gemini Pro, 64K on Gemini Flash — read from the provider's model
 metadata and clamped per model, so no request exceeds a model's ceiling).
 A phase-1 turn that still clips that ceiling (`finish_reason='length'`)
 reports the truncation explicitly and is retried once in **chunked** mode:

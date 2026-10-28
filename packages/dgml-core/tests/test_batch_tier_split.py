@@ -47,7 +47,7 @@ from dgml_core.usage import BILLED_MARKER, PricingTier, read_events
 
 from .conftest import FakeLLMResponse
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 
 
 def _cfg(ws: Workspace, **kw: Any) -> llm.LLMConfig:

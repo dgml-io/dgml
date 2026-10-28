@@ -46,7 +46,7 @@ from dgml_core.usage import read_events
 
 from .conftest import FakeLLMResponse
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 _LINE_RE = re.compile(r"(?m)^(b\d+) (\w+)(?: \[[^]]*\])?: (.*)$")
 
 

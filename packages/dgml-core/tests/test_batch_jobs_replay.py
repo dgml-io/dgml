@@ -51,7 +51,7 @@ from .conftest import _write_text_pdf, needs_gs
 
 def _kwargs(text: str) -> dict[str, Any]:
     return {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "messages": [{"role": "user", "content": text}],
         "max_tokens": 64,
     }
@@ -87,7 +87,7 @@ def _executor(
     ex = ReplayExecutor(
         backend,
         session=session,
-        model="anthropic/claude-haiku-4-5",
+        model="anthropic/claude-haiku-5-5",
         api_base=None,
         poll_interval_s=0,
         sleep=lambda _s: None,

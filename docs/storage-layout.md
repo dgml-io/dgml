@@ -549,7 +549,7 @@ family (an explicit tier always overrides its family default):
 [models]
 family   = "anthropic_google"
 light    = "gemini/gemini-flash-lite-latest"  # classification, style
-standard = "anthropic/claude-haiku-4-5"    # transcription, text extraction
+standard = "anthropic/claude-haiku-5-5"    # transcription, text extraction
 advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
 expert   = "anthropic/claude-opus-5"       # schema generation
 ```
@@ -900,7 +900,7 @@ digital/hybrid path.
 ```toml
 [style]
 enabled = true
-model = "anthropic/claude-haiku-4-5"
+model = "anthropic/claude-haiku-5-5"
 ```
 
 Field rules:
@@ -1206,7 +1206,7 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
     "provider_batches": [                  // every provider batch the job submitted
       {"job": {"provider": "anthropic", "job_id": "msgbatch_…", "custom_ids": ["…"],
                "submitted_at": "…", "extra": {}},
-       "model": "anthropic/claude-haiku-4-5", "api_base": null,
+       "model": "anthropic/claude-haiku-5-5", "api_base": null,
        "stage": "transcribe",               // the pipeline stage the batch served
        "credential": {"section": "generation", "field": "transcribe",
                       "env": "MY_ANTHROPIC_KEY"},   // where the key comes from; never the key
@@ -1237,7 +1237,7 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
     "billed": ["<request key>", "…"],      // responses already counted on a usage row
     "inputs": {"generate/schema.json": true, "presence:generate/blocks/a.pdf": false},
     "state": {},                           // command-specific (file add: its ingest results)
-    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}},
+    "run_stats": {"e1:anthropic/claude-haiku-5-5": {"1": {"batches": 1, "…": 0}}},
                                            // per executor, per run: summed for the payload
     "record_usage": true,                  // the command writes usage rows (`--debug`);
                                            // the job's own `batch_unused` rows follow it

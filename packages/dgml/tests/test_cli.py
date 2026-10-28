@@ -2478,7 +2478,7 @@ def _init_with_docset(ws: Path, capsys: pytest.CaptureFixture[str], name: str = 
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             }
         },
@@ -2531,7 +2531,7 @@ def test_docset_generate_rejects_malformed_style_config(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             },
             "style": {"enabled": True, "max_tokens": 100},
@@ -2564,7 +2564,7 @@ def test_docset_generate_rejects_unset_style_api_key_env(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             },
             "style": {"enabled": True, "model": "m", "api_key_env": "DGML_STYLE_KEY_MISSING"},
@@ -2629,7 +2629,7 @@ def test_docset_generate_happy_path(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2749,13 +2749,13 @@ def test_docset_generate_model_flags_default_to_config() -> None:
             "--generation-config",
             "fast",
             "--model",
-            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-haiku-5-5",
             "--label-model",
             "anthropic/claude-sonnet-4-6",
         ]
     )
     assert args.generation_config == "fast"
-    assert args.model == "anthropic/claude-haiku-4-5"
+    assert args.model == "anthropic/claude-haiku-5-5"
     assert args.label_model == "anthropic/claude-sonnet-4-6"
 
 
@@ -2793,7 +2793,7 @@ def test_docset_generate_models_from_config(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2816,11 +2816,11 @@ def test_docset_generate_models_from_config(
     assert rc == 0
     payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
-    assert opts.model == "anthropic/claude-haiku-4-5"
+    assert opts.model == "anthropic/claude-haiku-5-5"
     assert opts.label_model == "anthropic/claude-sonnet-4-6"
     # The effective models are recorded in the output so the choice is visible.
     assert payload["models"] == {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "label_model": "anthropic/claude-sonnet-4-6",
         "source": "config",
     }
@@ -2845,7 +2845,7 @@ def test_docset_generate_threads_both_models_credentials(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "api_key_env": "T_KEY",
                     "label_model": "anthropic/claude-sonnet-4-6",
                     "label_api_key_env": "L_KEY",
@@ -2880,7 +2880,7 @@ def test_docset_generate_model_flags_override_config(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2913,10 +2913,10 @@ def test_docset_generate_model_flags_override_config(
     assert rc == 0
     payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
-    assert opts.model == "anthropic/claude-haiku-4-5"  # unchanged
+    assert opts.model == "anthropic/claude-haiku-5-5"  # unchanged
     assert opts.label_model == "anthropic/claude-opus-4-8"  # overridden
     assert payload["models"] == {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "label_model": "anthropic/claude-opus-4-8",
         "source": "override",
     }
@@ -4307,7 +4307,7 @@ def _generate_with_xml(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -4479,7 +4479,7 @@ def test_docset_generate_preflight_rejects_missing_api_key(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -4510,7 +4510,7 @@ def test_docset_generate_preflight_skips_key_check_when_api_base_set(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                     "api_base": "http://localhost:8000",
                     "label_api_base": "http://localhost:8000",

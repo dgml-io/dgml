@@ -43,7 +43,7 @@ def test_openai_never_prefills(model: str) -> None:
     assert not supports_assistant_prefill(model)
 
 
-@pytest.mark.parametrize("model", ["anthropic/claude-haiku-4-5", "claude-opus-5"])
+@pytest.mark.parametrize("model", ["anthropic/claude-sonnet-4-6", "claude-opus-5"])
 def test_anthropic_prefills(model: str) -> None:
     assert supports_assistant_prefill(model)
     assert not is_gemini_model(model)
@@ -62,11 +62,18 @@ def test_sonnet5_refuses_prefill_despite_being_anthropic(model: str) -> None:
     assert not supports_assistant_prefill(model)
 
 
-def test_haiku_is_not_caught_by_the_sonnet5_rule() -> None:
-    # The exclusion must stay narrow: haiku-4-5 prefills fine over thousands of
-    # calls, so a blanket "newer Claude" rule would lose a working fast path.
-    assert supports_assistant_prefill("anthropic/claude-haiku-4-5")
+@pytest.mark.parametrize("model", ["anthropic/claude-haiku-5-5", "claude-haiku-5-5"])
+def test_haiku5_refuses_prefill(model: str) -> None:
+    # Haiku 5.5 is the default `standard` tier, so transcription continuations
+    # must take the user-turn fallback rather than a prefill the API rejects.
+    assert not supports_assistant_prefill(model)
+
+
+def test_no_prefill_rule_stays_narrow() -> None:
+    # The exclusion must stay narrow: older Claude models still prefill, so a
+    # blanket "any Claude" rule would lose a working fast path.
     assert supports_assistant_prefill("anthropic/claude-sonnet-4-6")
+    assert supports_assistant_prefill("anthropic/claude-opus-5")
 
 
 def test_unknown_provider_still_defaults_to_prefill() -> None:
@@ -77,7 +84,7 @@ def test_unknown_provider_still_defaults_to_prefill() -> None:
 
 def test_anthropic_model_names_are_not_matched_as_gemini() -> None:
     # 'google' appears in the Gemini patterns; make sure that cannot leak.
-    assert not is_gemini_model("anthropic/claude-haiku-4-5")
+    assert not is_gemini_model("anthropic/claude-haiku-5-5")
     assert not is_gemini_model("gpt-5.4")
 
 
@@ -87,10 +94,10 @@ def test_reasoning_disables_prefill_even_on_anthropic() -> None:
     Mirrors the gate in call_continued; kept as a test so the interaction is
     documented somewhere executable. The model has to be one that prefills in
     the first place, or the assertion passes for the wrong reason — hence
-    haiku-4-5 rather than sonnet-5, which refuses prefill outright (see
-    test_sonnet5_refuses_prefill_despite_being_anthropic).
+    sonnet-4-6 rather than sonnet-5 or haiku-5-5, which refuse prefill outright
+    (see test_sonnet5_refuses_prefill_despite_being_anthropic).
     """
-    model = "anthropic/claude-haiku-4-5"
+    model = "anthropic/claude-sonnet-4-6"
     with_reasoning = LLMConfig(model=model, reasoning_effort="medium")
     without = LLMConfig(model=model)
     assert supports_assistant_prefill(model) and without.reasoning_effort is None
@@ -134,7 +141,7 @@ def test_reasoning_models_reject_explicit_temperature(model: str) -> None:
     [
         "openai/gpt-4o",
         "gpt-4-turbo",
-        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-haiku-5-5",
         "gemini/gemini-3.6-flash",
     ],
 )

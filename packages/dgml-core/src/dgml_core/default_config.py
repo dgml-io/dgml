@@ -44,7 +44,7 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
         # (classification/style); Anthropic for the document-reasoning pipeline
         # (transcription → labeling/value-extraction → schema generation).
         "light": "gemini/gemini-flash-lite-latest",
-        "standard": "anthropic/claude-haiku-4-5",
+        "standard": "anthropic/claude-haiku-5-5",
         "advanced": "anthropic/claude-sonnet-5",
         "expert": "anthropic/claude-opus-5",
     },
@@ -54,10 +54,10 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
         # Sonnet/Opus generation. Both allow 128K output tokens — twice the
         # previous generation's ceiling, which matters for value extraction on
         # charge-heavy documents (see grounded._DEFAULT_MAX_COMPLETION_TOKENS).
-        # `light`/`standard` stay on Haiku 4.5: there is no Haiku 5, and the
-        # cheap tiers do classification and transcription where it holds up.
-        "light": "anthropic/claude-haiku-4-5",
-        "standard": "anthropic/claude-haiku-4-5",
+        # `light`/`standard` run on Haiku 5.5, which also allows 128K output
+        # and does the cheap classification and transcription work.
+        "light": "anthropic/claude-haiku-5-5",
+        "standard": "anthropic/claude-haiku-5-5",
         "advanced": "anthropic/claude-sonnet-5",
         "expert": "anthropic/claude-opus-5",
     },

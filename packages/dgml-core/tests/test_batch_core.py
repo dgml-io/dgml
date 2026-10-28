@@ -72,7 +72,7 @@ def _fake_factory(cfg: BackendConfig) -> FakeBackend:
 @pytest.mark.parametrize(
     ("model", "provider"),
     [
-        ("anthropic/claude-haiku-4-5", "anthropic"),
+        ("anthropic/claude-haiku-5-5", "anthropic"),
         ("claude-sonnet-4-6", "anthropic"),
         ("openai/gpt-5.4", "openai"),
         ("gpt-4o", "openai"),
@@ -120,11 +120,11 @@ def test_resolve_backend_returns_registered_fake_per_provider() -> None:
 
     for provider in ("anthropic", "openai", "gemini"):
         register_backend(provider, factory)
-    for model in ("anthropic/claude-haiku-4-5", "openai/gpt-5.4", "gemini/gemini-2.5-pro"):
+    for model in ("anthropic/claude-haiku-5-5", "openai/gpt-5.4", "gemini/gemini-2.5-pro"):
         backend = resolve_backend(model, api_key="k", api_base=None)
         assert backend.provider == provider_of(model)
     assert [c.model for c in seen] == [
-        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-haiku-5-5",
         "openai/gpt-5.4",
         "gemini/gemini-2.5-pro",
     ]
@@ -148,10 +148,10 @@ def test_missing_dependency_quotes_hint_only_when_registered() -> None:
 
     register_backend("anthropic", _fake_factory, available=probe)
     with pytest.raises(BatchUnavailable) as info:
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
     msg = str(info.value)
     assert "No module named 'anthropic'" in msg
-    assert "anthropic/claude-haiku-4-5" in msg
+    assert "anthropic/claude-haiku-5-5" in msg
     assert "pip install" not in msg
     assert isinstance(info.value.__cause__, ImportError)
 
@@ -159,7 +159,7 @@ def test_missing_dependency_quotes_hint_only_when_registered() -> None:
         "anthropic", _fake_factory, available=probe, install_hint="pip install dgml[batch-x]"
     )
     with pytest.raises(BatchUnavailable) as info:
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
     assert "`pip install dgml[batch-x]`" in str(info.value)
 
 
@@ -172,11 +172,11 @@ def test_factory_import_error_is_missing_dependency_other_errors_propagate() -> 
 
     register_backend("anthropic", importless)
     with pytest.raises(BatchUnavailable):
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
 
     register_backend("anthropic", misconfigured)
     with pytest.raises(ValueError, match="bad api_base"):
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
 
 
 def test_assert_batchable_probes_each_provider_once_without_instantiating() -> None:
@@ -197,7 +197,7 @@ def test_assert_batchable_probes_each_provider_once_without_instantiating() -> N
     make("openai")
     assert_batchable(
         {
-            "transcribe": "anthropic/claude-haiku-4-5",
+            "transcribe": "anthropic/claude-haiku-5-5",
             "label": "anthropic/claude-sonnet-4-6",
             "links": "openai/gpt-5.4",
         }
@@ -211,7 +211,7 @@ def test_assert_batchable_names_first_offending_stage() -> None:
     with pytest.raises(BatchUnavailable) as info:
         assert_batchable(
             {
-                "transcribe": "anthropic/claude-haiku-4-5",
+                "transcribe": "anthropic/claude-haiku-5-5",
                 "label": "bedrock/" + BEDROCK_ID,
                 "links": "bedrock/" + BEDROCK_ID,
             }

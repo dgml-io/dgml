@@ -28,7 +28,7 @@ from dgml_core.generation import transcribe as transcribe_mod
 
 from .conftest import FakeLLMResponse
 
-HAIKU = "anthropic/claude-haiku-4-5"
+HAIKU = "anthropic/claude-haiku-5-5"
 EPHEMERAL = {"type": "ephemeral"}
 
 
@@ -43,11 +43,11 @@ def instruction(request: dict[str, Any]) -> str:
     return str(request["messages"][1]["content"][0]["text"])
 
 
-def steps(cache_dir: Path) -> Any:
+def steps(cache_dir: Path, model: str = HAIKU) -> Any:
     return transcribe_mod.transcribe_steps(
         b"%PDF-fake",
         doc_name="doc.pdf",
-        config=llm.LLMConfig(model=HAIKU),
+        config=llm.LLMConfig(model=model),
         window_size=1,
         cache_dir=cache_dir,
     )
@@ -82,7 +82,8 @@ def test_windows_are_asked_in_order_each_carrying_the_previous_tail(tmp_path: Pa
 
 @pytest.mark.usefixtures("three_pages")
 def test_a_truncated_window_is_continued_with_an_assistant_prefill(tmp_path: Path) -> None:
-    gen = steps(tmp_path)
+    # Haiku 5.5 refuses prefill, so use a model that takes it.
+    gen = steps(tmp_path, model="anthropic/claude-sonnet-4-6")
     first = next(gen)
     continued = gen.send(FakeLLMResponse("P\tHello wo", finish_reason="length"))
 

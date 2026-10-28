@@ -289,7 +289,7 @@ def test_annotate_style_from_image(tmp_path: Path, monkeypatch) -> None:  # type
         ws,
         file_id,
         root,
-        config=LLMConfig(model="anthropic/claude-haiku-4-5", api_key=None, max_tokens=None),
+        config=LLMConfig(model="anthropic/claude-haiku-5-5", api_key=None, max_tokens=None),
         style_attr=f"{{{dg}}}style",
         origin_attr=f"{{{dg}}}origin",
     )
@@ -386,11 +386,11 @@ def test_load_style_config_valid(tmp_path: Path) -> None:
 
     cfg = load_style_config(
         _ws_with_config(
-            tmp_path, {"style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"}}
+            tmp_path, {"style": {"enabled": True, "model": "anthropic/claude-haiku-5-5"}}
         )
     )
     assert cfg is not None
-    assert cfg.model == "anthropic/claude-haiku-4-5"
+    assert cfg.model == "anthropic/claude-haiku-5-5"
 
 
 def test_load_style_config_requires_model(tmp_path: Path) -> None:
@@ -461,7 +461,7 @@ def test_ground_honors_style_config_for_ocr(tmp_path: Path, monkeypatch) -> None
     )
     ws.blobs.put_blob(layout.file_page_image_key(fid, 1), b"\x89PNG\r\n\x1a\n fake")
     ws.config_path.write_text(
-        dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"}}),
+        dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-5-5"}}),
         encoding="utf-8",
     )
     monkeypatch.setattr(style_llm, "_request_styles", lambda c, i, s: {0: "font-weight: bold"})
@@ -527,7 +527,7 @@ def _seed_ocr_style_workspace(tmp_path: Path):  # type: ignore[no-untyped-def]
     )
     ws.blobs.put_blob(layout.file_page_image_key(fid, 1), b"\x89PNG\r\n\x1a\n fake")
     ws.config_path.write_text(
-        dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"}}),
+        dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-5-5"}}),
         encoding="utf-8",
     )
     src = tmp_path / "doc.dgml.xml"
@@ -680,7 +680,7 @@ def test_style_credential_failure_preserves_grounding(tmp_path: Path, monkeypatc
             {
                 "style": {
                     "enabled": True,
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "api_key_env": "DGML_STYLE_KEY_MISSING",
                 }
             }
@@ -737,7 +737,7 @@ def _annotate(ws: Any, file_id: str, root: Any, **kwargs: Any) -> int:
         ws,
         file_id,
         root,
-        config=LLMConfig(model="anthropic/claude-haiku-4-5", api_key=None, max_tokens=None),
+        config=LLMConfig(model="anthropic/claude-haiku-5-5", api_key=None, max_tokens=None),
         style_attr=f"{{{dg}}}style",
         origin_attr=f"{{{dg}}}origin",
         **kwargs,
@@ -941,7 +941,7 @@ def test_ground_records_one_style_usage_row_per_page(tmp_path: Path, monkeypatch
         )
         ws.blobs.put_blob(layout.file_page_image_key(fid, page), b"\x89PNG\r\n\x1a\n fake")
     ws.config_path.write_text(
-        dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"}}),
+        dump_toml({"style": {"enabled": True, "model": "anthropic/claude-haiku-5-5"}}),
         encoding="utf-8",
     )
 

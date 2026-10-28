@@ -35,7 +35,7 @@ tier — but the feature only runs when ``enabled``)::
 
     [style]
     enabled = true
-    model = "anthropic/claude-haiku-4-5"
+    model = "anthropic/claude-haiku-5-5"
     api_base = "http://localhost:11434"
     max_tokens = 4000
 

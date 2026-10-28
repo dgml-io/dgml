@@ -83,7 +83,7 @@ def _write_config(ws: Path, *, classification: bool = False, grounded: bool = Tr
             "values_model": "anthropic/claude-sonnet-4-6",
         }
     if classification:
-        data["classification"] = {"model": "anthropic/claude-haiku-4-5", "max_pages": 1}
+        data["classification"] = {"model": "anthropic/claude-haiku-5-5", "max_pages": 1}
     Workspace(root=ws).config_path.write_text(dump_toml(data), encoding="utf-8")
 
 
@@ -454,7 +454,7 @@ _UNSET = "DGML_TEST_UNSET_BATCH_KEY"
 
 
 def _config_with(ws: Path, *, classification_env: bool = False, values_env: bool = False) -> None:
-    classification: dict[str, Any] = {"model": "anthropic/claude-haiku-4-5", "max_pages": 1}
+    classification: dict[str, Any] = {"model": "anthropic/claude-haiku-5-5", "max_pages": 1}
     grounded: dict[str, Any] = {
         "schema_model": "anthropic/claude-opus-4-7",
         "values_model": "anthropic/claude-sonnet-4-6",
