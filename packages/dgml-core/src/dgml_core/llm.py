@@ -720,7 +720,7 @@ def model_max_output_tokens(model: str, api_base: str | None = None) -> int | No
 
     Read from litellm's model metadata so callers can ask for a model's real
     ceiling instead of hardcoding one number across a fleet whose limits
-    differ (current Claude and Gemini Pro allow 128K; Gemini Flash caps at 64K).
+    differ (current Claude and Gemini Pro allow 128K; some smaller models cap at 64K).
     ``None`` for a custom ``api_base`` (self-hosted/proxy — no metadata) or an
     id litellm doesn't know, in which case callers keep their own default.
     """

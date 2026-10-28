@@ -1846,7 +1846,7 @@ Both are counted in `extraction_stats.json` under `matching.dropped_inputs`
 it used is dropped, and counted under `matching.unsupported_values`.
 
 Extraction asks each model for its own maximum output (128K on current
-Claude and Gemini Pro, 64K on Gemini Flash — read from the provider's model
+Claude and Gemini Pro, lower on some smaller models — read from the provider's model
 metadata and clamped per model, so no request exceeds a model's ceiling).
 A phase-1 turn that still clips that ceiling (`finish_reason='length'`)
 reports the truncation explicitly and is retried once in **chunked** mode:

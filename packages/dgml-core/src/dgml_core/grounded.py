@@ -172,10 +172,10 @@ DEFAULT_MAX_TOOL_ITERS = 20
 # Per-call output token cap — deliberately set to the largest ceiling any
 # current frontier model offers (128K on Claude Opus/Sonnet 5, Sonnet 4.6,
 # Gemini 2.5 Pro). `llm._build_completion_kwargs` clamps this down to each
-# model's documented limit, so a model with a lower ceiling (Gemini 2.5 Flash
-# at 64K) gets its own maximum rather than a 400. Asking for the ceiling matters
-# for value extraction: a long itemized document can genuinely need
-# >65K output tokens, and clipping surfaces as truncated tool-call arguments.
+# model's documented limit, so a model with a lower ceiling (e.g. 64K) gets
+# its own maximum rather than a 400. Asking for the ceiling matters for value
+# extraction: a long itemized document can genuinely need >65K output tokens,
+# and clipping surfaces as truncated tool-call arguments.
 _DEFAULT_MAX_COMPLETION_TOKENS = 128000
 
 # Temperature for value extraction specifically. Schema generation

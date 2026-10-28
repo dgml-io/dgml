@@ -1039,22 +1039,31 @@ def test_model_max_output_tokens_reads_litellm_metadata() -> None:
     # Real metadata: frontier models allow more output than older ones.
     assert llm.model_max_output_tokens("anthropic/claude-sonnet-5") == 128000
     assert llm.model_max_output_tokens("anthropic/claude-haiku-5-5") == 128000
-    assert llm.model_max_output_tokens("gemini/gemini-2.5-flash") == 65536
     # Unknown id and custom api_base both fall back to "caller keeps its own".
     assert llm.model_max_output_tokens("not-a-real-model-xyz") is None
     assert llm.model_max_output_tokens("anthropic/claude-sonnet-5", "http://localhost:1234") is None
 
 
-def test_output_tokens_clamped_to_model_ceiling() -> None:
+def test_output_tokens_clamped_to_model_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request for more output than the model allows is a provider 400 —
     the builder lowers it to the model's own ceiling instead."""
     msgs = [{"role": "user", "content": "hi"}]
-    # Gemini 2.5 Flash caps at 64K: an ask for 128K is clamped down.
+    # Fake a 64K ceiling rather than pin a real model that has one: every such
+    # model is an older release that will drop out of litellm's metadata.
+    small = "anthropic/claude-haiku-5-5"
+    real_info = litellm.get_model_info
+
+    def fake_info(model: str, *args: Any, **kwargs: Any) -> Any:
+        info = real_info(model, *args, **kwargs)
+        return {**info, "max_output_tokens": 64000} if model == small else info
+
+    monkeypatch.setattr(litellm, "get_model_info", fake_info)
+    # A 64K model asked for 128K is clamped down.
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="gemini/gemini-2.5-flash", max_completion_tokens=128000),
+        llm.LLMConfig(model=small, max_completion_tokens=128000),
         messages=msgs,
     )
-    assert kwargs["max_completion_tokens"] == 65536
+    assert kwargs["max_completion_tokens"] == 64000
     # Sonnet 5 allows the full 128K — passed through untouched.
     kwargs = llm._build_completion_kwargs(
         llm.LLMConfig(model="anthropic/claude-sonnet-5", max_completion_tokens=128000),
@@ -1069,9 +1078,9 @@ def test_output_tokens_clamped_to_model_ceiling() -> None:
     assert kwargs["max_completion_tokens"] == 4096
     # max_tokens follows the same rule.
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="gemini/gemini-2.5-flash", max_tokens=128000), messages=msgs
+        llm.LLMConfig(model=small, max_tokens=128000), messages=msgs
     )
-    assert kwargs["max_tokens"] == 65536
+    assert kwargs["max_tokens"] == 64000
 
 
 def test_rate_limits_are_retried(monkeypatch: pytest.MonkeyPatch) -> None:
