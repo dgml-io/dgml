@@ -253,6 +253,7 @@ summing to `total`) is the quick health read; report it to the user.
 
 Variants:
 - **Add to an existing DocSet:** skip the `docset create` step; pass its known ID as `$ds`. Find it with `uv run dgml docset list | jq -r '.docsets[] | select(.name=="…") | .id'`.
+- **User-supplied DocSet id:** create it with `uv run dgml docset create --name "…" --id "$ds"` and skip the `jq -r .id` capture. Same grammar as `file add --id` (lowercase only).
 - **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome. Use `--auto-classify existing` instead when the workspace's DocSets are curated and the run must not create more — a file that fits none of them is left unassigned with `decision: "none"` for you to route.
 - **Recurse into subdirectories:** add `--recursive`.
 - **Hidden errors:** a PDF that fails to parse, render, or extract digital text still produces an entry — `soft_failed` (the `page_*`/`text_extraction_error` fields are set on its `file` entry) or `hard_failed` (the entry has an `error` object and no `file`). `dgml check` afterward is the authoritative whole-workspace health signal.
@@ -1127,11 +1128,13 @@ Check the response payload's `conflict_kind` (`"hash"` or `"path"`), `created`, 
 
 `file add --id <id>` fails with `CONFLICT` if another File holds that id with different content (under every policy, except `--on-conflict replace` re-ingesting a revised document under its own id). It fails with `INVALID_ARGUMENT` if the id is malformed, the path is a directory, or the policy would return an existing record carrying a different id — it never silently hands back an id you didn't ask for. `--id` is not allowed when the path is a directory.
 
+`docset create --id <id>` likewise fails with `CONFLICT` if a DocSet already holds that id (the existing DocSet is untouched) and with `INVALID_ARGUMENT` if the id is malformed.
+
 ## Things to remember
 
 - Ghostscript is the default PDF engine and must be installed system-wide (`brew install ghostscript` / `apt-get install ghostscript`) unless you switch engines. Without it, page rendering fails and `dgml check` will flag it. To avoid it entirely, set `[pdf] provider = "pypdfium2"` in the config (`pip install dgml[pdfium]`): PDFium then handles **both** page-image rendering and the page slicing `docset generate` needs, so no system binary is required.
 - A `docset delete` does **not** delete the underlying Files — they may belong to other DocSets. Use `file delete` to remove a File entirely.
-- Generated IDs are 12-char base-36 strings. Don't try to derive them; always pull them from JSON output. A File ID can also be **set** at add time with `file add --id <id>` (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit) — do that when the id is decided elsewhere and must match, not to guess an existing one.
+- Generated IDs are 12-char base-36 strings. Don't try to derive them; always pull them from JSON output. A File or DocSet ID can also be **set** at creation with `file add --id <id>` or `docset create --id <id>` (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit — a UUID qualifies) — do that when the id is decided elsewhere and must match, not to guess an existing one.
 - The JSON output schema is part of the public API. If a command's output shape looks wrong, the implementation is probably the source of truth — read [packages/dgml/src/dgml/cli.py](../../../packages/dgml/src/dgml/cli.py).
 
 ## Discover XML element subtrees and stake them on chain

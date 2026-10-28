@@ -29,6 +29,8 @@ import re
 import secrets
 import string
 
+from .errors import InvalidArgument
+
 ID_ALPHABET = string.ascii_lowercase + string.digits
 ID_LENGTH = 12
 
@@ -71,3 +73,17 @@ def is_record_id(value: str) -> bool:
     Wider than what :func:`new_id` generates, because a caller may supply their own. Says
     nothing about whether a record with this id *exists* — that is a store lookup."""
     return _RECORD_ID_RE.match(value) is not None
+
+
+def require_record_id(value: str, *, label: str) -> None:
+    """Raise :class:`InvalidArgument` unless ``value`` satisfies :func:`is_record_id`.
+
+    ``label`` names the id in the message (``"file id"``, ``"docset id"``). The value is
+    never case-folded for the caller: the id is how their system and this workspace
+    name the same record, so rewriting it would let the two diverge silently.
+    :data:`RECORD_ID_SHAPE` says outright that letters must be lowercase, which is the
+    whole of what a caller needs to fix it."""
+    if not is_record_id(value):
+        raise InvalidArgument(
+            f"{label} {value!r} is not well formed: it must be {RECORD_ID_SHAPE}."
+        )

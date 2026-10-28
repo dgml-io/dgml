@@ -1116,6 +1116,86 @@ def test_docset_create_show_list(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert any(d["id"] == docset_id for d in listed["docsets"])
 
 
+# --------------------------------------------------------------------------
+# `dgml docset create --id` — caller-supplied docset ids.
+# These lock the JSON/exit-code contract; the rule matrix itself is covered in
+# dgml-core's test_docsets.py.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("docset_id", ["q2-contracts", "123e4567-e89b-12d3-a456-426614174000"])
+def test_docset_create_id_flag_sets_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], docset_id: str
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "Contracts", "--id", docset_id])
+    assert rc == 0
+    assert _read_stdout(capsys)["id"] == docset_id
+    assert (ws / "docsets" / docset_id / "docset.json").is_file()
+
+    assert main(_ws_args(ws) + ["docset", "show", docset_id]) == 0
+    shown = _read_stdout(capsys)
+    assert shown["id"] == docset_id
+    assert shown["name"] == "Contracts"
+
+
+@pytest.mark.parametrize("bad", ["My_Set", "ab", "a b", "a/b"])
+def test_docset_create_id_rejects_malformed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    """Exit 1 with a structured envelope — not argparse's exit 2."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "X", "--id", bad])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+    assert not (ws / "docsets").exists()
+
+
+def test_docset_create_id_uppercase_uuid_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ids are lowercase-only, so an uppercase UUID is the likely mistake. The
+    message must say the rule (letters lowercase) rather than leaving the caller
+    to guess."""
+    import uuid
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "X", "--id", str(uuid.uuid4()).upper()])
+    assert rc == 1
+    err = _read_stderr(capsys)
+    assert err["error"]["code"] == "INVALID_ARGUMENT"
+    assert "lowercase" in err["error"]["message"]
+
+
+def test_docset_create_id_conflict_envelope(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    assert main(_ws_args(ws) + ["docset", "create", "--name", "First", "--id", "shared"]) == 0
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "Second", "--id", "shared"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "CONFLICT"
+
+    # The held DocSet survived — the whole point of the id guard.
+    main(_ws_args(ws) + ["docset", "show", "shared"])
+    assert _read_stdout(capsys)["name"] == "First"
+    main(_ws_args(ws) + ["docset", "list"])
+    assert len(_read_stdout(capsys)["docsets"]) == 1
+
+
 def test_docset_update_and_delete(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     ws = tmp_path / "ws"
     _init_ws(ws)

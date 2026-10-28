@@ -13,7 +13,8 @@
 from __future__ import annotations
 
 import pytest
-from dgml_core.ids import ID_ALPHABET, ID_LENGTH, is_record_id, new_id
+from dgml_core.errors import InvalidArgument
+from dgml_core.ids import ID_ALPHABET, ID_LENGTH, is_record_id, new_id, require_record_id
 
 
 def test_new_id_format() -> None:
@@ -42,6 +43,10 @@ def test_new_id_collisions_rare() -> None:
         "9-9_9",
         "invoice-2024-q1",
         "invoice_2024_q1",
+        # A canonical UUID, and its 32-hex form: ids decided by another
+        # system are the main reason a caller supplies one.
+        "123e4567-e89b-12d3-a456-426614174000",
+        "123e4567e89b12d3a456426614174000",
     ],
 )
 def test_is_record_id_accepts(value: str) -> None:
@@ -56,6 +61,8 @@ def test_is_record_id_accepts(value: str) -> None:
         "a" * 41,  # one past the ceiling
         "Z" * ID_LENGTH,
         "AbC",  # uppercase: would collide on a case-insensitive filesystem
+        "123E4567-E89B-12D3-A456-426614174000",  # uppercase UUID: lowercase it first
+        "{123e4567-e89b-12d3-a456-426614174000}",  # braced UUID form
         "-abc",  # leading separator
         "_abc",
         "a.b",
@@ -68,3 +75,13 @@ def test_is_record_id_accepts(value: str) -> None:
 )
 def test_is_record_id_rejects(value: str) -> None:
     assert not is_record_id(value)
+
+
+def test_require_record_id_passes_silently() -> None:
+    require_record_id("invoice-2024-q1", label="file id")
+
+
+def test_require_record_id_names_the_id_in_the_message() -> None:
+    with pytest.raises(InvalidArgument, match="docset id 'AbC' is not well formed") as exc_info:
+        require_record_id("AbC", label="docset id")
+    assert "lowercase" in str(exc_info.value)

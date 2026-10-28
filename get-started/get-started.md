@@ -251,7 +251,7 @@ Let's manually create a DocSet for Non-Traded REIT main files:
 ```bash
 uv run dgml docset create --name "NonTraded_REITs" --description "Primary property descriptions and assets"
 ```
-This returns a DocSet ID (e.g., `p9pjusnwg50l`).
+This returns a DocSet ID (e.g., `p9pjusnwg50l`). Pass `--id <id>` to choose it yourself, with the same grammar as `file add --id`.
 
 #### Assign a File to a DocSet
 To link an ingested file to your newly created DocSet:

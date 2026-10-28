@@ -82,7 +82,7 @@ at all — see [storage services](#storage-services-storage).
 │       ├── responses/<key>.json      #   one received response per request key
 │       └── inputs/<name>             #   inputs a resumed run restores
 ├── docsets/
-│   └── <docset_id>/                  # generated: 12-char base-36 ID
+│   └── <docset_id>/                  # generated, or set by `docset create --id`
 │       ├── docset.json               # { id, name, description, key_questions }
 │       ├── extraction-schema.rnc      # grounded extraction schema, RELAX NG Compact (optional)
 │       ├── extraction-guidance.md     # docset-level extraction guidance shown to the LLM (optional)
@@ -120,12 +120,10 @@ A generated ID is 12 lowercase alphanumerics — `~62` bits of entropy each, fro
 `secrets.choice`
 ([packages/dgml-core/src/dgml_core/ids.py](../packages/dgml-core/src/dgml_core/ids.py)).
 
-A File ID can also be **set by the caller** with `dgml file add --id`: 3 to 40
-characters using only lowercase letters, digits, hyphens and underscores, starting with a
-letter or digit. The generated form is a strict subset of that, so both shapes are valid
-everywhere an ID appears.
-
-DocSet IDs are always generated today.
+A File or DocSet ID can also be **set by the caller** with `dgml file add --id` or
+`dgml docset create --id`: 3 to 40 characters using only lowercase letters, digits, hyphens
+and underscores, starting with a letter or digit. The generated form is a strict subset
+of that, so both shapes are valid everywhere an ID appears.
 
 ## Page images (JPEG, edge bounds)
 

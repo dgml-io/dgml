@@ -106,7 +106,7 @@ class ConflictErrorKind(StrEnum):
 
     ``HASH`` / ``PATH`` are the :class:`dgml_core.files.ConflictKind` matches
     :meth:`~dgml_core.files.FileStore.add` refuses under ``on_conflict=error``;
-    ``ID`` is a caller-chosen file id already held; ``WORKSPACE`` is a workspace
+    ``ID`` is a caller-chosen File or DocSet id already held; ``WORKSPACE`` is a workspace
     id or path already taken. Wider than ``ConflictKind``, which names only the
     matches an ``AddFileResult`` can report.
     """

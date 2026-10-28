@@ -18,6 +18,8 @@ import logging
 
 from . import layout
 from .errors import (
+    ConflictError,
+    ConflictErrorKind,
     CorruptMetadata,
     DocSetNotFound,
     FileNotFound,
@@ -27,7 +29,7 @@ from .errors import (
     SchemaNotFound,
     now_iso,
 )
-from .ids import new_id
+from .ids import new_id, require_record_id
 from .models import DocSet, DocSetAssignment
 from .storage import Workspace
 from .workspace_ops import WorkspaceOps
@@ -77,10 +79,35 @@ class DocSetStore:
         description: str = "",
         *,
         key_questions: list[str] | None = None,
+        docset_id: str | None = None,
     ) -> DocSet:
+        """Create a DocSet and return it.
+
+        ``docset_id`` sets the DocSet's id instead of generating one. It shares
+        the File-id grammar (:data:`~dgml_core.ids.RECORD_ID_SHAPE`): lowercase
+        letters, digits, hyphens and underscores only. Raises
+        :class:`InvalidArgument` if it is malformed and :class:`ConflictError`
+        (``kind=ID``) if a DocSet already holds it; either way nothing is written.
+        """
         if not name.strip():
             raise InvalidArgument("docset name must not be empty")
-        docset_id = new_id()
+        if docset_id is None:
+            docset_id = new_id()
+        else:
+            require_record_id(docset_id, label="docset id")
+            # put_doc is an upsert on every backend, so writing under an id another
+            # DocSet holds would silently replace its manifest. Best-effort against
+            # a race (get_doc -> put_doc is not atomic), the same posture as
+            # FileStore.add and generate_unique_workspace_id.
+            held = self.ws.docs.get_doc(layout.Collection.DOCSETS, docset_id)
+            if held is not None:
+                raise ConflictError(
+                    f"docset id '{docset_id}' is already held by DocSet "
+                    f"'{held.get('name', '')}'. Pick an unused id, or delete "
+                    f"'{docset_id}' first.",
+                    kind=ConflictErrorKind.ID,
+                    existing_id=docset_id,
+                )
         ds = DocSet(
             id=docset_id,
             name=name,
@@ -88,7 +115,8 @@ class DocSetStore:
             key_questions=list(key_questions or []),
         )
         # No directory is created up front — the store owns container creation
-        # (put_doc writes the manifest). A fresh new_id never collides.
+        # (put_doc writes the manifest). A fresh new_id never collides; a
+        # supplied id was checked above.
         self.ws.docs.put_doc(layout.Collection.DOCSETS, docset_id, ds.to_json())
         return ds
 
