@@ -24,7 +24,14 @@ import json
 from pathlib import Path
 
 import pytest
-from dgml_core import DocSetStore, EmptyDocSet, GenerateFileResult, GenerateReport, Workspace
+from dgml_core import (
+    DocSetStore,
+    EmptyDocSet,
+    GenerateFileResult,
+    GenerateFileStatus,
+    GenerateReport,
+    Workspace,
+)
 from dgml_core.docset_generate import _load_schema_roster, _load_schema_seed, generate_docset
 from dgml_core.errors import DocSetNotFound, InvalidArgument
 
@@ -56,7 +63,9 @@ def test_generate_docset_raises_empty_docset(workspace: Workspace) -> None:
 def test_file_result_rows_match_the_cli_shape() -> None:
     """Conditional keys appear exactly when their pass ran or failed, in the
     CLI's key order — the report is the payload, so the two cannot drift."""
-    skipped = GenerateFileResult(status="skipped", file_id="f1", source="a.pdf", output="k/a")
+    skipped = GenerateFileResult(
+        status=GenerateFileStatus.SKIPPED, file_id="f1", source="a.pdf", output="k/a"
+    )
     assert skipped.to_json() == {
         "status": "skipped",
         "file_id": "f1",
@@ -65,7 +74,10 @@ def test_file_result_rows_match_the_cli_shape() -> None:
     }
 
     failed = GenerateFileResult(
-        status="failed", file_id="f2", source="b.pdf", error={"code": "X", "message": "m"}
+        status=GenerateFileStatus.FAILED,
+        file_id="f2",
+        source="b.pdf",
+        error={"code": "X", "message": "m"},
     )
     assert failed.to_json() == {
         "status": "failed",
@@ -75,7 +87,7 @@ def test_file_result_rows_match_the_cli_shape() -> None:
     }
 
     grounded = GenerateFileResult(
-        status="converted",
+        status=GenerateFileStatus.CONVERTED,
         file_id="f3",
         source="c.pdf",
         output="k/c",
@@ -96,7 +108,7 @@ def test_file_result_rows_match_the_cli_shape() -> None:
     }
 
     ungrounded = GenerateFileResult(
-        status="converted",
+        status=GenerateFileStatus.CONVERTED,
         file_id="f4",
         source="d.pdf",
         output="k/d",
@@ -119,7 +131,7 @@ def test_off_schema_concepts_key_follows_extend_schema() -> None:
     (refused) and `added_concepts` under extend-schema (coined and used)."""
     tally = {"count": 3, "distinct": 2, "examples": ["Foo", "Bar"]}
     result = GenerateFileResult(
-        status="converted",
+        status=GenerateFileStatus.CONVERTED,
         file_id="f1",
         source="a.pdf",
         output="k/a",
@@ -137,12 +149,17 @@ def test_report_to_json_builds_the_generate_envelope(workspace: Workspace) -> No
     """The envelope the CLI prints: summary counts come from the three lists,
     results concatenate in skipped + failed + converted order."""
     ds = DocSetStore(workspace).create(name="Invoices")
-    skipped = GenerateFileResult(status="skipped", file_id="f1", source="a.pdf", output="k/a")
+    skipped = GenerateFileResult(
+        status=GenerateFileStatus.SKIPPED, file_id="f1", source="a.pdf", output="k/a"
+    )
     failed = GenerateFileResult(
-        status="failed", file_id="f2", source="b.pdf", error={"code": "X", "message": "m"}
+        status=GenerateFileStatus.FAILED,
+        file_id="f2",
+        source="b.pdf",
+        error={"code": "X", "message": "m"},
     )
     converted = GenerateFileResult(
-        status="converted",
+        status=GenerateFileStatus.CONVERTED,
         file_id="f3",
         source="c.pdf",
         output="k/c",

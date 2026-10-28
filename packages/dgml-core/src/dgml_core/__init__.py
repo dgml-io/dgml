@@ -27,7 +27,12 @@ from .conversion import (
     make_converter,
 )
 from .dgml_output import DgmlDocument, read_dgml
-from .docset_generate import GenerateFileResult, GenerateReport, generate_docset
+from .docset_generate import (
+    GenerateFileResult,
+    GenerateFileStatus,
+    GenerateReport,
+    generate_docset,
+)
 from .docsets import DocSetStore
 
 # Exported in full, and pinned so by tests/test_error_codes.py.
@@ -353,6 +358,7 @@ __all__ = [
     "FileVersion",
     "FormatFamily",
     "GenerateFileResult",
+    "GenerateFileStatus",
     "GenerateReport",
     "GenerationConfigInvalid",
     "GenerationConfigMissing",

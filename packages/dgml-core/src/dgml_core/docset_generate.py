@@ -32,6 +32,7 @@ import tempfile
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,7 +58,13 @@ if TYPE_CHECKING:
     from .generation.schema import Schema
     from .style_config import StyleConfig
 
-__all__ = ["GenerateFileResult", "GenerateReport", "any_ocr_file", "generate_docset"]
+__all__ = [
+    "GenerateFileResult",
+    "GenerateFileStatus",
+    "GenerateReport",
+    "any_ocr_file",
+    "generate_docset",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -68,19 +75,28 @@ logger = logging.getLogger(__name__)
 _UNMATCHED_EXAMPLES = 10
 
 
+class GenerateFileStatus(StrEnum):
+    """One file's outcome in a :class:`GenerateReport`: the ``status`` value of
+    its row in the ``results`` array."""
+
+    CONVERTED = "converted"
+    #: Already generated; left as it was.
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class GenerateFileResult:
     """One file's outcome in a :class:`GenerateReport`.
 
-    ``status`` is ``"converted"``, ``"skipped"`` (already generated) or
-    ``"failed"``. Every other field is populated only where it applies —
+    Every field other than ``status`` is populated only where it applies —
     ``output`` on success, ``error`` on failure, and the per-pass fields
     (``grounded`` and friends, ``links``, ``label_error``, ``link_error``,
     ``off_schema_concepts``) only on a converted file, mirroring the CLI's
     conditional JSON keys. ``to_json`` renders exactly the row the CLI emits.
     """
 
-    status: str
+    status: GenerateFileStatus
     file_id: str
     source: str
     #: Store key of the rendered ``<stem>.dgml.xml`` (converted and skipped files).
@@ -108,7 +124,7 @@ class GenerateFileResult:
         """This file's row in the ``results`` array, keys in the CLI's order
         and present only where the matching pass ran or failed."""
         row: dict[str, Any] = {
-            "status": self.status,
+            "status": str(self.status),
             "file_id": self.file_id,
             "source": self.source,
         }
@@ -628,7 +644,7 @@ def generate_docset(
         ):
             failed_results.append(
                 GenerateFileResult(
-                    status="failed",
+                    status=GenerateFileStatus.FAILED,
                     file_id=fid,
                     source=name,
                     error={
@@ -655,7 +671,9 @@ def generate_docset(
             # `generate`) falls through and gets its tree built; _on_output
             # carries the existing dg:extraction over into the fresh render.
             skipped_results.append(
-                GenerateFileResult(status="skipped", file_id=fid, source=name, output=out_xml_key)
+                GenerateFileResult(
+                    status=GenerateFileStatus.SKIPPED, file_id=fid, source=name, output=out_xml_key
+                )
             )
             prior_stems[stem] = name
             prior_out_paths[name] = out_xml_key
@@ -683,7 +701,7 @@ def generate_docset(
             for fid, _out, _pref in group:
                 failed_results.append(
                     GenerateFileResult(
-                        status="failed",
+                        status=GenerateFileStatus.FAILED,
                         file_id=fid,
                         source=name,
                         error={
@@ -921,7 +939,7 @@ def generate_docset(
         # Each field set only when that step failed, like grounding_error,
         # which is present only when grounded is False.
         converted_by_name[name] = GenerateFileResult(
-            status="converted",
+            status=GenerateFileStatus.CONVERTED,
             file_id=filename_to_fid[name],
             source=name,
             output=xml_key,
@@ -1203,7 +1221,7 @@ def generate_docset(
                     )
                     failed_results.append(
                         GenerateFileResult(
-                            status="failed",
+                            status=GenerateFileStatus.FAILED,
                             file_id=fid,
                             source=name,
                             error={"code": GenerationFailed.code, "message": message},
