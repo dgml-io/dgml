@@ -31,6 +31,7 @@ from .docset_generate import (
     GenerateFileResult,
     GenerateFileStatus,
     GenerateReport,
+    JobRequest,
     generate_docset,
 )
 from .docsets import DocSetStore
@@ -375,6 +376,7 @@ __all__ = [
     "Issue",
     "IssueKind",
     "IssueTarget",
+    "JobRequest",
     "LabelModelUnreachable",
     "LegacyConfigPresent",
     "LinkOutcome",

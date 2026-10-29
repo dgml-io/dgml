@@ -55,7 +55,7 @@ from dgml_core.conversion import (
     require_converter,
 )
 from dgml_core.default_config import PROVIDER_API_KEYS, PROVIDER_MODELS
-from dgml_core.docset_generate import any_ocr_file, generate_docset
+from dgml_core.docset_generate import JobRequest, batch_stage_models, generate_docset
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     BatchJobInvalid,
@@ -811,10 +811,11 @@ def _positive_int(raw: str) -> int:
 #
 # A batch-capable command (1) adds its flags with _add_batch_arguments, (2)
 # rejects, before any work, a stage whose model has no batch backend with
-# _batch_preflight (BATCH_UNAVAILABLE, naming the stage and model), and (3)
-# reports what its batch stages did as the payload's `batch` block, built by
-# _batch_block from each stage's WaveStats.to_json() (or a {"skipped": ...}
-# entry). Without --batch none of this runs and the payload has no `batch` key.
+# _batch_preflight (BATCH_UNAVAILABLE, naming the stage and model) — or, for
+# `docset generate`, leaves that to `generate_docset` — and (3)
+# reports what its batch stages did as the payload's `batch` block: `enabled`
+# plus each stage's WaveStats.to_json() (or a {"skipped": ...} entry). Without
+# --batch none of this runs and the payload has no `batch` key.
 
 
 def _positive_float(raw: str) -> float:
@@ -905,14 +906,6 @@ def _batch_preflight(stages: Mapping[str, Any]) -> None:
 
     assert_batchable(stages)
     _log.info(f"[batch] batch mode on ({', '.join(stages)})")
-
-
-def _batch_block(stages: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-    """A command payload's ``batch`` block: ``enabled`` plus one entry per
-    stage — a batched stage's ``WaveStats.to_json()`` (counters and the cost
-    fields ``cost_usd`` / ``standard_cost_usd`` / ``saved_usd``), or
-    ``{"skipped": "<reason>"}`` for one that ran synchronously."""
-    return {"enabled": True, "stages": {name: dict(stats) for name, stats in stages.items()}}
 
 
 def _batch_log(args: argparse.Namespace) -> Callable[[str], None]:
@@ -2445,8 +2438,11 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 #
 # Every --batch run opens a batch job session (_start_batch_job): a plain
 # blocking run silently, for crash recovery; --no-wait / --job explicitly.
-# _dispatch_with_job closes it exactly once with how the run ended, and only
-# then emits what the run printed (one outcome per run).
+# `docset generate` instead hands the library a JobRequest, which opens the
+# session after its pre-flights and closes it itself (_note_closed_job keeps
+# it for the payload). _dispatch_with_job closes a session the command opened
+# exactly once with how the run ended, and only then emits what the run
+# printed (one outcome per run).
 
 
 def _active_batch_job() -> Any:
@@ -2455,6 +2451,22 @@ def _active_batch_job() -> Any:
     unless ``dgml_core.batch.jobs`` was already imported."""
     jobs = sys.modules.get("dgml_core.batch.jobs")
     return None if jobs is None else jobs.active_session()
+
+
+#: The session the library opened and closed for this run (`docset generate`
+#: under a JobRequest): no longer active, still what the payload reports on.
+_CLOSED_JOB: Any = None
+
+
+def _note_closed_job(session: Any) -> None:
+    global _CLOSED_JOB
+    _CLOSED_JOB = session
+
+
+def _run_batch_job() -> Any:
+    """This run's batch job session, running or already closed by the library."""
+    active = _active_batch_job()
+    return active if active is not None else _CLOSED_JOB
 
 
 def _begin_job_capture() -> None:
@@ -2588,9 +2600,11 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
     """:func:`_dispatch`, closing the batch job session a command opened.
 
     A command that runs in batch job mode opens its session itself (see
-    :func:`_start_batch_job`); this is the one place every exit path passes, so
-    the session is closed exactly once with how the run ended, and the output
-    the run held back is emitted only then. A run that paused
+    :func:`_start_batch_job`) or has the library open and close it (a
+    :class:`JobRequest`); this is the one place every exit path passes, so
+    the session is closed exactly once with how the run ended (a close is
+    idempotent), and the output the run held back is emitted only then. A
+    run that paused
     (:class:`BatchPending`, ``--no-wait``) is not an error: it prints the job's
     ``batch_job`` payload on stdout and exits 0. A run the nondeterminism guard
     stopped (:class:`BatchJobNondeterministic`) or that lost its lease has
@@ -2598,10 +2612,11 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
     emitted before. A run that leaves a failed, resumable job behind names it
     in its payload's ``batch.job`` (``error.details.batch.job`` of an error
     envelope)."""
+    _note_closed_job(None)
     try:
         rc = _dispatch(args, ws, fmt)
     except BatchPending as pending:
-        session = _active_batch_job()
+        session = _run_batch_job()
         command = session.manifest.command if session is not None else None
         if session is not None:
             session.close(pending)
@@ -2623,20 +2638,20 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
         _emit({"batch_job": block}, fmt)
         return 0
     except BatchJobNondeterministic as guard:
-        session = _active_batch_job()
+        session = _run_batch_job()
         if session is not None:
             session.close(guard)
         _end_job_capture()  # whatever the run emitted before is void
         return _emit_nondeterministic(guard, session, fmt)
     except BatchJobLeaseLost as lost:
         # Another process drives the job now: this run stopped, fenced.
-        session = _active_batch_job()
+        session = _run_batch_job()
         if session is not None:
             session.close(lost)
         _end_job_capture()
         return _emit_lease_lost(lost, session, fmt)
     except BaseException as exc:
-        session = _active_batch_job()
+        session = _run_batch_job()
         if session is not None:
             session.close(exc)
         if (fenced := _fenced(session)) is not None:
@@ -2652,7 +2667,7 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             batch = {name: value for name, value in (("job", job), ("deadline", deadline)) if value}
             return _emit_error(exc.code, str(exc), fmt, details={"batch": batch})
         raise
-    session = _active_batch_job()
+    session = _run_batch_job()
     job = None
     if session is not None:
         drift = session.nondeterministic
@@ -2692,6 +2707,38 @@ def _start_batch_job(
             return session
     from dgml_core.batch import start_session
 
+    request = _job_request(args, command=command, pinned=pinned)
+    session = start_session(
+        ws,
+        command=command,
+        argv=request.argv,
+        job_id=request.job_id,
+        wait=request.wait,
+        cwd=request.cwd,
+        log=request.log or _batch_log(args),
+        deadline_s=request.deadline_s,
+    )
+    # From here the run's output waits for the session's close (one outcome
+    # per run; a job left behind is named in the payload).
+    _begin_job_capture()
+    if not session.resumed:
+        # Name the job up front: if this run is interrupted (crash, kill,
+        # reboot, lost network), this id is what picks it up again. A run that
+        # finishes cleanly deletes its job, so the id only matters on failure.
+        _batch_log(args)(
+            f"[batch-job] job {session.job_id}: if this run is interrupted, "
+            f"continue it with `dgml batch resume {session.job_id}` "
+            "(`dgml batch list` also shows it)"
+        )
+    return session
+
+
+def _job_request(
+    args: argparse.Namespace, *, command: str, pinned: Mapping[str, str | bool] | None = None
+) -> JobRequest:
+    """This run's batch job as the library opens it: the job to continue
+    (``--job``), the run's mode (``--no-wait``, ``--batch-deadline``), and the
+    command line a resume replays."""
     # Stored canonical (abbreviated flags spelled in full): resume and the
     # `--no-wait` short-circuit inspect it token by token.
     argv = _canonical_argv(list(getattr(args, "raw_argv", [])))
@@ -2710,30 +2757,15 @@ def _start_batch_job(
             argv.append(flag if value else negated)
         else:
             argv += [flag, value]
-    log = _batch_log(args)
-    session = start_session(
-        ws,
-        command=command,
-        argv=argv,
+    return JobRequest(
         job_id=getattr(args, "job", None),
         wait=not getattr(args, "no_wait", False),
-        cwd=os.getcwd(),
-        log=log,
         deadline_s=_batch_deadline_seconds(args),
+        command=command,
+        argv=argv,
+        cwd=os.getcwd(),
+        log=_batch_log(args),
     )
-    # From here the run's output waits for the session's close (one outcome
-    # per run; a job left behind is named in the payload).
-    _begin_job_capture()
-    if not session.resumed:
-        # Name the job up front: if this run is interrupted (crash, kill,
-        # reboot, lost network), this id is what picks it up again. A run that
-        # finishes cleanly deletes its job, so the id only matters on failure.
-        log(
-            f"[batch-job] job {session.job_id}: if this run is interrupted, "
-            f"continue it with `dgml batch resume {session.job_id}` "
-            "(`dgml batch list` also shows it)"
-        )
-    return session
 
 
 def _reject_job_flags_without_batch(args: argparse.Namespace) -> None:
@@ -3897,11 +3929,13 @@ def _add_generate_subparser(
             "ANTHROPIC_API_KEY); no other configured key or api_base carries over."
         ),
     )
-    gen.add_argument("--window-size", type=int, default=10, help="Pages per transcription window.")
-    gen.add_argument("--temperature", type=float, default=0.0)
-    # Keep in step with ConvertOptions.max_tokens — see the note there for
-    # why the ceiling is 64000 rather than 32000.
-    gen.add_argument("--max-tokens", type=int, default=64000)
+    # These four default to None: generate_docset then uses ConvertOptions'
+    # own values, so the numbers are written down once, in the library.
+    gen.add_argument(
+        "--window-size", type=int, default=None, help="Pages per transcription window."
+    )
+    gen.add_argument("--temperature", type=float, default=None)
+    gen.add_argument("--max-tokens", type=int, default=None)
     gen.add_argument(
         "--transcription",
         choices=["text", "lines"],
@@ -3943,11 +3977,11 @@ def _add_generate_subparser(
     gen.add_argument(
         "--max-parallel-calls",
         type=int,
-        default=4,
+        default=None,
         help=(
             "Max documents transcribed concurrently. Windows within a document "
             "stay serial. Set to 1 to disable parallelism. Tune to your provider's "
-            "RPM tier (default: 4)."
+            "RPM tier."
         ),
     )
     gen.add_argument(
@@ -4161,68 +4195,52 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
     under ``--verbose``.
 
     Batch mode (--batch / --no-batch, else [generation] batch) is the CLI's to
-    set up: it is rejected here, before any work, when a stage it would batch
-    names a model whose provider has no batch backend — never a silent
-    full-price fallback — and the run's batch job session is opened here (see
-    `_start_batch_job`). Transcription always batches, and the labeling model
-    always serves a batch stage too: roster/gap planning and concept
-    descriptions batch under every vocabulary, the link pass uses it, and
-    labeling itself batches under a closed one, or per document under any
-    other (unless --no-batch-label).
+    turn on; the library does the rest as it does for any caller: it
+    pre-flights the stages it will batch (BATCH_UNAVAILABLE before any work,
+    never a silent full-price fallback), then opens the run's batch job from
+    the `JobRequest` built here and closes it however the run ends. A step of
+    `docset run` passes the run's own session instead.
     """
     from dgml_core.generation import (
         BatchOptions,
         load_generation_batch,
         load_generation_batch_label,
-        resolve_generation_config,
     )
 
     batch_opts: BatchOptions | None = None
-    batch_job = None
+    job: Any = None
     batch_enabled = args.batch if args.batch is not None else load_generation_batch(ws)
     if batch_enabled:
-        ds_store = DocSetStore(ws)
-        ds_store.get(args.docset_id)  # raises DocSetNotFound
-        file_ids = ds_store.list_files(args.docset_id)
-        # The models the pre-flight checks are the ones generate_docset
-        # resolves again below (deterministic, no I/O beyond config).
-        gen_cfg, _source = resolve_generation_config(
-            ws, config=args.generation_config, model=args.model, label_model=args.label_model
-        )
-        batch_stages = {"transcribe": gen_cfg.model, "label": gen_cfg.label_model}
-        from dgml_core.style_config import load_style_config
-
-        style_config = load_style_config(ws)
-        if style_config is not None and any_ocr_file(FileStore(ws), file_ids):
-            # Image style runs only for OCR files (the grounding gate), so a
-            # docset with none never reaches the style model.
-            batch_stages["style"] = style_config.model
-        if not args.no_semlinks:
-            batch_stages["links"] = gen_cfg.label_model
         batch_label = (
             args.batch_label if args.batch_label is not None else load_generation_batch_label(ws)
         )
-        _batch_preflight(batch_stages)
-        from dgml_core.batch.jobs import credential_ref
-
         batch_opts = BatchOptions(
-            poll_interval_s=args.batch_poll_interval,
-            label=batch_label,
-            log=_batch_log(args),
-            credentials={
-                "transcribe": credential_ref("generation", "transcribe", gen_cfg.api_key_env),
-                "label": credential_ref("generation", "label", gen_cfg.label_api_key_env),
-            },
+            poll_interval_s=args.batch_poll_interval, label=batch_label, log=_batch_log(args)
         )
-        batch_job = _start_batch_job(
-            args, ws, command="docset generate", pinned={"--batch-label": batch_label}
-        )
-        if batch_job.resumed:
-            _log.info(f"[batch-job] resuming {batch_job.job_id} (run {batch_job.manifest.runs})")
+        if getattr(args, "run_step", False):
+            job = _active_batch_job()  # one job spans every step of `docset run`
+        if job is None:
+            job = _job_request(
+                args, command="docset generate", pinned={"--batch-label": batch_label}
+            )
+            # The run's output waits for the job's close (one outcome per run;
+            # a job left behind is named in the payload).
+            _begin_job_capture()
     else:
         _reject_job_flags_without_batch(args)
 
-    report = generate_docset(
+    try:
+        report = _generate(args, ws, batch=batch_opts, job=job)
+    finally:
+        if isinstance(job, JobRequest):
+            _note_closed_job(job.session)
+    _emit(report.to_json(), fmt)
+    return 0
+
+
+def _generate(args: argparse.Namespace, ws: Workspace, *, batch: Any, job: Any) -> Any:
+    """`generate_docset` with the parsed flags mapped onto its parameters."""
+    return generate_docset(
         ws,
         args.docset_id,
         generation_config=args.generation_config,
@@ -4243,11 +4261,9 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         semlink_cache=not args.no_semlink_cache,
         semlink_verify=not args.no_semlink_verify,
         debug=args.debug,
-        batch=batch_opts,
-        job=batch_job,
+        batch=batch,
+        job=job,
     )
-    _emit(report.to_json(), fmt)
-    return 0
 
 
 #: Job state recording whether a `docset run` job had to generate the
@@ -4438,20 +4454,17 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             gen_cfg, _source = resolve_generation_config(
                 ws, config=args.generation_config, model=args.model, label_model=args.label_model
             )
-            # As `docset generate` checks: transcription, and the labeling model
-            # (planning and descriptions batch; labeling too unless --no-batch-label).
-            stages["generate.transcribe"] = gen_cfg.model
-            stages["generate.label"] = gen_cfg.label_model
             from dgml_core.style_config import load_style_config
 
-            style_section = load_style_config(ws)
-            if style_section is not None and any_ocr_file(
-                FileStore(ws), ds_store.list_files(args.docset_id)
-            ):
-                # As `docset generate` gates it: only OCR files reach the style model.
-                stages["generate.style"] = style_section.model
-            if not args.no_semlinks:
-                stages["generate.links"] = gen_cfg.label_model
+            # The stages `docset generate` batches, named as its step.
+            generate_stages = batch_stage_models(
+                FileStore(ws),
+                ds_store.list_files(args.docset_id),
+                gen_cfg,
+                load_style_config(ws),
+                semlinks=not args.no_semlinks,
+            )
+            stages.update({f"generate.{name}": model for name, model in generate_stages.items()})
             from dgml_core.generation import load_generation_batch_label
 
             # As `docset generate` pins it: a resume labels the same way

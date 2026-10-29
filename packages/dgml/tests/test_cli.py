@@ -7597,16 +7597,19 @@ def test_missing_chain_extra_reports_missing_extra(
     assert err["message"] == "The 'chain' extra is not installed. Run: pip install dgml[chain]"
 
 
-def test_generate_max_tokens_default_matches_the_library() -> None:
-    """The flag default and ConvertOptions.max_tokens are two copies of one
-    number. They have to move together: a CLI run that silently used a lower
-    ceiling than a library run would truncate replies the library completes,
-    and the failure shows up as an under-labeled chunk, not as an error."""
+def test_generate_pipeline_knobs_have_no_cli_default() -> None:
+    """The flags carry no copy of the pipeline's numbers: unset, they reach
+    generate_docset as None and ConvertOptions' own defaults apply (pinned in
+    the library suite). A second copy here would let a CLI run silently use a
+    lower max_tokens ceiling than a library run, and the failure would show
+    up as an under-labeled chunk, not as an error."""
     from dgml.cli import _build_parser
-    from dgml_core.generation.pipeline import ConvertOptions
 
     args = _build_parser().parse_args(["docset", "generate", "somedocset"])
-    assert args.max_tokens == ConvertOptions.max_tokens
+    assert args.window_size is None
+    assert args.temperature is None
+    assert args.max_tokens is None
+    assert args.max_parallel_calls is None
 
 
 def test_generate_max_tokens_default_clears_the_largest_observed_reply() -> None:

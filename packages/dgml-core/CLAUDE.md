@@ -31,8 +31,12 @@ Generating a DocSet is `generate_docset(ws, docset_id, ...)` (module
 [src/dgml_core/docset_generate.py](src/dgml_core/docset_generate.py)) — the
 whole `dgml docset generate` orchestration (transcription, labeling, grounding,
 semantic links, coverage, schema artifacts), returning a `GenerateReport`
-whose `to_json()` is exactly the CLI's payload. `convert_batch` underneath it
-is the raw pipeline for callers that bring their own files and options.
+whose `to_json()` is exactly the CLI's payload. Batch mode is
+`batch=BatchOptions(...)`, and `job=JobRequest()` puts the run under a batch
+job it opens (after its pre-flights) and closes itself, so an interrupted run
+is continued with `JobRequest(job_id=...)` rather than paid for again; the CLI
+calls it the same way. `convert_batch` underneath it is the raw pipeline for
+callers that bring their own files and options.
 
 ## Logging
 

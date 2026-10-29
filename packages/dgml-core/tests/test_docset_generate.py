@@ -21,19 +21,55 @@ preconditions, and the schema-seed loaders that moved here from `cli.py`.
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 from dgml_core import (
     DocSetStore,
     EmptyDocSet,
+    FileStore,
     GenerateFileResult,
     GenerateFileStatus,
     GenerateReport,
+    JobRequest,
     Workspace,
 )
-from dgml_core.docset_generate import _load_schema_roster, _load_schema_seed, generate_docset
-from dgml_core.errors import DocSetNotFound, InvalidArgument
+from dgml_core.docset_generate import (
+    _load_schema_roster,
+    _load_schema_seed,
+    batch_stage_models,
+    generate_docset,
+)
+from dgml_core.errors import BatchJobInvalid, BatchUnavailable, DocSetNotFound, InvalidArgument
+from dgml_core.generation import BatchOptions, resolve_generation_config
+from dgml_core.style_config import StyleConfig
+
+from .conftest import needs_gs, write_config
+
+_LABEL_MODEL = "anthropic/claude-sonnet-4-6"
+
+
+def _batch_seed(
+    workspace: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model: str = "anthropic/claude-haiku-4-5",
+    pdf: Path | None = None,
+) -> str:
+    """A docset under batchable-or-not generation models, holding *pdf*."""
+    write_config(workspace, {"generation": {"model": model, "label_model": _LABEL_MODEL}})
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-dummy")  # never used: no call is made
+    ds = DocSetStore(workspace).create(name="Batch")
+    if pdf is not None:
+        added = FileStore(workspace).add(pdf)
+        DocSetStore(workspace).add_file(ds.id, added.record.id)
+    return ds.id
+
 
 # ---------------------------------------------------------------------------
 # Raised preconditions
@@ -53,6 +89,182 @@ def test_generate_docset_raises_empty_docset(workspace: Workspace) -> None:
         generate_docset(workspace, ds.id)
     assert excinfo.value.code == "EMPTY_DOCSET"
     assert ds.id in str(excinfo.value)
+
+
+@needs_gs
+def test_batch_rejects_an_unbatchable_stage_before_any_spend(
+    workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library caller gets the same pre-flight the CLI does: a stage whose
+    model has no batch backend is BATCH_UNAVAILABLE, naming the stage, before
+    transcription runs."""
+    did = _batch_seed(
+        workspace, monkeypatch, model="openrouter/anthropic/claude-sonnet-4", pdf=sample_pdf
+    )
+    with (
+        patch("dgml_core.generation.convert_batch") as convert,
+        pytest.raises(BatchUnavailable) as excinfo,
+    ):
+        generate_docset(workspace, did, batch=BatchOptions())
+    assert "stage 'transcribe'" in str(excinfo.value)
+    convert.assert_not_called()
+
+
+def test_batch_preflight_runs_after_the_offline_checks(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch pre-flight is the last check: an empty docset is EMPTY_DOCSET
+    whatever its models could batch."""
+    did = _batch_seed(workspace, monkeypatch, model="openrouter/anthropic/claude-sonnet-4")
+    with pytest.raises(EmptyDocSet):
+        generate_docset(workspace, did, batch=BatchOptions())
+
+
+@needs_gs
+def test_pipeline_knobs_default_to_convert_options(
+    workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unset, the four pipeline knobs take ConvertOptions' own defaults, and
+    an explicit value still wins — the numbers live in one place."""
+    from dgml_core.generation import ConvertOptions
+
+    did = _batch_seed(workspace, monkeypatch, pdf=sample_pdf)
+    with patch("dgml_core.generation.convert_batch", return_value={}) as convert:
+        generate_docset(workspace, did)
+    opts = convert.call_args.kwargs["options"]
+    assert (opts.window_size, opts.temperature, opts.max_tokens, opts.max_parallel_docs) == (
+        ConvertOptions.window_size,
+        ConvertOptions.temperature,
+        ConvertOptions.max_tokens,
+        ConvertOptions.max_parallel_docs,
+    )
+    with patch("dgml_core.generation.convert_batch", return_value={}) as convert:
+        generate_docset(workspace, did, window_size=3, max_parallel_docs=1)
+    opts = convert.call_args.kwargs["options"]
+    assert (opts.window_size, opts.max_parallel_docs) == (3, 1)
+
+
+@needs_gs
+def test_progress_logs_from_worker_threads_reach_the_module_logger(
+    workspace: Workspace,
+    sample_pdf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The per-document sink runs on the pipeline's worker pool; its lines
+    still land on ``dgml_core.docset_generate`` at INFO, as a caller's handler
+    sees them, whichever thread emitted them."""
+    did = _batch_seed(workspace, monkeypatch, pdf=sample_pdf)
+
+    def fake_convert(
+        paths: object, *, options: object, on_output: Any, **_kw: object
+    ) -> dict[str, str]:
+        worker = threading.Thread(
+            target=on_output, args=(sample_pdf.name, "<xml><chunk>hello</chunk></xml>")
+        )
+        worker.start()
+        worker.join()
+        return {}
+
+    caplog.set_level(logging.INFO, logger="dgml_core.docset_generate")
+    with patch("dgml_core.generation.convert_batch", side_effect=fake_convert):
+        generate_docset(workspace, did, semlinks=False)  # no link model call to block
+    ground = [r for r in caplog.records if r.getMessage().startswith("[ground] ")]
+    assert ground, [r.getMessage() for r in caplog.records]
+    assert ground[0].name == "dgml_core.docset_generate"
+    assert ground[0].threadName != threading.main_thread().name
+
+
+@needs_gs
+def test_batch_credentials_default_from_the_resolved_config(
+    workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    did = _batch_seed(workspace, monkeypatch, pdf=sample_pdf)
+    opts = BatchOptions()
+    with patch("dgml_core.generation.convert_batch", return_value={}):
+        generate_docset(workspace, did, batch=opts)
+    assert opts.credentials == {
+        "transcribe": {"section": "generation", "field": "transcribe", "env": None},
+        "label": {"section": "generation", "field": "label", "env": None},
+    }
+
+
+@needs_gs
+def test_job_request_opens_only_once_the_preflights_pass(
+    workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run rejected at pre-flight never opened its job: nothing to resume,
+    nothing left in the workspace."""
+    from dgml_core.batch import list_jobs
+
+    did = _batch_seed(
+        workspace, monkeypatch, model="openrouter/anthropic/claude-sonnet-4", pdf=sample_pdf
+    )
+    request = JobRequest()
+    with pytest.raises(BatchUnavailable):
+        generate_docset(workspace, did, batch=BatchOptions(), job=request)
+    assert request.session is None
+    assert list_jobs(workspace) == []
+
+
+@needs_gs
+def test_job_request_runs_under_a_job_the_run_opens_and_closes(
+    workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller holds no session: the run opens the job after its
+    pre-flights, records it on the request, and closes it on the way out — a
+    finished blocking run's job is deleted with it."""
+    from dgml_core.batch import list_jobs
+    from dgml_core.batch.jobs import JobStatus, active_session
+
+    did = _batch_seed(workspace, monkeypatch, pdf=sample_pdf)
+    request = JobRequest()
+    with patch("dgml_core.generation.convert_batch", return_value={}):
+        report = generate_docset(workspace, did, batch=BatchOptions(), job=request)
+    assert report.total == 1
+    assert request.session is not None
+    assert request.session.manifest.command == "docset generate"
+    assert request.session.manifest.status == JobStatus.COMPLETED
+    assert active_session() is None  # closed, not left active for the caller
+    assert list_jobs(workspace) == []
+
+
+def test_a_job_needs_batch_mode(workspace: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
+    did = _batch_seed(workspace, monkeypatch)
+    with pytest.raises(BatchJobInvalid):
+        generate_docset(workspace, did, job=JobRequest())
+
+
+@needs_gs
+def test_batch_stage_models_gate_style_and_links(
+    workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Style is a stage only when a file is OCR; links only with semlinks on."""
+    did = _batch_seed(workspace, monkeypatch, pdf=sample_pdf)
+    store = DocSetStore(workspace)
+    file_ids = store.list_files(did)
+    gen_cfg, _source = resolve_generation_config(workspace)
+    style = StyleConfig(model="anthropic/claude-haiku-4-5")
+    files = FileStore(workspace)
+
+    assert batch_stage_models(files, file_ids, gen_cfg, None, semlinks=False) == {
+        "transcribe": "anthropic/claude-haiku-4-5",
+        "label": _LABEL_MODEL,
+    }
+    assert batch_stage_models(files, file_ids, gen_cfg, style, semlinks=True) == {
+        "transcribe": "anthropic/claude-haiku-4-5",
+        "label": _LABEL_MODEL,
+        "links": _LABEL_MODEL,
+    }
+    record = workspace.docs.get_doc("files", file_ids[0])
+    assert record is not None
+    workspace.docs.put_doc("files", file_ids[0], {**record, "text_mode": "ocr"})
+    assert batch_stage_models(files, file_ids, gen_cfg, style, semlinks=True) == {
+        "transcribe": "anthropic/claude-haiku-4-5",
+        "label": _LABEL_MODEL,
+        "style": "anthropic/claude-haiku-4-5",
+        "links": _LABEL_MODEL,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -481,7 +481,7 @@ def test_the_anthropic_google_style_tier_passes_the_pre_flight(
 ) -> None:
     """The anthropic_google family styles with its Gemini light tier, which
     now has a batch backend: the pre-flight accepts every stage."""
-    from dgml.cli import _batch_preflight
+    from dgml_core.batch import assert_batchable
     from dgml_core.default_config import PROVIDER_MODELS
 
     light = PROVIDER_MODELS["anthropic_google"]["light"]
@@ -491,11 +491,11 @@ def test_the_anthropic_google_style_tier_passes_the_pre_flight(
     checked: list[dict[str, Any]] = []
 
     def preflight(stages: dict[str, Any]) -> None:
-        _batch_preflight(stages)
+        assert_batchable(stages)
         checked.append(dict(stages))
         raise RuntimeError("stop after the pre-flight")
 
-    monkeypatch.setattr("dgml.cli._batch_preflight", preflight)
+    monkeypatch.setattr("dgml_core.batch.assert_batchable", preflight)
     with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
         assert main(_argv(ws, did, *_BATCH)) == 1
     assert _read_stderr(capsys)["error"]["message"].endswith("stop after the pre-flight")
