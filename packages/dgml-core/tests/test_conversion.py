@@ -203,6 +203,63 @@ def test_load_conversion_config_missing_provider_raises(tmp_path: Path) -> None:
         load_conversion_config(ws)
 
 
+@pytest.mark.parametrize(
+    ("key", "hint"),
+    [
+        ("doc", "('.doc' files are configured under conversion.docx)"),
+        ("xls", "('.xls' files are configured under conversion.xlsx)"),
+        ("ppt", "('.ppt' files are configured under conversion.pptx)"),
+    ],
+)
+def test_load_conversion_config_suffix_as_family_raises_with_hint(
+    tmp_path: Path, key: str, hint: str
+) -> None:
+    """A key that is a file extension rather than a family (dgml-io/dgml#274)
+    is rejected up front — nothing would ever look it up — and the message
+    names the family that extension belongs to."""
+    ws = Workspace(root=tmp_path)
+    _write_config(ws, {key: {"provider": _STUB}})
+    with pytest.raises(ConversionConfigInvalid) as excinfo:
+        load_conversion_config(ws)
+    message = str(excinfo.value)
+    assert f"unknown conversion family '{key}'" in message
+    assert "expected one of docx, xlsx, pptx" in message
+    assert hint in message
+
+
+def test_load_conversion_config_unknown_family_raises(tmp_path: Path) -> None:
+    """A key that is neither a family nor a known extension lists the families
+    and gives no extension hint."""
+    ws = Workspace(root=tmp_path)
+    _write_config(ws, {"docx": {"provider": _STUB}, "word": {"provider": _STUB}})
+    with pytest.raises(ConversionConfigInvalid) as excinfo:
+        load_conversion_config(ws)
+    message = str(excinfo.value)
+    assert message == "unknown conversion family 'word'; expected one of docx, xlsx, pptx"
+
+
+def test_load_conversion_config_wrong_case_family_raises_with_case_hint(tmp_path: Path) -> None:
+    """A family in the wrong case is told so, rather than being read as a file
+    extension (``DOCX`` normalises to ``.docx``, which maps to the same family)."""
+    ws = Workspace(root=tmp_path)
+    _write_config(ws, {"DOCX": {"provider": _STUB}})
+    with pytest.raises(ConversionConfigInvalid) as excinfo:
+        load_conversion_config(ws)
+    message = str(excinfo.value)
+    assert "unknown conversion family 'DOCX'" in message
+    assert "(family keys are lowercase: conversion.docx)" in message
+    assert "files are configured under" not in message
+
+
+def test_load_conversion_config_unknown_family_checked_before_shape(tmp_path: Path) -> None:
+    """The family check comes first: a bad key is reported as such even when
+    its table is also malformed."""
+    ws = Workspace(root=tmp_path)
+    _write_config(ws, {"doc": {}})
+    with pytest.raises(ConversionConfigInvalid, match="unknown conversion family 'doc'"):
+        load_conversion_config(ws)
+
+
 def test_dispatch_pdf_passthrough(tmp_path: Path) -> None:
     pdf = tmp_path / "x.pdf"
     pdf.write_bytes(b"%PDF-1.4 hi")

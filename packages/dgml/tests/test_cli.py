@@ -3912,6 +3912,58 @@ def test_file_add_directory_refuses_a_family_on_the_wrong_converter(
     assert not (ws / "files").exists() or not any((ws / "files").iterdir())
 
 
+def _write_extension_keyed_conversion(ws: Path) -> None:
+    """Append the dgml-io/dgml#274 mistake to the workspace config: a converter
+    under ``conversion.doc`` (an extension) rather than ``conversion.docx``."""
+    conversion = {"doc": {"provider": "translators_pdf.libreoffice:LibreOfficeConverter"}}
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+
+def test_file_add_rejects_extension_as_conversion_family(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `.doc` added under `[conversion.doc]` is a CONVERSION_CONFIG_INVALID that
+    names the right key, not UNSUPPORTED_FILE_TYPE as if nothing were configured
+    (dgml-io/dgml#274). No record is created."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_extension_keyed_conversion(ws)
+    src = tmp_path / "report.doc"
+    src.write_bytes(b"\xd0\xcf\x11\xe0 not really a doc")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc != 0
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "unknown conversion family 'doc'" in err["message"]
+    assert "'.doc' files are configured under conversion.docx" in err["message"]
+    assert not (ws / "files").exists() or not any((ws / "files").iterdir())
+
+
+def test_file_add_directory_rejects_extension_as_conversion_family(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A folder add under `[conversion.doc]` fails up front rather than silently
+    skipping every `.doc` as an unconfigured type (dgml-io/dgml#274)."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_extension_keyed_conversion(ws)
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "report.doc").write_bytes(b"\xd0\xcf\x11\xe0 not really a doc")
+    _write_text_pdf(src / "a.pdf", ["Page one"])
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc != 0
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "unknown conversion family 'doc'" in err["message"]
+    assert not (ws / "files").exists() or not any((ws / "files").iterdir())
+
+
 @needs_gs
 def test_file_add_directory_mixed_soft_and_hard_fails(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]

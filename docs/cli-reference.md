@@ -1147,6 +1147,7 @@ Errors (run-level, error envelope + exit 1):
 | `EMPTY_DOCSET` | DocSet exists but has no files assigned. |
 | `GENERATION_CONFIG_MISSING` | A generation model can't be resolved — neither the per-task field (`generation.model` / `generation.label_model`) nor its `[models]` tier (`standard` / `advanced`) is set in the merged config. |
 | `GENERATION_CONFIG_INVALID` | The `generation` section is malformed (bad model string, both `api_key` and `api_key_env` set, etc.). A **pre-flight check** (before any transcription spend) also raises this for a model string with no resolvable provider. |
+| `CONVERSION_CONFIG_INVALID` | The `conversion` section is malformed or has a key that is not a format family (`conversion.doc` instead of `conversion.docx`). The section is loaded up front, so this fails the run even when every file in the DocSet is a PDF. |
 | `AUTH_ERROR` | Pre-flight check: the API key for `model` or `label_model`'s provider is absent (and no `api_key` / `api_key_env` set). Skipped when `generation.api_base` is set, since a custom endpoint may authenticate differently. |
 
 > stdout is a single JSON object. The transcription / labeling / render
@@ -2108,7 +2109,7 @@ Error codes that can come back on `file add`:
 | `TEXT_EXTRACTION_CONFIG_INVALID` | `--text-mode hybrid` but the optional `text_extraction` section in `<workspace>/config.toml` is malformed. No record is created. |
 | `UNSUPPORTED_FILE_TYPE` | Path is not a `.pdf` and is not a convertible source with a converter configured for its format family. |
 | `INVALID_PDF` | File does not start with the `%PDF-` magic. |
-| `CONVERSION_CONFIG_INVALID` | The `conversion` section of `<workspace>/config.toml` is malformed or names an unresolvable/invalid provider. |
+| `CONVERSION_CONFIG_INVALID` | The `conversion` section of `<workspace>/config.toml` is malformed, has a key that is not a format family (`conversion.doc` instead of `conversion.docx`), or names an unresolvable/invalid provider. |
 | `CONFLICT` | Hash- or path-conflict and `--on-conflict error`; or `--id <id>` naming an id another File already holds (`conflict_kind: "id"`, under any policy). (Also `workspace create --id <id>` when the store of workspaces already holds that id.) |
 | `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
@@ -3435,7 +3436,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `UNSUPPORTED_FILE_TYPE` | hard | `file add` path is neither a PDF nor a convertible source. |
 | `INVALID_PDF` | hard | File does not start with the `%PDF-` magic. |
 | `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; `docset create --id <id>` naming an id a DocSet already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
-| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed, or a family's converter cannot be resolved or does not handle that family's file types (checked before a file is added or gathered, so a misconfigured family is one error, not one per file). |
+| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed or has a key that is not a format family (`conversion.doc` instead of `conversion.docx`), or a family's converter cannot be resolved or does not handle that family's file types (checked before a file is added or gathered, so a misconfigured family is one error, not one per file). |
 | `CONVERSION_FAILED` | hard / soft | A docx/xlsx/pptx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
 | `OCR_CONFIG_MISSING` | hard | `--text-mode ocr`/`hybrid` with no `ocr` config section. |
 | `OCR_CONFIG_INVALID` | hard | The `ocr` config section has invalid fields, or names a provider that cannot be resolved. |

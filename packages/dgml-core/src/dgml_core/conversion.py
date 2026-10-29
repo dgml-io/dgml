@@ -329,10 +329,11 @@ def load_conversion_config(workspace: Workspace) -> dict[FormatFamily, Converter
     Returns a mapping of :class:`FormatFamily` to its :class:`ConverterConfig`.
     Only families explicitly configured are present — there are no defaults, so
     an absent family means that format is unsupported. A key that is not a
-    family (``conversion.doc``, say) is shape-checked like the rest and then left
-    out: nothing would ever look it up (dgml-io/dgml#274 tracks rejecting it
-    instead). A missing config file or missing ``conversion`` section yields an
-    empty dict.
+    family (``conversion.doc``, ``conversion.word``) is rejected: nothing would
+    ever look it up, so the converter it names would silently never run. When
+    the key is a convertible suffix (``doc``, ``xls``), the error names the
+    family it belongs to. A missing config file or missing ``conversion``
+    section yields an empty dict.
 
     Validates only the *generic shape* — each family is an object with a
     non-empty string ``provider``. It deliberately does **not** import the
@@ -344,7 +345,8 @@ def load_conversion_config(workspace: Workspace) -> dict[FormatFamily, Converter
     :func:`make_converter`, when a document is actually converted.
 
     Raises :class:`ConversionConfigInvalid` only for a malformed *shape* (the
-    section or a family isn't an object, or ``provider`` is missing/blank).
+    section or a family isn't an object, a key isn't a format family, or
+    ``provider`` is missing/blank).
     """
     section = load_merged_config(workspace).get(ConfigSection.CONVERSION)
     if section is None:
@@ -353,7 +355,8 @@ def load_conversion_config(workspace: Workspace) -> dict[FormatFamily, Converter
         raise ConversionConfigInvalid("'conversion' must be a table")
 
     configs: dict[FormatFamily, ConverterConfig] = {}
-    for family, family_section in section.items():
+    for key, family_section in section.items():
+        family = _require_family(key)
         if not isinstance(family_section, dict):
             raise ConversionConfigInvalid(f"'conversion.{family}' must be a table")
         provider = family_section.get("provider")
@@ -364,6 +367,32 @@ def load_conversion_config(workspace: Workspace) -> dict[FormatFamily, Converter
         # Keep the section verbatim (minus provider). The class is resolved and
         # these fields validated lazily, in make_converter — see the docstring.
         options = {k: v for k, v in family_section.items() if k != "provider"}
-        if family in FormatFamily.__members__.values():
-            configs[FormatFamily(family)] = ConverterConfig(provider=provider, options=options)
+        configs[family] = ConverterConfig(provider=provider, options=options)
     return configs
+
+
+def _require_family(key: str) -> FormatFamily:
+    """The :class:`FormatFamily` a ``conversion.<key>`` table configures.
+
+    Raises :class:`ConversionConfigInvalid` for a key that is not a family.
+    Converters are looked up by family only, so a converter under any other key
+    (``conversion.doc``, ``conversion.word``) would load and never run — the
+    file types it was meant for would be refused as having no converter. The
+    message lists the families and, for a key that is a convertible suffix
+    (``doc``, ``xls``), the family that suffix belongs to. A family spelled in
+    the wrong case (``DOCX``) is told so, not that it is an extension.
+    """
+    try:
+        return FormatFamily(key)
+    except ValueError:
+        pass
+    families = ", ".join(FormatFamily)
+    message = f"unknown conversion family '{key}'; expected one of {families}"
+    if key.lower() in FormatFamily.__members__.values():
+        message += f" (family keys are lowercase: conversion.{key.lower()})"
+    else:
+        suffix = _normalize_suffix(key)
+        family = family_for_suffix(suffix)
+        if family is not None:
+            message += f" ('{suffix}' files are configured under conversion.{family})"
+    raise ConversionConfigInvalid(message)

@@ -55,6 +55,12 @@ row_gap = 4
 Only families you configure are supported. A family you omit stays
 unsupported — there is no implicit fallback to some default tool.
 
+Keys are format *families*, not file extensions: `.doc` files are handled by
+the `conversion.docx` converter, `.xls` by `conversion.xlsx`, and `.ppt` by
+`conversion.pptx`. Any other key under `[conversion]` (`conversion.doc`,
+`conversion.word`) is rejected with `CONVERSION_CONFIG_INVALID` when the
+config is loaded, since nothing would ever look it up.
+
 ## Provided converters
 
 All of the converters below are referenced by their dotted path in the
@@ -247,6 +253,10 @@ file attestation key off the stored original document, not the converted PDF.
 - **"no converter configured for .xlsx …"** — add a `conversion.xlsx`
   (or `.docx`, `.pptx`) entry to `config.toml` pointing at a converter. This appears
   both when adding a file and when generating.
+- **"unknown conversion family 'doc'; expected one of docx, xlsx, pptx ('.doc'
+  files are configured under conversion.docx)"** — the key under
+  `[conversion]` is a file extension or some other name, not a format family.
+  Rename the table to the family the message names.
 - **"converter 'xlsx-islands' (conversion.pptx.provider) does not handle
   '.pptx' …"** — the family's `provider` names a converter whose
   `input_formats` doesn't include that file type. Point the family at a
