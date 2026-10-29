@@ -46,21 +46,23 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
         # (transcription → labeling/value-extraction → schema generation).
         "light": "gemini/gemini-3.5-flash-lite",
         "standard": "anthropic/claude-haiku-5-5",
-        "advanced": "anthropic/claude-sonnet-5",
-        "expert": "anthropic/claude-opus-5",
+        "advanced": "anthropic/claude-sonnet-5-5",
+        "expert": "anthropic/claude-opus-5-5",
     },
     "anthropic": {
         # `advanced` (labeling, value extraction) and `expert` (schema
         # generation) carry the reasoning-heavy work, so they track the current
-        # Sonnet/Opus generation. Both allow 128K output tokens — twice the
-        # previous generation's ceiling, which matters for value extraction on
-        # charge-heavy documents (see grounded._DEFAULT_MAX_COMPLETION_TOKENS).
+        # Sonnet/Opus generation. Both allow 128K output tokens, which matters
+        # for value extraction on charge-heavy documents (see
+        # grounded._DEFAULT_MAX_COMPLETION_TOKENS). Neither accepts a forced
+        # tool_choice or `thinking: disabled`; `llm._build_completion_kwargs`
+        # sends the nearest request each accepts.
         # `light`/`standard` run on Haiku 5.5, which also allows 128K output
         # and does the cheap classification and transcription work.
         "light": "anthropic/claude-haiku-5-5",
         "standard": "anthropic/claude-haiku-5-5",
-        "advanced": "anthropic/claude-sonnet-5",
-        "expert": "anthropic/claude-opus-5",
+        "advanced": "anthropic/claude-sonnet-5-5",
+        "expert": "anthropic/claude-opus-5-5",
     },
     "google": {
         "light": "gemini/gemini-3.5-flash-lite",

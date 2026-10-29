@@ -154,7 +154,7 @@ family default:
 ```toml
 [models]
 family = "anthropic_google"
-expert = "anthropic/claude-opus-5"
+expert = "anthropic/claude-opus-5-5"
 ```
 
 To pin a specific model for one task, add its per-task section (it overrides the
@@ -164,7 +164,7 @@ them to this workspace only (it deep-merges over the user config):
 ```toml
 [generation]
 model = "anthropic/claude-haiku-5-5"
-label_model = "anthropic/claude-sonnet-5"
+label_model = "anthropic/claude-sonnet-5-5"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [classification]

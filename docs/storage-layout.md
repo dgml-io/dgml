@@ -548,8 +548,8 @@ family (an explicit tier always overrides its family default):
 family   = "anthropic_google"
 light    = "gemini/gemini-3.5-flash-lite"  # classification, style
 standard = "anthropic/claude-haiku-5-5"    # transcription, text extraction
-advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
-expert   = "anthropic/claude-opus-5"       # schema generation
+advanced = "anthropic/claude-sonnet-5-5"   # labeling, value extraction
+expert   = "anthropic/claude-opus-5-5"     # schema generation
 ```
 
 (The tier→task mapping lives in code and may change; it is not written into the
@@ -579,7 +579,7 @@ from the model it was written beside.
 family = "anthropic_google"
 anthropic_api_key_env = "ANTHROPIC_API_KEY"   # onto every keyless anthropic/… model
 google_api_key_env    = "GEMINI_API_KEY"      # … and every keyless gemini/… one
-expert          = "anthropic/claude-opus-5"
+expert          = "anthropic/claude-opus-5-5"
 expert_api_key_env = "OPUS_KEY"               # this tier's own key …
 expert_api_base = "https://proxy.example"     # … and endpoint
 ```
@@ -609,7 +609,7 @@ expert_api_base = "https://proxy.example"     # … and endpoint
   change across dgml upgrades** — and in a mixed family may belong to another
   provider (in `anthropic_google`, `light` is a Gemini model, so `light_api_key`
   there must be a Google key). To know which model a key is sent to, pin the tier
-  beside it (`expert = "anthropic/claude-opus-5"`).
+  beside it (`expert = "anthropic/claude-opus-5-5"`).
 - **Per provider**: `anthropic_api_key`, `google_api_key`, `openai_api_key` (or
   the `_env` form) merges like any other setting — the highest layer that sets
   either form wins, so a key in `DGML_MODELS__ANTHROPIC_API_KEY_ENV` overrides one
@@ -733,7 +733,7 @@ credentials.
 
 ```toml
 [grounded]
-schema_model = "anthropic/claude-opus-5"
+schema_model = "anthropic/claude-opus-5-5"
 values_model = "gemini/gemini-3.1-pro-preview"
 schema_api_key_env = "ANTHROPIC_API_KEY"
 values_api_key_env = "GEMINI_API_KEY"
@@ -789,7 +789,7 @@ half as much, so the stronger tier was not earning its price on this task. Set
 ```toml
 [generation]
 # Overrides (optional — the tiers cover both by default):
-label_model = "anthropic/claude-opus-5"
+label_model = "anthropic/claude-opus-5-5"
 # Anthropic extended thinking for both passes. Default "disabled".
 thinking = "adaptive"
 ```

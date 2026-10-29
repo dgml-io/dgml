@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 import threading
@@ -837,6 +838,9 @@ def test_is_openai_model_rejects_other_providers(model: str) -> None:
 
 def test_prefill_supported_on_anthropic_but_not_openai_or_gemini() -> None:
     assert llm.supports_assistant_prefill("anthropic/claude-sonnet-4-6") is True
+    # The current Opus and Sonnet refuse a prefilled turn (measured, 400).
+    assert llm.supports_assistant_prefill("anthropic/claude-opus-5-5") is False
+    assert llm.supports_assistant_prefill("anthropic/claude-sonnet-5-5") is False
     # Gemini refuses a trailing model turn outright ("Requests ending with a
     # model turn are not supported", 400) — see supports_assistant_prefill and
     # test_prefill_support.py for what the earlier assumption cost.
@@ -1143,6 +1147,118 @@ def test_between_tools_is_sonnet_55_off_switch() -> None:
         llm.LLMConfig(model="anthropic/claude-sonnet-5-5", thinking="between_tools"), messages=msgs
     )
     assert kwargs["thinking"] == {"type": "between_tools"}
+
+
+def test_disabled_thinking_becomes_between_tools_on_sonnet_55() -> None:
+    """Sonnet 5.5 answers `{"type": "disabled"}` with a 400 naming
+    `between_tools` as its off switch, so a config that says "disabled" — the
+    generation default — must reach it as `between_tools`."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-sonnet-5-5", thinking="disabled"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert kwargs["thinking"] == {"type": "between_tools"}
+
+
+@pytest.mark.parametrize("mode", ["disabled", "between_tools"])
+def test_thinking_off_becomes_lowest_effort_on_opus_55(mode: str) -> None:
+    """Opus 5.5 rejects both off switches; adaptive thinking at the lowest
+    effort is the nearest request it accepts."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-opus-5-5", thinking=mode),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert kwargs["reasoning_effort"] == "low"
+    assert "thinking" not in kwargs
+
+
+def test_adaptive_thinking_unchanged_on_opus_55() -> None:
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-opus-5-5", thinking="adaptive"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert "reasoning_effort" not in kwargs
+
+
+_TWO_TOOLS = [
+    {"type": "function", "function": {"name": "lookup", "parameters": {}}},
+    {"type": "function", "function": {"name": "submit", "parameters": {}}},
+]
+
+
+@pytest.mark.parametrize("model", ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"])
+def test_named_tool_choice_becomes_auto_over_that_tool_alone(model: str) -> None:
+    """These models answer any forced tool_choice with a 400. Sending "auto"
+    over only the forced function keeps that call the model's only option, and
+    the choice no longer being forced lets reasoning_effort through."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model=model, reasoning_effort="high"),
+        messages=[{"role": "user", "content": "hi"}],
+        tools=_TWO_TOOLS,
+        tool_choice={"type": "function", "function": {"name": "submit"}},
+    )
+    assert kwargs["tool_choice"] == "auto"
+    assert [t["function"]["name"] for t in kwargs["tools"]] == ["submit"]
+    assert kwargs["reasoning_effort"] == "high"
+
+
+def test_required_tool_choice_becomes_auto_over_every_tool() -> None:
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-opus-5-5"),
+        messages=[{"role": "user", "content": "hi"}],
+        tools=_TWO_TOOLS,
+        tool_choice="required",
+    )
+    assert kwargs["tool_choice"] == "auto"
+    assert kwargs["tools"] == _TWO_TOOLS
+
+
+def test_forced_tool_choice_kept_where_supported() -> None:
+    """Only the models that reject forcing lose it."""
+    for model in ("anthropic/claude-opus-5", "anthropic/claude-haiku-5-5", "openai/gpt-5.4"):
+        kwargs = llm._build_completion_kwargs(
+            llm.LLMConfig(model=model),
+            messages=[{"role": "user", "content": "hi"}],
+            tools=_TWO_TOOLS,
+            tool_choice={"type": "function", "function": {"name": "submit"}},
+        )
+        assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "submit"}}, model
+        assert kwargs["tools"] == _TWO_TOOLS, model
+
+
+def test_opus_55_lowest_effort_reaches_the_wire_as_adaptive_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Opus 5.5 off-switch substitute relies on litellm translating
+    `reasoning_effort` into adaptive thinking plus an effort, not into the
+    `budget_tokens` form Opus 5.5 rejects. Capture the request body litellm
+    would send to pin that."""
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    sent: list[dict[str, Any]] = []
+
+    def capture(self: Any, url: str, data: Any = None, json: Any = None, **_kw: Any) -> Any:
+        import json as _json
+
+        sent.append(json if json is not None else _json.loads(data))
+        raise RuntimeError("captured, not sent")
+
+    monkeypatch.setattr(HTTPHandler, "post", capture)
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-opus-5-5", api_key="k", thinking="disabled"),
+        messages=[{"role": "user", "content": "hi"}],
+        tools=_TWO_TOOLS,
+        tool_choice={"type": "function", "function": {"name": "submit"}},
+    )
+    # litellm re-raises the capture as its own error type; the body is the check.
+    with contextlib.suppress(Exception):
+        litellm.completion(**kwargs, max_retries=0)
+    (body,) = sent
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "low"}
+    assert body["tool_choice"] == {"type": "auto"}
+    assert [t["name"] for t in body["tools"]] == ["submit"]
 
 
 def test_thinking_omitted_when_unset() -> None:

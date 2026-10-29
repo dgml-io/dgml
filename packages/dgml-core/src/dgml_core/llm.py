@@ -22,7 +22,9 @@ consistent:
   thinking (``reasoning_effort``) together with a forced ``tool_choice``.
   The wrapper drops ``reasoning_effort`` for Anthropic-routed models
   when ``tool_choice`` is forced; callers state what they want and the
-  wrapper omits fields the provider would reject.
+  wrapper omits fields the provider would reject. Some models reject a
+  forced ``tool_choice`` or ``thinking: disabled`` outright; the wrapper
+  sends the nearest request they accept instead.
 - **Provider-aware message shaping.** Prompt-cache markers
   (``cache_control``) are Anthropic-only, and continuing a length-truncated
   reply by prefilling an assistant turn works on Anthropic ONLY. OpenAI treats
@@ -134,10 +136,32 @@ GEMINI_MODEL_PATTERNS = [r"gemini", r"vertex_ai", r"google"]
 # 17-25% of documents in every claude-sonnet-5 transcriber draw, and because F1
 # is computed over the survivors the arm then scored *highest* of the sweep.
 # claude-haiku-5-5 refuses it the same way (litellm's metadata agrees:
-# `supports_assistant_prefill: False`). Older Claude models such as
-# claude-sonnet-4-6 still prefill, so this stays a narrow list rather than a
-# blanket rule.
-ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5", r"claude-haiku-5"]
+# `supports_assistant_prefill: False`), and so do claude-sonnet-5-5 (matched by
+# the sonnet-5 pattern) and claude-opus-5-5, both measured with no `thinking`
+# field sent. Older Claude models such as claude-sonnet-4-6 still prefill, so
+# this stays a narrow list rather than a blanket rule.
+ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5", r"claude-haiku-5", r"claude-opus-5-5"]
+
+# Anthropic models that reject a forced `tool_choice`. Both forced shapes —
+# `{"type": "any"}` (litellm's spelling of "required") and `{"type": "tool",
+# ...}` (a named function) — answer
+#
+#   400 'tool_choice: type "tool" and "any" are not supported for this model.'
+#
+# Measured on claude-opus-5-5 and claude-sonnet-5-5. `_build_completion_kwargs`
+# sends "auto" to these models instead and, when the forced choice named a
+# function, narrows `tools` to that function, so the only call the model can
+# make is still the one the caller forced. Both models answer a single-tool
+# "auto" request with the call.
+ANTHROPIC_NO_FORCED_TOOL_CHOICE_PATTERNS = [r"claude-opus-5-5", r"claude-sonnet-5-5"]
+
+# Anthropic models that reject `thinking: {"type": "disabled"}` (a 400 on both,
+# measured), split by the nearest request each accepts. Claude Sonnet 5.5 turns
+# thinking off with "between_tools". Claude Opus 5.5 cannot turn it off at all:
+# it rejects "between_tools" too, and its error asks for adaptive thinking with
+# an effort, so the lowest effort is as close to "off" as it gets.
+ANTHROPIC_BETWEEN_TOOLS_OFF_PATTERNS = [r"claude-sonnet-5-5"]
+ANTHROPIC_THINKING_ALWAYS_ON_PATTERNS = [r"claude-opus-5-5"]
 
 # Accepted values for `LLMConfig.thinking`, Anthropic's extended-thinking switch.
 #
@@ -689,6 +713,51 @@ def _is_tool_choice_forced(tool_choice: Any) -> bool:
     return False
 
 
+def supports_forced_tool_choice(model: str) -> bool:
+    """Does *model* accept a ``tool_choice`` that forces a call?
+
+    ``False`` for the Anthropic models in
+    :data:`ANTHROPIC_NO_FORCED_TOOL_CHOICE_PATTERNS`; ``True`` for everything
+    else, so an unrecognized id keeps the caller's choice.
+    """
+    m = model.lower()
+    return not any(re.search(p, m) for p in ANTHROPIC_NO_FORCED_TOOL_CHOICE_PATTERNS)
+
+
+def _unforce_tool_choice(
+    tools: list[dict[str, Any]] | None, tool_choice: str | dict[str, Any]
+) -> tuple[list[dict[str, Any]] | None, str]:
+    """``"auto"`` in place of a forced *tool_choice*, for a model that rejects forcing.
+
+    A choice naming one function also narrows *tools* to that function, so
+    under ``"auto"`` the only call the model can make is still the forced one.
+    A name that matches no tool leaves *tools* as they are.
+    """
+    if isinstance(tool_choice, dict) and tools:
+        name = tool_choice.get("function", {}).get("name")
+        named = [t for t in tools if t.get("function", {}).get("name") == name]
+        if named:
+            tools = named
+    return tools, "auto"
+
+
+def _thinking_kwargs(model: str, mode: str) -> dict[str, Any]:
+    """The request fields that ask an Anthropic *model* for thinking *mode*.
+
+    Usually just ``{"thinking": {"type": mode}}``. A model that rejects the
+    mode gets the nearest request it accepts instead: see
+    :data:`ANTHROPIC_BETWEEN_TOOLS_OFF_PATTERNS` and
+    :data:`ANTHROPIC_THINKING_ALWAYS_ON_PATTERNS`.
+    """
+    m = model.lower()
+    if mode != "adaptive" and any(re.search(p, m) for p in ANTHROPIC_THINKING_ALWAYS_ON_PATTERNS):
+        # litellm sends this as adaptive thinking at the lowest effort.
+        return {"reasoning_effort": "low"}
+    if mode == "disabled" and any(re.search(p, m) for p in ANTHROPIC_BETWEEN_TOOLS_OFF_PATTERNS):
+        return {"thinking": {"type": "between_tools"}}
+    return {"thinking": {"type": mode}}
+
+
 def _require_supported_model(model: str, api_base: str | None) -> None:
     """Fail fast when litellm doesn't recognize *model*.
 
@@ -770,6 +839,13 @@ def _build_completion_kwargs(
     ``thinking`` follows the same shape: sent only to Anthropic-routed
     models, and only when ``reasoning_effort`` did not already claim the
     field.
+
+    A model that rejects a forced ``tool_choice`` gets ``"auto"`` instead,
+    with ``tools`` narrowed to the forced function (see
+    :func:`_unforce_tool_choice`); the choice is then no longer forced, so
+    ``reasoning_effort`` is kept. A model that rejects the configured
+    ``thinking`` mode gets the nearest one it accepts (see
+    :func:`_thinking_kwargs`).
     """
     _require_supported_model(config.model, config.api_base)
     kwargs: dict[str, Any] = {
@@ -820,6 +896,12 @@ def _build_completion_kwargs(
         kwargs["api_key"] = config.api_key
     if config.api_base:
         kwargs["api_base"] = config.api_base
+    if (
+        tool_choice is not None
+        and _is_tool_choice_forced(tool_choice)
+        and not supports_forced_tool_choice(config.model)
+    ):
+        tools, tool_choice = _unforce_tool_choice(tools, tool_choice)
     if tools is not None:
         kwargs["tools"] = tools
     if tool_choice is not None:
@@ -840,7 +922,7 @@ def _build_completion_kwargs(
         and is_anthropic_model(config.model)
         and "reasoning_effort" not in kwargs
     ):
-        kwargs["thinking"] = {"type": config.thinking}
+        kwargs.update(_thinking_kwargs(config.model, config.thinking))
 
     kwargs.update(config.extra)
     return kwargs
