@@ -74,6 +74,7 @@ from dgml_core.errors import (
     short_error_message,
 )
 from dgml_core.files import AddFileResult, ConflictPolicy, FileStore
+from dgml_core.generation.config import ThinkingMode, TranscriptionMode
 from dgml_core.ids import RECORD_ID_SHAPE
 from dgml_core.models import DocSet
 from dgml_core.pages import DEFAULT_DPI, PAGE_MAX_EDGE, PAGE_MIN_EDGE
@@ -2449,8 +2450,8 @@ def _workspace_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 # Every --batch run opens a batch job session (_start_batch_job): a plain
 # blocking run silently, for crash recovery; --no-wait / --job explicitly.
 # `docset generate` instead hands the library a JobRequest, which opens the
-# session after its pre-flights and closes it itself (_note_closed_job keeps
-# it for the payload). _dispatch_with_job closes a session the command opened
+# session after its pre-flights and closes it itself (the command leaves it
+# on its args for the payload). _dispatch_with_job closes a session the command opened
 # exactly once with how the run ended, and only then emits what the run
 # printed (one outcome per run).
 
@@ -2463,20 +2464,18 @@ def _active_batch_job() -> Any:
     return None if jobs is None else jobs.active_session()
 
 
-#: The session the library opened and closed for this run (`docset generate`
-#: under a JobRequest): no longer active, still what the payload reports on.
-_CLOSED_JOB: Any = None
+#: `args` attribute a command sets to the session the library opened and closed
+#: for its run (`docset generate` under a JobRequest): no longer active, still
+#: what the payload reports on. On the parsed args, not module state, so a
+#: nested dispatch (`batch resume` replaying the command) never reports on
+#: the inner run's job a second time.
+_CLOSED_JOB_ATTR = "closed_batch_job"
 
 
-def _note_closed_job(session: Any) -> None:
-    global _CLOSED_JOB
-    _CLOSED_JOB = session
-
-
-def _run_batch_job() -> Any:
+def _run_batch_job(args: argparse.Namespace) -> Any:
     """This run's batch job session, running or already closed by the library."""
     active = _active_batch_job()
-    return active if active is not None else _CLOSED_JOB
+    return active if active is not None else getattr(args, _CLOSED_JOB_ATTR, None)
 
 
 def _begin_job_capture() -> None:
@@ -2622,11 +2621,10 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
     emitted before. A run that leaves a failed, resumable job behind names it
     in its payload's ``batch.job`` (``error.details.batch.job`` of an error
     envelope)."""
-    _note_closed_job(None)
     try:
         rc = _dispatch(args, ws, fmt)
     except BatchPending as pending:
-        session = _run_batch_job()
+        session = _run_batch_job(args)
         command = session.manifest.command if session is not None else None
         if session is not None:
             session.close(pending)
@@ -2648,20 +2646,20 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
         _emit({"batch_job": block}, fmt)
         return 0
     except BatchJobNondeterministic as guard:
-        session = _run_batch_job()
+        session = _run_batch_job(args)
         if session is not None:
             session.close(guard)
         _end_job_capture()  # whatever the run emitted before is void
         return _emit_nondeterministic(guard, session, fmt)
     except BatchJobLeaseLost as lost:
         # Another process drives the job now: this run stopped, fenced.
-        session = _run_batch_job()
+        session = _run_batch_job(args)
         if session is not None:
             session.close(lost)
         _end_job_capture()
         return _emit_lease_lost(lost, session, fmt)
     except BaseException as exc:
-        session = _run_batch_job()
+        session = _run_batch_job(args)
         if session is not None:
             session.close(exc)
         if (fenced := _fenced(session)) is not None:
@@ -2677,7 +2675,7 @@ def _dispatch_with_job(args: argparse.Namespace, ws: Workspace, fmt: str) -> int
             batch = {name: value for name, value in (("job", job), ("deadline", deadline)) if value}
             return _emit_error(exc.code, str(exc), fmt, details={"batch": batch})
         raise
-    session = _run_batch_job()
+    session = _run_batch_job(args)
     job = None
     if session is not None:
         drift = session.nondeterministic
@@ -3948,7 +3946,7 @@ def _add_generate_subparser(
     gen.add_argument("--max-tokens", type=int, default=None)
     gen.add_argument(
         "--transcription",
-        choices=["text", "lines"],
+        choices=[m.value for m in TranscriptionMode],
         default=None,
         help=(
             "How Pass A is asked for a window. 'text': the model copies the text "
@@ -3961,7 +3959,7 @@ def _add_generate_subparser(
     )
     gen.add_argument(
         "--thinking",
-        choices=["disabled", "adaptive", "between_tools"],
+        choices=[m.value for m in ThinkingMode],
         default=None,
         help=(
             "Anthropic extended thinking for both generation passes. Overrides "
@@ -4243,7 +4241,7 @@ def _docset_generate_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> i
         report = _generate(args, ws, batch=batch_opts, job=job)
     finally:
         if isinstance(job, JobRequest):
-            _note_closed_job(job.session)
+            setattr(args, _CLOSED_JOB_ATTR, job.session)
     _emit(report.to_json(), fmt)
     return 0
 
@@ -4259,8 +4257,10 @@ def _generate(args: argparse.Namespace, ws: Workspace, *, batch: Any, job: Any) 
         window_size=args.window_size,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
-        thinking=args.thinking,
-        transcription=args.transcription,
+        thinking=None if args.thinking is None else ThinkingMode(args.thinking),
+        transcription=(
+            None if args.transcription is None else TranscriptionMode(args.transcription)
+        ),
         max_parallel_docs=args.max_parallel_calls,
         cache_dir=args.cache_dir,
         schema_path=args.schema_path,

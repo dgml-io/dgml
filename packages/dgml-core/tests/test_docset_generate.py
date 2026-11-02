@@ -179,14 +179,33 @@ def test_progress_logs_from_worker_threads_reach_the_module_logger(
 def test_batch_credentials_default_from_the_resolved_config(
     workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The pipeline gets the resolved key references under the caller's own,
+    on a copy: the caller's BatchOptions is left as it was, so one object
+    can serve a second run (with other models) without carrying this run's
+    credentials or stats into it."""
     did = _batch_seed(workspace, monkeypatch, pdf=sample_pdf)
-    opts = BatchOptions()
-    with patch("dgml_core.generation.convert_batch", return_value={}):
+    mine = {"section": "generation", "field": "label", "env": "MY_LABEL_KEY"}
+    opts = BatchOptions(credentials={"label": dict(mine)})
+    with patch("dgml_core.generation.convert_batch", return_value={}) as convert:
         generate_docset(workspace, did, batch=opts)
-    assert opts.credentials == {
+    received = convert.call_args.kwargs["options"].batch
+    assert received is not opts
+    assert received.credentials == {
         "transcribe": {"section": "generation", "field": "transcribe", "env": None},
-        "label": {"section": "generation", "field": "label", "env": None},
+        "label": mine,
     }
+    assert opts.credentials == {"label": mine}
+    assert opts.stats == {}
+
+
+def test_an_unknown_mode_is_rejected_before_anything_is_read(workspace: Workspace) -> None:
+    """A misspelled thinking or transcription mode is INVALID_ARGUMENT up
+    front (the docset is not even looked up), never a silent text-mode run or
+    a per-window provider rejection after the pre-flights."""
+    with pytest.raises(InvalidArgument, match="thinking must be one of"):
+        generate_docset(workspace, "nope", thinking="off")  # type: ignore[arg-type]
+    with pytest.raises(InvalidArgument, match="transcription must be one of"):
+        generate_docset(workspace, "nope", transcription="line")  # type: ignore[arg-type]
 
 
 @needs_gs

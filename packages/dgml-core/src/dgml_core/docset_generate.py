@@ -30,10 +30,10 @@ import logging
 import tempfile
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from . import layout
 from .concurrency import map_concurrent
@@ -43,10 +43,12 @@ from .errors import (
     BatchJobInvalid,
     DgmlError,
     EmptyDocSet,
+    FileNotFound,
     GenerationFailed,
     InvalidArgument,
 )
 from .files import FileStore
+from .generation.config import ThinkingMode, TranscriptionMode
 from .models import DocSet
 from .pages import load_pdf_config
 from .storage import Workspace, write_json_atomic
@@ -68,6 +70,19 @@ __all__ = [
     "batch_stage_models",
     "generate_docset",
 ]
+
+_Mode = TypeVar("_Mode", bound=StrEnum)
+
+
+def _mode_arg(kind: type[_Mode], value: Any, name: str) -> _Mode:
+    """*value* as a member of *kind*, else INVALID_ARGUMENT naming the parameter."""
+    try:
+        return kind(value)
+    except ValueError:
+        raise InvalidArgument(
+            f"{name} must be one of {[m.value for m in kind]} (got {value!r})"
+        ) from None
+
 
 logger = logging.getLogger(__name__)
 
@@ -541,8 +556,8 @@ def generate_docset(
     window_size: int | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
-    thinking: str | None = None,
-    transcription: str | None = None,
+    thinking: ThinkingMode | None = None,
+    transcription: TranscriptionMode | None = None,
     max_parallel_docs: int | None = None,
     cache_dir: Path | None = None,
     schema_path: Path | None = None,
@@ -582,7 +597,8 @@ def generate_docset(
     that is missing or unparseable, ``extend_schema`` with no authored schema
     to extend, and an unusable remembered roster raise
     :class:`~dgml_core.errors.InvalidArgument` — today only once a file needs
-    converting, after the skip check has read the store.
+    converting, after the skip check has read the store. A ``thinking`` or
+    ``transcription`` outside its enum raises it before anything is read.
 
     ``model`` / ``label_model`` / ``generation_config`` (a bundled profile name
     or a config-file path) override the workspace's merged ``generation``
@@ -597,9 +613,10 @@ def generate_docset(
 
     ``batch`` runs the batchable stages (transcription, labeling, the link
     pass, OCR files' image-style pass) through the providers' batch endpoints
-    (see :class:`~dgml_core.generation.BatchOptions`; its ``stats`` come back
-    as the report's ``batch_stages``, and its ``credentials`` default to the
-    resolved models' key references). Under batch mode nothing is written
+    (see :class:`~dgml_core.generation.BatchOptions`). It is read, never
+    written: the run works on a copy whose ``credentials`` default to the
+    resolved models' key references and whose ``stats`` come back as the
+    report's ``batch_stages``, so one may serve several runs. Under batch mode nothing is written
     until the link pass is past its last wave, so a run interrupted while it
     waits on a provider leaves every output as it found it.
 
@@ -669,8 +686,8 @@ def _generate_docset(
     window_size: int | None,
     temperature: float | None,
     max_tokens: int | None,
-    thinking: str | None,
-    transcription: str | None,
+    thinking: ThinkingMode | None,
+    transcription: TranscriptionMode | None,
     max_parallel_docs: int | None,
     cache_dir: Path | None,
     schema_path: Path | None,
@@ -706,6 +723,13 @@ def _generate_docset(
     from .generation.vocab import TagVocab
     from .xml_grounding import ground_dgml_xml
 
+    # Caller-supplied modes are checked before anything is read, as the CLI's
+    # argparse choices check them: a misspelling must not reach the pipeline
+    # (a bad transcription mode would silently run text mode).
+    if thinking is not None:
+        thinking = _mode_arg(ThinkingMode, thinking, "thinking")
+    if transcription is not None:
+        transcription = _mode_arg(TranscriptionMode, transcription, "transcription")
     # None means the pipeline's own default: ConvertOptions is the one place
     # these numbers are written down.
     if window_size is None:
@@ -780,13 +804,19 @@ def _generate_docset(
         stages = batch_stage_models(file_store, file_ids, gen_cfg, style_config, semlinks=semlinks)
         assert_batchable(stages)
         logger.info(f"[batch] batch mode on ({', '.join(stages)})")
-        # The non-secret key references a job records with each provider
-        # batch, unless the caller named its own.
-        batch.credentials.setdefault(
-            "transcribe", credential_ref("generation", "transcribe", gen_cfg.api_key_env)
-        )
-        batch.credentials.setdefault(
-            "label", credential_ref("generation", "label", gen_cfg.label_api_key_env)
+        # The run works on a copy: the caller's options are never written to
+        # (one BatchOptions may serve several runs), the non-secret key
+        # references a job records with each provider batch default from the
+        # resolved config unless the caller named its own, and the stats the
+        # pipeline fills start empty and come back on the report.
+        batch = replace(
+            batch,
+            credentials={
+                "transcribe": credential_ref("generation", "transcribe", gen_cfg.api_key_env),
+                "label": credential_ref("generation", "label", gen_cfg.label_api_key_env),
+                **batch.credentials,
+            },
+            stats={},
         )
     if request is not None:
         # Every pre-flight has passed: the job opens now, so a rejected run
@@ -858,7 +888,7 @@ def _generate_docset(
                     file_id=fid,
                     source=name,
                     error={
-                        "code": "FILE_NOT_FOUND",
+                        "code": FileNotFound.code,
                         "message": f"no source PDF for file '{fid}'",
                     },
                 )

@@ -45,7 +45,7 @@ from dgml_core.errors import GenerationConfigInvalid
 from dgml_core.generation import document as document_mod
 from dgml_core.generation import label as label_mod
 from dgml_core.generation import transcribe as transcribe_mod
-from dgml_core.generation.config import load_generation_batch
+from dgml_core.generation.config import TranscriptionMode, load_generation_batch
 from dgml_core.generation.pipeline import (
     BATCH_LABEL_OFF,
     BatchOptions,
@@ -187,7 +187,7 @@ def _run(
     label: bool = True,
     pages: dict[str, int] | None = None,
     label_errors: dict[str, dict[str, str]] | None = None,
-    transcription: str = "text",
+    transcription: TranscriptionMode = TranscriptionMode.TEXT,
     page_text_dirs: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Run convert_batch once; return everything observable about the run."""
@@ -993,7 +993,7 @@ def test_lines_mode_reaches_the_batch_driver(
     text_layers = {"alpha.pdf": _write_page_text(tmp_path, {1: PAGES[1]})}
     common: dict[str, Any] = {
         "pages": {"alpha.pdf": 1},
-        "transcription": "lines",
+        "transcription": TranscriptionMode.LINES,
         "page_text_dirs": text_layers,
     }
     sync = _run(tmp_path / "sync", answer, monkeypatch, batch=None, **common)
