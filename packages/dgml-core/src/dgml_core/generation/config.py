@@ -30,9 +30,12 @@ mirroring the ``dgml cluster --config PRESET|PATH`` precedent:
 
 Both are applied as the merged config's highest-precedence layer
 (``load_merged_config(cli_overrides=...)``), so they override the keys they name
-while the rest of the resolution is unchanged: unnamed keys (e.g. a workspace
-``api_key_env``) survive, and a model neither the overlay nor the config names
-still falls back to its ``[models]`` tier.
+while the rest of the resolution is unchanged. A model's credentials move with
+it: an overlay that sets ``model`` replaces that model's whole ``api_key`` /
+``api_key_env`` / ``api_base`` group, so a workspace ``api_key_env`` does not
+follow the overlay's model (keys outside a model group, e.g. ``thinking``, do
+survive). A model neither the overlay nor the config names still falls back to
+its ``[models]`` tier.
 
 Both keep the model choice visible/recorded: a profile/file is a checked-in,
 named artifact, and the effective models (plus a ``source`` label recording
@@ -42,15 +45,17 @@ The two models can name different providers (e.g. the ``anthropic_google``
 family blends Gemini and Anthropic models), so each carries its
 own credentials: ``api_key`` / ``api_key_env`` / ``api_base`` for transcription
 and ``label_api_key`` / ``label_api_key_env`` / ``label_api_base`` for labeling.
-These apply whether the models are set here or come from their tiers; the tiers
-themselves carry no credentials.
+Each applies only to the model set beside it in this section; a model that comes
+from its tier brings the tier's credentials, and a section credential with no
+section model is an error.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -62,7 +67,7 @@ from dgml_core.errors import (
     GenerationConfigMissing,
     short_error_message,
 )
-from dgml_core.models_config import ConfigSection, Tier, resolve_tiered_model
+from dgml_core.models_config import GROUP_SUFFIXES, ConfigSection, Tier, resolve_tiered_model
 from dgml_core.storage import Workspace
 
 # Extended thinking is OFF for generation unless the config says otherwise.
@@ -78,6 +83,10 @@ from dgml_core.storage import Workspace
 # Set ``thinking = "adaptive"`` under ``[generation]`` to restore the model
 # default.
 DEFAULT_THINKING = "disabled"
+
+# Pass A wire formats; see ``GenerationConfig.transcription``.
+TRANSCRIPTION_MODES = ("text", "lines")
+DEFAULT_TRANSCRIPTION = "text"
 
 
 @dataclass(frozen=True)
@@ -104,12 +113,12 @@ class GenerationConfig:
 
     model: str
     label_model: str
-    # transcription (``model``) credentials
-    api_key: str | None = None
+    # transcription (``model``) credentials; the keys stay out of the repr
+    api_key: str | None = field(default=None, repr=False)
     api_key_env: str | None = None
     api_base: str | None = None
     # labeling (``label_model``) credentials
-    label_api_key: str | None = None
+    label_api_key: str | None = field(default=None, repr=False)
     label_api_key_env: str | None = None
     label_api_base: str | None = None
     # Anthropic extended thinking for BOTH generation passes, one of
@@ -118,6 +127,25 @@ class GenerationConfig:
     # model is a Claude 5 model and those think adaptively unless told not to —
     # see the note on :data:`DEFAULT_THINKING`. Ignored for non-Anthropic models.
     thinking: str = DEFAULT_THINKING
+    # How Pass A is asked for a window: ``"text"`` -- the model copies the
+    # text into typed block lines; ``"lines"`` -- the model assigns structure
+    # to the numbered lines of the text layer and the text is copied from the
+    # page (``dgml_core.generation.lines``). ``lines`` needs a text layer and
+    # falls back to ``text`` window by window where a page has none.
+    transcription: str = DEFAULT_TRANSCRIPTION
+
+
+def _resolve_transcription(merged: dict[ConfigSection, Any]) -> str:
+    """Read ``[generation] transcription``, defaulting to :data:`DEFAULT_TRANSCRIPTION`."""
+    section = merged.get(ConfigSection.GENERATION) or {}
+    if not isinstance(section, dict):
+        return DEFAULT_TRANSCRIPTION
+    value = section.get("transcription", DEFAULT_TRANSCRIPTION)
+    if value not in TRANSCRIPTION_MODES:
+        raise GenerationConfigInvalid(
+            f"'generation.transcription' must be one of {list(TRANSCRIPTION_MODES)} (got {value!r})"
+        )
+    return str(value)
 
 
 def _resolve_thinking(merged: dict[ConfigSection, Any]) -> str:
@@ -170,6 +198,7 @@ def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:
     )
     return GenerationConfig(
         thinking=_resolve_thinking(merged),
+        transcription=_resolve_transcription(merged),
         model=transcribe.model,
         label_model=label.model,
         api_key=transcribe.api_key,
@@ -202,13 +231,39 @@ def load_generation_batch(workspace: Workspace) -> bool:
     return parsed
 
 
-#: ``batch.stages.label.mode`` in a batch run's payload: how Pass B labeled.
-#: ``all-at-once`` — every document as one batch stage (a closed vocabulary:
-#: the roster cannot change between documents); ``sync`` — ordinary
-#: synchronous calls (any other vocabulary: each document's labels extend the
-#: roster the next one is shown, so documents cannot be labeled together).
-LABEL_MODE_ALL_AT_ONCE = "all-at-once"
-LABEL_MODE_SYNC = "sync"
+class LabelMode(StrEnum):
+    """``batch.stages.label.mode`` in a batch run's payload: how Pass B labeled.
+
+    ``ALL_AT_ONCE`` — every document as one batch stage (a closed vocabulary:
+    the roster cannot change between documents); ``PER_DOCUMENT`` — one batch
+    stage per document, in the synchronous order (any other vocabulary: each
+    document's labels extend the roster the next one is shown, so the output
+    is byte-identical to a synchronous run); ``SYNC`` — ordinary synchronous
+    calls (``[generation] batch_label = false`` / ``--no-batch-label``).
+    """
+
+    ALL_AT_ONCE = "all-at-once"
+    PER_DOCUMENT = "per-document"
+    SYNC = "sync"
+
+
+def load_generation_batch_label(workspace: Workspace) -> bool:
+    """The ``[generation] batch_label`` setting: whether batch mode batches
+    Pass B labeling too (absent means ``True``). The CLI's ``--no-batch-label``
+    overrides it. Only read under batch mode.
+
+    Strict boolean (:func:`~dgml_core.config.config_bool`, as
+    ``generation.batch``): anything else — a word like ``"sequential"``, a
+    number — raises :class:`GenerationConfigInvalid` rather than being guessed
+    at."""
+    section = load_merged_config(workspace).get(ConfigSection.GENERATION) or {}
+    value = section.get("batch_label", True) if isinstance(section, dict) else True
+    parsed = config_bool(value)
+    if parsed is None:
+        raise GenerationConfigInvalid(
+            f"generation.batch_label must be true or false, got {value!r} ({type(value).__name__})"
+        )
+    return parsed
 
 
 def load_generation_config(workspace: Workspace) -> GenerationConfig:
@@ -299,10 +354,16 @@ def resolve_generation_config(
     1 and 2 are collapsed into one ``[generation]`` overlay handed to
     :func:`~dgml_core.config.load_merged_config` as ``cli_overrides``, its
     highest-precedence layer. So an overlay overrides the keys it names and
-    leaves the rest of the resolution intact — a workspace ``api_key_env`` still
-    applies, and a model the overlay doesn't name still falls back to its tier.
-    Passing both ``--model`` and ``--label-model`` therefore fully specifies the
-    models and works with no ``[generation]`` section at all.
+    leaves the rest of the resolution intact: a model the overlay doesn't name
+    still falls back to its tier, and keys outside a model group (``thinking``)
+    survive. A model's credentials move with it, so a model the overlay names
+    takes only the credentials the overlay sets — a workspace ``api_key_env``
+    does not follow it, nor does a file's or profile's follow a flag's model.
+    One that sets none takes the config's ``[models]`` provider key for its
+    provider, unless it has an ``api_base``; else litellm reads its per-provider
+    env var. Passing
+    both ``--model`` and ``--label-model`` therefore fully specifies the models
+    and works with no ``[generation]`` section at all.
 
     With no ``config`` and no overrides this is exactly
     :func:`load_generation_config` (so an unresolvable model still raises
@@ -325,10 +386,12 @@ def resolve_generation_config(
         overlay = dict(load_generation_config_file(Path(config)))
         base_source = "file"
 
-    if model is not None:
-        overlay["model"] = model
-    if label_model is not None:
-        overlay["label_model"] = label_model
+    # A flag replaces the file's / profile's model and the credentials written beside it.
+    for prefix, flag in (("", model), ("label_", label_model)):
+        if flag is not None:
+            overlay[f"{prefix}model"] = flag
+            for suffix in GROUP_SUFFIXES:
+                overlay.pop(f"{prefix}{suffix}", None)
 
     overridden = model is not None or label_model is not None
     if base_source == "config":

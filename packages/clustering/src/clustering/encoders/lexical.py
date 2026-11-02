@@ -51,7 +51,7 @@ from typing import Any
 
 import torch
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 
 # Document-frequency pruning bounds, named because the fit has to reason about
@@ -366,6 +366,6 @@ class TfidfEncoder(Encoder[str]):
         return EncoderOutput(pooled=pooled)
 
 
-@register_encoder("tfidf")
+@register_encoder(EncoderName.TFIDF)
 def _factory_tfidf(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return TfidfEncoder(cfg, device=device)

@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -487,7 +489,7 @@ def test_transcribe_document_is_unconditionally_compact(
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path,
         debug=True,
     )
@@ -708,7 +710,7 @@ def test_label_documents_plans_then_labels_with_roster(
         )
 
     monkeypatch.setattr(llm, "call", fake_call)
-    warnings = label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
+    warnings = label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"))
     assert warnings == []
     # Pass B.1 plans the roster over EVERY document's skeleton side by side (one
     # call_with_refinement); then one labeling call per document carries it.
@@ -748,7 +750,7 @@ def test_label_documents_roster_seed_skips_planning(
     monkeypatch.setattr(llm, "call", fake_call)
     label_documents(
         docs,
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         roster_seed={"PaymentTerms": "the payment clause"},
     )
     # The seeded concept is carried into the per-document labeling calls.
@@ -787,7 +789,7 @@ def test_label_documents_schema_seed_full_fidelity(
         )
     )
     label_documents(
-        docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"), schema_seed=schema
+        docs, config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"), schema_seed=schema
     )
     line = '- PaymentTerms [section] — the payment clause (seen: "net 30")'
     assert all("CONCEPTS ALREADY IN USE" in text for text in label_inputs)
@@ -819,7 +821,7 @@ def test_label_documents_pilot_stage_confirms_roster(
         return json.dumps({"labels": {"b0001": {"concept": "PaymentTerms"}}})
 
     monkeypatch.setattr(llm, "call", fake_call)
-    label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
+    label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"))
     # The five 2-block docs labeled first (the pilot); small.pdf — first in
     # input order but smallest — went last.
     assert [name for name, _ in seen] == [f"big{i}.pdf" for i in range(5)] + ["small.pdf"]
@@ -875,7 +877,7 @@ def test_transcribe_document_reuses_cached_blocks(
     blocks = transcribe_document(
         b"not-even-a-pdf",  # never parsed: the cache short-circuits before page counting
         doc_name="doc.pdf",
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path,
     )
     assert [b.text for b in blocks] == ["hello world"]
@@ -888,11 +890,11 @@ def test_roster_content_blocks_cache_marker_is_anthropic_only() -> None:
     from dgml_core.generation.label import RosterEntry, _roster_content_blocks
 
     roster = {"Foo": RosterEntry(description="a role")}
-    (block,) = _roster_content_blocks(roster, model="anthropic/claude-haiku-4-5")
+    (block,) = _roster_content_blocks(roster, model="anthropic/claude-haiku-5-5")
     assert block["cache_control"] == {"type": "ephemeral"}
-    (block,) = _roster_content_blocks(roster, model="gemini/gemini-2.5-pro")
+    (block,) = _roster_content_blocks(roster, model="gemini/gemini-3.1-pro-preview")
     assert "cache_control" not in block
-    assert _roster_content_blocks({}, model="anthropic/claude-haiku-4-5") == []
+    assert _roster_content_blocks({}, model="anthropic/claude-haiku-5-5") == []
 
 
 def test_label_documents_failure_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -906,7 +908,7 @@ def test_label_documents_failure_is_noop(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(llm, "call", boom)
     monkeypatch.setattr(llm, "call_with_refinement", boom_refine)
-    warnings = label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
+    warnings = label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"))
     # Planning fails soft (empty roster); each doc chunk fails soft too.
     assert sum("labeling failed" in w for w in warnings) == 2
     assert all(not b.concept for blocks in docs.values() for b in blocks)
@@ -914,7 +916,7 @@ def test_label_documents_failure_is_noop(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_is_model_reachability_error_splits_hard_from_soft() -> None:
     auth = litellm.exceptions.AuthenticationError(
-        message="bad key", llm_provider="anthropic", model="anthropic/claude-haiku-4-5"
+        message="bad key", llm_provider="anthropic", model="anthropic/claude-haiku-5-5"
     )
     bad_req = litellm.exceptions.BadRequestError(
         message="unknown model", llm_provider="anthropic", model="anthropic/claude-typo"
@@ -950,7 +952,7 @@ def test_label_documents_reports_unreachable_model_per_doc(
     errors: dict[str, dict[str, str]] = {}
     warnings = label_documents(
         docs,
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         on_label_error=lambda name, err: errors.__setitem__(name, err),
     )
     # Fired once per document, with the registry code.
@@ -971,7 +973,7 @@ def test_label_documents_no_labels_is_soft_no_error(monkeypatch: pytest.MonkeyPa
     errors: dict[str, dict[str, str]] = {}
     label_documents(
         docs,
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         on_label_error=lambda name, err: errors.__setitem__(name, err),
     )
     assert errors == {}
@@ -1001,7 +1003,7 @@ def test_convert_batch_skips_failed_document(
     out = pl.convert_batch(
         ["good.pdf", "bad.pdf"],
         options=pl.ConvertOptions(
-            model="anthropic/claude-haiku-4-5",
+            model="anthropic/claude-haiku-5-5",
             label_model="anthropic/claude-sonnet-4-6",
             dgml_header="<dg:chunk>",
             max_parallel_docs=max_parallel_docs,
@@ -1009,6 +1011,53 @@ def test_convert_batch_skips_failed_document(
     )
     assert set(out) == {"good.pdf"}  # bad.pdf dropped; the batch did not abort
     assert "hello" in out["good.pdf"]
+
+
+_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar("test_job_id", default="-")
+
+
+@pytest.mark.parametrize("max_parallel_docs", [1, 2])
+def test_convert_batch_transcribes_in_the_callers_context(
+    monkeypatch: pytest.MonkeyPatch, max_parallel_docs: int
+) -> None:
+    """Each document is transcribed in its own copy of the caller's context, on
+    a thread pool or (one worker) inline: it sees what the caller bound (a job
+    id its log handler stamps on every record), and what one document binds
+    reaches neither the next document nor the caller."""
+    from dgml_core.generation import pipeline as pl
+
+    monkeypatch.setattr(
+        "dgml_core.generation.document.load_document_as_pdf",
+        lambda path, *, converters: b"%PDF-",
+    )
+    seen: dict[str, tuple[str, bool]] = {}
+
+    def fake_transcribe(pdf_bytes: bytes, *, doc_name: str, **kw: object) -> list[Block]:
+        on_main = threading.current_thread() is threading.main_thread()
+        seen[doc_name] = (_JOB_ID.get(), on_main)
+        _JOB_ID.set(doc_name)
+        return [Block(id="b1", structure="p", text="hello", concept="Greeting")]
+
+    monkeypatch.setattr(pl, "transcribe_document", fake_transcribe)
+    monkeypatch.setattr(pl, "label_documents", lambda docs, **kw: [])
+
+    token = _JOB_ID.set("job-42")
+    try:
+        pl.convert_batch(
+            ["a.pdf", "b.pdf"],
+            options=pl.ConvertOptions(
+                model="anthropic/claude-haiku-5-5",
+                label_model="anthropic/claude-sonnet-4-6",
+                dgml_header="<dg:chunk>",
+                max_parallel_docs=max_parallel_docs,
+            ),
+        )
+        assert _JOB_ID.get() == "job-42"
+    finally:
+        _JOB_ID.reset(token)
+
+    inline = max_parallel_docs == 1
+    assert seen == {"a.pdf": ("job-42", inline), "b.pdf": ("job-42", inline)}
 
 
 def test_convert_batch_streams_to_sink_without_accumulating(
@@ -1033,7 +1082,7 @@ def test_convert_batch_streams_to_sink_without_accumulating(
     out = pl.convert_batch(
         ["a.pdf", "b.pdf"],
         options=pl.ConvertOptions(
-            model="anthropic/claude-haiku-4-5",
+            model="anthropic/claude-haiku-5-5",
             label_model="anthropic/claude-sonnet-4-6",
             dgml_header="<dg:chunk>",
         ),
@@ -1156,7 +1205,7 @@ def test_convert_batch_concepts_always_docset_namespaced(
     pl.convert_batch(
         ["new.pdf"],
         options=pl.ConvertOptions(
-            model="anthropic/claude-haiku-4-5",
+            model="anthropic/claude-haiku-5-5",
             label_model="anthropic/claude-sonnet-4-6",
             dgml_header="<dg:chunk>",
         ),
@@ -1185,7 +1234,7 @@ def test_plan_concept_roster_caps_to_largest_docs(
     }
 
     captured = _patch_roster(monkeypatch, {"Foo": "a foo role"})
-    roster = plan_concept_roster(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
+    roster = plan_concept_roster(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"))
 
     listing = captured["listing"]
     assert listing.count("== doc") == _PLAN_MAX_DOCS  # only the cap many docs planned
@@ -1299,7 +1348,7 @@ def test_label_documents_writes_cache_artifacts(
         return json.dumps({"labels": {"b0001": {"concept": "PaymentTerms"}}})
 
     monkeypatch.setattr(llm, "call", fake_call)
-    cfg = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    cfg = llm.LLMConfig(model="anthropic/claude-haiku-5-5")
 
     # Default (debug off): only the functional files the next run reloads are
     # written — the concept roster and the per-chunk RAW label outputs.
@@ -1565,7 +1614,7 @@ def test_label_documents_section_retry_forces_untagged_headings(
         return json.dumps({"labels": {}})  # first pass labels nothing
 
     monkeypatch.setattr(llm, "call", fake_call)
-    label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
+    label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"))
     # plan + first-pass + section retry
     assert sum("left unlabeled" in c for c in calls) == 1
     assert docs["a.pdf"][0].concept == "ChargesTerms"
@@ -2227,7 +2276,7 @@ def test_transcribe_window_gate_retries_early_stopped_window(
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path,
         page_text_dir=pt_dir,
     )
@@ -2263,7 +2312,7 @@ def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
     transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path / "a",
         page_text_dir=pt_dir,
     )
@@ -2279,7 +2328,7 @@ def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path / "b",
         page_text_dir=None,
     )
@@ -2372,7 +2421,7 @@ def test_transcribe_window_gate_splits_stubborn_window(
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path,
         debug=True,  # raw window writes are debug-gated
         page_text_dir=pt_dir,
@@ -2523,7 +2572,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 ) -> None:
     """A chunk whose JSON reply is unparseable is bisected until each block is
     labeled, instead of dropping the whole chunk."""
-    from dgml_core.generation.label import _label_chunk_steps
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause number {i}") for i in range(4)]
     calls = {"n": 0}
@@ -2537,13 +2586,13 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
         return json.dumps({"labels": {ids[0]: {"concept": "Revenue"}}})
 
     monkeypatch.setattr(llm, "call", fake_call)
-    warnings: list[str] = []
-    config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    effects = _ChunkEffects()
+    warnings = effects.warnings
+    config = llm.LLMConfig(model="anthropic/claude-haiku-5-5")
     err = llm.drive(
         _label_chunk_steps(
             "doc.pdf",
             chunk,
-            {},
             [],
             config=config,
             cache_dir=None,
@@ -2551,9 +2600,8 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
             log=lambda *_: None,
             stem="doc",
             label_tag="c01",
-            warnings=warnings,
+            effects=effects,
             vocab=OPEN_VOCAB,
-            off_schema=[],
         ),
         config,
     )
@@ -2566,7 +2614,7 @@ def test_label_chunk_recovers_by_splitting_on_unparseable_reply(
 def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A call-level error must not split (it fails at any size) — retry once and
     warn, bounding calls to 2."""
-    from dgml_core.generation.label import _label_chunk_steps
+    from dgml_core.generation.label import _ChunkEffects, _label_chunk_steps
 
     chunk = [_b("p", f"p{i}", text=f"clause {i}") for i in range(8)]
     calls = {"n": 0}
@@ -2576,13 +2624,13 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(llm, "call", boom)
-    warnings: list[str] = []
-    config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    effects = _ChunkEffects()
+    warnings = effects.warnings
+    config = llm.LLMConfig(model="anthropic/claude-haiku-5-5")
     err = llm.drive(
         _label_chunk_steps(
             "doc.pdf",
             chunk,
-            {},
             [],
             config=config,
             cache_dir=None,
@@ -2590,9 +2638,8 @@ def test_label_chunk_does_not_split_on_call_error(monkeypatch: pytest.MonkeyPatc
             log=lambda *_: None,
             stem="doc",
             label_tag="c01",
-            warnings=warnings,
+            effects=effects,
             vocab=OPEN_VOCAB,
-            off_schema=[],
         ),
         config,
     )
@@ -2617,7 +2664,7 @@ def _label_fresh_then_replay(
         "doc.pdf",
         blocks,
         {},
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=cache,
         debug=False,
         log=lambda *_: None,
@@ -2955,7 +3002,7 @@ def test_closed_vocabulary_keeps_the_emitted_tags_a_subset_of_the_schema(
     rejected: dict[str, Counter[str]] = {}
     label_documents(
         docs,
-        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         schema_seed=schema,
         vocab=vocab,
         on_off_schema=lambda name, tally: rejected.__setitem__(name, tally),
@@ -3041,7 +3088,7 @@ def test_closed_run_sends_the_exhaustive_vocabulary_prompt(
         sent.clear()
         label_documents(
             {"a.pdf": [_b("heading", "b1", text="Payment Terms")]},
-            config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+            config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
             schema_seed=schema,
             vocab=TagVocab.build(schema.tags, closed=closed),
         )
@@ -3085,7 +3132,7 @@ def test_closed_run_skips_the_concept_description_call(
         cache.mkdir(parents=True)
         label_documents(
             {"a.pdf": [_b("heading", "b1", text="Payment Terms")]},
-            config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+            config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
             schema_seed=schema,
             vocab=TagVocab.build(schema.tags, closed=closed),
             cache_dir=cache,
@@ -3309,7 +3356,7 @@ def test_each_vocabulary_mode_sends_its_own_roster_prompt(
         sent.clear()
         label_documents(
             {"a.pdf": [_b("heading", "b1", text="Payment Terms")]},
-            config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+            config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
             schema_seed=schema,
             vocab=vocab,
         )
@@ -3384,8 +3431,8 @@ def test_extend_bounds_its_vocabulary_to_supplied_plus_planned(
     convert_batch(
         [Path("a.pdf")],
         options=ConvertOptions(
-            model="anthropic/claude-haiku-4-5",
-            label_model="anthropic/claude-haiku-4-5",
+            model="anthropic/claude-haiku-5-5",
+            label_model="anthropic/claude-haiku-5-5",
             dgml_header=_HEADER,
             schema_seed=schema,
             vocab=TagVocab.build(schema.tags, closed=False, authored=True),
@@ -3438,8 +3485,8 @@ def test_extend_stays_unbounded_when_gap_planning_yields_nothing(
     convert_batch(
         [Path("a.pdf")],
         options=ConvertOptions(
-            model="anthropic/claude-haiku-4-5",
-            label_model="anthropic/claude-haiku-4-5",
+            model="anthropic/claude-haiku-5-5",
+            label_model="anthropic/claude-haiku-5-5",
             dgml_header=_HEADER,
             schema_seed=schema,
             vocab=TagVocab.build(schema.tags, closed=False, authored=True),

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any
 
 from dgml_core.errors import now_iso
 
@@ -116,9 +116,27 @@ class BatchStatus:
         return self.state in (BatchState.ENDED, BatchState.FAILED, BatchState.CANCELED)
 
 
-ItemErrorKind = Literal["errored", "expired", "canceled", "invalid", "batch_rejected"]
+class ItemErrorKind(StrEnum):
+    """Why one request inside a delivered batch produced no response.
 
-_RETRYABLE_KINDS: frozenset[str] = frozenset({"errored", "expired"})
+    ``ERRORED`` is a provider-side failure and ``EXPIRED`` a request the batch
+    window closed on before it ran; both are retryable by default (see
+    :class:`BatchItemError`). ``CANCELED`` is a request the batch was canceled
+    before running, ``INVALID`` one the provider (or the encoder) refused as
+    malformed, and ``BATCH_REJECTED`` marks every item of a batch the provider
+    failed as a whole for a batch-level reason.
+    """
+
+    ERRORED = "errored"
+    EXPIRED = "expired"
+    CANCELED = "canceled"
+    INVALID = "invalid"
+    BATCH_REJECTED = "batch_rejected"
+
+
+_RETRYABLE_KINDS: frozenset[ItemErrorKind] = frozenset(
+    {ItemErrorKind.ERRORED, ItemErrorKind.EXPIRED}
+)
 
 
 @dataclass(frozen=True, init=False)

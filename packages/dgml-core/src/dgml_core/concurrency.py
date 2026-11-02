@@ -21,10 +21,19 @@ Deliberately stdlib-only and dependency-free: :mod:`dgml_core.utils` imports
 ``Workspace``/``FileStore``/``DocSetStore`` and ``files`` imports ``ocr``, so
 putting this there would close an ``ocr -> utils -> files -> ocr`` import cycle.
 Nothing here is exported from ``dgml_core/__init__.py``; it is internal.
+
+**Every task runs in a copy of the caller's context** (:mod:`contextvars`). A
+``ThreadPoolExecutor`` worker otherwise starts with an empty one, so anything a
+caller binds there — a job id its log handler stamps onto every record, a
+structlog ``bind_contextvars`` — would vanish from lines logged on the worker.
+Each task gets its own copy, made on the submitting thread: a context cannot be
+entered by two threads at once, and a copy taken on the worker would be the
+worker's (empty) one. The other pools in this package do the same.
 """
 
 from __future__ import annotations
 
+import contextvars
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TypeVar, cast
@@ -45,6 +54,9 @@ def map_concurrent(fn: Callable[[T], R], items: Sequence[T], *, max_workers: int
     that resolves to one — a single item, or an explicitly serial caller — the
     items run inline on the calling thread, with no pool and no thread spawned,
     so the common single-page case pays nothing and stays easy to debug.
+    Either way each item runs in its own copy of the caller's context (see the
+    module docstring): ``fn`` sees what the caller bound, and what ``fn`` binds
+    reaches neither the next item nor the caller.
 
     **Failure is fail-fast**, for callers whose ``fn`` can raise. On the first
     exception, queued-but-unstarted items are cancelled (so a dead API isn't
@@ -65,13 +77,14 @@ def map_concurrent(fn: Callable[[T], R], items: Sequence[T], *, max_workers: int
     """
     workers = max(1, min(max_workers, len(items)))
     if workers == 1:
-        return [fn(item) for item in items]
+        return [contextvars.copy_context().run(fn, item) for item in items]
 
     results: list[R | None] = [None] * len(items)
     first_exc: BaseException | None = None
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures: dict[Future[R], int] = {
-            executor.submit(fn, item): index for index, item in enumerate(items)
+            executor.submit(contextvars.copy_context().run, fn, item): index
+            for index, item in enumerate(items)
         }
         for future in as_completed(futures):
             try:

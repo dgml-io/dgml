@@ -57,6 +57,7 @@ from typing import Any
 
 from .errors import CorruptMetadata, InvalidArgument, StorageConfigInvalid
 from .layout import (
+    BATCHES_DIR,
     CACHE_DIR,
     DOC_LAYOUTS,
     DOCSET_FILES_DIR,
@@ -118,6 +119,10 @@ def _write_text_atomic(path: Path, text: str) -> None:
 
 def _matches(doc: Mapping[str, Any], query: Mapping[str, Any]) -> bool:
     return all(doc.get(k) == v for k, v in query.items())
+
+
+#: Top-level directories that are removed once emptied (see ``_prune_empty_dirs``).
+_EPHEMERAL_TOP_DIRS = frozenset({BATCHES_DIR})
 
 
 class LocalStore(BlobStore, DocStore):
@@ -200,8 +205,8 @@ class LocalStore(BlobStore, DocStore):
         the two namespaces apart and needs no such check.
 
         No caller can currently reach this: every reserved basename ends in
-        ``.json``/``.jsonl`` and no ingestable source suffix does
-        (``.pdf``/``.doc``/``.docx``/``.xls``/``.xlsx``), so this is
+        ``.json``/``.jsonl`` and no ingestable source suffix does (``.pdf``, or a
+        convertible suffix in ``conversion.FAMILY_BY_SUFFIX``), so this is
         defence-in-depth rather than a fix for a live bug. It earns its place by
         making the *next* document filename or accepted extension fail loudly
         here instead of silently clobbering a manifest."""
@@ -374,7 +379,11 @@ class LocalStore(BlobStore, DocStore):
         No directory is load-bearing: every record is a document, so pruning an
         empty directory can never destroy one. (It could when an assignment *was*
         an empty ``docsets/<did>/files/<fid>/``, which is why this used to need a
-        guard against removing them.)"""
+        guard against removing them.)
+
+        ``batches/`` is the exception among top-level directories: it holds only
+        batch-job state, so once its last job is deleted it goes too, rather
+        than lingering empty after every finished ``--batch`` run."""
         if base.is_dir():
             subdirs = sorted(
                 (p for p in base.rglob("*") if p.is_dir()),
@@ -385,7 +394,9 @@ class LocalStore(BlobStore, DocStore):
                 with contextlib.suppress(OSError):
                     sub.rmdir()
         directory = base
-        while directory != self._root and directory.parent != self._root:
+        while directory != self._root and (
+            directory.parent != self._root or directory.name in _EPHEMERAL_TOP_DIRS
+        ):
             try:
                 parent = directory.parent
                 directory.rmdir()

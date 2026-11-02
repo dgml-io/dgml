@@ -12,9 +12,9 @@
 
 """Document-to-PDF conversion — abstract provider interface, config loader, dispatcher.
 
-Source documents (docx, xlsx, …) are converted to PDF before the rest of the
+Source documents (docx, xlsx, pptx, …) are converted to PDF before the rest of the
 pipeline, which is PDF-only. Which converter handles each *format family*
-(``docx``, ``xlsx``) is chosen per workspace in the ``conversion`` section of
+(``docx``, ``xlsx``, ``pptx``) is chosen per workspace in the ``conversion`` section of
 ``<workspace>/config.toml``::
 
     {
@@ -52,6 +52,7 @@ import importlib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -60,21 +61,38 @@ from .errors import ConversionConfigInvalid, UnsupportedFileType
 from .models_config import ConfigSection
 from .storage import Workspace
 
+
+class FormatFamily(StrEnum):
+    """A convertible source format family: the ``conversion.<family>`` key one
+    converter is configured under. A member is its TOML key (``"docx"``)."""
+
+    DOCX = "docx"
+    XLSX = "xlsx"
+    PPTX = "pptx"
+
+
 # Format families and the source suffixes that belong to each. ``.pdf`` is
 # absent on purpose: it needs no converter. Shared with the add-time ingestion
 # gate (dgml_core.files) and the generation dispatch (dgml_core.generation.document) so
 # the supported-input surface lives in one place.
-FAMILY_BY_SUFFIX: dict[str, str] = {
-    ".docx": "docx",
-    ".doc": "docx",
-    ".xlsx": "xlsx",
-    ".xls": "xlsx",
+FAMILY_BY_SUFFIX: dict[str, FormatFamily] = {
+    ".docx": FormatFamily.DOCX,
+    ".doc": FormatFamily.DOCX,
+    ".xlsx": FormatFamily.XLSX,
+    ".xls": FormatFamily.XLSX,
+    ".pptx": FormatFamily.PPTX,
+    ".ppt": FormatFamily.PPTX,
 }
 
+# The convertible suffixes as user-facing text (``.docx/.doc/…``), for the
+# add-time error and the CLI help.
+CONVERTIBLE_SUFFIXES_TEXT = "/".join(FAMILY_BY_SUFFIX)
 
-def family_for_suffix(suffix: str) -> str | None:
-    """Return the conversion family for a file suffix (e.g. ``.docx`` → ``"docx"``),
-    or ``None`` if the suffix is not a known convertible source format."""
+
+def family_for_suffix(suffix: str) -> FormatFamily | None:
+    """Return the conversion family for a file suffix (e.g. ``.docx`` →
+    :attr:`FormatFamily.DOCX`), or ``None`` if the suffix is not a known
+    convertible source format."""
     return FAMILY_BY_SUFFIX.get(suffix.lower())
 
 
@@ -109,8 +127,10 @@ class DocConverter(ABC):
     ``conversion.<family>.*`` (besides the universal ``provider`` key); anything
     else is rejected by :meth:`_check_no_extra_fields` to catch typos and
     stale-after-switching-provider fields. ``input_formats`` lists the suffixes
-    a converter handles (informational; an empty set means "any", used by
-    format-agnostic converters like the command runner).
+    a converter handles, compared case-insensitively and with or without the
+    leading dot; a document of any other suffix is refused before the converter
+    is built (see :func:`require_converter`). An empty set means "any", for
+    format-agnostic converters like the command runner.
     """
 
     name: ClassVar[str]
@@ -222,7 +242,9 @@ def _strip_converter_suffix(name: str) -> str:
     return name
 
 
-def converter_name_for_path(path: Path, converters: Mapping[str, ConverterConfig]) -> str | None:
+def converter_name_for_path(
+    path: Path, converters: Mapping[FormatFamily, ConverterConfig]
+) -> str | None:
     """Return the display name of the converter that handles ``path``.
 
     The name is the converter class's ``name`` ClassVar with any trailing
@@ -238,17 +260,41 @@ def converter_name_for_path(path: Path, converters: Mapping[str, ConverterConfig
     return _strip_converter_suffix(cls.name)
 
 
-def convert_to_pdf_bytes(path: Path, converters: Mapping[str, ConverterConfig]) -> bytes:
-    """Convert a non-PDF source at ``path`` to PDF bytes via the configured converter.
+def _normalize_suffix(suffix: str) -> str:
+    """``suffix`` as :data:`FAMILY_BY_SUFFIX` spells it: lowercase, with the dot —
+    so a converter may declare ``input_formats`` as ``"DOCX"`` or ``"docx"``."""
+    suffix = suffix.lower()
+    return suffix if suffix.startswith(".") else f".{suffix}"
 
-    Looks up the converter for the file's format family in ``converters``,
-    instantiates it, and runs it. Raises :class:`dgml.errors.UnsupportedFileType`
-    if the suffix has no configured converter (or is not a convertible source),
-    and :class:`dgml.errors.ConversionFailed` on converter errors. Callers that
-    need to handle ``.pdf`` inputs or reuse a previously-produced PDF do so
-    before calling this.
+
+def _check_input_format(cls: type[DocConverter], suffix: str, family: FormatFamily) -> None:
+    """Refuse a converter that declares ``input_formats`` without ``suffix``, before
+    it is built: a family pointed at the wrong converter (``conversion.pptx`` at the
+    xlsx renderer, say) would otherwise fail inside that converter's SDK, or hand
+    back a PDF of something else."""
+    handled = sorted({_normalize_suffix(s) for s in cls.input_formats})
+    if handled and suffix not in handled:
+        raise ConversionConfigInvalid(
+            f"converter {cls.name!r} (conversion.{family}.provider) does not handle "
+            f"'{suffix}' — it handles {', '.join(handled)}. Set conversion.{family}.provider "
+            f"to a converter that does."
+        )
+
+
+def require_converter(
+    suffix: str, converters: Mapping[FormatFamily, ConverterConfig]
+) -> tuple[FormatFamily, ConverterConfig]:
+    """The format family of a convertible ``suffix`` and the converter configured
+    for it, checked to handle that suffix.
+
+    Raises :class:`dgml.errors.UnsupportedFileType` naming the config key to set
+    when no converter is configured, and :class:`ConversionConfigInvalid` when the
+    configured one cannot be resolved or its ``input_formats`` excludes ``suffix``.
+    Resolving the class is an import of the converter's module, not a construction
+    (no binary or SDK is touched). The add-time gate (``FileStore._validate_source``),
+    the CLI's bulk-add gathering and :func:`convert_to_pdf_bytes` share this, so a
+    misconfigured family is refused before anything is written, with one message.
     """
-    suffix = path.suffix.lower()
     family = family_for_suffix(suffix)
     if family is None or family not in converters:
         family_hint = family or "<family>"
@@ -257,16 +303,36 @@ def convert_to_pdf_bytes(path: Path, converters: Mapping[str, ConverterConfig]) 
             f"conversion.{family_hint}.provider in config.toml (see the translators-pdf "
             f"package for ready-made converters)"
         )
-    return make_converter(converters[family]).to_pdf(path)
+    config = converters[family]
+    _check_input_format(_resolve_converter_class(config.provider), suffix, family)
+    return family, config
 
 
-def load_conversion_config(workspace: Workspace) -> dict[str, ConverterConfig]:
+def convert_to_pdf_bytes(path: Path, converters: Mapping[FormatFamily, ConverterConfig]) -> bytes:
+    """Convert a non-PDF source at ``path`` to PDF bytes via the configured converter.
+
+    Looks up the converter for the file's format family in ``converters``,
+    instantiates it, and runs it. Raises :class:`dgml.errors.UnsupportedFileType`
+    if the suffix has no configured converter (or is not a convertible source),
+    :class:`ConversionConfigInvalid` if the configured converter's
+    ``input_formats`` excludes the suffix, and :class:`dgml.errors.ConversionFailed`
+    on converter errors. Callers that need to handle ``.pdf`` inputs or reuse a
+    previously-produced PDF do so before calling this.
+    """
+    _, config = require_converter(path.suffix.lower(), converters)
+    return make_converter(config).to_pdf(path)
+
+
+def load_conversion_config(workspace: Workspace) -> dict[FormatFamily, ConverterConfig]:
     """Read and validate the ``conversion`` section of ``<workspace>/config.toml``.
 
-    Returns a mapping of format family (``"docx"``, ``"xlsx"``) to its
-    :class:`ConverterConfig`. Only families explicitly configured are present —
-    there are no defaults, so an absent family means that format is unsupported.
-    A missing config file or missing ``conversion`` section yields an empty dict.
+    Returns a mapping of :class:`FormatFamily` to its :class:`ConverterConfig`.
+    Only families explicitly configured are present — there are no defaults, so
+    an absent family means that format is unsupported. A key that is not a
+    family (``conversion.doc``, say) is shape-checked like the rest and then left
+    out: nothing would ever look it up (dgml-io/dgml#274 tracks rejecting it
+    instead). A missing config file or missing ``conversion`` section yields an
+    empty dict.
 
     Validates only the *generic shape* — each family is an object with a
     non-empty string ``provider``. It deliberately does **not** import the
@@ -286,7 +352,7 @@ def load_conversion_config(workspace: Workspace) -> dict[str, ConverterConfig]:
     if not isinstance(section, dict):
         raise ConversionConfigInvalid("'conversion' must be a table")
 
-    configs: dict[str, ConverterConfig] = {}
+    configs: dict[FormatFamily, ConverterConfig] = {}
     for family, family_section in section.items():
         if not isinstance(family_section, dict):
             raise ConversionConfigInvalid(f"'conversion.{family}' must be a table")
@@ -298,5 +364,6 @@ def load_conversion_config(workspace: Workspace) -> dict[str, ConverterConfig]:
         # Keep the section verbatim (minus provider). The class is resolved and
         # these fields validated lazily, in make_converter — see the docstring.
         options = {k: v for k, v in family_section.items() if k != "provider"}
-        configs[family] = ConverterConfig(provider=provider, options=options)
+        if family in FormatFamily.__members__.values():
+            configs[FormatFamily(family)] = ConverterConfig(provider=provider, options=options)
     return configs

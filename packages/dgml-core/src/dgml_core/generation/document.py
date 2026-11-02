@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from dgml_core import layout
-from dgml_core.conversion import ConverterConfig, convert_to_pdf_bytes
+from dgml_core.conversion import ConverterConfig, FormatFamily, convert_to_pdf_bytes
 from dgml_core.pages import PdfConfig, slice_pages
 
 
@@ -29,7 +29,7 @@ def load_pdf(path: Path) -> bytes:
 def load_document_as_pdf(
     path: Path,
     *,
-    converters: Mapping[str, ConverterConfig],
+    converters: Mapping[FormatFamily, ConverterConfig],
 ) -> bytes:
     """Return PDF bytes for a supported input.
 

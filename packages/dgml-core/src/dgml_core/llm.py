@@ -40,13 +40,13 @@ consistent:
   calls inside it into a single row for multi-call operations. Recording is
   independent of debug artifacts: the CLI turns it on under ``--debug``, a
   library caller sets ``record_usage=True`` directly.
-- **One request protocol, one driver.** Each wrapper is defined once as a
+- **One request protocol, two drivers.** Each wrapper is defined once as a
   pure ``steps_*`` generator (yields the completion kwargs for a request,
   receives the response, decides whether another request follows) and the
   ``call*`` function is its synchronous driver via :func:`drive`, which owns
-  the usage accounting. Request shaping and continuation logic exist in
-  exactly one place, so any other driver of the same generators sends the
-  same requests.
+  the usage accounting. An executor that defers requests — a provider batch
+  endpoint — runs the same generators, so request shaping and continuation
+  logic exist in exactly one place.
 
 Lives at the package root (:mod:`dgml_core.llm`) so generation and the
 non-generation call sites share one implementation.
@@ -62,7 +62,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, TypeVar, cast
@@ -82,12 +82,13 @@ from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
 from .usage import (
-    OUTCOME_ERROR,
-    OUTCOME_OK,
-    TIER_STANDARD,
+    PricingTier,
     UsageEvent,
+    UsageOperation,
+    UsageOutcome,
     _as_cost,
     add_partial,
+    as_pricing_tier,
     extract_cost_and_tokens,
     record_usage,
     scope_events,
@@ -141,14 +142,21 @@ GEMINI_MODEL_PATTERNS = [r"gemini", r"vertex_ai", r"google"]
 # the documented thinking/prefill incompatibility, it is the model. It cost
 # 17-25% of documents in every claude-sonnet-5 transcriber draw, and because F1
 # is computed over the survivors the arm then scored *highest* of the sweep.
-# claude-haiku-4-5 prefills fine across thousands of calls, so this stays a
-# narrow list rather than a blanket rule.
-ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
+# claude-haiku-5-5 refuses it the same way (litellm's metadata agrees:
+# `supports_assistant_prefill: False`). Older Claude models such as
+# claude-sonnet-4-6 still prefill, so this stays a narrow list rather than a
+# blanket rule.
+ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5", r"claude-haiku-5"]
 
 # Accepted values for `LLMConfig.thinking`, Anthropic's extended-thinking switch.
 #
-#   "disabled" — no thinking tokens.
-#   "adaptive" — the model decides per request (Claude 4.6+/5 only).
+#   "disabled"      — no thinking tokens.
+#   "adaptive"      — the model decides per request (Claude 4.6+/5 only).
+#   "between_tools" — thinking only between tool calls, i.e. off for a plain
+#                     text reply. This is how Claude Sonnet 5.5 turns thinking
+#                     off: it rejects `{"type": "disabled"}` with a 400 ("To turn
+#                     thinking off..."), and accepts "between_tools" at effort
+#                     high or below, with no other field beside `type`.
 #
 # OMITTING the field is not the same as "disabled": Claude 4.6+/5 models think
 # adaptively when a request carries no `thinking`, so a caller that never sets it
@@ -158,7 +166,7 @@ ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5"]
 # `{"type": "enabled", "budget_tokens": N}` is deliberately not offered here:
 # claude-sonnet-5 rejects `budget_tokens`. A caller that needs it can pass the
 # whole dict through `LLMConfig.extra`.
-ANTHROPIC_THINKING_MODES = ("disabled", "adaptive")
+ANTHROPIC_THINKING_MODES = ("disabled", "adaptive", "between_tools")
 
 # OpenAI families that accept ONLY the default temperature (1). Prefix-matched
 # so future point releases are covered automatically; see
@@ -343,7 +351,7 @@ def supports_assistant_prefill(model: str) -> bool:
     restarting the reply.
 
     **Some Anthropic models refuse it too**, which is why this is not simply
-    "is it Anthropic". ``claude-sonnet-5`` returns the same shape of 400 as
+    "is it Anthropic". ``claude-sonnet-5`` and ``claude-haiku-5-5`` return the same shape of 400 as
     Gemini on a path that sets no ``reasoning_effort``, so it is the model and
     not the thinking/prefill incompatibility — see
     ``ANTHROPIC_NO_PREFILL_PATTERNS``.
@@ -440,12 +448,15 @@ class LLMConfig:
     # don't want telemetry.
     workspace: Workspace | None = None
     record_usage: bool = False
-    operation: str | None = None
+    #: A :class:`~dgml_core.usage.UsageOperation` for every call dgml makes; a
+    #: library caller may label its own calls with any string. ``None`` records
+    #: :attr:`~dgml_core.usage.UsageOperation.LLM_CALL`.
+    operation: UsageOperation | str | None = None
     context: dict[str, Any] | None = None
-    # Pricing tier recorded on the usage row (``usage.TIER_STANDARD`` /
-    # ``usage.TIER_BATCH``). A batch driver sets ``TIER_BATCH`` on the configs
-    # it drives; every synchronous call records standard.
-    tier: str = TIER_STANDARD
+    # Pricing tier recorded on the usage row. The batch executor sets
+    # ``PricingTier.BATCH`` on the configs it drives; every synchronous call
+    # records standard.
+    tier: PricingTier = PricingTier.STANDARD
     # Internal: set by an active :func:`record_usage_for` scope. While set,
     # the call functions fold their usage into it (one aggregated row for the
     # whole scope) instead of each writing its own row. Never set by callers.
@@ -483,22 +494,35 @@ class CallResult:
     duration_s: float
 
 
+#: Name sent with an inline PDF: OpenAI's Responses API rejects inline file
+#: data without one, and litellm's Chat→Responses bridge adds no default.
+#: A constant, not the file's own name: values come from the pages.
+_PDF_FILENAME = "document.pdf"
+
+
 def _pdf_content_block(pdf_bytes: bytes) -> dict[str, Any]:
-    """Unified LiteLLM content block for an inline base64 PDF."""
+    """Unified LiteLLM content block for an inline base64 PDF.
+
+    litellm normalizes it per provider: Anthropic gets a ``document`` block,
+    Gemini ``inline_data``, OpenAI a ``file`` or Responses ``input_file``.
+    """
     b64 = base64.b64encode(pdf_bytes).decode("ascii")
     return {
         "type": "file",
         "file": {
             "file_data": f"data:application/pdf;base64,{b64}",
+            "filename": _PDF_FILENAME,
         },
     }
 
 
-def _image_content_block(png_bytes: bytes) -> dict[str, Any]:
-    b64 = base64.b64encode(png_bytes).decode("ascii")
+def _image_content_block(image_bytes: bytes) -> dict[str, Any]:
+    # A page image is a JPEG or a PNG, whichever encoding was smaller.
+    mime = "image/jpeg" if image_bytes.startswith(b"\xff\xd8\xff") else "image/png"
+    b64 = base64.b64encode(image_bytes).decode("ascii")
     return {
         "type": "image_url",
-        "image_url": {"url": f"data:image/png;base64,{b64}"},
+        "image_url": {"url": f"data:{mime};base64,{b64}"},
     }
 
 
@@ -711,7 +735,7 @@ def _require_supported_model(model: str, api_base: str | None) -> None:
     except Exception as exc:
         raise ModelNotSupported(
             f"model '{model}' is not a recognized model id — check the spelling and "
-            "provider prefix (e.g. 'gemini/gemini-2.5-pro'); it may be unavailable in "
+            "provider prefix (e.g. 'gemini/gemini-3.1-pro-preview'); it may be unavailable in "
             f"this litellm version ({short_error_message(exc)})"
         ) from exc
 
@@ -721,7 +745,7 @@ def model_max_output_tokens(model: str, api_base: str | None = None) -> int | No
 
     Read from litellm's model metadata so callers can ask for a model's real
     ceiling instead of hardcoding one number across a fleet whose limits
-    differ (frontier Claude/Gemini allow 128K; Haiku 4.5 caps at 64K).
+    differ (current Claude and Gemini Pro allow 128K; some smaller models cap at 64K).
     ``None`` for a custom ``api_base`` (self-hosted/proxy — no metadata) or an
     id litellm doesn't know, in which case callers keep their own default.
     """
@@ -1387,6 +1411,149 @@ def _choice_finish_reason(choice: Any) -> Any:
     )
 
 
+# Set on an exception :func:`_completion_with_retry` raises: how many calls it
+# made before giving up. Read back by :func:`provider_error_context`.
+_ATTEMPTS_ATTR = "dgml_attempts"
+
+# Response headers providers put their request id in, most specific first:
+# OpenAI, Anthropic, Azure API Management.
+_REQUEST_ID_HEADERS = ("x-request-id", "request-id", "apim-request-id")
+
+
+def _set_attempts(exc: BaseException, attempts: int) -> None:
+    # Best effort: an exception class can refuse a new attribute (a __setattr__
+    # override), and failing here would replace the provider's error. The count
+    # then just goes unreported.
+    try:
+        setattr(exc, _ATTEMPTS_ATTR, attempts)
+    except Exception:
+        pass
+
+
+def _redacted_api_base(api_base: str) -> str:
+    """``scheme://host[:port]`` of *api_base*. The rest is dropped because it
+    can carry credentials: userinfo, a key in the query string, or a token in
+    the path of some gateways."""
+    from urllib.parse import urlsplit
+
+    # urlsplit raises ValueError on a malformed IPv6 host ("http://[::1"), and
+    # .port on a port that is not a number in range ("https://h:abc").
+    try:
+        parts = urlsplit(api_base)
+        port = parts.port
+    except ValueError:
+        return "<unparseable api_base>"
+    if not parts.hostname:
+        return "<unparseable api_base>"
+    return f"{parts.scheme}://{parts.hostname}" + (f":{port}" if port else "")
+
+
+def _provider_request_id(exc: BaseException) -> str | None:
+    request_id = getattr(exc, "request_id", None)
+    if isinstance(request_id, str) and request_id:
+        return request_id
+    # LiteLLM keeps the provider's real headers on ``litellm_response_headers``
+    # (set after it maps the error); its ``exc.response`` is often a stand-in it
+    # builds with no headers, as on Anthropic and Gemini errors. A provider SDK's
+    # own error carries them on its response. Anything else has no id to read.
+    for headers in (
+        getattr(exc, "litellm_response_headers", None),
+        getattr(getattr(exc, "response", None), "headers", None),
+    ):
+        if not isinstance(headers, Mapping):
+            continue
+        for name in _REQUEST_ID_HEADERS:
+            value = headers.get(name)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+class _Unreported:
+    """Type of :data:`_UNREPORTED`."""
+
+
+#: ``api_key`` default of :func:`provider_error_context`: the caller does not
+#: know the key, so its state is left out (distinct from ``None``, no key).
+_UNREPORTED = _Unreported()
+
+
+def _api_key_state(api_key: str | None) -> str:
+    """Whether a key was passed — never any part of the key itself. An empty
+    key is not sent (see :func:`_build_completion_kwargs`), so it and ``None``
+    both leave LiteLLM to find one in the provider's environment variable
+    (``OPENAI_API_KEY`` and the like), which may not be the key intended — and
+    both read the same, since the request kwargs cannot tell them apart."""
+    return "api key passed" if api_key else "api key not passed"
+
+
+def provider_error_context(
+    exc: BaseException,
+    *,
+    model: str | None = None,
+    api_base: str | None = None,
+    api_key: str | None | _Unreported = _UNREPORTED,
+) -> str:
+    """Identifiers for tracing a failed model call, safe to log.
+
+    ``model 'm' at https://host, api key passed, HTTP 500, request id req_…,
+    3 attempts`` — each part only when known, ``""`` when none is. The request
+    id is what a provider's support needs to look a failure up. ``api_base`` is
+    cut to scheme and host (see :func:`_redacted_api_base`); ``api_key`` is
+    reported only as passed or not passed (see :func:`_api_key_state`).
+    Deliberately absent: the exception's message (callers already carry it) and
+    LiteLLM's ``litellm_debug_info``, which embeds the request's messages, i.e.
+    document content. The HTTP status is LiteLLM's mapped one (its
+    ``InternalServerError`` always says 500).
+    """
+    # It runs inside ``except`` blocks (the retry log, the phase-1/phase-3
+    # failure message), where an error of its own would abort the retries or
+    # replace the provider's error. So every value read off *exc* is
+    # type-checked before use rather than assumed, and *api_base* is parsed
+    # only when it is a string.
+    parts: list[str] = []
+    if model:
+        at = f" at {_redacted_api_base(api_base)}" if isinstance(api_base, str) and api_base else ""
+        parts.append(f"model {model!r}{at}")
+    if not isinstance(api_key, _Unreported):
+        parts.append(_api_key_state(api_key))
+    # getattr's default absorbs only AttributeError, and a provider exception's
+    # property can raise anything (httpx's RuntimeError for a missing request,
+    # say). Keep what was read before it rather than lose the whole context.
+    try:
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int):
+            parts.append(f"HTTP {status}")
+        request_id = _provider_request_id(exc)
+        if request_id:
+            parts.append(f"request id {request_id}")
+        attempts = getattr(exc, _ATTEMPTS_ATTR, None)
+        if isinstance(attempts, int) and attempts > 1:
+            parts.append(f"{attempts} attempts")
+    except Exception:
+        pass
+    return ", ".join(parts)
+
+
+def describe_call_failure(exc: BaseException, config: LLMConfig) -> str:
+    """``"<Type>: <message> (<context>)"`` for a model call made with *config*
+    that raised *exc*: the text every "… call failed" error carries. The context
+    is :func:`provider_error_context`, since a provider's own message is often
+    no more than "Internal Server Error". Like it, safe inside ``except``."""
+    context = provider_error_context(
+        exc, model=config.model, api_base=config.api_base, api_key=config.api_key
+    )
+    return f"{type(exc).__name__}: {exc}" + (f" ({context})" if context else "")
+
+
+#: Optional seam over every synchronous completion: ``recorder(kwargs, call)``
+#: returns the response, where ``call(kwargs)`` performs the real request. Set
+#: only while a batch job session is active (:mod:`dgml_core.batch.jobs`), which
+#: uses it to record synchronous responses and replay them on a resumed run;
+#: ``None`` — the default — leaves every call exactly as it was.
+_SYNC_RECORDER: Callable[[dict[str, Any], Callable[[dict[str, Any]], Any]], Any] | None = None
+
+
 def _completion_with_retry(
     kwargs: dict[str, Any], *, max_retries: int = 3, stream_deadline_s: float | None = None
 ) -> Any:
@@ -1403,6 +1570,27 @@ def _completion_with_retry(
     retried like any other transient failure, and only raises
     :class:`EmptyModelResponse` once it persists across every attempt.
     """
+    if stream_deadline_s is None:
+        stream_deadline_s = getattr(kwargs, "stream_deadline_s", None)
+    recorder = _SYNC_RECORDER
+    if recorder is not None:
+        return recorder(
+            kwargs,
+            lambda kw: _completion_attempts(
+                kw, max_retries=max_retries, stream_deadline_s=stream_deadline_s
+            ),
+        )
+    return _completion_attempts(
+        kwargs, max_retries=max_retries, stream_deadline_s=stream_deadline_s
+    )
+
+
+def _completion_attempts(
+    kwargs: dict[str, Any], *, max_retries: int = 3, stream_deadline_s: float | None = None
+) -> Any:
+    """The retry loop behind :func:`_completion_with_retry`, without the
+    recorder seam (a batch job's own synchronous fallback calls this directly,
+    having already accounted for the request)."""
     if stream_deadline_s is None:
         stream_deadline_s = getattr(kwargs, "stream_deadline_s", None)
     import litellm
@@ -1429,6 +1617,7 @@ def _completion_with_retry(
             except Exception as exc:
                 stream_error = exc if isinstance(exc, _StreamConsumptionError) else None
                 retry_exc = stream_error.error if stream_error is not None else exc
+                _set_attempts(retry_exc, attempt + 1)
                 if stream_error is not None:
                     response = None
                 elapsed_s = (
@@ -1459,6 +1648,7 @@ def _completion_with_retry(
                             elapsed_s,
                             type(retry_exc).__name__,
                         )
+                    _set_attempts(deadline_error, attempt + 1)
                     raise deadline_error from retry_exc
                 if (
                     not _is_transient(retry_exc)
@@ -1482,6 +1672,22 @@ def _completion_with_retry(
                     raise
                 last_exc = retry_exc.with_traceback(None)
                 stream_error = None
+                # A retry that then succeeds leaves no trace in the result, so say
+                # it here; INFO, since nothing is degraded yet. Identifiers only:
+                # never the exception's debug info, which carries the prompt.
+                logger.info(
+                    "model call failed (%s, %s); retry %d of %d in %.0fs",
+                    type(retry_exc).__name__,
+                    provider_error_context(
+                        retry_exc,
+                        model=kwargs.get("model"),
+                        api_base=kwargs.get("api_base"),
+                        api_key=kwargs.get("api_key"),
+                    ),
+                    attempt + 1,
+                    max_retries - 1,
+                    delay,
+                )
                 time.sleep(delay)
                 delay *= 2
                 retry_attempt = True
@@ -1500,6 +1706,15 @@ def _completion_with_retry(
                 f"model returned no choices after {max_retries} attempts "
                 f"(model={kwargs.get('model')!r})"
             )
+        # Logged like a raised error's retry: one that then succeeds leaves no
+        # trace in the result, yet costs a paid call and the backoff.
+        logger.info(
+            "model returned no choices (model %r); retry %d of %d in %.0fs",
+            kwargs.get("model"),
+            attempt + 1,
+            max_retries - 1,
+            delay,
+        )
         time.sleep(delay)
         delay *= 2
     raise last_exc  # type: ignore[misc]
@@ -1528,17 +1743,19 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
 
     Exceptions propagate after the totals are recorded, so a failed call
     still leaves a row (or contributes its partial usage to the scope).
+    ``BaseException`` is classified, not just ``Exception``, so an interrupted
+    call (``KeyboardInterrupt``, ``SystemExit``) never leaves an ``ok`` row.
     The write itself can never break the caller (see :func:`record_usage`).
     """
     totals = empty_usage_totals()
     started = time.monotonic()
     error_msg: str | None = None
-    outcome = OUTCOME_OK
+    outcome = UsageOutcome.OK
     try:
         yield totals
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        outcome = OUTCOME_ERROR
+        outcome = UsageOutcome.ERROR
         raise
     finally:
         if config._usage_sink is not None:
@@ -1546,7 +1763,7 @@ def _record_call(config: LLMConfig) -> Iterator[dict[str, Any]]:
         elif config.record_usage and config.workspace is not None:
             event = UsageEvent(
                 at=now_iso(),
-                operation=config.operation or "llm_call",
+                operation=config.operation or UsageOperation.LLM_CALL,
                 model=config.model,
                 cost_usd=totals["cost_usd"],
                 prompt_tokens=totals["prompt_tokens"],
@@ -1596,6 +1813,57 @@ T = TypeVar("T")
 LLMStep = dict[str, Any]
 
 
+class FanOut:
+    """Fork independent child step generators and join on their results.
+
+    Yielded by an :data:`LLMSteps` generator in place of a request (structured
+    concurrency: the children cannot outlive the yield). The yield evaluates to
+    ``[result_0, result_1, ...]`` — each child's return value, in *child*
+    order, whatever order they finished in. The contract every driver honours:
+
+    - **The children must be independent**: no child's requests may depend on
+      another child's responses or side effects. The parent applies any
+      order-sensitive side effects itself, after the join, in child order —
+      that is what keeps the outcome identical whichever driver runs it.
+    - **Sync** (:func:`drive`): the children run one after another, to
+      completion, in child order — so the request sequence and every request
+      byte are exactly those of ``yield from child_0; yield from child_1; ...``,
+      failures included: the first child that fails stops the run there, and
+      the children after it are closed without making a request.
+    - **Batch** (:func:`dgml_core.batch.run_stage`): the children's pending
+      requests are extra in-flight requests of the same unit, sharing each wave
+      with every other unit's; the parent resumes once every child has
+      returned. Within one child, requests stay strictly ordered.
+    - **Failures, per child as for a unit**: a request a driver could not serve
+      is thrown into *that child* at its pending ``yield``; only an exception
+      escaping the child fails it. In batch every child runs to the end even
+      when an earlier one failed (their requests share waves, so they are
+      already in flight); in sync the first failure stops the run (above).
+      Either way the first failed child's exception, in child order, is
+      thrown into the parent at the ``FanOut`` yield instead of sending the
+      results. An interrupt (a non-``Exception``
+      ``BaseException``) closes every child and propagates.
+    - **Usage folds in child order**: each child's per-wrapper subtotals are
+      folded, after the parent's preceding ones, in child order — exactly the
+      sequence the sync driver produces — so sums associate bit for bit across
+      drivers (see :class:`_UsageFold`).
+    - **Determinism**: children are primed in child order and a batch driver
+      assigns request ids in that order, so a job's replay (keyed by request
+      occurrence) meets the same requests in the same order on every run.
+
+    Children may yield ``FanOut`` themselves (nesting). An empty ``FanOut``
+    joins at once with ``[]`` and makes no request.
+    """
+
+    __slots__ = ("children",)
+
+    def __init__(self, children: Iterable[Generator[Any, Any, Any]]) -> None:
+        self.children: tuple[Generator[Any, Any, Any], ...] = tuple(children)
+
+    def __repr__(self) -> str:
+        return f"FanOut({len(self.children)} children)"
+
+
 #: A wrapper's request/response protocol. Contract:
 #:
 #: - The generator is **pure**: it yields :data:`LLMStep` values, receives the
@@ -1620,6 +1888,15 @@ LLMStep = dict[str, Any]
 #:   ``BaseException`` that is not an ``Exception`` (an interrupt) is never
 #:   thrown in; it propagates straight out of the driver.
 LLMSteps = Generator[LLMStep, Any, T]
+
+#: An :data:`LLMSteps` generator that may also yield a :class:`FanOut` of
+#: child generators (each an ``LLMSteps`` or ``LLMFlow`` itself) in place of a
+#: request: the driver runs the children and sends their return values back as
+#: a list in child order (see :class:`FanOut` for the join contract). Every
+#: driver — :func:`drive` and :func:`dgml_core.batch.run_stage` — accepts
+#: either; the ``steps_*`` primitives are plain ``LLMSteps``. Kept a separate
+#: alias so code that hand-drives a primitive still sees only requests.
+LLMFlow = Generator[LLMStep | FanOut, Any, T]
 
 
 def _require_choices(response: Any) -> None:
@@ -1722,9 +1999,16 @@ class _UsageFold:
             sub, self._sub, self._wrapper = self._sub, None, None
             self._fold(sub)
 
+    def emit(self, sub: dict[str, Any]) -> None:
+        """Hand an already-finished subtotal on, after the running one: how a
+        batch driver folds a :class:`FanOut` child's subtotals into its
+        parent's at the join, in the sequence the sync driver produces."""
+        self.flush()
+        self._fold(sub)
+
 
 def drive(
-    steps: LLMSteps[T],
+    steps: LLMFlow[T],
     config: LLMConfig,
     execute: Callable[[LLMStep], Any] | None = None,
 ) -> T:
@@ -1743,7 +2027,8 @@ def drive(
     again keeps the run going, one that does not re-raises it out of the
     scope, which records the error row exactly as the inline wrappers did;
     and the generator is closed on every exit. A failed request contributes
-    no usage (there was no response).
+    no usage (there was no response). A :class:`FanOut` runs its children
+    here one after another, in child order, under the same scope and fold.
 
     ``execute`` turns one step into a response; it defaults to
     :func:`_completion_with_retry` (resolved at call time, so a test that
@@ -1753,39 +2038,91 @@ def drive(
     with _record_call(config) as totals:
         fold = _UsageFold(lambda sub: add_partial(_fold_target(config, totals), sub))
         try:
-            try:
-                step = next(steps)
-            except StopIteration as done:
-                return cast(T, done.value)
-            while True:
-                if isinstance(step, _WrapperStep) and step.get("stream"):
-                    # A streamed request carries the config timeout as its
-                    # total deadline on the step object (never in the dict, so
-                    # the request stays byte-identical and a one-argument fake
-                    # still intercepts it); the dict's own timeout is the read
-                    # timeout between chunks.
-                    step.stream_deadline_s = config.timeout
-                try:
-                    response = run(step)
-                except Exception as exc:
-                    # Deliver the failure at the pending yield. An uncaught
-                    # exception re-raises out of throw() and leaves the scope
-                    # as the error row; a caught one may yield a retry step.
-                    try:
-                        step = steps.throw(exc)
-                    except StopIteration as done:
-                        return cast(T, done.value)
-                    continue
-                fold.add(step, with_tier(extract_cost_and_tokens(response), response, config.tier))
-                try:
-                    step = steps.send(response)
-                except StopIteration as done:
-                    return cast(T, done.value)
+            return cast(T, _drive_steps(steps, config, run, fold))
         finally:
-            steps.close()
             # Before the scope exits, so its row (or its fold into an
             # enclosing sink) sees the last wrapper's subtotal.
             fold.flush()
+
+
+def _drive_steps(
+    steps: LLMFlow[Any],
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> Any:
+    """:func:`drive`'s loop over one generator (a whole run, or one
+    :class:`FanOut` child): every response folded into *fold* before it is
+    sent in, every request failure thrown in, the generator closed on exit.
+
+    A ``FanOut`` runs its children here, one after another in child order,
+    through the same *fold* — so the request sequence and the usage folding
+    are exactly those of ``yield from`` over each child in turn."""
+    try:
+        try:
+            step = next(steps)
+        except StopIteration as done:
+            return done.value
+        while True:
+            if isinstance(step, FanOut):
+                results, failure = _drive_fanout(step, config, run, fold)
+                try:
+                    step = steps.send(results) if failure is None else steps.throw(failure)
+                except StopIteration as done:
+                    return done.value
+                continue
+            if isinstance(step, _WrapperStep) and step.get("stream"):
+                # A streamed request carries the config timeout as its
+                # total deadline on the step object (never in the dict, so
+                # the request stays byte-identical and a one-argument fake
+                # still intercepts it); the dict's own timeout is the read
+                # timeout between chunks.
+                step.stream_deadline_s = config.timeout
+            try:
+                response = run(step)
+            except Exception as exc:
+                # Deliver the failure at the pending yield. An uncaught
+                # exception re-raises out of throw() and leaves the scope
+                # as the error row; a caught one may yield a retry step.
+                try:
+                    step = steps.throw(exc)
+                except StopIteration as done:
+                    return done.value
+                continue
+            fold.add(step, with_tier(extract_cost_and_tokens(response), response, config.tier))
+            try:
+                step = steps.send(response)
+            except StopIteration as done:
+                return done.value
+    finally:
+        steps.close()
+
+
+def _drive_fanout(
+    fan: FanOut,
+    config: LLMConfig,
+    run: Callable[[LLMStep], Any],
+    fold: _UsageFold,
+) -> tuple[list[Any], Exception | None]:
+    """Run the children of *fan* one after another, in child order (the sync
+    side of the :class:`FanOut` contract), as ``yield from`` would: the first
+    child whose ``Exception`` escapes stops the run, and the children after it
+    are closed without making a request. Returns the results in child order
+    and that ``Exception`` (or ``None``); an interrupt closes the children not
+    yet run and propagates."""
+    results: list[Any] = []
+    unrun = list(fan.children)
+    try:
+        while unrun:
+            child = unrun.pop(0)
+            try:
+                results.append(_drive_steps(child, config, run, fold))
+            except Exception as exc:
+                return results, exc
+    finally:
+        for child in unrun:  # after a failure or an interrupt
+            child.close()
+    return results, None
 
 
 def steps_call(
@@ -2142,8 +2479,8 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
     the one that served the scope's responses (each response's tier marker,
     else the driving config's tier); a scope with no responses falls back to
     the scope config's tier, or batch when a batch driver marked the sink via
-    ``totals[SINK_TIER_KEY]``; a scope whose responses span tiers appends one row per tier
-    instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
+    ``totals[SINK_TIER_KEY]``. A scope whose responses span tiers appends one
+    row per tier instead (:func:`dgml_core.usage.scope_events`). Nesting is safe:
     an inner scope defers to the outer one. The write can never break the
     caller (see :func:`record_usage`); exceptions propagate after the row.
     """
@@ -2155,13 +2492,13 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
     totals = empty_usage_totals()
     started = time.monotonic()
     error_msg: str | None = None
-    outcome = OUTCOME_OK
+    outcome = UsageOutcome.OK
     config._usage_sink = totals
     try:
         yield
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        outcome = OUTCOME_ERROR
+        outcome = UsageOutcome.ERROR
         raise
     finally:
         config._usage_sink = None
@@ -2169,7 +2506,7 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
         if workspace is not None:
             event = UsageEvent(
                 at=now_iso(),
-                operation=config.operation or "llm_call",
+                operation=config.operation or UsageOperation.LLM_CALL,
                 model=config.model,
                 cost_usd=totals["cost_usd"],
                 prompt_tokens=totals["prompt_tokens"],
@@ -2181,7 +2518,7 @@ def record_usage_for(config: LLMConfig) -> Iterator[None]:
                 outcome=outcome,
                 context=config.context or {},
                 error=error_msg,
-                tier=str(totals.get(SINK_TIER_KEY) or config.tier),
+                tier=as_pricing_tier(totals.get(SINK_TIER_KEY), config.tier),
             )
             # One row, or one per tier when the responses span tiers.
             for part in scope_events(event, totals):
@@ -2194,7 +2531,9 @@ __all__ = [
     "PDF_NATIVE_MODEL_PATTERNS",
     "SINK_TIER_KEY",
     "CallResult",
+    "FanOut",
     "LLMConfig",
+    "LLMFlow",
     "LLMStep",
     "LLMSteps",
     "add_partial",

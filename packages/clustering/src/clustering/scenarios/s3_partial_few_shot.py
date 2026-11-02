@@ -26,13 +26,14 @@ from __future__ import annotations
 import torch
 
 from clustering.calibration import fit_support_calibrator
+from clustering.config.schema import ScenarioName
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes, cluster_emergent_bucket
 
 
 class S3PartialFewShot(Scenario):
-    name = "s3"
+    name = ScenarioName.S3
     # If ``config.scenario.n_shots`` is unset, take at most this many
     # support samples per category when building prototypes.
     DEFAULT_N_SHOTS = 4

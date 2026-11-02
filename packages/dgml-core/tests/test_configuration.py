@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from dgml_core.config import load_merged_config
 from dgml_core.configuration import (
     Classification,
     Clustering,
@@ -40,9 +41,11 @@ from dgml_core.configuration import (
     Style,
     TextExtraction,
 )
+from dgml_core.conversion import FormatFamily
 from dgml_core.default_config import PROVIDER_MODELS
 from dgml_core.errors import GroundedConfigMissing, InvalidArgument
 from dgml_core.models_config import ConfigSection, Tier, resolve_tiered_model
+from dgml_core.storage import Workspace
 
 _ID = Identity(workspace_id="tenant-1", name="Tenant One", organization="TenantOne")
 _LOCAL = ProviderSpec("dgml_core.storage_local:LocalStore")
@@ -91,13 +94,17 @@ def test_every_section_renders_its_loader_keys() -> None:
         pdf=Pdf(provider="pypdfium2"),
         style=Style(model=Model("st")),
         text_extraction=TextExtraction(model=Model("te"), temperature=0.5, enabled=False),
-        conversion=Conversion({"docx": ProviderSpec("mod:Conv", {"binary": "/usr/bin/x"})}),
+        conversion=Conversion(
+            {FormatFamily.DOCX: ProviderSpec("mod:Conv", {"binary": "/usr/bin/x"})}
+        ),
         generation=Generation(
             model=Model("g"), label_model=Model("l", api_key="lk"), thinking="disabled"
         ),
         clustering=Clustering({"scenario": {"pooling_pages": 2}}),
     )
     assert cfg.sections == {
+        # `anthropic_api_key` stays in [models]: the loaders' read writes it onto the
+        # keyless models of its provider, per-call overrides included.
         ConfigSection.MODELS: {
             "advanced": "a/m",
             "advanced_api_key": "ak",
@@ -142,8 +149,9 @@ def test_family_expands_into_tiers_like_a_toml_layer() -> None:
 
 
 def _resolve(cfg: Configuration, tier: Tier = Tier.ADVANCED, prefix: str = "values_") -> Model:
+    """Through the loaders' read, which is where the provider keys are applied."""
     return resolve_tiered_model(
-        dict(cfg.sections),
+        load_merged_config(Workspace(root=Path("/unused"), configuration=cfg)),
         section_name=ConfigSection.GROUNDED,
         tier=tier,
         invalid=GroundedConfigMissing,
@@ -189,14 +197,94 @@ def test_section_key_wins_over_tier_and_provider_keys() -> None:
     assert _resolve(cfg).api_key == "task"
 
 
-def test_provider_key_reaches_a_section_model_of_that_provider_only() -> None:
+def test_section_models_take_the_provider_key_of_their_provider() -> None:
+    """One `Configuration` is one layer: the provider key on `Models` serves its section
+    models as it serves its tiers — not a model of another provider, and not one at a
+    custom `api_base`. Otherwise a keyless section model would read the server's own
+    `ANTHROPIC_API_KEY`, not the one this configuration was given."""
     cfg = _build(
-        models=Models(family="anthropic", anthropic_api_key="ant"),
+        models=Models(anthropic_api_key="ant"),
         grounded=Grounded(schema_model=Model("anthropic/y"), values_model=Model("openai/gpt-4o")),
+        classification=Classification(model=Model("anthropic/z", api_base="https://proxy")),
     )
     assert _resolve(cfg, Tier.EXPERT, "schema_") == Model("anthropic/y", api_key="ant")
-    # Another provider's model never gets the Anthropic key: litellm reads OPENAI_API_KEY.
     assert _resolve(cfg) == Model("openai/gpt-4o")
+    assert cfg.sections[ConfigSection.CLASSIFICATION] == {
+        "model": "anthropic/z",
+        "api_base": "https://proxy",
+    }
+
+
+def test_a_per_call_override_takes_the_configurations_provider_key(tmp_path: Path) -> None:
+    """A multi-tenant caller passes each tenant's key by value: a `values_model=`
+    override must run on that key, not on the server's own `ANTHROPIC_API_KEY`."""
+    from dgml_core.grounded import load_grounded_config
+
+    cfg = _build(models=Models(family="anthropic", anthropic_api_key="tenant-key"))
+    ws = Workspace(root=tmp_path, configuration=cfg)
+    config = load_grounded_config(
+        ws, values_model="anthropic/claude-sonnet-4-6", schema_model="openai/gpt-5"
+    )
+    assert config.values_api_key == "tenant-key"
+    assert config.schema_api_key is None  # no OpenAI key on this configuration
+
+
+def test_a_per_call_provider_key_reaches_every_tier(tmp_path: Path) -> None:
+    """The keys are applied after the overrides are in, so an override's provider key
+    is the one the tiers get — not a copy of the configuration's baked in earlier."""
+    cfg = _build(models=Models(family="anthropic", anthropic_api_key="K1"))
+    ws = Workspace(root=tmp_path, configuration=cfg)
+    merged = load_merged_config(ws, cli_overrides={"models": {"anthropic_api_key": "K2"}})
+    assert all(merged[ConfigSection.MODELS][f"{t}_api_key"] == "K2" for t in Tier)
+    assert cfg.sections[ConfigSection.MODELS]["anthropic_api_key"] == "K1"  # untouched
+
+
+def test_a_stray_override_credential_is_refused_on_the_in_memory_path_too(tmp_path: Path) -> None:
+    ws = Workspace(root=tmp_path, configuration=_build(models=Models(family="anthropic")))
+    merged = load_merged_config(ws, cli_overrides={"grounded": {"values_api_key_env": "K"}})
+    assert merged[ConfigSection.GROUNDED] == {"values_api_key_env": "K"}
+    with pytest.raises(GroundedConfigMissing, match=r"'grounded\.values_api_key_env' is set, but"):
+        resolve_tiered_model(
+            merged,
+            section_name=ConfigSection.GROUNDED,
+            tier=Tier.ADVANCED,
+            invalid=GroundedConfigMissing,
+            missing=GroundedConfigMissing,
+            prefix="values_",
+        )
+
+
+def test_a_tier_at_an_api_base_without_a_key_is_warned(caplog: pytest.LogCaptureFixture) -> None:
+    cfg = _build(
+        models=Models(
+            family="anthropic",
+            anthropic_api_key="tenant-key",
+            standard=Model("anthropic/x", api_base="https://proxy"),
+        )
+    )
+    assert _resolve(cfg, Tier.STANDARD) == Model("anthropic/x", api_base="https://proxy")
+    assert "'models.anthropic_api_key' is not sent to models.standard" in caplog.text
+
+
+def test_from_merged_keeps_its_provider_keys_for_the_loaders() -> None:
+    sections = {"models": {"standard": "anthropic/x", "anthropic_api_key": "sk"}}
+    cfg = Configuration._from_merged(identity=_ID, storage=_STORAGE, sections=sections)
+    assert cfg.sections[ConfigSection.MODELS] == sections["models"]  # as merged
+    assert _resolve(cfg, Tier.STANDARD) == Model("anthropic/x", api_key="sk")
+    assert cfg.models.standard == Model("anthropic/x", api_key="sk")
+
+
+def test_a_toml_workspaces_config_keeps_its_provider_keys(tmp_path: Path) -> None:
+    """Reopening with `configuration=ws.config` keeps the keys for per-call overrides."""
+    from dgml_core.grounded import load_grounded_config
+
+    from .conftest import write_config
+
+    src = Workspace(root=tmp_path / "src")
+    write_config(src, {"models": {"family": "anthropic", "anthropic_api_key_env": "ORG"}})
+    reopened = Workspace(root=tmp_path / "copy", configuration=src.config)
+    config = load_grounded_config(reopened, values_model="anthropic/claude-sonnet-4-6")
+    assert config.values_api_key_env == "ORG"
 
 
 def test_no_key_anywhere_leaves_litellm_its_env_var() -> None:
@@ -231,7 +319,7 @@ def test_storage_builds_the_store_config_pair() -> None:
 
 
 def test_from_merged_accepts_string_keys() -> None:
-    cfg = Configuration.from_merged(
+    cfg = Configuration._from_merged(
         identity=_ID, storage=_STORAGE, sections={"models": {"advanced": "a/m"}}
     )
     assert cfg.sections == {ConfigSection.MODELS: {"advanced": "a/m"}}
@@ -253,3 +341,101 @@ def test_is_frozen() -> None:
     cfg = _build()
     with pytest.raises(AttributeError):
         cfg.identity = _ID  # type: ignore[misc]
+
+
+def test_redaction_matches_whole_words_and_spares_env_names() -> None:
+    from dgml_core.redaction import redacted
+
+    table = {
+        "max_tokens": 64000,
+        "max_completion_tokens": 1,
+        "auth_token": "t",
+        "api_key": "k",
+        "api_key_env": "ENV",
+        "mongo_uri": "mongodb://u:p@h",
+        "nested": {"aws_secret_access_key": "s", "bucket": "b"},
+        "unset_key": None,
+        "database_url": "postgresql://u:pw@h/d",
+        "endpoint_url": "http://minio:9000",
+        "plain_uri": "mongodb://h/d",
+        "dsn": "d",
+        "apikey": "a",
+        "hosts": [{"password": "p", "host": "h"}, "h2"],
+    }
+    assert redacted(table) == {
+        "max_tokens": 64000,
+        "max_completion_tokens": 1,
+        "auth_token": "***",
+        "api_key": "***",
+        "api_key_env": "ENV",
+        "mongo_uri": "***",
+        "nested": {"aws_secret_access_key": "***", "bucket": "b"},
+        "unset_key": None,
+        "database_url": "***",
+        "endpoint_url": "http://minio:9000",
+        "plain_uri": "mongodb://h/d",
+        "dsn": "***",
+        "apikey": "***",
+        "hosts": [{"password": "***", "host": "h"}, "h2"],
+    }
+
+
+def test_resolved_task_configs_hide_their_keys() -> None:
+    """The loaders' results carry the literal key once the merge has applied it, and
+    they are what a host is likeliest to log."""
+    from dgml_core.classification import ClassificationConfig
+    from dgml_core.generation.config import GenerationConfig
+    from dgml_core.grounded import GroundedConfig
+    from dgml_core.ocr import OcrConfig
+    from dgml_core.style_config import StyleConfig
+    from dgml_core.text_extraction_config import TextExtractionConfig
+
+    configs = [
+        GenerationConfig(model="m", label_model="l", api_key="SECRET", label_api_key="SECRET"),
+        GroundedConfig(
+            schema_model="s", values_model="v", schema_api_key="SECRET", values_api_key="SECRET"
+        ),
+        ClassificationConfig(model="m", api_key="SECRET"),
+        StyleConfig(model="m", api_key="SECRET"),
+        TextExtractionConfig(model="m", api_key="SECRET"),
+        OcrConfig(provider="azure", options={"endpoint": "https://e", "api_key": "SECRET"}),
+    ]
+    for cfg in configs:
+        assert "SECRET" not in repr(cfg) + str(cfg), cfg
+    assert "'endpoint': 'https://e'" in repr(configs[-1])
+
+
+def test_reprs_never_show_a_credential() -> None:
+    """A `Configuration` is built from secrets passed by value, and a host logs or
+    debug-prints it like any object: no repr or str may carry one. Model ids, env-var
+    names, endpoints and non-secret options stay visible."""
+    spec = ProviderSpec(
+        "s3:Blob",
+        {
+            "bucket": "b",
+            "aws_secret_access_key": "SECRET-aws",
+            "mongo_uri": "mongodb://u:SECRET-pw@h/d",
+        },
+    )
+    expert = Model("anthropic/x", api_key="SECRET-tier", api_base="https://p")
+    advanced = Model("anthropic/y", api_key_env="OPUS_KEY")
+    cfg = Configuration.build(
+        identity=_ID,
+        storage=Storage.combined(spec),
+        models=Models(
+            family="anthropic", anthropic_api_key="SECRET-ant", expert=expert, advanced=advanced
+        ),
+        ocr=Ocr(provider="azure", options={"endpoint": "https://e", "api_key": "SECRET-ocr"}),
+        conversion=Conversion(
+            {FormatFamily.DOCX: ProviderSpec("mod:Conv", {"auth_token": "SECRET-tok"})}
+        ),
+    )
+    objects = [cfg, cfg.storage, spec, cfg.models, cfg.models.expert, expert]
+    objects += list(cfg.storage.store_configs(root=Path("/r"), workspace_id="t"))
+    objects.append(Models(anthropic_api_key="SECRET-ant"))
+    for obj in objects:
+        text = repr(obj) + str(obj)
+        assert "SECRET" not in text, text
+    text = repr(cfg)
+    for visible in ("anthropic/x", "OPUS_KEY", "https://p", "'bucket': 'b'", "https://e", "'***'"):
+        assert visible in text

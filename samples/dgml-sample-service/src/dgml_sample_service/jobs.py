@@ -25,6 +25,7 @@ queue instead.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import uuid
 from collections.abc import Callable
@@ -36,6 +37,7 @@ from dgml_core import DgmlError
 from sqlalchemy.engine import Engine
 
 from .db import iso, jobs, utcnow
+from .logcontext import bind_workspace_id
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +114,10 @@ class JobRunner:
                     created_at=utcnow(),
                 )
             )
-        self._pool.submit(self._run, job_id, fn)
+        # The job runs in a copy of the submitting context (a pool thread would
+        # otherwise start with an empty one, losing whatever the request bound),
+        # with the organisation's workspace id bound for every line it logs.
+        self._pool.submit(contextvars.copy_context().run, self._run, organisation_id, job_id, fn)
         found = self.get(organisation_id, job_id)
         assert found is not None
         return found
@@ -124,20 +129,21 @@ class JobRunner:
     def _fail(self, job_id: uuid.UUID, error: str, code: str) -> None:
         self._set(job_id, status=FAILED, error=error, error_code=code, finished_at=utcnow())
 
-    def _run(self, job_id: uuid.UUID, fn: JobFn) -> None:
+    def _run(self, organisation_id: uuid.UUID, job_id: uuid.UUID, fn: JobFn) -> None:
         # Nothing may escape: the pool would swallow the exception and leave the job
         # ``running`` forever. Recording the result is inside the ``try`` too, so a
         # result the JSON column cannot store fails the job instead.
-        try:
-            self._set(job_id, status=RUNNING, started_at=utcnow())
-            result = fn()
-            self._set(job_id, status=SUCCEEDED, result=result, finished_at=utcnow())
-        except DgmlError as exc:
-            logger.warning("job %s failed: %s: %s", job_id, exc.code, exc)
-            self._fail(job_id, str(exc), exc.code)
-        except Exception as exc:
-            logger.exception("job %s crashed", job_id)
-            self._fail(job_id, f"{type(exc).__name__}: {exc}", "INTERNAL")
+        with bind_workspace_id(organisation_id):
+            try:
+                self._set(job_id, status=RUNNING, started_at=utcnow())
+                result = fn()
+                self._set(job_id, status=SUCCEEDED, result=result, finished_at=utcnow())
+            except DgmlError as exc:
+                logger.warning("job %s failed: %s: %s", job_id, exc.code, exc)
+                self._fail(job_id, str(exc), exc.code)
+            except Exception as exc:
+                logger.exception("job %s crashed", job_id)
+                self._fail(job_id, f"{type(exc).__name__}: {exc}", "INTERNAL")
 
     def get(self, organisation_id: uuid.UUID, job_id: uuid.UUID) -> dict[str, Any] | None:
         with self._engine.connect() as conn:

@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from clustering.config.schema import Config, SupportSelection
+from clustering.config.schema import Config, ScenarioName, SupportSelection
 from clustering.data.datasets import DocumentDataset, DocumentRecord
 from clustering.encoders import build_encoder
 from clustering.encoders.base import EncoderOutput
@@ -88,7 +88,7 @@ class Scenario(ABC):
       - override :meth:`embed` to inject custom encoding logic
     """
 
-    name: str
+    name: ScenarioName
 
     def __init__(self, config: Config) -> None:
         from clustering.manifolds.projector import ManifoldProjector
@@ -394,7 +394,7 @@ class Scenario(ABC):
         *,
         categories: list[str],
         n_shots: int | None = None,
-        selection: SupportSelection = "order",
+        selection: SupportSelection = SupportSelection.ORDER,
     ) -> torch.Tensor:
         """Build one on-manifold prototype per category from labeled samples.
 
@@ -432,7 +432,7 @@ class Scenario(ABC):
         for cat in categories:
             support_idx = [i for i, lbl in enumerate(support_labels) if lbl == cat]
             if n_shots is not None and len(support_idx) > n_shots:
-                if selection == "central":
+                if selection == SupportSelection.CENTRAL:
                     # Keep the n_shots rows nearest the category's ambient mean
                     # (the most typical), ranked in the same space the mean below
                     # is taken in — so a capped budget spends on representatives,

@@ -138,7 +138,7 @@ def test_both_api_key_and_env_is_invalid(workspace: Workspace) -> None:
         {
             "text_extraction": {
                 "enabled": True,
-                "model": "gemini/gemini-2.5-flash-lite",
+                "model": "gemini/gemini-3.5-flash-lite",
                 "api_key": "literal",
                 "api_key_env": "SOME_VAR",
             }

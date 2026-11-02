@@ -49,7 +49,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any
 
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL
 
@@ -61,9 +61,17 @@ from .classification import (
     load_classification_config,
     propose_new_docset_for_files,
 )
+
+# Re-exported: the option enums were defined here before the CLI needed them
+# without the optional extra this module imports.
+from .clustering_types import CLUSTER_METHODS as CLUSTER_METHODS
+from .clustering_types import CLUSTER_MODES as CLUSTER_MODES
+from .clustering_types import ClusterMethod as ClusterMethod
+from .clustering_types import ClusterMode as ClusterMode
 from .config import load_merged_config
 from .dataset import WorkspaceFileDataset
 from .docsets import DocSetStore
+from .enums import parse_enum
 from .errors import (
     ClassificationConfigMissing,
     ClassificationFailed,
@@ -94,32 +102,6 @@ MAX_FILES_PER_CLUSTER_NAMING = 2
 # embedding cost). Embeddings are content-hashed and cached by the encoder
 # layer, so re-embedding already-seen members is cheap on repeat runs.
 MAX_SUPPORT_SAMPLES_PER_DOCSET = 64
-
-# Clustering run modes. ``auto`` resolves to ``incremental`` when the
-# workspace already has DocSets, else ``fresh``.
-ClusterMode = Literal["auto", "fresh", "incremental"]
-CLUSTER_MODES: tuple[str, ...] = get_args(ClusterMode)
-
-# Clustering *method* — how documents are grouped, orthogonal to the
-# fresh/incremental mode above.
-#
-# - ``embedding``: the encode → project → statistical-cluster pipeline in
-#   :mod:`dgml_core.run_clustering`. The right choice once a corpus is
-#   large enough for tf-idf / neighbor-graph statistics to be meaningful.
-# - ``llm``: send every document's page images to the vision LLM in one
-#   call and let it partition them (:func:`dgml_core.llm_clustering.llm_cluster_files`).
-#   Built for *very small* corpora, where the embedding pipeline has too
-#   little signal to cluster reliably.
-# - ``auto`` (default): on a *fresh* run, pick ``llm`` when the number of
-#   clusterable files is at or below :data:`SMALL_CORPUS_MAX_FILES`, else
-#   ``embedding``; an incremental run always takes ``embedding`` (see
-#   :func:`_resolve_method` for why the batch size does not speak for it).
-#   ``embedding`` is not a safe default on its own: on a small fresh corpus
-#   it is the path the two bullets above say it cannot serve, and the
-#   tf-idf fit has no document-frequency signal to work with at all. So the
-#   routing, not the caller, picks the engine unless the caller insists.
-ClusterMethod = Literal["auto", "embedding", "llm"]
-CLUSTER_METHODS: tuple[str, ...] = get_args(ClusterMethod)
 
 # At or below this many clusterable files, ``method="auto"`` routes to the
 # LLM partitioner instead of the embedding pipeline. Small enough that the
@@ -247,11 +229,11 @@ class _InternalResult:
     # flagged files appear, so an unconfigured run carries an empty dict rather
     # than one ``False`` per file. Empty unless ``scenario.calibration`` is set.
     review: dict[str, bool] = field(default_factory=dict)
-    mode: str = "fresh"
+    mode: ClusterMode = ClusterMode.FRESH
     # The engine that grouped the files, or None when none ran (empty
     # workspace, nothing clusterable, `skip_existing` short-circuit). Never
-    # "auto": that is a request, not an outcome.
-    method: str | None = None
+    # AUTO: that is a request, not an outcome.
+    method: ClusterMethod | None = None
     known_categories: list[str] = field(default_factory=list)
     # LLM-method only: proposed DocSet metadata for each emergent
     # ``"unknown_N"`` cluster, keyed by cluster name. When present,
@@ -307,8 +289,8 @@ def clustering(
     *,
     skip_existing: bool = False,
     config: str | None = None,
-    mode: str = "auto",
-    method: str = "auto",
+    mode: ClusterMode = ClusterMode.AUTO,
+    method: ClusterMethod = ClusterMethod.AUTO,
     small_corpus_threshold: int = SMALL_CORPUS_MAX_FILES,
     write_stats: bool = False,
     record_usage: bool = False,
@@ -332,13 +314,13 @@ def clustering(
     ``"embedding"`` (default) uses the statistical pipeline; ``"llm"`` uses
     the vision-LLM partitioner built for very small corpora; ``"auto"``
     picks ``"llm"`` when at most ``small_corpus_threshold`` files are
-    clusterable, else ``"embedding"``. See :data:`ClusterMethod`.
+    clusterable, else ``"embedding"``. See :class:`ClusterMethod`.
 
     Partial success: if classification config is missing/invalid, or the
     LLM call for a given cluster fails, the files in *that* cluster
     land in ``failed_file_ids`` while every other cluster (matched or
     successfully named) is still assigned. Files whose page rendering
-    failed at ingest time (no ``page_1.png``), and files the clusterer
+    failed at ingest time (no ``page_1.{png,jpg}``), and files the clusterer
     placed in no cluster at all, also land in ``failed_file_ids``. The
     function does not raise.
 
@@ -412,20 +394,16 @@ def clustering(
     assignment to a schema-bearing DocSet triggers, and ``record_usage`` also
     to the clustering and naming LLM calls.
     """
-    if mode not in CLUSTER_MODES:
-        raise ClusteringConfigInvalid(
-            f"unknown clustering mode {mode!r}; choose one of {', '.join(CLUSTER_MODES)}."
-        )
-    if method not in CLUSTER_METHODS:
-        raise ClusteringConfigInvalid(
-            f"unknown clustering method {method!r}; choose one of {', '.join(CLUSTER_METHODS)}."
-        )
+    mode = _parse_mode(mode)
+    method = _parse_method(method)
     if skip_existing and not unassigned_file_ids(workspace):
         return {
             "clusters": {},
             "failed_file_ids": [],
             "skipped": True,
-            "mode": "incremental" if DocSetStore(workspace).list_all() else "fresh",
+            "mode": str(
+                ClusterMode.INCREMENTAL if DocSetStore(workspace).list_all() else ClusterMode.FRESH
+            ),
             # No engine ran, so there is nothing to report. Echoing the request
             # would put "auto" — the default — in a field documented as the
             # engine that grouped the files.
@@ -525,7 +503,17 @@ def clustering(
                     decision = propose_new_docset_for_files(
                         workspace, sample, config=classification_config, record_usage=record_usage
                     )
-                except DgmlError:
+                except DgmlError as exc:
+                    # Soft-failed like the partitioner's failure above: INFO,
+                    # since failed_file_ids does not carry the reason.
+                    logger.info(
+                        "clustering: naming cluster %s failed; its %d files left "
+                        "unassigned: %s: %s",
+                        cluster_name,
+                        len(cluster_files),
+                        exc.code,
+                        exc,
+                    )
                     failed_file_ids.extend(cluster_files)
                     continue
             new_name = decision.new_name or ""
@@ -577,12 +565,12 @@ def clustering(
         "clusters": clusters,
         "failed_file_ids": failed_file_ids,
         "skipped": False,
-        "mode": internal.mode,
+        "mode": str(internal.mode),
         # Which engine actually grouped the files, or null when none ran.
         # Under the default ``method="auto"`` the caller does not choose it,
         # and an ``auto`` run that fell back off the LLM partitioner would
         # otherwise be indistinguishable from one that never routed there.
-        "method": internal.method,
+        "method": None if internal.method is None else str(internal.method),
         "n_assigned_existing": n_assigned_existing,
         "n_new_clusters": n_new_clusters,
         "assignments": assignments,
@@ -593,8 +581,8 @@ def clustering(
 def clustering_internal(
     workspace: Workspace,
     config: str | None = None,
-    mode: str = "auto",
-    method: str = "auto",
+    mode: ClusterMode = ClusterMode.AUTO,
+    method: ClusterMethod = ClusterMethod.AUTO,
     small_corpus_threshold: int = SMALL_CORPUS_MAX_FILES,
     record_usage: bool = False,
 ) -> _InternalResult:
@@ -641,9 +629,13 @@ def clustering_internal(
       an emergent cluster: they resemble neither an existing DocSet nor
       one another, so naming them into a DocSet would invent a category.
 
+    An unknown ``mode`` or ``method`` raises :class:`ClusteringConfigInvalid`.
+
     Returns an :class:`_InternalResult`. Empty workspace ⇒ an empty
     result carrying the resolved ``mode``.
     """
+    mode = _parse_mode(mode)
+    method = _parse_method(method)
     docset_store = DocSetStore(workspace)
     docsets = docset_store.list_all()
     effective_mode = _resolve_mode(mode, has_docsets=bool(docsets))
@@ -668,7 +660,7 @@ def clustering_internal(
     # prototypes.
     known_categories = [d.name for d in docsets]
     proto_docsets = docsets
-    if effective_mode == "fresh":
+    if effective_mode == ClusterMode.FRESH:
         known_categories = []
         proto_docsets = []
 
@@ -694,9 +686,13 @@ def clustering_internal(
     # is not in the environment. Deciding it here, before the call, keeps
     # :func:`clustering`'s documented "does not raise" contract intact and
     # costs nothing — a caller who *named* ``llm`` still gets the error.
-    if effective_method == "llm" and method == "auto" and not _llm_partitioner_usable(workspace):
-        effective_method = "embedding"
-    if effective_method == "llm":
+    if (
+        effective_method == ClusterMethod.LLM
+        and method == ClusterMethod.AUTO
+        and not _llm_partitioner_usable(workspace)
+    ):
+        effective_method = ClusterMethod.EMBEDDING
+    if effective_method == ClusterMethod.LLM:
         llm_result = _llm_cluster_internal(
             workspace,
             usable,
@@ -705,7 +701,7 @@ def clustering_internal(
             known_categories=known_categories,
             effective_mode=effective_mode,
             record_usage=record_usage,
-            retry_on_embedding=method == "auto",
+            retry_on_embedding=method == ClusterMethod.AUTO,
         )
         # ``None`` only under ``auto``, and only for a call that failed after it
         # started. Some of those failures belong to the partitioner rather than
@@ -721,7 +717,7 @@ def clustering_internal(
     # nothing is ever novel. Ship a conservative quantile gate by default (only
     # when the user hasn't set one) so new categories can emerge. Fresh mode
     # clusters from scratch (S1, no prototypes) and needs no gate.
-    if effective_mode == "incremental":
+    if effective_mode == ClusterMode.INCREMENTAL:
         overrides = _with_incremental_novelty_default(overrides)
     # Point corpus-fitted text encoders at a directory of page text and learn
     # the text view the configured encoder expects, so the dataset assembles
@@ -820,7 +816,7 @@ def clustering_internal(
         confidences=confidences,
         review=review,
         mode=effective_mode,
-        method="embedding",
+        method=ClusterMethod.EMBEDDING,
         known_categories=known_categories,
     )
 
@@ -937,7 +933,9 @@ def _llm_partitioner_usable(workspace: Workspace) -> bool:
     return True
 
 
-def _resolve_method(method: str, *, n_usable: int, threshold: int, mode: str) -> str:
+def _resolve_method(
+    method: ClusterMethod, *, n_usable: int, threshold: int, mode: ClusterMode
+) -> ClusterMethod:
     """Resolve ``auto`` to ``llm`` / ``embedding``. Others pass through.
 
     Only a **fresh** run is at the mercy of how many files it was handed. It
@@ -958,11 +956,11 @@ def _resolve_method(method: str, *, n_usable: int, threshold: int, mode: str) ->
     the embedding path is at its strongest. So it stays on the statistical
     path regardless of batch size.
     """
-    if method != "auto":
+    if method != ClusterMethod.AUTO:
         return method
-    if mode != "fresh":
-        return "embedding"
-    return "llm" if n_usable <= threshold else "embedding"
+    if mode != ClusterMode.FRESH:
+        return ClusterMethod.EMBEDDING
+    return ClusterMethod.LLM if n_usable <= threshold else ClusterMethod.EMBEDDING
 
 
 def _llm_cluster_internal(
@@ -972,7 +970,7 @@ def _llm_cluster_internal(
     *,
     proto_docsets: list[Any],
     known_categories: list[str],
-    effective_mode: str,
+    effective_mode: ClusterMode,
     record_usage: bool,
     retry_on_embedding: bool = False,
 ) -> _InternalResult | None:
@@ -1009,14 +1007,28 @@ def _llm_cluster_internal(
         result = llm_cluster_files(
             workspace, usable, config=ccfg, docsets=proto_docsets, record_usage=record_usage
         )
-    except ClassificationFailed:
+    except ClassificationFailed as exc:
+        # Soft-failed (the run goes on), so INFO; but the error is logged since
+        # neither outcome below carries it — the files only land in
+        # ``failed_file_ids``, or the embedding pipeline takes over.
         if retry_on_embedding:
+            logger.info(
+                "clustering: the LLM partitioner failed on %d files; grouping them "
+                "with the embedding pipeline instead: %s",
+                len(usable),
+                exc,
+            )
             return None
+        logger.info(
+            "clustering: the LLM partitioner failed; %d files left unassigned: %s",
+            len(usable),
+            exc,
+        )
         return _InternalResult(
             clusters={},
             render_skipped=[*skipped, *usable],
             mode=effective_mode,
-            method="llm",
+            method=ClusterMethod.LLM,
             known_categories=known_categories,
         )
 
@@ -1032,22 +1044,49 @@ def _llm_cluster_internal(
         # model gave no confidence for stays ``None``.
         confidences={fid: result.confidences.get(fid) for fid in result.clusters},
         mode=effective_mode,
-        method="llm",
+        method=ClusterMethod.LLM,
         known_categories=known_categories,
         proposals=result.proposals,
     )
 
 
-def _resolve_mode(mode: str, *, has_docsets: bool) -> str:
+def _parse_mode(mode: str) -> ClusterMode:
+    """``mode`` as a :class:`ClusterMode`, or :class:`ClusteringConfigInvalid`.
+
+    The one place an unknown mode is rejected. Every later check compares
+    against members, so a value that is not one would otherwise slip past them
+    all and run as whichever branch its ``!=`` tests happened to fall through to.
+    """
+    parsed = parse_enum(ClusterMode, mode)
+    if parsed is None:
+        raise ClusteringConfigInvalid(
+            f"unknown clustering mode {mode!r}; choose one of {', '.join(CLUSTER_MODES)}."
+        )
+    return parsed
+
+
+def _parse_method(method: str) -> ClusterMethod:
+    """``method`` as a :class:`ClusterMethod`, or :class:`ClusteringConfigInvalid`."""
+    parsed = parse_enum(ClusterMethod, method)
+    if parsed is None:
+        raise ClusteringConfigInvalid(
+            f"unknown clustering method {method!r}; choose one of {', '.join(CLUSTER_METHODS)}."
+        )
+    return parsed
+
+
+def _resolve_mode(mode: ClusterMode, *, has_docsets: bool) -> ClusterMode:
     """Resolve ``auto`` to ``fresh`` / ``incremental`` and validate forcing.
 
-    ``incremental`` requires at least one existing DocSet — forcing it on
-    an empty workspace raises :class:`IncrementalWithoutClusters` so the
-    caller gets a clear error rather than a silent fresh run.
+    ``mode`` is already a member: the entry points parse it (see
+    :func:`_parse_mode`). ``incremental`` requires at least one existing
+    DocSet — forcing it on an empty workspace raises
+    :class:`IncrementalWithoutClusters` so the caller gets a clear error rather
+    than a silent fresh run.
     """
-    if mode == "auto":
-        return "incremental" if has_docsets else "fresh"
-    if mode == "incremental" and not has_docsets:
+    if mode == ClusterMode.AUTO:
+        return ClusterMode.INCREMENTAL if has_docsets else ClusterMode.FRESH
+    if mode == ClusterMode.INCREMENTAL and not has_docsets:
         raise IncrementalWithoutClusters(
             "mode='incremental' requires at least one existing DocSet to assign into, "
             "but this workspace has none. Run a fresh clustering first "

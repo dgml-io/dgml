@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from dgml_core.dg_refs import ValueMethod
 from dgml_core.extraction_schema import Tag, Vocabulary, json_schema_to_rnc, parse_rnc
 from dgml_core.extraction_xml import (
     carry_extraction_over,
@@ -438,6 +439,23 @@ def test_calculated_field_roundtrip() -> None:
     assert back["Invoice"]["VendorName"] == invoice["VendorName"]
     # Grounded line-item leaves gain their normalized dg:value on the way back.
     assert back["Invoice"]["LineItems"][0]["UnitPrice"]["value"] == "49.95"
+
+
+def test_method_member_writes_the_same_xml_and_reads_back_plain() -> None:
+    """``dg:method`` is a :class:`ValueMethod` value: a member in the values
+    writes byte-identical XML to the bare string, and reading the XML back
+    yields the bare string in the (JSON-shaped) values."""
+    vocab = parse_rnc(_INVOICE_RNC)
+    values = _invoice_values()
+    invoice = values["Invoice"]
+    assert isinstance(invoice, dict)
+    assert invoice["InvoiceTotal"]["method"] == "calculated"
+    plain_xml = standalone_extraction_doc(values, vocab=vocab)
+    invoice["InvoiceTotal"]["method"] = ValueMethod.CALCULATED
+    assert standalone_extraction_doc(values, vocab=vocab) == plain_xml
+    back = dgml_xml_to_values(plain_xml, vocab=vocab)
+    method = back["Invoice"]["InvoiceTotal"]["method"]
+    assert method == ValueMethod.CALCULATED and type(method) is str
 
 
 def test_dangling_inputs_dropped() -> None:

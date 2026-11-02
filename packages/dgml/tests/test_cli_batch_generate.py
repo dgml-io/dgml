@@ -49,7 +49,7 @@ from .test_cli import _init_ws, _read_stderr, _read_stdout, _seed_file_dir, _wri
 _PAGES = {"alpha.pdf": 1, "bravo.pdf": 3}
 _HEADER_RE = re.compile(r"pages (\d+)-(\d+) of (\d+)")
 _BLOCK_ID_RE = re.compile(r"\bb\d{4}\b")
-_MODELS = {"model": "anthropic/claude-haiku-4-5", "label_model": "anthropic/claude-sonnet-4-6"}
+_MODELS = {"model": "anthropic/claude-haiku-5-5", "label_model": "anthropic/claude-sonnet-4-6"}
 
 
 def _system(kwargs: dict[str, Any]) -> str:
@@ -267,6 +267,7 @@ def _run_both(
     provider: _Provider,
     *extra: str,
     config: dict[str, Any] | None = None,
+    batch_extra: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], list[Any]]:
     """(sync payload, sync state, batch payload, batch state, batch-run sync calls)."""
     ws_s, did_s = _seed(tmp_path / "sync", capsys, config)
@@ -283,7 +284,7 @@ def _run_both(
         return _answer(kwargs)
 
     with patch("litellm.completion", side_effect=record):
-        assert main(_argv(ws_b, did_b, *extra, *_BATCH)) == 0
+        assert main(_argv(ws_b, did_b, *extra, *_BATCH, *batch_extra)) == 0
     batch_payload = _read_stdout(capsys)
     return (
         sync_payload,
@@ -297,10 +298,40 @@ def _run_both(
 _COST_FIELDS = ("cost_usd", "standard_cost_usd", "saved_usd")
 
 
-def test_open_vocab_batches_every_stage_but_labeling_and_matches_sync(
+def test_open_vocab_batches_every_stage_and_labels_per_document(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], provider: _Provider
 ) -> None:
+    """The default under --batch: an open vocabulary labels one document per
+    batch stage, in the sync order, and ends byte-identical to the sync run."""
     sync_payload, sync_state, payload, state, batch_sync = _run_both(tmp_path, capsys, provider)
+
+    assert "batch" not in sync_payload
+    assert state["outputs"] == sync_state["outputs"]
+    assert b"Greeting" in state["outputs"]["bravo.pdf"]
+    assert state["files"] == sync_state["files"]
+    assert state["rows"] == sync_state["rows"]
+    rest = {k: v for k, v in payload.items() if k != "batch"}
+    assert _payload_shape(rest) == _payload_shape(sync_payload)
+
+    stages = payload["batch"]["stages"]
+    assert set(stages) == {"transcribe", "plan", "label", "links"}
+    label = stages["label"]
+    assert label["mode"] == "per-document"
+    assert label["documents"] == len(_PAGES)
+    assert label["waves"] >= len(_PAGES)  # at least one round trip per document
+    assert label["requests"] == label["batch_ok"] > 0
+    assert label["sync_fallbacks"] == 0
+    assert label["cost_usd"] == pytest.approx(label["standard_cost_usd"] / 2)
+    assert batch_sync == []  # every request went through the batch
+
+
+def test_no_batch_label_batches_every_stage_but_labeling_and_matches_sync(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], provider: _Provider
+) -> None:
+    """``--no-batch-label``: today's behavior — labeling stays synchronous."""
+    sync_payload, sync_state, payload, state, batch_sync = _run_both(
+        tmp_path, capsys, provider, batch_extra=("--no-batch-label",)
+    )
 
     assert "batch" not in sync_payload  # no --batch: the payload is unchanged
     assert state["outputs"] == sync_state["outputs"]
@@ -325,7 +356,7 @@ def test_open_vocab_batches_every_stage_but_labeling_and_matches_sync(
     assert stages["plan"]["waves"] == 2  # the draft, then the refine turn
     assert stages["links"]["waves"] == 2  # propose, then verify
     assert stages["label"]["mode"] == "sync"
-    assert "open vocabulary" in stages["label"]["skipped"]
+    assert "batch_label = false" in stages["label"]["skipped"]
     # Only labeling reached the synchronous seam.
     assert batch_sync and {_system(c) for c in batch_sync} == {label_mod.SYSTEM_PROMPT}
 
@@ -361,7 +392,7 @@ def test_no_semlinks_reports_the_link_stage_skipped(
 
 _STYLE_CONFIG = {
     "generation": _MODELS,
-    "style": {"enabled": True, "model": "anthropic/claude-haiku-4-5"},
+    "style": {"enabled": True, "model": "anthropic/claude-haiku-5-5"},
 }
 
 
@@ -445,6 +476,32 @@ def test_style_model_is_not_checked_when_no_file_is_ocr(
     }
 
 
+def test_the_anthropic_google_style_tier_passes_the_pre_flight(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anthropic_google family styles with its Gemini light tier, which
+    now has a batch backend: the pre-flight accepts every stage."""
+    from dgml.cli import _batch_preflight
+    from dgml_core.default_config import PROVIDER_MODELS
+
+    light = PROVIDER_MODELS["anthropic_google"]["light"]
+    config = {**_STYLE_CONFIG, "style": {"enabled": True, "model": light}}
+    ws, did = _seed(tmp_path, capsys, config)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")  # never used: no call is made
+    checked: list[dict[str, Any]] = []
+
+    def preflight(stages: dict[str, Any]) -> None:
+        _batch_preflight(stages)
+        checked.append(dict(stages))
+        raise RuntimeError("stop after the pre-flight")
+
+    monkeypatch.setattr("dgml.cli._batch_preflight", preflight)
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        assert main(_argv(ws, did, *_BATCH)) == 1
+    assert _read_stderr(capsys)["error"]["message"].endswith("stop after the pre-flight")
+    assert [stages["style"] for stages in checked] == [light]
+
+
 def test_batch_poll_interval_must_be_positive(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -452,3 +509,27 @@ def test_batch_poll_interval_must_be_positive(
     with pytest.raises(SystemExit) as exc:
         main(_argv(ws, did, "--batch", "--batch-poll-interval", "0"))
     assert exc.value.code == 2
+
+
+def test_a_batch_deadline_adds_its_block_and_changes_nothing_else(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], provider: _Provider
+) -> None:
+    """``--batch-deadline`` on ``docset generate``: an unreached deadline
+    reports ``batch.deadline`` and the run is otherwise the plain batch run."""
+    *_sync, plain, plain_state, _calls = _run_both(tmp_path / "plain", capsys, provider)
+    with patch("dgml_core.batch.deadline.wall_clock", lambda: 1_800_000_000.0):
+        *_sync, timed, timed_state, calls = _run_both(
+            tmp_path / "timed", capsys, provider, batch_extra=("--batch-deadline", "90m")
+        )
+
+    assert timed["batch"].pop("deadline") == {
+        "at": "2027-01-15T09:30:00Z",
+        "expired": False,
+        "canceled_batches": 0,
+        "collected_after_cancel": 0,
+        "sync_after_deadline": 0,
+        "possibly_double_billed": 0,
+    }
+    assert _payload_shape(timed) == _payload_shape(plain)
+    assert timed_state["outputs"] == plain_state["outputs"]
+    assert calls == []

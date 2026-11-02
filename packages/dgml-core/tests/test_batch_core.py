@@ -25,6 +25,7 @@ from dgml_core.batch import (
     BatchRequest,
     BatchState,
     FakeBackend,
+    ItemErrorKind,
     assert_batchable,
     fake_model_response,
     plan_batches,
@@ -71,11 +72,11 @@ def _fake_factory(cfg: BackendConfig) -> FakeBackend:
 @pytest.mark.parametrize(
     ("model", "provider"),
     [
-        ("anthropic/claude-haiku-4-5", "anthropic"),
+        ("anthropic/claude-haiku-5-5", "anthropic"),
         ("claude-sonnet-4-6", "anthropic"),
         ("openai/gpt-5.4", "openai"),
         ("gpt-4o", "openai"),
-        ("gemini/gemini-2.5-pro", "gemini"),
+        ("gemini/gemini-3.1-pro-preview", "gemini"),
         ("bedrock/" + BEDROCK_ID, "bedrock"),
         ("vertex_ai/claude-sonnet-4-6", "vertex_ai"),
         # Claude served by another host is that host's provider, not Anthropic's
@@ -119,13 +120,13 @@ def test_resolve_backend_returns_registered_fake_per_provider() -> None:
 
     for provider in ("anthropic", "openai", "gemini"):
         register_backend(provider, factory)
-    for model in ("anthropic/claude-haiku-4-5", "openai/gpt-5.4", "gemini/gemini-2.5-pro"):
+    for model in ("anthropic/claude-haiku-5-5", "openai/gpt-5.4", "gemini/gemini-3.1-pro-preview"):
         backend = resolve_backend(model, api_key="k", api_base=None)
         assert backend.provider == provider_of(model)
     assert [c.model for c in seen] == [
-        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-haiku-5-5",
         "openai/gpt-5.4",
-        "gemini/gemini-2.5-pro",
+        "gemini/gemini-3.1-pro-preview",
     ]
     assert all(c.api_key == "k" for c in seen)
 
@@ -147,10 +148,10 @@ def test_missing_dependency_quotes_hint_only_when_registered() -> None:
 
     register_backend("anthropic", _fake_factory, available=probe)
     with pytest.raises(BatchUnavailable) as info:
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
     msg = str(info.value)
     assert "No module named 'anthropic'" in msg
-    assert "anthropic/claude-haiku-4-5" in msg
+    assert "anthropic/claude-haiku-5-5" in msg
     assert "pip install" not in msg
     assert isinstance(info.value.__cause__, ImportError)
 
@@ -158,7 +159,7 @@ def test_missing_dependency_quotes_hint_only_when_registered() -> None:
         "anthropic", _fake_factory, available=probe, install_hint="pip install dgml[batch-x]"
     )
     with pytest.raises(BatchUnavailable) as info:
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
     assert "`pip install dgml[batch-x]`" in str(info.value)
 
 
@@ -171,11 +172,11 @@ def test_factory_import_error_is_missing_dependency_other_errors_propagate() -> 
 
     register_backend("anthropic", importless)
     with pytest.raises(BatchUnavailable):
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
 
     register_backend("anthropic", misconfigured)
     with pytest.raises(ValueError, match="bad api_base"):
-        resolve_backend("anthropic/claude-haiku-4-5")
+        resolve_backend("anthropic/claude-haiku-5-5")
 
 
 def test_assert_batchable_probes_each_provider_once_without_instantiating() -> None:
@@ -196,7 +197,7 @@ def test_assert_batchable_probes_each_provider_once_without_instantiating() -> N
     make("openai")
     assert_batchable(
         {
-            "transcribe": "anthropic/claude-haiku-4-5",
+            "transcribe": "anthropic/claude-haiku-5-5",
             "label": "anthropic/claude-sonnet-4-6",
             "links": "openai/gpt-5.4",
         }
@@ -210,7 +211,7 @@ def test_assert_batchable_names_first_offending_stage() -> None:
     with pytest.raises(BatchUnavailable) as info:
         assert_batchable(
             {
-                "transcribe": "anthropic/claude-haiku-4-5",
+                "transcribe": "anthropic/claude-haiku-5-5",
                 "label": "bedrock/" + BEDROCK_ID,
                 "links": "bedrock/" + BEDROCK_ID,
             }
@@ -224,7 +225,7 @@ def test_assert_batchable_missing_dependency_names_stage() -> None:
 
     register_backend("gemini", _fake_factory, available=probe, install_hint="pip install g")
     with pytest.raises(BatchUnavailable) as info:
-        assert_batchable({"transcribe": "gemini/gemini-2.5-pro"})
+        assert_batchable({"transcribe": "gemini/gemini-3.1-pro-preview"})
     msg = str(info.value)
     assert msg.startswith("stage 'transcribe'")
     assert "`pip install g`" in msg
@@ -283,7 +284,7 @@ def test_plan_batches_empty() -> None:
 
 def test_fake_backend_records_and_returns_scripted_results() -> None:
     ok = fake_model_response("hello", usage={"prompt_tokens": 3, "completion_tokens": 1}, cost=0.5)
-    err = BatchItemError("r1", "errored", "boom")
+    err = BatchItemError("r1", ItemErrorKind.ERRORED, "boom")
     backend = FakeBackend({"r0": ok, "r1": err}, polls_until_ended=2)
     job = backend.submit([_req("r0"), _req("r1")])
     assert job.custom_ids == ("r0", "r1")
@@ -402,7 +403,7 @@ def test_fake_backend_cancel_after_end_keeps_delivered_outcomes() -> None:
 
 
 def test_fake_backend_counts_expired() -> None:
-    backend = FakeBackend({"a": BatchItemError("a", "expired", "24h")})
+    backend = FakeBackend({"a": BatchItemError("a", ItemErrorKind.EXPIRED, "24h")})
     job = backend.submit([_req("a")])
     status = backend.poll(job)
     assert status.expired == 1 and status.errored == 0
@@ -430,11 +431,11 @@ def test_batch_job_json_round_trip() -> None:
 
 
 def test_batch_item_error_retryable_defaults() -> None:
-    assert BatchItemError("a", "errored", "m").retryable is True
-    assert BatchItemError("a", "expired", "m").retryable is True
-    assert BatchItemError("a", "canceled", "m").retryable is False
-    assert BatchItemError("a", "invalid", "m").retryable is False
-    assert BatchItemError("a", "errored", "m", retryable=False).retryable is False
+    assert BatchItemError("a", ItemErrorKind.ERRORED, "m").retryable is True
+    assert BatchItemError("a", ItemErrorKind.EXPIRED, "m").retryable is True
+    assert BatchItemError("a", ItemErrorKind.CANCELED, "m").retryable is False
+    assert BatchItemError("a", ItemErrorKind.INVALID, "m").retryable is False
+    assert BatchItemError("a", ItemErrorKind.ERRORED, "m", retryable=False).retryable is False
 
 
 def test_batch_request_identity_is_custom_id() -> None:

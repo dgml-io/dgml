@@ -605,8 +605,8 @@ def test_export_writes_artifacts_and_attestation(workspace: Workspace) -> None:
     assert attestation_path.exists()
     # Artifacts copied into the bundle under their slot subdirs.
     assert (out_dir / "source" / "contract.pdf").exists()
-    assert (out_dir / "page_images" / "page_1.png").exists()
-    assert (out_dir / "page_images" / "page_2.png").exists()
+    assert (out_dir / "page_images" / "page_1.jpg").exists()
+    assert (out_dir / "page_images" / "page_2.jpg").exists()
     # The token files under page_text/ are never bundled.
     assert not (out_dir / "page_text").exists()
 
@@ -628,9 +628,9 @@ def test_export_unpacked_writes_loose_opc_parts_no_archive(workspace: Workspace)
     ct_root = etree.parse(str(out_dir / "[Content_Types].xml")).getroot()
     ns = "http://schemas.openxmlformats.org/package/2006/content-types"
     exts = {el.get("Extension") for el in ct_root.findall(f"{{{ns}}}Default")}
-    # docx source + png page images + the .xml attestation file + .rels. No
+    # docx source + jpg page images + the .xml attestation file + .rels. No
     # 'json' — page_text is not bundled and this file-only export has no schema.
-    assert {"docx", "png", "xml", "rels"} <= exts
+    assert {"docx", "jpg", "xml", "rels"} <= exts
     assert "json" not in exts
 
     # _rels/.rels: main-document → the (percent-encoded) source, attestation → metadata.
@@ -929,7 +929,7 @@ def test_verify_dir_false_on_tampered_artifact(workspace: Workspace) -> None:
     out_dir = workspace.root.parent / "bundle"
     _export(workspace, "f001", out_dir)
 
-    (out_dir / "page_images" / "page_1.png").write_bytes(b"TAMPERED")
+    (out_dir / "page_images" / "page_1.jpg").write_bytes(b"TAMPERED")
     result = verify_attestation_dir(out_dir)
     assert result.valid is False
     assert result.computed_root != result.expected_root
@@ -1006,8 +1006,8 @@ def test_renaming_bundle_files_keeps_verification_when_inventory_tracks_them(
     out_dir = workspace.root.parent / "bundle"
     attestation, attestation_path, _ = _export(workspace, "f001", out_dir)
 
-    # Rename page_1.png -> img-a.bin, page_2.png -> img-b.bin.
-    renames = {"page_images/page_1.png": "img-a.bin", "page_images/page_2.png": "img-b.bin"}
+    # Rename page_1.jpg -> img-a.bin, page_2.jpg -> img-b.bin.
+    renames = {"page_images/page_1.jpg": "img-a.bin", "page_images/page_2.jpg": "img-b.bin"}
     for old_rel, new_name in renames.items():
         (out_dir / old_rel).rename(out_dir / new_name)
 
@@ -1090,7 +1090,7 @@ def test_collect_from_attestation_missing_artifact_raises(workspace: Workspace) 
     _seed_file(workspace, "f001", pages=1)
     out_dir = workspace.root.parent / "bundle"
     _export(workspace, "f001", out_dir)
-    (out_dir / "page_images" / "page_1.png").unlink()
+    (out_dir / "page_images" / "page_1.jpg").unlink()
     with pytest.raises(AttestationInvalid, match="missing artifact"):
         verify_attestation_dir(out_dir)
 

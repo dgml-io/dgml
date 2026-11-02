@@ -35,7 +35,7 @@ tier — but the feature only runs when ``enabled``)::
 
     [style]
     enabled = true
-    model = "anthropic/claude-haiku-4-5"
+    model = "anthropic/claude-haiku-5-5"
     api_base = "http://localhost:11434"
     max_tokens = 4000
 
@@ -47,7 +47,7 @@ default env var. Setting both ``api_key`` and ``api_key_env`` is an error.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import load_merged_config
@@ -70,7 +70,7 @@ class StyleConfig:
 
     model: str
     api_base: str | None = None
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     api_key_env: str | None = None
     max_tokens: int | None = DEFAULT_MAX_TOKENS
 

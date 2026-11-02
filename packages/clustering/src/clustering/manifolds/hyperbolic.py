@@ -28,7 +28,7 @@ from typing import cast
 
 import torch
 
-from clustering.config.schema import ManifoldConfig
+from clustering.config.schema import ManifoldConfig, ManifoldName
 from clustering.manifolds.base import ManifoldHead, register_manifold
 
 _EPS = 1e-6
@@ -148,6 +148,6 @@ class HyperbolicHead(ManifoldHead):
         return geoopt.PoincareBall(c=self.c)
 
 
-@register_manifold("hyperbolic")
+@register_manifold(ManifoldName.HYPERBOLIC)
 def _factory(cfg: ManifoldConfig) -> ManifoldHead:
     return HyperbolicHead(cfg)

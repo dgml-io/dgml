@@ -1,11 +1,11 @@
-# Converting Word and Excel documents to PDF
+# Converting Word, Excel and PowerPoint documents to PDF
 
-DGML's pipeline works on PDFs. To ingest a Word (`.docx`, `.doc`) or Excel
-(`.xlsx`, `.xls`) document, DGML first converts it to PDF. `.pdf` inputs
-need no conversion and always work.
+DGML's pipeline works on PDFs. To ingest a Word (`.docx`, `.doc`), Excel
+(`.xlsx`, `.xls`) or PowerPoint (`.pptx`, `.ppt`) document, DGML first
+converts it to PDF. `.pdf` inputs need no conversion and always work.
 
 Conversion is **pluggable**: you choose which converter handles each format
-family (`docx`, `xlsx`) by naming it in your workspace config. There is **no
+family (`docx`, `xlsx`, `pptx`) by naming it in your workspace config. There is **no
 default converter** — until you configure one for a format, that format is
 unsupported, and adding or generating such a file fails with an actionable
 error telling you what to set.
@@ -62,7 +62,7 @@ All of the converters below are referenced by their dotted path in the
 
 ### LibreOffice — `translators_pdf.libreoffice:LibreOfficeConverter`
 
-Handles **both** `docx` and `xlsx` by driving a headless `soffice`
+Handles `docx`, `xlsx` and `pptx` by driving a headless `soffice`
 subprocess. No Python dependencies and no config fields — but LibreOffice
 must be installed and `soffice` must be on your `PATH` (or at a standard
 install location). It resolves `soffice` cross-platform and uses a
@@ -72,6 +72,8 @@ per-process lock directory so concurrent conversions are safe.
 [conversion.docx]
 provider = "translators_pdf.libreoffice:LibreOfficeConverter"
 [conversion.xlsx]
+provider = "translators_pdf.libreoffice:LibreOfficeConverter"
+[conversion.pptx]
 provider = "translators_pdf.libreoffice:LibreOfficeConverter"
 ```
 
@@ -228,6 +230,14 @@ workspace like a PDF:
 - **Generating.** Generation reuses the PDF produced at add time, so there is
   no second conversion and no drift. (Files added before conversion was
   stored fall back to converting on demand.)
+- **Supplying the PDF yourself.** A library caller that already has the
+  converted PDF can pass it to `FileStore.add(source, converted_pdf=pdf_path)`.
+  It is stored as the source's PDF instead of running a converter, so no
+  converter needs to be configured, and the file records no `pdf_converter`
+  — nothing was converted, which for a non-PDF source is how a supplied PDF
+  shows up in `file.json` and in the attestation. DGML can't check that the
+  PDF matches the source; the caller vouches for it. The CLI has no
+  equivalent.
 
 The converted PDF is a derived artifact, like page images. `dgml check` and
 file attestation key off the stored original document, not the converted PDF.
@@ -235,8 +245,13 @@ file attestation key off the stored original document, not the converted PDF.
 ## Troubleshooting
 
 - **"no converter configured for .xlsx …"** — add a `conversion.xlsx`
-  (or `.docx`) entry to `config.toml` pointing at a converter. This appears
+  (or `.docx`, `.pptx`) entry to `config.toml` pointing at a converter. This appears
   both when adding a file and when generating.
+- **"converter 'xlsx-islands' (conversion.pptx.provider) does not handle
+  '.pptx' …"** — the family's `provider` names a converter whose
+  `input_formats` doesn't include that file type. Point the family at a
+  converter that handles it. This is checked before a file is added or a
+  folder is gathered, so it's one error, not one per file.
 - **"pip install translators-pdf[xlsx]"** — the island renderer's
   dependencies are missing; install the extra.
 - **Aspose SDK error** — `pip install aspose-words` or

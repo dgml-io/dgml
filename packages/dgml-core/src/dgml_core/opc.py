@@ -13,7 +13,7 @@
 """OPC (Open Packaging Conventions, ECMA-376 Part 2) packaging for DGMLX bundles.
 
 A DGMLX bundle is shaped as an **OPC package**: a set of *parts* (the source
-document, page images, page text, schema, and the
+document, page images, schemas, DGML XML, and the
 ``META-INF/dgml-attestation.xml`` attestation file) described by two well-known
 parts —
 
@@ -67,6 +67,7 @@ _CONTENT_TYPE_BY_EXT: dict[str, str] = {
     "rels": _RELS_CONTENT_TYPE,
     "xml": "application/xml",
     "png": "image/png",
+    "jpg": "image/jpeg",
     "json": "application/json",
     "rnc": "text/plain",
     "pdf": "application/pdf",
@@ -74,6 +75,8 @@ _CONTENT_TYPE_BY_EXT: dict[str, str] = {
     "doc": "application/msword",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "xls": "application/vnd.ms-excel",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "ppt": "application/vnd.ms-powerpoint",
 }
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 

@@ -24,13 +24,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+from clustering.config.schema import LoggerName
 from clustering.logging_.base import Logger
 
 
 class ClearMLLogger(Logger):
     """Wraps a single :class:`clearml.Task`."""
 
-    name = "clearml"
+    name = LoggerName.CLEARML
 
     def __init__(
         self,

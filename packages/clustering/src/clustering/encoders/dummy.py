@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 
 _TOKENS_PER_DOC = 8
@@ -85,7 +85,7 @@ class DummyEncoder(Encoder[Any]):
         return EncoderOutput(pooled=torch.from_numpy(pooled), tokens=tokens)
 
 
-@register_encoder("dummy")
+@register_encoder(EncoderName.DUMMY)
 def _factory(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     # device is irrelevant for the dummy encoder; accept it for API uniformity.
     del device

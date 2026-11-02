@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from dgml_core import (
+    ClassifyMode,
     ConflictError,
     DgmlError,
     DocSetStore,
@@ -42,6 +43,7 @@ from dgml_core import (
     UnsupportedFileType,
     Workspace,
     layout,
+    read_page_image,
 )
 
 # Aliased: the GET .../dgml route below is itself named ``read_dgml`` (its name is
@@ -61,6 +63,7 @@ from .config import ServiceConfig
 from .db import create_schema, make_engine
 from .docstore import PostgresDocStore
 from .jobs import JobFn, JobRunner
+from .logcontext import WorkspaceLogContextMiddleware
 from .tenancy import TEXT_MODES, SettingsMissing, WorkspaceRegistry
 
 logger = logging.getLogger(__name__)
@@ -208,6 +211,9 @@ def create_app(config: ServiceConfig | None = None, *, engine: Engine | None = N
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # An organisation-scoped request's log lines, dgml-core's included, carry
+    # its workspace id (see logcontext).
+    app.add_middleware(WorkspaceLogContextMiddleware)
 
     @app.exception_handler(DgmlError)
     def _on_dgml(_: Request, exc: DgmlError) -> JSONResponse:
@@ -495,6 +501,7 @@ def _routes(app: FastAPI) -> None:
         if text_mode is not None and text_mode not in TEXT_MODES:
             raise InvalidArgument(f"text_mode must be one of {list(TEXT_MODES)}")
         mode = text_mode or services.registry.settings(org_id).text_mode
+        classify_mode = None if classify == "none" else ClassifyMode(classify)
         queued = []
         for upload in files:
             filename = upload.filename or "upload.pdf"
@@ -503,7 +510,7 @@ def _routes(app: FastAPI) -> None:
                 services.jobs.submit(
                     org_id,
                     "add_file",
-                    _add_file_fn(services, org_id, ws, staged, mode, classify),
+                    _add_file_fn(services, org_id, ws, staged, mode, classify_mode),
                     label=f"Add {filename}",
                     params={"filename": filename, "text_mode": mode, "classify": classify},
                 )
@@ -543,12 +550,13 @@ def _routes(app: FastAPI) -> None:
 
     @app.get("/api/orgs/{org_id}/files/{file_id}/pages/{page}")
     def page_image(file_id: str, page: int, ws: WorkspaceDep) -> Response:
-        key = layout.file_page_image_key(file_id, page)
-        try:
-            data = ws.blobs.get_blob(key)
-        except FileNotFoundError:
-            raise HTTPException(404, f"no page image {page} for file {file_id!r}") from None
-        return Response(data, media_type="image/png", headers={"Cache-Control": "max-age=3600"})
+        found = read_page_image(ws, file_id, page)
+        if found is None:
+            raise HTTPException(404, f"no page image {page} for file {file_id!r}")
+        key, data = found
+        # A page image is a JPEG or a PNG, whichever encoding was smaller.
+        media_type = "image/png" if key.endswith(".png") else "image/jpeg"
+        return Response(data, media_type=media_type, headers={"Cache-Control": "max-age=3600"})
 
     @app.post("/api/orgs/{org_id}/files/{file_id}/classify", status_code=202)
     def classify_file(
@@ -556,11 +564,12 @@ def _routes(app: FastAPI) -> None:
     ) -> dict[str, Any]:
         if body.mode not in CLASSIFY_MODES:
             raise InvalidArgument(f"mode must be one of {list(CLASSIFY_MODES)}")
+        mode = ClassifyMode(body.mode)
         record = FileStore(ws).get(file_id)
 
         def run() -> dict[str, Any]:
             with services.registry.file_lock(org_id, file_id):
-                return ops.classify(ws, file_id, mode=body.mode, extract=body.extract)
+                return ops.classify(ws, file_id, mode=mode, extract=body.extract)
 
         return services.jobs.submit(
             org_id,
@@ -675,7 +684,7 @@ def _add_file_fn(
     ws: Workspace,
     staged: Path,
     text_mode: str,
-    classify: str,
+    classify: ClassifyMode | None,
 ) -> JobFn:
     def run() -> dict[str, Any]:
         try:
@@ -684,7 +693,7 @@ def _add_file_fn(
             ops.discard_upload(staged)
         out = ops.add_result_json(result)
         file_id = result.record.id
-        if classify != "none" and result.page_render_error is None:
+        if classify is not None and result.page_render_error is None:
             # Classification is a vision call over the page images, so it needs the
             # render to have succeeded. A classify failure does not undo the add.
             try:

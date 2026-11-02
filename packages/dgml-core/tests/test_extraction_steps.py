@@ -15,6 +15,8 @@ submits values) and ``phase3_page_steps`` (one page of box locating)."""
 
 from __future__ import annotations
 
+import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -136,20 +138,23 @@ def test_phase1_and_phase3_share_one_usage_row(workspace: Workspace, capture_kwa
 # -- the generators, driven by hand ------------------------------------------
 
 
-def phase1(ws: Workspace, run: grounded.Phase1Result) -> Any:
+def phase1(ws: Workspace, run: grounded.Phase1Result, *, model: str = DEFAULT_VALUES_MODEL) -> Any:
     _seed_file(ws, FID)
     return grounded.phase1_steps(
         workspace=ws,
         file_id=FID,
         run=run,
         pdf_bytes=b"%PDF",
-        messages_factory=lambda *, chunked, pdf, part: [
+        messages_factory=lambda *, chunked, permissive, pdf, part: [
             {"role": "system", "content": "S"},
-            {"role": "user", "content": [{"type": "text", "text": f"chunked={chunked}"}]},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": f"chunked={chunked} permissive={permissive}"}],
+            },
         ],
         tool_schema={"type": "object"},
         vocab=parse_rnc(_CHUNK_RNC),
-        model=DEFAULT_VALUES_MODEL,
+        model=model,
         api_key=None,
         api_base=None,
         max_tool_iters=5,
@@ -175,22 +180,302 @@ def test_truncation_restarts_chunked_and_a_second_truncation_fails(workspace: Wo
     gen = phase1(workspace, run)
     next(gen)
     retry = gen.send(_truncated_response())
-    assert retry["messages"][1]["content"][0]["text"] == "chunked=True"
+    assert retry["messages"][1]["content"][0]["text"] == "chunked=True permissive=False"
     assert tool_names(retry) == ["submit_values", "append_entries"]
     with pytest.raises(ValuesExtractionFailed, match="truncated too"):
         gen.send(_truncated_response())
+
+
+TOO_MANY_STATES = RuntimeError("400 INVALID_ARGUMENT: too many states for serving")
+BILL = {"Bill": {"Items": [{"Name": {"text": "a"}}]}}
+
+
+def permissive_phase1(ws: Workspace, run: grounded.Phase1Result) -> Any:
+    """A phase-1 generator on its permissive retry: the provider refused the
+    inlined schema and the request with the permissive tool set is pending."""
+    gen = phase1(ws, run)
+    next(gen)
+    gen.throw(TOO_MANY_STATES)
+    return gen
 
 
 def test_too_many_states_falls_back_to_the_permissive_schema(workspace: Workspace) -> None:
     run = grounded.Phase1Result()
     gen = phase1(workspace, run)
     next(gen)
-    refusal = RuntimeError("400 INVALID_ARGUMENT: too many states for serving")
-    retry = gen.throw(refusal)
+    retry = gen.throw(TOO_MANY_STATES)
     submit_tool = retry["tools"][0]["function"]
-    assert submit_tool["parameters"]["properties"]["values"] == grounded._PERMISSIVE_VALUES_PARAM
+    values_param = submit_tool["parameters"]["properties"]["values"]
+    assert values_param == grounded._PERMISSIVE_VALUES_PARAM
+    # JSON text, not an open object: Gemini (the provider that trips this
+    # fallback) can only leave an object with no declared keys empty.
+    assert values_param["type"] == "string"
+    # The factory is told, so the retry's prompt can carry the permissive block.
+    assert retry["messages"][1]["content"][0]["text"] == "chunked=False permissive=True"
     with pytest.raises(ValuesExtractionFailed, match="too many states"):
-        gen.throw(refusal)
+        gen.throw(TOO_MANY_STATES)
+
+
+GEMINI = "gemini/gemini-3.1-pro-preview"
+# litellm's wording for a Gemini HTTP 500, as the attempt wraps it.
+GEMINI_500 = RuntimeError(
+    "litellm.InternalServerError: GeminiException InternalServerError - "
+    '{"error": {"code": 500, "message": "An internal error has occurred. Please retry '
+    'or report in https://developers.generativeai.google/guide/troubleshooting", '
+    '"status": "INTERNAL"}}'
+)
+
+
+def test_a_gemini_500_on_the_inlined_schema_falls_back_to_the_permissive_one(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Gemini answers some oversized inlined schemas with a bare 500 rather
+    than the 400 that names the overflow; on a Gemini model that takes the
+    same permissive retry, once. A second 500 fails the file as itself. The
+    warning names the cause in one line; the provider's JSON body is DEBUG."""
+    run = grounded.Phase1Result()
+    gen = phase1(workspace, run, model=GEMINI)
+    next(gen)
+    with caplog.at_level(logging.DEBUG, logger="dgml_core"):
+        retry = gen.throw(GEMINI_500)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "HTTP 500 INTERNAL" in warnings[0]
+    assert "\n" not in warnings[0] and "developers.generativeai.google" not in warnings[0]
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("developers.generativeai.google" in m for m in debug)
+    values_param = retry["tools"][0]["function"]["parameters"]["properties"]["values"]
+    assert values_param == grounded._PERMISSIVE_VALUES_PARAM
+    assert retry["messages"][1]["content"][0]["text"] == "chunked=False permissive=True"
+    assert run.tool_schema_mode == grounded.ToolSchemaMode.PERMISSIVE
+    with pytest.raises(ValuesExtractionFailed, match="GeminiException InternalServerError"):
+        gen.throw(GEMINI_500)
+
+
+def test_a_500_from_another_provider_does_not_fall_back(workspace: Workspace) -> None:
+    run = grounded.Phase1Result()
+    gen = phase1(workspace, run, model="openai/gpt-5.4")
+    next(gen)
+    with pytest.raises(ValuesExtractionFailed, match="InternalServerError"):
+        gen.throw(RuntimeError("litellm.InternalServerError: OpenAIException InternalServerError"))
+    assert run.tool_schema_mode == grounded.ToolSchemaMode.INLINED
+
+
+def test_other_gemini_errors_do_not_fall_back(workspace: Workspace) -> None:
+    run = grounded.Phase1Result()
+    gen = phase1(workspace, run, model=GEMINI)
+    next(gen)
+    with pytest.raises(ValuesExtractionFailed, match="ServiceUnavailable"):
+        gen.throw(RuntimeError("litellm.ServiceUnavailableError: GeminiException - 503"))
+    assert run.tool_schema_mode == grounded.ToolSchemaMode.INLINED
+
+
+@pytest.mark.parametrize(
+    ("model", "text", "expected"),
+    [
+        (GEMINI, str(GEMINI_500), True),
+        ("vertex_ai/gemini-3.1-pro-preview", "VertexAIException InternalServerError - 500", True),
+        ("anthropic/claude-sonnet-5", str(GEMINI_500), False),
+        (GEMINI, "litellm.InternalServerError: OpenAIException InternalServerError", False),
+        (GEMINI, "litellm.RateLimitError: GeminiException - 429", False),
+        (GEMINI, "litellm.BadRequestError: GeminiException - too many states", False),
+    ],
+)
+def test_is_gemini_internal_error(model: str, text: str, expected: bool) -> None:
+    assert grounded._is_gemini_internal_error(RuntimeError(text), model) is expected
+
+
+def test_an_empty_submission_logs_the_models_reason_at_info(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A model that finds nothing usually says why in text beside the tool
+    call; the loop discards text, so that reason is logged at INFO with the
+    empty submission (the run stays a legal nothing-found)."""
+    run = grounded.Phase1Result()
+    gen = phase1(workspace, run)
+    next(gen)
+    reply = _tool_call_response("submit_values", {"values": {}})
+    reply.choices[0].message.content = (
+        "This document is a Master Services Agreement, not a utility bill.\n"
+        "None of the schema fields are applicable."
+    )
+    with caplog.at_level(logging.INFO, logger="dgml_core"), pytest.raises(StopIteration):
+        gen.send(reply)
+    assert run.values == {} and run.refusal is None
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any(
+        FID in m and "submitted no values" in m and "not a utility bill. None of" in m
+        for m in infos
+    )
+
+
+def test_an_empty_submission_without_text_is_still_logged(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    run = grounded.Phase1Result()
+    gen = phase1(workspace, run)
+    next(gen)
+    with caplog.at_level(logging.INFO, logger="dgml_core"), pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": {"Bill": None}}))
+    assert any("submitted no values and gave no reason" in r.getMessage() for r in caplog.records)
+
+
+def test_a_non_empty_submission_logs_nothing_about_empty_values(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    run = grounded.Phase1Result()
+    gen = phase1(workspace, run)
+    next(gen)
+    with caplog.at_level(logging.INFO, logger="dgml_core"), pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": BILL}))
+    assert not any("submitted no values" in r.getMessage() for r in caplog.records)
+
+
+def test_permissive_values_arrive_as_json_text_and_are_decoded(workspace: Workspace) -> None:
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": json.dumps(BILL)}))
+    assert run.values == BILL
+    assert run.refusal is None
+    assert run.counters["envelope_repairs"] == 0
+
+
+def test_permissive_values_text_wrapping_the_envelope_is_still_repaired(
+    workspace: Workspace,
+) -> None:
+    """The text is decoded before the envelope repair reads it, so a tree
+    the model wrapped in the tool's own envelope inside the string is
+    unwrapped like a nested object would be, layout included."""
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    layout = {"Items": {"kind": "table"}}
+    text = json.dumps({"values": BILL, "layout": layout})
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": text}))
+    assert run.values == BILL
+    assert run.layout == layout
+    assert run.counters["envelope_repairs"] == 1
+
+
+def test_permissive_values_text_that_is_not_an_object_is_a_correctable_error(
+    workspace: Workspace,
+) -> None:
+    """The model hand-writes the tree inside a string on this path, so one
+    slip is answered with an error tool result and a resend, not a failed
+    file after a full round-trip of the PDF (as append_entries does)."""
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    again = gen.send(_tool_call_response("submit_values", {"values": "Bill: a"}))
+    reply = json.loads(again["messages"][-1]["content"])
+    assert again["messages"][-1]["role"] == "tool"
+    assert "JSON text of one object" in reply["error"]
+    assert "Bill: a" in reply["error"]
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": json.dumps(BILL)}))
+    assert run.values == BILL
+    assert run.refusal is None
+
+
+def test_permissive_values_text_in_a_code_fence_is_decoded(workspace: Workspace) -> None:
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    fenced = "```json\n" + json.dumps(BILL, indent=2) + "\n```"
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": fenced}))
+    assert run.values == BILL
+    assert run.counters["envelope_repairs"] == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "inner"),
+    [
+        ('```json\n{"a": 1}\n```', '{"a": 1}'),
+        ('```\n{"a": 1}```', '{"a": 1}'),
+        ('  ```JSON \r\n{"a":\n 1}\r\n```  ', '{"a":\n 1}'),
+        ('{"a": 1}', '{"a": 1}'),
+        ('```json\n{"a": 1}', '```json\n{"a": 1}'),
+        ("```json\n```", ""),
+    ],
+)
+def test_strip_code_fence(text: str, inner: str) -> None:
+    assert grounded._strip_code_fence(text) == inner
+
+
+def test_permissive_values_sent_as_an_object_anyway_are_taken_as_is(workspace: Workspace) -> None:
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": BILL}))
+    assert run.values == BILL
+
+
+def test_permissive_empty_tree_is_flagged_for_refusal(workspace: Workspace) -> None:
+    """Under the inlined schema `{}` is a legal nothing-found. Under the
+    permissive one it is also what a decoder that cannot fill the fallback
+    parameter emits (how this path returned no values on Gemini), so the
+    generator flags it and the caller refuses to write it as success."""
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": "{}"}))
+    assert run.values == {}
+    assert run.refusal is not None
+    assert "empty values tree under the permissive tool schema" in run.refusal
+    assert DEFAULT_VALUES_MODEL in run.refusal
+
+
+def test_permissive_all_null_roots_stay_a_legal_nothing_found(workspace: Workspace) -> None:
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("submit_values", {"values": json.dumps({"Bill": None})}))
+    assert run.refusal is None
+
+
+def test_permissive_chunked_entries_arrive_as_json_text(workspace: Workspace) -> None:
+    """A truncated permissive attempt restarts chunked with the permissive
+    continuation tool: `entries` is JSON text of the array, decoded on the
+    way in; text that is not an array is a correctable tool error."""
+    run = grounded.Phase1Result()
+    gen = permissive_phase1(workspace, run)
+    retry = gen.send(_truncated_response())
+    assert tool_names(retry) == ["submit_values", "append_entries"]
+    append_tool = retry["tools"][1]["function"]
+    assert append_tool["parameters"]["properties"]["entries"]["type"] == "string"
+
+    first = {"values": json.dumps(BILL), "done": False}
+    again = gen.send(_tool_call_response("submit_values", first))
+    assert "recorded" in again["messages"][-1]["content"]
+
+    bad = {"path": "Bill.Items", "entries": "[{oops", "done": True}
+    again = gen.send(_tool_call_response("append_entries", bad))
+    assert "JSON text of an array" in again["messages"][-1]["content"]
+
+    more = {"path": "Bill.Items", "entries": json.dumps([{"Name": {"text": "b"}}]), "done": True}
+    with pytest.raises(StopIteration):
+        gen.send(_tool_call_response("append_entries", more))
+    assert [e["Name"]["text"] for e in run.values["Bill"]["Items"]] == ["a", "b"]
+    assert run.tool_schema_mode == grounded.ToolSchemaMode.PERMISSIVE and run.chunked
+
+
+def test_permissive_fallback_is_warned_once_per_model_then_logged_per_file(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="dgml_core"):
+        for _ in range(2):
+            permissive_phase1(workspace, grounded.Phase1Result())
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert DEFAULT_VALUES_MODEL in warnings[0]
+    assert "too many states" in warnings[0]
+    assert "permissive tool schema" in warnings[0]
+    infos = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and "permissive tool schema" in r.getMessage()
+    ]
+    assert len(infos) == 1 and FID in infos[0]
 
 
 def test_a_nested_envelope_is_unwrapped_and_counted(workspace: Workspace) -> None:
@@ -275,7 +560,13 @@ def phase3(ws: Workspace) -> Any:
 def test_thrown_errors_keep_their_sync_messages(workspace: Workspace) -> None:
     gen = phase1(workspace, grounded.Phase1Result())
     next(gen)
-    with pytest.raises(ValuesExtractionFailed, match=r"^extraction call failed: RuntimeError: x$"):
+    with pytest.raises(
+        ValuesExtractionFailed,
+        match=(
+            rf"^extraction call failed: RuntimeError: x \(model '{DEFAULT_VALUES_MODEL}', "
+            r"api key not passed\)$"
+        ),
+    ):
         gen.throw(RuntimeError("x"))
 
     page = phase3(workspace)

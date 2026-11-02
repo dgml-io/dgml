@@ -48,12 +48,14 @@ from typing import Any
 
 from litellm import ModelResponse
 
+from dgml_core.batch.deadline import CANCEL_SETTLE_S
 from dgml_core.batch.types import (
     BatchItemError,
     BatchJob,
     BatchRequest,
     BatchState,
     BatchStatus,
+    ItemErrorKind,
 )
 
 ResponseScript = Mapping[str, Any] | Callable[[BatchRequest], Any]
@@ -121,11 +123,14 @@ class FakeBackend:
         max_requests: int = 100_000,
         max_bytes: int = 256 * 1024**2,
         max_wait_s: float = 24 * 3600.0,
-        cancel_settle_s: float = 180.0,
+        cancel_settle_s: float = CANCEL_SETTLE_S,
         processed_early: Callable[[BatchRequest], bool] | None = None,
         cancel_settle_polls: int = 0,
     ) -> None:
         self._processed_early = processed_early
+        #: What :meth:`credential_fingerprint` reports (``None``: no check);
+        #: public so a test can switch the "key" between runs.
+        self.key_fingerprint: str | None = None
         #: Polls a canceled batch reports `running` for; public so a test can
         #: let a long-settling cancel end later.
         self.cancel_settle_polls = cancel_settle_polls
@@ -173,6 +178,9 @@ class FakeBackend:
         return BatchJob(
             provider=self.provider, job_id=job_id, custom_ids=tuple(r.custom_id for r in batch)
         )
+
+    def credential_fingerprint(self) -> str | None:
+        return self.key_fingerprint
 
     def poll(self, job: BatchJob) -> BatchStatus:
         self.polls += 1
@@ -234,11 +242,15 @@ class FakeBackend:
                 continue
             if state.canceled:
                 outcome: Any = BatchItemError(
-                    request.custom_id, "canceled", "batch canceled before this request ran"
+                    request.custom_id,
+                    ItemErrorKind.CANCELED,
+                    "batch canceled before this request ran",
                 )
             elif state.rejected:
                 outcome = BatchItemError(
-                    request.custom_id, "batch_rejected", "batch failed validation (fake)"
+                    request.custom_id,
+                    ItemErrorKind.BATCH_REJECTED,
+                    "batch failed validation (fake)",
                 )
             else:
                 outcome = self._scripted(request)
@@ -251,7 +263,9 @@ class FakeBackend:
             return self._responses[request.custom_id]
         except KeyError:
             return BatchItemError(
-                request.custom_id, "invalid", f"no scripted response for {request.custom_id!r}"
+                request.custom_id,
+                ItemErrorKind.INVALID,
+                f"no scripted response for {request.custom_id!r}",
             )
 
     @staticmethod
@@ -260,9 +274,9 @@ class FakeBackend:
         for outcome in state.outcomes.values():
             if not isinstance(outcome, BatchItemError):
                 succeeded += 1
-            elif outcome.kind == "expired":
+            elif outcome.kind == ItemErrorKind.EXPIRED:
                 expired += 1
-            elif outcome.kind == "canceled":
+            elif outcome.kind == ItemErrorKind.CANCELED:
                 canceled += 1
             else:
                 errored += 1

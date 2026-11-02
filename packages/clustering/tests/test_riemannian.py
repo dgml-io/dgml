@@ -30,7 +30,13 @@ import importlib.util
 
 import pytest
 import torch
-from clustering.config.schema import ManifoldComponent, ManifoldConfig, TrainingConfig
+from clustering.config.schema import (
+    LossName,
+    ManifoldComponent,
+    ManifoldConfig,
+    ManifoldName,
+    TrainingConfig,
+)
 from clustering.manifolds import (
     ManifoldProjector,
     build_manifold,
@@ -56,21 +62,21 @@ def _anchor_tensor(p: ManifoldProjector) -> torch.Tensor:
 def test_euclidean_head_to_geoopt_is_euclidean() -> None:
     import geoopt
 
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
     assert isinstance(m.to_geoopt(), geoopt.Euclidean)
 
 
 def test_spherical_head_to_geoopt_is_sphere() -> None:
     import geoopt
 
-    m = build_manifold(ManifoldConfig(name="spherical", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.SPHERICAL, dim=8, curvature=1.0))
     assert isinstance(m.to_geoopt(), geoopt.Sphere)
 
 
 def test_hyperbolic_head_to_geoopt_is_poincare_ball() -> None:
     import geoopt
 
-    m = build_manifold(ManifoldConfig(name="hyperbolic", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.HYPERBOLIC, dim=8, curvature=1.0))
     assert isinstance(m.to_geoopt(), geoopt.PoincareBall)
 
 
@@ -79,11 +85,11 @@ def test_product_head_to_geoopt_is_product() -> None:
 
     m = build_manifold(
         ManifoldConfig(
-            name="product",
+            name=ManifoldName.PRODUCT,
             dim=8,
             components=[
-                ManifoldComponent(name="euclidean", dim=4, curvature=0.0),
-                ManifoldComponent(name="hyperbolic", dim=4, curvature=1.0),
+                ManifoldComponent(name=ManifoldName.EUCLIDEAN, dim=4, curvature=0.0),
+                ManifoldComponent(name=ManifoldName.HYPERBOLIC, dim=4, curvature=1.0),
             ],
         )
     )
@@ -94,15 +100,15 @@ def test_product_head_to_geoopt_is_product() -> None:
 @pytest.mark.parametrize(
     "cfg",
     [
-        ManifoldConfig(name="euclidean", dim=8, curvature=0.0),
-        ManifoldConfig(name="spherical", dim=8, curvature=1.0),
-        ManifoldConfig(name="hyperbolic", dim=8, curvature=1.0),
+        ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0),
+        ManifoldConfig(name=ManifoldName.SPHERICAL, dim=8, curvature=1.0),
+        ManifoldConfig(name=ManifoldName.HYPERBOLIC, dim=8, curvature=1.0),
         ManifoldConfig(
-            name="product",
+            name=ManifoldName.PRODUCT,
             dim=8,
             components=[
-                ManifoldComponent(name="euclidean", dim=4, curvature=0.0),
-                ManifoldComponent(name="hyperbolic", dim=4, curvature=1.0),
+                ManifoldComponent(name=ManifoldName.EUCLIDEAN, dim=4, curvature=0.0),
+                ManifoldComponent(name=ManifoldName.HYPERBOLIC, dim=4, curvature=1.0),
             ],
         ),
     ],
@@ -116,7 +122,7 @@ def test_manifold_origin_shape_matches_dim(cfg: ManifoldConfig) -> None:
 
 def test_spherical_origin_is_unit_norm() -> None:
     """Sphere origin must be on the unit sphere — zeros wouldn't be."""
-    m = build_manifold(ManifoldConfig(name="spherical", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.SPHERICAL, dim=8, curvature=1.0))
     origin = m.manifold_origin()
     assert torch.isclose(origin.norm(), torch.tensor(1.0), atol=1e-6)
 
@@ -125,7 +131,7 @@ def test_spherical_origin_is_unit_norm() -> None:
 def test_projector_manifold_bias_registers_manifold_parameter() -> None:
     import geoopt
 
-    m = build_manifold(ManifoldConfig(name="hyperbolic", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.HYPERBOLIC, dim=8, curvature=1.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True, manifold_bias=True)
     # Exactly one ManifoldParameter (the anchor) plus the linear's weight + bias.
     manifold_params = [
@@ -137,20 +143,20 @@ def test_projector_manifold_bias_registers_manifold_parameter() -> None:
 
 def test_projector_manifold_bias_init_on_manifold_for_sphere() -> None:
     """The anchor's init must be on the manifold — for the sphere that means unit norm."""
-    m = build_manifold(ManifoldConfig(name="spherical", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.SPHERICAL, dim=8, curvature=1.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True, manifold_bias=True)
     assert torch.isclose(_anchor_tensor(p).norm(), torch.tensor(1.0), atol=1e-5)
 
 
 def test_projector_without_manifold_bias_has_no_anchor() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True, manifold_bias=False)
     assert p._anchor is None
 
 
 def test_projector_default_forward_unchanged_without_anchor() -> None:
     """Backwards-compat: no anchor → forward equals manifold.expmap0(linear(x))."""
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True, manifold_bias=False)
     x = torch.randn(4, 8) * 0.1
     assert torch.allclose(p(x), m.expmap0(p.linear(x)), atol=1e-5)
@@ -172,7 +178,7 @@ def test_riemannian_training_keeps_anchor_on_manifold(manifold_name: str) -> Non
     m = build_manifold(cfg_m)
     p = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True, manifold_bias=True)
     fused, labels = _toy_two_class()
-    cfg = TrainingConfig(epochs=3, loss="prototypical", lr=1e-2, riemannian=True)
+    cfg = TrainingConfig(epochs=3, loss=LossName.PROTOTYPICAL, lr=1e-2, riemannian=True)
     history = train_projector(p, fused, labels, cfg=cfg)
     assert len(history) == 3
 
@@ -189,11 +195,11 @@ def test_riemannian_training_keeps_anchor_on_manifold(manifold_name: str) -> Non
 
 def test_riemannian_training_actually_moves_anchor() -> None:
     """A non-zero gradient on the anchor must produce a non-zero update."""
-    m = build_manifold(ManifoldConfig(name="hyperbolic", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.HYPERBOLIC, dim=8, curvature=1.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True, manifold_bias=True)
     fused, labels = _toy_two_class()
     before = _anchor_tensor(p).clone()
-    cfg = TrainingConfig(epochs=5, loss="prototypical", lr=1e-1, riemannian=True)
+    cfg = TrainingConfig(epochs=5, loss=LossName.PROTOTYPICAL, lr=1e-1, riemannian=True)
     train_projector(p, fused, labels, cfg=cfg)
     after = _anchor_tensor(p)
     assert not torch.allclose(before, after, atol=1e-6), "anchor did not move"
@@ -201,10 +207,10 @@ def test_riemannian_training_actually_moves_anchor() -> None:
 
 def test_riemannian_false_path_unchanged() -> None:
     """riemannian=False must produce no on-manifold anchor and behave as before."""
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
     p = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True, manifold_bias=False)
     fused, labels = _toy_two_class()
-    cfg = TrainingConfig(epochs=2, loss="prototypical", lr=1e-2, riemannian=False)
+    cfg = TrainingConfig(epochs=2, loss=LossName.PROTOTYPICAL, lr=1e-2, riemannian=False)
     history = train_projector(p, fused, labels, cfg=cfg)
     assert len(history) == 2
     # No anchor; only the linear's parameters.

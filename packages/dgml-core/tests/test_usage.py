@@ -19,6 +19,7 @@ from dgml_core import layout
 from dgml_core.storage import Workspace
 from dgml_core.usage import (
     UsageEvent,
+    UsageOutcome,
     add_partial,
     extract_cost_and_tokens,
     read_events,
@@ -44,7 +45,7 @@ def test_record_usage_appends_and_read_back(workspace: Workspace) -> None:
             completion_tokens=20,
             total_tokens=120,
             duration_s=0.5,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
             context={"file_id": "abc"},
         ),
     )
@@ -59,7 +60,7 @@ def test_record_usage_appends_and_read_back(workspace: Workspace) -> None:
             completion_tokens=None,
             total_tokens=None,
             duration_s=2.1,
-            outcome="error",
+            outcome=UsageOutcome.ERROR,
             context={"from_file_ids": ["a", "b"]},
             error="ValueError: nope",
         ),
@@ -119,7 +120,7 @@ def test_record_usage_swallows_write_errors(workspace: Workspace) -> None:
             completion_tokens=None,
             total_tokens=None,
             duration_s=0.0,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
         ),
     )
 
@@ -281,7 +282,7 @@ def test_cache_tokens_round_trip_to_usage_jsonl(workspace: Workspace) -> None:
             completion_tokens=100,
             total_tokens=2100,
             duration_s=1.0,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
             cache_read_tokens=1500,
             cache_creation_tokens=500,
         ),
@@ -297,7 +298,7 @@ def test_cache_tokens_round_trip_to_usage_jsonl(workspace: Workspace) -> None:
             completion_tokens=None,
             total_tokens=None,
             duration_s=0.2,
-            outcome="ok",
+            outcome=UsageOutcome.OK,
         ),
     )
     events = read_events(workspace)
@@ -415,7 +416,7 @@ def test_concurrent_appends_keep_every_row(workspace: Workspace) -> None:
                 completion_tokens=0,
                 total_tokens=i,
                 duration_s=0.0,
-                outcome="ok",
+                outcome=UsageOutcome.OK,
                 context={"i": i},
             ),
         )

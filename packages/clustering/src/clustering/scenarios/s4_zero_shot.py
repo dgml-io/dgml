@@ -23,13 +23,14 @@ from typing import ClassVar
 
 import torch
 
+from clustering.config.schema import ScenarioName
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes
 
 
 class S4ZeroShot(Scenario):
-    name = "s4"
+    name = ScenarioName.S4
 
     # Prompt-engineering hook — overridable on a per-corpus basis.
     PROMPT_TEMPLATE: ClassVar[str] = "a scanned document of category: {category}"

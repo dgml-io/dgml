@@ -352,6 +352,21 @@ extraction_values_phase1_retry_chunked: |-
   in the first ``submit_values`` call — their ``inputs`` paths may
   reference entries appended afterwards.
 
+# Appended to the phase-1 user prompt, as its own block after the schema, when
+# the provider rejected the inlined submit_values schema and phase 1 retries
+# with the permissive one (the values tree as JSON text); used verbatim. The
+# base prompt says to omit absent fields, which would make `{}` the honest
+# answer for an empty document; on this path `{}` is refused (it is also what
+# a decoder that cannot fill the parameter emits), so roots go null instead.
+extraction_values_phase1_permissive: |-
+  SUBMISSION FORMAT. On this request ``submit_values`` takes ``values`` as
+  a string: the JSON text of one object that follows the SCHEMA above
+  exactly, with nothing around it — no code fence, no prose. Every
+  top-level field of the schema MUST appear in that object; a field the
+  document has nothing for is set to ``null``, not left out. An empty
+  object ``{}`` is never a valid submission. If ``append_entries`` is
+  offered, its ``entries`` is likewise the JSON text of one array.
+
 # Added to the phase-1 user prompt, ahead of the PDF, only when the provider
 # refused the whole document as too large and it is sent as page-range parts
 # (each extracted separately, then merged in code). .format()'d with

@@ -32,7 +32,7 @@ _DG = "http://dgml.io/ns/dg#"
 _XMLID = "{http://www.w3.org/XML/1998/namespace}id"
 # A real model id: requests are built by the real kwargs builder, which
 # validates the model against litellm's registry before the (faked) call.
-_MODEL = "anthropic/claude-haiku-4-5"
+_MODEL = "anthropic/claude-haiku-5-5"
 
 # element order under root: e0000=chunk, 1=Commencement, 2=Adjustment, 3=BaseRent, 4=Escalation
 _XML = (

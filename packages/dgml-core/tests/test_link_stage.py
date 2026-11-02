@@ -30,7 +30,7 @@ from dgml_core.generation import links as links_mod
 from dgml_core.generation.pipeline import BatchOptions
 from dgml_core.storage import Workspace
 
-_MODEL = "anthropic/claude-haiku-4-5"
+_MODEL = "anthropic/claude-haiku-5-5"
 _DOCSET = "ds_links"
 
 # element order under root: e0000=chunk, 1=Commencement, 2=Adjustment, 3=BaseRent

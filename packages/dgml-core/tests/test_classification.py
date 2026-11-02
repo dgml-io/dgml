@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from dgml_core.classification import (
     ClassificationConfig,
     ClassificationDecision,
     ClassifyMode,
+    DecisionKind,
     classify_file,
     load_classification_config,
     propose_new_docset_for_files,
@@ -42,7 +44,7 @@ from dgml_core.utils import gather_file_pages
 
 from .conftest import write_classification_config
 
-DEFAULT_TEST_MODEL = "gemini/gemini-2.5-flash-lite"
+DEFAULT_TEST_MODEL = "gemini/gemini-3.5-flash-lite"
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +126,9 @@ def test_load_config_section_not_object(workspace: Workspace) -> None:
 def test_load_config_model_from_light_tier(workspace: Workspace) -> None:
     from .conftest import write_config
 
-    write_config(workspace, {"models": {"light": "gemini/gemini-2.5-flash-lite"}})
+    write_config(workspace, {"models": {"light": "gemini/gemini-3.5-flash-lite"}})
     cfg = load_classification_config(workspace)
-    assert cfg.model == "gemini/gemini-2.5-flash-lite"
+    assert cfg.model == "gemini/gemini-3.5-flash-lite"
 
 
 def test_load_config_happy_minimal(workspace: Workspace) -> None:
@@ -321,7 +323,9 @@ def test_classify_file_existing_decision(workspace: Workspace) -> None:
     with patch("litellm.completion", return_value=response) as mock_completion:
         decision = classify_file(workspace, new_id, config=cfg)
 
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=existing_id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=existing_id
+    )
     # api_key_env was unset → no api_key kwarg passed; litellm uses its own
     # per-provider env var lookup.
     call_kwargs = mock_completion.call_args.kwargs
@@ -339,7 +343,7 @@ def test_classify_file_new_decision(workspace: Workspace) -> None:
         decision = classify_file(workspace, new_id, config=cfg)
 
     assert decision == ClassificationDecision(
-        decision="new",
+        decision=DecisionKind.NEW,
         new_name="Purchase Orders",
         new_description="vendor POs",
         new_key_questions=tuple(_DEFAULT_NEW_QUESTIONS),
@@ -359,8 +363,14 @@ def test_classify_file_provider_exception_wrapped(workspace: Workspace) -> None:
     _, new_id = _seed_for_classify(workspace)
     cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
     with patch("litellm.completion", side_effect=RuntimeError("network boom")):
-        with pytest.raises(ClassificationFailed, match="RuntimeError: network boom"):
+        with pytest.raises(ClassificationFailed) as failed:
             classify_file(workspace, new_id, config=cfg)
+    # A provider's message alone ("Internal Server Error") can't be traced, so
+    # the call's model and key state follow it.
+    assert str(failed.value) == (
+        f"LLM call failed: RuntimeError: network boom "
+        f"(model {DEFAULT_TEST_MODEL!r}, api key not passed)"
+    )
 
 
 def test_classify_file_empty_tool_calls(workspace: Workspace) -> None:
@@ -641,7 +651,9 @@ def test_classify_file_existing_only_assigns(workspace: Workspace) -> None:
     with patch("litellm.completion", return_value=response):
         decision = classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING)
 
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=existing_id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=existing_id
+    )
 
 
 def test_classify_file_existing_only_declines_off_type_file(workspace: Workspace) -> None:
@@ -654,7 +666,9 @@ def test_classify_file_existing_only_declines_off_type_file(workspace: Workspace
     with patch("litellm.completion", return_value=response):
         decision = classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING)
 
-    assert decision == ClassificationDecision(decision="none", reason="A lease, not an invoice.")
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.NONE, reason="A lease, not an invoice."
+    )
 
 
 @pytest.mark.parametrize("raw_args", ["", "  ", "{}", '{"reason": "  "}', '{"reason": 3}'])
@@ -724,7 +738,7 @@ def test_classify_file_existing_only_single_docset_calls_llm(workspace: Workspac
         decision = classify_file(workspace, "newfid", config=cfg, mode=ClassifyMode.EXISTING)
 
     mock_completion.assert_called_once()
-    assert decision == ClassificationDecision(decision="none", reason="Not an invoice.")
+    assert decision == ClassificationDecision(decision=DecisionKind.NONE, reason="Not an invoice.")
 
 
 def test_classify_file_single_docset_still_calls_llm_in_default_mode(
@@ -901,7 +915,9 @@ def test_classify_file_forced_offers_assign_alone(workspace: Workspace) -> None:
         decision = classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING_FORCED)
 
     assert _tool_names(mock_completion) == ["assign_to_existing_docset"]
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=existing_id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=existing_id
+    )
     prompt_text = _prompt_text(mock_completion)
     assert "closest" in prompt_text
     assert "no_matching_docset" not in prompt_text
@@ -926,7 +942,9 @@ def test_classify_file_forced_single_docset_skips_llm(workspace: Workspace) -> N
         )
 
     mock_completion.assert_not_called()
-    assert decision == ClassificationDecision(decision="existing", existing_docset_id=only.id)
+    assert decision == ClassificationDecision(
+        decision=DecisionKind.EXISTING, existing_docset_id=only.id
+    )
 
 
 def test_classify_file_forced_raises_without_docsets(workspace: Workspace) -> None:
@@ -977,7 +995,7 @@ def test_propose_new_docset_returns_name_and_description(workspace: Workspace) -
         decision = propose_new_docset_for_files(workspace, ["fid1"], config=cfg)
 
     assert decision == ClassificationDecision(
-        decision="new",
+        decision=DecisionKind.NEW,
         new_name="Purchase Orders",
         new_description="vendor POs",
         new_key_questions=tuple(_DEFAULT_NEW_QUESTIONS),
@@ -1225,3 +1243,83 @@ def test_a_nonsensical_attempt_count_is_rejected(workspace: Workspace, attempts:
         with pytest.raises(ValueError, match="at least 1"):
             propose_new_docset_for_files(workspace, ["fid1"], config=cfg, attempts=attempts)
     mock_completion.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# classify_file logs its decision at INFO
+# ---------------------------------------------------------------------------
+
+
+def _decision_log(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "dgml_core.classification" and r.levelno == logging.INFO
+    ]
+
+
+def test_classify_file_logs_an_existing_decision(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    existing_id, new_id = _seed_for_classify(workspace)
+    cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
+    response = _tool_call_response("assign_to_existing_docset", {"docset_id": existing_id})
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with patch("litellm.completion", return_value=response):
+        classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING)
+
+    assert _decision_log(caplog) == [
+        f"file {new_id}: classified into docset {existing_id} ('Invoices') "
+        f"[mode existing, by {DEFAULT_TEST_MODEL}]"
+    ]
+
+
+def test_classify_file_logs_a_new_decision(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    _, new_id = _seed_for_classify(workspace)
+    cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
+    response = _tool_call_response("create_new_docset", _create_new_args())
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with patch("litellm.completion", return_value=response):
+        classify_file(workspace, new_id, config=cfg)
+
+    assert _decision_log(caplog) == [
+        f"file {new_id}: classification proposes a new docset 'Purchase Orders' "
+        f"[mode existing-or-new, by {DEFAULT_TEST_MODEL}]"
+    ]
+
+
+def test_classify_file_logs_a_decline_with_its_reason(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    _, new_id = _seed_for_classify(workspace)
+    cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
+    response = _tool_call_response("no_matching_docset", {"reason": "A lease, not an invoice."})
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with patch("litellm.completion", return_value=response):
+        classify_file(workspace, new_id, config=cfg, mode=ClassifyMode.EXISTING)
+
+    assert _decision_log(caplog) == [
+        f"file {new_id}: no existing docset fits [mode existing, by {DEFAULT_TEST_MODEL}]: "
+        "A lease, not an invoice."
+    ]
+
+
+def test_classify_file_logs_the_forced_single_docset_shortcut(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    only = DocSetStore(workspace).create(name="Invoices")
+    _seed_file(workspace, "nopagesfid")
+    cfg = ClassificationConfig(model=DEFAULT_TEST_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    classify_file(workspace, "nopagesfid", config=cfg, mode=ClassifyMode.EXISTING_FORCED)
+
+    assert _decision_log(caplog) == [
+        f"file nopagesfid: classified into docset {only.id} ('Invoices') "
+        "[mode existing-forced, by the only docset, no LLM call]"
+    ]

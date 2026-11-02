@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -241,7 +242,7 @@ def test_completion_with_retry_redirects_only_during_call(
 
 
 def test_completion_with_retry_retries_empty_choices_then_succeeds(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A successful response with an empty `choices` list (an intermittent
     Gemini glitch) is retried rather than passed through to a downstream
@@ -258,11 +259,18 @@ def test_completion_with_retry_retries_empty_choices_then_succeeds(
 
     monkeypatch.setattr("litellm.completion", flaky_completion)
     monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)  # no backoff wait
+    caplog.set_level(logging.INFO, logger="dgml_core.llm")
 
-    result = llm._completion_with_retry({"model": "gemini/gemini-2.5-pro", "messages": []})
+    result = llm._completion_with_retry({"model": "gemini/gemini-3.1-pro-preview", "messages": []})
 
     assert calls["n"] == 3
     assert result.choices[0].message == "ok"
+    # Each retry costs a paid call and the backoff, so each is logged, like a
+    # raised error's retry.
+    assert [r.getMessage() for r in caplog.records if r.name == "dgml_core.llm"] == [
+        "model returned no choices (model 'gemini/gemini-3.1-pro-preview'); retry 1 of 2 in 2s",
+        "model returned no choices (model 'gemini/gemini-3.1-pro-preview'); retry 2 of 2 in 4s",
+    ]
 
 
 def test_completion_with_retry_raises_on_persistent_empty(
@@ -285,7 +293,7 @@ def test_completion_with_retry_raises_on_persistent_empty(
 
     with pytest.raises(EmptyModelResponse, match="no choices"):
         llm._completion_with_retry(
-            {"model": "gemini/gemini-2.5-pro", "messages": []}, max_retries=3
+            {"model": "gemini/gemini-3.1-pro-preview", "messages": []}, max_retries=3
         )
 
     assert calls["n"] == 3  # exhausted every attempt before raising
@@ -305,7 +313,7 @@ def test_completion_with_retry_retries_dict_shaped_empty(
     monkeypatch.setattr("litellm.completion", flaky)
     monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
 
-    result = llm._completion_with_retry({"model": "gemini/gemini-2.5-pro", "messages": []})
+    result = llm._completion_with_retry({"model": "gemini/gemini-3.1-pro-preview", "messages": []})
 
     assert calls["n"] == 2
     assert result == _resp("OK")
@@ -334,6 +342,200 @@ def test_completion_with_retry_retries_transient_exception(
     assert result == _resp("OK")
 
 
+def _server_error(request_id: str | None = "req_abc123") -> Exception:
+    """A LiteLLM 500 as the OpenAI provider raises it, headers included."""
+    import httpx
+
+    headers = {"x-request-id": request_id} if request_id else {}
+    return litellm.exceptions.InternalServerError(
+        message="InternalServerError: OpenAIException - Internal Server Error",
+        llm_provider="openai",
+        model="gpt-4o",
+        response=httpx.Response(
+            500, headers=headers, request=httpx.Request("POST", "https://api.openai.com")
+        ),
+        litellm_debug_info="\nModel: gpt-4o\nMessages: `[{'content': 'SECRET DOCUMENT TEXT'}]`",
+    )
+
+
+def test_completion_with_retry_logs_each_retry_and_counts_attempts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def failing(**kwargs: Any) -> Any:
+        raise _server_error()
+
+    monkeypatch.setattr("litellm.completion", failing)
+    monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+    caplog.set_level(logging.INFO, logger="dgml_core.llm")
+
+    with pytest.raises(litellm.exceptions.InternalServerError) as raised:
+        llm._completion_with_retry(
+            {
+                "model": "gpt-4o",
+                "api_base": "https://proxy.example.com/v1",
+                "api_key": "sk-SECRET",
+                "messages": [],
+            }
+        )
+
+    retries = [r.getMessage() for r in caplog.records if r.name == "dgml_core.llm"]
+    context = (
+        "model 'gpt-4o' at https://proxy.example.com, api key passed, HTTP 500, "
+        "request id req_abc123"
+    )
+    assert retries == [
+        f"model call failed (InternalServerError, {context}); retry 1 of 2 in 2s",
+        f"model call failed (InternalServerError, {context}, 2 attempts); retry 2 of 2 in 4s",
+    ]
+    assert llm.provider_error_context(raised.value, model="gpt-4o") == (
+        "model 'gpt-4o', HTTP 500, request id req_abc123, 3 attempts"
+    )
+
+
+def test_completion_with_retry_logs_a_missing_key_as_not_passed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The kwargs leave out an empty key and None alike, so the retry line and
+    # the final error (built from the config) must word both the same.
+    attempts = iter([_server_error(), _resp("ok")])
+
+    def flaky(**kwargs: Any) -> Any:
+        result = next(attempts)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr("litellm.completion", flaky)
+    monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+    caplog.set_level(logging.INFO, logger="dgml_core.llm")
+
+    llm._completion_with_retry({"model": "gpt-4o", "messages": []})
+
+    [retry] = [r.getMessage() for r in caplog.records if r.name == "dgml_core.llm"]
+    assert "api key not passed" in retry
+    assert "None" not in retry and "empty" not in retry
+
+
+def test_completion_with_retry_does_not_log_a_non_transient_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def failing(**kwargs: Any) -> Any:
+        raise ValueError("bad request")
+
+    monkeypatch.setattr("litellm.completion", failing)
+    caplog.set_level(logging.DEBUG, logger="dgml_core.llm")
+
+    with pytest.raises(ValueError) as raised:
+        llm._completion_with_retry({"model": "gpt-4o", "messages": []})
+
+    assert [r for r in caplog.records if r.name == "dgml_core.llm"] == []
+    # One attempt is not worth mentioning.
+    assert llm.provider_error_context(raised.value, model="gpt-4o") == "model 'gpt-4o'"
+
+
+def test_provider_error_context_leaves_out_prompt_and_credentials() -> None:
+    context = llm.provider_error_context(
+        _server_error(),
+        model="gpt-4o",
+        api_base="https://user:hunter2@gw.example.com:8443/tok_SECRET/v1?api-key=sk-SECRET",
+        api_key="sk-SECRET-key-value",
+    )
+
+    assert context == (
+        "model 'gpt-4o' at https://gw.example.com:8443, api key passed, HTTP 500, "
+        "request id req_abc123"
+    )
+    assert "SECRET" not in context and "hunter2" not in context
+
+
+@pytest.mark.parametrize(
+    ("api_key", "state"),
+    [
+        ("sk-x", "api key passed"),
+        ("", "api key not passed"),
+        (None, "api key not passed"),
+    ],
+)
+def test_provider_error_context_reports_api_key_state(api_key: str | None, state: str) -> None:
+    assert llm.provider_error_context(RuntimeError("x"), api_key=api_key) == state
+
+
+def test_provider_error_context_leaves_out_an_unreported_api_key() -> None:
+    # Not passing api_key at all is "unknown", not "no key".
+    assert "api key" not in llm.provider_error_context(RuntimeError("x"), model="m")
+
+
+def test_describe_call_failure_appends_the_calls_context() -> None:
+    config = llm.LLMConfig(
+        model="gpt-4o", api_key="sk-SECRET", api_base="https://proxy.example.com/v1"
+    )
+
+    assert llm.describe_call_failure(_server_error(), config) == (
+        "InternalServerError: litellm.InternalServerError: InternalServerError: "
+        "OpenAIException - Internal Server Error "
+        "(model 'gpt-4o' at https://proxy.example.com, api key passed, HTTP 500, "
+        "request id req_abc123)"
+    )
+
+
+def test_provider_error_context_reads_the_request_id_litellm_keeps_aside() -> None:
+    # As LiteLLM raises an Anthropic error (seen live): exc.response is a
+    # stand-in with no headers; the real ones are set on the exception after.
+    import httpx
+
+    exc = litellm.exceptions.AuthenticationError(
+        message="AnthropicException - invalid x-api-key",
+        llm_provider="anthropic",
+        model="claude-sonnet-5",
+        response=httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com")),
+    )
+    exc.litellm_response_headers = httpx.Headers(  # type: ignore[attr-defined]
+        {"request-id": "req_011live", "content-type": "application/json"}
+    )
+
+    assert llm.provider_error_context(exc, model="anthropic/claude-sonnet-5") == (
+        "model 'anthropic/claude-sonnet-5', HTTP 401, request id req_011live"
+    )
+
+
+def test_provider_error_context_survives_an_exception_whose_attributes_raise() -> None:
+    # Runs inside except blocks: an error of its own would replace the provider's.
+    class Unreadable(Exception):
+        @property
+        def response(self) -> Any:
+            raise RuntimeError("no response attached")
+
+    assert llm.provider_error_context(Unreadable(), model="m") == "model 'm'"
+
+
+def test_completion_with_retry_keeps_an_exception_that_refuses_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Recording the attempt count must never replace the provider's error.
+    class Locked(Exception):
+        def __setattr__(self, name: str, value: Any) -> None:
+            if not name.startswith("__"):
+                raise AttributeError(f"{name} is read-only")
+            super().__setattr__(name, value)
+
+    def failing(**kwargs: Any) -> Any:
+        raise Locked("bad request")
+
+    monkeypatch.setattr("litellm.completion", failing)
+
+    with pytest.raises(Locked):
+        llm._completion_with_retry({"model": "gpt-4o", "messages": []})
+
+
+def test_provider_error_context_with_nothing_known() -> None:
+    assert llm.provider_error_context(RuntimeError("x")) == ""
+    assert llm.provider_error_context(_server_error(request_id=None)) == "HTTP 500"
+    assert (
+        llm.provider_error_context(RuntimeError("x"), model="m", api_base="not a url")
+        == "model 'm' at <unparseable api_base>"
+    )
+
+
 def test_call_with_refinement_replays_draft_in_second_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -348,7 +550,7 @@ def test_call_with_refinement_replays_draft_in_second_request(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     draft, refined = llm.call_with_refinement(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "LISTING"}],
         refine_instruction=[{"type": "text", "text": "complete it"}],
@@ -378,7 +580,7 @@ def test_call_with_refinement_marks_cache_on_anthropic(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     llm.call_with_refinement(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "LISTING"}],
         refine_instruction=[{"type": "text", "text": "complete it"}],
@@ -1591,7 +1793,7 @@ def test_call_with_tools_marks_system_cache_on_anthropic(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     llm.call_with_tools(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         messages=_extraction_messages(),
         tools=[{"type": "function", "function": {"name": "t"}}],
         cache=True,
@@ -1621,7 +1823,7 @@ def test_call_with_tools_preserves_caller_marked_stable_block(
     messages[1]["content"][0]["cache_control"] = {"type": "ephemeral"}  # schema text
 
     llm.call_with_tools(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         messages=messages,
         tools=[{"type": "function", "function": {"name": "t"}}],
         cache=True,
@@ -1646,7 +1848,7 @@ def test_call_with_tools_no_cache_markers_when_flag_off(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     llm.call_with_tools(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         messages=_extraction_messages(),
         tools=[{"type": "function", "function": {"name": "t"}}],
         cache=False,
@@ -1710,7 +1912,7 @@ def test_call_continued_stitches_length_truncations(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     out = llm.call_continued(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-sonnet-4-6"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "U"}],
     )
@@ -1739,7 +1941,7 @@ def test_call_continued_single_call_when_not_truncated(
 
     monkeypatch.setattr("litellm.completion", fake_completion)
     out = llm.call_continued(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "U"}],
     )
@@ -1774,7 +1976,7 @@ def test_is_openai_model_matches_openai_routed_ids(model: str) -> None:
     "model",
     [
         "anthropic/claude-sonnet-5",
-        "gemini/gemini-2.5-pro",
+        "gemini/gemini-3.1-pro-preview",
         "ollama/llama3",
         # Azure deployments of the same models are a different endpoint with
         # their own quirks; nothing here has been validated against them, so
@@ -1787,11 +1989,11 @@ def test_is_openai_model_rejects_other_providers(model: str) -> None:
 
 
 def test_prefill_supported_on_anthropic_but_not_openai_or_gemini() -> None:
-    assert llm.supports_assistant_prefill("anthropic/claude-haiku-4-5") is True
+    assert llm.supports_assistant_prefill("anthropic/claude-sonnet-4-6") is True
     # Gemini refuses a trailing model turn outright ("Requests ending with a
     # model turn are not supported", 400) — see supports_assistant_prefill and
     # test_prefill_support.py for what the earlier assumption cost.
-    assert llm.supports_assistant_prefill("gemini/gemini-2.5-flash") is False
+    assert llm.supports_assistant_prefill("gemini/gemini-3.8-flash") is False
     # Unrecognized ids (self-hosted, proxied) keep the prefill path — it is the
     # natural behaviour of an OpenAI-compatible server that just concatenates
     # the messages into a prompt.
@@ -1969,9 +2171,9 @@ def test_unrecognized_model_raises_model_not_supported() -> None:
 
 
 def test_recognized_model_passes_validation() -> None:
-    cfg = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    cfg = llm.LLMConfig(model="anthropic/claude-haiku-5-5")
     kwargs = llm._build_completion_kwargs(cfg, messages=[{"role": "user", "content": "hi"}])
-    assert kwargs["model"] == "anthropic/claude-haiku-4-5"
+    assert kwargs["model"] == "anthropic/claude-haiku-5-5"
 
 
 def test_api_base_skips_model_validation() -> None:
@@ -1989,19 +2191,29 @@ def test_api_base_skips_model_validation() -> None:
 def test_model_max_output_tokens_reads_litellm_metadata() -> None:
     # Real metadata: frontier models allow more output than older ones.
     assert llm.model_max_output_tokens("anthropic/claude-sonnet-5") == 128000
-    assert llm.model_max_output_tokens("anthropic/claude-haiku-4-5") == 64000
+    assert llm.model_max_output_tokens("anthropic/claude-haiku-5-5") == 128000
     # Unknown id and custom api_base both fall back to "caller keeps its own".
     assert llm.model_max_output_tokens("not-a-real-model-xyz") is None
     assert llm.model_max_output_tokens("anthropic/claude-sonnet-5", "http://localhost:1234") is None
 
 
-def test_output_tokens_clamped_to_model_ceiling() -> None:
+def test_output_tokens_clamped_to_model_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request for more output than the model allows is a provider 400 —
     the builder lowers it to the model's own ceiling instead."""
     msgs = [{"role": "user", "content": "hi"}]
-    # Haiku caps at 64K: an ask for 128K is clamped down.
+    # Fake a 64K ceiling rather than pin a real model that has one: every such
+    # model is an older release that will drop out of litellm's metadata.
+    small = "anthropic/claude-haiku-5-5"
+    real_info = litellm.get_model_info
+
+    def fake_info(model: str, *args: Any, **kwargs: Any) -> Any:
+        info = real_info(model, *args, **kwargs)
+        return {**info, "max_output_tokens": 64000} if model == small else info
+
+    monkeypatch.setattr(litellm, "get_model_info", fake_info)
+    # A 64K model asked for 128K is clamped down.
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5", max_completion_tokens=128000),
+        llm.LLMConfig(model=small, max_completion_tokens=128000),
         messages=msgs,
     )
     assert kwargs["max_completion_tokens"] == 64000
@@ -2019,7 +2231,7 @@ def test_output_tokens_clamped_to_model_ceiling() -> None:
     assert kwargs["max_completion_tokens"] == 4096
     # max_tokens follows the same rule.
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5", max_tokens=128000), messages=msgs
+        llm.LLMConfig(model=small, max_tokens=128000), messages=msgs
     )
     assert kwargs["max_tokens"] == 64000
 
@@ -2075,6 +2287,17 @@ def test_thinking_sent_to_anthropic_models() -> None:
     assert kwargs["thinking"] == {"type": "adaptive"}
 
 
+def test_between_tools_is_sonnet_55_off_switch() -> None:
+    """Claude Sonnet 5.5 rejects `{"type": "disabled"}`; `between_tools` is how it
+    turns thinking off for a plain text reply, and it goes on the wire verbatim
+    (type only, no other field)."""
+    msgs = [{"role": "user", "content": "hi"}]
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="anthropic/claude-sonnet-5-5", thinking="between_tools"), messages=msgs
+    )
+    assert kwargs["thinking"] == {"type": "between_tools"}
+
+
 def test_thinking_omitted_when_unset() -> None:
     """Unset means "say nothing", which leaves the model's own default in
     force — deliberately NOT the same as "disabled"."""
@@ -2088,7 +2311,7 @@ def test_thinking_omitted_when_unset() -> None:
 def test_thinking_not_sent_to_non_anthropic_models() -> None:
     """The field is Anthropic-shaped; other providers spell reasoning their
     own way and reject it."""
-    for model in ("gemini/gemini-2.5-pro", "openai/gpt-5"):
+    for model in ("gemini/gemini-3.1-pro-preview", "openai/gpt-5"):
         kwargs = llm._build_completion_kwargs(
             llm.LLMConfig(model=model, thinking="disabled"),
             messages=[{"role": "user", "content": "hi"}],
@@ -2171,7 +2394,7 @@ def test_prefill_on_continuation_follows_thinking_mode(
 
     monkeypatch.setattr(litellm, "completion", fake)
     out = llm.call_continued(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5", thinking=thinking),
+        llm.LLMConfig(model="anthropic/claude-sonnet-4-6", thinking=thinking),
         system_prompt="s",
         user_content=[{"type": "text", "text": "u"}],
     )
@@ -2220,3 +2443,56 @@ def test_call_continued_raises_when_every_round_is_textless(
             system_prompt="s",
             user_content=[{"type": "text", "text": "u"}],
         )
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    ["http://[::1", "https://h:notaport", "https://h:99999", "not a url"],
+)
+def test_redacted_api_base_reports_a_malformed_url(api_base: str) -> None:
+    assert llm._redacted_api_base(api_base) == "<unparseable api_base>"
+
+
+def test_provider_error_context_ignores_a_non_string_api_base() -> None:
+    # Typed str | None; anything else is left out rather than parsed.
+    context = llm.provider_error_context(
+        RuntimeError("x"),
+        model="m",
+        api_base=123,  # type: ignore[arg-type]
+    )
+    assert context == "model 'm'"
+
+
+def test_provider_error_context_reads_only_well_typed_fields() -> None:
+    """Fields that are missing, None, or not the expected type are left out."""
+    exc = RuntimeError("x")
+    exc.status_code = None  # type: ignore[attr-defined]
+    exc.response = SimpleNamespace(headers=None)  # type: ignore[attr-defined]
+    assert llm.provider_error_context(exc) == ""
+
+    exc.response = SimpleNamespace(headers=["x-request-id"])  # type: ignore[attr-defined]
+    assert llm.provider_error_context(exc) == ""
+
+    exc.response = SimpleNamespace(headers={"x-request-id": None})  # type: ignore[attr-defined]
+    assert llm.provider_error_context(exc) == ""
+
+
+def test_build_user_content_labels_each_image_by_its_own_format() -> None:
+    """A page image is a JPEG or a PNG, whichever encoding was smaller; each
+    image block must carry the MIME type of the bytes it holds."""
+    jpeg = b"\xff\xd8\xff\xe0 jpeg body"
+    png = b"\x89PNG\r\n\x1a\n png body"
+    content = llm.build_user_content(instruction_text="x", images=[jpeg, png])
+    urls = [block["image_url"]["url"] for block in content if block["type"] == "image_url"]
+    assert urls[0].startswith("data:image/jpeg;base64,")
+    assert urls[1].startswith("data:image/png;base64,")
+
+
+def test_build_user_content_names_the_inline_pdf() -> None:
+    """The inline PDF block carries a filename (see `_PDF_FILENAME`)."""
+    content = llm.build_user_content(instruction_text="read", pdf_bytes=b"%PDF-1.4 x")
+    assert [block["type"] for block in content] == ["text", "file"]
+    assert content[1]["file"] == {
+        "file_data": "data:application/pdf;base64,JVBERi0xLjQgeA==",
+        "filename": "document.pdf",
+    }

@@ -8,7 +8,7 @@ disagree. No LLM calls and no network: everything here is local and free.
 
 Checks, in the order they matter:
 
-  1. GROUNDING CONTRACT   page_text/ declared size == the PNG's real pixels,
+  1. GROUNDING CONTRACT   page_text/ declared size == the image's real pixels,
                           and every word box inside the image. A violation
                           silently mis-places every dg:origin on the page and
                           `dgml check` does not look for it.
@@ -30,7 +30,6 @@ import argparse
 import json
 import resource
 import shutil
-import struct
 import sys
 import tempfile
 import time
@@ -39,9 +38,12 @@ from pathlib import Path
 
 from dgml_core.pages import (
     EngineName,
+    PageImageSpec,
     PdfConfig,
+    list_page_images,
+    make_renderer,
+    page_number_from_image_name,
     pdf_page_count_bytes,
-    render_pages,
     slice_pages,
 )
 
@@ -69,12 +71,19 @@ class Findings:
         print(f"    warn  {m}")
 
 
-def png_size(p: Path) -> tuple[int, int]:
-    b = p.read_bytes()
-    if not b.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError(f"not a PNG: {p}")
-    w, h = struct.unpack(">II", b[16:24])
-    return w, h
+def page_images_by_number(d: Path) -> dict[int, Path]:
+    """The stored page images in ``d`` by page number. Each is a ``.png`` or a
+    ``.jpg``, whichever encoding was smaller, so the extension can't be assumed."""
+    return {
+        n: p for p in list_page_images(d) if (n := page_number_from_image_name(p.name)) is not None
+    }
+
+
+def image_size(p: Path) -> tuple[int, int]:
+    from PIL import Image
+
+    with Image.open(p) as im:
+        return im.size
 
 
 def peak_rss_mb() -> float:
@@ -139,7 +148,16 @@ def check_render(pdf: Path, dpi: int, f: Findings) -> dict[EngineName, dict]:
         d = Path(tempfile.mkdtemp(prefix=f"parity-{eng.value}-"))
         t0 = time.perf_counter()
         try:
-            n = render_pages(pdf, d, dpi=dpi, config=PdfConfig(provider=eng))
+            # The engine's own lossless output, not render_pages's stored images:
+            # those are each the smaller of PNG and JPEG, so the two engines'
+            # copies of a page can differ in format and JPEG artifacts would
+            # pass for engine divergence.
+            # Unbounded: compare each engine's exact-dpi render, not PDFium's
+            # direct render at the fitted size for out-of-bounds pages.
+            make_renderer(PdfConfig(provider=eng)).render(
+                pdf, d, dpi=dpi, image_spec=PageImageSpec(min_edge=None, max_edge=None)
+            )
+            n = len(list_page_images(d))
             out[eng] = {
                 "dir": d,
                 "pages": n,
@@ -172,13 +190,17 @@ def check_render(pdf: Path, dpi: int, f: Findings) -> dict[EngineName, dict]:
         return out
 
     # geometry must match exactly -- page_text/ boxes assume gs's numbers
+    gs_images, pf_images = page_images_by_number(gs["dir"]), page_images_by_number(pf["dir"])
     for i in range(1, gs["pages"] + 1):
-        ga, pa = gs["dir"] / f"page_{i}.png", pf["dir"] / f"page_{i}.png"
-        if not pa.exists():
+        ga, pa = gs_images.get(i), pf_images.get(i)
+        if pa is None:
             f.fail(f"{pdf.name} p{i}: pypdfium2 wrote no image")
             continue
-        if png_size(ga) != png_size(pa):
-            f.fail(f"{pdf.name} p{i}: {png_size(ga)} (gs) vs {png_size(pa)} (pypdfium2)")
+        if ga is None:
+            f.fail(f"{pdf.name} p{i}: ghostscript wrote no image")
+            continue
+        if image_size(ga) != image_size(pa):
+            f.fail(f"{pdf.name} p{i}: {image_size(ga)} (gs) vs {image_size(pa)} (pypdfium2)")
             continue
         cmp = compare_pixels(ga, pa)
         if cmp is None:

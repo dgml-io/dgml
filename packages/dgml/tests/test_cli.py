@@ -18,17 +18,19 @@ import shutil
 import sys
 import threading
 import tomllib
+import types
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
 from dgml.cli import main
 from dgml_core import layout
+from dgml_core.conversion import ConverterConfig, DocConverter
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import FileNotFound, InvalidArgument
 from dgml_core.migrations import (
@@ -1114,6 +1116,86 @@ def test_docset_create_show_list(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert any(d["id"] == docset_id for d in listed["docsets"])
 
 
+# --------------------------------------------------------------------------
+# `dgml docset create --id` — caller-supplied docset ids.
+# These lock the JSON/exit-code contract; the rule matrix itself is covered in
+# dgml-core's test_docsets.py.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("docset_id", ["q2-contracts", "123e4567-e89b-12d3-a456-426614174000"])
+def test_docset_create_id_flag_sets_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], docset_id: str
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "Contracts", "--id", docset_id])
+    assert rc == 0
+    assert _read_stdout(capsys)["id"] == docset_id
+    assert (ws / "docsets" / docset_id / "docset.json").is_file()
+
+    assert main(_ws_args(ws) + ["docset", "show", docset_id]) == 0
+    shown = _read_stdout(capsys)
+    assert shown["id"] == docset_id
+    assert shown["name"] == "Contracts"
+
+
+@pytest.mark.parametrize("bad", ["My_Set", "ab", "a b", "a/b"])
+def test_docset_create_id_rejects_malformed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    """Exit 1 with a structured envelope — not argparse's exit 2."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "X", "--id", bad])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+    assert not (ws / "docsets").exists()
+
+
+def test_docset_create_id_uppercase_uuid_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ids are lowercase-only, so an uppercase UUID is the likely mistake. The
+    message must say the rule (letters lowercase) rather than leaving the caller
+    to guess."""
+    import uuid
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "X", "--id", str(uuid.uuid4()).upper()])
+    assert rc == 1
+    err = _read_stderr(capsys)
+    assert err["error"]["code"] == "INVALID_ARGUMENT"
+    assert "lowercase" in err["error"]["message"]
+
+
+def test_docset_create_id_conflict_envelope(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    assert main(_ws_args(ws) + ["docset", "create", "--name", "First", "--id", "shared"]) == 0
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "Second", "--id", "shared"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "CONFLICT"
+
+    # The held DocSet survived — the whole point of the id guard.
+    main(_ws_args(ws) + ["docset", "show", "shared"])
+    assert _read_stdout(capsys)["name"] == "First"
+    main(_ws_args(ws) + ["docset", "list"])
+    assert len(_read_stdout(capsys)["docsets"]) == 1
+
+
 def test_docset_update_and_delete(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     ws = tmp_path / "ws"
     _init_ws(ws)
@@ -1355,6 +1437,9 @@ def test_check_returns_two_when_issues(
     assert rc == 2
     report = _read_stdout(capsys)
     assert report["issue_count"] >= 1
+    assert {(i["target_type"], i["target_id"]) for i in report["issues"]} == {("file", fid)}
+    # ``kind`` is wire format (an ``IssueKind`` member renders as its value).
+    assert "missing_pdf" in {i["kind"] for i in report["issues"]}
 
 
 @needs_gs
@@ -1365,7 +1450,7 @@ def test_cluster_assigns_unassigned_files_to_docsets(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     # Empty workspace: no unassigned files → no-op, no LLM or clusterer call.
@@ -1623,7 +1708,7 @@ def test_cluster_config_flag_passes_overrides_to_run_clustering(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1659,7 +1744,7 @@ def test_cluster_config_flag_missing_file_errors(
     ws = tmp_path / "ws"
     _init_ws(ws)
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     capsys.readouterr()
@@ -1696,7 +1781,7 @@ def test_cluster_config_preset_name_passes_preset_overrides(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1724,14 +1809,14 @@ def test_cluster_config_preset_name_passes_preset_overrides(
 def _llm_partition(fid: str) -> Any:
     """A one-cluster LLMClusteringResult that names its emergent bucket in the
     same call (so clustering() needs no second naming round-trip)."""
-    from dgml_core.classification import ClassificationDecision
+    from dgml_core.classification import ClassificationDecision, DecisionKind
     from dgml_core.llm_clustering import LLMClusteringResult
 
     return LLMClusteringResult(
         clusters={fid: "unknown_0"},
         proposals={
             "unknown_0": ClassificationDecision(
-                decision="new",
+                decision=DecisionKind.NEW,
                 new_name="Sample Documents",
                 new_description="test docs",
                 new_key_questions=("What is this document about?",),
@@ -1752,7 +1837,7 @@ def test_cluster_method_llm_routes_to_llm_partitioner(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1784,7 +1869,7 @@ def test_cluster_method_auto_small_corpus_uses_llm(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1818,7 +1903,7 @@ def test_cluster_partial_success_when_llm_fails(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     # Existing DocSet "Foo" — mock run_clustering to put one file in "Foo"
@@ -1926,7 +2011,7 @@ def test_file_add_auto_classify_creates_new_docset(
     # the LLM is forced to call create_new_docset.
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     new_questions = [
@@ -1955,7 +2040,7 @@ def test_file_add_auto_classify_creates_new_docset(
     assert cls["docset_name"] == "Receipts"
     assert cls["docset_key_questions"] == new_questions
     assert cls["error"] is None
-    assert cls["model"] == "gemini/gemini-2.5-flash-lite"
+    assert cls["model"] == "gemini/gemini-3.5-flash-lite"
 
     # Persisted: the created DocSet's record carries the key_questions
     # for future classification calls to read.
@@ -1980,7 +2065,7 @@ def test_file_add_auto_classify_new_docset_rolled_back_when_assign_fails(
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
-    write_classification_config(Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite"})
+    write_classification_config(Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite"})
     response = _tool_response(
         "create_new_docset",
         {"name": "Receipts", "description": "expense receipts", "key_questions": ["Who?"]},
@@ -2054,7 +2139,7 @@ def test_file_add_auto_classify_assigns_existing_docset(
     ]
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     response = _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
 
@@ -2102,7 +2187,7 @@ def test_file_add_auto_classify_soft_fails_when_llm_errors(
     capsys.readouterr()
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     with patch("litellm.completion", side_effect=RuntimeError("API down")):
@@ -2129,7 +2214,7 @@ def test_file_add_auto_classify_skipped_on_duplicate(
     capsys.readouterr()
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     with patch("litellm.completion") as mock_completion:
@@ -2187,7 +2272,7 @@ def _seed_docset_and_config(
     )
     existing_id: str = _read_stdout(capsys)["id"]
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     return existing_id
 
@@ -2348,7 +2433,7 @@ def test_file_add_auto_classify_existing_errors_when_no_docsets(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     with patch("litellm.completion") as mock_completion:
@@ -2376,7 +2461,7 @@ def test_file_add_auto_classify_default_mode_handles_empty_workspace(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     response = _tool_response(
         "create_new_docset",
@@ -2473,7 +2558,7 @@ def _init_with_docset(ws: Path, capsys: pytest.CaptureFixture[str], name: str = 
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             }
         },
@@ -2526,7 +2611,7 @@ def test_docset_generate_rejects_malformed_style_config(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             },
             "style": {"enabled": True, "max_tokens": 100},
@@ -2559,7 +2644,7 @@ def test_docset_generate_rejects_unset_style_api_key_env(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             },
             "style": {"enabled": True, "model": "m", "api_key_env": "DGML_STYLE_KEY_MISSING"},
@@ -2624,7 +2709,7 @@ def test_docset_generate_happy_path(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2744,13 +2829,13 @@ def test_docset_generate_model_flags_default_to_config() -> None:
             "--generation-config",
             "fast",
             "--model",
-            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-haiku-5-5",
             "--label-model",
             "anthropic/claude-sonnet-4-6",
         ]
     )
     assert args.generation_config == "fast"
-    assert args.model == "anthropic/claude-haiku-4-5"
+    assert args.model == "anthropic/claude-haiku-5-5"
     assert args.label_model == "anthropic/claude-sonnet-4-6"
 
 
@@ -2788,7 +2873,7 @@ def test_docset_generate_models_from_config(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2811,14 +2896,55 @@ def test_docset_generate_models_from_config(
     assert rc == 0
     payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
-    assert opts.model == "anthropic/claude-haiku-4-5"
+    assert opts.model == "anthropic/claude-haiku-5-5"
     assert opts.label_model == "anthropic/claude-sonnet-4-6"
     # The effective models are recorded in the output so the choice is visible.
     assert payload["models"] == {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "label_model": "anthropic/claude-sonnet-4-6",
         "source": "config",
     }
+
+
+@needs_gs
+@pytest.mark.usefixtures("no_link_model")
+def test_docset_generate_threads_both_models_credentials(
+    tmp_path: Path,
+    text_pdf: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The labeling model's key and api_base reach ConvertOptions beside the
+    transcription model's — otherwise every labeling-side call (roster planning,
+    labeling, descriptions) silently runs on litellm's env-var key instead."""
+    ws = tmp_path / "ws"
+    did = _init_with_docset(ws, capsys)
+    monkeypatch.setenv("T_KEY", "t-key")
+    monkeypatch.setenv("L_KEY", "l-key")
+    Workspace(root=ws).config_path.write_text(
+        dump_toml(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-5-5",
+                    "api_key_env": "T_KEY",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                    "label_api_key_env": "L_KEY",
+                    "label_api_base": "https://proxy.example",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(_ws_args(ws) + ["file", "add", str(text_pdf)])
+    fid = _read_stdout(capsys)["file"]["id"]
+    main(_ws_args(ws) + ["docset", "add-file", fid, "--docset", did])
+    capsys.readouterr()
+
+    with patch("dgml_core.generation.convert_batch", return_value={}) as mock_batch:
+        assert main(_ws_args(ws) + ["docset", "generate", did, "--no-coverage"]) == 0
+    opts = mock_batch.call_args.kwargs["options"]
+    assert (opts.api_key, opts.api_base) == ("t-key", None)
+    assert (opts.label_api_key, opts.label_api_base) == ("l-key", "https://proxy.example")
 
 
 @needs_gs
@@ -2834,7 +2960,7 @@ def test_docset_generate_model_flags_override_config(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2867,10 +2993,10 @@ def test_docset_generate_model_flags_override_config(
     assert rc == 0
     payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
-    assert opts.model == "anthropic/claude-haiku-4-5"  # unchanged
+    assert opts.model == "anthropic/claude-haiku-5-5"  # unchanged
     assert opts.label_model == "anthropic/claude-opus-4-8"  # overridden
     assert payload["models"] == {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "label_model": "anthropic/claude-opus-4-8",
         "source": "override",
     }
@@ -3668,7 +3794,7 @@ def test_file_add_directory_clean_run(tmp_path: Path, capsys: pytest.CaptureFixt
 def test_file_add_directory_skips_unconfigured_sources(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """With no `conversion` config, convertible sources (docx/xlsx) in a bulk
+    """With no `conversion` config, convertible sources (docx/xlsx/pptx) in a bulk
     directory are silently skipped — not gathered, not counted as failures."""
     ws = tmp_path / "ws"
     _init_ws(ws)
@@ -3678,12 +3804,112 @@ def test_file_add_directory_skips_unconfigured_sources(
     src.mkdir()
     _write_text_pdf(src / "a.pdf", ["Alpha"])
     (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
 
     rc = main(_ws_args(ws) + ["file", "add", str(src)])
     assert rc == 0
     payload = _read_stdout(capsys)
     assert payload["summary"]["total"] == 1
     assert [e["path"] for e in payload["results"]] == [str(src / "a.pdf")]
+
+
+class _FixedPdfConverter(DocConverter):
+    """Returns the PDF named by its ``pdf`` option, whatever the source."""
+
+    name: ClassVar[str] = "fixed-pdf"
+    input_formats: ClassVar[frozenset[str]] = frozenset()
+    config_fields: ClassVar[frozenset[str]] = frozenset({"pdf"})
+
+    @classmethod
+    def parse_config(cls, section: Mapping[str, Any]) -> ConverterConfig:
+        cls._check_no_extra_fields(section)
+        return ConverterConfig(provider=str(section["provider"]), options={"pdf": section["pdf"]})
+
+    def __init__(self, config: ConverterConfig) -> None:
+        self._pdf = Path(config.options["pdf"])
+
+    def to_pdf(self, path: Path) -> bytes:
+        return self._pdf.read_bytes()
+
+
+@needs_gs
+def test_file_add_directory_gathers_configured_pptx(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `conversion.pptx` configured, a bulk add gathers `.pptx` and `.ppt` (any
+    case) and converts them, while a family with no converter is still skipped."""
+    stub = types.ModuleType("cli_stub_conv")
+    stub._FixedPdfConverter = _FixedPdfConverter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cli_stub_conv", stub)
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rendered = tmp_path / "rendered.pdf"
+    _write_text_pdf(rendered, ["Slide one"])
+    conversion = {"pptx": {"provider": "cli_stub_conv:_FixedPdfConverter", "pdf": str(rendered)}}
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+    src = tmp_path / "mixed"
+    src.mkdir()
+    _write_text_pdf(src / "a.pdf", ["Alpha"])
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
+    (src / "OLD.PPT").write_bytes(b"\xd0\xcf\x11\xe0 not really a ppt")
+    (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc == 0
+    payload = _read_stdout(capsys)
+    by_name = {Path(e["path"]).name: e for e in payload["results"]}
+    assert set(by_name) == {"a.pdf", "deck.pptx", "OLD.PPT"}  # notes.docx: no converter
+    for name in ("deck.pptx", "OLD.PPT"):
+        entry = by_name[name]
+        assert entry["status"] == "added"
+        assert entry["conversion_error"] is None
+        # The converted PDF is persisted beside the source (the uppercase suffix
+        # lowercased in its name) and the pages were rendered from it.
+        assert entry["file"]["page_count"] == 1
+        assert entry["file"]["pdf_converter"] == "fixed-pdf"
+        assert (ws / layout.file_pdf_key(entry["file"]["id"], name)).is_file()
+
+
+class _SpreadsheetOnlyConverter(_FixedPdfConverter):
+    name: ClassVar[str] = "spreadsheet-only"
+    input_formats: ClassVar[frozenset[str]] = frozenset({".xlsx", ".xls"})
+
+
+def test_file_add_directory_refuses_a_family_on_the_wrong_converter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`conversion.pptx` pointed at a converter that handles only spreadsheets is
+    one CONVERSION_CONFIG_INVALID up front, not a failed record per deck."""
+    stub = types.ModuleType("cli_stub_conv")
+    stub._SpreadsheetOnlyConverter = _SpreadsheetOnlyConverter  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cli_stub_conv", stub)
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rendered = tmp_path / "rendered.pdf"
+    _write_text_pdf(rendered, ["Slide one"])
+    conversion = {
+        "pptx": {"provider": "cli_stub_conv:_SpreadsheetOnlyConverter", "pdf": str(rendered)}
+    }
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+    src = tmp_path / "decks"
+    src.mkdir()
+    (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
+    (src / "other.pptx").write_bytes(b"PK\x03\x04 not really a pptx either")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc != 0
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "does not handle '.pptx'" in err["message"]
+    assert not (ws / "files").exists() or not any((ws / "files").iterdir())
 
 
 @needs_gs
@@ -3759,6 +3985,7 @@ def test_file_add_directory_skip_already_imported(
         "hard_failed": 0,
     }
     for entry in payload["results"]:
+        assert entry["status"] == "skipped"
         assert entry["created"] is False
         assert entry["conflict_kind"] == "hash"
 
@@ -3803,7 +4030,7 @@ def test_file_add_directory_auto_classify_amortizes_docsets(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     src = tmp_path / "pdfs"
@@ -3955,7 +4182,7 @@ def test_file_add_directory_auto_classify_existing_aborts_before_adding(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     src = tmp_path / "pdfs"
@@ -4160,7 +4387,7 @@ def _generate_with_xml(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -4332,7 +4559,7 @@ def test_docset_generate_preflight_rejects_missing_api_key(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -4363,7 +4590,7 @@ def test_docset_generate_preflight_skips_key_check_when_api_base_set(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                     "api_base": "http://localhost:8000",
                     "label_api_base": "http://localhost:8000",
@@ -4524,7 +4751,7 @@ def test_dgmlx_verify_detects_tamper(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     capsys.readouterr()
 
-    (out_dir / "page_images" / "page_1.png").write_bytes(b"TAMPERED")
+    (out_dir / "page_images" / "page_1.jpg").write_bytes(b"TAMPERED")
     rc = main(_ws_args(ws) + ["dgmlx", "verify", str(out_dir)])
     assert rc == 2  # mirrors `check`: verified-but-failed
     payload = _read_stdout(capsys)
@@ -4970,6 +5197,28 @@ def test_prove_file_bad_uri_is_invalid_argument(
     assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
 
 
+def test_prove_file_node_record_is_invalid_argument(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A node record (URI with a #leaf fragment) handed to `prove file` is the wrong
+    # command, not a tamper: it must be a structural error (exit 1), not valid=false (exit 2).
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rec = tmp_path / "rec.json"
+    rec.write_text(
+        json.dumps({"checksum": "ab", "checksum_algo": "sha256", "uri": "dgmlx://f00000/ds0000#3"}),
+        encoding="utf-8",
+    )
+    rc = main(
+        _ws_args(ws) + ["prove", "file", "--chain", "nvnm-testnet", "--record-json", str(rec)]
+    )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "INVALID_ARGUMENT"
+    assert "prove node" in err["message"]
+
+
 # --- discover ----------------------------------------------------------------
 
 _DISCOVER_XML = (
@@ -5080,6 +5329,24 @@ def test_discover_page_from_origin(tmp_path: Path, capsys: pytest.CaptureFixture
     inv = next((t for t in payload["tags"] if t["tag"] == "InvoiceCycle"), None)
     assert inv is not None
     assert inv["samples"][0]["page"] == 4
+
+
+def test_discover_full_reports_structural_roles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--full`` emits each tag's structural ``role`` as its plain wire string."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    _seed_file_dir(ws, _DISC_FILE, pages=4)
+    _seed_discover_xml(ws, _DISC_FILE, _DISC_DS)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["discover", _DISC_FILE, "--docset", _DISC_DS, "--full"])
+    assert rc == 0
+    roles = {t["tag"]: t["role"] for t in _read_stdout(capsys)["tags"]}
+    assert roles["LiabilityCap"] == "leaf-value"
+    assert roles["IndemnificationClause"] == "container"
+    assert set(roles.values()) <= {"leaf-value", "container", "hybrid", "mixed"}
 
 
 def test_discover_depth_first_addressable(
@@ -5417,7 +5684,7 @@ def _write_grounded_config(ws: Path) -> None:
             {
                 "grounded": {
                     "schema_model": "anthropic/claude-opus-4-7",
-                    "values_model": "gemini/gemini-2.5-pro",
+                    "values_model": "gemini/gemini-3.1-pro-preview",
                 }
             }
         ),
@@ -5976,7 +6243,7 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     assert payload["assigned"] is True
     assert payload["extraction"]["performed"] is True
     assert payload["extraction"]["error"] is None
-    assert payload["extraction"]["model"] == "gemini/gemini-2.5-pro"
+    assert payload["extraction"]["model"] == "gemini/gemini-3.1-pro-preview"
     # The run's cost is reported without --debug, so no usage.jsonl is needed.
     assert payload["extraction"]["usage"]["cost_usd"] == 0.03
     assert set(payload["extraction"]["usage"]) == {
@@ -6922,6 +7189,7 @@ def test_import_is_idempotent(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     payload = _read_stdout(capsys)
     assert payload["imported"] == []
     assert payload["skipped"][0]["workspace_id"] == wid
+    assert payload["skipped"][0]["status"] == "skipped"
 
 
 def test_import_on_conflict_fail_stops(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -6964,7 +7232,9 @@ def test_import_reports_a_bad_row_and_keeps_going(
     assert main(["workspace", "import"]) == 2  # partial success
     payload = _read_stdout(capsys)
     assert [r["workspace_id"] for r in payload["imported"]] == [wid]
+    assert payload["imported"][0]["status"] == "imported"
     assert payload["failed"][0]["root"] == str(tmp_path / "vanished")
+    assert payload["failed"][0]["status"] == "failed"
     assert "does not exist" in payload["failed"][0]["reason"]
 
 

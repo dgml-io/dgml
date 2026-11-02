@@ -160,6 +160,28 @@ background jobs on a thread pool; their state is in the `jobs` table, and the UI
 A per-(organisation, file) lock keeps two jobs from writing one file's `.dgml.xml` at
 once. Jobs left unfinished by a restart are marked `INTERRUPTED`.
 
+### Logs
+
+Every log line carries the workspace id (the organisation's UUID) it was logged for,
+dgml-core's lines included:
+
+```text
+2026-10-19 12:00:01 INFO [0b9c8d39-…] dgml_core.docsets: assigned file f1… to docset d7…
+```
+
+dgml-core logs through stdlib `logging` and leaves formatting to the host, so the id is
+added on the service's side (`logcontext.py`):
+
+- **A context variable holds the id.** Middleware binds it for each `/api/orgs/{id}/…`
+  request, and the job runner binds it around each job.
+- **A filter on the handler copies it onto each record** as `%(workspace_id)s`. It goes
+  on the handler, not a logger, so records from `dgml_core.extraction` and the other child
+  loggers get it too.
+- **The id follows the work:** into the thread a sync endpoint runs on, into a job (the
+  runner copies the submitting context), and into dgml-core's own worker threads.
+
+Any other id, such as a request id, can be added the same way.
+
 ### Errors
 
 DGML errors map to HTTP **by class**, never by message: `NotFoundError` → 404,

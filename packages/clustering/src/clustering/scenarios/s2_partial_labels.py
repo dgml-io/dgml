@@ -24,13 +24,14 @@ from typing import ClassVar
 
 import torch
 
+from clustering.config.schema import ScenarioName
 from clustering.data.datasets import DocumentDataset
 from clustering.scenarios.base import UNKNOWN_NOISE_LABEL, Scenario, ScenarioResult
 from clustering.scenarios.clustering import assign_to_prototypes, cluster_emergent_bucket
 
 
 class S2PartialLabels(Scenario):
-    name = "s2"
+    name = ScenarioName.S2
 
     PROMPT_TEMPLATE: ClassVar[str] = "a scanned document of category: {category}"
 

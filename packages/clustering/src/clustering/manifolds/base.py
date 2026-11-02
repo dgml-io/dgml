@@ -27,7 +27,7 @@ from collections.abc import Callable
 import torch
 from torch import nn
 
-from clustering.config.schema import ManifoldConfig
+from clustering.config.schema import ManifoldConfig, ManifoldName
 
 
 class ManifoldHead(nn.Module, ABC):
@@ -111,13 +111,13 @@ class ManifoldHead(nn.Module, ABC):
 
 # ── Registry ─────────────────────────────────────────────────────────────
 ManifoldFactory = Callable[..., ManifoldHead]
-_REGISTRY: dict[str, ManifoldFactory] = {}
+_REGISTRY: dict[ManifoldName, ManifoldFactory] = {}
 
 
-def register_manifold(name: str) -> Callable[[ManifoldFactory], ManifoldFactory]:
+def register_manifold(name: ManifoldName) -> Callable[[ManifoldFactory], ManifoldFactory]:
     def deco(fn: ManifoldFactory) -> ManifoldFactory:
         if name in _REGISTRY:
-            raise ValueError(f"Manifold {name!r} is already registered.")
+            raise ValueError(f"Manifold '{name}' is already registered.")
         _REGISTRY[name] = fn
         return fn
 
@@ -126,9 +126,11 @@ def register_manifold(name: str) -> Callable[[ManifoldFactory], ManifoldFactory]
 
 def build_manifold(cfg: ManifoldConfig) -> ManifoldHead:
     if cfg.name not in _REGISTRY:
-        raise KeyError(f"Unknown manifold {cfg.name!r}. Registered: {sorted(_REGISTRY)}")
+        raise KeyError(
+            f"Unknown manifold '{cfg.name}'. Registered: {sorted(str(n) for n in _REGISTRY)}"
+        )
     return _REGISTRY[cfg.name](cfg)
 
 
-def registered_manifolds() -> list[str]:
+def registered_manifolds() -> list[ManifoldName]:
     return sorted(_REGISTRY)

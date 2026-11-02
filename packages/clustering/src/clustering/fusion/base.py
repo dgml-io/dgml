@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from clustering.config.schema import FusionConfig
+from clustering.config.schema import FusionConfig, FusionName
 from clustering.encoders.base import EncoderOutput
 
 
@@ -54,15 +54,15 @@ class Fusion(nn.Module, ABC):
 
 
 FusionFactory = Callable[..., Fusion]
-_REGISTRY: dict[str, FusionFactory] = {}
+_REGISTRY: dict[FusionName, FusionFactory] = {}
 
 
-def register_fusion(name: str) -> Callable[[FusionFactory], FusionFactory]:
+def register_fusion(name: FusionName) -> Callable[[FusionFactory], FusionFactory]:
     """Decorator: register a fusion factory under ``name``."""
 
     def deco(fn: FusionFactory) -> FusionFactory:
         if name in _REGISTRY:
-            raise ValueError(f"Fusion {name!r} is already registered.")
+            raise ValueError(f"Fusion '{name}' is already registered.")
         _REGISTRY[name] = fn
         return fn
 
@@ -83,11 +83,13 @@ def build_fusion(
         image_dim: Output dim of the image encoder.
     """
     if cfg.name not in _REGISTRY:
-        raise KeyError(f"Unknown fusion {cfg.name!r}. Registered: {sorted(_REGISTRY)}")
+        raise KeyError(
+            f"Unknown fusion '{cfg.name}'. Registered: {sorted(str(n) for n in _REGISTRY)}"
+        )
     return _REGISTRY[cfg.name](cfg, text_dim=text_dim, image_dim=image_dim)
 
 
-def registered_fusions() -> list[str]:
+def registered_fusions() -> list[FusionName]:
     return sorted(_REGISTRY)
 
 

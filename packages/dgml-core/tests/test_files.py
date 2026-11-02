@@ -21,16 +21,18 @@ from typing import Any, ClassVar
 
 import pytest
 from dgml_core import layout
-from dgml_core.conversion import ConverterConfig, DocConverter
+from dgml_core.conversion import ConverterConfig, DocConverter, FormatFamily
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
     ConflictError,
+    ConversionConfigInvalid,
     FileNotFound,
     InvalidArgument,
     InvalidPDF,
     UnsupportedFileType,
 )
-from dgml_core.files import ConflictPolicy, FileStore
+from dgml_core.files import ConflictKind, ConflictPolicy, FileStore
+from dgml_core.ocr import _image_dimensions
 from dgml_core.storage import Workspace
 
 from .conftest import needs_gs
@@ -43,10 +45,11 @@ def store(workspace: Workspace) -> FileStore:
 
 class _StubDocxConverter(DocConverter):
     """Returns deterministic bytes so persistence can be asserted without a
-    real converter binary."""
+    real converter binary. Declares the suffixes the tests feed it, so every add
+    goes through the ``input_formats`` check with a restricted set."""
 
     name: ClassVar[str] = "stub-docx"
-    input_formats: ClassVar[frozenset[str]] = frozenset({".docx"})
+    input_formats: ClassVar[frozenset[str]] = frozenset({".docx", ".pptx"})
     config_fields: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod
@@ -67,36 +70,238 @@ sys.modules["files_stub_conv"] = _stub_mod
 _STUB_DOCX = "files_stub_conv:_StubDocxConverter"
 
 
+@pytest.mark.parametrize(
+    ("family", "filename"),
+    [(FormatFamily.DOCX, "foo.docx"), (FormatFamily.PPTX, "foo.pptx")],
+)
 def test_convertible_source_persists_converted_pdf(
-    store: FileStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: FileStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: FormatFamily,
+    filename: str,
 ) -> None:
     """A convertible source is stored as-is and its converted PDF is persisted
     alongside it at ``<stem>.pdf`` (the artifact generation later reuses)."""
     from .conftest import write_config
 
-    write_config(store.ws, {"conversion": {"docx": {"provider": _STUB_DOCX}}})
+    write_config(store.ws, {"conversion": {family: {"provider": _STUB_DOCX}}})
     # The PDF-only post-steps need ghostscript / pdfminer; stub them out so the
     # test isolates the conversion-persistence behavior.
     monkeypatch.setattr(FileStore, "_safe_page_count", lambda self, *a, **k: (None, None))
     monkeypatch.setattr(FileStore, "_render_pages", lambda self, *a, **k: None)
     monkeypatch.setattr(FileStore, "_extract_text", lambda self, *a, **k: (None, None))
 
-    src = tmp_path / "foo.docx"
-    src.write_bytes(b"original docx bytes")
+    src = tmp_path / filename
+    src.write_bytes(b"original source bytes")
     result = store.add(src)
 
     assert result.conversion_error is None
-    assert result.record.original_filename == "foo.docx"
+    assert result.record.original_filename == filename
     # original preserved + converted PDF persisted, both as blobs under the file
     assert (
-        store.ws.blobs.get_blob(layout.file_source_key(result.record.id, "foo.docx"))
-        == b"original docx bytes"
+        store.ws.blobs.get_blob(layout.file_source_key(result.record.id, filename))
+        == b"original source bytes"
     )
     assert (
         store.ws.blobs.get_blob(layout.file_source_key(result.record.id, "foo.pdf"))
-        == b"%PDF-stub:foo.docx"
+        == b"%PDF-stub:" + filename.encode()
     )
     assert result.record.pdf_converter == "stub-docx"  # converter named on the record
+
+
+def test_supplied_converted_pdf_needs_no_converter(
+    store: FileStore, tmp_path: Path, text_pdf: Path
+) -> None:
+    """A caller-supplied PDF is stored as the source's PDF and drives the rest of
+    the add, with no converter configured for the family."""
+    from .conftest import write_config
+
+    # PDFium renders without ghostscript, so this runs the real post-steps.
+    write_config(store.ws, {"pdf": {"provider": "pypdfium2"}})
+    src = tmp_path / "deck.docx"
+    src.write_bytes(b"original docx bytes")
+
+    result = store.add(src, converted_pdf=text_pdf)
+
+    assert result.conversion_error is None
+    assert result.record.pdf_converter is None  # nothing was converted: a supplied PDF
+    assert result.record.page_count == 2
+    assert len(_page_images(store.ws, result.record.id)) == 2
+    fid = result.record.id
+    assert store.ws.blobs.get_blob(layout.file_source_key(fid, "deck.docx")) == (
+        b"original docx bytes"
+    )
+    assert store.ws.blobs.get_blob(layout.file_pdf_key(fid, "deck.docx")) == text_pdf.read_bytes()
+
+
+@pytest.fixture
+def no_pdf_post_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub out page count, render and text extraction (they need ghostscript /
+    pdfminer), for tests about which PDF gets stored."""
+    monkeypatch.setattr(FileStore, "_safe_page_count", lambda self, *a, **k: (None, None))
+    monkeypatch.setattr(FileStore, "_render_pages", lambda self, *a, **k: None)
+    monkeypatch.setattr(FileStore, "_extract_text", lambda self, *a, **k: (None, None))
+
+
+@pytest.mark.usefixtures("no_pdf_post_steps")
+def test_supplied_converted_pdf_is_used_over_a_configured_converter(
+    store: FileStore, tmp_path: Path, sample_pdf: Path
+) -> None:
+    from .conftest import write_config
+
+    write_config(store.ws, {"conversion": {"docx": {"provider": _STUB_DOCX}}})
+    src = tmp_path / "foo.docx"
+    src.write_bytes(b"original docx bytes")
+
+    result = store.add(src, converted_pdf=sample_pdf)
+
+    assert result.record.pdf_converter is None  # nothing was converted: a supplied PDF
+    pdf_key = layout.file_pdf_key(result.record.id, "foo.docx")
+    assert store.ws.blobs.get_blob(pdf_key) == sample_pdf.read_bytes()
+
+
+@pytest.mark.usefixtures("no_pdf_post_steps")
+def test_replace_of_identical_content_says_the_supplied_pdf_was_not_used(
+    store: FileStore, tmp_path: Path, sample_pdf: Path, sample_pdf_alt: Path
+) -> None:
+    src = tmp_path / "deck.docx"
+    src.write_bytes(b"original docx bytes")
+    first = store.add(src, converted_pdf=sample_pdf)
+
+    again = store.add(src, converted_pdf=sample_pdf_alt, on_conflict=ConflictPolicy.REPLACE)
+
+    assert again.created is False
+    assert again.record.id == first.record.id
+    assert again.note is not None and "converted_pdf was not used" in again.note
+    pdf_key = layout.file_pdf_key(first.record.id, "deck.docx")
+    assert store.ws.blobs.get_blob(pdf_key) == sample_pdf.read_bytes()
+
+
+@pytest.mark.usefixtures("no_pdf_post_steps")
+def test_replace_keeps_a_supplied_pdf_stored_under_the_record_it_deletes(
+    store: FileStore, tmp_path: Path, sample_pdf: Path
+) -> None:
+    """`replace` deletes the old record before writing the new one; a supplied PDF
+    that lives under the old record must still reach the new one."""
+    src = tmp_path / "deck.docx"
+    src.write_bytes(b"first version")
+    old = store.add(src, converted_pdf=sample_pdf)
+    stored_pdf = store.ws.root / layout.file_pdf_key(old.record.id, "deck.docx")
+    assert stored_pdf.is_file()
+
+    src.write_bytes(b"second version")  # same path, new content: a path conflict
+    new = store.add(src, converted_pdf=stored_pdf, on_conflict=ConflictPolicy.REPLACE)
+
+    assert new.created is True
+    assert [r.id for r in store.list_all()] == [new.record.id]
+    pdf_key = layout.file_pdf_key(new.record.id, "deck.docx")
+    assert store.ws.blobs.get_blob(pdf_key) == sample_pdf.read_bytes()
+
+
+@pytest.mark.usefixtures("no_pdf_post_steps")
+def test_skip_says_the_supplied_pdf_was_not_used(
+    store: FileStore, tmp_path: Path, sample_pdf: Path, sample_pdf_alt: Path
+) -> None:
+    """Both `skip` outcomes — identical content, or the same path with new
+    content — return the existing record, so a supplied PDF is unused either way."""
+    src = tmp_path / "deck.docx"
+    src.write_bytes(b"original docx bytes")
+    first = store.add(src, converted_pdf=sample_pdf)
+    pdf_key = layout.file_pdf_key(first.record.id, "deck.docx")
+
+    same = store.add(src, converted_pdf=sample_pdf_alt, on_conflict=ConflictPolicy.SKIP)
+    assert same.record.id == first.record.id
+    assert same.conflict_kind == "hash"
+    assert same.note is not None and "converted_pdf was not used" in same.note
+
+    src.write_bytes(b"edited docx bytes")
+    same_path = store.add(src, converted_pdf=sample_pdf_alt, on_conflict=ConflictPolicy.SKIP)
+    assert same_path.record.id == first.record.id
+    assert same_path.conflict_kind == "path"
+    assert same_path.note is not None and "converted_pdf was not used" in same_path.note
+
+    assert store.ws.blobs.get_blob(pdf_key) == sample_pdf.read_bytes()
+
+
+@pytest.mark.usefixtures("no_pdf_post_steps")
+def test_duplicate_stores_the_supplied_pdf_under_the_new_record(
+    store: FileStore, tmp_path: Path, sample_pdf: Path, sample_pdf_alt: Path
+) -> None:
+    src = tmp_path / "deck.docx"
+    src.write_bytes(b"original docx bytes")
+    first = store.add(src, converted_pdf=sample_pdf)
+
+    second = store.add(src, converted_pdf=sample_pdf_alt, on_conflict=ConflictPolicy.DUPLICATE)
+
+    assert second.created is True
+    assert second.record.id != first.record.id
+    assert second.record.pdf_converter is None
+    assert second.note is None
+    first_pdf = layout.file_pdf_key(first.record.id, "deck.docx")
+    second_pdf = layout.file_pdf_key(second.record.id, "deck.docx")
+    assert store.ws.blobs.get_blob(first_pdf) == sample_pdf.read_bytes()
+    assert store.ws.blobs.get_blob(second_pdf) == sample_pdf_alt.read_bytes()
+
+
+def test_supplied_pdf_is_named_in_the_exported_attestation(
+    store: FileStore, tmp_path: Path, text_pdf: Path
+) -> None:
+    """The bundle's attestation names no converter for a supplied PDF: with a
+    convertible source, that absence is what tells a verifier DGML converted nothing
+    (every converter DGML runs is named)."""
+    from dgml_core.file_attestation import (
+        ATTESTATION_NS,
+        METADATA_DIRNAME,
+        METADATA_FILENAME,
+        export_attestation,
+    )
+    from lxml import etree  # type: ignore[import-untyped]
+
+    from .conftest import write_config
+
+    write_config(store.ws, {"pdf": {"provider": "pypdfium2"}})
+    src = tmp_path / "deck.docx"
+    src.write_bytes(b"original docx bytes")
+    result = store.add(src, converted_pdf=text_pdf)
+
+    out_dir = tmp_path / "bundle"
+    export_attestation(store.ws, result.record.id, out_dir, None, unpacked=True)
+
+    root_el = etree.parse(str(out_dir / METADATA_DIRNAME / METADATA_FILENAME)).getroot()
+    assert root_el.tag == f"{{{ATTESTATION_NS}}}dgml-attestation"
+    assert root_el.get("pdf-converter") is None
+    assert root_el.find(f"{{{ATTESTATION_NS}}}artifacts/{{{ATTESTATION_NS}}}source") is not None
+
+
+@pytest.mark.parametrize(
+    ("source_name", "converted_name", "converted_bytes", "error"),
+    [
+        ("doc.pdf", "doc-copy.pdf", b"%PDF-1.4", InvalidArgument),  # source is a PDF already
+        ("doc.docx", "missing.pdf", None, FileNotFound),
+        ("doc.docx", "fake.pdf", b"not a pdf", InvalidPDF),
+        # The source's type is checked before the PDF: the missing PDF isn't reported.
+        ("notes.txt", "missing.pdf", None, UnsupportedFileType),
+    ],
+)
+def test_supplied_converted_pdf_rejected_before_any_write(
+    store: FileStore,
+    tmp_path: Path,
+    source_name: str,
+    converted_name: str,
+    converted_bytes: bytes | None,
+    error: type[Exception],
+) -> None:
+    src = tmp_path / source_name
+    src.write_bytes(b"%PDF-1.4 source")
+    converted = tmp_path / converted_name
+    if converted_bytes is not None:
+        converted.write_bytes(converted_bytes)
+
+    with pytest.raises(error):
+        store.add(src, converted_pdf=converted)
+    assert store.list_all() == []
+    assert store.ws.blobs.list_blobs(f"{layout.FILES_DIR}/") == []
 
 
 @needs_gs
@@ -111,7 +316,7 @@ def test_add_pdf(store: FileStore, sample_pdf: Path) -> None:
     assert result.record.page_image_dpi == 300
     assert result.record.page_image_renderer == "ghostscript"
     assert result.record.pdf_converter is None
-    pages = _page_pngs(store.ws, result.record.id)
+    pages = _page_images(store.ws, result.record.id)
     assert len(pages) == 2
 
 
@@ -125,7 +330,7 @@ def test_add_pdf_with_pypdfium2_renderer(store: FileStore, sample_pdf: Path) -> 
     assert result.created
     assert result.page_render_error is None
     assert result.record.page_image_renderer == "pypdfium2"
-    assert len(_page_pngs(store.ws, result.record.id)) == 2
+    assert len(_page_images(store.ws, result.record.id)) == 2
 
 
 @needs_gs
@@ -133,27 +338,25 @@ def test_add_pdf_custom_dpi_is_rendered_and_recorded(store: FileStore, sample_pd
     result = store.add(sample_pdf, dpi=150)
     assert result.page_render_error is None
     assert result.record.page_image_dpi == 150
-    pages = _page_pngs(store.ws, result.record.id)
+    pages = _page_images(store.ws, result.record.id)
     assert len(pages) == 2
     # The record has to describe the pixels actually on disk, since `dgml check`
     # reproduces this geometry when it repairs the file later.
-    width, height = _png_size(store.ws.blobs.get_blob(pages[0]))
+    width, height = _image_dimensions(store.ws.blobs.get_blob(pages[0]))
     at_300 = store.add(sample_pdf, on_conflict=ConflictPolicy.DUPLICATE)
-    w300, h300 = _png_size(store.ws.blobs.get_blob(_page_pngs(store.ws, at_300.record.id)[0]))
+    w300, h300 = _image_dimensions(
+        store.ws.blobs.get_blob(_page_images(store.ws, at_300.record.id)[0])
+    )
     assert width < w300 and height < h300
 
 
-def _png_size(data: bytes) -> tuple[int, int]:
-    """Width/height from a PNG's IHDR — avoids depending on an image library."""
-    header = data[16:24]
-    return int.from_bytes(header[:4], "big"), int.from_bytes(header[4:], "big")
-
-
-def _page_pngs(ws: Workspace, file_id: str) -> list[str]:
+def _page_images(ws: Workspace, file_id: str) -> list[str]:
     """Sorted page-image blob keys for ``file_id`` (store analogue of globbing
-    page_*.png in the page-images dir)."""
+    page_*.{jpg,png} in the page-images dir)."""
     return sorted(
-        k for k in ws.blobs.list_blobs(layout.file_pages_prefix(file_id)) if k.endswith(".png")
+        k
+        for k in ws.blobs.list_blobs(layout.file_pages_prefix(file_id))
+        if k.endswith((".jpg", ".png"))
     )
 
 
@@ -189,6 +392,32 @@ def test_reject_non_pdf(store: FileStore, tmp_path: Path) -> None:
         store.add(bad)
 
 
+def test_reject_family_pointed_at_a_converter_that_cannot_handle_it(
+    store: FileStore, tmp_path: Path
+) -> None:
+    """A converter whose ``input_formats`` excludes the family's suffix is a config
+    error, refused before any write — not a per-file ``conversion_error``."""
+    from .conftest import write_config
+
+    # The stub handles .docx/.pptx; configured here for spreadsheets.
+    write_config(store.ws, {"conversion": {FormatFamily.XLSX: {"provider": _STUB_DOCX}}})
+    book = tmp_path / "book.xlsx"
+    book.write_bytes(b"PK\x03\x04 not really a workbook")
+    with pytest.raises(ConversionConfigInvalid, match=r"does not handle '\.xlsx'"):
+        store.add(book)
+    assert store.list_all() == []
+    assert store.ws.blobs.list_blobs(f"{layout.FILES_DIR}/") == []
+
+
+def test_reject_convertible_source_without_converter(store: FileStore, tmp_path: Path) -> None:
+    """A known convertible format with no converter configured is rejected as
+    unconfigured, not as an unknown file type."""
+    deck = tmp_path / "deck.pptx"
+    deck.write_bytes(b"PK\x03\x04 not really a pptx")
+    with pytest.raises(UnsupportedFileType, match=r"conversion\.pptx\.provider"):
+        store.add(deck)
+
+
 def test_reject_invalid_magic(store: FileStore, tmp_path: Path) -> None:
     bad = tmp_path / "fake.pdf"
     bad.write_bytes(b"NOT A PDF")
@@ -215,7 +444,7 @@ def test_conflict_hash_skip_returns_existing(store: FileStore, sample_pdf: Path)
     second = store.add(sample_pdf, on_conflict=ConflictPolicy.SKIP)
     assert second.record.id == first.record.id
     assert not second.created
-    assert second.conflict_kind == "hash"
+    assert second.conflict_kind is ConflictKind.HASH
 
 
 @needs_gs
@@ -505,6 +734,7 @@ def test_free_id_honoured_when_replace_swaps_path(
     shutil.copy2(sample_pdf_alt, sample_pdf)
     second = store.add(sample_pdf, file_id="rev-2", on_conflict=ConflictPolicy.REPLACE)
     assert second.created
+    assert second.conflict_kind is ConflictKind.PATH
     assert second.record.id == "rev-2"
     assert {r.id for r in store.list_all()} == {"rev-2"}
 

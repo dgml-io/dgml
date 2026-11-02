@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from clustering.config.schema import LoggerName
 from clustering.logging_.base import Logger
 
 WandbMode = Literal["online", "offline", "disabled", "shared"]
@@ -31,7 +32,7 @@ _VALID_WANDB_MODES: frozenset[str] = frozenset(("online", "offline", "disabled",
 
 
 class WandbLogger(Logger):
-    name = "wandb"
+    name = LoggerName.WANDB
 
     def __init__(
         self,

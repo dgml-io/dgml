@@ -36,14 +36,15 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from . import layout, llm
+from . import llm
 from .concurrency import map_concurrent
 from .errors import short_error_message
 from .generation.transcribe import strip_fences
 from .storage import Workspace
 from .storage_service import BlobStore
 from .style import ALLOWED, merge_styles, validate_style
-from .usage import OPERATION_STYLE_ANNOTATE
+from .usage import UsageOperation
+from .utils import page_image_key
 
 if TYPE_CHECKING:
     from .batch import BatchExecutor
@@ -193,8 +194,8 @@ def prepare_style_jobs(
     # fan-out that follows is over nothing but self-contained work items.
     jobs: list[_PageJob] = []
     for page, pairs in by_page.items():
-        image_key = layout.file_page_image_key(file_id, page)
-        if not workspace.blobs.blob_exists(image_key):
+        image_key = page_image_key(workspace, file_id, page)
+        if image_key is None:
             continue
         capped = pairs[:_MAX_SNIPPETS_PER_PAGE]
         jobs.append(
@@ -212,7 +213,7 @@ def prepare_style_jobs(
                     config,
                     workspace=workspace,
                     record_usage=record_usage,
-                    operation=OPERATION_STYLE_ANNOTATE,
+                    operation=UsageOperation.STYLE_ANNOTATE,
                     context={"file_id": file_id, "page": page},
                 ),
             )
@@ -280,12 +281,14 @@ def style_batch_executor(
     it. Raises :class:`~dgml_core.errors.BatchUnavailable` when the provider
     has no batch backend. Imports the batch package lazily."""
     from .batch import make_executor
+    from .batch.jobs import credential_ref
     from .style_config import resolve_api_key
 
     return make_executor(
         config.model,
         api_key=resolve_api_key(config),
         api_base=config.api_base,
+        credential=credential_ref("style", "model", config.api_key_env),
         poll_interval_s=poll_interval_s,
         max_poll_s=max_poll_s,
         min_wave_size=min_wave_size,

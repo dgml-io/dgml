@@ -35,7 +35,7 @@ from dgml_core.batch import registry as batch_registry
 from dgml_core.batch.compat import IncompatibleDependency, require_supported_litellm
 from dgml_core.errors import BatchUnavailable
 
-_MODEL = "anthropic/claude-haiku-4-5"
+_MODEL = "anthropic/claude-haiku-5-5"
 
 
 @pytest.fixture
@@ -102,3 +102,23 @@ def test_the_builtin_anthropic_backend_rejects_an_unsupported_litellm(
         assert_batchable({"transcribe": _MODEL})
     with pytest.raises(BatchUnavailable, match=r"litellm 1\.99\.0 is installed"):
         resolve_backend(_MODEL, api_key="k")
+
+
+def test_the_builtin_gemini_backend_rejects_an_unsupported_litellm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(compat_mod, "litellm_version", lambda: "1.99.0")
+    with pytest.raises(BatchUnavailable, match=r"litellm 1\.99\.0 is installed"):
+        assert_batchable({"classification": "gemini/gemini-3.5-flash-lite"})
+    with pytest.raises(BatchUnavailable, match=r"litellm 1\.99\.0 is installed"):
+        resolve_backend("gemini/gemini-3.5-flash-lite", api_key="k")
+
+
+def test_the_builtin_openai_backend_rejects_an_unsupported_litellm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(compat_mod, "litellm_version", lambda: "1.99.0")
+    with pytest.raises(BatchUnavailable, match=r"litellm 1\.99\.0 is installed"):
+        assert_batchable({"transcribe": "openai/gpt-4.1-mini"})
+    with pytest.raises(BatchUnavailable, match=r"litellm 1\.99\.0 is installed"):
+        resolve_backend("openai/gpt-4.1-mini", api_key="k")

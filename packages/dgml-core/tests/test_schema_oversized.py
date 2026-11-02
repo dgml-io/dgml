@@ -33,6 +33,7 @@ from unittest.mock import patch
 
 import pytest
 from dgml_core import layout
+from dgml_core.batch import ItemErrorKind
 from dgml_core.errors import SchemaGenerationFailed
 from dgml_core.grounded import GroundedConfig, generate_schema
 from dgml_core.models import FileRecord
@@ -168,6 +169,41 @@ def test_oversized_samples_are_trimmed_not_dropped(
     assert re.search(rf"sample 2 .*pages 1-{len(pages)} of 8", note, re.IGNORECASE)
     assert "3 attached PDFs" in note
     assert "fbig00000000" in caplog.text
+
+
+def test_oversized_samples_are_trimmed_under_batch_like_sync(
+    workspace: Workspace, samples: dict[str, bytes]
+) -> None:
+    """Under a batch driver the too-large request comes back ``invalid``, runs
+    synchronously, and its 413 trims the samples exactly as the sync path does."""
+    from dgml_core.batch import BatchExecutor, BatchItemError, BatchRequest, FakeBackend
+    from dgml_core.grounded import generate_schema_batch
+
+    ids = list(samples)
+    with patch("litellm.completion", side_effect=_rejecting(_LIMIT)) as m:
+        sync = generate_schema(workspace, ids, config=_config(), docset_name="Leases")
+    sync_retry = m.call_args_list[1].kwargs
+
+    sent: list[dict[str, Any]] = []
+
+    def script(req: BatchRequest) -> Any:
+        sent.append(req.kwargs)
+        if len(json.dumps(req.kwargs["messages"]).encode()) > _LIMIT:
+            return BatchItemError(req.custom_id, ItemErrorKind.INVALID, "request_too_large")
+        return _schema_response()
+
+    executor = BatchExecutor(FakeBackend(script), min_wave_size=1, sleep=lambda _s: None)
+    with patch("litellm.completion", side_effect=_rejecting(_LIMIT)):
+        batch = generate_schema_batch(
+            workspace, ids, config=_config(), docset_name="Leases", executor=executor
+        )
+    assert batch == sync
+    # Refused whole (then run synchronously, refused again), accepted trimmed.
+    assert executor.stats.sync_fallbacks == 1 and executor.stats.batch_ok == 1
+    # The same samples, cut to the same pages (PDFium stamps each slice's date).
+    assert [_pages_in(p) for p in _attached_pdfs(sent[-1])] == [
+        _pages_in(p) for p in _attached_pdfs(sync_retry)
+    ]
 
 
 def test_sample_whose_first_page_does_not_fit_is_dropped(

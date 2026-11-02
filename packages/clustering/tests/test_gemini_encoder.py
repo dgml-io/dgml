@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 import torch
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.caching import encoder_fingerprint
 from clustering.encoders.gemini import GeminiEncoder
 from litellm.exceptions import AuthenticationError, RateLimitError
@@ -29,7 +29,7 @@ MODEL = "gemini/gemini-embedding-001"
 
 def _cfg(*, max_length: int | None = None, **extra: Any) -> EncoderConfig:
     return EncoderConfig(
-        name="gemini",
+        name=EncoderName.GEMINI,
         model_id=MODEL,
         embedding_dim=3,
         max_length=max_length,
@@ -193,7 +193,9 @@ def test_gemini_without_a_key_defers_to_litellm(monkeypatch: pytest.MonkeyPatch)
     # No key in extra and none in the env is not an error: litellm resolves
     # credentials itself (GOOGLE_API_KEY, Vertex ADC, ...), so failing here
     # would break setups that work.
-    enc = GeminiEncoder(EncoderConfig(name="gemini", model_id=MODEL, embedding_dim=3, extra={}))
+    enc = GeminiEncoder(
+        EncoderConfig(name=EncoderName.GEMINI, model_id=MODEL, embedding_dim=3, extra={})
+    )
     assert enc.api_key is None
     enc.encode(["a"])
     assert calls[0]["api_key"] is None
@@ -202,7 +204,7 @@ def test_gemini_without_a_key_defers_to_litellm(monkeypatch: pytest.MonkeyPatch)
 def test_gemini_reads_the_key_from_the_named_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MY_GEMINI_KEY", "from-env")
     cfg = EncoderConfig(
-        name="gemini",
+        name=EncoderName.GEMINI,
         model_id=MODEL,
         embedding_dim=3,
         extra={"api_key_env": "MY_GEMINI_KEY"},
@@ -233,7 +235,7 @@ def test_api_key_does_not_namespace_the_embedding_cache() -> None:
     """Rotating a key must not orphan the vectors it already paid for."""
 
     def cfg(**extra: Any) -> EncoderConfig:
-        return EncoderConfig(name="gemini", model_id=MODEL, embedding_dim=3, extra=extra)
+        return EncoderConfig(name=EncoderName.GEMINI, model_id=MODEL, embedding_dim=3, extra=extra)
 
     key_a = cfg(batch_size=4, api_key="aaa")
     assert encoder_fingerprint(key_a) == encoder_fingerprint(cfg(batch_size=4, api_key="bbb"))

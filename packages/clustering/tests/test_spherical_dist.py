@@ -23,7 +23,7 @@ parity fix ported from doc-categorization.
 from __future__ import annotations
 
 import torch
-from clustering.config.schema import ManifoldConfig
+from clustering.config.schema import ManifoldConfig, ManifoldName
 from clustering.manifolds import build_manifold
 
 
@@ -35,7 +35,7 @@ def test_spherical_dist_invariant_under_radial_scaling() -> None:
     them — independent of magnitude. The defensive normalize makes this
     hold for any positive scaling.
     """
-    m = build_manifold(ManifoldConfig(name="spherical", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.SPHERICAL, dim=8, curvature=1.0))
     torch.manual_seed(0)
     x = torch.randn(5, 8)
     y = torch.randn(5, 8)
@@ -58,7 +58,7 @@ def test_spherical_dist_handles_unnormalized_raw_inputs() -> None:
     of going through ``expmap0`` first), the answer must still equal
     the geodesic distance between the corresponding sphere points.
     """
-    m = build_manifold(ManifoldConfig(name="spherical", dim=8, curvature=1.0))
+    m = build_manifold(ManifoldConfig(name=ManifoldName.SPHERICAL, dim=8, curvature=1.0))
     torch.manual_seed(1)
     x_raw = torch.randn(4, 8) * 5.0  # large ambient magnitudes — definitely off-sphere
     y_raw = torch.randn(4, 8) * 0.01  # very small magnitudes

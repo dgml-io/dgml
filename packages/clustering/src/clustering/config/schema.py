@@ -18,53 +18,245 @@ are frozen (immutable) and forbid extra fields so typos become loud errors.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# ── Enum-like literals (also used as ClearML / W&B tags) ─────────────────
-FusionName = Literal["none", "concat_norm", "late_concat", "cross_attention", "gated"]
-ManifoldName = Literal["euclidean", "spherical", "hyperbolic", "product"]
-ScenarioName = Literal["s1", "s2", "s3", "s4", "s5"]
-# How the few-shot / supervised scenarios (S3, S5) pick which support samples
-# build each category prototype when a category has more than ``n_shots``:
-# ``order`` keeps the first ``n_shots`` in dataset order (today's behaviour);
-# ``central`` keeps the ``n_shots`` nearest the category mean (the most typical),
-# a measured win over ``order`` when support is capped, largest at low shot counts.
-SupportSelection = Literal["order", "central"]
-# Text-encoder names that share the SentenceTransformer adapter — the
-# instruction-tuned / Matryoshka / MTEB-frontier crew (E5, BGE, GTE,
-# Stella, Jina v3). Distinct registry names rather than a single
-# "sentence_transformers" entry so each gets its own Hydra config file
-# with the model's canonical prefix templates, default model_id, etc.
-EncoderName = Literal[
-    "dummy",
-    "st_minilm",
-    "e5",
-    "bge",
-    "gte",
-    "stella",
-    "jina",
-    "gemini",
-    "openai",
-    "tfidf",
-    "dit",
-    "vit",
-    "donut",
-    "qwen_vl",
-    "qwen3_vl_embedding",
-    "qwen3_vl_embedding_2b",
-]
-LoggerName = Literal["none", "clearml", "wandb", "multi"]
-LossName = Literal[
-    "contrastive",
-    "triplet",
-    "prototypical",
-    "pseudo_label",
-    "knn_contrastive",
-    "cross_modal",
-]
+# ── Closed value sets ─────────────────────────────────────────────────────
+# Every closed-set config value is a ``StrEnum``: a member *is* a ``str``, so
+# configs keep their plain-string wire format (YAML / dict / JSON input parses
+# into members; ``model_dump(mode="json")`` and f-strings emit the bare value,
+# which is what the ClearML / W&B tags and the ``run_id`` hash see). They live
+# here, in the package's lowest-level module, so the scenario / calibration /
+# consolidation code imports them from one place without an import cycle.
+
+
+class FusionName(StrEnum):
+    """A registered fusion module (``fusion.name``) — how the text and image
+    embeddings of one document are combined into a single vector."""
+
+    NONE = "none"
+    CONCAT_NORM = "concat_norm"
+    LATE_CONCAT = "late_concat"
+    CROSS_ATTENTION = "cross_attention"
+    GATED = "gated"
+
+
+class ManifoldName(StrEnum):
+    """A registered representation manifold (``manifold.name``). ``PRODUCT`` is a
+    Cartesian product of the other three, so it is not valid as one of its own
+    ``components``."""
+
+    EUCLIDEAN = "euclidean"
+    SPHERICAL = "spherical"
+    HYPERBOLIC = "hyperbolic"
+    PRODUCT = "product"
+
+
+class ScenarioName(StrEnum):
+    """A labelling regime (``scenario.name``): ``S1`` unsupervised, ``S2`` partial
+    labels, ``S3`` partial few-shot, ``S4`` zero-shot, ``S5`` fully supervised."""
+
+    S1 = "s1"
+    S2 = "s2"
+    S3 = "s3"
+    S4 = "s4"
+    S5 = "s5"
+
+
+class SupportSelection(StrEnum):
+    """How the few-shot / supervised scenarios (S3, S5) pick which support samples
+    build each category prototype when a category has more than ``n_shots``.
+
+    ``ORDER`` keeps the first ``n_shots`` in dataset order (today's behaviour);
+    ``CENTRAL`` keeps the ``n_shots`` nearest the category mean (the most typical),
+    a measured win over ``ORDER`` when support is capped, largest at low shot
+    counts."""
+
+    ORDER = "order"
+    CENTRAL = "central"
+
+
+class EncoderName(StrEnum):
+    """A registered encoder (``encoder_text.name`` / ``encoder_image.name``).
+
+    The SentenceTransformer-backed text encoders (E5, BGE, GTE, Stella, Jina v3 —
+    the instruction-tuned / Matryoshka / MTEB-frontier crew) share one adapter but
+    have distinct names rather than a single ``sentence_transformers`` entry, so
+    each gets its own Hydra config file with the model's canonical prefix
+    templates, default ``model_id``, etc."""
+
+    DUMMY = "dummy"
+    ST_MINILM = "st_minilm"
+    E5 = "e5"
+    BGE = "bge"
+    GTE = "gte"
+    STELLA = "stella"
+    JINA = "jina"
+    GEMINI = "gemini"
+    OPENAI = "openai"
+    TFIDF = "tfidf"
+    DIT = "dit"
+    VIT = "vit"
+    DONUT = "donut"
+    QWEN_VL = "qwen_vl"
+    QWEN3_VL_EMBEDDING = "qwen3_vl_embedding"
+    QWEN3_VL_EMBEDDING_2B = "qwen3_vl_embedding_2b"
+
+
+class LoggerName(StrEnum):
+    """An experiment-tracking backend (``logger.name``). ``MULTI`` fans out to every
+    backend that initializes; ``NONE`` logs nothing."""
+
+    NONE = "none"
+    CLEARML = "clearml"
+    WANDB = "wandb"
+    MULTI = "multi"
+
+
+class LossName(StrEnum):
+    """A projector training loss (``training.loss``). The first three consume
+    corpus labels; the rest are :data:`UNSUPERVISED_LOSSES`."""
+
+    CONTRASTIVE = "contrastive"
+    TRIPLET = "triplet"
+    PROTOTYPICAL = "prototypical"
+    PSEUDO_LABEL = "pseudo_label"
+    KNN_CONTRASTIVE = "knn_contrastive"
+    CROSS_MODAL = "cross_modal"
+
+
+class Modality(StrEnum):
+    """One side of a document's embedding: its rendered page image or its text."""
+
+    IMAGE = "image"
+    TEXT = "text"
+
+
+class CalibrationMethod(StrEnum):
+    """Post-hoc confidence calibrator (``scenario.calibration.method``). ``NONE``
+    reports the ordinal softmax peak unchanged; ``TEMPERATURE`` / ``PLATT`` are
+    fit on the labelled support set."""
+
+    NONE = "none"
+    TEMPERATURE = "temperature"
+    PLATT = "platt"
+
+
+class SelectorStrategy(StrEnum):
+    """Which rule picks the low-confidence tail for LLM consolidation
+    (``scenario.consolidation.selector.strategy``)."""
+
+    QUANTILE = "quantile"
+    CONFIDENCE = "confidence"
+    MARGIN = "margin"
+    NOISE = "noise"
+
+
+class ConsolidationMode(StrEnum):
+    """How the LLM adjudicates the selected tail (``scenario.consolidation.mode``):
+    per-document ``REASSIGN``, batch ``REPARTITION``, or ``AUTO`` per region."""
+
+    REASSIGN = "reassign"
+    REPARTITION = "repartition"
+    AUTO = "auto"
+
+
+class ConsolidationApply(StrEnum):
+    """What happens to LLM verdicts (``scenario.consolidation.apply``): ``SUGGEST``
+    flags them for review with labels unchanged; ``AUTO`` writes them in."""
+
+    SUGGEST = "suggest"
+    AUTO = "auto"
+
+
+class ClusterAlgorithm(StrEnum):
+    """A manifold-aware clustering algorithm (``scenario.cluster_algorithm``,
+    :func:`~clustering.scenarios.clustering.cluster_embeddings`)."""
+
+    KMEANS = "kmeans"
+    HDBSCAN = "hdbscan"
+    GRAPH_CC = "graph_cc"
+    LEIDEN = "leiden"
+    DBSCAN = "dbscan"
+    OPTICS = "optics"
+    AFFINITY_PROPAGATION = "affinity_propagation"
+    MEANSHIFT = "meanshift"
+
+
+class ClusterSelectionMethod(StrEnum):
+    """HDBSCAN's flat-cluster extraction: ``EOM`` (Excess of Mass, robust default)
+    or ``LEAF`` (more fine-grained). Passed straight through to scikit-learn."""
+
+    EOM = "eom"
+    LEAF = "leaf"
+
+
+class RadiusMethod(StrEnum):
+    """Heuristic that auto-picks a distance radius when none is given — the
+    ``graph_cc`` radius, the Leiden ``radius``-graph cutoff and the DBSCAN
+    ``eps`` all share it: ``KNEE`` (the k-NN-distance knee) or ``MST_GAP`` (the
+    largest gap in the minimum-spanning-tree edge weights)."""
+
+    KNEE = "knee"
+    MST_GAP = "mst_gap"
+
+
+class LeidenGraphMethod(StrEnum):
+    """How the Leiden graph is built from pairwise manifold distances."""
+
+    KNN = "knn"
+    MUTUAL_KNN = "mutual_knn"
+    RADIUS = "radius"
+
+
+class LeidenQuality(StrEnum):
+    """The Leiden partition objective: ``MODULARITY`` or ``CPM``."""
+
+    MODULARITY = "modularity"
+    CPM = "cpm"
+
+
+class LeidenKSelection(StrEnum):
+    """Whether Leiden picks its k-NN graph degree per corpus by silhouette."""
+
+    NONE = "none"
+    SILHOUETTE = "silhouette"
+
+
+class ReduceMethod(StrEnum):
+    """Dimensionality reducer applied before clustering
+    (``scenario.reduce_method``); ``NONE`` is a passthrough."""
+
+    NONE = "none"
+    PCA = "pca"
+    TRUNCATED_SVD = "truncated_svd"
+    RANDOM_PROJECTION = "random_projection"
+    KERNEL_PCA = "kernel_pca"
+    ISOMAP = "isomap"
+    LLE = "lle"
+    SPECTRAL = "spectral"
+    UMAP = "umap"
+
+
+class Auto(StrEnum):
+    """The ``"auto"`` sentinel of a numeric knob that can instead be derived from
+    the data (``float | Auto``). Its only member is ``AUTO``, so an
+    ``isinstance(x, Auto)`` check narrows the union to the derived case."""
+
+    AUTO = "auto"
+
+
+class Supervision(StrEnum):
+    """What signal trains the projector (``training.supervision``)."""
+
+    LABELS = "labels"
+    PSEUDO_LABELS = "pseudo_labels"
+    CROSS_MODAL = "cross_modal"
+
+
 # Losses that train the projector WITHOUT ground-truth labels (S1 regime).
 # The supervised trio above consumes corpus labels; these three derive their
 # training signal from the data itself:
@@ -75,7 +267,9 @@ LossName = Literal[
 #                     learnable prototypes + entropy regularization.
 #   cross_modal     — CLIP-style InfoNCE between the text-only and
 #                     image-only fused views of each document.
-UNSUPERVISED_LOSSES: frozenset[str] = frozenset({"pseudo_label", "knn_contrastive", "cross_modal"})
+UNSUPERVISED_LOSSES: frozenset[LossName] = frozenset(
+    {LossName.PSEUDO_LABEL, LossName.KNN_CONTRASTIVE, LossName.CROSS_MODAL}
+)
 DeviceSpec = str  # "auto" | "cuda" | "cuda:N" | "mps" | "cpu" — validated by utils.resolve_device
 
 
@@ -123,7 +317,7 @@ class FusionConfig(_StrictModel):
     # Ignored by every other fusion (which consume both modalities).
     # ``text`` is often the stronger zero-shot signal for document
     # categorization; ``image`` is the default for layout-driven corpora.
-    prefer_modality: Literal["image", "text"] = "image"
+    prefer_modality: Modality = Modality.IMAGE
     # ── concat_norm blend weight ──────────────────────────────────────────
     # Only consulted by the parameter-free ``concat_norm`` fusion. Each
     # modality's pooled vector is L2-normalized, then text is scaled by
@@ -136,9 +330,19 @@ class FusionConfig(_StrictModel):
 
 # ── Manifold ──────────────────────────────────────────────────────────────
 class ManifoldComponent(_StrictModel):
-    name: Literal["euclidean", "spherical", "hyperbolic"]
+    name: ManifoldName
     dim: int
     curvature: float = 1.0
+
+    @field_validator("name")
+    @classmethod
+    def _check_base_manifold(cls, name: ManifoldName) -> ManifoldName:
+        # A product of products is not supported: components are base manifolds.
+        if name == ManifoldName.PRODUCT:
+            raise ValueError(
+                "a product manifold component must be 'euclidean', 'spherical' or 'hyperbolic'."
+            )
+        return name
 
 
 class ManifoldConfig(_StrictModel):
@@ -149,7 +353,7 @@ class ManifoldConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_product(self) -> ManifoldConfig:
-        if self.name == "product":
+        if self.name == ManifoldName.PRODUCT:
             if not self.components or len(self.components) < 2:
                 raise ValueError(
                     f"Product manifold requires at least 2 components; got {self.components!r}."
@@ -178,7 +382,7 @@ class CalibrationConfig(_StrictModel):
     whether a human should confirm it.
     """
 
-    method: Literal["none", "temperature", "platt"] = "none"
+    method: CalibrationMethod = CalibrationMethod.NONE
     coverage: float | None = None
     """Target coverage in (0, 1) for the conformal abstain gate. ``None`` off.
 
@@ -216,7 +420,7 @@ class ConsolidationSelectorConfig(_StrictModel):
     only notice from the bill.
     """
 
-    strategy: Literal["quantile", "confidence", "margin", "noise"] = "quantile"
+    strategy: SelectorStrategy = SelectorStrategy.QUANTILE
     quantile: float = 0.10
     """Bottom fraction by confidence to select, for ``quantile``."""
     confidence_threshold: float | None = None
@@ -248,15 +452,15 @@ class ConsolidationSelectorConfig(_StrictModel):
                 "consolidation.selector.margin_threshold must be in [0, 1]; "
                 f"got {self.margin_threshold}."
             )
-        if self.strategy == "confidence" and self.confidence_threshold is None:
+        if self.strategy == SelectorStrategy.CONFIDENCE and self.confidence_threshold is None:
             raise ValueError(
                 "consolidation.selector.strategy='confidence' needs confidence_threshold to be set."
             )
-        if self.strategy == "margin" and self.margin_threshold is None:
+        if self.strategy == SelectorStrategy.MARGIN and self.margin_threshold is None:
             raise ValueError(
                 "consolidation.selector.strategy='margin' needs margin_threshold to be set."
             )
-        if self.strategy == "noise" and not self.include_noise:
+        if self.strategy == SelectorStrategy.NOISE and not self.include_noise:
             raise ValueError(
                 "consolidation.selector.strategy='noise' with include_noise=false "
                 "selects nothing at all."
@@ -278,7 +482,7 @@ class ConsolidationConfig(_StrictModel):
     selector: ConsolidationSelectorConfig = Field(default_factory=ConsolidationSelectorConfig)
     candidates_k: int = 3
     """Nearest existing clusters offered to the LLM per adjudicated document."""
-    mode: Literal["reassign", "repartition", "auto"] = "reassign"
+    mode: ConsolidationMode = ConsolidationMode.REASSIGN
     """``reassign``: one candidate-pick decision per document. ``repartition``:
     re-cluster a contested subset as a batch. ``auto``: let the adjudicator
     choose per region."""
@@ -286,7 +490,7 @@ class ConsolidationConfig(_StrictModel):
     """Repartition batch size."""
     model: str | None = None
     """Adjudication model. ``None`` ⇒ reuse the workspace classification model."""
-    apply: Literal["suggest", "auto"] = "suggest"
+    apply: ConsolidationApply = ConsolidationApply.SUGGEST
     """``suggest``: record verdicts and flag the documents for review, labels
     unchanged. ``auto``: write the reassignments into the result. ``suggest``
     is the default because an LLM overruling the embedding partition is a
@@ -308,7 +512,7 @@ class ScenarioConfig(_StrictModel):
     n_shots: int | None = None
     known_categories: list[str] | None = None
     # ── Support-sample selection (S3 / S5) ────────────────────────────────
-    support_selection: SupportSelection = "order"
+    support_selection: SupportSelection = SupportSelection.ORDER
     """Which support samples build each prototype when a category has more than
     ``n_shots`` of them. ``"order"`` (default) keeps the first ``n_shots`` in
     dataset order — today's behaviour. ``"central"`` keeps the ``n_shots`` nearest
@@ -378,22 +582,13 @@ class ScenarioConfig(_StrictModel):
     # - ``meanshift``: mode-seeking. NOT manifold-aware — clusters the raw
     #   embedding coordinates in Euclidean space (sklearn has no precomputed
     #   path). Bandwidth is explicit or auto-estimated.
-    cluster_algorithm: Literal[
-        "kmeans",
-        "hdbscan",
-        "graph_cc",
-        "leiden",
-        "dbscan",
-        "optics",
-        "affinity_propagation",
-        "meanshift",
-    ] = "hdbscan"
+    cluster_algorithm: ClusterAlgorithm = ClusterAlgorithm.HDBSCAN
     # HDBSCAN hyper-parameters (ignored when ``cluster_algorithm='kmeans'``).
     # The defaults follow scikit-learn; tune ``min_cluster_size`` first.
     hdbscan_min_cluster_size: int = 2
     hdbscan_min_samples: int | None = None
     hdbscan_cluster_selection_epsilon: float = 0.000001
-    hdbscan_cluster_selection_method: Literal["eom", "leaf"] = "eom"
+    hdbscan_cluster_selection_method: ClusterSelectionMethod = ClusterSelectionMethod.EOM
     hdbscan_allow_single_cluster: bool = False
     # Graph-CC hyper-parameters (ignored unless
     # ``cluster_algorithm='graph_cc'``).
@@ -406,7 +601,7 @@ class ScenarioConfig(_StrictModel):
     #   to the noise bucket (label = -1). Default ``2`` folds isolated
     #   singletons; set to ``1`` to keep every CC.
     graph_cc_radius: float | None = None
-    graph_cc_r_method: Literal["knee", "mst_gap"] = "knee"
+    graph_cc_r_method: RadiusMethod = RadiusMethod.KNEE
     graph_cc_k_neighbors: int = 4
     graph_cc_min_cluster_size: int = 2
     # Leiden hyper-parameters (ignored unless
@@ -438,15 +633,15 @@ class ScenarioConfig(_StrictModel):
     #   small corpus with no regression on the others; opt-in, off by default,
     #   so the shipped fixed-k behaviour is unchanged.
     # - ``leiden_k_selection_margin``: the silhouette margin above (``>= 0``).
-    leiden_graph_method: Literal["knn", "mutual_knn", "radius"] = "knn"
+    leiden_graph_method: LeidenGraphMethod = LeidenGraphMethod.KNN
     leiden_k_neighbors: int = 15
     leiden_radius: float | None = None
-    leiden_r_method: Literal["knee", "mst_gap"] = "knee"
-    leiden_quality: Literal["modularity", "cpm"] = "modularity"
+    leiden_r_method: RadiusMethod = RadiusMethod.KNEE
+    leiden_quality: LeidenQuality = LeidenQuality.MODULARITY
     leiden_resolution: float = 1.0
     leiden_min_cluster_size: int = 2
     leiden_n_iterations: int = -1
-    leiden_k_selection: Literal["none", "silhouette"] = "none"
+    leiden_k_selection: LeidenKSelection = LeidenKSelection.NONE
     leiden_k_selection_margin: float = 0.1
     # DBSCAN hyper-parameters (ignored unless ``cluster_algorithm='dbscan'``).
     # - ``dbscan_eps``: neighbourhood radius. ``None`` → auto via
@@ -456,7 +651,7 @@ class ScenarioConfig(_StrictModel):
     # - ``dbscan_min_cluster_size``: clusters smaller than this go to noise
     #   (label = -1); default ``1`` keeps every DBSCAN cluster.
     dbscan_eps: float | None = None
-    dbscan_r_method: Literal["knee", "mst_gap"] = "knee"
+    dbscan_r_method: RadiusMethod = RadiusMethod.KNEE
     dbscan_k_neighbors: int = 4
     dbscan_min_samples: int = 5
     dbscan_min_cluster_size: int = 1
@@ -499,21 +694,11 @@ class ScenarioConfig(_StrictModel):
     # off). When active, clustering runs in the reduced Euclidean space
     # regardless of the representation manifold. Strongly recommended with
     # ``cluster_algorithm='hdbscan'`` (try reduce_dim 5-15).
-    reduce_method: Literal[
-        "none",
-        "pca",
-        "truncated_svd",
-        "random_projection",
-        "kernel_pca",
-        "isomap",
-        "lle",
-        "spectral",
-        "umap",
-    ] = "none"
+    reduce_method: ReduceMethod = ReduceMethod.NONE
     reduce_dim: int = 0
 
     # ── Ordinal confidence temperature (S1) ───────────────────────────────
-    confidence_temperature: float | Literal["auto"] = "auto"
+    confidence_temperature: float | Auto = Auto.AUTO
     """Softmax temperature for the S1 unsupervised ordinal confidence signal.
 
     ``"auto"`` (default) scales it to the median inter-centroid distance so
@@ -533,7 +718,7 @@ class ScenarioConfig(_StrictModel):
         t = self.confidence_temperature
         # Caught here rather than in ``cluster_confidence`` so a bad value is a
         # config error up front, not a failure partway through a long run.
-        if not isinstance(t, str) and t <= 0.0:
+        if not isinstance(t, Auto) and t <= 0.0:
             raise ValueError(f"confidence_temperature must be > 0 or 'auto'; got {t}.")
         return self
 
@@ -575,7 +760,7 @@ class CorpusConfig(_StrictModel):
 
 # ── Logger ────────────────────────────────────────────────────────────────
 class LoggerConfig(_StrictModel):
-    name: LoggerName = "none"
+    name: LoggerName = LoggerName.NONE
     project: str = "doc-cat"
     entity: str | None = None
     tags: list[str] = Field(default_factory=list)
@@ -587,7 +772,7 @@ class TrainingConfig(_StrictModel):
     epochs: int = 0  # 0 = no training (S1/S4 baselines)
     lr: float = 1e-4
     weight_decay: float = 0.0
-    loss: LossName = "prototypical"
+    loss: LossName = LossName.PROTOTYPICAL
     margin: float = 0.2
     temperature: float = 0.07
     # ── Unsupervised losses (S1, ``loss`` ∈ UNSUPERVISED_LOSSES) ───────────
@@ -669,7 +854,7 @@ class TrainingConfig(_StrictModel):
     #   InfoNCE where a document's text-only view and image-only view are
     #   positives and all other documents are negatives.
     # S1 honours all three; S3/S5 always train on their support labels.
-    supervision: Literal["labels", "pseudo_labels", "cross_modal"] = "labels"
+    supervision: Supervision = Supervision.LABELS
     # Cluster → train rounds for ``supervision="pseudo_labels"``. Each
     # round re-clusters the current projection and runs ``epochs`` epochs
     # against the fresh pseudo-labels.
@@ -719,7 +904,7 @@ def _dummy_encoder() -> EncoderConfig:
     ``cross_attention``, …) will silently blend in this dummy noise — specify
     both encoders explicitly for multimodal runs.
     """
-    return EncoderConfig(name="dummy", model_id="dummy")
+    return EncoderConfig(name=EncoderName.DUMMY, model_id="dummy")
 
 
 class Config(_StrictModel):

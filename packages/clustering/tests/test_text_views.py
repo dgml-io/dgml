@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders import build_encoder
 from clustering.example import VIEW_TEXT_SEP, _build_text, split_view_spec
 
@@ -128,7 +128,7 @@ def test_tfidf_encoder_fits_and_encodes(tmp_path: Path) -> None:
             [_w(tok, 100 + 50 * j, 100, 140 + 50 * j, 115) for j, tok in enumerate(body.split())],
         )
     cfg = EncoderConfig(
-        name="tfidf",
+        name=EncoderName.TFIDF,
         model_id="tfidf",
         embedding_dim=8,
         extra={"corpus_dir": str(files), "text_view": "full"},
@@ -143,7 +143,7 @@ def test_tfidf_encoder_fits_and_encodes(tmp_path: Path) -> None:
 
 def _tfidf_cfg(files: Path) -> EncoderConfig:
     return EncoderConfig(
-        name="tfidf",
+        name=EncoderName.TFIDF,
         model_id="tfidf",
         embedding_dim=8,
         extra={"corpus_dir": str(files), "text_view": "full"},
@@ -250,7 +250,7 @@ def _tiny_corpus(files: Path) -> None:
 def _encoder(files: Path, view: str, *, dim: int = 8) -> object:
     return build_encoder(
         EncoderConfig(
-            name="tfidf",
+            name=EncoderName.TFIDF,
             model_id="tfidf",
             embedding_dim=dim,
             extra={"corpus_dir": str(files), "text_view": view},

@@ -31,10 +31,11 @@ from dgml_core.storage import Workspace
 from .conftest import local_tree_path, needs_gs
 
 
-def _page_pngs(ws: Workspace, file_id: str) -> list[str]:
+def _page_images(ws: Workspace, file_id: str) -> list[str]:
     """Rendered page-image blob keys for ``file_id`` — the store analogue of
-    globbing ``page_*.png`` in the workspace's page-images dir."""
-    return [k for k in ws.blobs.list_blobs(layout.file_pages_prefix(file_id)) if k.endswith(".png")]
+    globbing ``page_*.{jpg,png}`` in the workspace's page-images dir."""
+    prefix = layout.file_pages_prefix(file_id)
+    return [k for k in ws.blobs.list_blobs(prefix) if k.endswith((".jpg", ".png"))]
 
 
 @needs_gs
@@ -74,7 +75,7 @@ def test_missing_pages_re_rendered(workspace: Workspace, sample_pdf: Path) -> No
     report = check_workspace(workspace)
     repaired = [i for i in report.issues if i.kind == "page_count_mismatch" and i.repaired]
     assert repaired, report.to_json()
-    assert len(_page_pngs(workspace, f.record.id)) == 2
+    assert len(_page_images(workspace, f.record.id)) == 2
 
 
 @needs_gs
@@ -112,7 +113,7 @@ def test_bogus_zero_page_count_re_renders_missing_pages(
     assert any(i.kind == "page_count_mismatch" and i.repaired for i in report.issues), (
         report.to_json()
     )
-    assert len(_page_pngs(workspace, f.record.id)) == 2
+    assert len(_page_images(workspace, f.record.id)) == 2
 
 
 @needs_gs
@@ -131,7 +132,7 @@ def test_permanent_error_blocks_retry(workspace: Workspace, sample_pdf: Path) ->
     )
     report = check_workspace(workspace)
     assert any(i.kind == "page_render_failed_permanent" for i in report.issues)
-    assert not _page_pngs(workspace, f.record.id)
+    assert not _page_images(workspace, f.record.id)
 
 
 @needs_gs
@@ -149,7 +150,7 @@ def test_retry_errors_clears_and_retries(workspace: Workspace, sample_pdf: Path)
         ),
     )
     report = check_workspace(workspace, retry_errors=True)
-    assert len(_page_pngs(workspace, f.record.id)) == 2
+    assert len(_page_images(workspace, f.record.id)) == 2
     assert load_recorded_errors(workspace, f.record.id) == []
     assert any(i.kind == "page_count_mismatch" and i.repaired for i in report.issues)
 
@@ -205,6 +206,10 @@ def test_corrupt_docset_metadata_does_not_crash(workspace: Workspace) -> None:
         i.target_type == "docset" and i.target_id == did and i.kind == "corrupt_metadata"
         for i in report.issues
     )
+    # The JSON form carries the plain wire string, not the enum member.
+    emitted = [i for i in report.to_json()["issues"] if i["target_id"] == did]
+    assert emitted
+    assert all(type(i["target_type"]) is str and i["target_type"] == "docset" for i in emitted)
 
 
 def test_corrupt_metadata_alongside_clean_continues_walk(

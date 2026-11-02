@@ -54,7 +54,7 @@ from litellm.llms.custom_httpx.http_handler import HTTPHandler
 
 from .conftest import FakeLLMResponse
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 # Read at import: the autouse ``_api_key`` fixture swaps the env var for a fake
 # key before any test body runs, so the live test must not read it from there.
 _LIVE_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -79,7 +79,7 @@ TEXT_MESSAGE: dict[str, Any] = {
     "id": "msg_text",
     "type": "message",
     "role": "assistant",
-    "model": "claude-haiku-4-5",
+    "model": "claude-haiku-5-5",
     "content": [{"type": "text", "text": "hello from the batch"}],
     "stop_reason": "end_turn",
     "stop_sequence": None,
@@ -94,7 +94,7 @@ TOOL_MESSAGE: dict[str, Any] = {
     "id": "msg_tool",
     "type": "message",
     "role": "assistant",
-    "model": "claude-haiku-4-5",
+    "model": "claude-haiku-5-5",
     "content": [
         {"type": "text", "text": "submitting"},
         {"type": "tool_use", "id": "toolu_1", "name": "submit", "input": {"value": "x"}},
@@ -240,7 +240,7 @@ def test_wire_parity_with_sync_route(
     assert encoded["custom_id"] == name
     assert encoded["params"] == sync_capture(kwargs)
     assert "stream" not in encoded["params"]
-    assert encoded["params"]["model"] == "claude-haiku-4-5" or encoded["params"][
+    assert encoded["params"]["model"] == "claude-haiku-5-5" or encoded["params"][
         "model"
     ].startswith("claude")
 
@@ -299,7 +299,7 @@ def test_decode_parity_with_sync_route(
     ):
         assert got[key] == want[key], key
     standard = litellm.completion_cost(
-        completion_response=sync, model="claude-haiku-4-5", custom_llm_provider="anthropic"
+        completion_response=sync, model="claude-haiku-5-5", custom_llm_provider="anthropic"
     )
     assert standard > 0
     assert got["cost_usd"] == pytest.approx(standard * BATCH_PRICE_MULTIPLIER)
@@ -458,7 +458,7 @@ def test_submit_poll_results_cancel_round_trip() -> None:
     assert extract_cost_and_tokens(outcomes["text"])["cost_usd"] == pytest.approx(
         litellm.completion_cost(
             completion_response=outcomes["text"],
-            model="claude-haiku-4-5",
+            model="claude-haiku-5-5",
             custom_llm_provider="anthropic",
         )
         * BATCH_PRICE_MULTIPLIER
@@ -880,3 +880,17 @@ def test_results_are_streamed_not_read_whole() -> None:
     assert stream.read < len(body)  # the first result came before the body was read
     rest = list(results)
     assert len(rest) == 49 and stream.read == len(body) and stream.closed
+
+
+def test_the_credential_fingerprint_tells_keys_apart_and_hides_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    one = AnthropicBatchBackend(api_key="sk-ant-one").credential_fingerprint()
+    assert one == hashlib.sha256(b"sk-ant-one").hexdigest()[:12]
+    assert AnthropicBatchBackend(api_key="sk-ant-two").credential_fingerprint() != one
+    assert AnthropicBatchBackend().credential_fingerprint() is None
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-one")
+    assert AnthropicBatchBackend().credential_fingerprint() == one  # the key it would send

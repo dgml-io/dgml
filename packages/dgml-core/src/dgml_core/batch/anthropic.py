@@ -46,6 +46,7 @@ No optional dependency: ``httpx`` ships with litellm.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -77,6 +78,7 @@ from dgml_core.batch.types import (
     BatchStatus,
     ItemErrorKind,
 )
+from dgml_core.usage import PricingTier
 
 PROVIDER = "anthropic"
 DEFAULT_API_BASE = "https://api.anthropic.com"
@@ -224,6 +226,15 @@ class AnthropicBatchBackend:
 
     def _key(self) -> str | None:
         return self._api_key or os.environ.get("ANTHROPIC_API_KEY") or None
+
+    def credential_fingerprint(self) -> str | None:
+        """The first 12 hex digits of the SHA-256 of the key this backend
+        sends, or ``None`` with no key: enough to tell two keys apart, never
+        enough to recover one. A batch job keeps it on each batch it creates,
+        since a 404 under another account's key does not mean the batch is
+        gone."""
+        key = self._key()
+        return hashlib.sha256(key.encode()).hexdigest()[:12] if key else None
 
     def _headers(self) -> dict[str, str]:
         key = self._key()
@@ -412,7 +423,9 @@ class AnthropicBatchBackend:
         if kind == "succeeded":
             message = result.get("message")
             if not isinstance(message, dict):
-                return BatchItemError(custom_id, "invalid", "succeeded result carries no message")
+                return BatchItemError(
+                    custom_id, ItemErrorKind.INVALID, "succeeded result carries no message"
+                )
             return self.decode_message(message)
         if kind == "errored":
             # The error object nests: {"type": "error", "error": {"type": ..., "message": ...}}.
@@ -420,15 +433,19 @@ class AnthropicBatchBackend:
             inner = error.get("error") if isinstance(error.get("error"), dict) else error
             etype = str(inner.get("type", "")) if isinstance(inner, dict) else ""
             emsg = str(inner.get("message", "")) if isinstance(inner, dict) else str(error)
-            err_kind: ItemErrorKind = "invalid" if "invalid_request" in etype else "errored"
+            err_kind = (
+                ItemErrorKind.INVALID if "invalid_request" in etype else ItemErrorKind.ERRORED
+            )
             return BatchItemError(custom_id, err_kind, f"{etype}: {emsg}".strip(": "))
         if kind == "expired":
-            return BatchItemError(custom_id, "expired", "batch expired before this request ran")
+            return BatchItemError(
+                custom_id, ItemErrorKind.EXPIRED, "batch expired before this request ran"
+            )
         if kind == "canceled":
             return BatchItemError(
-                custom_id, "canceled", "batch was canceled before this request ran"
+                custom_id, ItemErrorKind.CANCELED, "batch was canceled before this request ran"
             )
-        return BatchItemError(custom_id, "invalid", f"unknown result type {kind!r}")
+        return BatchItemError(custom_id, ItemErrorKind.INVALID, f"unknown result type {kind!r}")
 
     def decode_message(self, message: Mapping[str, Any]) -> Any:
         """An Anthropic message object → the ``ModelResponse`` the sync path returns,
@@ -458,7 +475,7 @@ class AnthropicBatchBackend:
         except Exception:  # unknown model price → unknown cost, as on the sync path
             cost = None
         response._hidden_params["response_cost"] = cost
-        response._hidden_params["tier"] = "batch"
+        response._hidden_params["tier"] = PricingTier.BATCH.value
         return response
 
 

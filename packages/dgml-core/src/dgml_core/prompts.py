@@ -54,6 +54,7 @@ class PromptKey(StrEnum):
     VALUES_PHASE1_USER = "extraction_values_phase1_user"
     VALUES_PHASE1_GUIDANCE = "extraction_values_phase1_guidance"
     VALUES_PHASE1_RETRY_CHUNKED = "extraction_values_phase1_retry_chunked"
+    VALUES_PHASE1_PERMISSIVE = "extraction_values_phase1_permissive"
     VALUES_PHASE1_PART = "extraction_values_phase1_part"
     VALUES_PHASE1_NUDGE_SUBMIT = "extraction_values_phase1_nudge_submit"
     VALUES_PHASE1_NUDGE_CONTINUE = "extraction_values_phase1_nudge_continue"

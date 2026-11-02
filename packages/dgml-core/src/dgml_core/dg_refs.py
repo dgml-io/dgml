@@ -37,9 +37,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import NamedTuple
 
 from lxml import etree  # type: ignore[import-untyped]
+
+from .enums import parse_enum
 
 DG_NS = "http://dgml.io/ns/dg#"
 
@@ -49,10 +52,26 @@ METHOD_ATTR = f"{{{DG_NS}}}method"
 HREF_ATTR = f"{{{DG_NS}}}href"
 VALUE_ATTR = f"{{{DG_NS}}}value"
 
-METHOD_CALCULATED = "calculated"
-METHOD_INFERRED = "inferred"
-METHOD_DEFAULTED = "defaulted"
-METHODS: tuple[str, ...] = (METHOD_CALCULATED, METHOD_INFERRED, METHOD_DEFAULTED)
+
+class ValueMethod(StrEnum):
+    """How a value the page doesn't print was produced: the ``dg:method``
+    attribute (DGML 0.71).
+
+    ``CALCULATED`` is arithmetic over its ``dg:inputs`` (a verifier can redo
+    it), ``INFERRED`` a judgment from them (a verifier can only check they
+    exist), and ``DEFAULTED`` a value the schema supplies when the document is
+    silent, which never carries inputs. A boxed (printed) value has no method.
+    """
+
+    CALCULATED = "calculated"
+    INFERRED = "inferred"
+    DEFAULTED = "defaulted"
+
+
+#: Every :class:`ValueMethod`, in definition order. A tuple, so ``x in
+#: METHODS`` is a plain equality scan that is safe for any model-returned
+#: value, hashable or not.
+METHODS: tuple[ValueMethod, ...] = tuple(ValueMethod)
 
 # The 0.7 reserved ``dg:origin`` value for a value the page doesn't print.
 # Retired in 0.71: never written, only recognized when reading old files.
@@ -131,7 +150,7 @@ def effective_inputs(el: etree._Element) -> list[str]:
     return split_refs(effective_inputs_attr(el))
 
 
-def effective_method(el: etree._Element) -> str | None:
+def effective_method(el: etree._Element) -> ValueMethod | None:
     """How the element's value was produced, or ``None`` when that is not
     stated and can't be read off the other attributes.
 
@@ -142,9 +161,9 @@ def effective_method(el: etree._Element) -> str | None:
     """
     if effective_origin(el) is not None:
         return None
-    method: str | None = el.get(METHOD_ATTR)
-    if method in METHODS:
+    method = parse_enum(ValueMethod, el.get(METHOD_ATTR))
+    if method is not None:
         return method
     if effective_inputs(el):
-        return METHOD_INFERRED
+        return ValueMethod.INFERRED
     return None

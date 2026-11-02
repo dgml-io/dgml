@@ -20,8 +20,8 @@ built one of two ways:
   workspace is opened with ``Workspace.open(configuration=…)``. No ``config.toml``,
   no user config, no ``DGML_*`` environment variables, nothing written back.
 - **From TOML**, for a workspace addressed by path or held in the store of workspaces —
-  :meth:`Configuration.from_merged`, called by ``Workspace.config`` with the result of
-  the usual merge (user config → workspace config → environment).
+  derived by ``Workspace.config`` from the result of the usual merge (user config →
+  workspace config → environment).
 
 Either way the loaders (``load_grounded_config`` and friends) read the same thing: the
 ``sections`` mapping, in the exact shape ``load_merged_config`` has always returned, so
@@ -42,7 +42,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from .models_config import ConfigSection, Model, ModelsConfig
+from .conversion import FormatFamily
+from .models_config import (
+    ConfigSection,
+    Model,
+    ModelsConfig,
+    apply_provider_keys,
+    load_models_config,
+)
+from .redaction import redacted
 from .storage_service import StorageConfig
 from .workspace_id import ID_SHAPE, is_workspace_id
 
@@ -109,10 +117,14 @@ class ProviderSpec:
     ``[conversion.<family>]`` table. ``provider`` is the dotted
     ``module.path:ClassName`` the resolver imports; ``options`` is validated by that
     class's ``parse_config`` (unknown keys are rejected there), so a provider's own
-    settings — including credential-named ones — pass through untouched."""
+    settings — including credential-named ones — pass through untouched. The repr
+    prints those as ``***`` (:func:`~dgml_core.redaction.redacted`)."""
 
     provider: str
     options: Mapping[str, Any] = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return f"ProviderSpec(provider={self.provider!r}, options={redacted(self.options)!r})"
 
     def table(self) -> dict[str, Any]:
         return {"provider": self.provider, **dict(self.options)}
@@ -175,17 +187,19 @@ def _table(obj: Any, *, exclude: frozenset[str] = frozenset()) -> dict[str, Any]
 class Models:
     """``[models]``: the four tiers, or a provider ``family`` that expands into them
     (an explicit tier wins over its family default). A tier is a :class:`Model`, so it
-    may carry its own credentials; ``<provider>_api_key`` is the key for every model
-    of that provider — a tier's or a task section's — that sets none itself."""
+    may carry its own credentials; ``<provider>_api_key`` goes to every tier and
+    section model of that provider in the same :class:`Configuration` that carries
+    neither its own key nor an ``api_base`` — and to a per-call override's model —
+    when a loader reads it. The keys are left out of the repr."""
 
     family: str | None = None
     light: Model | None = None
     standard: Model | None = None
     advanced: Model | None = None
     expert: Model | None = None
-    anthropic_api_key: str | None = None
-    google_api_key: str | None = None
-    openai_api_key: str | None = None
+    anthropic_api_key: str | None = field(default=None, repr=False)
+    google_api_key: str | None = field(default=None, repr=False)
+    openai_api_key: str | None = field(default=None, repr=False)
 
     def table(self) -> dict[str, Any]:
         return _table(self)
@@ -278,13 +292,13 @@ class TextExtraction:
 
 @dataclass(frozen=True)
 class Conversion:
-    """``[conversion]``: one :class:`ProviderSpec` per format family (``docx``,
-    ``xlsx``). Reads ``dgml_core.conversion.load_conversion_config``."""
+    """``[conversion]``: one :class:`ProviderSpec` per :class:`FormatFamily`. Reads
+    ``dgml_core.conversion.load_conversion_config``."""
 
-    families: Mapping[str, ProviderSpec] = field(default_factory=dict)
+    families: Mapping[FormatFamily, ProviderSpec] = field(default_factory=dict)
 
     def table(self) -> dict[str, Any]:
-        return {family: spec.table() for family, spec in self.families.items()}
+        return {str(family): spec.table() for family, spec in self.families.items()}
 
 
 @dataclass(frozen=True)
@@ -330,11 +344,24 @@ class Configuration:
 
     Equality covers everything; the hash covers identity and storage only (sections
     hold dicts), which is what a per-tenant cache of ``Workspace`` objects keys on.
+    ``sections`` is the merge as written: ``Models`` provider keys stay in its
+    ``[models]`` table, and ``load_merged_config`` writes them onto the models that
+    take them each time a loader reads this configuration — so a per-call model
+    override (``values_model=``, a generation flag) of the same provider gets this
+    configuration's key rather than the process environment's.
     """
 
     identity: Identity
     storage: Storage
     sections: Sections = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        """Credential values in ``sections`` print as ``***``, so this can be logged."""
+        sections = {k: redacted(v) for k, v in self.sections.items()}
+        return (
+            f"Configuration(identity={self.identity!r}, storage={self.storage!r}, "
+            f"sections={sections!r})"
+        )
 
     def __hash__(self) -> int:
         return hash((self.identity, self.storage.blobs._frozen(), self.storage.docs._frozen()))
@@ -360,7 +387,7 @@ class Configuration:
         already treat ``{}`` and absent alike. ``models.family`` is expanded into
         tiers here, exactly as it is for a TOML layer."""
         # Imported here: config.py imports storage.py, which names this module.
-        from .config import _expand_layer
+        from .config import _drop_none_values, _normalize_layer
 
         identity.require_complete()
         typed: dict[ConfigSection, Any] = {
@@ -376,23 +403,29 @@ class Configuration:
             ConfigSection.CLUSTERING: clustering,
         }
         layer = {s.value: t.table() for s, t in typed.items() if t is not None}
-        return cls.from_merged(identity=identity, storage=storage, sections=_expand_layer(layer))
+        # A single layer: normalized for the same provider-key and family rules as a
+        # TOML layer, then its explicit ``None``s dropped — there is no lower layer to
+        # override.
+        sections = _drop_none_values(_normalize_layer(layer))
+        return cls._from_merged(identity=identity, storage=storage, sections=sections)
 
     @classmethod
-    def from_merged(
+    def _from_merged(
         cls, *, identity: Identity, storage: Storage, sections: Mapping[Any, Any]
     ) -> Configuration:
         """Wrap an already-merged section mapping (string or :class:`ConfigSection`
-        keys). This is how ``Workspace.config`` is derived on the TOML path."""
-        return cls(
-            identity=identity,
-            storage=storage,
-            sections={ConfigSection(str(k)): dict(v) for k, v in sections.items()},
-        )
+        keys), as merged — provider keys are applied when a loader reads it. This is
+        how ``Workspace.config`` is derived on the TOML path, and :meth:`build`'s last
+        step. Internal: it expands no ``family`` and drops no stray credential, so a
+        raw table must not come in this way. :meth:`build` is the public constructor;
+        a public one for raw tables can be added when a caller needs it."""
+        merged = {ConfigSection(str(k)): dict(v) for k, v in sections.items()}
+        return cls(identity=identity, storage=storage, sections=merged)
 
     @property
     def models(self) -> ModelsConfig:
-        """The validated ``[models]`` tiers — a convenience over the loaders."""
-        from .models_config import load_models_config
-
-        return load_models_config(dict(self.sections))
+        """The validated ``[models]`` tiers, provider keys applied — a convenience over
+        the loaders."""
+        merged = {k: dict(v) for k, v in self.sections.items()}
+        apply_provider_keys(merged)
+        return load_models_config(merged)

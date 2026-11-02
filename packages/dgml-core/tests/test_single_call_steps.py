@@ -26,7 +26,7 @@ from dgml_core.classification import ClassificationConfig
 from dgml_core.errors import ClassificationFailed, SchemaGenerationFailed
 from dgml_core.generation import label as label_mod
 from dgml_core.generation.blocks import Block
-from dgml_core.generation.single_calls import STAGE_PLAN, single_calls_through
+from dgml_core.generation.single_calls import SingleCallStage, single_calls_through
 from dgml_core.grounded import GroundedConfig, generate_schema
 from dgml_core.storage import Workspace
 from dgml_core.usage import read_events
@@ -84,7 +84,11 @@ def test_schema_provider_failure_keeps_its_message_and_error_row(
         generate_schema(
             workspace, ["f1aaaaaaaaaa"], config=schema_config(), docset_name="D", record_usage=True
         )
-    assert str(failed.value) == "schema generation call failed: RuntimeError: provider exploded"
+    # The provider's message, then what traces the call (see describe_call_failure).
+    assert str(failed.value) == (
+        "schema generation call failed: RuntimeError: provider exploded "
+        f"(model {DEFAULT_SCHEMA_MODEL!r}, api key not passed)"
+    )
     (row,) = read_events(workspace)
     assert (row["outcome"], row["error"]) == ("error", "RuntimeError: provider exploded")
     assert row["tier"] == "standard"
@@ -101,7 +105,7 @@ def test_classify_request_requires_a_tool_and_carries_the_page_images(
     cfg, steps = classification.classify_steps(
         workspace,
         ["fid1"],
-        config=ClassificationConfig(model="gemini/gemini-2.5-flash-lite"),
+        config=ClassificationConfig(model="gemini/gemini-3.5-flash-lite"),
         prompt=classification._build_prompt_new_only(),
         tools=[classification._create_new_docset_tool()],
     )
@@ -123,7 +127,7 @@ def test_classify_fails_before_any_request_without_page_images(workspace: Worksp
         classification.classify_steps(
             workspace,
             ["blankfid"],
-            config=ClassificationConfig(model="gemini/gemini-2.5-flash-lite"),
+            config=ClassificationConfig(model="gemini/gemini-3.5-flash-lite"),
             prompt="p",
             tools=[],
         )
@@ -176,16 +180,16 @@ def test_a_runner_sees_the_same_requests_under_the_plan_stage(
     sync = capture_kwargs(list(replies))
     plan(tmp_path / "sync")
 
-    stages: list[str] = []
+    stages: list[SingleCallStage] = []
 
-    def runner(stage: str, config: llm.LLMConfig, steps: Any) -> Any:
+    def runner(stage: SingleCallStage, config: llm.LLMConfig, steps: Any) -> Any:
         stages.append(stage)
         return llm.drive(steps, config)
 
     through_runner = capture_kwargs(list(replies))
     with single_calls_through(runner):
         assert plan(tmp_path / "runner") == REFINED["concepts"]
-    assert stages == [STAGE_PLAN]
+    assert stages == [SingleCallStage.PLAN]
     assert through_runner.kwargs == sync.kwargs
 
 

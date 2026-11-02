@@ -63,11 +63,9 @@ from lxml import etree  # type: ignore[import-untyped]
 from .dg_refs import (
     INPUTS_ATTR,
     METHOD_ATTR,
-    METHOD_CALCULATED,
-    METHOD_DEFAULTED,
-    METHOD_INFERRED,
     METHODS,
     ORIGIN_ATTR,
+    ValueMethod,
     effective_inputs,
     effective_method,
     effective_origin,
@@ -442,9 +440,9 @@ def _unverifiable(leaf: dict[str, Any], values: dict[str, Any]) -> str | None:
     if "locations" in leaf:
         return "unboxed" if _origin_from_locations(leaf["locations"]) is None else None
     method = leaf.get("method")
-    if method == METHOD_DEFAULTED:
+    if method == ValueMethod.DEFAULTED:
         return None
-    if method in (METHOD_CALCULATED, METHOD_INFERRED):
+    if method in (ValueMethod.CALCULATED, ValueMethod.INFERRED):
         refs = leaf.get("inputs")
         items = leaf.get("evidence")
         if (
@@ -616,7 +614,7 @@ def check_derivations(values: dict[str, Any]) -> tuple[int, int]:
     checked = 0
     mismatched = 0
     for _path, leaf in walk_input_leaves(values):
-        if leaf.get("method") != METHOD_CALCULATED or leaf.get("evidence"):
+        if leaf.get("method") != ValueMethod.CALCULATED or leaf.get("evidence"):
             # Evidence is printed text, not a number to add up.
             continue
         refs = leaf.get("inputs")
@@ -828,9 +826,9 @@ def provenance_issues(xml: str | bytes) -> list[tuple[str, str, str]]:
                 out.append(("method_misplaced", name, f"unknown dg:method {method!r}"))
             elif boxed:
                 out.append(("method_misplaced", name, "dg:method on an element with dg:origin"))
-            elif method == METHOD_DEFAULTED and tokens:
+            elif method == ValueMethod.DEFAULTED and tokens:
                 out.append(("method_misplaced", name, "defaulted value with dg:inputs"))
-            elif method != METHOD_DEFAULTED and not tokens:
+            elif method != ValueMethod.DEFAULTED and not tokens:
                 out.append(("method_misplaced", name, f"{method} value with no dg:inputs"))
         if is_legacy_computed(el) and not tokens:
             out.append(("value_unsupported", name, 'dg:origin="computed" with no dg:href'))
@@ -904,7 +902,7 @@ def _add_evidence(parent: etree._Element, value: dict[str, Any], path: LeafPath)
     field's. Items without a box are dropped (and counted by
     :func:`count_dropped_inputs`)."""
     evidence = value.get("evidence")
-    if not isinstance(evidence, list) or value.get("method") == METHOD_DEFAULTED:
+    if not isinstance(evidence, list) or value.get("method") == ValueMethod.DEFAULTED:
         return []
     refs: list[str] = []
     base = _id_for_path(path)
@@ -972,11 +970,13 @@ def _set_unprinted_attrs(
 
     method = value.get("method")
     inputs = (
-        [] if method == METHOD_DEFAULTED else _resolved_inputs(value, ids) + (evidence_refs or [])
+        []
+        if method == ValueMethod.DEFAULTED
+        else _resolved_inputs(value, ids) + (evidence_refs or [])
     )
     if inputs:
         el.set(INPUTS_ATTR, format_refs(inputs))
-    if method == METHOD_DEFAULTED or (method in METHODS and inputs):
+    if method == ValueMethod.DEFAULTED or (method in METHODS and inputs):
         el.set(METHOD_ATTR, method)
 
 
@@ -1313,7 +1313,7 @@ def _leaf_value(
         if acc is not None:
             acc.with_inputs.append(leaf)
     if method is not None:
-        leaf["method"] = method
+        leaf["method"] = str(method)
     return leaf
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from clustering.config.schema import LoggerName
 from clustering.logging_.base import Logger
 
 
@@ -28,7 +29,7 @@ class MultiLogger(Logger):
     pass-through.
     """
 
-    name = "multi"
+    name = LoggerName.MULTI
 
     def __init__(self, loggers: list[Logger]) -> None:
         self.loggers = list(loggers)

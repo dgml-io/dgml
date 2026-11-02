@@ -1,6 +1,6 @@
 ---
 name: dgml
-description: Use when the user wants to manage a DGML workspace from the shell — initialize a workspace, add PDFs or Office documents (docx/xlsx, when a converter is configured) single or bulk from a directory, create or manage DocSets, assign files to DocSets, convert PDFs to DGML XML (grounded in place with dg:origin bounding boxes as part of generation), extract structured values against a schema (RNC schema generation, grounded value extraction to DGML), or run a consistency check. Triggers on phrases like "add these PDFs", "ingest these Word/Excel docs", "create a docset", "import documents into DGML", "ingest a folder of PDFs", "ground the DGML", "add bounding boxes", "extract values", "extraction schema", "generate a schema", "pull fields from these docs", "dgml workspace", "check the workspace".
+description: Use when the user wants to manage a DGML workspace from the shell — initialize a workspace, add PDFs or Office documents (docx/xlsx/pptx, when a converter is configured) single or bulk from a directory, create or manage DocSets, assign files to DocSets, convert PDFs to DGML XML (grounded in place with dg:origin bounding boxes as part of generation), extract structured values against a schema (RNC schema generation, grounded value extraction to DGML), or run a consistency check. Triggers on phrases like "add these PDFs", "ingest these Word/Excel docs", "create a docset", "import documents into DGML", "ingest a folder of PDFs", "ground the DGML", "add bounding boxes", "extract values", "extraction schema", "generate a schema", "pull fields from these docs", "dgml workspace", "check the workspace".
 ---
 
 # Using the `dgml` CLI
@@ -159,6 +159,25 @@ and route them yourself (or run `dgml cluster` over them). Re-running the
 same command with `--on-conflict skip` does **not** retry them — existing
 files skip classification — so assign them with `docset add-file`.
 
+For a large ingest nobody is waiting on, add `--batch`: every file is
+added first, then the classifications go through the provider's batch API
+at about half price, and the auto-extraction of files landing in a DocSet
+with a schema is batched too. With `--auto-classify existing` (or
+`existing-forced`) all files classify in ONE wave. In the default mode they
+classify in order, ONE WAVE PER FILE (each file must be offered the DocSets
+created for the files before it), so a directory of N files takes N round
+trips of minutes to hours each — prefer `existing` for a big curated
+ingest. `--batch` works only on a directory with `--auto-classify` and only
+for models with a batch backend (`anthropic/…`, `gemini/…`, `openai/…`);
+otherwise it fails before adding anything (`INVALID_ARGUMENT` /
+`BATCH_UNAVAILABLE`). The entries are the same as without it, plus a
+top-level `batch` block.
+
+```bash
+uv run dgml file add --workspace "$wid" /path/to/docs \
+  --recursive --on-conflict skip --auto-classify existing --batch | jq .batch
+```
+
 ⚠️ `--auto-classify` takes an *optional* MODE, so the parser eats the
 next token. Always put PATH **before** the flag (as above), or name the
 mode explicitly (`--auto-classify existing /path/doc.pdf`).
@@ -234,6 +253,7 @@ summing to `total`) is the quick health read; report it to the user.
 
 Variants:
 - **Add to an existing DocSet:** skip the `docset create` step; pass its known ID as `$ds`. Find it with `uv run dgml docset list | jq -r '.docsets[] | select(.name=="…") | .id'`.
+- **User-supplied DocSet id:** create it with `uv run dgml docset create --name "…" --id "$ds"` and skip the `jq -r .id` capture. Same grammar as `file add --id` (lowercase only).
 - **Auto-route heterogeneous PDFs into DocSets**: drop the `docset create` step and the `docset add-file` loop; pass `--auto-classify` to `file add` instead. Each file lands in the best-fitting existing DocSet, or in a new one the LLM proposes — and DocSets created mid-run are visible to later files in the same batch, so similar PDFs cluster. Requires `classification` config in `<workspace>/config.toml`; see the one-shot example above. Read each file's `.results[].classification` block for the outcome. Use `--auto-classify existing` instead when the workspace's DocSets are curated and the run must not create more — a file that fits none of them is left unassigned with `decision: "none"` for you to route.
 - **Recurse into subdirectories:** add `--recursive`.
 - **Hidden errors:** a PDF that fails to parse, render, or extract digital text still produces an entry — `soft_failed` (the `page_*`/`text_extraction_error` fields are set on its `file` entry) or `hard_failed` (the entry has an `error` object and no `file`). `dgml check` afterward is the authoritative whole-workspace health signal.
@@ -256,9 +276,9 @@ find "$DIR" -type f -iname '*.pdf' -print0 |
   done
 ```
 
-### Office documents (docx/xlsx)
+### Office documents (docx/xlsx/pptx)
 
-`file add` accepts not just `.pdf` but convertible sources — `.docx`/`.doc`/`.xlsx`/`.xls` — **when a converter is configured** for that format family in `<workspace>/config.toml`. The source is converted to PDF at add time, then ingested exactly like a PDF (same `page_images/`, `page_text/`, generation). With no converter configured for a non-PDF format, the add fails with `UNSUPPORTED_FILE_TYPE` — there is no default. Ready-made converters ship in the `translators-pdf` package (LibreOffice, Aspose.Words, an xlsx island-renderer, a generic command runner); or point a family at your own class. Minimal config:
+`file add` accepts not just `.pdf` but convertible sources — `.docx`/`.doc`/`.xlsx`/`.xls`/`.pptx`/`.ppt` — **when a converter is configured** for that format family in `<workspace>/config.toml`. The source is converted to PDF at add time, then ingested exactly like a PDF (same `page_images/`, `page_text/`, generation). With no converter configured for a non-PDF format, the add fails with `UNSUPPORTED_FILE_TYPE` — there is no default. Ready-made converters ship in the `translators-pdf` package (LibreOffice, Aspose.Words, an xlsx island-renderer, a generic command runner); or point a family at your own class. Minimal config:
 
 ```toml
 # <workspace>/config.toml
@@ -268,11 +288,11 @@ provider = "translators_pdf.libreoffice:LibreOfficeConverter"
 provider = "translators_pdf.xlsx:XlsxIslandsConverter"
 ```
 
-Install the providers you reference: `pip install translators-pdf` (LibreOffice needs `soffice` on PATH; `pip install translators-pdf[xlsx]` for the xlsx renderer). A convertible source that can't be converted (missing binary/SDK) is a *soft* fail — the File record is created with `conversion_error` set, like `page_render_error`. See [conversion.md](../../../docs/conversion.md).
+Install the providers you reference: `pip install translators-pdf` (LibreOffice needs `soffice` on PATH; `pip install translators-pdf[xlsx]` for the xlsx renderer). For `pptx`, use the LibreOffice converter: `[conversion.pptx]` with `provider = "translators_pdf.libreoffice:LibreOfficeConverter"`. A convertible source that can't be converted (missing binary/SDK) is a *soft* fail — the File record is created with `conversion_error` set, like `page_render_error`. See [conversion.md](../../../docs/conversion.md).
 
 ### Text extraction
 
-`file add` extracts digital text at ingest time (default `--text-mode digital`, via `pdfminer.six`) and writes one compact JSON per page to `<workspace>/files/<file_id>/page_text/page_N.json`. Word locations are integer `[left, top, right, bottom]` pixel boxes that align with the matching `page_images/page_N.png`.
+`file add` extracts digital text at ingest time (default `--text-mode digital`, via `pdfminer.six`) and writes one compact JSON per page to `<workspace>/files/<file_id>/page_text/page_N.json`. Word locations are integer `[left, top, right, bottom]` pixel boxes that align with the matching `page_images/page_N.{png,jpg}`.
 
 A PDF with no extractable digital text (e.g. a scan) still gets a File record — the failure is *soft*. The response payload has `text_extraction_error` set, a permanent error is recorded, and `dgml check` reports `text_extraction_failed_permanent` until `--retry-errors` clears it. Always look at `text_extraction_error` after `file add`, the same way you look at `page_render_error`.
 
@@ -352,8 +372,12 @@ cheap). Without a `generation` section, an un-overridden `generate` fails with
 
 To run against an explicit model config **without editing `config.json`** (e.g.
 a cheap smoke-test run, or an A/B), use the override flags — they mirror `dgml
-cluster --config`. Precedence: `--model`/`--label-model` > `--generation-config`
-> the workspace config.
+cluster --config`. Precedence: `--model`/`--label-model` >
+`--generation-config` > the workspace config. A flag's or profile's model takes
+the `[models]` provider key for its provider (e.g. `anthropic_api_key_env`), else
+LiteLLM's per-provider env var (e.g. `ANTHROPIC_API_KEY`); no other configured key
+or `api_base` carries over. For a different key or a custom endpoint, put the model
+and its credentials together in the `--generation-config` file or `[generation]`.
 
 ```bash
 # Bundled profile (fast | balanced | quality) — replaces the generation
@@ -410,7 +434,7 @@ fi
 cat >> "$cfg" <<'EOF'
 
 [generation]
-model = "anthropic/claude-haiku-4-5"
+model = "anthropic/claude-haiku-5-5"
 label_model = "anthropic/claude-sonnet-5"
 api_key_env = "ANTHROPIC_API_KEY"
 EOF
@@ -536,13 +560,21 @@ waiting on the result, add `--batch`. It sends transcription, roster
 planning, concept descriptions, OCR image style (when `[style]` is enabled)
 and the semantic-link pass through the provider's batch API at half the token
 price; results can take up to 24 hours per wave, and a long document needs
-one wave per window. Labeling batches too under a closed `--schema-path`
-vocabulary (every document at once); under an open or `--extend-schema`
-vocabulary it stays synchronous, because each document is labeled against
-the tags the documents before it coined. The output is the same as a
-synchronous run. Only `anthropic/` models have a batch backend; any other
-model fails fast with `BATCH_UNAVAILABLE`, naming the stage, before spending
-anything. The payload's `batch.stages` block reports what each stage did,
+one wave per window. Labeling batches too: under a closed `--schema-path`
+vocabulary every document at once; under an open or `--extend-schema`
+vocabulary one document at a time, in the synchronous order, because each
+document is labeled against the tags the documents before it coined. That
+costs about one queue round trip per document, so pair a bulk open-vocabulary
+run with `--no-wait` (below). The output is the same as a synchronous run.
+Add `--no-batch-label` (or `batch_label = false` under `[generation]`) to
+label with ordinary synchronous calls when latency matters more than the
+labeling half of the bill; the payload's `batch.stages.label.mode` says which
+ran (`all-at-once`, `per-document` or `sync`). Only `anthropic/`, `gemini/`
+and `openai/` models have a batch backend; any other model, and an OpenAI
+model litellm serves through the Responses API (`gpt-5-pro`, `o3-pro`,
+`codex`; gpt-5.4+ for schema generation and extraction), fails fast with
+`BATCH_UNAVAILABLE`, naming the stage, before spending anything. The
+payload's `batch.stages` block reports what each stage did,
 including `cost_usd`, `standard_cost_usd` and `saved_usd`, so you can report
 the saving without `--debug`.
 
@@ -553,10 +585,100 @@ uv run dgml docset generate "$ds" --batch --schema-path ./po-tags.json | jq .bat
 Never use `--batch` on an interactive request: use it for nightly or bulk
 ingestion.
 
+**Don't hold a process open for a day: use job mode.** Add `--no-wait` to any
+`--batch` command (`docset generate`, `docset run`, `extraction extract`,
+`extraction generate-schema`, `file add <dir>`): it submits the wave and exits 0 with a
+`batch_job` payload. Check with `dgml batch status <job_id>` (read-only) and
+run `dgml batch resume <job_id>` only when it says `ready`; each resume
+replays what came back at no cost, collects open batches (never resubmits)
+and pauses on the next wave, until the command's normal payload comes back.
+A blocking `--batch` run that crashed is resumable the same way (`dgml batch
+list` shows its job). Stop resuming once status is `completed`.
+
+```bash
+job=$(uv run dgml docset generate "$ds" --batch --no-wait | jq -r .batch_job.job_id)
+uv run dgml batch status "$job" | jq -r .status   # pending | ready | completed | failed
+uv run dgml batch resume "$job"                   # when ready
+uv run dgml batch prune                           # drop finished jobs
+```
+
+`BATCH_JOB_BUSY` means another process holds the job (after a crash,
+`dgml batch unlock <job_id>` once `batch status` shows `lease.stale: true`).
+`BATCH_JOB_NONDETERMINISTIC` means the inputs changed under an open batch:
+`dgml batch cancel <job_id>` then resume.
+
+**Bound the wait with `--batch-deadline`.** A wave usually ends within an
+hour but can take many hours. When the user needs results by a certain time,
+add `--batch-deadline <duration>` (`90m`, `6h`, `1d`, at most `30d`; with
+`--batch`, on any batch command). Once it passes, open batches are canceled, results already
+produced are kept at batch price, and the rest of the run finishes
+synchronously at standard price, so the saving shrinks but the run ends. The
+deadline belongs to the job: set it on the first run; every `batch resume`
+honors it (a resume after it finishes the job instead of pausing), and passing
+a different duration on a resume is `BATCH_JOB_INVALID`. The payload's
+`.batch.deadline` reports `at`, `expired`, `canceled_batches`,
+`collected_after_cancel`, `sync_after_deadline` and `possibly_double_billed`;
+`dgml batch status` shows `deadline: {at, expired}`, and so does a paused
+run's `batch_job` block. Canceling can take minutes: the run waits a
+per-provider time for each cancel to settle (Anthropic 450 s, Gemini 60 s,
+OpenAI 660 s; a `--no-wait` run checks once and does not wait). A batch still
+canceling after that wait has its requests run synchronously; a provider that
+keeps processing while canceling (OpenAI does) may bill those twice.
+`possibly_double_billed` counts them and a WARNING names the batch. The job
+keeps such a batch as `settling`; once it ends, the next resume, `batch
+cancel` or `batch prune` records its real extra cost in `late_billed` /
+`late_billed_usd` (real spend is `cost_usd + late_billed_usd`), and `batch
+prune` keeps the job until then (listed in `settling`). While one is settling,
+`.batch.deadline.job_id` names that job, and `batch delete` refuses it without
+`--force` (the late cost would be lost).
+
+```bash
+job=$(uv run dgml docset generate "$ds" --batch --no-wait --batch-deadline 6h | jq -r .batch_job.job_id)
+```
+
+**A whole docset, overnight, in one command.** `dgml docset run` chains the
+extraction schema (only when the docset has none, from `--schema-from`
+samples), `docset generate`, and `extraction extract --all`, each exactly as
+the standalone command runs, with the step payloads nested under `.steps`.
+Under `--batch --no-wait` the entire pipeline is **one** job: each
+`batch resume` continues whichever step is waiting (or pauses again if its
+batch is still running), finished steps replay free, and `batch status`
+reports `.step` (`schema`, `generate`, `extract`, or `completed`). Pass-through
+options (`--window-size`, `--thinking`, `--model`, …) are checked for every
+step before the first one runs, so a bad value fails at once with
+`INVALID_ARGUMENT` instead of after the schema step has paid. `--no-batch-label`
+passes through to `docset generate`, and `--batch-deadline` is one deadline for
+the whole run, not one per step. Prefer it to
+chaining the three commands yourself for an unattended run: one job id to
+track, one cron entry.
+
+```bash
+job=$(uv run dgml docset run "$ds" --schema-from "$sample_fid" --batch --no-wait \
+  | jq -r .batch_job.job_id)
+# cron every 15-30 min (one resume at a time per job); remove the entry once
+# status is `completed` — resuming a completed job fails with BATCH_JOB_INVALID:
+[ "$(uv run dgml batch status "$job" | jq -r .status)" = ready ] || exit 0
+out=$(uv run dgml batch resume "$job")
+echo "$out" | jq -e .batch_job >/dev/null \
+  || echo "$out" | jq '{schema: .steps.schema.skipped, generate: .steps.generate.summary, extract: .steps.extract.summary, waves: .batch.waves}'
+```
+
+A step that fails as a whole (for example `EMPTY_DOCSET`) fails the run with
+that step's error code (`INTERNAL_ERROR` for an unexpected error) and
+`error.details.step` (with `completed_steps` / `skipped_steps`, in run order);
+per-file failures stay per file in the step's payload. A step that fails on
+EVERY file ends the run with its payload on stdout and exit 2 (later steps
+`skipped`), as a multi-file `extraction extract` does.
+Under `--batch`, a step that ran no batch shows `.batch.steps.<step>.skipped`
+as a string reason. With no schema and no `--schema-from`, extraction
+is skipped (`.steps.extract.skipped`), never guessed. In `docset run`,
+`BATCH_JOB_NONDETERMINISTIC` stops the run at that step (`error.details.step`):
+no later step runs.
+
 **Grounding is built in.** As the last step, generation grounds each
 `<stem>.dgml.xml` *in place* against the file's `page_text/` OCR — adding
 a `dg:origin` bounding-box attribute (`<page> <x1> <y1> <x2> <y2>`,
-space-separated, in integer image pixels, matching `page_images/page_N.png`) to
+space-separated, in integer image pixels, matching `page_images/page_N.{png,jpg}`) to
 every element whose subtree grounded: elements with text content get one
 box per visual line, and pure containers (sections, lists, tables, rows,
 the document root) get one union box per page. It's deterministic (no LLM, no config),
@@ -675,6 +797,10 @@ The workflow is generate-schema → extract → get-values:
 #    (xsd:date, xsd:decimal, xsd:integer, …) — dates/amounts/counts come back as
 #    typed dg:value at extraction, not bare text.
 uv run dgml extraction generate-schema "$ds" --from-file "$fid"
+#    Same request at about half price through the provider's batch API when
+#    nobody is waiting on it: one batch round trip (minutes, at most 24h), the
+#    same schema stored, plus a `batch` block in the payload.
+uv run dgml extraction generate-schema "$ds" --batch | jq '{model, batch}'
 
 #    …or set one yourself. set-schema accepts RNC *or* a JSON Schema and
 #    converts JSON to RNC on the way in (RNC is the only on-disk form).
@@ -706,6 +832,23 @@ uv run dgml extraction get-guidance "$ds" | jq -r .guidance
 uv run dgml docset add-file "$fid" --docset "$ds" | jq '.extraction | {error, cost: .usage.cost_usd}'
 uv run dgml extraction extract "$ds" "$fid" | jq '{mode, tool_calls, field_count, xml_key}'
 
+#    Many files at once: name several ids or pass --all. Each file gets its own
+#    `results` entry and a failed file never aborts the others — check
+#    `.summary.failed` and each entry's `status`/`error`. Exit is 0 even on a
+#    partial failure; it is 2 (payload still on stdout) only when EVERY file
+#    failed.
+#    Add --batch when nobody is waiting on the answer (a backfill, a nightly
+#    re-extract): both LLM phases go through the provider's batch API at about
+#    half price, but results take minutes to hours (up to 24h; 48h on Gemini).
+#    Only Anthropic, Gemini and OpenAI chat-mode models can batch (gpt-5.4+
+#    is refused here: litellm sends its extraction calls to the Responses
+#    API); anything else fails fast
+#    with BATCH_UNAVAILABLE and nothing is sent. One file id with --batch keeps the single-file payload
+#    above (plus a `batch` block), not `summary`/`results`. Every `batch` block
+#    reports `cost_usd`, `standard_cost_usd` and `saved_usd`.
+uv run dgml extraction extract "$ds" --all --batch \
+  | jq '{summary, failed: [.results[] | select(.status == "failed")], batch}'
+
 # 3) Read them back. Default is values-shape JSON (projected from dg:extraction);
 #    --as xml returns the whole core DGML document.
 uv run dgml extraction get-values "$ds" "$fid" \
@@ -717,7 +860,7 @@ Inspect or convert the stored schema with `get-schema` (`--schema-format rnc`
 default, or `json` for the engine's extracted-value projection). Typed values
 carry a normalized `dg:value`/`xsi:type` (dates, amounts, integers), enum
 fields carry the schema token as `dg:value` (no `xsi:type`), and every
-grounded value carries a `dg:origin` box back to `page_images/page_N.png`.
+grounded value carries a `dg:origin` box back to `page_images/page_N.{png,jpg}`.
 
 A schema field's `## Prompt:` may describe a **derivation rule** instead of a
 place on the page ("Compute as sum of Quantity × UnitPrice for each LineItem").
@@ -861,7 +1004,7 @@ asked to name a new one, bundling multiple files per cluster into a
 single call). The only time a placeholder like `"unknown_0"` shows up
 here is for a file that also appears in `failed_file_ids`.
 
-`failed_file_ids` covers two distinct cases: files whose `page_1.png` is
+`failed_file_ids` covers two distinct cases: files whose `page_1.{png,jpg}` is
 missing (page render failed at ingest — can't be embedded) and files
 whose cluster needed LLM naming but that call failed. Both surface in
 the same channel.
@@ -985,11 +1128,13 @@ Check the response payload's `conflict_kind` (`"hash"` or `"path"`), `created`, 
 
 `file add --id <id>` fails with `CONFLICT` if another File holds that id with different content (under every policy, except `--on-conflict replace` re-ingesting a revised document under its own id). It fails with `INVALID_ARGUMENT` if the id is malformed, the path is a directory, or the policy would return an existing record carrying a different id — it never silently hands back an id you didn't ask for. `--id` is not allowed when the path is a directory.
 
+`docset create --id <id>` likewise fails with `CONFLICT` if a DocSet already holds that id (the existing DocSet is untouched) and with `INVALID_ARGUMENT` if the id is malformed.
+
 ## Things to remember
 
 - Ghostscript is the default PDF engine and must be installed system-wide (`brew install ghostscript` / `apt-get install ghostscript`) unless you switch engines. Without it, page rendering fails and `dgml check` will flag it. To avoid it entirely, set `[pdf] provider = "pypdfium2"` in the config (`pip install dgml[pdfium]`): PDFium then handles **both** page-image rendering and the page slicing `docset generate` needs, so no system binary is required.
 - A `docset delete` does **not** delete the underlying Files — they may belong to other DocSets. Use `file delete` to remove a File entirely.
-- Generated IDs are 12-char base-36 strings. Don't try to derive them; always pull them from JSON output. A File ID can also be **set** at add time with `file add --id <id>` (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit) — do that when the id is decided elsewhere and must match, not to guess an existing one.
+- Generated IDs are 12-char base-36 strings. Don't try to derive them; always pull them from JSON output. A File or DocSet ID can also be **set** at creation with `file add --id <id>` or `docset create --id <id>` (3 to 40 characters using only lowercase letters, digits, hyphens and underscores, starting with a letter or digit — a UUID qualifies) — do that when the id is decided elsewhere and must match, not to guess an existing one.
 - The JSON output schema is part of the public API. If a command's output shape looks wrong, the implementation is probably the source of truth — read [packages/dgml/src/dgml/cli.py](../../../packages/dgml/src/dgml/cli.py).
 
 ## Discover XML element subtrees and stake them on chain

@@ -41,7 +41,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 from clustering.utils import resolve_device
 
@@ -165,6 +165,6 @@ class QwenVLEncoder(Encoder[Image.Image]):
         return EncoderOutput(pooled=pooled.detach().cpu())
 
 
-@register_encoder("qwen_vl")
+@register_encoder(EncoderName.QWEN_VL)
 def _factory(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return QwenVLEncoder(cfg, device=device)

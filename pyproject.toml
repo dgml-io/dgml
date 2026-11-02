@@ -13,9 +13,6 @@ dev-dependencies = [
     "boto3>=1.34",
     "azure-ai-documentintelligence>=1.0",
     "azure-identity>=1.15",
-    # Pillow (the OCR extras' deskew dependency) — in dev so the rotation
-    # tests and mypy can see it. Tests build/rotate images in-process.
-    "Pillow>=10.0",
     # PyObjC (the `dgml[macos]` extra) is macOS-only — gated to darwin so it
     # installs in dev there (Apple Vision tests run) and is skipped on
     # Linux/Windows CI (those tests skip).
@@ -24,7 +21,6 @@ dev-dependencies = [
     # The `dgml[pdfium]` page-render extra, installed in dev so its provider
     # tests run against the real PDFium (no network involved).
     "pypdfium2>=4.30",
-    "pillow>=10.2",
     # Type stubs for PyYAML (the runtime dep moved to `dgml` core).
     "types-PyYAML>=6.0",
     # Type stubs (typeshed, Apache-2.0) so mypy can check the translators-pdf

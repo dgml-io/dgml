@@ -83,7 +83,7 @@ class WorkspaceFileDataset(DocumentDataset):
     """Lazy :class:`DocumentDataset` over a list of dgml file IDs.
 
     The first-page image for each file comes from the pre-rendered
-    ``<file>/page_images/page_1.png`` that ``dgml file add`` produced —
+    ``<file>/page_images/page_1.{png,jpg}`` that ``dgml file add`` produced —
     no re-rendering happens at cluster time. ``text`` is assembled from
     the file's ``page_text/`` JSON under ``text_view`` (the same word-box
     → text logic the eval corpus uses); pass ``text_view`` to match the

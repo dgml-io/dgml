@@ -452,6 +452,25 @@ def test_image_dimensions_reads_width_height() -> None:
     assert _image_dimensions(blob) == (1234, 5678)
 
 
+def test_image_dimensions_reads_a_jpeg() -> None:
+    """Page images are JPEG; their size comes from the header."""
+    import io
+
+    from dgml_core.ocr import _image_dimensions
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (321, 654), "white").save(buf, format="JPEG")
+    assert _image_dimensions(buf.getvalue()) == (321, 654)
+
+
+def test_image_dimensions_rejects_a_truncated_jpeg() -> None:
+    from dgml_core.ocr import _image_dimensions
+
+    with pytest.raises(ValueError, match="JPEG"):
+        _image_dimensions(b"\xff\xd8\xff\xe0")
+
+
 def test_image_dimensions_rejects_non_png() -> None:
     """Bytes that aren't a PNG raise ValueError."""
     from dgml_core.ocr import _image_dimensions

@@ -25,10 +25,10 @@ The workspace layout this script consumes is described in
     │   └── files/<file_id>/           # marker: file is assigned to this docset
     └── files/<file_id>/
         ├── file.json                  # { id, original_filename, page_count, ... }
-        ├── page_images/page_1.png     # 300 dpi render of page 1
+        ├── page_images/page_1.png     # render of page 1 (.png or .jpg)
         └── page_text/page_N.json      # word boxes (one per page)
 
-We treat each file as one document, use ``page_1.png`` as the visual
+We treat each file as one document, use ``page_1.{png,jpg}`` as the visual
 input, and concatenate ``page_text/*.json`` words into the text input.
 A file's "label" — used as supervision by S2/S3/S5 — is the *name* of
 the DocSet it's already assigned to, or ``None`` if it's unassigned.
@@ -99,8 +99,8 @@ class WorkspaceDataset(DocumentDataset):
 def _page_one_image(file_dir: Path) -> Path | None:
     """Return the page-1 image for a workspace file, or None if absent.
 
-    The DGML renderer emits ``page_images/page_<n>.png`` (canonical); older
-    workspaces may carry ``.jpg``. Resolve by extension-agnostic glob rather
+    The DGML renderer emits ``page_images/page_<n>.jpg`` or ``.png``, whichever
+    encoding was smaller for that page. Resolve by extension-agnostic glob rather
     than hardcoding a suffix so this tracks the renderer's format.
     """
     matches = sorted((file_dir / "page_images").glob("page_1.*"))
@@ -144,7 +144,7 @@ def split_view_spec(view: TextView) -> tuple[str, ...]:
 
     A single name returns a 1-tuple, so callers need no special case. Raises
     :class:`ValueError` on an unknown name, an empty component, or a repeated
-    one — ``TextView`` is a bare ``str`` alias with no ``Literal`` to validate
+    one — ``TextView`` is a bare ``str`` alias with no enum to validate
     against, and a multi-view spec arrives from user config, so it is checked
     here (once, at assembly) rather than failing deeper in an encoder.
     """
@@ -343,34 +343,39 @@ def cluster_workspace(workspace: Path) -> dict[str, str]:
         Config,
         CorpusConfig,
         EncoderConfig,
+        EncoderName,
         FusionConfig,
+        FusionName,
         LoggerConfig,
+        LoggerName,
         ManifoldConfig,
+        ManifoldName,
         ScenarioConfig,
+        ScenarioName,
         TrainingConfig,
     )
 
     if known_categories:
-        scenario_cfg = ScenarioConfig(name="s2", known_categories=known_categories)
+        scenario_cfg = ScenarioConfig(name=ScenarioName.S2, known_categories=known_categories)
     else:
-        scenario_cfg = ScenarioConfig(name="s1")
+        scenario_cfg = ScenarioConfig(name=ScenarioName.S1)
 
     config = Config(
         scenario=scenario_cfg,
         encoder_text=EncoderConfig(
-            name="st_minilm",
+            name=EncoderName.ST_MINILM,
             model_id="sentence-transformers/all-MiniLM-L6-v2",
             embedding_dim=384,
         ),
         encoder_image=EncoderConfig(
-            name="vit",
+            name=EncoderName.VIT,
             model_id="google/vit-base-patch16-224",
             embedding_dim=768,
         ),
-        fusion=FusionConfig(name="late_concat", output_dim=256),
-        manifold=ManifoldConfig(name="euclidean", dim=256),
+        fusion=FusionConfig(name=FusionName.LATE_CONCAT, output_dim=256),
+        manifold=ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=256),
         training=TrainingConfig(epochs=0, batch_size=8),
-        logger=LoggerConfig(name="none"),
+        logger=LoggerConfig(name=LoggerName.NONE),
         # corpus.root is required by the schema but unused here — we pass
         # the dataset to the scenario directly.
         corpus=CorpusConfig(root=workspace / "files"),

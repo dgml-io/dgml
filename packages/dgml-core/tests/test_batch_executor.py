@@ -25,12 +25,13 @@ from dgml_core.batch import (
     BatchJob,
     BatchRequest,
     FakeBackend,
+    ItemErrorKind,
     fake_model_response,
 )
 from dgml_core.batch.executor import DEFAULT_MAX_POLL_S, POLL_MARGIN_S, default_max_poll_s
 from dgml_core.batch.types import BatchRejected, BatchState, BatchStatus, BatchSubmitUncertain
 from dgml_core.errors import BatchExecutionFailed
-from dgml_core.usage import TIER_BATCH, TIER_STANDARD
+from dgml_core.usage import PricingTier
 
 
 def _step(tag: str) -> dict[str, Any]:
@@ -73,7 +74,7 @@ def test_every_id_gets_its_response_regardless_of_result_order() -> None:
 
     assert set(out) == set(ids)
     assert all(_text(out[cid]) == f"reply-{cid}" for cid in ids)
-    assert all(out[cid]._hidden_params[TIER_MARKER] == TIER_BATCH for cid in ids)
+    assert all(out[cid]._hidden_params[TIER_MARKER] == PricingTier.BATCH for cid in ids)
     assert sync.calls == []
     assert len(backend.submitted) == 1
     assert [r.custom_id for r in backend.submitted[0]] == ids
@@ -85,7 +86,7 @@ def test_every_id_gets_its_response_regardless_of_result_order() -> None:
 def test_errored_item_is_resubmitted_once_then_run_synchronously() -> None:
     def script(req: BatchRequest) -> Any:
         if req.custom_id == "bad":
-            return BatchItemError("bad", "errored", "provider hiccup")
+            return BatchItemError("bad", ItemErrorKind.ERRORED, "provider hiccup")
         return fake_model_response(f"reply-{req.custom_id}")
 
     backend = FakeBackend(script)
@@ -97,7 +98,7 @@ def test_errored_item_is_resubmitted_once_then_run_synchronously() -> None:
     assert [[r.custom_id for r in b] for b in backend.submitted] == [["good", "bad"], ["bad"]]
     assert sync.calls == [_step("bad")]
     assert _text(out["bad"]) == "sync:bad"
-    assert out["bad"]._hidden_params[TIER_MARKER] == TIER_STANDARD
+    assert out["bad"]._hidden_params[TIER_MARKER] == PricingTier.STANDARD
     assert _text(out["good"]) == "reply-good"
     assert ex.stats.resubmitted == 1 and ex.stats.sync_fallbacks == 1
     assert ex.stats.batch_ok == 1 and ex.stats.batches == 2
@@ -106,7 +107,7 @@ def test_errored_item_is_resubmitted_once_then_run_synchronously() -> None:
 def test_non_retryable_item_falls_back_immediately() -> None:
     def script(req: BatchRequest) -> Any:
         if req.custom_id == "bad":
-            return BatchItemError("bad", "invalid", "schema rejected")
+            return BatchItemError("bad", ItemErrorKind.INVALID, "schema rejected")
         return fake_model_response("ok")
 
     backend = FakeBackend(script)
@@ -123,7 +124,7 @@ def test_expired_item_is_resubmitted_and_served_by_the_batch() -> None:
     def script(req: BatchRequest) -> Any:
         seen[req.custom_id] = seen.get(req.custom_id, 0) + 1
         if req.custom_id == "late" and seen["late"] == 1:
-            return BatchItemError("late", "expired", "24h window passed")
+            return BatchItemError("late", ItemErrorKind.EXPIRED, "24h window passed")
         return fake_model_response(f"reply-{req.custom_id}")
 
     backend = FakeBackend(script)
@@ -131,7 +132,7 @@ def test_expired_item_is_resubmitted_and_served_by_the_batch() -> None:
     out = ex.run_wave({"a": _step("a"), "late": _step("late")})
 
     assert _text(out["late"]) == "reply-late"
-    assert out["late"]._hidden_params[TIER_MARKER] == TIER_BATCH
+    assert out["late"]._hidden_params[TIER_MARKER] == PricingTier.BATCH
     assert sync.calls == []
     assert seen == {"a": 1, "late": 2}
     assert ex.stats.resubmitted == 1 and ex.stats.sync_fallbacks == 0 and ex.stats.batches == 2
@@ -139,7 +140,7 @@ def test_expired_item_is_resubmitted_and_served_by_the_batch() -> None:
 
 def test_zero_retries_means_any_failure_falls_back_at_once() -> None:
     def script(req: BatchRequest) -> Any:
-        return BatchItemError(req.custom_id, "expired", "expired")
+        return BatchItemError(req.custom_id, ItemErrorKind.EXPIRED, "expired")
 
     backend = FakeBackend(script)
     ex, sync = _executor(backend, max_item_retries=0)
@@ -184,7 +185,7 @@ def test_wave_below_min_size_runs_synchronously_without_a_batch() -> None:
     out = ex.run_wave({"only": _step("only")})
     assert backend.submitted == []
     assert sync.calls == [_step("only")]
-    assert out["only"]._hidden_params[TIER_MARKER] == TIER_STANDARD
+    assert out["only"]._hidden_params[TIER_MARKER] == PricingTier.STANDARD
     assert ex.stats.waves == 1 and ex.stats.batches == 0 and ex.stats.sync_fallbacks == 1
 
 
@@ -273,7 +274,7 @@ def test_stats_to_json_round_trip_shape() -> None:
 def test_cost_fields_price_batch_results_and_fallbacks_at_their_tiers() -> None:
     def script(req: BatchRequest) -> Any:
         if req.custom_id == "bad":
-            return BatchItemError("bad", "invalid", "rejected")
+            return BatchItemError("bad", ItemErrorKind.INVALID, "rejected")
         return fake_model_response("ok", cost=0.25)  # batch price
 
     def sync(_kwargs: dict[str, Any]) -> Any:
@@ -290,7 +291,7 @@ def test_cost_fields_price_batch_results_and_fallbacks_at_their_tiers() -> None:
 def test_failing_sync_fallback_is_returned_as_that_items_outcome() -> None:
     def script(req: BatchRequest) -> Any:
         if req.custom_id == "bad":
-            return BatchItemError("bad", "invalid", "rejected")
+            return BatchItemError("bad", ItemErrorKind.INVALID, "rejected")
         return fake_model_response("ok")
 
     def sync(_kwargs: dict[str, Any]) -> Any:
@@ -388,7 +389,7 @@ def test_one_refused_submission_keeps_the_other_batches_results() -> None:
     ex, sync = _executor(backend)
     out = ex.run_wave({cid: _step(cid) for cid in ids})
     assert _text(out["a"]) == "reply-a" and _text(out["b"]) == "reply-b"
-    assert out["a"]._hidden_params[TIER_MARKER] == TIER_BATCH
+    assert out["a"]._hidden_params[TIER_MARKER] == PricingTier.BATCH
     assert sync.calls == [_step("c")] and _text(out["c"]) == "sync:c"
     assert ex.stats.batches == 2 and ex.stats.sync_fallbacks == 1
 
@@ -412,7 +413,7 @@ def test_default_batches_a_lone_request_rather_than_paying_full_price() -> None:
     out = ex.run_wave({"only": _step("only")})
 
     assert _text(out["only"]) == "reply-only"
-    assert out["only"]._hidden_params[TIER_MARKER] == TIER_BATCH
+    assert out["only"]._hidden_params[TIER_MARKER] == PricingTier.BATCH
     assert sync.calls == []
     assert len(backend.submitted) == 1
     assert ex.stats.sync_fallbacks == 0
@@ -433,7 +434,7 @@ def test_batch_rejected_at_submit_is_bisected_until_it_fits() -> None:
     out = ex.run_wave({cid: _step(cid) for cid in ids})
 
     assert all(_text(out[cid]) == f"reply-{cid}" for cid in ids)
-    assert all(out[cid]._hidden_params[TIER_MARKER] == TIER_BATCH for cid in ids)
+    assert all(out[cid]._hidden_params[TIER_MARKER] == PricingTier.BATCH for cid in ids)
     assert sync.calls == []
     # 8 → 4 + 4 → (2 + 2) + (2 + 2), halves in request order.
     assert [len(b) for b in backend.attempted] == [8, 4, 2, 2, 4, 2, 2]

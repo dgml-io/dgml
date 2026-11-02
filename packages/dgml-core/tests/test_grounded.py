@@ -12,8 +12,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
+import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -42,6 +45,7 @@ from dgml_core.grounded import (
     _SCHEMA_TREE_MAX_DEPTH,
     DEFAULT_MAX_TOOL_ITERS,
     GroundedConfig,
+    _describe_run,
     _drop_bboxes_from_schema,
     _empty_totals,
     _field_node_schema,
@@ -64,7 +68,7 @@ from dgml_core.storage import Workspace
 # ---------------------------------------------------------------------------
 
 DEFAULT_SCHEMA_MODEL = "anthropic/claude-opus-4-7"
-DEFAULT_VALUES_MODEL = "gemini/gemini-2.5-pro"
+DEFAULT_VALUES_MODEL = "gemini/gemini-3.1-pro-preview"
 
 # Extraction schemas are RNC at rest. A lowercase `title` tag keeps the
 # engine's JSON-Schema property key "title" (matching the mocked LLM output).
@@ -350,11 +354,16 @@ def test_load_config_models_from_tiers(workspace: Workspace) -> None:
 
     write_config(
         workspace,
-        {"models": {"advanced": "gemini/gemini-2.5-pro", "expert": "anthropic/claude-opus-4-8"}},
+        {
+            "models": {
+                "advanced": "gemini/gemini-3.1-pro-preview",
+                "expert": "anthropic/claude-opus-4-8",
+            }
+        },
     )
     config = load_grounded_config(workspace)
     assert config.schema_model == "anthropic/claude-opus-4-8"
-    assert config.values_model == "gemini/gemini-2.5-pro"
+    assert config.values_model == "gemini/gemini-3.1-pro-preview"
 
 
 def test_load_config_section_overrides_tier(workspace: Workspace) -> None:
@@ -363,7 +372,10 @@ def test_load_config_section_overrides_tier(workspace: Workspace) -> None:
     write_config(
         workspace,
         {
-            "models": {"advanced": "gemini/gemini-2.5-pro", "expert": "anthropic/claude-opus-4-8"},
+            "models": {
+                "advanced": "gemini/gemini-3.1-pro-preview",
+                "expert": "anthropic/claude-opus-4-8",
+            },
             "grounded": {"values_model": "openai/gpt-5"},
         },
     )
@@ -373,14 +385,18 @@ def test_load_config_section_overrides_tier(workspace: Workspace) -> None:
 
 
 def test_load_config_call_override_resolves_like_section(workspace: Workspace) -> None:
-    # A per-call override resolves as if written in [grounded]: the section's
-    # own credentials apply to it, and it wins over both the section and the tier.
+    # A per-call override is a layer above [grounded]: it wins over the section and
+    # the tier, and brings no credentials of its own — the section's key and
+    # endpoint were written beside `openai/gpt-5` and must not follow another model.
     from .conftest import write_config
 
     write_config(
         workspace,
         {
-            "models": {"advanced": "gemini/gemini-2.5-pro", "expert": "anthropic/claude-opus-4-8"},
+            "models": {
+                "advanced": "gemini/gemini-3.1-pro-preview",
+                "expert": "anthropic/claude-opus-4-8",
+            },
             "grounded": {
                 "values_model": "openai/gpt-5",
                 "values_api_key_env": "MY_KEY",
@@ -392,8 +408,8 @@ def test_load_config_call_override_resolves_like_section(workspace: Workspace) -
         workspace, values_model="anthropic/claude-sonnet-5", schema_model="openai/gpt-5.4"
     )
     assert config.values_model == "anthropic/claude-sonnet-5"
-    assert (config.values_api_key, config.values_api_key_env) == (None, "MY_KEY")
-    assert config.values_api_base == "https://proxy.example"
+    assert (config.values_api_key, config.values_api_key_env) == (None, None)
+    assert config.values_api_base is None
     assert config.schema_model == "openai/gpt-5.4"
     assert (config.schema_api_key, config.schema_api_key_env, config.schema_api_base) == (
         None,
@@ -436,8 +452,9 @@ def test_load_config_defaults(workspace: Workspace) -> None:
 
 
 def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> None:
-    # Tier credentials belong to the tier's model: an override to another
-    # provider takes that provider's key and no api_base, never the tier's.
+    # Tier credentials belong to the tier's model: an override to another model
+    # takes nothing from the tier — not its key, not its api_base. The provider key
+    # on [models] serves an override of its own provider, as it serves a tier.
     from .conftest import write_config
 
     write_config(
@@ -459,6 +476,7 @@ def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> No
     )
     assert (config.values_api_key, config.values_api_key_env) == ("sk-ant", None)
     assert config.values_api_base is None
+    # No openai_api_key, and the tier's Azure key is not the override's.
     assert (config.schema_api_key, config.schema_api_key_env, config.schema_api_base) == (
         None,
         None,
@@ -748,7 +766,7 @@ def test_declared_schema_accepts_a_collection_inside_a_collection() -> None:
 
 def test_submit_schema_tool_stays_within_geminis_decoder_budget() -> None:
     """Gemini rejects an over-large constrained-decoding schema with "too many
-    states for serving". Measured against gemini-2.5-pro: the current schema
+    states for serving". Measured against Gemini Pro: the current schema
     (~13 KB) is served, one more level of depth (~27 KB) is not. Guard the size
     here so raising the depth fails in CI rather than in front of a user."""
     assert len(json.dumps(_submit_schema_tool())) < 20_000
@@ -801,7 +819,7 @@ def test_generate_schema_omits_reasoning_for_anthropic(workspace: Workspace) -> 
 
     # Gemini — kept.
     gemini_cfg = GroundedConfig(
-        schema_model="gemini/gemini-2.5-pro",
+        schema_model="gemini/gemini-3.1-pro-preview",
         values_model=DEFAULT_VALUES_MODEL,
     )
     with patch("litellm.completion", return_value=response) as m:
@@ -834,7 +852,7 @@ def test_extract_values_drops_temperature_for_anthropic(
     assert phase1_kwargs["stream"] is True
 
     gemini_cfg = GroundedConfig(
-        schema_model=DEFAULT_SCHEMA_MODEL, values_model="gemini/gemini-2.5-pro"
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="gemini/gemini-3.1-pro-preview"
     )
     with patch("litellm.completion", return_value=response) as m:
         extract_values(workspace, ds_id, fid, config=gemini_cfg)
@@ -1284,6 +1302,97 @@ def test_extract_values_phase3_resolves_unmatched_via_llm(workspace: Workspace) 
     assert title["locations"] == [{"page_number": 1, "bounding_box": [100, 56, 200, 76]}]
 
 
+def _phase_log(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The run's INFO lines, with durations masked so they compare exactly."""
+    return [
+        re.sub(r"\d+\.\ds", "Ns", r.getMessage())
+        for r in caplog.records
+        if r.name == "dgml_core.grounded" and r.levelno == logging.INFO
+    ]
+
+
+def test_extract_values_logs_each_phase(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_image(workspace, fid, 1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Goodnight", "locations": [{"page_number": 1}]}}
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[100, 56, 200, 76]]}]}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ):
+        extract_values(workspace, ds_id, fid, config=config)
+
+    assert _phase_log(caplog) == [
+        f"file {fid}: extracting values into docset {ds_id} with {DEFAULT_VALUES_MODEL}",
+        f"file {fid}: phase 1 (values) starting",
+        f"file {fid}: phase 1 (values) done in Ns",
+        f"file {fid}: phase 2 (OCR matching, no LLM) matched 0 of 1 locations in Ns",
+        f"file {fid}: phase 3 (locations) starting: 1 items on 1 pages",
+        f"file {fid}: phase 3 (locations) matched 1 more locations in Ns; 0 still unmatched",
+        f"file {fid}: extracted values into docset {ds_id} (0 tool calls, Ns)",
+    ]
+
+
+def test_describe_run_skips_figures_it_does_not_have() -> None:
+    """It runs after the values are stored, so it must not raise: a cost the
+    provider did not report is None, and usage is {} when it could not be built."""
+    assert _describe_run(2, {"duration_s": 1.25, "cost_usd": 0.5}) == "2 tool calls, 1.2s, $0.5000"
+    assert _describe_run(2, {"duration_s": 1.25, "cost_usd": None}) == "2 tool calls, 1.2s"
+    assert _describe_run(2, {}) == "2 tool calls"
+
+
+def test_extract_values_logs_no_start_for_a_refused_file(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unassigned file is refused before the run starts, so nothing reads as
+    started; reporting the refusal is the caller's."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    DocSetStore(workspace).remove_file(ds_id, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with pytest.raises(FileNotFound):
+        extract_values(workspace, ds_id, fid, config=config)
+
+    assert _phase_log(caplog) == []
+
+
+def test_extract_values_logs_phase3_not_needed(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)  # "Hello", "world"
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 1}]}}
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
+
+    with patch(
+        "litellm.completion",
+        return_value=_tool_call_response("submit_values", {"values": phase1_values}),
+    ):
+        extract_values(workspace, ds_id, fid, config=config)
+
+    assert _phase_log(caplog)[-3:-1] == [
+        f"file {fid}: phase 2 (OCR matching, no LLM) matched 1 of 1 locations in Ns",
+        f"file {fid}: phase 3 (locations) not needed",
+    ]
+
+
 def test_extract_values_phase3_words_are_toon_encoded(
     workspace: Workspace,
 ) -> None:
@@ -1721,6 +1830,49 @@ def test_extract_values_phase3_merges_costs_across_parallel_pages(
     assert stats["phases"]["phase1"]["cost_usd"] == pytest.approx(0.0002)
 
 
+_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar("test_job_id", default="-")
+
+
+def test_extract_values_phase3_page_calls_run_in_the_callers_context(
+    workspace: Workspace,
+) -> None:
+    """Phase 3's page calls run on a thread pool; each must see what the caller
+    bound (a job id its log handler stamps on every record), so the page
+    workers' retry and failure lines carry it like the main thread's."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid, page_count=2)
+    _seed_page_text(workspace, fid, page=1)
+    _seed_page_text(workspace, fid, page=2)
+    _seed_page_image(workspace, fid, 1)
+    _seed_page_image(workspace, fid, 2)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    phase1_values = {
+        "title": {"text": "Goodnight", "locations": [{"page_number": 1}]},
+        "subtitle": {"text": "Farewell", "locations": [{"page_number": 2}]},
+    }
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
+    seen: list[tuple[str, bool]] = []  # (job id, on the main thread?)
+
+    def completion(**kwargs: Any) -> Any:
+        seen.append((_JOB_ID.get(), threading.current_thread() is threading.main_thread()))
+        offered = {t["function"]["name"] for t in kwargs.get("tools") or []}
+        if "submit_values" in offered:
+            return _tool_call_response("submit_values", {"values": phase1_values})
+        return _tool_call_response("submit_locations", phase3_args)
+
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    token = _JOB_ID.set("job-42")
+    try:
+        with patch("litellm.completion", side_effect=completion):
+            extract_values(workspace, ds_id, fid, config=config)
+    finally:
+        _JOB_ID.reset(token)
+
+    # Phase 1 on the caller's thread, then the two page calls on workers.
+    assert seen[0] == ("job-42", True)
+    assert sorted(seen[1:]) == [("job-42", False), ("job-42", False)]
+
+
 def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
     """A successful extract_values with write_stats=True (what the CLI passes
     under --debug) stores extraction_stats.json with per-phase timings and
@@ -1753,6 +1905,7 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "phase1_tool_schema",
     }
     assert stats["phase1_tool_schema"] == "inlined"
+    assert type(stats["phase1_tool_schema"]) is str  # the wire string, not the enum member
     assert stats["outcome"] == "ok"
     assert stats["error"] is None
     # Phase 2 matched the only location; phase 3 not needed.
@@ -1966,7 +2119,7 @@ def _rejection(message: str) -> Exception:
     import litellm.exceptions
 
     return litellm.exceptions.BadRequestError(
-        message, model="gemini-2.5-pro", llm_provider="gemini"
+        message, model="gemini-3.1-pro-preview", llm_provider="gemini"
     )
 
 
@@ -2084,7 +2237,7 @@ def test_non_rejection_errors_do_not_fall_back(
     _seed_page_text(workspace, fid, page=1)
     ds_id, _ = _seed_docset_with_schema(workspace, fid)
 
-    m, p = "gemini-2.5-pro", "gemini"
+    m, p = "gemini-3.1-pro-preview", "gemini"
     exc = {
         "timeout": litellm.exceptions.Timeout("request timed out", model=m, llm_provider=p),
         "context_window": litellm.exceptions.ContextWindowExceededError(
@@ -2124,7 +2277,7 @@ def test_schema_overflow_rejection_keeps_the_permissive_fallback(workspace: Work
     calls = _phase1_calls(mock_completion)
     assert [c["tool_choice"] for c in calls] == ["required", "required"]
     submit_tool = next(t for t in calls[1]["tools"] if t["function"]["name"] == "submit_values")
-    assert "properties" not in submit_tool["function"]["parameters"]["properties"]["values"]
+    assert submit_tool["function"]["parameters"]["properties"]["values"]["type"] == "string"
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None
     assert stats["phase1_tool_schema"] == "permissive"
@@ -3398,8 +3551,9 @@ def test_prune_to_vocabulary_drops_unknown_keys() -> None:
 
 def test_extract_values_permissive_fallback_on_too_many_states(workspace: Workspace) -> None:
     """A Gemini 'too many states for serving' rejection retries phase 1 once
-    with a permissive object parameter, prunes the result against the
-    vocabulary, and records the mode in extraction_stats.json."""
+    with the permissive parameter (the values tree as JSON text), decodes
+    and prunes the result against the vocabulary, and records the mode in
+    extraction_stats.json."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid)
     _seed_page_text(workspace, fid, page=1, words=[{"t": "hi", "l": [10, 20, 30, 40]}])
@@ -3418,17 +3572,27 @@ def test_extract_values_permissive_fallback_on_too_many_states(workspace: Worksp
         "litellm.completion",
         side_effect=[
             Exception("BadRequestError: The specified schema produces too many states for serving"),
-            _tool_call_response("submit_values", {"values": phase1_values}),
+            _tool_call_response("submit_values", {"values": json.dumps(phase1_values)}),
         ],
     ) as mock_completion:
         result = extract_values(workspace, ds.id, fid, config=config, write_stats=True)
 
     assert mock_completion.call_count == 2
-    # Retry used the permissive values parameter (no inlined properties).
+    # Retry used the permissive values parameter: JSON text, no inlined schema.
     retry_tools = mock_completion.call_args_list[1].kwargs["tools"]
     submit_tool = next(t for t in retry_tools if t["function"]["name"] == "submit_values")
     values_param = submit_tool["function"]["parameters"]["properties"]["values"]
+    assert values_param["type"] == "string"
     assert "properties" not in values_param
+    # ...and its user prompt carries the permissive block (values as JSON
+    # text, absent roots null, never `{}`) as its own block after the schema,
+    # which the first attempt did not have.
+    first_user = mock_completion.call_args_list[0].kwargs["messages"][1]["content"]
+    retry_user = mock_completion.call_args_list[1].kwargs["messages"][1]["content"]
+    assert first_user[0] == retry_user[0]  # the cached schema block is untouched
+    assert not any("SUBMISSION FORMAT" in b.get("text", "") for b in first_user)
+    assert "SUBMISSION FORMAT" in retry_user[1]["text"]
+    assert "``null``" in retry_user[1]["text"]
     # Fabricated key pruned code-side.
     assert "bogus_key" not in result.values
     assert result.values["title"]["text"] == "hi"
@@ -3881,7 +4045,7 @@ def test_phase1_schema_block_not_cached_off_anthropic(workspace: Workspace) -> N
     response = _tool_call_response("submit_values", {"values": values})
 
     gemini_cfg = GroundedConfig(
-        schema_model=DEFAULT_SCHEMA_MODEL, values_model="gemini/gemini-2.5-pro"
+        schema_model=DEFAULT_SCHEMA_MODEL, values_model="gemini/gemini-3.1-pro-preview"
     )
     with patch("litellm.completion", return_value=response) as m:
         extract_values(workspace, ds_id, fid, config=gemini_cfg)
@@ -4022,7 +4186,9 @@ def _seed_two_leaves_one_missing_page(
     return ds_id, phase1_values
 
 
-def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Workspace) -> None:
+def test_extract_values_phase3_skips_a_page_the_file_does_not_have(
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
+) -> None:
     """Phase 1 cited page 2 of a one-page file. Phase 3 still runs for page
     1 (and patches its leaf), makes no call for page 2, keeps the whole
     tree with that leaf unmatched, and counts the page in the stats."""
@@ -4030,6 +4196,7 @@ def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Wo
     ds_id, phase1_values = _seed_two_leaves_one_missing_page(workspace, fid, page_count=1)
     phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
     with patch(
         "litellm.completion",
         side_effect=[
@@ -4052,11 +4219,18 @@ def test_extract_values_phase3_skips_a_page_the_file_does_not_have(workspace: Wo
     assert stats["matching"]["matched_phase3"] == 1
     assert stats["matching"]["unmatched"] == 1
     assert stats["matching"]["dropped_unboxed_values"] == 1
+    assert [line for line in _phase_log(caplog) if "phase 3 (locations)" in line][:2] == [
+        f"file {fid}: phase 3 (locations) skipping 1 items on 1 pages the file does not "
+        "have (it has 1); they stay unmatched",
+        f"file {fid}: phase 3 (locations) starting: 1 items on 1 pages",
+    ]
 
 
 def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
-    workspace: Workspace,
+    workspace: Workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Every unmatched item is on a page the file lacks, so phase 3 is skipped,
+    and the log says so rather than calling it "not needed"."""
     fid = "f1aaaaaaaaaa"
     _seed_file(workspace, fid, page_count=1)
     _seed_page_text(workspace, fid, page=1)
@@ -4064,6 +4238,7 @@ def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
     ds_id, _ = _seed_docset_with_schema(workspace, fid)
     phase1_values = {"title": {"text": "Hello world", "locations": [{"page_number": 3}]}}
     config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    caplog.set_level(logging.INFO, logger="dgml_core")
     with patch(
         "litellm.completion",
         return_value=_tool_call_response("submit_values", {"values": phase1_values}),
@@ -4081,6 +4256,11 @@ def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(
     assert stats["phases"]["phase3"]["page_calls"] == 0
     assert stats["phases"]["phase3"]["pages_out_of_range"] == 1
     assert stats["matching"]["unmatched"] == 1
+    phase3_log = [line for line in _phase_log(caplog) if "phase 3 (locations)" in line]
+    assert phase3_log == [
+        f"file {fid}: phase 3 (locations) skipping 1 items on 1 pages the file does not "
+        "have (it has 1); they stay unmatched",
+    ]
 
 
 def test_extract_values_phase3_counts_the_dropped_page_even_when_a_page_call_fails(
@@ -4702,13 +4882,36 @@ def test_extract_values_refuses_a_tree_pruned_to_nothing_in_permissive_mode(
         "litellm.completion",
         side_effect=[
             Exception("BadRequestError: The specified schema produces too many states for serving"),
-            _tool_call_response("submit_values", {"values": {"title": "Hello world"}}),
+            _tool_call_response("submit_values", {"values": json.dumps({"title": "Hello world"})}),
         ],
     ):
         with pytest.raises(ValuesExtractionFailed, match="nothing that fits the schema"):
             extract_values(workspace, ds_id, fid, config=config, write_stats=True)
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None and stats["outcome"] == "error"
+
+
+def test_extract_values_refuses_an_empty_tree_in_permissive_mode(workspace: Workspace) -> None:
+    """The permissive fallback used to return `{}` for every file on Gemini
+    and write an empty <dg:extraction/> as "ok". An empty tree on that path
+    now fails the file, with the stats still recording the fallback."""
+    fid = "f1aaaaaaaaaa"
+    _seed_file(workspace, fid)
+    _seed_page_text(workspace, fid, page=1)
+    ds_id, _ = _seed_docset_with_schema(workspace, fid)
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            Exception("BadRequestError: The specified schema produces too many states for serving"),
+            _tool_call_response("submit_values", {"values": "{}", "layout": {}}),
+        ],
+    ):
+        with pytest.raises(ValuesExtractionFailed, match="empty values tree under the permissive"):
+            extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "error"
+    assert stats["phase1_tool_schema"] == "permissive"
 
 
 def test_extract_values_keeps_an_empty_tree_as_a_legal_outcome(workspace: Workspace) -> None:

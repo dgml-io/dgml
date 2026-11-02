@@ -27,7 +27,7 @@ from typing import Any, Generic, TypeVar
 
 import torch
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 
 T = TypeVar("T")
 
@@ -80,15 +80,15 @@ class Encoder(ABC, Generic[T]):
 
 # ── Registry ─────────────────────────────────────────────────────────────
 EncoderFactory = Callable[..., Encoder[Any]]
-_REGISTRY: dict[str, EncoderFactory] = {}
+_REGISTRY: dict[EncoderName, EncoderFactory] = {}
 
 
-def register_encoder(name: str) -> Callable[[EncoderFactory], EncoderFactory]:
+def register_encoder(name: EncoderName) -> Callable[[EncoderFactory], EncoderFactory]:
     """Decorator to register an encoder factory under ``name``."""
 
     def deco(fn: EncoderFactory) -> EncoderFactory:
         if name in _REGISTRY:
-            raise ValueError(f"Encoder {name!r} is already registered.")
+            raise ValueError(f"Encoder '{name}' is already registered.")
         _REGISTRY[name] = fn
         return fn
 
@@ -113,7 +113,9 @@ def build_encoder(
         KeyError: If ``cfg.name`` has no registered factory.
     """
     if cfg.name not in _REGISTRY:
-        raise KeyError(f"Unknown encoder {cfg.name!r}. Registered: {sorted(_REGISTRY)}")
+        raise KeyError(
+            f"Unknown encoder '{cfg.name}'. Registered: {sorted(str(n) for n in _REGISTRY)}"
+        )
     encoder = _REGISTRY[cfg.name](cfg, device=device)
     if cache_dir is not None:
         # Imported lazily to avoid a circular import (caching imports this module).
@@ -123,5 +125,5 @@ def build_encoder(
     return encoder
 
 
-def registered_encoders() -> list[str]:
+def registered_encoders() -> list[EncoderName]:
     return sorted(_REGISTRY)

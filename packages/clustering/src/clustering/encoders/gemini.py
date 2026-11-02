@@ -58,7 +58,7 @@ from typing import Any
 
 import torch
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 
 _DEFAULT_MODEL = "gemini/gemini-embedding-001"
@@ -208,4 +208,4 @@ def _factory(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
     return GeminiEncoder(cfg, device=device)
 
 
-register_encoder("gemini")(_factory)
+register_encoder(EncoderName.GEMINI)(_factory)

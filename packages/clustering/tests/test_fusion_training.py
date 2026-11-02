@@ -27,7 +27,15 @@ Covered contracts:
 from __future__ import annotations
 
 import torch
-from clustering.config.schema import FusionConfig, ManifoldConfig, TrainingConfig
+from clustering.config.schema import (
+    FusionConfig,
+    FusionName,
+    LossName,
+    ManifoldConfig,
+    ManifoldName,
+    Modality,
+    TrainingConfig,
+)
 from clustering.encoders.base import EncoderOutput
 from clustering.fusion import build_fusion
 from clustering.manifolds import ManifoldProjector, build_manifold, train_fusion_projector
@@ -39,21 +47,23 @@ def test_none_fusion_prefers_configured_modality() -> None:
     image = EncoderOutput(pooled=torch.ones(2, 7))
 
     img_fusion = build_fusion(
-        FusionConfig(name="none", prefer_modality="image"), text_dim=5, image_dim=7
+        FusionConfig(name=FusionName.NONE, prefer_modality=Modality.IMAGE), text_dim=5, image_dim=7
     )
     assert img_fusion.output_dim == 7
     assert torch.allclose(img_fusion(text, image).pooled, image.pooled)
 
     txt_fusion = build_fusion(
-        FusionConfig(name="none", prefer_modality="text"), text_dim=5, image_dim=7
+        FusionConfig(name=FusionName.NONE, prefer_modality=Modality.TEXT), text_dim=5, image_dim=7
     )
     assert txt_fusion.output_dim == 5
     assert torch.allclose(txt_fusion(text, image).pooled, text.pooled)
 
 
 def test_fusion_projector_pipeline_forward_shape() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
-    fusion = build_fusion(FusionConfig(name="late_concat", output_dim=8), text_dim=6, image_dim=4)
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
+    fusion = build_fusion(
+        FusionConfig(name=FusionName.LATE_CONCAT, output_dim=8), text_dim=6, image_dim=4
+    )
     projector = ManifoldProjector(m, input_dim=8, output_dim=8, force_identity=True)
     pipeline = _FusionProjector(fusion, projector, text_dim=6)
 
@@ -74,13 +84,15 @@ def _toy_two_class(
 
 
 def test_train_fusion_projector_updates_fusion_weights() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
-    fusion = build_fusion(FusionConfig(name="late_concat", output_dim=8), text_dim=6, image_dim=4)
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
+    fusion = build_fusion(
+        FusionConfig(name=FusionName.LATE_CONCAT, output_dim=8), text_dim=6, image_dim=4
+    )
     projector = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True)
     text, image, labels = _toy_two_class()
 
     before = fusion.mlp[0].weight.detach().clone()  # type: ignore[index, union-attr]
-    cfg = TrainingConfig(epochs=3, loss="prototypical", lr=1e-1, trainable_fusion=True)
+    cfg = TrainingConfig(epochs=3, loss=LossName.PROTOTYPICAL, lr=1e-1, trainable_fusion=True)
     history = train_fusion_projector(fusion, projector, text, image, labels, cfg=cfg)
 
     assert len(history) == 3
@@ -89,8 +101,10 @@ def test_train_fusion_projector_updates_fusion_weights() -> None:
 
 
 def test_train_fusion_projector_noop_without_epochs() -> None:
-    m = build_manifold(ManifoldConfig(name="euclidean", dim=8, curvature=0.0))
-    fusion = build_fusion(FusionConfig(name="late_concat", output_dim=8), text_dim=6, image_dim=4)
+    m = build_manifold(ManifoldConfig(name=ManifoldName.EUCLIDEAN, dim=8, curvature=0.0))
+    fusion = build_fusion(
+        FusionConfig(name=FusionName.LATE_CONCAT, output_dim=8), text_dim=6, image_dim=4
+    )
     projector = ManifoldProjector(m, input_dim=8, output_dim=8, trainable=True)
     text, image, labels = _toy_two_class()
     cfg = TrainingConfig(epochs=0, trainable_fusion=True)

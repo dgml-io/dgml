@@ -18,7 +18,7 @@ purpose-built **multimodal embedding** model (base: Qwen3-VL-*-Instruct). It
 emits a single, already-normalized vector per input in a *shared text+image
 space*, so the same encoder serves both sides of the pipeline:
 
-* as ``encoder_image`` it embeds a page render (``page_1.png``);
+* as ``encoder_image`` it embeds a page render (``page_1.{png,jpg}``);
 * as ``encoder_text`` it embeds the page's OCR text;
 
 and because both land in one space, the fusion layer combines genuinely
@@ -61,7 +61,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from clustering.config.schema import EncoderConfig
+from clustering.config.schema import EncoderConfig, EncoderName
 from clustering.encoders.base import Encoder, EncoderOutput, register_encoder
 from clustering.encoders.mrl import mrl_truncate
 from clustering.utils import resolve_device
@@ -293,5 +293,5 @@ def _factory(cfg: EncoderConfig, *, device: str = "auto") -> Encoder[Any]:
 # MRL-truncatable). Registered under a size-explicit name each; the same name
 # works as ``encoder_text`` or ``encoder_image`` because the encoder embeds
 # both modalities into one shared space.
-register_encoder("qwen3_vl_embedding")(_factory)  # Qwen/Qwen3-VL-Embedding-8B
-register_encoder("qwen3_vl_embedding_2b")(_factory)  # Qwen/Qwen3-VL-Embedding-2B
+register_encoder(EncoderName.QWEN3_VL_EMBEDDING)(_factory)  # Qwen/Qwen3-VL-Embedding-8B
+register_encoder(EncoderName.QWEN3_VL_EMBEDDING_2B)(_factory)  # Qwen/Qwen3-VL-Embedding-2B

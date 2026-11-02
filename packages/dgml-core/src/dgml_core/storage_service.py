@@ -67,6 +67,7 @@ from typing import Any
 from . import layout
 from .hashing import sha256_file
 from .provider import ProviderConfigFields
+from .redaction import redacted
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,13 @@ class StorageConfig:
     root: Path
     options: Mapping[str, Any] = field(default_factory=dict)
     workspace_id: str | None = None
+
+    def __repr__(self) -> str:
+        """Credential-named options print as ``***``."""
+        return (
+            f"StorageConfig(provider={self.provider!r}, root={self.root!r}, "
+            f"options={redacted(self.options)!r}, workspace_id={self.workspace_id!r})"
+        )
 
 
 class _StoreBase(ProviderConfigFields, ABC):

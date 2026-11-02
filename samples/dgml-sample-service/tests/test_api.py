@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
-from dgml_core import ClassificationDecision, layout
+from dgml_core import ClassificationDecision, DecisionKind, layout
 from dgml_core.grounded import ExtractionResult
 from dgml_sample_service import operations
 from dgml_sample_service.db import dgml_settings
@@ -138,7 +138,11 @@ def test_upload_view_and_storage_lock(
     assert files[0]["page_count"] == 1 and files[0]["page_image_renderer"] == "pypdfium2"
 
     page = client.get(f"/api/orgs/{org_id}/files/{file_id}/pages/1")
-    assert page.status_code == 200 and page.content.startswith(b"\x89PNG")
+    # A page is a PNG or a JPEG, whichever was smaller; the type must match the bytes.
+    assert page.status_code == 200
+    expected = "image/png" if page.content.startswith(b"\x89PNG") else "image/jpeg"
+    assert page.content[:3] in (b"\x89PN", b"\xff\xd8\xff")
+    assert page.headers["content-type"] == expected
     assert client.get(f"/api/orgs/{org_id}/files/{file_id}/pages/9").status_code == 404
     source = client.get(f"/api/orgs/{org_id}/files/{file_id}/source")
     assert source.status_code == 200 and source.content.startswith(b"%PDF")
@@ -201,7 +205,7 @@ def test_classify_assigns_and_extracts(
 
     def fake_classify(ws: Any, fid: str, *, config: Any, mode: Any) -> ClassificationDecision:
         seen["mode"], seen["model"] = mode, config.model
-        return ClassificationDecision(decision="existing", existing_docset_id=ds["id"])
+        return ClassificationDecision(decision=DecisionKind.EXISTING, existing_docset_id=ds["id"])
 
     def fake_extract(ws: Any, docset_id: str, fid: str, **_: Any) -> ExtractionResult:
         key = layout.dgml_xml_key(docset_id, fid, "lease")
@@ -217,7 +221,7 @@ def test_classify_assigns_and_extracts(
     monkeypatch.setattr(operations, "classify_file", fake_classify)
     monkeypatch.setattr("dgml_core.extraction.extract_file", fake_extract)
     monkeypatch.setattr(
-        "dgml_core.extraction._auto_extract",
+        "dgml_core.extraction.auto_extract",
         lambda ws, d, f, **kw: {
             "performed": True,
             "error": None,
@@ -235,7 +239,7 @@ def test_classify_assigns_and_extracts(
     assert done["result"]["docset_id"] == ds["id"]
     assert done["result"]["extraction"]["performed"] is True
     assert str(seen["mode"]) == "existing"
-    assert seen["model"] == "anthropic/claude-haiku-4-5"  # the light tier of the family
+    assert seen["model"] == "anthropic/claude-haiku-5-5"  # the light tier of the family
 
     detail = client.get(f"{base}/{ds['id']}").json()
     assert detail["file_ids"] == [file_id] and detail["files"][0]["has_dgml"] is True
@@ -298,7 +302,9 @@ def test_classify_none_leaves_file_unassigned(
     monkeypatch.setattr(
         operations,
         "classify_file",
-        lambda *a, **k: ClassificationDecision(decision="none", reason="a lease, not an invoice"),
+        lambda *a, **k: ClassificationDecision(
+            decision=DecisionKind.NONE, reason="a lease, not an invoice"
+        ),
     )
     job = client.post(f"/api/orgs/{org_id}/files/{file_id}/classify", json={}).json()
     done = wait_job(org_id, job["id"])
@@ -324,7 +330,7 @@ def test_classify_new_creates_docset(
         operations,
         "classify_file",
         lambda *a, **k: ClassificationDecision(
-            decision="new",
+            decision=DecisionKind.NEW,
             new_name="Lease",
             new_description="A lease",
             new_key_questions=("What is the rent?",),

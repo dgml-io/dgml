@@ -32,6 +32,7 @@ from unittest.mock import patch
 
 import pytest
 from dgml_core import layout
+from dgml_core.batch import ItemErrorKind
 from dgml_core.default_config import PROVIDER_MODELS
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import ValuesExtractionFailed
@@ -205,7 +206,7 @@ def test_is_request_too_large_recognizes_provider_errors() -> None:
     assert is_request_too_large(_too_large_error())
     gemini = ContextWindowExceededError(
         message="GeminiException - 400 Request payload size exceeds the limit: 20971520 bytes.",
-        model="gemini/gemini-2.5-pro",
+        model="gemini/gemini-3.1-pro-preview",
         llm_provider="gemini",
     )
     assert is_request_too_large(gemini)
@@ -271,6 +272,36 @@ def test_oversized_pdf_is_split_and_merged(workspace: Workspace, tmp_path: Path)
     assert stats["phases"]["phase1"]["pdf_parts"] == [[1, 2], [3, 4], [5, 6], [7, 8]]
 
 
+def test_oversized_pdf_is_split_under_batch_like_sync(workspace: Workspace, tmp_path: Path) -> None:
+    """Under a batch driver a too-large phase-1 request comes back as an
+    ``invalid`` item, is run synchronously, and the provider's 413 thrown into
+    the generator trips the same page-range split: same values as sync."""
+    from dgml_core.batch import BatchExecutor, BatchItemError, BatchRequest, FakeBackend
+    from dgml_core.grounded import extract_values_batch
+
+    pdf = _big_pdf(tmp_path)
+    ds_id, fid = _seed(workspace, pdf)
+    sizes: list[int] = []
+    with patch("litellm.completion", side_effect=_rejecting(_LIMIT, _bill_model, sizes)):
+        sync = extract_values(workspace, ds_id, fid, config=_config())
+
+    def script(req: BatchRequest) -> Any:
+        if len(json.dumps(req.kwargs["messages"]).encode()) > _LIMIT:
+            return BatchItemError(req.custom_id, ItemErrorKind.INVALID, "request_too_large")
+        return _bill_model(req.kwargs)
+
+    executor = BatchExecutor(FakeBackend(script), min_wave_size=1, sleep=lambda _s: None)
+    with patch("litellm.completion", side_effect=_rejecting(_LIMIT, _bill_model, [])):
+        batch = extract_values_batch(workspace, ds_id, [fid], config=_config(), executor=executor)
+
+    result = batch[fid]
+    assert not isinstance(result, Exception), result
+    assert result.values == sync.values
+    # The whole document and both halves were refused, then the quarters batched.
+    assert executor.stats.sync_fallbacks == 1 + 2
+    assert executor.stats.batch_ok == 4
+
+
 def test_part_requests_say_which_pages_they_hold(workspace: Workspace, tmp_path: Path) -> None:
     ds_id, fid = _seed(workspace, _big_pdf(tmp_path))
     with patch("litellm.completion", side_effect=_rejecting(_LIMIT, _bill_model, [])) as m:
@@ -329,7 +360,10 @@ def test_accepted_request_is_unchanged(workspace: Workspace, tmp_path: Path) -> 
     assert [b["type"] for b in content] == ["text", "file"]
     assert content[1] == {
         "type": "file",
-        "file": {"file_data": "data:application/pdf;base64," + base64.b64encode(pdf).decode()},
+        "file": {
+            "file_data": "data:application/pdf;base64," + base64.b64encode(pdf).decode(),
+            "filename": "document.pdf",
+        },
     }
     stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
     assert stats is not None

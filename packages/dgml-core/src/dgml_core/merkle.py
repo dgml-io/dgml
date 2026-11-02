@@ -42,13 +42,26 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Literal
+from enum import StrEnum
+from typing import Any
 
 from lxml import etree  # type: ignore[import-untyped]
 from lxml.etree import _Element  # type: ignore[import-untyped]
 
 HASH_HEX_LEN: int = 64
-Side = Literal["L", "R"]
+
+
+class Side(StrEnum):
+    """Which side of the current node a :class:`ProofStep`'s sibling sits on.
+
+    It only orders the two operands of a pair hash (see :class:`ProofStep`); the
+    side itself is never hashed. A ``StrEnum`` whose value is the literal
+    ``"L"`` / ``"R"`` that :func:`proof_to_json` emits and
+    :func:`proof_from_json` accepts, so the proof wire format is unchanged.
+    """
+
+    L = "L"
+    R = "R"
 
 
 @dataclass(frozen=True)
@@ -201,9 +214,9 @@ def verify_proof(root_hash: str, element: _Element, proof: MerkleProof) -> bool:
         return False
     current = candidate
     for step in proof.path:
-        if step.side == "L":
+        if step.side == Side.L:
             current = _hash_pair(step.sibling, current)
-        elif step.side == "R":
+        elif step.side == Side.R:
             current = _hash_pair(current, step.sibling)
         else:
             # Structurally invalid proof (shouldn't happen via the typed API,
@@ -225,7 +238,9 @@ def proof_to_json(proof: MerkleProof) -> dict[str, object]:
         "leaf_hash": proof.leaf_hash,
         "leaf_index": proof.leaf_index,
         "leaf_count": proof.leaf_count,
-        "path": [{"sibling": s.sibling, "side": s.side} for s in proof.path],
+        # ``str()`` keeps the plain-data view plain: the bare value, not the enum
+        # member (and unchanged for a step built with a bare string).
+        "path": [{"sibling": s.sibling, "side": str(s.side)} for s in proof.path],
     }
 
 
@@ -255,9 +270,11 @@ def proof_from_json(data: object) -> MerkleProof:
     for i, raw in enumerate(raw_path):
         if not isinstance(raw, dict):
             raise ValueError(f"path[{i}] must be a JSON object")
-        side = raw.get("side")
-        if side not in ("L", "R"):
-            raise ValueError(f"path[{i}].side must be 'L' or 'R', got {side!r}")
+        raw_side: Any = raw.get("side")  # any JSON value; ``Side()`` rejects the rest
+        try:
+            side = Side(raw_side)
+        except ValueError:
+            raise ValueError(f"path[{i}].side must be 'L' or 'R', got {raw_side!r}") from None
         steps.append(ProofStep(_require_hash(raw.get("sibling"), f"path[{i}].sibling"), side))
     return MerkleProof(
         leaf_hash=leaf_hash, leaf_index=leaf_index, leaf_count=leaf_count, path=steps
@@ -335,10 +352,10 @@ def _build_proof_path(leaves: list[str], idx: int) -> list[ProofStep]:
     while len(level) > 1:
         if pos % 2 == 1:
             # Right-side node — its partner is the left sibling.
-            path.append(ProofStep(sibling=level[pos - 1], side="L"))
+            path.append(ProofStep(sibling=level[pos - 1], side=Side.L))
         elif pos + 1 < len(level):
             # Left-side node with a partner on the right.
-            path.append(ProofStep(sibling=level[pos + 1], side="R"))
+            path.append(ProofStep(sibling=level[pos + 1], side=Side.R))
         # else: lone odd-out at this level; no step emitted.
         level = _pair_level(level)
         pos //= 2

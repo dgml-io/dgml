@@ -24,6 +24,7 @@ racing the pool picking up the next item is inherently timing-dependent, so any
 
 from __future__ import annotations
 
+import contextvars
 import threading
 import time
 
@@ -183,3 +184,51 @@ def test_map_concurrent_empty() -> None:
 
     assert map_concurrent(calls.append, [], max_workers=8) == []
     assert calls == []
+
+
+_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar("test_job_id", default="-")
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_map_concurrent_runs_items_in_the_callers_context(workers: int) -> None:
+    """What a caller binds (a job id its log handler stamps on every record) is
+    visible to ``fn`` on a worker thread, as on the inline path. A bare
+    ``ThreadPoolExecutor`` worker would see only the default."""
+    token = _JOB_ID.set("job-42")
+    try:
+        seen = map_concurrent(lambda _i: _JOB_ID.get(), list(range(6)), max_workers=workers)
+    finally:
+        _JOB_ID.reset(token)
+
+    assert seen == ["job-42"] * 6
+
+
+def test_map_concurrent_gives_each_item_its_own_context() -> None:
+    """Each item runs in its own copy: a value one item sets is neither seen by
+    the others nor left behind in the caller."""
+    barrier = threading.Barrier(3)
+
+    def bind_then_read(i: int) -> str:
+        _JOB_ID.set(f"item-{i}")
+        barrier.wait(timeout=5)  # all three have set theirs before any reads
+        return _JOB_ID.get()
+
+    assert map_concurrent(bind_then_read, [0, 1, 2], max_workers=3) == [
+        "item-0",
+        "item-1",
+        "item-2",
+    ]
+    assert _JOB_ID.get() == "-"
+
+
+def test_map_concurrent_inline_items_get_their_own_context_too() -> None:
+    """The serial path (no pool) isolates items the same way: each starts from
+    the caller's value, not the previous item's, and the caller keeps its own."""
+
+    def read_then_bind(i: int) -> str:
+        before = _JOB_ID.get()
+        _JOB_ID.set(f"item-{i}")
+        return before
+
+    assert map_concurrent(read_then_bind, [0, 1, 2], max_workers=1) == ["-", "-", "-"]
+    assert _JOB_ID.get() == "-"

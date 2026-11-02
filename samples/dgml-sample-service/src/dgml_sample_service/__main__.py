@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 import argparse
-import logging
+
+from .logcontext import configure_logging
 
 
 def main() -> None:
@@ -27,9 +28,8 @@ def main() -> None:
 
     import uvicorn
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    # Every line carries the workspace id it was logged for (see logcontext).
+    configure_logging()
     uvicorn.run(
         "dgml_sample_service.app:create_app",
         factory=True,

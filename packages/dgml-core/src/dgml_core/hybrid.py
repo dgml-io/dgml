@@ -113,7 +113,7 @@ from .text_extraction import (
     largest_image_coverage,
 )
 from .text_extraction_config import TextExtractionConfig, resolve_api_key
-from .usage import OPERATION_HYBRID_MERGE
+from .usage import UsageOperation
 
 logger = logging.getLogger(__name__)
 
@@ -264,8 +264,8 @@ def _merge_into(
         d_payload = _read_page(digital_pages.get(page_num))
         o_payload = _read_page(ocr_pages.get(page_num))
 
-        # Prefer OCR's reported dimensions — the PNG IHDR is the source of
-        # truth they were measured against. Digital fills in only when OCR
+        # Prefer OCR's reported dimensions — the page image's header is the
+        # source of truth they were measured against. Digital fills in only when OCR
         # didn't process this page.
         rotation: float | None = None
         if o_payload is not None:
@@ -773,7 +773,7 @@ def _call_merge_llm(
         max_tokens=config.max_tokens,
         workspace=workspace,
         record_usage=record_usage,
-        operation=OPERATION_HYBRID_MERGE,
+        operation=UsageOperation.HYBRID_MERGE,
         context={"file_id": file_id, "page": page_num},
     )
     user_content = build_user_content(instruction_text=json.dumps(payload, ensure_ascii=False))

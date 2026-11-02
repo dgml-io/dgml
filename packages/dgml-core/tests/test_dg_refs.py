@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 from dgml_core.dg_refs import (
     Ref,
+    ValueMethod,
     effective_inputs,
     effective_method,
     effective_origin,
@@ -69,13 +70,13 @@ def test_boxed_value_has_no_method() -> None:
 
 
 def test_stated_method_wins() -> None:
-    assert effective_method(_el('dg:value="0" dg:method="defaulted"')) == "defaulted"
+    assert effective_method(_el('dg:value="0" dg:method="defaulted"')) is ValueMethod.DEFAULTED
     el = _el('dg:value="12" dg:inputs="#s; #e" dg:method="calculated"')
-    assert effective_method(el) == "calculated"
+    assert effective_method(el) is ValueMethod.CALCULATED
 
 
 def test_missing_method_with_inputs_reads_as_inferred() -> None:
-    assert effective_method(_el('dg:value="EMEA" dg:inputs="#hq"')) == "inferred"
+    assert effective_method(_el('dg:value="EMEA" dg:inputs="#hq"')) is ValueMethod.INFERRED
 
 
 def test_no_origin_inputs_or_method_is_unsupported() -> None:
@@ -87,7 +88,7 @@ def test_legacy_computed_origin_reads_href_as_inputs() -> None:
     el = _el('dg:origin="computed" dg:value="10" dg:itemprop="computedFrom" dg:href="#p1; #p2"')
     assert effective_origin(el) is None
     assert effective_inputs(el) == ["#p1", "#p2"]
-    assert effective_method(el) == "inferred"
+    assert effective_method(el) is ValueMethod.INFERRED
 
 
 def test_semantic_href_is_not_an_input() -> None:

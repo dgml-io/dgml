@@ -196,8 +196,8 @@ def test_support_prototypes_central_picks_typical_over_first() -> None:
             emb, labels, categories=["Invoice"], n_shots=n_shots, selection=selection
         )
 
-    order = proto("order")
-    central = proto("central")
+    order = proto(SupportSelection.ORDER)
+    central = proto(SupportSelection.CENTRAL)
 
     # order = mean of first two rows, dragged up toward the outlier
     assert torch.allclose(order[0], torch.tensor([0.0, 5.0]), atol=1e-4)
@@ -217,7 +217,7 @@ def test_support_prototypes_central_is_noop_when_within_budget() -> None:
             emb, labels, categories=["Invoice"], n_shots=8, selection=selection
         )
 
-    assert torch.allclose(proto("order")[0], proto("central")[0])
+    assert torch.allclose(proto(SupportSelection.ORDER)[0], proto(SupportSelection.CENTRAL)[0])
 
 
 def test_scenario_support_selection_defaults_to_order() -> None:

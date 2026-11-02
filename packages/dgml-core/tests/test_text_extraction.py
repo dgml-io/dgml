@@ -20,7 +20,7 @@ from dgml_core import layout
 from dgml_core.consistency import check_workspace
 from dgml_core.errors import load_recorded_errors
 from dgml_core.files import FileStore
-from dgml_core.pages import DEFAULT_DPI
+from dgml_core.pages import DEFAULT_DPI, EngineName
 from dgml_core.storage import Workspace
 from dgml_core.text_extraction import (
     TextMode,
@@ -97,6 +97,72 @@ def test_extract_text_digital_scales_boxes_with_dpi(tmp_path: Path, text_pdf: Pa
         # Every box stays inside its own page.
         assert w150["l"][2] <= page_150["width"]
         assert w150["l"][3] <= page_150["height"]
+
+
+def test_extract_text_digital_lands_in_the_stored_image_of_a_refit_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page past the edge bounds is stored at ``PageImageSpec.fit`` of its
+    render, so its word boxes must be refit by the same scale: the page JSON's
+    size is the stored image's, and a word keeps its place on the page.
+
+    Rendered for real here, so the agreement is checked against the image on
+    disk rather than against the formula both sides use.
+    """
+    from dgml_core.ocr import _image_dimensions
+    from dgml_core.pages import (
+        DEFAULT_PAGE_IMAGE_SPEC,
+        PAGE_CACHE_ENV,
+        PageImageSpec,
+        PdfConfig,
+        list_page_images,
+        render_pages,
+    )
+
+    from .conftest import _write_text_pdf
+
+    monkeypatch.delenv(PAGE_CACHE_ENV, raising=False)
+    pdf = tmp_path / "sheet.pdf"
+    _write_text_pdf(pdf, pages_text=["Hello"], page_size=(1190.55, 1683.78))  # A2
+
+    images = tmp_path / "images"
+    render_pages(pdf, images, config=PdfConfig(provider=EngineName.PYPDFIUM2))
+    (image,) = list_page_images(images)
+    stored = _image_dimensions(image.read_bytes())
+
+    extract_text_digital(pdf, tmp_path / "fit", file_id="f")
+    fit = json.loads((tmp_path / "fit" / "page_1.json").read_text())
+    assert (fit["width"], fit["height"]) == stored
+    assert max(stored) == DEFAULT_PAGE_IMAGE_SPEC.max_edge
+
+    # The same word without the fit, in full-size render pixels.
+    unbounded = PageImageSpec(min_edge=None, max_edge=None)
+    extract_text_digital(pdf, tmp_path / "full", file_id="f", image_spec=unbounded)
+    full = json.loads((tmp_path / "full" / "page_1.json").read_text())
+    ratio = stored[0] / full["width"]
+    (word,) = [w for w in fit["words"] if w["t"] == "Hello"]
+    (full_word,) = [w for w in full["words"] if w["t"] == "Hello"]
+    for c_fit, c_full in zip(word["l"], full_word["l"], strict=True):
+        assert abs(c_full * ratio - c_fit) <= 1, (word["l"], full_word["l"])
+
+
+def test_extract_text_digital_is_unchanged_for_a_page_inside_the_bounds(
+    tmp_path: Path, text_pdf: Path
+) -> None:
+    """Letter at 300 dpi is not refit, so its boxes are exactly what the plain
+    ``dpi / 72`` scale gives — the fit costs nothing on an ordinary page."""
+    from dgml_core.pages import PageImageSpec
+
+    extract_text_digital(text_pdf, tmp_path / "default", file_id="f")
+    extract_text_digital(
+        text_pdf,
+        tmp_path / "unbounded",
+        file_id="f",
+        image_spec=PageImageSpec(min_edge=None, max_edge=None),
+    )
+    for name in ("page_1.json", "page_2.json"):
+        default = (tmp_path / "default" / name).read_text()
+        assert default == (tmp_path / "unbounded" / name).read_text()
 
 
 def test_extract_text_digital_writes_compact_json(tmp_path: Path, text_pdf: Path) -> None:

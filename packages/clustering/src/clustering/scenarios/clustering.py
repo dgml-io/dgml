@@ -62,48 +62,46 @@ import math
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from enum import StrEnum
+from typing import Any, assert_never, cast
 
 import numpy as np
 import torch
 
 from clustering.calibration import Calibrator
-from clustering.config.schema import ScenarioConfig
+from clustering.config.schema import (
+    Auto,
+    ClusterAlgorithm,
+    ClusterSelectionMethod,
+    LeidenGraphMethod,
+    LeidenKSelection,
+    LeidenQuality,
+    RadiusMethod,
+    ReduceMethod,
+    ScenarioConfig,
+)
 from clustering.manifolds.base import ManifoldHead
 
 _log = logging.getLogger(__name__)
 
-ClusterAlgorithm = Literal[
-    "kmeans",
-    "hdbscan",
-    "graph_cc",
-    "leiden",
-    "dbscan",
-    "optics",
-    "affinity_propagation",
-    "meanshift",
-]
-GraphCCRadiusMethod = Literal["knee", "mst_gap"]
-LeidenGraphMethod = Literal["knn", "mutual_knn", "radius"]
-LeidenQuality = Literal["modularity", "cpm"]
-LeidenKSelection = Literal["none", "silhouette"]
-ReduceMethod = Literal[
-    "none",
-    "pca",
-    "truncated_svd",
-    "random_projection",
-    "kernel_pca",
-    "isomap",
-    "lle",
-    "spectral",
-    "umap",
-]
+
+def _check_choice(cls: type[StrEnum], value: str, message: str) -> None:
+    """Raise ``ValueError(message)`` unless ``value`` names a member of ``cls``.
+
+    The public entry points take enum members, but a caller may pass the plain
+    string (a ``StrEnum`` member *is* one). An unknown string must fail with the
+    choices spelled out, not reach an ``assert_never`` as an ``AssertionError``.
+    """
+    try:
+        cls(value)
+    except ValueError:
+        raise ValueError(message) from None
 
 
 def reduce_embeddings(
     embeddings: torch.Tensor,
     *,
-    method: ReduceMethod = "none",
+    method: ReduceMethod = ReduceMethod.NONE,
     n_components: int = 0,
     seed: int = 0,
 ) -> torch.Tensor:
@@ -148,7 +146,7 @@ def reduce_embeddings(
     """
     n = int(embeddings.shape[0])
     d = int(embeddings.shape[-1])
-    if method == "none" or n_components <= 0 or n_components >= d or n < 3:
+    if method == ReduceMethod.NONE or n_components <= 0 or n_components >= d or n < 3:
         return embeddings
     k = max(1, min(int(n_components), n - 1, d))
 
@@ -166,7 +164,9 @@ def reduce_embeddings(
 # Nonlinear reducers that build a k-nearest-neighbour graph. They clamp
 # ``n_neighbors`` for small corpora, but can still degenerate or error on
 # pathologically small / collinear inputs — where we fall back to PCA.
-_NEIGHBOUR_BASED: frozenset[ReduceMethod] = frozenset({"isomap", "lle", "spectral", "umap"})
+_NEIGHBOUR_BASED: frozenset[ReduceMethod] = frozenset(
+    {ReduceMethod.ISOMAP, ReduceMethod.LLE, ReduceMethod.SPECTRAL, ReduceMethod.UMAP}
+)
 
 
 def _fit_reduce(
@@ -189,44 +189,44 @@ def _fit_reduce(
         if method not in _NEIGHBOUR_BASED:
             raise
         warnings.warn(
-            f"reduce method {method!r} failed on this corpus (n={n}, k={k}): "
+            f"reduce method '{method}' failed on this corpus (n={n}, k={k}): "
             f"{exc}. Falling back to PCA.",
             RuntimeWarning,
             stacklevel=2,
         )
-        return _dispatch_reduce(x, method="pca", k=k, n=n, seed=seed)
+        return _dispatch_reduce(x, method=ReduceMethod.PCA, k=k, n=n, seed=seed)
 
 
 def _dispatch_reduce(
     x: np.ndarray[Any, Any], *, method: ReduceMethod, k: int, n: int, seed: int
 ) -> np.ndarray[Any, Any]:
     """Fit the requested reducer and return the ``[N, k]`` array."""
-    if method == "pca":
+    if method == ReduceMethod.PCA:
         from sklearn.decomposition import PCA
 
         return cast("np.ndarray[Any, Any]", PCA(n_components=k, random_state=seed).fit_transform(x))
-    if method == "truncated_svd":
+    if method == ReduceMethod.TRUNCATED_SVD:
         from sklearn.decomposition import TruncatedSVD
 
         return cast(
             "np.ndarray[Any, Any]",
             TruncatedSVD(n_components=k, random_state=seed).fit_transform(x),
         )
-    if method == "random_projection":
+    if method == ReduceMethod.RANDOM_PROJECTION:
         from sklearn.random_projection import GaussianRandomProjection
 
         return cast(
             "np.ndarray[Any, Any]",
             GaussianRandomProjection(n_components=k, random_state=seed).fit_transform(x),
         )
-    if method == "kernel_pca":
+    if method == ReduceMethod.KERNEL_PCA:
         from sklearn.decomposition import KernelPCA
 
         return cast(
             "np.ndarray[Any, Any]",
             KernelPCA(n_components=k, kernel="cosine", random_state=seed).fit_transform(x),
         )
-    if method == "isomap":
+    if method == ReduceMethod.ISOMAP:
         from sklearn.manifold import Isomap
 
         n_neighbors = max(2, min(10, n - 1))
@@ -234,7 +234,7 @@ def _dispatch_reduce(
             "np.ndarray[Any, Any]",
             Isomap(n_components=k, n_neighbors=n_neighbors).fit_transform(x),
         )
-    if method == "lle":
+    if method == ReduceMethod.LLE:
         from sklearn.manifold import LocallyLinearEmbedding
 
         # Standard LLE needs n_neighbors > n_components.
@@ -245,7 +245,7 @@ def _dispatch_reduce(
                 n_components=k, n_neighbors=n_neighbors, random_state=seed
             ).fit_transform(x),
         )
-    if method == "spectral":
+    if method == ReduceMethod.SPECTRAL:
         from sklearn.manifold import SpectralEmbedding
 
         n_neighbors = max(2, min(10, n - 1))
@@ -255,7 +255,7 @@ def _dispatch_reduce(
                 n_components=k, n_neighbors=n_neighbors, random_state=seed
             ).fit_transform(x),
         )
-    if method == "umap":
+    if method == ReduceMethod.UMAP:
         try:
             import umap
         except ImportError as exc:  # pragma: no cover — optional dep
@@ -280,7 +280,7 @@ def _dispatch_reduce(
                 random_state=seed,
             ).fit_transform(x),
         )
-    raise ValueError(f"Unknown reduce method {method!r}.")  # pragma: no cover — Literal-guarded
+    raise ValueError(f"Unknown reduce method {method!r}.")  # pragma: no cover — enum-guarded
 
 
 def manifold_kmeans(
@@ -350,7 +350,7 @@ def manifold_hdbscan(
     min_cluster_size: int = 5,
     min_samples: int | None = None,
     cluster_selection_epsilon: float = 0.0,
-    cluster_selection_method: Literal["eom", "leaf"] = "eom",
+    cluster_selection_method: ClusterSelectionMethod = ClusterSelectionMethod.EOM,
     allow_single_cluster: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Manifold-aware HDBSCAN clustering on ``embeddings``.
@@ -583,7 +583,7 @@ def manifold_graph_cc(
     manifold: ManifoldHead,
     *,
     radius: float | None = None,
-    r_method: GraphCCRadiusMethod = "knee",
+    r_method: RadiusMethod = RadiusMethod.KNEE,
     k_neighbors: int = 4,
     min_cluster_size: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -659,14 +659,17 @@ def manifold_graph_cc(
 
     # ── Determine radius ────────────────────────────────────────────────
     if radius is None:
-        if r_method == "knee":
+        _check_choice(
+            RadiusMethod, r_method, f"Unknown r_method {r_method!r}; expected 'knee' or 'mst_gap'."
+        )
+        if r_method == RadiusMethod.KNEE:
             r = _radius_knee(d_np, k=k_neighbors)
-        elif r_method == "mst_gap":
+        elif r_method == RadiusMethod.MST_GAP:
             r = _radius_mst_gap(d_np)
         else:
-            raise ValueError(f"Unknown r_method {r_method!r}; expected 'knee' or 'mst_gap'.")
+            assert_never(r_method)
         _log.info(
-            "manifold_graph_cc: auto-radius via %r → r=%.6f (N=%d, k=%d)",
+            "manifold_graph_cc: auto-radius via '%s' → r=%.6f (N=%d, k=%d)",
             r_method,
             r,
             n,
@@ -810,11 +813,11 @@ def manifold_leiden(
     embeddings: torch.Tensor,
     manifold: ManifoldHead,
     *,
-    graph_method: LeidenGraphMethod = "knn",
+    graph_method: LeidenGraphMethod = LeidenGraphMethod.KNN,
     k_neighbors: int = 15,
     radius: float | None = None,
-    r_method: GraphCCRadiusMethod = "knee",
-    quality: LeidenQuality = "modularity",
+    r_method: RadiusMethod = RadiusMethod.KNEE,
+    quality: LeidenQuality = LeidenQuality.MODULARITY,
     resolution: float = 1.0,
     min_cluster_size: int = 2,
     seed: int = 0,
@@ -918,15 +921,24 @@ def manifold_leiden(
     d_np = np.clip(d_np, 0.0, np.finfo(np.float64).max).astype(np.float64, copy=False)
 
     # ── Build edge list ─────────────────────────────────────────────────
-    if graph_method == "knn":
+    _check_choice(
+        LeidenGraphMethod,
+        graph_method,
+        f"Unknown graph_method {graph_method!r}; expected 'knn', 'mutual_knn', or 'radius'.",
+    )
+    if graph_method == LeidenGraphMethod.KNN:
         src, dst, dist = _knn_edges(d_np, k=k_neighbors, mutual=False)
-    elif graph_method == "mutual_knn":
+    elif graph_method == LeidenGraphMethod.MUTUAL_KNN:
         src, dst, dist = _knn_edges(d_np, k=k_neighbors, mutual=True)
-    elif graph_method == "radius":
+    elif graph_method == LeidenGraphMethod.RADIUS:
         if radius is None:
-            r = _radius_knee(d_np, k=k_neighbors) if r_method == "knee" else _radius_mst_gap(d_np)
+            r = (
+                _radius_knee(d_np, k=k_neighbors)
+                if r_method == RadiusMethod.KNEE
+                else _radius_mst_gap(d_np)
+            )
             _log.info(
-                "manifold_leiden: auto-radius via %r → r=%.6f (N=%d, k=%d)",
+                "manifold_leiden: auto-radius via '%s' → r=%.6f (N=%d, k=%d)",
                 r_method,
                 r,
                 n,
@@ -936,9 +948,7 @@ def manifold_leiden(
             r = float(radius)
         src, dst, dist = _radius_edges(d_np, radius=r)
     else:
-        raise ValueError(
-            f"Unknown graph_method {graph_method!r}; expected 'knn', 'mutual_knn', or 'radius'."
-        )
+        assert_never(graph_method)
 
     weights = _distance_to_similarity(dist)
 
@@ -949,7 +959,7 @@ def manifold_leiden(
     # directly. The CPM objective has no networkx equivalent, so
     # ``quality="cpm"`` is served by the same resolution-scaled modularity
     # optimizer (an approximation — see docstring).
-    if quality not in ("modularity", "cpm"):
+    if quality not in (LeidenQuality.MODULARITY, LeidenQuality.CPM):
         raise ValueError(f"Unknown quality {quality!r}; expected 'modularity' or 'cpm'.")
 
     g: nx.Graph[int] = nx.Graph()
@@ -1090,7 +1100,7 @@ def manifold_dbscan(
     manifold: ManifoldHead,
     *,
     eps: float | None = None,
-    r_method: GraphCCRadiusMethod = "knee",
+    r_method: RadiusMethod = RadiusMethod.KNEE,
     k_neighbors: int = 4,
     min_samples: int = 5,
     min_cluster_size: int = 1,
@@ -1130,12 +1140,15 @@ def manifold_dbscan(
     d_np = _manifold_distance_matrix(embeddings, manifold)
 
     if eps is None:
-        if r_method == "knee":
+        _check_choice(
+            RadiusMethod, r_method, f"Unknown r_method {r_method!r}; expected 'knee' or 'mst_gap'."
+        )
+        if r_method == RadiusMethod.KNEE:
             r = _radius_knee(d_np, k=k_neighbors)
-        elif r_method == "mst_gap":
+        elif r_method == RadiusMethod.MST_GAP:
             r = _radius_mst_gap(d_np)
         else:
-            raise ValueError(f"Unknown r_method {r_method!r}; expected 'knee' or 'mst_gap'.")
+            assert_never(r_method)
         # A degenerate knee at 0 would make every point its own noise cluster;
         # nudge to the smallest positive off-diagonal distance so DBSCAN can
         # connect at least the nearest pairs.
@@ -1144,7 +1157,11 @@ def manifold_dbscan(
             positive = off_diag[off_diag > 0.0]
             r = float(positive.min()) if positive.size else 1.0
         _log.info(
-            "manifold_dbscan: auto-eps via %r → eps=%.6f (N=%d, k=%d)", r_method, r, n, k_neighbors
+            "manifold_dbscan: auto-eps via '%s' → eps=%.6f (N=%d, k=%d)",
+            r_method,
+            r,
+            n,
+            k_neighbors,
         )
     else:
         r = float(eps)
@@ -1400,35 +1417,35 @@ def cluster_embeddings(
     embeddings: torch.Tensor,
     manifold: ManifoldHead,
     *,
-    algorithm: ClusterAlgorithm = "kmeans",
+    algorithm: ClusterAlgorithm = ClusterAlgorithm.KMEANS,
     k: int | None = None,
     seed: int = 0,
     # HDBSCAN-only knobs (ignored for other algorithms).
     min_cluster_size: int = 5,
     min_samples: int | None = None,
     cluster_selection_epsilon: float = 0.0,
-    cluster_selection_method: Literal["eom", "leaf"] = "eom",
+    cluster_selection_method: ClusterSelectionMethod = ClusterSelectionMethod.EOM,
     allow_single_cluster: bool = False,
     # graph_cc-only knobs.  Prefixed so they don't collide with HDBSCAN's
     # ``min_cluster_size``.
     graph_cc_radius: float | None = None,
-    graph_cc_r_method: GraphCCRadiusMethod = "knee",
+    graph_cc_r_method: RadiusMethod = RadiusMethod.KNEE,
     graph_cc_k_neighbors: int = 4,
     graph_cc_min_cluster_size: int = 2,
     # Leiden-only knobs.
-    leiden_graph_method: LeidenGraphMethod = "knn",
+    leiden_graph_method: LeidenGraphMethod = LeidenGraphMethod.KNN,
     leiden_k_neighbors: int = 15,
     leiden_radius: float | None = None,
-    leiden_r_method: GraphCCRadiusMethod = "knee",
-    leiden_quality: LeidenQuality = "modularity",
+    leiden_r_method: RadiusMethod = RadiusMethod.KNEE,
+    leiden_quality: LeidenQuality = LeidenQuality.MODULARITY,
     leiden_resolution: float = 1.0,
     leiden_min_cluster_size: int = 2,
     leiden_n_iterations: int = -1,
-    leiden_k_selection: LeidenKSelection = "none",
+    leiden_k_selection: LeidenKSelection = LeidenKSelection.NONE,
     leiden_k_selection_margin: float = 0.1,
     # DBSCAN-only knobs.
     dbscan_eps: float | None = None,
-    dbscan_r_method: GraphCCRadiusMethod = "knee",
+    dbscan_r_method: RadiusMethod = RadiusMethod.KNEE,
     dbscan_k_neighbors: int = 4,
     dbscan_min_samples: int = 5,
     dbscan_min_cluster_size: int = 1,
@@ -1469,11 +1486,17 @@ def cluster_embeddings(
     Keeps S1 / S2 callers parameterised on ``algorithm`` without
     branching at every call site.
     """
-    if algorithm == "kmeans":
+    _check_choice(
+        ClusterAlgorithm,
+        algorithm,
+        f"Unknown clustering algorithm {algorithm!r}; expected one of 'kmeans', 'hdbscan', "
+        "'graph_cc', 'leiden', 'dbscan', 'optics', 'affinity_propagation', 'meanshift'.",
+    )
+    if algorithm == ClusterAlgorithm.KMEANS:
         if k is None:
             raise ValueError("cluster_embeddings(algorithm='kmeans') requires k; got None.")
         return manifold_kmeans(embeddings, k=k, manifold=manifold, n_iter=n_iter, seed=seed)
-    if algorithm == "hdbscan":
+    if algorithm == ClusterAlgorithm.HDBSCAN:
         return manifold_hdbscan(
             embeddings,
             manifold=manifold,
@@ -1483,7 +1506,7 @@ def cluster_embeddings(
             cluster_selection_method=cluster_selection_method,
             allow_single_cluster=allow_single_cluster,
         )
-    if algorithm == "graph_cc":
+    if algorithm == ClusterAlgorithm.GRAPH_CC:
         return manifold_graph_cc(
             embeddings,
             manifold=manifold,
@@ -1492,7 +1515,7 @@ def cluster_embeddings(
             k_neighbors=graph_cc_k_neighbors,
             min_cluster_size=graph_cc_min_cluster_size,
         )
-    if algorithm == "leiden":
+    if algorithm == ClusterAlgorithm.LEIDEN:
 
         def _leiden(k_neighbors: int) -> tuple[torch.Tensor, torch.Tensor]:
             return manifold_leiden(
@@ -1509,7 +1532,10 @@ def cluster_embeddings(
                 n_iterations=leiden_n_iterations,
             )
 
-        if leiden_k_selection == "silhouette" and leiden_graph_method == "knn":
+        if (
+            leiden_k_selection == LeidenKSelection.SILHOUETTE
+            and leiden_graph_method == LeidenGraphMethod.KNN
+        ):
             return _select_leiden_k_by_silhouette(
                 embeddings,
                 _leiden,
@@ -1517,7 +1543,7 @@ def cluster_embeddings(
                 margin=leiden_k_selection_margin,
             )
         return _leiden(leiden_k_neighbors)
-    if algorithm == "dbscan":
+    if algorithm == ClusterAlgorithm.DBSCAN:
         return manifold_dbscan(
             embeddings,
             manifold=manifold,
@@ -1527,7 +1553,7 @@ def cluster_embeddings(
             min_samples=dbscan_min_samples,
             min_cluster_size=dbscan_min_cluster_size,
         )
-    if algorithm == "optics":
+    if algorithm == ClusterAlgorithm.OPTICS:
         return manifold_optics(
             embeddings,
             manifold=manifold,
@@ -1535,7 +1561,7 @@ def cluster_embeddings(
             xi=optics_xi,
             min_cluster_size=optics_min_cluster_size,
         )
-    if algorithm == "affinity_propagation":
+    if algorithm == ClusterAlgorithm.AFFINITY_PROPAGATION:
         return manifold_affinity_propagation(
             embeddings,
             manifold=manifold,
@@ -1545,7 +1571,7 @@ def cluster_embeddings(
             convergence_iter=affinity_convergence_iter,
             seed=seed,
         )
-    if algorithm == "meanshift":
+    if algorithm == ClusterAlgorithm.MEANSHIFT:
         return manifold_meanshift(
             embeddings,
             manifold=manifold,
@@ -1555,10 +1581,7 @@ def cluster_embeddings(
             cluster_all=meanshift_cluster_all,
             seed=seed,
         )
-    raise ValueError(
-        f"Unknown clustering algorithm {algorithm!r}; expected one of 'kmeans', 'hdbscan', "
-        "'graph_cc', 'leiden', 'dbscan', 'optics', 'affinity_propagation', 'meanshift'."
-    )
+    assert_never(algorithm)
 
 
 def _auto_temperature(centroids: torch.Tensor, manifold: ManifoldHead) -> float:
@@ -1589,7 +1612,7 @@ def _auto_temperature(centroids: torch.Tensor, manifold: ManifoldHead) -> float:
 
 
 def _resolve_temperature(
-    temperature: float | Literal["auto"],
+    temperature: float | Auto,
     centroids: torch.Tensor,
     manifold: ManifoldHead,
 ) -> float:
@@ -1597,8 +1620,10 @@ def _resolve_temperature(
 
     ``"auto"`` defers to :func:`_auto_temperature`; a float is validated ``> 0``.
     """
+    # ``isinstance(str)`` rather than ``Auto`` so a bare ``"auto"`` from an untyped
+    # caller resolves too, and any other string is a loud error.
     if isinstance(temperature, str):
-        if temperature != "auto":
+        if temperature != Auto.AUTO:
             raise ValueError(
                 f"temperature must be a positive float or 'auto'; got {temperature!r}."
             )
@@ -1614,7 +1639,7 @@ def cluster_scores(
     centroids: torch.Tensor,
     manifold: ManifoldHead,
     *,
-    temperature: float | Literal["auto"] = 1.0,
+    temperature: float | Auto = 1.0,
 ) -> torch.Tensor:
     """Soft-assignment matrix ``[N, C]``: softmax over negative manifold
     distances from each document to each centroid.
@@ -1637,7 +1662,7 @@ def cluster_confidence(
     centroids: torch.Tensor,
     manifold: ManifoldHead,
     *,
-    temperature: float | Literal["auto"] = 1.0,
+    temperature: float | Auto = 1.0,
 ) -> list[float | None]:
     """Per-point ordinal confidence for an unsupervised clustering.
 
@@ -1725,7 +1750,7 @@ def emergent_bucket_k_neighbors(
     n: int,
     configured: int,
     *,
-    graph_method: LeidenGraphMethod = "knn",
+    graph_method: LeidenGraphMethod = LeidenGraphMethod.KNN,
 ) -> int:
     """Graph degree to use when clustering an *emergent bucket* of ``n`` docs.
 
@@ -1769,7 +1794,7 @@ def emergent_bucket_k_neighbors(
     Neither mode is covered by the measurement above and both have a plausible
     mechanism for harm, so both pass through unchanged.
     """
-    if graph_method != "knn":
+    if graph_method != LeidenGraphMethod.KNN:
         return configured
     return min(configured, max(2, math.isqrt(max(n, 0))))
 

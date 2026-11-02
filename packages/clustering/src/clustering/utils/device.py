@@ -24,12 +24,20 @@ cached on first call.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from functools import lru_cache
-from typing import Literal
 
 import torch
 
-DeviceKind = Literal["cuda", "mps", "cpu"]
+
+class DeviceKind(StrEnum):
+    """The kind of compute target a device spec resolved to. A device *spec*
+    (``"auto"``, ``"cuda:N"``, …) is free-form; its resolved kind is one of these.
+    A ``StrEnum``, so a member is also a valid ``torch.device`` string."""
+
+    CUDA = "cuda"
+    MPS = "mps"
+    CPU = "cpu"
 
 
 @dataclass(frozen=True)
@@ -37,7 +45,7 @@ class DeviceInfo:
     """Result of a device-resolution query.
 
     Attributes:
-        kind: One of ``"cuda" | "mps" | "cpu"``.
+        kind: The resolved :class:`DeviceKind`.
         torch_device: A concrete ``torch.device`` to hand to tensor / module
             ``.to(...)`` calls.
         name: Human-readable label (GPU name, ``"Apple Silicon (MPS)"`` or
@@ -72,19 +80,19 @@ def auto_select_device() -> DeviceInfo:
     if torch.cuda.is_available():
         idx = torch.cuda.current_device()
         return DeviceInfo(
-            kind="cuda",
+            kind=DeviceKind.CUDA,
             torch_device=torch.device(f"cuda:{idx}"),
             name=torch.cuda.get_device_name(idx),
         )
     if _mps_available():
         return DeviceInfo(
-            kind="mps",
-            torch_device=torch.device("mps"),
+            kind=DeviceKind.MPS,
+            torch_device=torch.device(DeviceKind.MPS),
             name="Apple Silicon (MPS)",
         )
     return DeviceInfo(
-        kind="cpu",
-        torch_device=torch.device("cpu"),
+        kind=DeviceKind.CPU,
+        torch_device=torch.device(DeviceKind.CPU),
         name="CPU",
     )
 
@@ -106,27 +114,29 @@ def resolve_device(spec: str | None = None) -> DeviceInfo:
     if spec is None or spec == "auto":
         return auto_select_device()
 
-    if spec == "cuda" or spec.startswith("cuda:"):
+    if spec == DeviceKind.CUDA or spec.startswith(f"{DeviceKind.CUDA}:"):
         if not torch.cuda.is_available():
             raise RuntimeError(f"Requested device {spec!r} but CUDA is not available.")
         dev = torch.device(spec)
         idx = dev.index if dev.index is not None else torch.cuda.current_device()
         return DeviceInfo(
-            kind="cuda",
+            kind=DeviceKind.CUDA,
             torch_device=dev,
             name=torch.cuda.get_device_name(idx),
         )
 
-    if spec == "mps":
+    if spec == DeviceKind.MPS:
         if not _mps_available():
             raise RuntimeError("Requested device 'mps' but MPS is not available.")
         return DeviceInfo(
-            kind="mps",
-            torch_device=torch.device("mps"),
+            kind=DeviceKind.MPS,
+            torch_device=torch.device(DeviceKind.MPS),
             name="Apple Silicon (MPS)",
         )
 
-    if spec == "cpu":
-        return DeviceInfo(kind="cpu", torch_device=torch.device("cpu"), name="CPU")
+    if spec == DeviceKind.CPU:
+        return DeviceInfo(
+            kind=DeviceKind.CPU, torch_device=torch.device(DeviceKind.CPU), name="CPU"
+        )
 
     raise ValueError(f"Unknown device spec: {spec!r}")

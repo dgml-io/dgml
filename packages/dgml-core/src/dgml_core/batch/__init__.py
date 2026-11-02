@@ -22,7 +22,9 @@ response each, with resubmission and synchronous fallback) and
 wave).
 
 Registered backends: ``anthropic`` (Message Batches,
-:mod:`dgml_core.batch.anthropic`). Nothing in the package is reachable from
+:mod:`dgml_core.batch.anthropic`), ``gemini`` (Gemini Developer API,
+:mod:`dgml_core.batch.gemini`) and ``openai`` (Batch API,
+:mod:`dgml_core.batch.openai`). Nothing in the package is reachable from
 the CLI or imported by the rest of ``dgml_core``: importing ``dgml_core``
 never imports this package.
 
@@ -31,19 +33,46 @@ backend whose optional dependency is not installed, is an error
 (:class:`dgml_core.errors.BatchUnavailable`) raised when the backend is
 resolved — before any request is sent. It never silently falls back to a
 full-price synchronous call.
+
+Job management — :func:`job_status`, :func:`resume_would_wait`,
+:func:`cancel_job`, :func:`delete_job`, :func:`prune_jobs`,
+:func:`unlock_job` and :func:`list_job_summaries`, the library behind ``dgml
+batch`` — is re-exported lazily from ``dgml_core``; everything else here is
+internal for now.
 """
 
 from __future__ import annotations
 
 # Built-in backends register themselves on import. Each needs nothing beyond
 # what dgml-core already depends on, so none carries an install hint.
+from dgml_core.batch import gemini as _gemini
 from dgml_core.batch.anthropic import AnthropicBatchBackend, AnthropicBatchError
 from dgml_core.batch.backend import BatchBackend
 from dgml_core.batch.chunking import DEFAULT_OVERHEAD_BYTES, plan_batches, request_size
 from dgml_core.batch.compat import SUPPORTED_LITELLM, IncompatibleDependency
+from dgml_core.batch.deadline import BatchDeadline, parse_duration
 from dgml_core.batch.driver import Unit, UnitOutcome, run_stage, run_stage_sync
 from dgml_core.batch.executor import TIER_MARKER, BatchExecutor, WaveStats, make_executor
 from dgml_core.batch.fake import FakeBackend, fake_model_response
+from dgml_core.batch.jobs import (
+    BatchJobStore,
+    JobSession,
+    Manifest,
+    ReplayExecutor,
+    active_session,
+    cancel_job,
+    delete_job,
+    job_status,
+    job_summary,
+    list_job_summaries,
+    list_jobs,
+    prune_jobs,
+    request_digest,
+    resume_would_wait,
+    start_session,
+    unlock_job,
+)
+from dgml_core.batch.openai import OpenAIBatchBackend
 from dgml_core.batch.registry import (
     AvailabilityProbe,
     BackendConfig,
@@ -70,6 +99,8 @@ from dgml_core.batch.types import (
     ItemErrorKind,
 )
 
+_gemini.register()
+
 __all__ = [
     "DEFAULT_OVERHEAD_BYTES",
     "SUPPORTED_LITELLM",
@@ -80,9 +111,11 @@ __all__ = [
     "BackendConfig",
     "BackendFactory",
     "BatchBackend",
+    "BatchDeadline",
     "BatchExecutor",
     "BatchItemError",
     "BatchJob",
+    "BatchJobStore",
     "BatchNotFound",
     "BatchRejected",
     "BatchRequest",
@@ -93,21 +126,38 @@ __all__ = [
     "FakeBackend",
     "IncompatibleDependency",
     "ItemErrorKind",
+    "JobSession",
+    "Manifest",
+    "OpenAIBatchBackend",
+    "ReplayExecutor",
     "RequestProbe",
     "StageRequest",
     "Unit",
     "UnitOutcome",
     "WaveStats",
+    "active_session",
     "assert_batchable",
+    "cancel_job",
+    "delete_job",
     "fake_model_response",
+    "job_status",
+    "job_summary",
+    "list_job_summaries",
+    "list_jobs",
     "make_executor",
+    "parse_duration",
     "plan_batches",
     "provider_of",
+    "prune_jobs",
     "register_backend",
     "registered_providers",
+    "request_digest",
     "request_size",
     "resolve_backend",
+    "resume_would_wait",
     "run_stage",
     "run_stage_sync",
+    "start_session",
+    "unlock_job",
     "unregister_backend",
 ]

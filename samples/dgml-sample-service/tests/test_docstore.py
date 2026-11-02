@@ -237,7 +237,7 @@ def test_workspace_on_postgres_docs_and_s3_blobs(engine: Engine, pdf: Any) -> No
             Bucket="dgml-sample-test", Prefix=f"tenants/{org}/"
         )["Contents"]
     ]
-    assert any(k.endswith("page_images/page_1.png") for k in keys)
+    assert any(k.endswith(("page_images/page_1.jpg", "page_images/page_1.png")) for k in keys)
 
     # Re-opening reads the meta document back and agrees on the identity.
     again = Workspace.open(configuration=cfg)

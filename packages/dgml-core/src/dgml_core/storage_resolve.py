@@ -49,6 +49,7 @@ from typing import Any
 from .errors import StorageConfigInvalid
 from .models_config import ConfigSection
 from .provider import import_provider_class
+from .redaction import SECRET_HINTS, SECRET_WORDS
 from .storage import Workspace
 from .storage_service import BlobStore, DocStore, StorageConfig
 
@@ -65,16 +66,12 @@ DEFAULT_STORAGE_SERVICE = "default"
 # both roles) or these two sub-tables (a backend each); it may not do both.
 _ROLE_KEYS = ("blobs", "docs")
 
-# Option keys never folded into the store fingerprint — rotating a credential must
-# not read as "the store moved". A provider carrying an inline credential must name
-# the option so one of these appears in it (see the storage-package READMEs);
-# every in-tree provider takes its credentials from the environment instead.
-_SECRET_HINTS = ("key", "secret", "token", "password", "credential")
-
-# Matched as a whole ``_``-separated word, not a substring: a connection URI
-# (``mongo_uri``) carries credentials inline, but ``security_…`` is not a secret. The
-# identity a URI also names (host, database) is covered by the ``mongo_*`` options.
-_SECRET_WORDS = frozenset({"uri"})
+# Secret-named option keys (`SECRET_HINTS` / `SECRET_WORDS` in `redaction`) are never
+# folded into the store fingerprint — rotating a credential must not read as "the store
+# moved". A provider carrying an inline credential must name the option so one of the
+# hints appears in it (see the storage-package READMEs); every in-tree provider takes
+# its credentials from the environment instead. The identity a URI also names (host,
+# database) is covered by the ``mongo_*`` options.
 
 # Option keys that name *where this machine keeps the data* rather than *which store
 # this is*, and so are also outside the identity fingerprint. Same argument as the one
@@ -405,10 +402,11 @@ def verify_storage_fingerprint(workspace: Workspace) -> None:
 
 def _excluded_from_identity(key: str) -> bool:
     """Whether an option key is outside the store-identity hash."""
+    # Not `is_secret_name`: a `*_env` option is outside the hash too, as it always was.
     lowered = key.lower()
     return (
-        any(hint in lowered for hint in _SECRET_HINTS)
-        or not _SECRET_WORDS.isdisjoint(lowered.split("_"))
+        any(hint in lowered for hint in SECRET_HINTS)
+        or not SECRET_WORDS.isdisjoint(lowered.split("_"))
         or lowered in _LOCATION_HINTS
     )
 
@@ -438,8 +436,8 @@ def storage_fingerprint_pair(blob_cfg: StorageConfig, doc_cfg: StorageConfig) ->
     machine":
 
     - ``root``, so a workspace copied or moved to another path keeps its seal.
-    - Secret-named options (:data:`_SECRET_HINTS`, :data:`_SECRET_WORDS`), so rotating a
-      credential never reads
+    - Secret-named options (:data:`~dgml_core.redaction.SECRET_HINTS`,
+      :data:`~dgml_core.redaction.SECRET_WORDS`), so rotating a credential never reads
       as "the store moved".
     - Location options (:data:`_LOCATION_HINTS`), for exactly the ``root`` argument: an
       option naming where *this machine* keeps the data describes an address, not an

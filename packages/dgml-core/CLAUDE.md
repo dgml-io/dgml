@@ -141,9 +141,10 @@ the `$DGML_PAGE_CACHE` cache, stale-image cleanup and page counting;
 request never reaches a backend.
 
 **Renderer geometry is a contract, not a preference.** A page's PNG must be
-exactly `round(pts * dpi / 72)` pixels per axis, measured from the
-**MediaBox** and after `/Rotate` — that is the space `page_text/` boxes and
-every `dg:origin` live in, and nothing at runtime checks that the two agree.
+exactly `round(pts * dpi / 72)` pixels per axis (the *nominal* size), measured
+from the **MediaBox** and after `/Rotate`, or exactly `PageImageSpec.fit` of
+that size — the fit is the space `page_text/` boxes and every `dg:origin` live
+in, and nothing at runtime checks that the two agree (see `PageRenderer.render`).
 A backend whose natural output differs must correct for it (PDFium needs both
 corrections; see `Pypdfium2Renderer._render_page`).
 

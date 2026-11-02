@@ -314,13 +314,13 @@
         <label class="form-label">Model</label>
         <select class="sel-input" id="llm-model-sel">
           <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-          <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
           <option value="claude-opus-4-8">Claude Opus 4.8</option>
           <option value="openai/gpt-4o">GPT-4o</option>
           <option value="openai/gpt-4o-mini">GPT-4o mini</option>
           <option value="openai/o3">o3</option>
-          <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro</option>
-          <option value="gemini/gemini-2.5-flash">Gemini 2.5 Flash</option>
+          <option value="gemini/gemini-3.1-pro-preview">Gemini 3.1 Pro (preview)</option>
+          <option value="gemini/gemini-3.8-flash">Gemini 3.8 Flash</option>
           <option value="__custom__">Custom model ID…</option>
         </select>
       </div>
@@ -673,23 +673,37 @@ async function findXml(root, docsetId, fileId) {
   return (await (await dir.getFileHandle(chosen)).getFile()).text();
 }
 
+// Each page is stored as page_N.png or page_N.jpg, whichever encoding was smaller,
+// so one file's pages can mix the two.
+const PAGE_IMAGE_EXTS = ['png', 'jpg'];
+
 async function getPageBlobUrl(root, fileId, page) {
-  if (IS_SERVER) {
-    // Pages are named page_1.png, page_2.png, … (PAGE_FILENAME_TEMPLATE = "page_%d.png")
-    return `/workspace/files/${encodeURIComponent(fileId)}/page_images/page_${page}.png`;
-  }
-  if (WORKSPACE_READ_BASE) {
-    return staticUrl(`${WORKSPACE_READ_BASE}/files/${encodeURIComponent(fileId)}/page_images/page_${page}.png`);
+  if (IS_SERVER || WORKSPACE_READ_BASE) {
+    // Keyed by workspace too: a server-side workspace switch keeps these URLs.
+    const urlKey = `url|${S.wsPath || WORKSPACE_READ_BASE}|${fileId}/${page}`;
+    if (S.blobCache[urlKey]) return S.blobCache[urlKey];
+    const base = `/files/${encodeURIComponent(fileId)}/page_images/page_${page}`;
+    for (const ext of PAGE_IMAGE_EXTS) {
+      const url = IS_SERVER ? `/workspace${base}.${ext}` : staticUrl(`${WORKSPACE_READ_BASE}${base}.${ext}`);
+      try {
+        if ((await fetch(url)).ok) { S.blobCache[urlKey] = url; return url; }
+      } catch {}
+    }
+    return null;
   }
   const key = `${fileId}/${page}`;
   if (S.blobCache[key]) return S.blobCache[key];
   const dir = await getDirHandle(root, 'files', fileId, 'page_images');
   if (!dir) return null;
   const p4 = String(page).padStart(4, '0'), p3 = String(page).padStart(3, '0');
-  for (const name of [`page_${p4}.png`, `page_${p3}.png`, `page_${page}.png`, `${page}.png`]) {
+  const stems = [`page_${p4}`, `page_${p3}`, `page_${page}`, `${page}`];
+  for (const name of stems.flatMap(s => PAGE_IMAGE_EXTS.map(ext => `${s}.${ext}`))) {
     try { const url = await getBlobUrl(await dir.getFileHandle(name)); S.blobCache[key] = url; return url; } catch {}
   }
-  const imgs = (await listFileNames(dir)).filter(n => /\.(png|jpe?g)$/i.test(n));
+  // Page order, not name order ('page_10' sorts before 'page_2').
+  const pageNum = n => parseInt((n.match(/(\d+)\.[^.]+$/) || [])[1] || '0', 10);
+  const imgs = (await listFileNames(dir)).filter(n => /\.(png|jpe?g)$/i.test(n))
+    .sort((a, b) => pageNum(a) - pageNum(b));
   if (imgs[page - 1]) {
     try { const url = await getBlobUrl(await dir.getFileHandle(imgs[page - 1])); S.blobCache[key] = url; return url; } catch {}
   }
