@@ -638,6 +638,10 @@ def generate_docset(
         session = job
     if job is not None and batch is None:
         raise BatchJobInvalid("a batch job needs batch mode: pass batch=BatchOptions(...)")
+    if request is not None:
+        # A request reused to continue its job still holds the last run's
+        # session: this run's slot starts empty.
+        request.session = None
     try:
         report = _generate_docset(
             ws,

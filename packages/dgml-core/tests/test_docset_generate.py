@@ -25,7 +25,7 @@ import logging
 import threading
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from dgml_core import (
@@ -224,6 +224,16 @@ def test_job_request_opens_only_once_the_preflights_pass(
         generate_docset(workspace, did, batch=BatchOptions(), job=request)
     assert request.session is None
     assert list_jobs(workspace) == []
+
+    # Reused to continue a job, the request still holds the last run's
+    # session: a rejected rerun neither reports on it nor closes it again.
+    earlier = MagicMock()
+    request.session = earlier
+    request.job_id = "bj_earlier"
+    with pytest.raises(BatchUnavailable):
+        generate_docset(workspace, did, batch=BatchOptions(), job=request)
+    assert request.session is None
+    earlier.close.assert_not_called()
 
 
 @needs_gs
