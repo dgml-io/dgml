@@ -67,7 +67,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, TypeVar, cast
 
+import httpx
 import litellm
+from litellm.exceptions import (
+    APIConnectionError,
+    InternalServerError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+)
 
 from .errors import EmptyModelResponse, ModelNotSupported, now_iso, short_error_message
 from .prompts import PromptKey
@@ -78,6 +86,7 @@ from .usage import (
     UsageEvent,
     UsageOperation,
     UsageOutcome,
+    _as_cost,
     add_partial,
     as_pricing_tier,
     extract_cost_and_tokens,
@@ -181,6 +190,25 @@ OPENAI_MODEL_PATTERNS = [
     r"^o[1-9]\b",
     r"^o[1-9]-",
 ]
+
+#: The request key a streamed call's total deadline travels under, in seconds
+#: (set by :func:`_build_completion_kwargs` from ``LLMConfig.timeout``). It is
+#: not a litellm parameter, and litellm forwards unknown keys into the provider
+#: request body, so whatever sends a request pops it first:
+#: :func:`_completion_with_retry` (which then enforces it, the one enforcement
+#: point for the sync driver, the batch drivers' synchronous fallbacks and any
+#: executor that delegates to it) and the batch request capture. A custom
+#: executor that calls litellm itself pops it with :func:`pop_stream_deadline`.
+STREAM_DEADLINE_KWARG = "dgml_stream_deadline_s"
+
+
+def pop_stream_deadline(kwargs: dict[str, Any]) -> float | None:
+    """Remove :data:`STREAM_DEADLINE_KWARG` from *kwargs* and return it, or
+    ``None`` when absent or not a positive number of seconds."""
+    value = kwargs.pop(STREAM_DEADLINE_KWARG, None)
+    if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
 
 
 def is_model_reachability_error(exc: BaseException) -> bool:
@@ -390,6 +418,21 @@ class LLMConfig:
     ``max_completion_tokens`` is the newer field grounded extraction
     paths prefer (it's what GPT-5 / o-series accept). Set whichever the
     target provider expects.
+
+    ``stream`` is opt-in per call: ``False`` (the default) sends one
+    unstreamed request whose ``timeout`` is the request timeout, exactly as
+    before streaming existed. ``True`` sends ``stream=True`` and rebuilds one
+    response from the chunks (see :func:`_completion_with_retry`). While
+    streaming, ``stream_read_timeout`` is the request's timeout and bounds the
+    gap between chunks, and ``timeout`` becomes the total deadline for the
+    whole call, every retry and its backoff included; it travels with the
+    request under :data:`STREAM_DEADLINE_KWARG`. The deadline is checked
+    between chunks and before each retry, so a call can overrun it by at most
+    one ``stream_read_timeout`` while a read is blocked. The read timeout's
+    default allows ten silent minutes for a model's initial reasoning phase; a
+    longer silent phase needs a larger one. ``extra["timeout"]``, when set, is
+    the request's timeout in both modes (``extra`` has always had the last
+    word on the request).
     """
 
     model: str
@@ -403,6 +446,8 @@ class LLMConfig:
     max_tokens: int | None = 16000
     max_completion_tokens: int | None = None
     timeout: float | None = None
+    stream: bool = False
+    stream_read_timeout: float | None = 600.0
     reasoning_effort: str | None = None
     # Anthropic extended thinking; one of :data:`ANTHROPIC_THINKING_MODES`.
     # ``None`` means "don't send the field" and therefore leaves the model's own
@@ -770,12 +815,25 @@ def _build_completion_kwargs(
     ``thinking`` follows the same shape: sent only to Anthropic-routed
     models, and only when ``reasoning_effort`` did not already claim the
     field.
+
+    A streamed request (``LLMConfig.stream``) also carries its total deadline
+    under :data:`STREAM_DEADLINE_KWARG`, and its ``timeout`` is the read
+    timeout between chunks; ``extra["timeout"]`` wins over either timeout.
+
+    Streaming requests automatically ask for usage only on OpenAI's native
+    endpoint. Azure and custom ``api_base`` endpoints must opt in through
+    ``extra["stream_options"]`` because some compatible endpoints accept but
+    ignore that option, which lets LiteLLM substitute estimated usage.
     """
     _require_supported_model(config.model, config.api_base)
     kwargs: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
     }
+    extra = dict(config.extra)
+    explicit_stream_options = "stream_options" in extra
+    stream = bool(extra.pop("stream", config.stream))
+    explicit_timeout = "timeout" in extra
     # Anthropic: never send temperature. Newer Claude models reject it
     # outright ("`temperature` is deprecated for this model") and older ones
     # reject anything but 1 when thinking is enabled — together the provider
@@ -814,8 +872,6 @@ def _build_completion_kwargs(
         kwargs["max_completion_tokens"] = _clamp_output_tokens(
             config.max_completion_tokens, config.model, config.api_base
         )
-    if config.timeout is not None:
-        kwargs["timeout"] = config.timeout
     if config.api_key:
         kwargs["api_key"] = config.api_key
     if config.api_base:
@@ -842,7 +898,34 @@ def _build_completion_kwargs(
     ):
         kwargs["thinking"] = {"type": config.thinking}
 
-    kwargs.update(config.extra)
+    kwargs.update(extra)
+    # ``extra`` is public API and has always had the last word on the request
+    # (it used to be applied after ``config.timeout``), so a timeout it sets is
+    # kept as it is in both modes and the config's timeout fills in only when
+    # it set none.
+    if stream:
+        kwargs["stream"] = True
+        if not explicit_timeout and config.stream_read_timeout is not None:
+            kwargs["timeout"] = config.stream_read_timeout
+        if config.timeout is not None:
+            kwargs[STREAM_DEADLINE_KWARG] = config.timeout
+        effective_model = str(kwargs.get("model") or "")
+        if (
+            not explicit_stream_options
+            and is_openai_model(effective_model)
+            and not (
+                effective_model.lower().startswith("azure/") or kwargs.get("api_base") is not None
+            )
+        ):
+            kwargs["stream_options"] = {"include_usage": True}
+        elif not explicit_stream_options:
+            kwargs.pop("stream_options", None)
+    else:
+        kwargs.pop("stream", None)
+        kwargs.pop("stream_options", None)
+        if not explicit_timeout and config.timeout is not None:
+            kwargs["timeout"] = config.timeout
+
     return kwargs
 
 
@@ -993,6 +1076,434 @@ def _quiet_stdout() -> Iterator[None]:
             own_sink.drain()
 
 
+class _StreamConsumptionError(Exception):
+    """Internal carrier for a stream error and honest progress metadata."""
+
+    def __init__(self, error: Exception, chunks_received: int, elapsed_s: float) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.chunks_received = chunks_received
+        self.elapsed_s = elapsed_s
+
+
+class StreamDeadlineExceeded(TimeoutError):
+    """A streamed call's total deadline expired: between received chunks, or
+    with no time left for another attempt. Never retried."""
+
+
+@dataclass(frozen=True)
+class _StreamDeadline:
+    """One streamed call's total deadline: *seconds* counted from *started*, a
+    :func:`time.monotonic` reading taken once, before the call's first
+    attempt, so retries and their backoff spend the same budget."""
+
+    seconds: float
+    started: float
+
+    def spent(self, *, after_s: float = 0.0) -> bool:
+        """Whether the budget is gone now, or will be *after_s* from now."""
+        return time.monotonic() + after_s - self.started >= self.seconds
+
+    def exceeded(self, detail: str) -> StreamDeadlineExceeded:
+        return StreamDeadlineExceeded(f"stream exceeded the {self.seconds:.0f} s deadline {detail}")
+
+
+def _is_stream(response: Any) -> bool:
+    """True when a ``stream=True`` call actually returned a stream to consume.
+
+    A layer that ignores ``stream`` (a test double, a proxy) hands back a
+    complete response instead; that response is used as it is rather than
+    iterated. A complete :class:`litellm.ModelResponse` is iterable (pydantic
+    yields its fields), so it is excluded by type, not by protocol.
+    """
+    if isinstance(response, litellm.ModelResponse):
+        return False
+    return hasattr(response, "__iter__") and not isinstance(response, dict | str | bytes)
+
+
+def _positive_usage(value: Any) -> Any | None:
+    """Return usage only when it reports a positive total token count."""
+    total = (
+        value.get("total_tokens")
+        if isinstance(value, dict)
+        else getattr(value, "total_tokens", None)
+    )
+    if isinstance(total, int | float) and not isinstance(total, bool) and total > 0:
+        return value
+    return None
+
+
+def _usage_object(value: Any) -> Any:
+    """Convert mapping usage into LiteLLM's attribute-readable shape."""
+    if not isinstance(value, dict):
+        return value
+    from litellm.types.utils import Usage
+
+    known_fields = (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "prompt_tokens_details",
+    )
+    return Usage(**{field: value[field] for field in known_fields if field in value})
+
+
+def _normalize_tool_call_indices(chunks: list[Any]) -> None:
+    """Give each provider-indexed tool call a stable builder index."""
+    open_calls: dict[tuple[Any, Any], tuple[int, str | None, str | None]] = {}
+    next_index: dict[Any, int] = {}
+    for chunk in chunks:
+        choices = (
+            chunk.get("choices", []) if isinstance(chunk, dict) else getattr(chunk, "choices", [])
+        )
+        for choice in choices or []:
+            choice_index = (
+                choice.get("index") if isinstance(choice, dict) else getattr(choice, "index", None)
+            )
+            delta = (
+                choice.get("delta") if isinstance(choice, dict) else getattr(choice, "delta", None)
+            )
+            if delta is None:
+                continue
+            tool_calls = (
+                delta.get("tool_calls")
+                if isinstance(delta, dict)
+                else getattr(delta, "tool_calls", None)
+            )
+            for tool_call in tool_calls or []:
+                provider_index = (
+                    tool_call.get("index")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "index", None)
+                )
+                call_id = (
+                    tool_call.get("id")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "id", None)
+                )
+                function = (
+                    tool_call.get("function")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "function", None)
+                )
+                name = (
+                    function.get("name")
+                    if isinstance(function, dict)
+                    else getattr(function, "name", None)
+                )
+                name = name or None
+                key = (choice_index, provider_index)
+                current = open_calls.get(key)
+                opens_new = current is None
+                if current is not None and call_id:
+                    if current[1] is None:
+                        current = (current[0], call_id, current[2] or name)
+                        open_calls[key] = current
+                    elif call_id != current[1]:
+                        opens_new = True
+                if opens_new:
+                    builder_index = next_index.get(choice_index, 0)
+                    current = (builder_index, call_id or None, name)
+                    open_calls[key] = current
+                    next_index[choice_index] = builder_index + 1
+                elif current is not None and name and current[2] is None:
+                    current = (current[0], current[1], name)
+                    open_calls[key] = current
+                elif current is not None and name and not call_id:
+                    combined_name = f"{current[2] or ''}{name}"
+                    current = (current[0], current[1], combined_name)
+                    open_calls[key] = current
+                    if isinstance(function, dict):
+                        function["name"] = combined_name
+                    elif function is not None:
+                        function.name = combined_name
+                assert current is not None
+                if isinstance(tool_call, dict):
+                    tool_call["index"] = current[0]
+                else:
+                    tool_call.index = current[0]
+
+
+def _consume_stream(
+    stream: Any,
+    *,
+    model: str,
+    deadline: _StreamDeadline | None = None,
+    started: float | None = None,
+) -> Any | None:
+    """Consume and rebuild a LiteLLM stream without estimating request usage.
+
+    Tool-call indices are normalized conservatively by provider index. Usage is
+    accepted only from positive provider usage on LiteLLM's raw stream chunks,
+    or from yielded chunks when the iterator has no raw chunk list. The call's
+    *deadline* is checked as each chunk arrives, so a run can exceed it by at
+    most one configured stream read timeout; a stream that ends normally is
+    returned complete, even when its end arrives just past the deadline (its
+    tokens are billed, and its usage is recorded). *started* is this attempt's
+    start, for the abort log. Events LiteLLM skips internally, such as
+    provider ping events, cannot be checked here. If iteration aborts, no
+    usage is recorded for that attempt. The wrapper itself is not closed
+    because it has only async close; its synchronous provider iterator is
+    closed directly when available.
+    """
+    chunks: list[Any] = []
+    if started is None:
+        started = time.monotonic()
+    try:
+        for chunk in stream:
+            chunks.append(chunk)
+            if deadline is not None and deadline.spent():
+                raise deadline.exceeded(f"after {len(chunks)} chunks")
+    except Exception as exc:
+        provider_stream = getattr(stream, "completion_stream", None)
+        close = getattr(provider_stream, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        stream = None
+        raise _StreamConsumptionError(exc, len(chunks), time.monotonic() - started) from exc
+    if not chunks:
+        return None
+
+    _normalize_tool_call_indices(chunks)
+
+    usage = None
+    raw_chunks = getattr(stream, "chunks", None) if stream is not None else None
+    if raw_chunks is None:
+        for chunk in chunks:
+            chunk_usage = (
+                chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
+            )
+            positive = _positive_usage(chunk_usage)
+            if positive is not None:
+                usage = positive
+    else:
+        raw_chunks = list(raw_chunks)
+        if not raw_chunks:
+            return None
+        if any(
+            _positive_usage(
+                chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
+            )
+            is not None
+            for chunk in raw_chunks
+        ):
+            usage_response = litellm.stream_chunk_builder(raw_chunks)
+            if usage_response is not None:
+                usage = _positive_usage(getattr(usage_response, "usage", None))
+
+    refusals: dict[Any, list[str]] = {}
+    for chunk in chunks:
+        chunk_choices = (
+            chunk.get("choices", []) if isinstance(chunk, dict) else getattr(chunk, "choices", [])
+        )
+        for choice in chunk_choices or []:
+            choice_index = (
+                choice.get("index") if isinstance(choice, dict) else getattr(choice, "index", None)
+            )
+            delta = (
+                choice.get("delta") if isinstance(choice, dict) else getattr(choice, "delta", None)
+            )
+            refusal = (
+                delta.get("refusal") if isinstance(delta, dict) else getattr(delta, "refusal", None)
+            )
+            if isinstance(refusal, str) and refusal:
+                refusals.setdefault(choice_index, []).append(refusal)
+
+    rebuilt = litellm.stream_chunk_builder(chunks)
+    if rebuilt is None:
+        return None
+    choices = getattr(rebuilt, "choices", None)
+    if not choices:
+        return None
+    for choice in choices:
+        choice_index = (
+            choice.get("index") if isinstance(choice, dict) else getattr(choice, "index", None)
+        )
+        if choice_index not in refusals:
+            continue
+        message = (
+            choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+        )
+        if isinstance(message, dict):
+            message["refusal"] = "".join(refusals[choice_index])
+        elif message is not None:
+            message.refusal = "".join(refusals[choice_index])
+    if not any(_choice_finish_reason(choice) for choice in choices) and not any(
+        _choice_has_payload(choice) for choice in choices
+    ):
+        return None
+    cast(Any, rebuilt).usage = _usage_object(usage) if usage is not None else None
+
+    cost: float | None = None
+    if usage is None:
+        logger.debug(
+            "streamed response for model %r has no positive usage; cost unavailable", model
+        )
+    else:
+        try:
+            cost = _as_cost(litellm.completion_cost(completion_response=rebuilt, model=model))
+        except Exception as exc:
+            logger.warning(
+                "could not calculate streamed response cost for model %r (%s)",
+                model,
+                type(exc).__name__,
+            )
+    if cost is not None:
+        hidden = getattr(rebuilt, "_hidden_params", None)
+        if not isinstance(hidden, dict):
+            hidden = {}
+            rebuilt._hidden_params = hidden
+        hidden["response_cost"] = cost
+    return rebuilt
+
+
+#: Transport failures: the request or its stream never completed. Retried
+#: whatever their message says.
+_TRANSIENT_TYPES: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    ConnectionError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    Timeout,
+    APIConnectionError,
+    RateLimitError,
+    ServiceUnavailableError,
+    InternalServerError,
+)
+
+#: HTTP statuses that say "not now" rather than "never": a request timeout, a
+#: rate limit, a server or gateway fault, and Anthropic's 529 "overloaded".
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
+
+# The message fallback, for an exception that is neither a transport type nor
+# carries an HTTP status (a provider SDK's bare ``Exception``, a wrapper's
+# ``RuntimeError``). The words match anywhere in the lowercased message. The
+# numbers (the three statuses and Windows' WSAECONNRESET) match only as whole
+# words, so a token count such as "215290 tokens" is not a 529.
+_TRANSIENT_WORDS = (
+    "connection",
+    "reset",
+    "timeout",
+    "internalservererror",
+    "overloaded",
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "too many requests",
+)
+_TRANSIENT_CODES = re.compile(r"\b(?:529|503|429|10054)\b")
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status *exc* carries: ``status_code`` on litellm's and the
+    provider SDKs' errors, ``response.status_code`` on httpx's
+    :class:`httpx.HTTPStatusError`. ``None`` when it carries none.
+
+    A provider exception's property can raise anything (httpx raises
+    ``RuntimeError`` for a response with no request), and this runs inside the
+    retry loop's ``except``, so a failed read counts as no status."""
+    try:
+        status = getattr(exc, "status_code", None)
+        if status is None and isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+    except Exception:
+        return None
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+    return None
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for a retryable transport or provider failure, including a wrapped one.
+
+    Judged by type first: *exc* and its ``__cause__``/``__context__`` chain are
+    read outward from *exc*, and the first exception that is a transport type
+    (:data:`_TRANSIENT_TYPES`, retried) or carries an HTTP status (retried only
+    for :data:`_TRANSIENT_STATUSES`) decides. So a typed error is never
+    re-judged by the words in its message: Anthropic's 400 "prompt is too
+    long: 215290 tokens > 200000 maximum" is a ``BadRequestError`` with status
+    400 and is not retried, although its text contains "529". Only when no
+    exception in the chain is typed does the message fallback
+    (:data:`_TRANSIENT_WORDS`, :data:`_TRANSIENT_CODES`) apply. A
+    :class:`StreamDeadlineExceeded` anywhere in the chain is never transient:
+    the call's budget is spent.
+    """
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    if any(isinstance(current, StreamDeadlineExceeded) for current in chain):
+        return False
+    for current in chain:
+        if isinstance(current, _TRANSIENT_TYPES):
+            return True
+        status = _http_status(current)
+        if status is not None:
+            return status in _TRANSIENT_STATUSES
+    for current in chain:
+        message = str(current).lower()
+        if any(word in message for word in _TRANSIENT_WORDS):
+            return True
+        if _TRANSIENT_CODES.search(message):
+            return True
+    return False
+
+
+def _log_stream_abort(
+    kwargs: dict[str, Any], attempt: int, error: _StreamConsumptionError, *, retrying: bool
+) -> None:
+    logger.warning(
+        "stream aborted for model %r on attempt %d after %d chunks and %.2fs "
+        "(%s); no usage recorded; %s",
+        kwargs.get("model"),
+        attempt + 1,
+        error.chunks_received,
+        error.elapsed_s,
+        type(error.error).__name__,
+        "retrying" if retrying else "aborting",
+    )
+
+
+def _choice_has_payload(choice: Any) -> bool:
+    """True when a rebuilt choice contains text, reasoning, a tool call, or refusal."""
+    message = (
+        choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+    )
+    if message is None:
+        return False
+
+    def field(name: str) -> Any:
+        return message.get(name) if isinstance(message, dict) else getattr(message, name, None)
+
+    return bool(
+        field("content") or field("tool_calls") or field("reasoning_content") or field("refusal")
+    )
+
+
+def _choice_finish_reason(choice: Any) -> Any:
+    """Return a choice's finish reason for mapping and object response shapes."""
+    return (
+        choice.get("finish_reason")
+        if isinstance(choice, dict)
+        else getattr(choice, "finish_reason", None)
+    )
+
+
 # Set on an exception :func:`_completion_with_retry` raises: how many calls it
 # made before giving up. Read back by :func:`provider_error_context`.
 _ATTEMPTS_ATTR = "dgml_attempts"
@@ -1140,6 +1651,16 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
     """Call litellm.completion with exponential-backoff retries for transient
     failures — both raised errors and *empty* responses.
 
+    Streamed calls are consumed and rebuilt before the same response checks
+    run. A streamed request's total deadline is read from the request itself
+    (:data:`STREAM_DEADLINE_KWARG`, popped before litellm sees the kwargs), so
+    every path that runs a request through here enforces it: the sync driver,
+    a batch stage's synchronous fallbacks, a job's raw fallback
+    (:func:`_completion_attempts`) and any executor that delegates here. The
+    budget starts once, before the first attempt; a retry whose backoff would
+    end past it is not made, and :class:`StreamDeadlineExceeded` is raised
+    from the error that would have been retried.
+
     A successful call can still come back with an empty ``choices`` list (zero
     candidates, zero completion tokens): observed intermittently with Gemini via
     litellm, and transient — an immediate retry clears it. Left unhandled it
@@ -1157,60 +1678,111 @@ def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> A
 def _completion_attempts(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
     """The retry loop behind :func:`_completion_with_retry`, without the
     recorder seam (a batch job's own synchronous fallback calls this directly,
-    having already accounted for the request)."""
+    having already accounted for the request). The one place a streamed
+    request's total deadline is enforced."""
     import litellm
 
+    kwargs = dict(kwargs)
+    deadline_s = pop_stream_deadline(kwargs)
+    # One budget for the whole call, started before the first attempt: a
+    # deadline restarted per attempt would let three retries each run to it.
+    deadline = (
+        _StreamDeadline(seconds=deadline_s, started=time.monotonic())
+        if deadline_s is not None and kwargs.get("stream")
+        else None
+    )
     delay = 2.0
     last_exc: Exception | None = None
     for attempt in range(max_retries):
-        try:
-            with _quiet_stdout():
-                response = litellm.completion(**kwargs)
-        except Exception as exc:
-            _set_attempts(exc, attempt + 1)
-            msg = str(exc).lower()
-            # Retry on transient network/server errors only. Rate limits count:
-            # they say "not now", not "never", and the pipeline runs documents
-            # concurrently, so hitting one is expected rather than exceptional.
-            transient = any(
-                t in msg
-                for t in (
-                    "10054",
-                    "connection",
-                    "reset",
-                    "timeout",
-                    "internalservererror",
-                    "overloaded",
-                    "529",
-                    "503",
-                    "429",
-                    "rate limit",
-                    "rate_limit",
-                    "ratelimit",
-                    "too many requests",
+        retried_without_stream_options = False
+        retry_attempt = False
+        while True:
+            started = time.monotonic()
+            try:
+                with _quiet_stdout():
+                    response = litellm.completion(**kwargs)
+                    if kwargs.get("stream") and _is_stream(response):
+                        response = _consume_stream(
+                            response,
+                            model=str(kwargs.get("model") or ""),
+                            deadline=deadline,
+                            started=started,
+                        )
+                break
+            except Exception as exc:
+                stream_error = exc if isinstance(exc, _StreamConsumptionError) else None
+                retry_exc = stream_error.error if stream_error is not None else exc
+                _set_attempts(retry_exc, attempt + 1)
+                if stream_error is not None:
+                    response = None
+                transient = _is_transient(retry_exc)
+                if (
+                    not transient
+                    and "stream_options" in str(retry_exc).lower()
+                    and "stream_options" in kwargs
+                    and not retried_without_stream_options
+                    and not (deadline is not None and deadline.spent())
+                ):
+                    kwargs.pop("stream_options")
+                    retried_without_stream_options = True
+                    logger.warning(
+                        "model %r rejected stream_options; retrying the same attempt without it",
+                        kwargs.get("model"),
+                    )
+                    continue
+                retrying = transient and attempt < max_retries - 1
+                if retrying and deadline is not None and deadline.spent(after_s=delay):
+                    # The retry would start at or past the call's deadline, so
+                    # it is not made: the budget covers the whole call, not
+                    # each attempt.
+                    chunks_received = (
+                        stream_error.chunks_received if stream_error is not None else 0
+                    )
+                    if stream_error is not None:
+                        _log_stream_abort(kwargs, attempt, stream_error, retrying=False)
+                    else:
+                        logger.warning(
+                            "stream aborted for model %r on attempt %d after 0 chunks and %.2fs "
+                            "(%s); no usage recorded; aborting",
+                            kwargs.get("model"),
+                            attempt + 1,
+                            time.monotonic() - started,
+                            type(retry_exc).__name__,
+                        )
+                    deadline_error = deadline.exceeded(
+                        f"after {chunks_received} chunks; no time left to retry"
+                    )
+                    _set_attempts(deadline_error, attempt + 1)
+                    raise deadline_error from retry_exc
+                if stream_error is not None:
+                    _log_stream_abort(kwargs, attempt, stream_error, retrying=retrying)
+                if not retrying:
+                    if stream_error is not None:
+                        raise retry_exc from None
+                    raise
+                last_exc = retry_exc.with_traceback(None)
+                stream_error = None
+                # A retry that then succeeds leaves no trace in the result, so say
+                # it here; INFO, since nothing is degraded yet. Identifiers only:
+                # never the exception's debug info, which carries the prompt.
+                logger.info(
+                    "model call failed (%s, %s); retry %d of %d in %.0fs",
+                    type(retry_exc).__name__,
+                    provider_error_context(
+                        retry_exc,
+                        model=kwargs.get("model"),
+                        api_base=kwargs.get("api_base"),
+                        api_key=kwargs.get("api_key"),
+                    ),
+                    attempt + 1,
+                    max_retries - 1,
+                    delay,
                 )
-            )
-            if not transient or attempt == max_retries - 1:
-                raise
-            last_exc = exc
-            # A retry that then succeeds leaves no trace in the result, so say
-            # it here; INFO, since nothing is degraded yet. Identifiers only —
-            # never the exception's debug info, which carries the prompt.
-            logger.info(
-                "model call failed (%s, %s); retry %d of %d in %.0fs",
-                type(exc).__name__,
-                provider_error_context(
-                    exc,
-                    model=kwargs.get("model"),
-                    api_base=kwargs.get("api_base"),
-                    api_key=kwargs.get("api_key"),
-                ),
-                attempt + 1,
-                max_retries - 1,
-                delay,
-            )
-            time.sleep(delay)
-            delay *= 2
+                time.sleep(delay)
+                delay *= 2
+                retry_attempt = True
+                break
+        if retry_attempt:
             continue
         # A successful call can still carry an empty choices list (transient
         # provider glitch); retry it rather than let choices[0] IndexError.
@@ -1224,6 +1796,14 @@ def _completion_attempts(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any
                 f"model returned no choices after {max_retries} attempts "
                 f"(model={kwargs.get('model')!r})"
             )
+        if deadline is not None and deadline.spent(after_s=delay):
+            logger.warning(
+                "model returned no choices (model %r) on attempt %d with no time left "
+                "before the stream deadline; aborting",
+                kwargs.get("model"),
+                attempt + 1,
+            )
+            raise deadline.exceeded("with no choices returned; no time left to retry")
         # Logged like a raised error's retry: one that then succeeds leaves no
         # trace in the result, yet costs a paid call and the backoff.
         logger.info(

@@ -111,6 +111,13 @@ def as_pricing_tier(raw: object, fallback: PricingTier | str) -> PricingTier | s
 BILLED_MARKER = "dgml_billed"
 
 
+def _as_cost(value: Any) -> float | None:
+    """Return a numeric cost as ``float`` without accepting booleans."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
 @dataclass
 class UsageEvent:
     """One LLM call worth of accounting.
@@ -260,9 +267,7 @@ def extract_cost_and_tokens(response: Any) -> dict[str, Any]:
         out.update(cost_usd=0.0, prompt_tokens=0, completion_tokens=0, total_tokens=0)
         return out
     if isinstance(hidden, dict):
-        cost = hidden.get("response_cost")
-        if isinstance(cost, int | float) and not isinstance(cost, bool):
-            out["cost_usd"] = float(cost)
+        out["cost_usd"] = _as_cost(hidden.get("response_cost"))
         # Fallback: some litellm paths stash the cache counters in
         # ``_hidden_params``. ``usage`` (read below) takes precedence.
         for src, dst in cache_fields:

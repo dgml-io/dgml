@@ -253,6 +253,12 @@ _PHASE3_GRID_REASONING_EFFORT = "medium"
 # at ~13min on a 7-page ledger with reasoning=high). 30 min gives
 # the model room to think through a long table without us cutting
 # the connection.
+#
+# On the two calls that stream (phase 1 and phase 3, see
+# :func:`_phase1_llm_config`) the same 30 minutes is the call's total
+# deadline instead, every retry included, and the request's own timeout is
+# ``LLMConfig.stream_read_timeout`` between chunks. Schema generation does not
+# stream: this stays its request timeout.
 _DEFAULT_TIMEOUT_SECONDS = 1800
 
 # Default number of files the schema-generation step samples from a
@@ -2423,6 +2429,13 @@ def _phase1_llm_config(
     workspace set ``grounded.values_reasoning_effort`` (``None`` sends no
     ``reasoning_effort``). It carries no workspace, so driving with it writes no usage row:
     :func:`extract_values` records one row for the whole extraction.
+
+    It streams (``stream=True``): an unstreamed request carrying a multi-page
+    document whose generation runs past about three minutes is dropped by the
+    provider ("Server disconnected without sending a response"), and the
+    values call is the one measured past that wall. Streaming keeps the
+    connection busy; :data:`_DEFAULT_TIMEOUT_SECONDS` becomes the call's total
+    deadline (see :class:`~dgml_core.llm.LLMConfig`).
     """
     return LLMConfig(
         model=model,
@@ -2432,6 +2445,7 @@ def _phase1_llm_config(
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
         timeout=_DEFAULT_TIMEOUT_SECONDS,
+        stream=True,
         reasoning_effort=reasoning_effort,
     )
 
@@ -2451,6 +2465,10 @@ def _phase3_llm_config(
     is ``grounded.locations_reasoning_effort`` on a page with OCR words
     (``None`` sends none) and :data:`_PHASE3_GRID_REASONING_EFFORT` on a page
     on the 0-1000 grid. No workspace, so driving with it writes no usage row.
+
+    It streams, for the reason :func:`_phase1_llm_config` gives: it is the
+    other extraction call whose reply grows with the document (a location for
+    every value on the page), so a dense page can run as long.
     """
     return LLMConfig(
         model=model,
@@ -2460,6 +2478,7 @@ def _phase3_llm_config(
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
         timeout=_DEFAULT_TIMEOUT_SECONDS,
+        stream=True,
         reasoning_effort=reasoning_effort,
     )
 
