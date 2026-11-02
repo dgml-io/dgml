@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import re
 from collections.abc import Generator
@@ -40,7 +41,7 @@ from dgml_core.usage import PricingTier, read_events
 
 from .conftest import FakeLLMResponse
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 
 
 def _cfg(ws: Workspace | None = None, **kw: Any) -> llm.LLMConfig:
@@ -119,7 +120,8 @@ def test_results_land_on_the_right_unit_under_shuffled_delivery() -> None:
 
 
 def test_continuation_spans_two_waves_and_prefills_the_partial() -> None:
-    cfg = _cfg()
+    # Haiku 5.5 refuses prefill, so use a model that takes it.
+    cfg = dataclasses.replace(_cfg(), model="anthropic/claude-sonnet-4-6")
     backend = FakeBackend(
         _script(
             {

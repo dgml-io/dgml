@@ -65,7 +65,7 @@ from dgml_core.usage import (
     record_usage,
 )
 
-_MODEL = "anthropic/claude-haiku-4-5"
+_MODEL = "anthropic/claude-haiku-5-5"
 
 
 def _kwargs(text: str) -> dict[str, Any]:

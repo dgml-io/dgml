@@ -76,7 +76,7 @@ class Clock:
 
 def _kwargs(text: str) -> dict[str, Any]:
     return {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "messages": [{"role": "user", "content": text}],
         "max_tokens": 64,
     }
@@ -333,7 +333,7 @@ def _replay(backend: FakeBackend, session: JobSession, clock: Clock) -> ReplayEx
     return ReplayExecutor(
         backend,
         session=session,
-        model="anthropic/claude-haiku-4-5",
+        model="anthropic/claude-haiku-5-5",
         api_base=None,
         poll_interval_s=60.0,
         sleep=clock.sleep,
@@ -761,7 +761,7 @@ def test_the_job_mode_settle_wait_lasts_cancel_settle_s_with_a_short_poll_interv
         ex = ReplayExecutor(
             backend,
             session=session,
-            model="anthropic/claude-haiku-4-5",
+            model="anthropic/claude-haiku-5-5",
             api_base=None,
             poll_interval_s=1.0,
             sleep=clock.sleep,

@@ -45,7 +45,7 @@ from dgml_core.usage import (
 
 from .conftest import FakeLLMResponse, local_tree_path
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 
 ROW_KEYS = [
     "at",

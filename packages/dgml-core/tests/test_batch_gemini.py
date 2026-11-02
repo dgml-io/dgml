@@ -51,7 +51,7 @@ from dgml_core.batch.types import BatchRejected, BatchSubmitUncertain
 from dgml_core.usage import extract_cost_and_tokens
 from litellm.llms.custom_httpx.http_handler import HTTPHandler
 
-MODEL = "gemini/gemini-2.5-pro"
+MODEL = "gemini/gemini-3.1-pro-preview"
 KEY = "test-gemini-key"
 BASE = "https://generativelanguage.googleapis.com"
 
@@ -88,7 +88,7 @@ def _text_response(text: str = "hello", finish: str = "STOP") -> dict[str, Any]:
             "candidatesTokenCount": 30,
             "totalTokenCount": 150,
         },
-        "modelVersion": "gemini-2.5-pro",
+        "modelVersion": "gemini-3.1-pro-preview",
     }
 
 
@@ -109,7 +109,7 @@ def _tool_response() -> dict[str, Any]:
             "candidatesTokenCount": 12,
             "totalTokenCount": 212,
         },
-        "modelVersion": "gemini-2.5-pro",
+        "modelVersion": "gemini-3.1-pro-preview",
     }
 
 
@@ -281,8 +281,8 @@ def test_continuation_second_step_carries_the_partial_and_a_user_turn(
 
 
 def test_encode_rejects_a_request_for_another_model() -> None:
-    kwargs = {"model": "gemini/gemini-2.5-flash", "messages": [{"role": "user", "content": "x"}]}
-    with pytest.raises(ValueError, match=re.escape("serves 'gemini/gemini-2.5-pro'")):
+    kwargs = {"model": "gemini/gemini-3.8-flash", "messages": [{"role": "user", "content": "x"}]}
+    with pytest.raises(ValueError, match=re.escape("serves 'gemini/gemini-3.1-pro-preview'")):
         _backend().encode(BatchRequest("x", kwargs))
 
 
@@ -385,7 +385,7 @@ def _req(cid: str, text: str = "hi") -> BatchRequest:
     return BatchRequest(cid, {"model": MODEL, "messages": [{"role": "user", "content": text}]})
 
 
-CREATE = "/v1beta/models/gemini-2.5-pro:batchGenerateContent"
+CREATE = "/v1beta/models/gemini-3.1-pro-preview:batchGenerateContent"
 OP = "batches/abc123"
 
 

@@ -54,6 +54,7 @@ import contextlib
 import copy
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -110,6 +111,7 @@ from .llm import (
     _pdf_content_block,
     describe_call_failure,
     is_anthropic_model,
+    is_gemini_model,
     is_request_rejection,
     is_request_too_large,
     model_max_output_tokens,
@@ -168,12 +170,12 @@ if TYPE_CHECKING:
 DEFAULT_MAX_TOOL_ITERS = 20
 
 # Per-call output token cap — deliberately set to the largest ceiling any
-# current frontier model offers (128K on Claude Opus/Sonnet 5, Sonnet 4.6,
-# Gemini 2.5 Pro). `llm._build_completion_kwargs` clamps this down to each
-# model's documented limit, so a model with a lower ceiling (Haiku 4.5 at
-# 64K) gets its own maximum rather than a 400. Asking for the ceiling matters
-# for value extraction: a long itemized document can genuinely need
-# >65K output tokens, and clipping surfaces as truncated tool-call arguments.
+# current frontier model offers (128K on Claude Opus/Sonnet 5, Sonnet 4.6).
+# `llm._build_completion_kwargs` clamps this down to each
+# model's documented limit, so a model with a lower ceiling (e.g. 64K) gets
+# its own maximum rather than a 400. Asking for the ceiling matters for value
+# extraction: a long itemized document can genuinely need >65K output tokens,
+# and clipping surfaces as truncated tool-call arguments.
 _DEFAULT_MAX_COMPLETION_TOKENS = 128000
 
 # Temperature for value extraction specifically. Schema generation
@@ -287,6 +289,11 @@ _NO_TOOL_CALL_REPLY_PREVIEW_CHARS = 500
 # attempts against them start on auto instead of re-sending a doomed request,
 # and the warning is emitted once, when an endpoint is added.
 _REQUIRED_TOOL_CHOICE_REJECTED: set[tuple[str, str | None, str | None]] = set()
+
+#: Values models that rejected the inlined ``submit_values`` schema and were
+#: retried with the permissive one; the fallback is warned about once per
+#: model (every file of the docset takes it) and logged at INFO per file.
+_WARNED_PERMISSIVE_SCHEMA: set[str] = set()
 
 
 # ---- Config ---------------------------------------------------------------
@@ -1317,7 +1324,7 @@ class _FileExtraction:
         values_model = self.config.values_model
 
         def _phase1_messages(
-            *, chunked: bool, pdf: bytes, part: _PdfPart | None
+            *, chunked: bool, permissive: bool, pdf: bytes, part: _PdfPart | None
         ) -> list[dict[str, Any]]:
             # Rebuilt per attempt — each phase-1 attempt appends to its message list.
             anthropic = is_anthropic_model(values_model)
@@ -1332,6 +1339,14 @@ class _FileExtraction:
             if chunked:
                 user_content.append(
                     {"type": "text", "text": prompt(PromptKey.VALUES_PHASE1_RETRY_CHUNKED)}
+                )
+            if permissive:
+                # The permissive retry's own block, after the schema for the
+                # same reason as the chunked directive: `values` is JSON text
+                # on this path, and absent roots go null rather than omitted,
+                # since `{}` is refused here (see phase1_steps).
+                user_content.append(
+                    {"type": "text", "text": prompt(PromptKey.VALUES_PHASE1_PERMISSIVE)}
                 )
             if part is not None:
                 # Only when the whole document was refused as too large. After
@@ -2336,8 +2351,9 @@ def _build_extraction_stats(
         "phase1_layout": phase1_layout,
         # "inlined" when the docset schema rode inside the submit_values
         # tool parameter (provider-enforced shape); "permissive" when the
-        # provider rejected the inlined schema (Gemini "too many states")
-        # and the retry ran with a bare object parameter + code-side
+        # provider rejected the inlined schema (Gemini "too many states",
+        # or a bare Gemini 500) and the retry ran with the values tree as
+        # JSON text + code-side
         # vocabulary pruning.
         "phase1_tool_schema": str(phase1_tool_schema),
     }
@@ -3389,11 +3405,16 @@ def _merge_part_values(base: dict[str, Any], extra: dict[str, Any]) -> dict[str,
     return base
 
 
-def _apply_append_entries(acc_args: dict[str, Any] | None, args: dict[str, Any]) -> dict[str, Any]:
+def _apply_append_entries(
+    acc_args: dict[str, Any] | None, args: dict[str, Any], *, permissive: bool = False
+) -> dict[str, Any]:
     """Apply one ``append_entries`` call to the accumulated values; the
     returned dict is the tool result (an ``error`` key means the call was
     rejected — the model sees it and can correct course; the run only fails
-    on protocol-independent problems)."""
+    on protocol-independent problems). Under the permissive tool schema
+    (*permissive*) ``entries`` is declared as a string and arrives as JSON
+    text of the array (see :func:`_append_entries_tool`); it is decoded here,
+    and text that does not read as an array is one more correctable error."""
     if acc_args is None:
         return {
             "error": (
@@ -3405,7 +3426,14 @@ def _apply_append_entries(acc_args: dict[str, Any] | None, args: dict[str, Any])
     entries = args.get("entries")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return {"error": "append_entries requires a dotted 'path' string"}
+    if permissive and isinstance(entries, str):
+        try:
+            entries = json.loads(entries)
+        except ValueError as exc:
+            return {"error": f"append_entries 'entries' must be JSON text of an array: {exc}"}
     if not isinstance(entries, list):
+        if permissive:
+            return {"error": "append_entries 'entries' must be JSON text of an array"}
         return {"error": "append_entries requires an 'entries' array"}
     path = parse_path(raw_path.strip())
     if path is None:
@@ -3424,11 +3452,32 @@ def _apply_append_entries(acc_args: dict[str, Any] | None, args: dict[str, Any])
     return {"recorded": len(entries), "total_entries": len(target)}
 
 
-def _append_entries_tool() -> dict[str, Any]:
+def _append_entries_tool(*, permissive: bool = False) -> dict[str, Any]:
     """The chunked-submission continuation tool: extend an array submitted by
     an earlier ``submit_values(done=false)`` call. Entries are validated
     code-side against the docset vocabulary after the run (the per-path item
-    schema can't be expressed in one static tool spec)."""
+    schema can't be expressed in one static tool spec).
+
+    Under the permissive tool schema (*permissive*) ``entries`` is JSON text
+    of the array rather than an array of open objects, for the reason
+    :data:`_PERMISSIVE_VALUES_PARAM` gives: an open object is one a
+    constrained decoder without ``additionalProperties`` can only leave
+    empty. :func:`_apply_append_entries` decodes it."""
+    entries_param: dict[str, Any] = (
+        {
+            "type": "string",
+            "description": (
+                "The next batch of array entries as JSON text: one JSON array "
+                "of entries, nothing around it."
+            ),
+        }
+        if permissive
+        else {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "The next batch of array entries.",
+        }
+    )
     return {
         "type": "function",
         "function": {
@@ -3451,11 +3500,7 @@ def _append_entries_tool() -> dict[str, Any]:
                             "'Transactions' or 'Sections[0].LineItems'."
                         ),
                     },
-                    "entries": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "The next batch of array entries.",
-                    },
+                    "entries": entries_param,
                     "done": {
                         "type": "boolean",
                         "description": (
@@ -3477,7 +3522,8 @@ class ToolSchemaMode(StrEnum):
     ``INLINED`` (the default) rides the schema inside the ``submit_values`` tool
     parameter, so the provider enforces its shape. ``PERMISSIVE`` is the fallback
     after a provider rejects the inlined schema as too large (Gemini's "too many
-    states"): a bare object parameter, with the vocabulary pruned code-side and
+    states", or a bare Gemini 500): the values tree as JSON text (see
+    :data:`_PERMISSIVE_VALUES_PARAM`), with the vocabulary pruned code-side and
     the full schema still in the user prompt.
     """
 
@@ -3505,7 +3551,8 @@ class Phase1Result:
     page ranges (empty when it went whole).
 
     ``refusal`` is set when the successful attempt submitted keys of which
-    nothing fits the schema. :func:`phase1_steps` does not raise it: the caller
+    nothing fits the schema, or an empty tree under the permissive tool
+    schema. :func:`phase1_steps` does not raise it: the caller
     first records what phase 1 did (tool calls, layout, duration), then raises
     it as :class:`ValuesExtractionFailed`.
     """
@@ -3555,18 +3602,25 @@ def phase1_steps(
     * a ``finish_reason='length'`` turn → chunked submission with the mandatory
       directive (``run.chunked``); a second truncation fails the file;
     * the provider refusing the inlined tool schema ("too many states",
-      Gemini's constrained decoder) → the permissive object parameter plus
-      code-side vocabulary pruning (``run.tool_schema_mode``). That refusal is
-      an executor failure the driver throws in at the pending ``yield``, so a
-      batch driver gets the fallback without doing anything.
+      Gemini's constrained decoder — or, for a Gemini model only, a bare
+      HTTP 500, which is how it answers some oversized schemas; see
+      :func:`_is_gemini_internal_error`) → the permissive parameter (the values
+      tree as JSON text, see :data:`_PERMISSIVE_VALUES_PARAM`) plus code-side
+      vocabulary pruning (``run.tool_schema_mode``). That refusal is an
+      executor failure the driver throws in at the pending ``yield``, so a
+      batch driver gets the fallback without doing anything. It is warned
+      about once per model. On this path an empty tree is refused rather
+      than written as a successful empty extraction (``run.refusal``); the
+      prompt block the factory adds for it asks for null roots instead.
 
     When the provider refuses the whole *pdf_bytes* as too large, the document
     is sent in page ranges instead (see :func:`_phase1_in_parts`), the parts'
     results merged as one, and ``run.pdf_parts`` set to their page ranges.
 
-    *messages_factory* is called as ``messages_factory(chunked=..., pdf=...,
-    part=...)`` for each attempt and must return a fresh list (the attempt
-    appends to it); *part* is ``None`` for the whole document.
+    *messages_factory* is called as ``messages_factory(chunked=...,
+    permissive=..., pdf=..., part=...)`` for each attempt and must return a
+    fresh list (the attempt appends to it); *part* is ``None`` for the whole
+    document.
     *tool_schema* is the inlined ``submit_values`` parameter; the permissive
     one replaces it once that latch is set. *reasoning_effort* is the
     configured ``grounded.values_reasoning_effort`` (``None`` sends none).
@@ -3580,19 +3634,21 @@ def phase1_steps(
 
     def _run(pdf: bytes, part: _PdfPart | None) -> LLMSteps[_Phase1Run]:
         while True:
-            values_param = (
-                _PERMISSIVE_VALUES_PARAM
-                if run.tool_schema_mode == ToolSchemaMode.PERMISSIVE
-                else tool_schema
-            )
+            permissive = run.tool_schema_mode == ToolSchemaMode.PERMISSIVE
+            values_param = _PERMISSIVE_VALUES_PARAM if permissive else tool_schema
             try:
                 return (
                     yield from _phase1_attempt_steps(
                         workspace=workspace,
                         file_id=file_id,
-                        messages=messages_factory(chunked=run.chunked, pdf=pdf, part=part),
-                        tools=_phase1_tools(values_param, chunked=run.chunked),
+                        messages=messages_factory(
+                            chunked=run.chunked, permissive=permissive, pdf=pdf, part=part
+                        ),
+                        tools=_phase1_tools(
+                            values_param, chunked=run.chunked, permissive=permissive
+                        ),
                         chunked=run.chunked,
+                        permissive=permissive,
                         model=model,
                         api_key=api_key,
                         api_base=api_base,
@@ -3614,13 +3670,19 @@ def phase1_steps(
                 run.chunked = True
                 run.truncated_retries += 1
             except ValuesExtractionFailed as exc:
-                if (
-                    run.tool_schema_mode == ToolSchemaMode.PERMISSIVE
-                    or not _is_tool_schema_too_large(exc)
+                if run.tool_schema_mode == ToolSchemaMode.PERMISSIVE or not (
+                    _is_tool_schema_too_large(exc) or _is_gemini_internal_error(exc, model)
                 ):
                     raise
-                # Gemini's constrained decoder rejected the inlined schema; the
-                # model still sees the full schema in the user prompt.
+                # Gemini's constrained decoder rejected the inlined schema (as
+                # the 400 that names it, or as a bare 500); the model still
+                # sees the full schema in the user prompt.
+                cause = (
+                    "too many states for serving"
+                    if _is_tool_schema_too_large(exc)
+                    else "HTTP 500 INTERNAL, after the request's own retries"
+                )
+                _note_permissive_schema_fallback(model, file_id, cause, exc)
                 run.tool_schema_mode = ToolSchemaMode.PERMISSIVE
 
     # The whole PDF goes in one request, as it always has. Only when the
@@ -3648,8 +3710,19 @@ def phase1_steps(
     # null, stays a legal "nothing found" outcome (the serializer reads null as
     # "not extracted"), and leaf internals (a leaf without text, a collection
     # of malformed entries) stay the serializer's business, as before.
-    submitted_keys = sorted(k for k, v in args["values"].items() if v is not None)
-    kept = _prune_to_vocabulary(args["values"], vocab)
+    #
+    # Except under the permissive tool schema: there an empty tree is also
+    # exactly what a constrained decoder emits when the fallback parameter
+    # cannot carry the values (the open-object form of it did, on Gemini,
+    # for every file), and a run that wrote <dg:extraction/> as "ok" hid that
+    # for as long as it lasted. So on that path `{}` is refused too; a model
+    # that truly finds nothing has the all-roots-null form, which the
+    # permissive prompt block (VALUES_PHASE1_PERMISSIVE) asks for explicitly,
+    # since the base prompt's "omit absent fields" would otherwise make `{}`
+    # the honest answer for an empty document.
+    submitted = args["values"]
+    submitted_keys = sorted(k for k, v in submitted.items() if v is not None)
+    kept = _prune_to_vocabulary(submitted, vocab)
     if submitted_keys and not kept:
         shown = ", ".join(repr(k) for k in submitted_keys[:6])
         if len(submitted_keys) > 6:
@@ -3659,9 +3732,18 @@ def phase1_steps(
             f"{shown}, expected roots {sorted(tag.name for tag in vocab.roots)} "
             "shaped as the schema defines; refusing to write an empty extraction"
         )
+    elif not submitted and run.tool_schema_mode == ToolSchemaMode.PERMISSIVE:
+        run.refusal = (
+            f"{_TOOL_SUBMIT_VALUES!r} returned an empty values tree under the permissive "
+            f"tool schema ({model!r} rejected the inlined schema as too large); on that "
+            "path an empty tree is what the model emits when the fallback parameter "
+            "cannot carry the values, so it is not written as a successful extraction "
+            "(a document with none of the schema's values is submitted with every "
+            "root null)"
+        )
     # Enforce the vocabulary code-side on exactly the paths whose payload
     # never met a provider-side shape check: permissive mode (the values
-    # parameter was a bare object) and chunked mode (append_entries
+    # tree arrived as JSON text) and chunked mode (append_entries
     # batches are validated only as generic objects). The inlined
     # single-shot path already got additionalProperties:false at the API
     # layer, and pruning it too would discard off-schema values *before*
@@ -3839,6 +3921,7 @@ def _phase1_attempt_steps(
     vocab: Vocabulary,
     counters: dict[str, int],
     chunked: bool = False,
+    permissive: bool = False,
     reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
     page_offset: int = 0,
 ) -> LLMSteps[tuple[dict[str, Any], int, int]]:
@@ -3872,6 +3955,15 @@ def _phase1_attempt_steps(
     set, so an ``append_entries`` call that arrives without it is treated as
     an unknown tool. That keeps the caller's invariant true by construction —
     if appends ran, chunked mode was on, so the payload gets pruned.
+
+    ``permissive`` likewise must match the tool set: under the permissive
+    tool schema ``submit_values``'s ``values`` and ``append_entries``'s
+    ``entries`` are declared as strings and arrive as JSON text, which this
+    loop decodes before reading them (see :data:`_PERMISSIVE_VALUES_PARAM`
+    for why). Text that does not read as one object (or one array) is an
+    error tool result the model can correct, like the tool's other protocol
+    errors: the model hand-wrote a large tree inside a string, and one slip
+    should not cost the whole file after a full round-trip of the PDF.
 
     A turn that stops with ``finish_reason == "length"`` raises
     :class:`_OutputTruncated` so :func:`phase1_steps` can retry with an explicit
@@ -4049,6 +4141,11 @@ def _phase1_attempt_steps(
                 ) from exc
 
             if name == _TOOL_SUBMIT_VALUES:
+                if permissive:
+                    args, decode_error = _decode_permissive_values(args)
+                    if decode_error is not None:
+                        _ack(call.id, name, {"error": decode_error})
+                        continue
                 args, repaired = _repair_submit_values_args(args, vocab, chunked=chunked)
                 if repaired is not None:
                     counters["envelope_repairs"] += 1
@@ -4070,6 +4167,8 @@ def _phase1_attempt_steps(
                             acc_args["layout"] = args["layout"]
                 assert acc_args is not None
                 if args.get("done", True):
+                    if all(v is None for v in acc_args["values"].values()):
+                        _note_empty_submission(file_id, result.content)
                     return acc_args, tool_calls_run, chunk_calls
                 _ack(
                     call.id,
@@ -4086,7 +4185,7 @@ def _phase1_attempt_steps(
 
             if name == _TOOL_APPEND_ENTRIES and chunked:
                 chunk_calls += 1
-                outcome = _apply_append_entries(acc_args, args)
+                outcome = _apply_append_entries(acc_args, args, permissive=permissive)
                 if "error" not in outcome and args.get("done", False):
                     assert acc_args is not None  # _apply_append_entries verified
                     return acc_args, tool_calls_run, chunk_calls
@@ -4122,6 +4221,54 @@ def _phase1_attempt_steps(
     raise ValuesExtractionFailed(
         f"extraction exceeded max_tool_iters={max_tool_iters} "
         f"without producing a {_TOOL_SUBMIT_VALUES!r} call"
+    )
+
+
+def _note_empty_submission(file_id: str, reply_text: str | None) -> None:
+    """Log at INFO that phase 1's final ``submit_values`` carried no values,
+    with whatever the model said in the same turn. A model that finds
+    nothing often says why in text beside the tool call (for a document
+    that does not match the docset's schema: "this is a services agreement,
+    not a utility bill"); the loop discards text, so this is the one place
+    that reason surfaces. The run itself stays a legal nothing-found."""
+    text = " ".join((reply_text or "").split())
+    if len(text) > 500:
+        text = text[:500] + "…"
+    if text:
+        logger.info("file %s: phase 1 submitted no values; the model said: %s", file_id, text)
+    else:
+        logger.info("file %s: phase 1 submitted no values and gave no reason", file_id)
+
+
+def _note_permissive_schema_fallback(
+    model: str, file_id: str, cause: str, exc: BaseException
+) -> None:
+    """Log that *model* rejected the inlined tool schema and phase 1 is
+    retrying with the permissive one: a WARNING the first time per model,
+    since the fallback trades the provider's shape enforcement for prompt
+    adherence plus code-side pruning and the user should know the docset
+    runs that way, then INFO for each further file. *cause* is the one-line
+    reason the warning shows; the provider's full error text (a multi-line
+    JSON body for a Gemini 500) goes to DEBUG only."""
+    logger.debug("file %s: inlined-schema rejection from %r: %s", file_id, model, exc)
+    if model in _WARNED_PERMISSIVE_SCHEMA:
+        logger.info(
+            "file %s: values model %r rejected the inlined extraction schema (%s); "
+            "retrying with the permissive tool schema",
+            file_id,
+            model,
+            cause,
+        )
+        return
+    _WARNED_PERMISSIVE_SCHEMA.add(model)
+    logger.warning(
+        "values model %r rejected the inlined extraction schema (%s); phase-1 "
+        "extraction retries with the permissive tool schema, where the values "
+        "tree rides as JSON text and is checked against the docset vocabulary "
+        "code-side (first seen on file %s)",
+        model,
+        cause,
+        file_id,
     )
 
 
@@ -4322,7 +4469,9 @@ def _values_phase1_user_prompt(schema: dict[str, Any], guidance: str | None = No
     return text
 
 
-def _phase1_tools(values_schema: dict[str, Any], *, chunked: bool) -> list[dict[str, Any]]:
+def _phase1_tools(
+    values_schema: dict[str, Any], *, chunked: bool, permissive: bool = False
+) -> list[dict[str, Any]]:
     """The phase-1 tool set.
 
     ``chunked`` gates the whole chunked-submission protocol — the ``done``
@@ -4332,10 +4481,14 @@ def _phase1_tools(values_schema: dict[str, Any], *, chunked: bool) -> list[dict[
     call, and costs tool-schema tokens on every request. Chunking is an
     escalation, enabled only after an attempt was truncated (see
     :func:`extract_values`), where the prompt carries the matching protocol.
+
+    ``permissive`` says *values_schema* is :data:`_PERMISSIVE_VALUES_PARAM`
+    (the provider rejected the inlined schema), so the continuation tool
+    takes its entries as JSON text too.
     """
     tools = [_submit_values_tool(values_schema, with_layout=True, chunked=chunked)]
     if chunked:
-        tools.append(_append_entries_tool())
+        tools.append(_append_entries_tool(permissive=permissive))
     return tools
 
 
@@ -4450,14 +4603,66 @@ def _strip_annotations(node: Any) -> Any:
 # docset schema: shape enforcement moves from the API layer to the prompt
 # (which carries the full schema) plus code-side pruning against the
 # vocabulary (_prune_to_vocabulary).
+#
+# It is a *string*, not an open object, because the one provider that trips
+# this fallback cannot fill an open object: Gemini's function calling has no
+# additionalProperties, litellm strips an empty `properties`, and its
+# constrained decoder then sees an OBJECT with no keys and can only emit `{}`
+# (the model reasons about the extraction and the call lands empty). A string
+# carries the whole tree as JSON text; _decode_permissive_values parses it
+# before the envelope repair reads it. The chunked continuation tool's
+# `entries` gets the same treatment (see _append_entries_tool).
 _PERMISSIVE_VALUES_PARAM: dict[str, Any] = {
-    "type": "object",
+    "type": "string",
     "description": (
-        "The extracted values tree. MUST follow the JSON Schema given in the "
-        "prompt exactly — same nesting, same field names, and the leaf value "
-        "shape it defines."
+        "The extracted values tree as JSON text: one JSON object, nothing "
+        "around it. It MUST follow the JSON Schema given in the prompt "
+        "exactly — same nesting, same field names, and the leaf value shape "
+        "it defines."
     ),
 }
+
+
+_CODE_FENCE = re.compile(r"\A```[A-Za-z0-9_-]*[ \t]*\r?\n(.*?)\r?\n?```\Z", re.DOTALL)
+
+
+def _strip_code_fence(text: str) -> str:
+    """Return *text* without a Markdown code fence wrapped around the whole
+    of it (```` ```json … ``` ````), the usual decoration a model adds to JSON
+    it writes as text; anything else is returned stripped of whitespace."""
+    text = text.strip()
+    fenced = _CODE_FENCE.match(text)
+    return fenced.group(1).strip() if fenced else text
+
+
+def _decode_permissive_values(args: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Decode the ``values`` JSON text of a permissive-mode ``submit_values`` call.
+
+    Under the permissive tool schema ``values`` is declared as a string (see
+    :data:`_PERMISSIVE_VALUES_PARAM`), so the tree arrives as JSON text. It
+    is decoded here, before :func:`_repair_submit_values_args` reads it, so a
+    tree the model wrapped in the tool's own envelope inside the string is
+    still repaired the usual way. A code fence around the text is stripped
+    first. A ``values`` that already is an object (a provider that honored
+    the prompt's schema over the declared type) is left alone.
+
+    Returns ``(args, None)`` with ``values`` decoded, or ``(args, error)``
+    when the text does not read as one JSON object: *error* is the tool
+    result to send back, so the model can resend rather than lose the file
+    to one mis-escaped quote (the same treatment ``append_entries`` gives
+    its ``entries`` text).
+    """
+    values = args.get("values")
+    if not isinstance(values, str):
+        return args, None
+    decoded = _decode_string_envelope(_strip_code_fence(values))
+    if decoded is None:
+        shown = values if len(values) <= 200 else values[:200] + "…"
+        return args, (
+            f"{_TOOL_SUBMIT_VALUES} 'values' must be the JSON text of one object "
+            f"(nothing around it); could not decode {shown!r}. Resend the full tree."
+        )
+    return {**args, "values": decoded}, None
 
 
 def _is_tool_schema_too_large(exc: Exception) -> bool:
@@ -4468,13 +4673,32 @@ def _is_tool_schema_too_large(exc: Exception) -> bool:
     return "too many states" in str(exc).lower()
 
 
+_GEMINI_INTERNAL_ERROR = re.compile(r"(gemini|vertexai)exception internalservererror")
+
+
+def _is_gemini_internal_error(exc: Exception, model: str) -> bool:
+    """True when a Gemini model answered with a bare HTTP 500.
+
+    Gemini does not always name an oversized inlined tool schema: the same
+    schema that one request rejects as "too many states" (a 400) another
+    answers with 500 ``INTERNAL`` and no detail, reproducibly, and the
+    permissive schema then succeeds (observed on Gemini Pro with a
+    144-element docset schema). The 500 carries nothing to match on, so
+    this is deliberately narrow: only a Gemini-routed *model*, only litellm's
+    Google provider exception wording, and the caller applies it only while
+    the inlined schema is in use — so a genuine outage costs one permissive
+    retry, never more, before the file fails with the provider's error."""
+    return is_gemini_model(model) and bool(_GEMINI_INTERNAL_ERROR.search(str(exc).lower()))
+
+
 def _prune_to_vocabulary(values: dict[str, Any], vocab: Vocabulary) -> dict[str, Any]:
     """Drop keys and wrong-shape nodes the docset vocabulary doesn't define.
 
     The code-side stand-in for the ``additionalProperties: false`` the
     inlined tool schema enforces at the API layer — used when the provider
-    rejected the inlined schema and phase 1 ran with the permissive object
-    parameter. Leaf internals are left untouched (they are normalized by
+    rejected the inlined schema and phase 1 ran with the permissive parameter
+    (the values tree as JSON text, see :data:`_PERMISSIVE_VALUES_PARAM`).
+    Leaf internals are left untouched (they are normalized by
     :func:`_normalize_leaf_provenance`)."""
 
     def prune_children(children: list[Tag], value: dict[str, Any]) -> dict[str, Any]:

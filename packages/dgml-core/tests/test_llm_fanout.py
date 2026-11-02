@@ -36,7 +36,7 @@ from dgml_core.usage import read_events
 
 from .conftest import FakeLLMResponse
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 
 #: Per-request costs chosen so the float sum depends on the fold order: child
 #: order (a1, a2, b1) and batch arrival order (a1, b1, a2) disagree in the last

@@ -153,7 +153,7 @@ def test_batch_checks_the_label_model_under_an_open_vocabulary(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "mistral/mistral-large-latest",
             }
         },

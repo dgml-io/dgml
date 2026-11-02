@@ -610,6 +610,16 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run_subparser(docset, common)
     ds_create = docset.add_parser("create", parents=[common], help="Create a new DocSet.")
     ds_create.add_argument("--name", required=True)
+    ds_create.add_argument(
+        "--id",
+        default=None,
+        metavar="DOCSET_ID",
+        help=(
+            f"Assign this id to the new DocSet instead of generating one — {RECORD_ID_SHAPE}, "
+            "e.g. 'q2-contracts'. Fails with CONFLICT if a DocSet "
+            "already holds it. Omit it for a generated 12-character id."
+        ),
+    )
     ds_create.add_argument("--description", default="")
     ds_create.add_argument(
         "--key-question",
@@ -3911,7 +3921,7 @@ def _add_generate_subparser(
         default=None,
         help=(
             "Override the per-page transcription model for this run (e.g. "
-            "'anthropic/claude-haiku-4-5'). Layers on top of --generation-config / "
+            "'anthropic/claude-haiku-5-5'). Layers on top of --generation-config / "
             "the workspace config. It takes the configured [models] provider key "
             "for its provider, else LiteLLM's per-provider env var (e.g. "
             "ANTHROPIC_API_KEY); no other configured key or api_base carries over."
@@ -4621,6 +4631,7 @@ def _docset_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             name=args.name,
             description=args.description,
             key_questions=args.key_questions,
+            docset_id=args.id,
         )
         _emit(ds.to_json(), fmt)
     elif sub == "list":

@@ -18,6 +18,8 @@ import pytest
 from dgml_core import layout
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import (
+    ConflictError,
+    ConflictErrorKind,
     DocSetNotFound,
     FileNotFound,
     InvalidArgument,
@@ -85,7 +87,7 @@ def test_from_json_tolerates_missing_key_questions(workspace: Workspace) -> None
     ds = store.create(name="X")
     # A docset.json that omits the optional key_questions field.
     minimal = {"id": ds.id, "name": "Minimal", "description": "no key_questions"}
-    workspace.docs.put_doc("docsets", ds.id, minimal)
+    workspace.docs.put_doc(layout.Collection.DOCSETS, ds.id, minimal)
     loaded = store.get(ds.id)
     assert loaded.key_questions == []
     assert loaded.name == "Minimal"
@@ -95,6 +97,87 @@ def test_create_empty_name_rejected(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     with pytest.raises(InvalidArgument):
         store.create(name="   ")
+
+
+# --------------------------------------------------------------------------
+# Caller-supplied docset ids. Same grammar as file ids (test_files.py covers the
+# content-hash interplay that docsets don't have).
+# --------------------------------------------------------------------------
+
+
+def test_create_with_requested_id_uses_it(workspace: Workspace) -> None:
+    store = DocSetStore(workspace)
+    ds = store.create(name="Contracts", docset_id="q2-contracts")
+    assert ds.id == "q2-contracts"
+    assert store.get("q2-contracts") == ds
+    assert (workspace.root / "docsets" / "q2-contracts" / "docset.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "docset_id",
+    [
+        "abc",
+        "a" * 40,
+        "a_b-c",
+        "0start",
+        "123e4567-e89b-12d3-a456-426614174000",  # UUID
+        "123e4567e89b12d3a456426614174000",  # uuid4().hex
+    ],
+)
+def test_create_requested_id_accepts_grammar_bounds(workspace: Workspace, docset_id: str) -> None:
+    """The grammar's edges have to survive being used as a real path segment."""
+    store = DocSetStore(workspace)
+    assert store.create(name="X", docset_id=docset_id).id == docset_id
+    assert store.get(docset_id).id == docset_id
+
+
+@pytest.mark.parametrize(
+    "docset_id",
+    ["ab", "A" * 12, "-lead", "a.b", "a/b", "", "123E4567-E89B-12D3-A456-426614174000"],
+)
+def test_create_rejects_malformed_requested_id(workspace: Workspace, docset_id: str) -> None:
+    store = DocSetStore(workspace)
+    with pytest.raises(InvalidArgument, match="not well formed"):
+        store.create(name="X", docset_id=docset_id)
+    # Nothing half-built — the shape check runs before any write.
+    assert store.list_all() == []
+    assert not (workspace.root / "docsets").exists()
+
+
+def test_create_requested_id_already_held_conflicts(workspace: Workspace) -> None:
+    """put_doc is an upsert, so without the guard a reused id would silently
+    replace the other DocSet's manifest."""
+    store = DocSetStore(workspace)
+    first = store.create(
+        name="First", description="keep me", key_questions=["q1"], docset_id="shared"
+    )
+    with pytest.raises(ConflictError) as exc_info:
+        store.create(name="Second", description="clobber", docset_id="shared")
+    assert exc_info.value.kind is ConflictErrorKind.ID
+    assert exc_info.value.existing_id == "shared"
+    assert "First" in str(exc_info.value)
+    assert store.get("shared") == first
+    assert store.list_all() == [first]
+
+
+def test_create_without_id_still_mints(workspace: Workspace) -> None:
+    store = DocSetStore(workspace)
+    ds = store.create(name="X")
+    assert len(ds.id) == 12
+    assert ds.id.isalnum() and ds.id.islower()
+
+
+@pytest.mark.parametrize("docset_id", ["123e4567-e89b-12d3-a456-426614174000", "my_set-2"])
+def test_requested_id_docset_takes_assignments(workspace: Workspace, docset_id: str) -> None:
+    """A separator-bearing docset id must round-trip through layout.pair_id."""
+    store = DocSetStore(workspace)
+    store.create(name="X", docset_id=docset_id)
+    fid = "abcdefghijkl"
+    workspace.docs.put_doc(layout.Collection.FILES, fid, {"id": fid})
+    store.add_file(docset_id, fid)
+    assert store.list_files(docset_id) == [fid]
+    store.remove_file(docset_id, fid)
+    assert store.list_files(docset_id) == []
 
 
 def test_list_all(workspace: Workspace) -> None:
@@ -139,7 +222,7 @@ def test_add_remove_file_reference(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     fid = "abcdefghijkl"
-    workspace.docs.put_doc("files", fid, {"id": fid})
+    workspace.docs.put_doc(layout.Collection.FILES, fid, {"id": fid})
     store.add_file(ds.id, fid)
     assert store.list_files(ds.id) == [fid]
     store.remove_file(ds.id, fid)
@@ -152,7 +235,7 @@ def test_add_file_logs_the_assignment(
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     fid = "abcdefghijkl"
-    workspace.docs.put_doc("files", fid, {"id": fid})
+    workspace.docs.put_doc(layout.Collection.FILES, fid, {"id": fid})
     caplog.set_level(logging.INFO, logger="dgml_core")
 
     store.add_file(ds.id, fid)
@@ -364,7 +447,7 @@ def _assigned_pair(workspace: Workspace) -> tuple[DocSetStore, str, str]:
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     fid = "abcdefghijkl"
-    workspace.docs.put_doc("files", fid, {"id": fid})
+    workspace.docs.put_doc(layout.Collection.FILES, fid, {"id": fid})
     store.add_file(ds.id, fid)
     workspace.blobs.put_blob(f"docsets/{ds.id}/files/{fid}/report.dgml.xml", b"<x/>")
     workspace.docs.put_doc("extraction_stats", f"{ds.id}/{fid}", {"matched": 3})
@@ -375,7 +458,7 @@ def test_add_file_records_an_assignment_document(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     fid = "abcdefghijkl"
-    workspace.docs.put_doc("files", fid, {"id": fid})
+    workspace.docs.put_doc(layout.Collection.FILES, fid, {"id": fid})
     store.add_file(ds.id, fid)
 
     doc = workspace.docs.get_doc("assignments", f"{ds.id}/{fid}")
@@ -415,7 +498,7 @@ def test_docset_delete_removes_every_assignment_and_artifact(workspace: Workspac
     assert workspace.docs.find_docs("assignments", {"docset_id": did}) == []
     assert workspace.blobs.list_blobs(f"docsets/{did}/") == []
     # the underlying file is untouched
-    assert workspace.docs.get_doc("files", fid) is not None
+    assert workspace.docs.get_doc(layout.Collection.FILES, fid) is not None
 
 
 def test_reassign_is_idempotent(workspace: Workspace) -> None:
@@ -433,7 +516,7 @@ def test_reassign_is_idempotent(workspace: Workspace) -> None:
 def test_docsets_for_file_lists_each_assignment(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     fid = "abcdefghijkl"
-    workspace.docs.put_doc("files", fid, {"id": fid})
+    workspace.docs.put_doc(layout.Collection.FILES, fid, {"id": fid})
     a = store.create(name="A", description="first")
     b = store.create(name="B")
     store.create(name="Unrelated")
@@ -455,7 +538,7 @@ def test_docsets_for_file_lists_each_assignment(workspace: Workspace) -> None:
 def test_docsets_for_file_unassigned_returns_empty(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     store.create(name="A")
-    workspace.docs.put_doc("files", "abcdefghijkl", {"id": "abcdefghijkl"})
+    workspace.docs.put_doc(layout.Collection.FILES, "abcdefghijkl", {"id": "abcdefghijkl"})
     assert store.docsets_for_file("abcdefghijkl") == []
 
 
@@ -483,7 +566,7 @@ def test_docsets_for_file_missing_assigned_at(workspace: Workspace) -> None:
     store = DocSetStore(workspace)
     ds = store.create(name="X")
     fid = "abcdefghijkl"
-    workspace.docs.put_doc("files", fid, {"id": fid})
+    workspace.docs.put_doc(layout.Collection.FILES, fid, {"id": fid})
     workspace.docs.put_doc(
         "assignments", layout.pair_id(ds.id, fid), {"docset_id": ds.id, "file_id": fid}
     )
@@ -545,7 +628,7 @@ def test_docsets_for_file_unaffected_by_malformed_manifest_elsewhere(
     every file in the workspace."""
     store, did, fid = _assigned_pair(workspace)
     unrelated = store.create(name="Unrelated")
-    workspace.docs.put_doc("docsets", unrelated.id, {"id": unrelated.id})
+    workspace.docs.put_doc(layout.Collection.DOCSETS, unrelated.id, {"id": unrelated.id})
 
     with pytest.raises(KeyError):
         store.list_all()

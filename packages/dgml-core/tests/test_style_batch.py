@@ -38,7 +38,7 @@ from dgml_core.models import FileRecord
 from dgml_core.storage import Workspace
 from dgml_core.usage import read_events
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 
 #: file id → its pages' words (one word list per page) and its DGML.
 DOCS: dict[str, tuple[list[list[str]], str]] = {

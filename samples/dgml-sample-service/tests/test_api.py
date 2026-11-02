@@ -239,7 +239,7 @@ def test_classify_assigns_and_extracts(
     assert done["result"]["docset_id"] == ds["id"]
     assert done["result"]["extraction"]["performed"] is True
     assert str(seen["mode"]) == "existing"
-    assert seen["model"] == "anthropic/claude-haiku-4-5"  # the light tier of the family
+    assert seen["model"] == "anthropic/claude-haiku-5-5"  # the light tier of the family
 
     detail = client.get(f"{base}/{ds['id']}").json()
     assert detail["file_ids"] == [file_id] and detail["files"][0]["has_dgml"] is True

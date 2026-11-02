@@ -72,7 +72,7 @@ SECRET = "sk-DGML-TEST-SECRET-0123456789"
 
 def _kwargs(text: str, **extra: Any) -> dict[str, Any]:
     return {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "messages": [{"role": "user", "content": text}],
         "max_tokens": 64,
         **extra,
@@ -112,7 +112,7 @@ def _executor(backend: FakeBackend, session: JobSession) -> ReplayExecutor:
     return ReplayExecutor(
         backend,
         session=session,
-        model="anthropic/claude-haiku-4-5",
+        model="anthropic/claude-haiku-5-5",
         api_base=None,
         poll_interval_s=0,
         sleep=lambda _s: None,
@@ -466,7 +466,7 @@ def test_sync_calls_are_recorded_and_replayed(ws: Workspace) -> None:
         calls.append(kwargs)
         return fake_model_response("sync reply", cost=0.5)
 
-    config = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    config = llm.LLMConfig(model="anthropic/claude-haiku-5-5")
     with patch("litellm.completion", side_effect=completion):
         first = _open(ws, wait=True)
         assert llm.call(config, system_prompt="S", user_content=[{"type": "text", "text": "u"}])
@@ -482,7 +482,7 @@ def test_without_a_session_the_sync_path_is_untouched() -> None:
     assert llm._SYNC_RECORDER is None
     with patch("litellm.completion", return_value=fake_model_response("plain")):
         out = llm.call(
-            llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+            llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
             system_prompt="S",
             user_content=[{"type": "text", "text": "u"}],
         )

@@ -1116,6 +1116,86 @@ def test_docset_create_show_list(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert any(d["id"] == docset_id for d in listed["docsets"])
 
 
+# --------------------------------------------------------------------------
+# `dgml docset create --id` — caller-supplied docset ids.
+# These lock the JSON/exit-code contract; the rule matrix itself is covered in
+# dgml-core's test_docsets.py.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("docset_id", ["q2-contracts", "123e4567-e89b-12d3-a456-426614174000"])
+def test_docset_create_id_flag_sets_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], docset_id: str
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "Contracts", "--id", docset_id])
+    assert rc == 0
+    assert _read_stdout(capsys)["id"] == docset_id
+    assert (ws / "docsets" / docset_id / "docset.json").is_file()
+
+    assert main(_ws_args(ws) + ["docset", "show", docset_id]) == 0
+    shown = _read_stdout(capsys)
+    assert shown["id"] == docset_id
+    assert shown["name"] == "Contracts"
+
+
+@pytest.mark.parametrize("bad", ["My_Set", "ab", "a b", "a/b"])
+def test_docset_create_id_rejects_malformed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    """Exit 1 with a structured envelope — not argparse's exit 2."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "X", "--id", bad])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
+    assert not (ws / "docsets").exists()
+
+
+def test_docset_create_id_uppercase_uuid_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ids are lowercase-only, so an uppercase UUID is the likely mistake. The
+    message must say the rule (letters lowercase) rather than leaving the caller
+    to guess."""
+    import uuid
+
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "X", "--id", str(uuid.uuid4()).upper()])
+    assert rc == 1
+    err = _read_stderr(capsys)
+    assert err["error"]["code"] == "INVALID_ARGUMENT"
+    assert "lowercase" in err["error"]["message"]
+
+
+def test_docset_create_id_conflict_envelope(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    assert main(_ws_args(ws) + ["docset", "create", "--name", "First", "--id", "shared"]) == 0
+    capsys.readouterr()
+
+    rc = main(_ws_args(ws) + ["docset", "create", "--name", "Second", "--id", "shared"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "CONFLICT"
+
+    # The held DocSet survived — the whole point of the id guard.
+    main(_ws_args(ws) + ["docset", "show", "shared"])
+    assert _read_stdout(capsys)["name"] == "First"
+    main(_ws_args(ws) + ["docset", "list"])
+    assert len(_read_stdout(capsys)["docsets"]) == 1
+
+
 def test_docset_update_and_delete(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     ws = tmp_path / "ws"
     _init_ws(ws)
@@ -1370,7 +1450,7 @@ def test_cluster_assigns_unassigned_files_to_docsets(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     # Empty workspace: no unassigned files → no-op, no LLM or clusterer call.
@@ -1628,7 +1708,7 @@ def test_cluster_config_flag_passes_overrides_to_run_clustering(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1664,7 +1744,7 @@ def test_cluster_config_flag_missing_file_errors(
     ws = tmp_path / "ws"
     _init_ws(ws)
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     capsys.readouterr()
@@ -1701,7 +1781,7 @@ def test_cluster_config_preset_name_passes_preset_overrides(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1757,7 +1837,7 @@ def test_cluster_method_llm_routes_to_llm_partitioner(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1789,7 +1869,7 @@ def test_cluster_method_auto_small_corpus_uses_llm(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     main(_ws_args(ws) + ["file", "add", str(sample_pdf)])
     fid = _read_stdout(capsys)["file"]["id"]
@@ -1823,7 +1903,7 @@ def test_cluster_partial_success_when_llm_fails(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     # Existing DocSet "Foo" — mock run_clustering to put one file in "Foo"
@@ -1931,7 +2011,7 @@ def test_file_add_auto_classify_creates_new_docset(
     # the LLM is forced to call create_new_docset.
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     new_questions = [
@@ -1960,7 +2040,7 @@ def test_file_add_auto_classify_creates_new_docset(
     assert cls["docset_name"] == "Receipts"
     assert cls["docset_key_questions"] == new_questions
     assert cls["error"] is None
-    assert cls["model"] == "gemini/gemini-2.5-flash-lite"
+    assert cls["model"] == "gemini/gemini-3.5-flash-lite"
 
     # Persisted: the created DocSet's record carries the key_questions
     # for future classification calls to read.
@@ -1985,7 +2065,7 @@ def test_file_add_auto_classify_new_docset_rolled_back_when_assign_fails(
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
-    write_classification_config(Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite"})
+    write_classification_config(Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite"})
     response = _tool_response(
         "create_new_docset",
         {"name": "Receipts", "description": "expense receipts", "key_questions": ["Who?"]},
@@ -2059,7 +2139,7 @@ def test_file_add_auto_classify_assigns_existing_docset(
     ]
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     response = _tool_response("assign_to_existing_docset", {"docset_id": existing_id})
 
@@ -2107,7 +2187,7 @@ def test_file_add_auto_classify_soft_fails_when_llm_errors(
     capsys.readouterr()
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     with patch("litellm.completion", side_effect=RuntimeError("API down")):
@@ -2134,7 +2214,7 @@ def test_file_add_auto_classify_skipped_on_duplicate(
     capsys.readouterr()
 
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     with patch("litellm.completion") as mock_completion:
@@ -2192,7 +2272,7 @@ def _seed_docset_and_config(
     )
     existing_id: str = _read_stdout(capsys)["id"]
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     return existing_id
 
@@ -2353,7 +2433,7 @@ def test_file_add_auto_classify_existing_errors_when_no_docsets(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     with patch("litellm.completion") as mock_completion:
@@ -2381,7 +2461,7 @@ def test_file_add_auto_classify_default_mode_handles_empty_workspace(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
     response = _tool_response(
         "create_new_docset",
@@ -2478,7 +2558,7 @@ def _init_with_docset(ws: Path, capsys: pytest.CaptureFixture[str], name: str = 
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             }
         },
@@ -2531,7 +2611,7 @@ def test_docset_generate_rejects_malformed_style_config(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             },
             "style": {"enabled": True, "max_tokens": 100},
@@ -2564,7 +2644,7 @@ def test_docset_generate_rejects_unset_style_api_key_env(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             },
             "style": {"enabled": True, "model": "m", "api_key_env": "DGML_STYLE_KEY_MISSING"},
@@ -2629,7 +2709,7 @@ def test_docset_generate_happy_path(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2749,13 +2829,13 @@ def test_docset_generate_model_flags_default_to_config() -> None:
             "--generation-config",
             "fast",
             "--model",
-            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-haiku-5-5",
             "--label-model",
             "anthropic/claude-sonnet-4-6",
         ]
     )
     assert args.generation_config == "fast"
-    assert args.model == "anthropic/claude-haiku-4-5"
+    assert args.model == "anthropic/claude-haiku-5-5"
     assert args.label_model == "anthropic/claude-sonnet-4-6"
 
 
@@ -2793,7 +2873,7 @@ def test_docset_generate_models_from_config(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2816,11 +2896,11 @@ def test_docset_generate_models_from_config(
     assert rc == 0
     payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
-    assert opts.model == "anthropic/claude-haiku-4-5"
+    assert opts.model == "anthropic/claude-haiku-5-5"
     assert opts.label_model == "anthropic/claude-sonnet-4-6"
     # The effective models are recorded in the output so the choice is visible.
     assert payload["models"] == {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "label_model": "anthropic/claude-sonnet-4-6",
         "source": "config",
     }
@@ -2845,7 +2925,7 @@ def test_docset_generate_threads_both_models_credentials(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "api_key_env": "T_KEY",
                     "label_model": "anthropic/claude-sonnet-4-6",
                     "label_api_key_env": "L_KEY",
@@ -2880,7 +2960,7 @@ def test_docset_generate_model_flags_override_config(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -2913,10 +2993,10 @@ def test_docset_generate_model_flags_override_config(
     assert rc == 0
     payload = _read_stdout(capsys)
     opts = mock_batch.call_args.kwargs["options"]
-    assert opts.model == "anthropic/claude-haiku-4-5"  # unchanged
+    assert opts.model == "anthropic/claude-haiku-5-5"  # unchanged
     assert opts.label_model == "anthropic/claude-opus-4-8"  # overridden
     assert payload["models"] == {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "label_model": "anthropic/claude-opus-4-8",
         "source": "override",
     }
@@ -3925,7 +4005,7 @@ def test_file_add_directory_auto_classify_amortizes_docsets(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     src = tmp_path / "pdfs"
@@ -4077,7 +4157,7 @@ def test_file_add_directory_auto_classify_existing_aborts_before_adding(
     _init_ws(ws)
     capsys.readouterr()
     write_classification_config(
-        Workspace(root=ws), {"model": "gemini/gemini-2.5-flash-lite", "max_pages": 1}
+        Workspace(root=ws), {"model": "gemini/gemini-3.5-flash-lite", "max_pages": 1}
     )
 
     src = tmp_path / "pdfs"
@@ -4282,7 +4362,7 @@ def _generate_with_xml(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -4454,7 +4534,7 @@ def test_docset_generate_preflight_rejects_missing_api_key(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                 }
             }
@@ -4485,7 +4565,7 @@ def test_docset_generate_preflight_skips_key_check_when_api_base_set(
         dump_toml(
             {
                 "generation": {
-                    "model": "anthropic/claude-haiku-4-5",
+                    "model": "anthropic/claude-haiku-5-5",
                     "label_model": "anthropic/claude-sonnet-4-6",
                     "api_base": "http://localhost:8000",
                     "label_api_base": "http://localhost:8000",
@@ -5092,6 +5172,28 @@ def test_prove_file_bad_uri_is_invalid_argument(
     assert _read_stderr(capsys)["error"]["code"] == "INVALID_ARGUMENT"
 
 
+def test_prove_file_node_record_is_invalid_argument(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A node record (URI with a #leaf fragment) handed to `prove file` is the wrong
+    # command, not a tamper: it must be a structural error (exit 1), not valid=false (exit 2).
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    rec = tmp_path / "rec.json"
+    rec.write_text(
+        json.dumps({"checksum": "ab", "checksum_algo": "sha256", "uri": "dgmlx://f00000/ds0000#3"}),
+        encoding="utf-8",
+    )
+    rc = main(
+        _ws_args(ws) + ["prove", "file", "--chain", "nvnm-testnet", "--record-json", str(rec)]
+    )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "INVALID_ARGUMENT"
+    assert "prove node" in err["message"]
+
+
 # --- discover ----------------------------------------------------------------
 
 _DISCOVER_XML = (
@@ -5420,7 +5522,7 @@ def _write_grounded_config(ws: Path) -> None:
             {
                 "grounded": {
                     "schema_model": "anthropic/claude-opus-4-7",
-                    "values_model": "gemini/gemini-2.5-pro",
+                    "values_model": "gemini/gemini-3.1-pro-preview",
                 }
             }
         ),
@@ -5979,7 +6081,7 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     assert payload["assigned"] is True
     assert payload["extraction"]["performed"] is True
     assert payload["extraction"]["error"] is None
-    assert payload["extraction"]["model"] == "gemini/gemini-2.5-pro"
+    assert payload["extraction"]["model"] == "gemini/gemini-3.1-pro-preview"
     # The run's cost is reported without --debug, so no usage.jsonl is needed.
     assert payload["extraction"]["usage"]["cost_usd"] == 0.03
     assert set(payload["extraction"]["usage"]) == {

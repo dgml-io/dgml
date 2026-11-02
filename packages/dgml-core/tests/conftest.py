@@ -345,6 +345,7 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     ocr._WARNED_NO_OCR_PROVIDER.clear()
     grounded._REQUIRED_TOOL_CHOICE_REJECTED.clear()
     grounded._WARNED_TELEMETRY.clear()
+    grounded._WARNED_PERMISSIVE_SCHEMA.clear()
     monkeypatch.setattr(pipeline, "_WARNED_DEBUG_WITHOUT_USAGE", False)
 
 

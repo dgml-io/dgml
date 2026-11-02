@@ -58,7 +58,7 @@ from dgml_core.storage import Workspace
 
 from .conftest import make_fake_png, write_classification_config
 
-DEFAULT_TEST_MODEL = "gemini/gemini-2.5-flash-lite"
+DEFAULT_TEST_MODEL = "gemini/gemini-3.5-flash-lite"
 
 
 # ---------------------------------------------------------------------------

@@ -88,10 +88,10 @@ def test_unknown_section_is_dropped(workspace: Workspace) -> None:
 
 
 def test_keys_are_config_section_members(workspace: Workspace) -> None:
-    write_config(workspace, {"models": {"light": "gemini/gemini-2.5-flash-lite"}})
+    write_config(workspace, {"models": {"light": "gemini/gemini-3.5-flash-lite"}})
     merged = load_merged_config(workspace)
     assert set(merged) == {ConfigSection.MODELS}
-    assert merged[ConfigSection.MODELS] == {"light": "gemini/gemini-2.5-flash-lite"}
+    assert merged[ConfigSection.MODELS] == {"light": "gemini/gemini-3.5-flash-lite"}
 
 
 # ---- Layering ---------------------------------------------------------------
@@ -538,7 +538,7 @@ def test_the_workspaces_provider_key_wins_over_the_user_configs(
     _write_user_config({"models": {"family": "anthropic", "anthropic_api_key_env": "PERSONAL"}})
     write_config(workspace, {"models": {"anthropic_api_key_env": "TEAM"}})
     assert load_merged_config(workspace)[ConfigSection.MODELS]["standard_api_key_env"] == "TEAM"
-    cfg, _ = resolve_generation_config(workspace, model="anthropic/claude-haiku-4-5")
+    cfg, _ = resolve_generation_config(workspace, model="anthropic/claude-haiku-5-5")
     assert (cfg.api_key_env, cfg.label_api_key_env) == ("TEAM", "TEAM")
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 

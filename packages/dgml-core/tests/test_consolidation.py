@@ -338,10 +338,10 @@ def test_adjudication_model_override_is_honoured() -> None:
     # now checks the model up front (`ModelNotSupported`), and the adjudicator
     # soft-fails on any error, so an unrecognized id would never reach the call
     # and the override would look honoured only because nothing ran.
-    adj = LLMAdjudicator(ClassificationConfig(model="gemini/gemini-2.5-pro"), attempts=1)
+    adj = LLMAdjudicator(ClassificationConfig(model="gemini/gemini-3.1-pro-preview"), attempts=1)
     with patch("litellm.completion", return_value=_adjudicate_response("A")) as completion:
         adj(_MemDataset(1), [_request()], mode=ConsolidationMode.REASSIGN, batch_size=40)
-    assert completion.call_args.kwargs["model"] == "gemini/gemini-2.5-pro"
+    assert completion.call_args.kwargs["model"] == "gemini/gemini-3.1-pro-preview"
 
 
 def test_adjudication_forwards_the_custom_endpoint() -> None:

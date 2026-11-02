@@ -105,7 +105,7 @@ def test_classify_request_requires_a_tool_and_carries_the_page_images(
     cfg, steps = classification.classify_steps(
         workspace,
         ["fid1"],
-        config=ClassificationConfig(model="gemini/gemini-2.5-flash-lite"),
+        config=ClassificationConfig(model="gemini/gemini-3.5-flash-lite"),
         prompt=classification._build_prompt_new_only(),
         tools=[classification._create_new_docset_tool()],
     )
@@ -127,7 +127,7 @@ def test_classify_fails_before_any_request_without_page_images(workspace: Worksp
         classification.classify_steps(
             workspace,
             ["blankfid"],
-            config=ClassificationConfig(model="gemini/gemini-2.5-flash-lite"),
+            config=ClassificationConfig(model="gemini/gemini-3.5-flash-lite"),
             prompt="p",
             tools=[],
         )

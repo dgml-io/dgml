@@ -36,7 +36,7 @@ from dgml_core.storage import Workspace
 
 from .conftest import dump_toml, write_config
 
-MODEL = "anthropic/claude-haiku-4-5"
+MODEL = "anthropic/claude-haiku-5-5"
 LABEL_MODEL = "anthropic/claude-sonnet-4-6"
 
 
@@ -137,7 +137,9 @@ def test_section_model_overrides_tier(workspace: Workspace) -> None:
 def test_tier_models_carry_no_credentials(workspace: Workspace) -> None:
     # [models] tiers name only models — no credentials — so a tier-sourced model
     # has no api_key/api_key_env/api_base (litellm uses its per-provider env var).
-    write_config(workspace, {"models": {"standard": MODEL, "advanced": "gemini/gemini-2.5-pro"}})
+    write_config(
+        workspace, {"models": {"standard": MODEL, "advanced": "gemini/gemini-3.1-pro-preview"}}
+    )
     cfg = load_generation_config(workspace)
     assert (cfg.model, cfg.label_model) == (MODEL, MODEL)  # both from standard
     assert (cfg.api_key, cfg.api_key_env, cfg.api_base) == (None, None, None)
@@ -152,7 +154,7 @@ def test_section_credentials_without_a_section_model_are_rejected(workspace: Wor
     write_config(
         workspace,
         {
-            "models": {"standard": MODEL, "advanced": "gemini/gemini-2.5-pro"},
+            "models": {"standard": MODEL, "advanced": "gemini/gemini-3.1-pro-preview"},
             "generation": {
                 "api_key_env": "MY_ANTH",
                 "label_api_key_env": "MY_GEM",
@@ -170,7 +172,7 @@ def test_per_task_credentials_sit_beside_their_models(workspace: Workspace) -> N
             "generation": {
                 "model": MODEL,
                 "api_key_env": "MY_ANTH",
-                "label_model": "gemini/gemini-2.5-pro",
+                "label_model": "gemini/gemini-3.1-pro-preview",
                 "label_api_key_env": "MY_GEM",
             },
         },

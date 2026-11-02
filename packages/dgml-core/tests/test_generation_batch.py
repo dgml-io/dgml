@@ -61,7 +61,7 @@ from dgml_core.usage import read_events
 
 from .conftest import FakeLLMResponse
 
-TRANSCRIBE_MODEL = "anthropic/claude-haiku-4-5"
+TRANSCRIBE_MODEL = "anthropic/claude-haiku-5-5"
 LABEL_MODEL = "anthropic/claude-sonnet-4-6"
 _HEADER = build_header("TestOrg", "TestDocSet")
 # Page counts per document: a one-window doc next to a three-window one, so the

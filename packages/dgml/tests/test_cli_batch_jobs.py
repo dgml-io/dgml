@@ -213,7 +213,7 @@ def _seed_generate_ws(root: Path, capsys: pytest.CaptureFixture[str]) -> tuple[P
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             }
         },
@@ -599,7 +599,7 @@ def test_a_per_document_label_stage_failure_resumes_from_the_failed_document(
     assert final["files"] == reference["files"]
 
 
-_MODELS = {"model": "anthropic/claude-haiku-4-5", "label_model": "anthropic/claude-sonnet-4-6"}
+_MODELS = {"model": "anthropic/claude-haiku-5-5", "label_model": "anthropic/claude-sonnet-4-6"}
 
 
 def test_batch_label_config_key_and_flag(

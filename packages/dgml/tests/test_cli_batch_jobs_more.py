@@ -282,7 +282,7 @@ def test_batch_mode_from_config_survives_a_config_flip_before_resume(
 ) -> None:
     ws, did = _seed_generate_ws(tmp_path, capsys)
     generation = {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "label_model": "anthropic/claude-sonnet-4-6",
     }
     _write_ws_config(ws, {"generation": {**generation, "batch": True}})

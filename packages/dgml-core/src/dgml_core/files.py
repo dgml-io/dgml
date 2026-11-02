@@ -49,7 +49,7 @@ from .errors import (
     now_iso,
 )
 from .hashing import sha256_file
-from .ids import RECORD_ID_SHAPE, is_record_id, new_id
+from .ids import new_id, require_record_id
 from .models import FileRecord
 from .ocr import extract_text_ocr, load_ocr_config, recover_unusable_pages
 from .pages import (
@@ -224,16 +224,10 @@ class FileStore:
         # add leaves the workspace untouched rather than half-built.
         if dpi <= 0:
             raise ValueError(f"dpi must be a positive integer; got {dpi!r}")
-        if file_id is not None and not is_record_id(file_id):
+        if file_id is not None:
             # Shape costs nothing to check — no digest, no store read — so the
-            # common typo is rejected before the source is even opened. The id is
-            # never case-folded for the caller: it is how their system and this
-            # workspace name the same document, so rewriting it would let the two
-            # diverge silently. RECORD_ID_SHAPE says outright that letters must be
-            # lowercase, which is the whole of what a caller needs to fix it.
-            raise InvalidArgument(
-                f"file id {file_id!r} is not well formed: it must be {RECORD_ID_SHAPE}."
-            )
+            # common typo is rejected before the source is even opened.
+            require_record_id(file_id, label="file id")
         if text_mode in (TextMode.OCR, TextMode.HYBRID):
             # Validate OCR config *before* touching the filesystem so a
             # rejected add leaves the workspace untouched. Hybrid needs OCR

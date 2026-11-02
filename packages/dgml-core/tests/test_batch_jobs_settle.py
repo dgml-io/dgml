@@ -53,7 +53,7 @@ SECRET = "sk-DGML-REVIEW-SECRET-987654321"
 
 def _kwargs(text: str) -> dict[str, Any]:
     return {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-haiku-5-5",
         "messages": [{"role": "user", "content": text}],
         "max_tokens": 64,
     }
@@ -87,7 +87,7 @@ def _executor(backend: FakeBackend, session: JobSession) -> ReplayExecutor:
     return ReplayExecutor(
         backend,
         session=session,
-        model="anthropic/claude-haiku-4-5",
+        model="anthropic/claude-haiku-5-5",
         api_base=None,
         poll_interval_s=0,
         sleep=lambda _s: None,
@@ -170,7 +170,7 @@ def test_a_stale_manifest_save_never_drops_another_runs_record(ws: Workspace) ->
     stale = store.load()  # read before the batch is recorded
     session.add_record(
         BatchJob(provider="anthropic", job_id="pb_1", custom_ids=("a",)),
-        model="anthropic/claude-haiku-4-5",
+        model="anthropic/claude-haiku-5-5",
         api_base=None,
         keys={"a": "k-1"},
     )
@@ -223,7 +223,7 @@ def test_the_credential_reference_resolves_through_the_env_var_name(
     session = _open(ws, wait=False)
     session.add_record(
         BatchJob(provider="anthropic", job_id="pb_1", custom_ids=("a",)),
-        model="anthropic/claude-haiku-4-5",
+        model="anthropic/claude-haiku-5-5",
         api_base=None,
         keys={"a": "k-1"},
         credential=ref,

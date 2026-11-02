@@ -82,7 +82,7 @@ at all — see [storage services](#storage-services-storage).
 │       ├── responses/<key>.json      #   one received response per request key
 │       └── inputs/<name>             #   inputs a resumed run restores
 ├── docsets/
-│   └── <docset_id>/                  # generated: 12-char base-36 ID
+│   └── <docset_id>/                  # generated, or set by `docset create --id`
 │       ├── docset.json               # { id, name, description, key_questions }
 │       ├── extraction-schema.rnc      # grounded extraction schema, RELAX NG Compact (optional)
 │       ├── extraction-guidance.md     # docset-level extraction guidance shown to the LLM (optional)
@@ -120,12 +120,10 @@ A generated ID is 12 lowercase alphanumerics — `~62` bits of entropy each, fro
 `secrets.choice`
 ([packages/dgml-core/src/dgml_core/ids.py](../packages/dgml-core/src/dgml_core/ids.py)).
 
-A File ID can also be **set by the caller** with `dgml file add --id`: 3 to 40
-characters using only lowercase letters, digits, hyphens and underscores, starting with a
-letter or digit. The generated form is a strict subset of that, so both shapes are valid
-everywhere an ID appears.
-
-DocSet IDs are always generated today.
+A File or DocSet ID can also be **set by the caller** with `dgml file add --id` or
+`dgml docset create --id`: 3 to 40 characters using only lowercase letters, digits, hyphens
+and underscores, starting with a letter or digit. The generated form is a strict subset
+of that, so both shapes are valid everywhere an ID appears.
 
 ## Page images (JPEG, edge bounds)
 
@@ -442,7 +440,7 @@ optional and not merely a place for overrides. It may also carry any other secti
 per-workspace override.
 
 **Env-var overrides (layer 4).** Prefix `DGML_`, split path segments on `__`,
-lowercased — e.g. `DGML_MODELS__ADVANCED=gemini/gemini-2.5-pro`,
+lowercased — e.g. `DGML_MODELS__ADVANCED=gemini/gemini-3.1-pro-preview`,
 `DGML_GENERATION__LABEL_MODEL=…`, `DGML_OCR__ENDPOINT=…`. This overrides config
 **settings**; it is distinct from provider **secret** vars (`ANTHROPIC_API_KEY`,
 `GEMINI_API_KEY`, …), which litellm and the `*_api_key_env` indirection use to
@@ -548,8 +546,8 @@ family (an explicit tier always overrides its family default):
 ```toml
 [models]
 family   = "anthropic_google"
-light    = "gemini/gemini-flash-lite-latest"  # classification, style
-standard = "anthropic/claude-haiku-4-5"    # transcription, text extraction
+light    = "gemini/gemini-3.5-flash-lite"  # classification, style
+standard = "anthropic/claude-haiku-5-5"    # transcription, text extraction
 advanced = "anthropic/claude-sonnet-5"     # labeling, value extraction
 expert   = "anthropic/claude-opus-5"       # schema generation
 ```
@@ -672,7 +670,7 @@ override it (with that model's own credentials, if any).
 
 ```toml
 [classification]
-model = "gemini/gemini-flash-lite-latest"
+model = "gemini/gemini-3.5-flash-lite"
 ```
 
 Field rules:
@@ -736,7 +734,7 @@ credentials.
 ```toml
 [grounded]
 schema_model = "anthropic/claude-opus-5"
-values_model = "gemini/gemini-2.5-pro"
+values_model = "gemini/gemini-3.1-pro-preview"
 schema_api_key_env = "ANTHROPIC_API_KEY"
 values_api_key_env = "GEMINI_API_KEY"
 ```
@@ -900,7 +898,7 @@ digital/hybrid path.
 ```toml
 [style]
 enabled = true
-model = "anthropic/claude-haiku-4-5"
+model = "anthropic/claude-haiku-5-5"
 ```
 
 Field rules:
@@ -1206,7 +1204,7 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
     "provider_batches": [                  // every provider batch the job submitted
       {"job": {"provider": "anthropic", "job_id": "msgbatch_…", "custom_ids": ["…"],
                "submitted_at": "…", "extra": {}},
-       "model": "anthropic/claude-haiku-4-5", "api_base": null,
+       "model": "anthropic/claude-haiku-5-5", "api_base": null,
        "stage": "transcribe",               // the pipeline stage the batch served
        "credential": {"section": "generation", "field": "transcribe",
                       "env": "MY_ANTHROPIC_KEY"},   // where the key comes from; never the key
@@ -1237,7 +1235,7 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
     "billed": ["<request key>", "…"],      // responses already counted on a usage row
     "inputs": {"generate/schema.json": true, "presence:generate/blocks/a.pdf": false},
     "state": {},                           // command-specific (file add: its ingest results)
-    "run_stats": {"e1:anthropic/claude-haiku-4-5": {"1": {"batches": 1, "…": 0}}},
+    "run_stats": {"e1:anthropic/claude-haiku-5-5": {"1": {"batches": 1, "…": 0}}},
                                            // per executor, per run: summed for the payload
     "record_usage": true,                  // the command writes usage rows (`--debug`);
                                            // the job's own `batch_unused` rows follow it

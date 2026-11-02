@@ -163,12 +163,12 @@ them to this workspace only (it deep-merges over the user config):
 
 ```toml
 [generation]
-model = "anthropic/claude-haiku-4-5"
+model = "anthropic/claude-haiku-5-5"
 label_model = "anthropic/claude-sonnet-5"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [classification]
-model = "gemini/gemini-2.5-flash"
+model = "gemini/gemini-3.8-flash"
 api_key_env = "GEMINI_API_KEY"
 ```
 
@@ -251,7 +251,7 @@ Let's manually create a DocSet for Non-Traded REIT main files:
 ```bash
 uv run dgml docset create --name "NonTraded_REITs" --description "Primary property descriptions and assets"
 ```
-This returns a DocSet ID (e.g., `p9pjusnwg50l`).
+This returns a DocSet ID (e.g., `p9pjusnwg50l`). Pass `--id <id>` to choose it yourself, with the same grammar as `file add --id`.
 
 #### Assign a File to a DocSet
 To link an ingested file to your newly created DocSet:
@@ -297,7 +297,7 @@ clustering specifically, add a `[classification]` section to your config:
 
 ```toml
 [classification]
-model = "gemini/gemini-2.5-flash"
+model = "gemini/gemini-3.8-flash"
 api_key_env = "GEMINI_API_KEY"
 ```
 *Make sure your `GEMINI_API_KEY` (or chosen provider key) is exported in your terminal environment.*

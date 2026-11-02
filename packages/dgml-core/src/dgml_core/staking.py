@@ -702,6 +702,12 @@ def prove_file(
             f"record uses checksum_algo {algo!r}; only {CHECKSUM_ALGO!r} is provable"
         )
     ids = _parse_record_uri(record["uri"])
+    # A node record's checksum is an element hash, never a bundle root — comparing
+    # the two would report a false tamper (exit 2) instead of a wrong-command error.
+    if ids["leaf_index"] is not None:
+        raise InvalidArgument(
+            f"record URI {record['uri']!r} is a node URI, not a bundle URI; use `prove node`"
+        )
     expected = record["checksum"]
     # Only the Merkle root is needed; attest_file computes it without copying
     # the bundle artifacts to disk (which export_attestation would).

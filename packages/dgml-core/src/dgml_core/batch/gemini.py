@@ -175,7 +175,7 @@ def _available() -> None:
 
 
 def _bare_model(model: str) -> str:
-    """``gemini/gemini-2.5-pro`` → ``gemini-2.5-pro`` (the URL form)."""
+    """``gemini/gemini-3.1-pro-preview`` → ``gemini-3.1-pro-preview`` (the URL form)."""
     return model.split("/", 1)[1] if model.startswith(f"{PROVIDER}/") else model
 
 

@@ -307,8 +307,8 @@ class ConvertOptions:
     # that scales with the CORPUS rather than a chunk is describe_concepts,
     # whose output grows with the concept roster and has been observed at
     # ~29.9K — 93% of the previous 32000 default. 64000 is ~2x the largest
-    # reply seen, matches claude-haiku-4-5's own ceiling (so transcription is
-    # unaffected either way), and still bounds a runaway reply.
+    # reply seen, sits under claude-haiku-5-5's 128K ceiling, and still
+    # bounds a runaway reply.
     max_tokens: int = 64000
     # Anthropic extended thinking for both passes, one of
     # :data:`~dgml_core.llm.ANTHROPIC_THINKING_MODES`; ``None`` leaves the

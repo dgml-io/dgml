@@ -99,12 +99,12 @@ def _seed(
         ws,
         {
             "generation": {
-                "model": "anthropic/claude-haiku-4-5",
+                "model": "anthropic/claude-haiku-5-5",
                 "label_model": "anthropic/claude-sonnet-4-6",
             },
             "grounded": {
                 "schema_model": "anthropic/claude-opus-4-7",
-                "values_model": "gemini/gemini-2.5-pro",
+                "values_model": "gemini/gemini-3.1-pro-preview",
             },
         },
     )

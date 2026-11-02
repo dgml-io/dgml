@@ -51,7 +51,7 @@ from dgml_core.errors import (
 )
 from dgml_core.storage import Workspace
 
-_MODEL = "anthropic/claude-haiku-4-5"
+_MODEL = "anthropic/claude-haiku-5-5"
 
 
 def _answer(request: Any) -> Any:

@@ -242,15 +242,15 @@ def test_completion_with_retry_retries_empty_choices_then_succeeds(
     monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)  # no backoff wait
     caplog.set_level(logging.INFO, logger="dgml_core.llm")
 
-    result = llm._completion_with_retry({"model": "gemini/gemini-2.5-pro", "messages": []})
+    result = llm._completion_with_retry({"model": "gemini/gemini-3.1-pro-preview", "messages": []})
 
     assert calls["n"] == 3
     assert result.choices[0].message == "ok"
     # Each retry costs a paid call and the backoff, so each is logged, like a
     # raised error's retry.
     assert [r.getMessage() for r in caplog.records if r.name == "dgml_core.llm"] == [
-        "model returned no choices (model 'gemini/gemini-2.5-pro'); retry 1 of 2 in 2s",
-        "model returned no choices (model 'gemini/gemini-2.5-pro'); retry 2 of 2 in 4s",
+        "model returned no choices (model 'gemini/gemini-3.1-pro-preview'); retry 1 of 2 in 2s",
+        "model returned no choices (model 'gemini/gemini-3.1-pro-preview'); retry 2 of 2 in 4s",
     ]
 
 
@@ -274,7 +274,7 @@ def test_completion_with_retry_raises_on_persistent_empty(
 
     with pytest.raises(EmptyModelResponse, match="no choices"):
         llm._completion_with_retry(
-            {"model": "gemini/gemini-2.5-pro", "messages": []}, max_retries=3
+            {"model": "gemini/gemini-3.1-pro-preview", "messages": []}, max_retries=3
         )
 
     assert calls["n"] == 3  # exhausted every attempt before raising
@@ -294,7 +294,7 @@ def test_completion_with_retry_retries_dict_shaped_empty(
     monkeypatch.setattr("litellm.completion", flaky)
     monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
 
-    result = llm._completion_with_retry({"model": "gemini/gemini-2.5-pro", "messages": []})
+    result = llm._completion_with_retry({"model": "gemini/gemini-3.1-pro-preview", "messages": []})
 
     assert calls["n"] == 2
     assert result == _resp("OK")
@@ -531,7 +531,7 @@ def test_call_with_refinement_replays_draft_in_second_request(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     draft, refined = llm.call_with_refinement(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "LISTING"}],
         refine_instruction=[{"type": "text", "text": "complete it"}],
@@ -561,7 +561,7 @@ def test_call_with_refinement_marks_cache_on_anthropic(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     llm.call_with_refinement(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "LISTING"}],
         refine_instruction=[{"type": "text", "text": "complete it"}],
@@ -640,7 +640,7 @@ def test_call_with_tools_marks_system_cache_on_anthropic(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     llm.call_with_tools(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         messages=_extraction_messages(),
         tools=[{"type": "function", "function": {"name": "t"}}],
         cache=True,
@@ -670,7 +670,7 @@ def test_call_with_tools_preserves_caller_marked_stable_block(
     messages[1]["content"][0]["cache_control"] = {"type": "ephemeral"}  # schema text
 
     llm.call_with_tools(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         messages=messages,
         tools=[{"type": "function", "function": {"name": "t"}}],
         cache=True,
@@ -695,7 +695,7 @@ def test_call_with_tools_no_cache_markers_when_flag_off(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     llm.call_with_tools(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         messages=_extraction_messages(),
         tools=[{"type": "function", "function": {"name": "t"}}],
         cache=False,
@@ -759,7 +759,7 @@ def test_call_continued_stitches_length_truncations(
     monkeypatch.setattr("litellm.completion", fake_completion)
 
     out = llm.call_continued(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-sonnet-4-6"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "U"}],
     )
@@ -788,7 +788,7 @@ def test_call_continued_single_call_when_not_truncated(
 
     monkeypatch.setattr("litellm.completion", fake_completion)
     out = llm.call_continued(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         system_prompt="SYS",
         user_content=[{"type": "text", "text": "U"}],
     )
@@ -823,7 +823,7 @@ def test_is_openai_model_matches_openai_routed_ids(model: str) -> None:
     "model",
     [
         "anthropic/claude-sonnet-5",
-        "gemini/gemini-2.5-pro",
+        "gemini/gemini-3.1-pro-preview",
         "ollama/llama3",
         # Azure deployments of the same models are a different endpoint with
         # their own quirks; nothing here has been validated against them, so
@@ -836,11 +836,11 @@ def test_is_openai_model_rejects_other_providers(model: str) -> None:
 
 
 def test_prefill_supported_on_anthropic_but_not_openai_or_gemini() -> None:
-    assert llm.supports_assistant_prefill("anthropic/claude-haiku-4-5") is True
+    assert llm.supports_assistant_prefill("anthropic/claude-sonnet-4-6") is True
     # Gemini refuses a trailing model turn outright ("Requests ending with a
     # model turn are not supported", 400) — see supports_assistant_prefill and
     # test_prefill_support.py for what the earlier assumption cost.
-    assert llm.supports_assistant_prefill("gemini/gemini-2.5-flash") is False
+    assert llm.supports_assistant_prefill("gemini/gemini-3.8-flash") is False
     # Unrecognized ids (self-hosted, proxied) keep the prefill path — it is the
     # natural behaviour of an OpenAI-compatible server that just concatenates
     # the messages into a prompt.
@@ -1018,9 +1018,9 @@ def test_unrecognized_model_raises_model_not_supported() -> None:
 
 
 def test_recognized_model_passes_validation() -> None:
-    cfg = llm.LLMConfig(model="anthropic/claude-haiku-4-5")
+    cfg = llm.LLMConfig(model="anthropic/claude-haiku-5-5")
     kwargs = llm._build_completion_kwargs(cfg, messages=[{"role": "user", "content": "hi"}])
-    assert kwargs["model"] == "anthropic/claude-haiku-4-5"
+    assert kwargs["model"] == "anthropic/claude-haiku-5-5"
 
 
 def test_api_base_skips_model_validation() -> None:
@@ -1038,19 +1038,29 @@ def test_api_base_skips_model_validation() -> None:
 def test_model_max_output_tokens_reads_litellm_metadata() -> None:
     # Real metadata: frontier models allow more output than older ones.
     assert llm.model_max_output_tokens("anthropic/claude-sonnet-5") == 128000
-    assert llm.model_max_output_tokens("anthropic/claude-haiku-4-5") == 64000
+    assert llm.model_max_output_tokens("anthropic/claude-haiku-5-5") == 128000
     # Unknown id and custom api_base both fall back to "caller keeps its own".
     assert llm.model_max_output_tokens("not-a-real-model-xyz") is None
     assert llm.model_max_output_tokens("anthropic/claude-sonnet-5", "http://localhost:1234") is None
 
 
-def test_output_tokens_clamped_to_model_ceiling() -> None:
+def test_output_tokens_clamped_to_model_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request for more output than the model allows is a provider 400 —
     the builder lowers it to the model's own ceiling instead."""
     msgs = [{"role": "user", "content": "hi"}]
-    # Haiku caps at 64K: an ask for 128K is clamped down.
+    # Fake a 64K ceiling rather than pin a real model that has one: every such
+    # model is an older release that will drop out of litellm's metadata.
+    small = "anthropic/claude-haiku-5-5"
+    real_info = litellm.get_model_info
+
+    def fake_info(model: str, *args: Any, **kwargs: Any) -> Any:
+        info = real_info(model, *args, **kwargs)
+        return {**info, "max_output_tokens": 64000} if model == small else info
+
+    monkeypatch.setattr(litellm, "get_model_info", fake_info)
+    # A 64K model asked for 128K is clamped down.
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5", max_completion_tokens=128000),
+        llm.LLMConfig(model=small, max_completion_tokens=128000),
         messages=msgs,
     )
     assert kwargs["max_completion_tokens"] == 64000
@@ -1068,7 +1078,7 @@ def test_output_tokens_clamped_to_model_ceiling() -> None:
     assert kwargs["max_completion_tokens"] == 4096
     # max_tokens follows the same rule.
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5", max_tokens=128000), messages=msgs
+        llm.LLMConfig(model=small, max_tokens=128000), messages=msgs
     )
     assert kwargs["max_tokens"] == 64000
 
@@ -1148,7 +1158,7 @@ def test_thinking_omitted_when_unset() -> None:
 def test_thinking_not_sent_to_non_anthropic_models() -> None:
     """The field is Anthropic-shaped; other providers spell reasoning their
     own way and reject it."""
-    for model in ("gemini/gemini-2.5-pro", "openai/gpt-5"):
+    for model in ("gemini/gemini-3.1-pro-preview", "openai/gpt-5"):
         kwargs = llm._build_completion_kwargs(
             llm.LLMConfig(model=model, thinking="disabled"),
             messages=[{"role": "user", "content": "hi"}],
@@ -1231,7 +1241,7 @@ def test_prefill_on_continuation_follows_thinking_mode(
 
     monkeypatch.setattr(litellm, "completion", fake)
     out = llm.call_continued(
-        llm.LLMConfig(model="anthropic/claude-haiku-4-5", thinking=thinking),
+        llm.LLMConfig(model="anthropic/claude-sonnet-4-6", thinking=thinking),
         system_prompt="s",
         user_content=[{"type": "text", "text": "u"}],
     )

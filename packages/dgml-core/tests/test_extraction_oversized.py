@@ -206,7 +206,7 @@ def test_is_request_too_large_recognizes_provider_errors() -> None:
     assert is_request_too_large(_too_large_error())
     gemini = ContextWindowExceededError(
         message="GeminiException - 400 Request payload size exceeds the limit: 20971520 bytes.",
-        model="gemini/gemini-2.5-pro",
+        model="gemini/gemini-3.1-pro-preview",
         llm_provider="gemini",
     )
     assert is_request_too_large(gemini)

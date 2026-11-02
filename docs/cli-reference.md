@@ -689,7 +689,7 @@ Errors:
 ## DocSet commands
 
 ```
-dgml docset create --name NAME [--description DESC] [--key-question Q ...]
+dgml docset create --name NAME [--id DOCSET_ID] [--description DESC] [--key-question Q ...]
 dgml docset list
 dgml docset show <docset_id>
 dgml docset update <docset_id> [--name NAME] [--description DESC]
@@ -701,6 +701,12 @@ dgml docset list-files <docset_id>
 dgml docset generate <docset_id> [--generation-config <profile|path>] [--model <id>] [--label-model <id>] [--window-size <n>] [--max-tokens <n>] [...]
 dgml docset run <docset_id> [--schema-from <file_id> ...] [--no-generate] [--no-extract] [generate flags] [--batch] [--no-wait] [--batch-deadline <duration>]
 ```
+
+`docset create --id DOCSET_ID` sets the DocSet's id instead of generating one. It takes
+the same grammar as `file add --id`: **3 to 40 characters using only lowercase letters,
+digits, hyphens and underscores, and starting with a letter or digit**. Omit it for a
+generated 12-character id. Fails with `CONFLICT` if a DocSet already holds the id (the
+existing DocSet is left untouched) and with `INVALID_ARGUMENT` if the id is malformed.
 
 `docset delete` removes the DocSet and its file-assignment markers, but
 **does not delete the underlying Files**. Files remain in
@@ -732,7 +738,7 @@ them.
   "assigned": true,
   "extraction": {
     "performed": true,
-    "model": "gemini/gemini-2.5-pro",
+    "model": "gemini/gemini-3.1-pro-preview",
     "tool_calls": 0,
     "usage": {
       "cost_usd": 0.0123,
@@ -962,7 +968,7 @@ per-item `results`, each carrying a `status`), matching the bulk `file add`:
   "docset_id": "p9pjusnwg50l",
   "docset_name": "Q2 contracts",
   "summary": { "total": 3, "converted": 2, "skipped": 1, "failed": 0 },
-  "models": { "model": "anthropic/claude-haiku-4-5", "label_model": "anthropic/claude-sonnet-4-6", "source": "config" },
+  "models": { "model": "anthropic/claude-haiku-5-5", "label_model": "anthropic/claude-sonnet-4-6", "source": "config" },
   "rerendered": [],
   "output_key": "docsets/p9pjusnwg50l",
   "coverage_report": "docsets/p9pjusnwg50l/coverage_report.json",
@@ -1625,7 +1631,7 @@ needs grounding.
 {
   "docset_id": "o8vr8rs488vg",
   "file_id": "5kqt9r5fowno",
-  "model": "gemini/gemini-2.5-pro",
+  "model": "gemini/gemini-3.1-pro-preview",
   "mode": "full-extraction",
   "tool_calls": 2,
   "field_count": 7,
@@ -1846,7 +1852,7 @@ Both are counted in `extraction_stats.json` under `matching.dropped_inputs`
 it used is dropped, and counted under `matching.unsupported_values`.
 
 Extraction asks each model for its own maximum output (128K on current
-frontier Claude/Gemini, 64K on Haiku 4.5 — read from the provider's model
+Claude and Gemini Pro, lower on some smaller models — read from the provider's model
 metadata and clamped per model, so no request exceeds a model's ceiling).
 A phase-1 turn that still clips that ceiling (`finish_reason='length'`)
 reports the truncation explicitly and is retried once in **chunked** mode:
@@ -1969,7 +1975,11 @@ stripped). The first four replace 0.7's
 `submit_values` tool parameter (`"inlined"`, provider-enforced shape) or
 extraction fell back to a permissive parameter with code-side vocabulary
 pruning (`"permissive"` — the retry path when a provider rejects a very large
-inlined schema, e.g. Gemini's "too many states for serving").
+inlined schema, e.g. Gemini's "too many states for serving"). On that path the
+values tree travels as JSON text rather than a typed object (an untyped object
+is one Gemini's decoder can only leave empty), the fallback is logged as a
+warning once per model, and a run that submits an empty tree fails instead of
+writing an empty extraction as success.
 
 Errors across the group: `DOCSET_NOT_FOUND`, `FILE_NOT_FOUND`,
 `SCHEMA_NOT_FOUND`, `SCHEMA_INVALID`, `GUIDANCE_NOT_FOUND`, `NO_FILES`,
@@ -2314,7 +2324,7 @@ Configure the model via the `classification` section in
 ```json
 {
   "classification": {
-    "model": "gemini/gemini-flash-lite-latest",
+    "model": "gemini/gemini-3.5-flash-lite",
     "max_pages": 3,
     "api_key_env": "GEMINI_API_KEY"
   }
@@ -2323,7 +2333,7 @@ Configure the model via the `classification` section in
 
 | Field | Required | Meaning |
 |---|---|---|
-| `model` | yes | `<provider>/<model>` in [litellm](https://docs.litellm.ai/docs/providers) form — e.g. `gemini/gemini-flash-lite-latest`, `anthropic/claude-opus-5`, `openai/gpt-4o`. |
+| `model` | yes | `<provider>/<model>` in [litellm](https://docs.litellm.ai/docs/providers) form — e.g. `gemini/gemini-3.5-flash-lite`, `anthropic/claude-opus-5`, `openai/gpt-4o`. |
 | `max_pages` | no (default `3`) | How many rendered page images (`page_images/page_1.{png,jpg}` …) to send to the LLM. Cap is per-classification cost: 1 is the cheap setting, 4+ is the thorough one. |
 | `naming_attempts` | no (default `1`) | How many independent proposals to request when naming a *newly clustered* DocSet (`dgml cluster`, not per-file `--auto-classify`). At `1` the single proposal is used as-is. At `2`+ the name the plurality of attempts agreed on wins, and that share is reported as the file's `naming_confidence` — a 3-of-3 agreement is safe to accept unreviewed, a 2-1 split is worth a look. Costs tokens linearly, so raise it only for runs where a wrong DocSet name is expensive to undo. |
 | `api_key` | no | Optional literal API key. Use only on per-developer workspaces (config.toml isn't checked in). Mutually exclusive with `api_key_env`. |
@@ -2375,7 +2385,7 @@ The `classification` payload block:
 ```json
 "classification": {
   "performed": true,
-  "model": "gemini/gemini-flash-lite-latest",
+  "model": "gemini/gemini-3.5-flash-lite",
   "decision": "existing",
   "docset_id": "k7q3xb91pmrf",
   "docset_created": false,
@@ -2412,7 +2422,7 @@ comes back without a reason is treated as a malformed response
 ```json
 "classification": {
   "performed": true,
-  "model": "gemini/gemini-flash-lite-latest",
+  "model": "gemini/gemini-3.5-flash-lite",
   "decision": "none",
   "docset_id": null,
   "docset_created": false,
@@ -3395,9 +3405,13 @@ Re-verify an anchored record against the current workspace. Supply the
 record either by looking it up on-chain (`--registry` + `--checksum`) or
 from a saved `--record-json` (`-` for stdin). `prove file` re-exports
 the bundle and compares the recomputed Merkle root to the anchored
-checksum; `prove node` re-hashes the element and re-walks its proof
-against the recorded root. Exit codes mirror `dgmlx verify`: `0` proven,
-`2` mismatch (`valid: false`), `1` for structural errors.
+checksum; `prove node` re-hashes the element at the record's leaf index
+and re-walks its proof against the recorded root. Exit codes mirror
+`dgmlx verify`: `0` proven, `2` mismatch (`valid: false`), `1` for
+structural errors. Handing a command the other kind of record is a
+structural error, not a mismatch: `prove file` rejects a node URI
+(`#<leaf>`) and `prove node` rejects a bundle URI, both with
+`INVALID_ARGUMENT`.
 
 ## Error code reference
 
@@ -3413,7 +3427,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `LEGACY_CONFIG_PRESENT` | hard | A pre-migration `<workspace>/config.toml` is the only config present; the format is now TOML. Run `dgml init` to write `~/.config/dgml/config.toml`, then migrate any settings. |
 | `MODELS_CONFIG_INVALID` | hard | The `[models]` block is malformed (a tier, `family` or credential set to a non-string or empty value, `family` naming an unknown provider family, both `*_api_key` and `*_api_key_env` set for one tier or provider, or a tier credential in a layer that does not set its tier). Raised by the commands that read the tiers, not by the merge, so `file add` and `file list` still run. |
 | `MISSING_EXTRA` | hard | A command needs an optional extra that isn't installed (e.g. `dgml[clustering]`). |
-| `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`, a `file add --id` that is malformed, passed with a directory, or unsatisfiable under the chosen `--on-conflict`). |
+| `INVALID_ARGUMENT` | hard | An argument is malformed or empty (e.g. blank `file_id`, unreadable `--proof`, a `file add --id` that is malformed, passed with a directory, or unsatisfiable under the chosen `--on-conflict`; a malformed `docset create --id`). |
 | `INTERNAL_ERROR` | hard | Unexpected exception; the message is a short, single-line `<ExcType>: <msg>` (capped, whitespace collapsed). Pass `--verbose` (or set `DGML_DEBUG=1`) for the full stderr traceback. |
 | `NOT_FOUND` | hard | Generic not-found (base for the specific codes below). |
 | `DOCSET_NOT_FOUND` | hard | No DocSet with the given id. |
@@ -3421,7 +3435,7 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `FILE_NOT_FOUND` | hard / soft | A File id, assignment, or source is missing. Soft as a per-item `results` entry in `docset generate`/`ground`. |
 | `UNSUPPORTED_FILE_TYPE` | hard | `file add` path is neither a PDF nor a convertible source. |
 | `INVALID_PDF` | hard | File does not start with the `%PDF-` magic. |
-| `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
+| `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; `docset create --id <id>` naming an id a DocSet already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
 | `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed, or a family's converter cannot be resolved or does not handle that family's file types (checked before a file is added or gathered, so a misconfigured family is one error, not one per file). |
 | `CONVERSION_FAILED` | hard / soft | A docx/xlsx/pptx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
 | `OCR_CONFIG_MISSING` | hard | `--text-mode ocr`/`hybrid` with no `ocr` config section. |
