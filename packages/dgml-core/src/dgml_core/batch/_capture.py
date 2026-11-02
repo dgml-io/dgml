@@ -288,9 +288,12 @@ def capture_sync_request(
     """
     import litellm
 
-    from dgml_core.llm import _quiet_stdout
+    from dgml_core.llm import _quiet_stdout, pop_stream_deadline
 
     params = copy.deepcopy(dict(kwargs))
+    # A streamed request's total deadline is ours, not a litellm parameter;
+    # litellm would copy it into the body a batch then sends.
+    pop_stream_deadline(params)
     params["api_key"] = params.get("api_key") or api_key or "dry-run"
     params["num_retries"] = 0
     sink: list[CapturedRequest] = []

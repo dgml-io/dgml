@@ -191,9 +191,24 @@ OPENAI_MODEL_PATTERNS = [
     r"^o[1-9]-",
 ]
 
-# Requests above this duration stream by default. Measurements showed idle
-# connections becoming unreliable after roughly three minutes.
-_STREAM_TIMEOUT_THRESHOLD_SECONDS = 180
+#: The request key a streamed call's total deadline travels under, in seconds
+#: (set by :func:`_build_completion_kwargs` from ``LLMConfig.timeout``). It is
+#: not a litellm parameter, and litellm forwards unknown keys into the provider
+#: request body, so whatever sends a request pops it first:
+#: :func:`_completion_with_retry` (which then enforces it, the one enforcement
+#: point for the sync driver, the batch drivers' synchronous fallbacks and any
+#: executor that delegates to it) and the batch request capture. A custom
+#: executor that calls litellm itself pops it with :func:`pop_stream_deadline`.
+STREAM_DEADLINE_KWARG = "dgml_stream_deadline_s"
+
+
+def pop_stream_deadline(kwargs: dict[str, Any]) -> float | None:
+    """Remove :data:`STREAM_DEADLINE_KWARG` from *kwargs* and return it, or
+    ``None`` when absent or not a positive number of seconds."""
+    value = kwargs.pop(STREAM_DEADLINE_KWARG, None)
+    if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
 
 
 def is_model_reachability_error(exc: BaseException) -> bool:
@@ -404,15 +419,20 @@ class LLMConfig:
     paths prefer (it's what GPT-5 / o-series accept). Set whichever the
     target provider expects.
 
-    ``stream=None`` streams automatically when ``timeout`` is greater than
-    :data:`_STREAM_TIMEOUT_THRESHOLD_SECONDS`; ``True`` and ``False`` force the
-    behavior. Calls with no timeout stay unstreamed by default. While streaming,
-    ``stream_read_timeout`` replaces ``timeout`` on the request and bounds the
-    gap between chunks, while ``timeout`` remains the total generation deadline.
-    The total deadline is checked between chunks, so it can overrun by at most
-    one ``stream_read_timeout`` while a read is blocked.
-    The default allows ten silent minutes for a model's initial reasoning phase;
-    a longer silent phase needs a larger ``stream_read_timeout``.
+    ``stream`` is opt-in per call: ``False`` (the default) sends one
+    unstreamed request whose ``timeout`` is the request timeout, exactly as
+    before streaming existed. ``True`` sends ``stream=True`` and rebuilds one
+    response from the chunks (see :func:`_completion_with_retry`). While
+    streaming, ``stream_read_timeout`` is the request's timeout and bounds the
+    gap between chunks, and ``timeout`` becomes the total deadline for the
+    whole call, every retry and its backoff included; it travels with the
+    request under :data:`STREAM_DEADLINE_KWARG`. The deadline is checked
+    between chunks and before each retry, so a call can overrun it by at most
+    one ``stream_read_timeout`` while a read is blocked. The read timeout's
+    default allows ten silent minutes for a model's initial reasoning phase; a
+    longer silent phase needs a larger one. ``extra["timeout"]``, when set, is
+    the request's timeout in both modes (``extra`` has always had the last
+    word on the request).
     """
 
     model: str
@@ -426,7 +446,7 @@ class LLMConfig:
     max_tokens: int | None = 16000
     max_completion_tokens: int | None = None
     timeout: float | None = None
-    stream: bool | None = None
+    stream: bool = False
     stream_read_timeout: float | None = 600.0
     reasoning_effort: str | None = None
     # Anthropic extended thinking; one of :data:`ANTHROPIC_THINKING_MODES`.
@@ -796,6 +816,10 @@ def _build_completion_kwargs(
     models, and only when ``reasoning_effort`` did not already claim the
     field.
 
+    A streamed request (``LLMConfig.stream``) also carries its total deadline
+    under :data:`STREAM_DEADLINE_KWARG`, and its ``timeout`` is the read
+    timeout between chunks; ``extra["timeout"]`` wins over either timeout.
+
     Streaming requests automatically ask for usage only on OpenAI's native
     endpoint. Azure and custom ``api_base`` endpoints must opt in through
     ``extra["stream_options"]`` because some compatible endpoints accept but
@@ -808,9 +832,8 @@ def _build_completion_kwargs(
     }
     extra = dict(config.extra)
     explicit_stream_options = "stream_options" in extra
-    stream = extra.pop("stream", config.stream)
-    if stream is None:
-        stream = config.timeout is not None and config.timeout > _STREAM_TIMEOUT_THRESHOLD_SECONDS
+    stream = bool(extra.pop("stream", config.stream))
+    explicit_timeout = "timeout" in extra
     # Anthropic: never send temperature. Newer Claude models reject it
     # outright ("`temperature` is deprecated for this model") and older ones
     # reject anything but 1 when thinking is enabled — together the provider
@@ -876,10 +899,16 @@ def _build_completion_kwargs(
         kwargs["thinking"] = {"type": config.thinking}
 
     kwargs.update(extra)
+    # ``extra`` is public API and has always had the last word on the request
+    # (it used to be applied after ``config.timeout``), so a timeout it sets is
+    # kept as it is in both modes and the config's timeout fills in only when
+    # it set none.
     if stream:
         kwargs["stream"] = True
-        if config.stream_read_timeout is not None:
+        if not explicit_timeout and config.stream_read_timeout is not None:
             kwargs["timeout"] = config.stream_read_timeout
+        if config.timeout is not None:
+            kwargs[STREAM_DEADLINE_KWARG] = config.timeout
         effective_model = str(kwargs.get("model") or "")
         if (
             not explicit_stream_options
@@ -894,7 +923,7 @@ def _build_completion_kwargs(
     else:
         kwargs.pop("stream", None)
         kwargs.pop("stream_options", None)
-        if config.timeout is not None:
+        if not explicit_timeout and config.timeout is not None:
             kwargs["timeout"] = config.timeout
 
     return kwargs
@@ -1058,7 +1087,25 @@ class _StreamConsumptionError(Exception):
 
 
 class StreamDeadlineExceeded(TimeoutError):
-    """A configured total stream deadline expired between received chunks."""
+    """A streamed call's total deadline expired: between received chunks, or
+    with no time left for another attempt. Never retried."""
+
+
+@dataclass(frozen=True)
+class _StreamDeadline:
+    """One streamed call's total deadline: *seconds* counted from *started*, a
+    :func:`time.monotonic` reading taken once, before the call's first
+    attempt, so retries and their backoff spend the same budget."""
+
+    seconds: float
+    started: float
+
+    def spent(self, *, after_s: float = 0.0) -> bool:
+        """Whether the budget is gone now, or will be *after_s* from now."""
+        return time.monotonic() + after_s - self.started >= self.seconds
+
+    def exceeded(self, detail: str) -> StreamDeadlineExceeded:
+        return StreamDeadlineExceeded(f"stream exceeded the {self.seconds:.0f} s deadline {detail}")
 
 
 def _is_stream(response: Any) -> bool:
@@ -1183,19 +1230,23 @@ def _consume_stream(
     stream: Any,
     *,
     model: str,
-    deadline_s: float | None = None,
+    deadline: _StreamDeadline | None = None,
     started: float | None = None,
 ) -> Any | None:
     """Consume and rebuild a LiteLLM stream without estimating request usage.
 
     Tool-call indices are normalized conservatively by provider index. Usage is
     accepted only from positive provider usage on LiteLLM's raw stream chunks,
-    or from yielded chunks when the iterator has no raw chunk list. The deadline
-    is checked between chunks, so a run can exceed it by at most one configured
-    stream read timeout. Events LiteLLM skips internally, such as provider ping
-    events, cannot be checked here. If iteration aborts, no usage is recorded
-    for that attempt. The wrapper itself is not closed because it has only async
-    close; its synchronous provider iterator is closed directly when available.
+    or from yielded chunks when the iterator has no raw chunk list. The call's
+    *deadline* is checked as each chunk arrives, so a run can exceed it by at
+    most one configured stream read timeout; a stream that ends normally is
+    returned complete, even when its end arrives just past the deadline (its
+    tokens are billed, and its usage is recorded). *started* is this attempt's
+    start, for the abort log. Events LiteLLM skips internally, such as
+    provider ping events, cannot be checked here. If iteration aborts, no
+    usage is recorded for that attempt. The wrapper itself is not closed
+    because it has only async close; its synchronous provider iterator is
+    closed directly when available.
     """
     chunks: list[Any] = []
     if started is None:
@@ -1203,14 +1254,8 @@ def _consume_stream(
     try:
         for chunk in stream:
             chunks.append(chunk)
-            if deadline_s is not None and time.monotonic() - started >= deadline_s:
-                raise StreamDeadlineExceeded(
-                    f"stream exceeded the {deadline_s:.0f} s deadline after {len(chunks)} chunks"
-                )
-        if deadline_s is not None and time.monotonic() - started >= deadline_s:
-            raise StreamDeadlineExceeded(
-                f"stream exceeded the {deadline_s:.0f} s deadline after {len(chunks)} chunks"
-            )
+            if deadline is not None and deadline.spent():
+                raise deadline.exceeded(f"after {len(chunks)} chunks")
     except Exception as exc:
         provider_stream = getattr(stream, "completion_stream", None)
         close = getattr(provider_stream, "close", None)
@@ -1317,42 +1362,83 @@ def _consume_stream(
     return rebuilt
 
 
-_TRANSIENT_TEXT = (
-    "10054",
+#: Transport failures: the request or its stream never completed. Retried
+#: whatever their message says.
+_TRANSIENT_TYPES: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    ConnectionError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    Timeout,
+    APIConnectionError,
+    RateLimitError,
+    ServiceUnavailableError,
+    InternalServerError,
+)
+
+#: HTTP statuses that say "not now" rather than "never": a request timeout, a
+#: rate limit, a server or gateway fault, and Anthropic's 529 "overloaded".
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
+
+# The message fallback, for an exception that is neither a transport type nor
+# carries an HTTP status (a provider SDK's bare ``Exception``, a wrapper's
+# ``RuntimeError``). The words match anywhere in the lowercased message. The
+# numbers (the three statuses and Windows' WSAECONNRESET) match only as whole
+# words, so a token count such as "215290 tokens" is not a 529.
+_TRANSIENT_WORDS = (
     "connection",
     "reset",
     "timeout",
     "internalservererror",
     "overloaded",
-    "529",
-    "503",
-    "429",
     "rate limit",
     "rate_limit",
     "ratelimit",
     "too many requests",
 )
+_TRANSIENT_CODES = re.compile(r"\b(?:529|503|429|10054)\b")
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status *exc* carries: ``status_code`` on litellm's and the
+    provider SDKs' errors, ``response.status_code`` on httpx's
+    :class:`httpx.HTTPStatusError`. ``None`` when it carries none.
+
+    A provider exception's property can raise anything (httpx raises
+    ``RuntimeError`` for a response with no request), and this runs inside the
+    retry loop's ``except``, so a failed read counts as no status."""
+    try:
+        status = getattr(exc, "status_code", None)
+        if status is None and isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+    except Exception:
+        return None
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+    return None
 
 
 def _is_transient(exc: BaseException) -> bool:
-    """True for retryable transport/provider failures, including wrapped ones."""
-    transient_types = (
-        TimeoutError,
-        ConnectionError,
-        httpx.TimeoutException,
-        httpx.NetworkError,
-        httpx.RemoteProtocolError,
-        Timeout,
-        APIConnectionError,
-        RateLimitError,
-        ServiceUnavailableError,
-        InternalServerError,
-    )
+    """True for a retryable transport or provider failure, including a wrapped one.
+
+    Judged by type first: *exc* and its ``__cause__``/``__context__`` chain are
+    read outward from *exc*, and the first exception that is a transport type
+    (:data:`_TRANSIENT_TYPES`, retried) or carries an HTTP status (retried only
+    for :data:`_TRANSIENT_STATUSES`) decides. So a typed error is never
+    re-judged by the words in its message: Anthropic's 400 "prompt is too
+    long: 215290 tokens > 200000 maximum" is a ``BadRequestError`` with status
+    400 and is not retried, although its text contains "529". Only when no
+    exception in the chain is typed does the message fallback
+    (:data:`_TRANSIENT_WORDS`, :data:`_TRANSIENT_CODES`) apply. A
+    :class:`StreamDeadlineExceeded` anywhere in the chain is never transient:
+    the call's budget is spent.
+    """
     chain: list[BaseException] = []
     seen: set[int] = set()
     pending: list[BaseException] = [exc]
     while pending:
-        current = pending.pop()
+        current = pending.pop(0)
         if id(current) in seen:
             continue
         seen.add(id(current))
@@ -1364,9 +1450,16 @@ def _is_transient(exc: BaseException) -> bool:
     if any(isinstance(current, StreamDeadlineExceeded) for current in chain):
         return False
     for current in chain:
-        if isinstance(current, transient_types):
+        if isinstance(current, _TRANSIENT_TYPES):
             return True
-        if any(text in str(current).lower() for text in _TRANSIENT_TEXT):
+        status = _http_status(current)
+        if status is not None:
+            return status in _TRANSIENT_STATUSES
+    for current in chain:
+        message = str(current).lower()
+        if any(word in message for word in _TRANSIENT_WORDS):
+            return True
+        if _TRANSIENT_CODES.search(message):
             return True
     return False
 
@@ -1554,13 +1647,19 @@ def describe_call_failure(exc: BaseException, config: LLMConfig) -> str:
 _SYNC_RECORDER: Callable[[dict[str, Any], Callable[[dict[str, Any]], Any]], Any] | None = None
 
 
-def _completion_with_retry(
-    kwargs: dict[str, Any], *, max_retries: int = 3, stream_deadline_s: float | None = None
-) -> Any:
+def _completion_with_retry(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
     """Call litellm.completion with exponential-backoff retries for transient
     failures — both raised errors and *empty* responses.
 
-    Streamed calls are consumed and rebuilt before the same response checks run.
+    Streamed calls are consumed and rebuilt before the same response checks
+    run. A streamed request's total deadline is read from the request itself
+    (:data:`STREAM_DEADLINE_KWARG`, popped before litellm sees the kwargs), so
+    every path that runs a request through here enforces it: the sync driver,
+    a batch stage's synchronous fallbacks, a job's raw fallback
+    (:func:`_completion_attempts`) and any executor that delegates here. The
+    budget starts once, before the first attempt; a retry whose backoff would
+    end past it is not made, and :class:`StreamDeadlineExceeded` is raised
+    from the error that would have been retried.
 
     A successful call can still come back with an empty ``choices`` list (zero
     candidates, zero completion tokens): observed intermittently with Gemini via
@@ -1570,32 +1669,28 @@ def _completion_with_retry(
     retried like any other transient failure, and only raises
     :class:`EmptyModelResponse` once it persists across every attempt.
     """
-    if stream_deadline_s is None:
-        stream_deadline_s = getattr(kwargs, "stream_deadline_s", None)
     recorder = _SYNC_RECORDER
     if recorder is not None:
-        return recorder(
-            kwargs,
-            lambda kw: _completion_attempts(
-                kw, max_retries=max_retries, stream_deadline_s=stream_deadline_s
-            ),
-        )
-    return _completion_attempts(
-        kwargs, max_retries=max_retries, stream_deadline_s=stream_deadline_s
-    )
+        return recorder(kwargs, lambda kw: _completion_attempts(kw, max_retries=max_retries))
+    return _completion_attempts(kwargs, max_retries=max_retries)
 
 
-def _completion_attempts(
-    kwargs: dict[str, Any], *, max_retries: int = 3, stream_deadline_s: float | None = None
-) -> Any:
+def _completion_attempts(kwargs: dict[str, Any], *, max_retries: int = 3) -> Any:
     """The retry loop behind :func:`_completion_with_retry`, without the
     recorder seam (a batch job's own synchronous fallback calls this directly,
-    having already accounted for the request)."""
-    if stream_deadline_s is None:
-        stream_deadline_s = getattr(kwargs, "stream_deadline_s", None)
+    having already accounted for the request). The one place a streamed
+    request's total deadline is enforced."""
     import litellm
 
     kwargs = dict(kwargs)
+    deadline_s = pop_stream_deadline(kwargs)
+    # One budget for the whole call, started before the first attempt: a
+    # deadline restarted per attempt would let three retries each run to it.
+    deadline = (
+        _StreamDeadline(seconds=deadline_s, started=time.monotonic())
+        if deadline_s is not None and kwargs.get("stream")
+        else None
+    )
     delay = 2.0
     last_exc: Exception | None = None
     for attempt in range(max_retries):
@@ -1610,7 +1705,7 @@ def _completion_attempts(
                         response = _consume_stream(
                             response,
                             model=str(kwargs.get("model") or ""),
-                            deadline_s=stream_deadline_s,
+                            deadline=deadline,
                             started=started,
                         )
                 break
@@ -1620,22 +1715,28 @@ def _completion_attempts(
                 _set_attempts(retry_exc, attempt + 1)
                 if stream_error is not None:
                     response = None
-                elapsed_s = (
-                    stream_error.elapsed_s
-                    if stream_error is not None
-                    else time.monotonic() - started
-                )
+                transient = _is_transient(retry_exc)
                 if (
-                    kwargs.get("stream")
-                    and stream_deadline_s is not None
-                    and elapsed_s >= stream_deadline_s
+                    not transient
+                    and "stream_options" in str(retry_exc).lower()
+                    and "stream_options" in kwargs
+                    and not retried_without_stream_options
+                    and not (deadline is not None and deadline.spent())
                 ):
+                    kwargs.pop("stream_options")
+                    retried_without_stream_options = True
+                    logger.warning(
+                        "model %r rejected stream_options; retrying the same attempt without it",
+                        kwargs.get("model"),
+                    )
+                    continue
+                retrying = transient and attempt < max_retries - 1
+                if retrying and deadline is not None and deadline.spent(after_s=delay):
+                    # The retry would start at or past the call's deadline, so
+                    # it is not made: the budget covers the whole call, not
+                    # each attempt.
                     chunks_received = (
                         stream_error.chunks_received if stream_error is not None else 0
-                    )
-                    deadline_error = StreamDeadlineExceeded(
-                        f"stream exceeded the {stream_deadline_s:.0f} s deadline after "
-                        f"{chunks_received} chunks"
                     )
                     if stream_error is not None:
                         _log_stream_abort(kwargs, attempt, stream_error, retrying=False)
@@ -1645,25 +1746,14 @@ def _completion_attempts(
                             "(%s); no usage recorded; aborting",
                             kwargs.get("model"),
                             attempt + 1,
-                            elapsed_s,
+                            time.monotonic() - started,
                             type(retry_exc).__name__,
                         )
+                    deadline_error = deadline.exceeded(
+                        f"after {chunks_received} chunks; no time left to retry"
+                    )
                     _set_attempts(deadline_error, attempt + 1)
                     raise deadline_error from retry_exc
-                if (
-                    not _is_transient(retry_exc)
-                    and "stream_options" in str(retry_exc).lower()
-                    and "stream_options" in kwargs
-                    and not retried_without_stream_options
-                ):
-                    kwargs.pop("stream_options")
-                    retried_without_stream_options = True
-                    logger.warning(
-                        "model %r rejected stream_options; retrying the same attempt without it",
-                        kwargs.get("model"),
-                    )
-                    continue
-                retrying = _is_transient(retry_exc) and attempt < max_retries - 1
                 if stream_error is not None:
                     _log_stream_abort(kwargs, attempt, stream_error, retrying=retrying)
                 if not retrying:
@@ -1706,6 +1796,14 @@ def _completion_attempts(
                 f"model returned no choices after {max_retries} attempts "
                 f"(model={kwargs.get('model')!r})"
             )
+        if deadline is not None and deadline.spent(after_s=delay):
+            logger.warning(
+                "model returned no choices (model %r) on attempt %d with no time left "
+                "before the stream deadline; aborting",
+                kwargs.get("model"),
+                attempt + 1,
+            )
+            raise deadline.exceeded("with no choices returned; no time left to retry")
         # Logged like a raised error's retry: one that then succeeds leaves no
         # trace in the result, yet costs a paid call and the backoff.
         logger.info(
@@ -1950,10 +2048,6 @@ class _WrapperStep(dict[str, Any]):
     """
 
     wrapper_id: int
-    #: Total deadline for a streamed request, set by the driver from the
-    #: config timeout; read by :func:`_completion_with_retry` when its own
-    #: ``stream_deadline_s`` is not given.
-    stream_deadline_s: float | None = None
 
 
 def _wrapper_step(wrapper_id: int, kwargs: dict[str, Any]) -> LLMStep:
@@ -2071,13 +2165,6 @@ def _drive_steps(
                 except StopIteration as done:
                     return done.value
                 continue
-            if isinstance(step, _WrapperStep) and step.get("stream"):
-                # A streamed request carries the config timeout as its
-                # total deadline on the step object (never in the dict, so
-                # the request stays byte-identical and a one-argument fake
-                # still intercepts it); the dict's own timeout is the read
-                # timeout between chunks.
-                step.stream_deadline_s = config.timeout
             try:
                 response = run(step)
             except Exception as exc:

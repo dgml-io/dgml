@@ -788,21 +788,46 @@ def test_build_completion_kwargs_stream_fields(
 
 
 @pytest.mark.parametrize(
-    ("config", "expected_stream", "expected_timeout"),
+    ("config", "expected_stream", "expected_timeout", "expected_deadline"),
     [
-        (llm.LLMConfig(model="gpt-4o", timeout=1800), True, 600.0),
-        (llm.LLMConfig(model="gpt-4o", timeout=60), False, 60),
-        (llm.LLMConfig(model="gpt-4o", stream=True), True, 600.0),
-        (llm.LLMConfig(model="gpt-4o", timeout=1800, stream=False), False, 1800),
+        # Streaming is opt-in: a long timeout alone sends one unstreamed request.
+        (llm.LLMConfig(model="gpt-4o", timeout=1800), False, 1800, None),
+        (llm.LLMConfig(model="gpt-4o", timeout=60), False, 60, None),
+        (llm.LLMConfig(model="gpt-4o", stream=True), True, 600.0, None),
+        (llm.LLMConfig(model="gpt-4o", timeout=1800, stream=True), True, 600.0, 1800),
+        (llm.LLMConfig(model="gpt-4o", timeout=1800, stream=False), False, 1800, None),
     ],
 )
 def test_build_completion_kwargs_stream_default_and_timeout(
-    config: llm.LLMConfig, expected_stream: bool, expected_timeout: float
+    config: llm.LLMConfig,
+    expected_stream: bool,
+    expected_timeout: float,
+    expected_deadline: float | None,
 ) -> None:
     kwargs = llm._build_completion_kwargs(config, messages=[{"role": "user", "content": "hi"}])
 
     assert kwargs.get("stream") is (True if expected_stream else None)
     assert kwargs["timeout"] == expected_timeout
+    assert kwargs.get(llm.STREAM_DEADLINE_KWARG) == expected_deadline
+
+
+def test_llm_config_does_not_stream_by_default() -> None:
+    assert llm.LLMConfig(model="gpt-4o").stream is False
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_extra_timeout_keeps_its_precedence_over_config_timeout(stream: bool) -> None:
+    """``LLMConfig.extra`` is public API and has always had the last word on
+    the request: ``extra["timeout"]`` wins over ``config.timeout`` unstreamed,
+    and over the stream read timeout streamed (where ``config.timeout`` is the
+    total deadline, which it keeps)."""
+    kwargs = llm._build_completion_kwargs(
+        llm.LLMConfig(model="gpt-4o", timeout=60, extra={"timeout": 900}, stream=stream),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert kwargs["timeout"] == 900
+    assert kwargs.get(llm.STREAM_DEADLINE_KWARG) == (60 if stream else None)
 
 
 def test_extra_stream_false_controls_all_derived_fields() -> None:
@@ -1548,8 +1573,7 @@ def test_stream_total_deadline_is_not_retried(
 
     with pytest.raises(TimeoutError, match=r"stream exceeded the 1 s deadline after 1 chunks"):
         llm._completion_with_retry(
-            {"model": "gpt-4o", "messages": [], "stream": True},
-            stream_deadline_s=1,
+            {"model": "gpt-4o", "messages": [], "stream": True, llm.STREAM_DEADLINE_KWARG: 1}
         )
     assert calls == 1
     assert any(
@@ -1558,9 +1582,11 @@ def test_stream_total_deadline_is_not_retried(
     )
 
 
-def test_zero_chunk_stream_checks_deadline_after_iteration(
+def test_empty_stream_past_the_deadline_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An empty stream is the empty-response retry, and that retry spends the
+    same budget: past the deadline it is not made."""
     calls = 0
     now = 0.0
 
@@ -1574,10 +1600,9 @@ def test_zero_chunk_stream_checks_deadline_after_iteration(
     monkeypatch.setattr("time.monotonic", lambda: now)
     monkeypatch.setattr("time.sleep", lambda *_args, **_kwargs: None)
 
-    with pytest.raises(llm.StreamDeadlineExceeded, match="after 0 chunks"):
+    with pytest.raises(llm.StreamDeadlineExceeded, match="with no choices returned"):
         llm._completion_with_retry(
-            {"model": "gpt-4o", "messages": [], "stream": True},
-            stream_deadline_s=1,
+            {"model": "gpt-4o", "messages": [], "stream": True, llm.STREAM_DEADLINE_KWARG: 1}
         )
 
     assert calls == 1
@@ -1606,12 +1631,252 @@ def test_read_timeout_after_stream_deadline_is_not_retried(
 
     with pytest.raises(llm.StreamDeadlineExceeded, match="after 0 chunks") as exc_info:
         llm._completion_with_retry(
-            {"model": "gpt-4o", "messages": [], "stream": True},
-            stream_deadline_s=1,
+            {"model": "gpt-4o", "messages": [], "stream": True, llm.STREAM_DEADLINE_KWARG: 1}
         )
 
     assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
     assert calls == 1
+
+
+class _Clock:
+    """A fake monotonic clock that ``time.sleep`` advances."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.now = 0.0
+        monkeypatch.setattr("time.monotonic", lambda: self.now)
+        monkeypatch.setattr("time.sleep", self.sleep)
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_stream_deadline_is_one_budget_for_the_whole_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline covers the call, not each attempt. Attempt 1 fails
+    transiently 7 s in and the 2 s backoff leaves 1 s: attempt 2's stream is
+    stopped 10 s after the call began, not allowed 10 s of its own (a deadline
+    restarted per attempt let three retries each run to it)."""
+    clock = _Clock(monkeypatch)
+    calls = 0
+
+    def stalls() -> Any:
+        clock.now = 7.0
+        raise httpx.ReadTimeout("stalled")
+        yield
+
+    def trickles() -> Any:
+        for chunk in _tool_stream(include_usage=False):
+            clock.now += 0.5
+            yield chunk
+
+    def completion(**_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return stalls() if calls == 1 else trickles()
+
+    monkeypatch.setattr("litellm.completion", completion)
+
+    with pytest.raises(llm.StreamDeadlineExceeded, match="10 s deadline after 2 chunks"):
+        llm._completion_with_retry(
+            {"model": "gpt-4o", "messages": [], "stream": True, llm.STREAM_DEADLINE_KWARG: 10}
+        )
+
+    assert calls == 2
+    assert clock.now == 10.0
+
+
+def test_no_retry_once_the_backoff_would_spend_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure 9 s into a 10 s budget is not retried: the 2 s
+    backoff alone would end past the deadline."""
+    clock = _Clock(monkeypatch)
+    calls = 0
+
+    def stalls() -> Any:
+        clock.now = 9.0
+        raise httpx.ReadTimeout("stalled")
+        yield
+
+    def completion(**_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return stalls()
+
+    monkeypatch.setattr("litellm.completion", completion)
+
+    with pytest.raises(llm.StreamDeadlineExceeded, match="no time left to retry") as exc_info:
+        llm._completion_with_retry(
+            {"model": "gpt-4o", "messages": [], "stream": True, llm.STREAM_DEADLINE_KWARG: 10}
+        )
+
+    assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
+    assert calls == 1
+    assert clock.now == 9.0  # no backoff slept
+
+
+def test_stream_that_ends_just_past_the_deadline_is_returned_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every chunk, usage included, arrives inside the 10 s budget and the
+    stream's end comes at 10.5 s: the finished response is returned with its
+    usage (its tokens were billed), not discarded as a deadline failure."""
+    clock = _Clock(monkeypatch)
+
+    class EndsLate(_FixtureStream):
+        def __iter__(self) -> Any:
+            for chunk in list.__iter__(self):
+                clock.now += 2.0
+                yield chunk
+            clock.now = 10.5
+
+    fixture = _tool_stream()
+    monkeypatch.setattr(
+        "litellm.completion", lambda **_kwargs: EndsLate(list(fixture), fixture.chunks)
+    )
+
+    result = llm._completion_with_retry(
+        {"model": "gpt-4o", "messages": [], "stream": True, llm.STREAM_DEADLINE_KWARG: 10}
+    )
+
+    assert clock.now == 10.5
+    assert result.choices[0].message.content == "working"
+    usage = extract_cost_and_tokens(result)
+    assert (usage["prompt_tokens"], usage["completion_tokens"]) == (21, 8)
+
+
+def test_the_deadline_travels_with_the_request_and_never_reaches_litellm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The total deadline is part of the request (so every executor path that
+    runs it sees it) and is popped before litellm, which would otherwise copy
+    an unknown key into the provider's request body."""
+    seen: list[dict[str, Any]] = []
+
+    def completion(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return _tool_stream()
+
+    monkeypatch.setattr("litellm.completion", completion)
+    request = llm._build_completion_kwargs(
+        llm.LLMConfig(model="gpt-4o", timeout=1800, stream=True),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert request[llm.STREAM_DEADLINE_KWARG] == 1800
+
+    llm._completion_with_retry(request)
+
+    assert llm.STREAM_DEADLINE_KWARG not in seen[0]
+    assert seen[0]["timeout"] == 600.0
+    assert request[llm.STREAM_DEADLINE_KWARG] == 1800  # the caller's request is untouched
+
+
+def _prompt_too_long() -> Exception:
+    """Anthropic's 400 for an oversized prompt, as litellm raises it."""
+    return litellm.exceptions.BadRequestError(
+        message="AnthropicException - prompt is too long: 215290 tokens > 200000 maximum",
+        model="claude-sonnet-5",
+        llm_provider="anthropic",
+    )
+
+
+def test_prompt_too_long_400_is_not_transient_although_its_text_contains_529(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typed error is judged by its type and status, never by digits in its
+    message: "215290 tokens" contains "529", and matching it resent the whole
+    document three times before the request-too-large fallback could run."""
+    error = _prompt_too_long()
+    assert "529" in str(error)
+    calls = 0
+
+    def completion(**_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr("litellm.completion", completion)
+    monkeypatch.setattr("time.sleep", lambda *_args, **_kwargs: None)
+
+    assert llm._is_transient(error) is False
+    with pytest.raises(litellm.exceptions.BadRequestError):
+        llm._completion_with_retry({"model": "anthropic/claude-sonnet-5", "messages": []})
+    assert calls == 1
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://api.example.test/v1/messages")
+    return httpx.HTTPStatusError(
+        "failed", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+def _wrapped(outer: Exception, cause: Exception) -> Exception:
+    outer.__cause__ = cause
+    return outer
+
+
+@pytest.mark.parametrize(
+    ("error", "transient"),
+    [
+        # Typed: the type or the HTTP status decides, whatever the text says.
+        (_prompt_too_long(), False),
+        (
+            litellm.exceptions.BadRequestError(
+                message="connection reset by the tool schema validator",
+                model="gpt-4o",
+                llm_provider="openai",
+            ),
+            False,
+        ),
+        (
+            litellm.exceptions.APIError(
+                status_code=529, message="Overloaded", llm_provider="anthropic", model="m"
+            ),
+            True,
+        ),
+        (
+            litellm.exceptions.APIError(
+                status_code=400, message="timeout must be positive", llm_provider="x", model="m"
+            ),
+            False,
+        ),
+        (_status_error(503), True),
+        (_status_error(404), False),
+        (httpx.ReadTimeout("read"), True),
+        (_wrapped(RuntimeError("wrapper"), httpx.RemoteProtocolError("closed")), True),
+        (_wrapped(RuntimeError("Error code: 503"), _prompt_too_long()), False),
+        # Untyped: the message fallback, with status codes as whole words only.
+        (Exception("prompt is too long: 215290 tokens > 200000 maximum"), False),
+        (Exception("request 105030 failed"), False),
+        (Exception("Error code: 529 - overloaded_error"), True),
+        (RuntimeError("HTTP 503 Service Unavailable"), True),
+        (RuntimeError("status 429"), True),
+        (OSError("[WinError 10054] An existing connection was forcibly closed"), True),
+        (ValueError("bad"), False),
+    ],
+    ids=[
+        "typed-400-with-529-in-text",
+        "typed-400-with-transient-words",
+        "typed-529",
+        "typed-400-timeout-word",
+        "httpx-503",
+        "httpx-404",
+        "httpx-read-timeout",
+        "untyped-wrapping-a-transport-error",
+        "untyped-wrapping-a-typed-400",
+        "untyped-digits-inside-a-number",
+        "untyped-503-inside-a-number",
+        "untyped-529-word",
+        "untyped-503-word",
+        "untyped-429-word",
+        "untyped-wsaeconnreset",
+        "untyped-plain",
+    ],
+)
+def test_is_transient_by_type_then_whole_word_text(error: Exception, transient: bool) -> None:
+    assert llm._is_transient(error) is transient
 
 
 def test_stream_options_rejection_retries_same_attempt_without_option(

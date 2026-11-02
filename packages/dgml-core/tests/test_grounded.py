@@ -814,8 +814,9 @@ def test_generate_schema_omits_reasoning_for_anthropic(workspace: Workspace) -> 
     with patch("litellm.completion", return_value=response) as m:
         generate_schema(workspace, ["f1aaaaaaaaaa"], config=anthropic_cfg, docset_name="D")
     assert "reasoning_effort" not in m.call_args.kwargs
-    assert m.call_args.kwargs["stream"] is True
-    assert m.call_args.kwargs["timeout"] == 600.0
+    # Schema generation does not stream: one request, its 30-minute timeout.
+    assert "stream" not in m.call_args.kwargs
+    assert m.call_args.kwargs["timeout"] == 1800
 
     # Gemini — kept.
     gemini_cfg = GroundedConfig(
@@ -933,6 +934,11 @@ def test_configured_values_effort_reaches_value_extraction_only(workspace: Works
     assert phase3.kwargs["reasoning_effort"] == "high"
     assert phase1.kwargs["stream"] is True
     assert phase3.kwargs["stream"] is True
+    # Both opt in: the request's timeout is the read timeout between chunks,
+    # and the 30-minute total deadline was popped before litellm saw it.
+    for call in (phase1, phase3):
+        assert call.kwargs["timeout"] == 600.0
+        assert llm.STREAM_DEADLINE_KWARG not in call.kwargs
 
 
 def test_values_effort_default_sends_no_reasoning_effort(workspace: Workspace) -> None:
@@ -2460,7 +2466,8 @@ def test_generate_schema_records_usage_on_success(workspace: Workspace) -> None:
     e = events[0]
     assert e["operation"] == "schema_generate"
     assert e["model"] == DEFAULT_SCHEMA_MODEL
-    assert e["cost_usd"] == pytest.approx(0.0014)
+    # Unstreamed: the row carries litellm's own response_cost, as on main.
+    assert e["cost_usd"] == 0.012
     assert e["total_tokens"] == 1200
     assert e["outcome"] == "ok"
     assert e["error"] is None
@@ -4077,8 +4084,9 @@ def test_schema_gen_never_cached(workspace: Workspace) -> None:
     with patch("litellm.completion", return_value=response) as m:
         generate_schema(workspace, [fid], config=config, docset_name="D")
     assert _cache_control_paths(m.call_args_list[0].kwargs["messages"]) == []
-    assert m.call_args_list[0].kwargs["stream"] is True
-    assert m.call_args_list[0].kwargs["timeout"] == 600.0
+    assert "stream" not in m.call_args_list[0].kwargs
+    assert "stream_options" not in m.call_args_list[0].kwargs
+    assert m.call_args_list[0].kwargs["timeout"] == 1800
 
 
 def test_phase3_never_cached(workspace: Workspace) -> None:
