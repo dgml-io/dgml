@@ -42,7 +42,7 @@ from dgml_core.errors import (
 )
 from dgml_core.generation import document
 from dgml_core.generation.blocks import Block, Span
-from dgml_core.generation.config import LabelMode
+from dgml_core.generation.config import LabelMode, ThinkingMode, TranscriptionMode
 from dgml_core.generation.label import (
     RosterEntry,
     _parse_labels_json,
@@ -310,13 +310,12 @@ class ConvertOptions:
     # reply seen, sits under claude-haiku-5-5's 128K ceiling, and still
     # bounds a runaway reply.
     max_tokens: int = 64000
-    # Anthropic extended thinking for both passes, one of
-    # :data:`~dgml_core.llm.ANTHROPIC_THINKING_MODES`; ``None`` leaves the
-    # model's own default in force (adaptive, on Claude 4.6+/5). The CLI passes
-    # ``[generation] thinking``, which defaults to ``"disabled"``.
-    thinking: str | None = None
-    # Pass A wire format, "text" or "lines" (see GenerationConfig.transcription).
-    transcription: str = "text"
+    # Anthropic extended thinking for both passes; ``None`` leaves the model's
+    # own default in force (adaptive, on Claude 4.6+/5). The CLI passes
+    # ``[generation] thinking``, which defaults to ``disabled``.
+    thinking: ThinkingMode | None = None
+    # Pass A wire format (see GenerationConfig.transcription).
+    transcription: TranscriptionMode = TranscriptionMode.TEXT
     cache_dir: Path | str | None = None
     # document name → its page_text/ dir (per-page word JSONs written before
     # generation). When a document has one, each transcription window is

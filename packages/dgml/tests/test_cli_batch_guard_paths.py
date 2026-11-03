@@ -211,6 +211,9 @@ def test_the_drift_guard_has_one_outcome_on_every_batch_path(
     out = capsys.readouterr()
     assert rc == 1
     assert out.out == ""  # one outcome: no payload alongside the error
+    # ... and one envelope: `batch resume` dispatches the replayed command
+    # inside its own dispatch, and the outer one must not report the job again.
+    assert out.err.count('"BATCH_JOB_NONDETERMINISTIC"') == 1
     start = max(i for i, c in enumerate(out.err) if c == "{" and (i == 0 or out.err[i - 1] == "\n"))
     error = json.loads(out.err[start:])["error"]
     assert error["code"] == "BATCH_JOB_NONDETERMINISTIC"

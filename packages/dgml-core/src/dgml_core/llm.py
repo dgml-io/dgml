@@ -70,6 +70,7 @@ from typing import Any, TypeVar, cast
 import litellm
 
 from .errors import EmptyModelResponse, ModelNotSupported, now_iso, short_error_message
+from .generation.config import ThinkingMode
 from .prompts import PromptKey
 from .prompts import get as prompt
 from .storage import Workspace
@@ -157,7 +158,7 @@ ANTHROPIC_NO_PREFILL_PATTERNS = [r"claude-sonnet-5", r"claude-haiku-5"]
 # `{"type": "enabled", "budget_tokens": N}` is deliberately not offered here:
 # claude-sonnet-5 rejects `budget_tokens`. A caller that needs it can pass the
 # whole dict through `LLMConfig.extra`.
-ANTHROPIC_THINKING_MODES = ("disabled", "adaptive", "between_tools")
+ANTHROPIC_THINKING_MODES = tuple(ThinkingMode)
 
 # OpenAI families that accept ONLY the default temperature (1). Prefix-matched
 # so future point releases are covered automatically; see
@@ -404,12 +405,12 @@ class LLMConfig:
     max_completion_tokens: int | None = None
     timeout: float | None = None
     reasoning_effort: str | None = None
-    # Anthropic extended thinking; one of :data:`ANTHROPIC_THINKING_MODES`.
-    # ``None`` means "don't send the field" and therefore leaves the model's own
-    # default in force — which for Claude 4.6+/5 is adaptive thinking, not off.
-    # Ignored for non-Anthropic models, and skipped when ``reasoning_effort``
-    # already expresses the same intent (see :func:`_build_completion_kwargs`).
-    thinking: str | None = None
+    # Anthropic extended thinking. ``None`` means "don't send the field" and
+    # therefore leaves the model's own default in force — which for Claude
+    # 4.6+/5 is adaptive thinking, not off. Ignored for non-Anthropic models,
+    # and skipped when ``reasoning_effort`` already expresses the same intent
+    # (see :func:`_build_completion_kwargs`).
+    thinking: ThinkingMode | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     # ---- Usage telemetry -------------------------------------------------
@@ -441,11 +442,14 @@ class LLMConfig:
         # Fail here rather than let the provider 400 on an unknown mode: the
         # value usually arrives from config, and the config file is where the
         # typo is.
-        if self.thinking is not None and self.thinking not in ANTHROPIC_THINKING_MODES:
-            raise ValueError(
-                f"thinking must be one of {list(ANTHROPIC_THINKING_MODES)} or None "
-                f"(got {self.thinking!r})"
-            )
+        if self.thinking is not None:
+            try:
+                self.thinking = ThinkingMode(self.thinking)
+            except ValueError:
+                raise ValueError(
+                    f"thinking must be one of {[m.value for m in ThinkingMode]} or None "
+                    f"(got {self.thinking!r})"
+                ) from None
 
 
 @dataclass

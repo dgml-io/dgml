@@ -43,6 +43,7 @@ from dgml_core.generation.blocks import (
     parse_block,
     xml_safe_block_dict,
 )
+from dgml_core.generation.config import TranscriptionMode
 from dgml_core.generation.prompts import get as prompt
 from dgml_core.pages import PdfConfig, pdf_page_count, pinned_slice
 from dgml_core.utils import xml_safe
@@ -626,7 +627,7 @@ def transcribe_steps(
     pdf_config: PdfConfig | None = None,
     window_overlap: int = 1,
     complete: bool = True,
-    transcription: str = "text",
+    transcription: TranscriptionMode = TranscriptionMode.TEXT,
 ) -> llm.LLMSteps[list[Block]]:
     """Pass A for one document as a state machine: yields each window request in
     order, receives its response, and returns the flat block list.
@@ -676,7 +677,7 @@ def transcribe_steps(
         log(f"{doc_name}: reusing cached transcription ({len(cached)} block(s))")
         return cached
     total = _count_pages(pdf_bytes)
-    lines_mode = transcription == "lines" and page_text_dir is not None
+    lines_mode = transcription == TranscriptionMode.LINES and page_text_dir is not None
     page_words: dict[int, Any] = {}
     if lines_mode:
         from dgml_core.generation import completeness
@@ -1072,7 +1073,7 @@ def transcribe_document(
     pdf_config: PdfConfig | None = None,
     window_overlap: int = 1,
     complete: bool = True,
-    transcription: str = "text",
+    transcription: TranscriptionMode = TranscriptionMode.TEXT,
 ) -> list[Block]:
     """Transcribe one document into a flat block list (Pass A), synchronously.
 

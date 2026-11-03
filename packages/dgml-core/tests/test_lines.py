@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from dgml_core import llm
 from dgml_core.generation import lines as lines_mod
+from dgml_core.generation.config import TranscriptionMode
 from dgml_core.textmatch import PageDims, Word, fuzzy_norm
 
 from .test_generation import _route_window_calls
@@ -246,7 +247,7 @@ def test_transcribe_document_in_lines_mode(monkeypatch: pytest.MonkeyPatch, tmp_
         cache_dir=tmp_path,
         debug=True,
         page_text_dir=page_text,
-        transcription="lines",
+        transcription=TranscriptionMode.LINES,
         complete=False,
     )
     assert seen[0]["system_prompt"] == transcribe_mod.SYSTEM_PROMPT_LINES
@@ -372,7 +373,7 @@ def test_text_format_reply_in_lines_mode_is_used_as_text(
         config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path,
         page_text_dir=page_text,
-        transcription="lines",
+        transcription=TranscriptionMode.LINES,
         complete=False,
     )
     assert [b.text for b in blocks] == ["We are a leading provider of services to clients."]
@@ -461,7 +462,7 @@ def test_textless_page_gets_its_own_text_call_in_a_lines_window(
         config=llm.LLMConfig(model="anthropic/claude-haiku-5-5"),
         cache_dir=tmp_path,
         page_text_dir=page_text,
-        transcription="lines",
+        transcription=TranscriptionMode.LINES,
         complete=False,
     )
     assert calls == [transcribe_mod.SYSTEM_PROMPT_LINES, transcribe_mod.SYSTEM_PROMPT]
