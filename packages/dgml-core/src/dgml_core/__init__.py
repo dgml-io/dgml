@@ -27,6 +27,13 @@ from .conversion import (
     make_converter,
 )
 from .dgml_output import DgmlDocument, read_dgml
+from .docset_generate import (
+    GenerateFileResult,
+    GenerateFileStatus,
+    GenerateReport,
+    JobRequest,
+    generate_docset,
+)
 from .docsets import DocSetStore
 
 # Exported in full, and pinned so by tests/test_error_codes.py.
@@ -55,6 +62,7 @@ from .errors import (
     DgmlError,
     DgmlNotFound,
     DocSetNotFound,
+    EmptyDocSet,
     EmptyModelResponse,
     EngineNotAvailable,
     FileNotFound,
@@ -339,6 +347,7 @@ __all__ = [
     "DocSetNotFound",
     "DocSetStore",
     "DocStore",
+    "EmptyDocSet",
     "EmptyModelResponse",
     "EngineName",
     "EngineNotAvailable",
@@ -349,6 +358,9 @@ __all__ = [
     "FileStore",
     "FileVersion",
     "FormatFamily",
+    "GenerateFileResult",
+    "GenerateFileStatus",
+    "GenerateReport",
     "GenerationConfigInvalid",
     "GenerationConfigMissing",
     "GenerationFailed",
@@ -364,6 +376,7 @@ __all__ = [
     "Issue",
     "IssueKind",
     "IssueTarget",
+    "JobRequest",
     "LabelModelUnreachable",
     "LegacyConfigPresent",
     "LinkOutcome",
@@ -441,6 +454,7 @@ __all__ = [
     "export_attestation",
     "extract_file",
     "extract_values_many",
+    "generate_docset",
     "generate_unique_workspace_id",
     "get_extracted_values",
     "is_record_id",

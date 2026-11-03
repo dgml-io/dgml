@@ -23,6 +23,7 @@ from typing import Any
 import litellm
 import pytest
 from dgml_core import llm
+from dgml_core.generation.config import ThinkingMode
 
 
 def _resp(text: str) -> dict[str, Any]:
@@ -1125,11 +1126,13 @@ def test_thinking_sent_to_anthropic_models() -> None:
     """The mode reaches the wire as Anthropic's `thinking` object."""
     msgs = [{"role": "user", "content": "hi"}]
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking="disabled"), messages=msgs
+        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking=ThinkingMode.DISABLED),
+        messages=msgs,
     )
     assert kwargs["thinking"] == {"type": "disabled"}
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking="adaptive"), messages=msgs
+        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking=ThinkingMode.ADAPTIVE),
+        messages=msgs,
     )
     assert kwargs["thinking"] == {"type": "adaptive"}
 
@@ -1140,7 +1143,8 @@ def test_between_tools_is_sonnet_55_off_switch() -> None:
     (type only, no other field)."""
     msgs = [{"role": "user", "content": "hi"}]
     kwargs = llm._build_completion_kwargs(
-        llm.LLMConfig(model="anthropic/claude-sonnet-5-5", thinking="between_tools"), messages=msgs
+        llm.LLMConfig(model="anthropic/claude-sonnet-5-5", thinking=ThinkingMode.BETWEEN_TOOLS),
+        messages=msgs,
     )
     assert kwargs["thinking"] == {"type": "between_tools"}
 
@@ -1160,7 +1164,7 @@ def test_thinking_not_sent_to_non_anthropic_models() -> None:
     own way and reject it."""
     for model in ("gemini/gemini-3.1-pro-preview", "openai/gpt-5"):
         kwargs = llm._build_completion_kwargs(
-            llm.LLMConfig(model=model, thinking="disabled"),
+            llm.LLMConfig(model=model, thinking=ThinkingMode.DISABLED),
             messages=[{"role": "user", "content": "hi"}],
         )
         assert "thinking" not in kwargs, model
@@ -1171,7 +1175,9 @@ def test_reasoning_effort_wins_over_thinking() -> None:
     sending both would contradict itself. The caller's explicit effort wins."""
     kwargs = llm._build_completion_kwargs(
         llm.LLMConfig(
-            model="anthropic/claude-sonnet-5", reasoning_effort="high", thinking="disabled"
+            model="anthropic/claude-sonnet-5",
+            reasoning_effort="high",
+            thinking=ThinkingMode.DISABLED,
         ),
         messages=[{"role": "user", "content": "hi"}],
     )
@@ -1184,7 +1190,9 @@ def test_thinking_still_sent_when_reasoning_effort_was_dropped() -> None:
     the field — so the configured mode applies rather than silently vanishing."""
     kwargs = llm._build_completion_kwargs(
         llm.LLMConfig(
-            model="anthropic/claude-sonnet-5", reasoning_effort="high", thinking="disabled"
+            model="anthropic/claude-sonnet-5",
+            reasoning_effort="high",
+            thinking=ThinkingMode.DISABLED,
         ),
         messages=[{"role": "user", "content": "hi"}],
         tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
@@ -1198,7 +1206,7 @@ def test_invalid_thinking_mode_rejected_at_construction() -> None:
     """A typo is a config error; catching it here names the value instead of
     letting the provider answer 400 mid-run."""
     with pytest.raises(ValueError, match="thinking must be one of"):
-        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking="enabled")
+        llm.LLMConfig(model="anthropic/claude-sonnet-5", thinking="enabled")  # type: ignore[arg-type]
 
 
 class _Reply:
@@ -1225,9 +1233,12 @@ def _reply(content: str | None, finish_reason: str, **extra: Any) -> Any:
     return _Reply(content, finish_reason, **extra)
 
 
-@pytest.mark.parametrize("thinking,expect_prefill", [("disabled", True), ("adaptive", False)])
+@pytest.mark.parametrize(
+    "thinking,expect_prefill",
+    [(ThinkingMode.DISABLED, True), (ThinkingMode.ADAPTIVE, False)],
+)
 def test_prefill_on_continuation_follows_thinking_mode(
-    monkeypatch: pytest.MonkeyPatch, thinking: str, expect_prefill: bool
+    monkeypatch: pytest.MonkeyPatch, thinking: ThinkingMode, expect_prefill: bool
 ) -> None:
     """Anthropic rejects a prefilled assistant turn while thinking is on, so a
     truncated reply may only be continued by prefill when thinking is off.

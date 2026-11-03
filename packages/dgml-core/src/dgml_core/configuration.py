@@ -40,7 +40,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from typing import Any
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
 
 from .conversion import FormatFamily
 from .models_config import (
@@ -53,6 +54,9 @@ from .models_config import (
 from .redaction import redacted
 from .storage_service import StorageConfig
 from .workspace_id import ID_SHAPE, is_workspace_id
+
+if TYPE_CHECKING:
+    from .generation.config import ThinkingMode
 
 __all__ = [
     "Classification",
@@ -179,7 +183,7 @@ def _table(obj: Any, *, exclude: frozenset[str] = frozenset()) -> dict[str, Any]
         if isinstance(value, Model):
             out.update(value.table(f.name, _credential_prefix(f.name)))
         else:
-            out[f.name] = value
+            out[f.name] = str(value) if isinstance(value, StrEnum) else value
     return out
 
 
@@ -311,7 +315,7 @@ class Generation:
 
     model: Model | None = None
     label_model: Model | None = None
-    thinking: str | None = None
+    thinking: ThinkingMode | None = None
     batch: bool | None = None
 
     def table(self) -> dict[str, Any]:
