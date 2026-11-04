@@ -3867,6 +3867,7 @@ def test_gather_skips_hidden_paths_and_lock_files(tmp_path: Path, root_name: str
         "sub/c.pdf",
         "sub/~$d.docx",
         "sub/._c.pdf",
+        "sub/.cache/x.pdf",
         ".hidden/b.pdf",
         ".Trashes/c.pdf",
     ):
