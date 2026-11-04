@@ -354,9 +354,19 @@ def load_conversion_config(workspace: Workspace) -> dict[FormatFamily, Converter
     if not isinstance(section, dict):
         raise ConversionConfigInvalid("'conversion' must be a table")
 
+    # The section is the merge of every config layer, so a bad key may not be
+    # in the file the user is looking at: say where else it could be. A
+    # workspace configured in memory has no layers — its caller built the
+    # section — so there is nothing to point at.
+    sources = (
+        None
+        if workspace.configuration is not None
+        else "the user-level config, the workspace-level config or a DGML_CONVERSION__* "
+        "environment variable"
+    )
     configs: dict[FormatFamily, ConverterConfig] = {}
     for key, family_section in section.items():
-        family = _require_family(key)
+        family = _require_family(key, sources)
         if not isinstance(family_section, dict):
             raise ConversionConfigInvalid(f"'conversion.{family}' must be a table")
         provider = family_section.get("provider")
@@ -371,7 +381,7 @@ def load_conversion_config(workspace: Workspace) -> dict[FormatFamily, Converter
     return configs
 
 
-def _require_family(key: str) -> FormatFamily:
+def _require_family(key: str, sources: str | None = None) -> FormatFamily:
     """The :class:`FormatFamily` a ``conversion.<key>`` table configures.
 
     Raises :class:`ConversionConfigInvalid` for a key that is not a family.
@@ -380,7 +390,8 @@ def _require_family(key: str) -> FormatFamily:
     file types it was meant for would be refused as having no converter. The
     message lists the families and, for a key that is a convertible suffix
     (``doc``, ``xls``), the family that suffix belongs to. A family spelled in
-    the wrong case (``DOCX``) is told so, not that it is an extension.
+    the wrong case (``DOCX``) is told so, not that it is an extension. When
+    *sources* is given it names the config layers the key may have come from.
     """
     try:
         return FormatFamily(key)
@@ -395,4 +406,6 @@ def _require_family(key: str) -> FormatFamily:
         family = family_for_suffix(suffix)
         if family is not None:
             message += f" ('{suffix}' files are configured under conversion.{family})"
+    if sources is not None:
+        message += f"; the key may be in {sources}"
     raise ConversionConfigInvalid(message)

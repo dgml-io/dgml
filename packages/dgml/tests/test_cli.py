@@ -4600,6 +4600,36 @@ def test_docset_generate_preflight_rejects_missing_api_key(
     mock_batch.assert_not_called()
 
 
+def test_docset_generate_preflight_rejects_extension_as_conversion_family(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pre-flight: a `[conversion.doc]` table (an extension, not a family) is
+    CONVERSION_CONFIG_INVALID before any transcription, even though every file
+    in the DocSet is a PDF and nothing would have been converted
+    (dgml-io/dgml#274)."""
+    ws_root = tmp_path / "ws"
+    ds_id = _seed_docset_with_one_file(ws_root, capsys)
+    Workspace(root=ws_root).config_path.write_text(
+        dump_toml(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-5-5",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                },
+                "conversion": {"doc": {"provider": "translators_pdf.libreoffice:LibreOffice"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with patch("dgml_core.generation.convert_batch") as mock_batch:
+        rc = main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage"])
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "unknown conversion family 'doc'" in err["message"]
+    mock_batch.assert_not_called()
+
+
 def test_docset_generate_preflight_skips_key_check_when_api_base_set(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

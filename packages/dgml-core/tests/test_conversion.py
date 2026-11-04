@@ -235,7 +235,11 @@ def test_load_conversion_config_unknown_family_raises(tmp_path: Path) -> None:
     with pytest.raises(ConversionConfigInvalid) as excinfo:
         load_conversion_config(ws)
     message = str(excinfo.value)
-    assert message == "unknown conversion family 'word'; expected one of docx, xlsx, pptx"
+    assert message == (
+        "unknown conversion family 'word'; expected one of docx, xlsx, pptx; the key "
+        "may be in the user-level config, the workspace-level config or a DGML_CONVERSION__* "
+        "environment variable"
+    )
 
 
 def test_load_conversion_config_wrong_case_family_raises_with_case_hint(tmp_path: Path) -> None:

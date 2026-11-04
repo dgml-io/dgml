@@ -256,7 +256,9 @@ file attestation key off the stored original document, not the converted PDF.
 - **"unknown conversion family 'doc'; expected one of docx, xlsx, pptx ('.doc'
   files are configured under conversion.docx)"** — the key under
   `[conversion]` is a file extension or some other name, not a format family.
-  Rename the table to the family the message names.
+  Rename the table to the family the message names. The check runs on the
+  merged config, so if the workspace `config.toml` looks right, the key is in
+  the user-level config or a `DGML_CONVERSION__*` environment variable.
 - **"converter 'xlsx-islands' (conversion.pptx.provider) does not handle
   '.pptx' …"** — the family's `provider` names a converter whose
   `input_formats` doesn't include that file type. Point the family at a

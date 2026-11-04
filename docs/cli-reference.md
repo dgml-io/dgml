@@ -1147,7 +1147,7 @@ Errors (run-level, error envelope + exit 1):
 | `EMPTY_DOCSET` | DocSet exists but has no files assigned. |
 | `GENERATION_CONFIG_MISSING` | A generation model can't be resolved — neither the per-task field (`generation.model` / `generation.label_model`) nor its `[models]` tier (`standard` / `advanced`) is set in the merged config. |
 | `GENERATION_CONFIG_INVALID` | The `generation` section is malformed (bad model string, both `api_key` and `api_key_env` set, etc.). A **pre-flight check** (before any transcription spend) also raises this for a model string with no resolvable provider. |
-| `CONVERSION_CONFIG_INVALID` | The `conversion` section is malformed or has a key that is not a format family (`conversion.doc` instead of `conversion.docx`). The section is loaded up front, so this fails the run even when every file in the DocSet is a PDF. |
+| `CONVERSION_CONFIG_INVALID` | The `conversion` section is malformed or has a key that is not a format family (`conversion.doc` instead of `conversion.docx`). A **pre-flight check** (before any transcription spend, and before a `--batch` job is opened) loads the section, so this fails the run even when every file in the DocSet is a PDF. |
 | `AUTH_ERROR` | Pre-flight check: the API key for `model` or `label_model`'s provider is absent (and no `api_key` / `api_key_env` set). Skipped when `generation.api_base` is set, since a custom endpoint may authenticate differently. |
 
 > stdout is a single JSON object. The transcription / labeling / render
@@ -2109,7 +2109,7 @@ Error codes that can come back on `file add`:
 | `TEXT_EXTRACTION_CONFIG_INVALID` | `--text-mode hybrid` but the optional `text_extraction` section in `<workspace>/config.toml` is malformed. No record is created. |
 | `UNSUPPORTED_FILE_TYPE` | Path is not a `.pdf` and is not a convertible source with a converter configured for its format family. |
 | `INVALID_PDF` | File does not start with the `%PDF-` magic. |
-| `CONVERSION_CONFIG_INVALID` | The `conversion` section of `<workspace>/config.toml` is malformed, has a key that is not a format family (`conversion.doc` instead of `conversion.docx`), or names an unresolvable/invalid provider. |
+| `CONVERSION_CONFIG_INVALID` | The `conversion` section is malformed, has a key that is not a format family (`conversion.doc` instead of `conversion.docx`), or names an unresolvable/invalid provider. The section is the merge of every config layer, so the offending key may be in the user-level config or a `DGML_CONVERSION__*` environment variable, not only `<workspace>/config.toml`. |
 | `CONFLICT` | Hash- or path-conflict and `--on-conflict error`; or `--id <id>` naming an id another File already holds (`conflict_kind: "id"`, under any policy). (Also `workspace create --id <id>` when the store of workspaces already holds that id.) |
 | `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
@@ -2143,8 +2143,11 @@ case-insensitive) **whose
 format family has a converter configured** in the workspace `conversion`
 config. Convertible sources with no configured converter are skipped, not
 gathered — so a folder of PDFs with stray Office docs doesn't produce a pile
-of per-file failures. (A malformed `conversion` config aborts the run with
-`CONVERSION_CONFIG_INVALID`.) `--recursive` descends into subdirectories; the
+of per-file failures. Deciding what to gather means loading the `conversion`
+config, so a malformed section or a key that is not a format family aborts
+the run with `CONVERSION_CONFIG_INVALID` **before anything is added — even
+when the folder holds only PDFs**. (A single `dgml file add <file>.pdf` never
+reads that section, so it is unaffected.) `--recursive` descends into subdirectories; the
 default scans the top level only (the `find -maxdepth 1` equivalent).
 
 `--on-conflict`, `--text-mode`, and `--auto-classify` apply per file
