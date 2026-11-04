@@ -3832,6 +3832,9 @@ def test_file_add_directory_gathers_configured_pptx(
     (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
     (src / "OLD.PPT").write_bytes(b"\xd0\xcf\x11\xe0 not really a ppt")
     (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+    # Office lock file and macOS AppleDouble sidecar: never gathered.
+    (src / "~$deck.pptx").write_bytes(b"\x05user")
+    (src / "._deck.pptx").write_bytes(b"\x00\x05\x16\x07")
 
     rc = main(_ws_args(ws) + ["file", "add", str(src)])
     assert rc == 0
@@ -3847,6 +3850,35 @@ def test_file_add_directory_gathers_configured_pptx(
         assert entry["file"]["page_count"] == 1
         assert entry["file"]["pdf_converter"] == "fixed-pdf"
         assert (ws / layout.file_pdf_key(entry["file"]["id"], name)).is_file()
+
+
+@pytest.mark.parametrize("root_name", ["src", ".inbox"])
+def test_gather_skips_hidden_paths_and_lock_files(tmp_path: Path, root_name: str) -> None:
+    """A directory gather skips hidden files and directories below the root and
+    Office `~$` lock files; a hidden root itself is still gathered from."""
+    from dgml.cli import _gather_pdfs
+
+    root = tmp_path / root_name
+    for rel in (
+        "a.pdf",
+        "~$b.docx",
+        "._a.pdf",
+        ".hidden.pdf",
+        "sub/c.pdf",
+        "sub/~$d.docx",
+        "sub/._c.pdf",
+        ".hidden/b.pdf",
+        ".Trashes/c.pdf",
+    ):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(b"x")
+    suffixes = frozenset({".pdf", ".docx"})
+
+    assert _gather_pdfs(root, recursive=False, suffixes=suffixes) == [root / "a.pdf"]
+    assert _gather_pdfs(root, recursive=True, suffixes=suffixes) == [
+        root / "a.pdf",
+        root / "sub" / "c.pdf",
+    ]
 
 
 class _SpreadsheetOnlyConverter(_FixedPdfConverter):

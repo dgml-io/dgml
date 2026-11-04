@@ -2143,7 +2143,9 @@ format family has a converter configured** in the workspace `conversion`
 config. Convertible sources with no configured converter are skipped, not
 gathered — so a folder of PDFs with stray Office docs doesn't produce a pile
 of per-file failures. (A malformed `conversion` config aborts the run with
-`CONVERSION_CONFIG_INVALID`.) `--recursive` descends into subdirectories; the
+`CONVERSION_CONFIG_INVALID`.) Hidden files and directories (names starting
+with `.`, such as macOS `._` files) and Office lock files (`~$…`) are never
+gathered. `--recursive` descends into subdirectories; the
 default scans the top level only (the `find -maxdepth 1` equivalent).
 
 `--on-conflict`, `--text-mode`, and `--auto-classify` apply per file
