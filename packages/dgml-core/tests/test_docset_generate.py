@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from dgml_core import (
+    ConversionConfigInvalid,
     DocSetStore,
     EmptyDocSet,
     FileStore,
@@ -118,6 +119,35 @@ def test_batch_preflight_runs_after_the_offline_checks(
     did = _batch_seed(workspace, monkeypatch, model="openrouter/anthropic/claude-sonnet-4")
     with pytest.raises(EmptyDocSet):
         generate_docset(workspace, did, batch=BatchOptions())
+
+
+@needs_gs
+def test_conversion_config_is_checked_at_preflight(
+    workspace: Workspace, sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `[conversion]` key that is not a format family is CONVERSION_CONFIG_INVALID
+    at pre-flight — before any cache or source material is read and before a
+    job opens — even though the docset holds only PDFs, which no run would
+    convert (dgml-io/dgml#274)."""
+    from dgml_core.batch import list_jobs
+
+    did = _batch_seed(workspace, monkeypatch, pdf=sample_pdf)
+    write_config(
+        workspace,
+        {
+            "generation": {"model": "anthropic/claude-haiku-4-5", "label_model": _LABEL_MODEL},
+            "conversion": {"doc": {"provider": "translators_pdf.libreoffice:LibreOffice"}},
+        },
+    )
+    request = JobRequest()
+    with (
+        patch("dgml_core.generation.convert_batch") as convert,
+        pytest.raises(ConversionConfigInvalid, match="unknown conversion family 'doc'"),
+    ):
+        generate_docset(workspace, did, batch=BatchOptions(), job=request)
+    convert.assert_not_called()
+    assert request.session is None
+    assert list_jobs(workspace) == []
 
 
 @needs_gs
