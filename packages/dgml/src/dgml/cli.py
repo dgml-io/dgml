@@ -4693,9 +4693,12 @@ def _ingestible_suffixes(ws: Workspace) -> frozenset[str]:
     configured in the workspace. Unconfigured source types are skipped (not
     gathered), so a folder of PDFs with stray Office docs doesn't produce a
     pile of per-file failures. Raises ``ConversionConfigInvalid`` on a
-    malformed ``conversion`` config, or a family whose converter cannot be
-    resolved or does not handle the family's suffixes (a real error worth
-    surfacing once, up front, rather than once per gathered file)."""
+    malformed ``conversion`` config or a key that is not a format family, or
+    a family whose converter cannot be resolved or does not handle the
+    family's suffixes (a real error worth surfacing once, up front, rather
+    than once per gathered file). Deciding what to gather needs the config, so
+    this fires even for a folder of only PDFs — unlike a single ``.pdf`` add,
+    which never reads the section."""
     configured = load_conversion_config(ws)
     extra: set[str] = set()
     for sfx, family in FAMILY_BY_SUFFIX.items():

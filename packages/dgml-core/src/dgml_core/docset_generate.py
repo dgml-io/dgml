@@ -798,6 +798,13 @@ def _generate_docset(
     # config pre-flight above.
     validate_generation_models(gen_cfg, gen_api_key, label_api_key)
 
+    # The conversion config is loaded here, once, for the same reason: a
+    # malformed section or a key that is not a format family is
+    # CONVERSION_CONFIG_INVALID before any cache or source material is pulled
+    # from the store, and even when no file needs converting — the config is
+    # wrong whether or not this run would have read it.
+    converters = load_conversion_config(ws)
+
     if batch is not None:
         # Last of the pre-flights: a stage whose model has no batch backend is
         # BATCH_UNAVAILABLE here, never a silent full-price fallback mid-run.
@@ -1408,7 +1415,7 @@ def _generate_docset(
                     page_text_dirs=page_text_dirs,
                     workspace=ws,
                     dgml_header=build_header(ws.organization, ds.name),
-                    converters=load_conversion_config(ws),
+                    converters=converters,
                     pdf_config=load_pdf_config(ws),
                     roster_seed=roster_seed,
                     schema_seed=schema_seed,
