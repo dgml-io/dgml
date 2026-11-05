@@ -2147,7 +2147,9 @@ of per-file failures. Deciding what to gather means loading the `conversion`
 config, so a malformed section or a key that is not a format family aborts
 the run with `CONVERSION_CONFIG_INVALID` **before anything is added — even
 when the folder holds only PDFs**. (A single `dgml file add <file>.pdf` never
-reads that section, so it is unaffected.) `--recursive` descends into subdirectories; the
+reads that section, so it is unaffected.) Hidden files and directories (names
+starting with `.`, such as macOS `._` files) and Office lock files (`~$…`) are
+never gathered. `--recursive` descends into subdirectories; the
 default scans the top level only (the `find -maxdepth 1` equivalent).
 
 `--on-conflict`, `--text-mode`, and `--auto-classify` apply per file

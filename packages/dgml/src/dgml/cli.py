@@ -4714,10 +4714,22 @@ def _gather_pdfs(directory: Path, *, recursive: bool, suffixes: frozenset[str]) 
     ``suffixes`` is the accepted extension set (see :func:`_ingestible_suffixes`).
     ``recursive`` descends into subdirectories; otherwise only the top level
     is scanned (matching the ``find -maxdepth 1`` variant the skill calls
-    out). Results are lex-sorted so a bulk run is deterministic.
+    out). Hidden files and directories below ``directory`` (names starting with
+    ``.``) and Office lock files (``~$…``) are skipped; hidden directories are
+    pruned, not walked. Results are lex-sorted so a bulk run is deterministic.
     """
-    candidates = directory.rglob("*") if recursive else directory.glob("*")
-    return sorted(p for p in candidates if p.is_file() and p.suffix.lower() in suffixes)
+    if recursive:
+        candidates: list[Path] = []
+        for root, dirnames, filenames in os.walk(directory):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            candidates.extend(Path(root) / f for f in filenames)
+    else:
+        candidates = list(directory.iterdir())
+    return sorted(
+        p
+        for p in candidates
+        if not p.name.startswith((".", "~$")) and p.suffix.lower() in suffixes and p.is_file()
+    )
 
 
 def _require_existing_docsets(docsets: list[DocSet]) -> None:
