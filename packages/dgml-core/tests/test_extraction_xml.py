@@ -26,6 +26,7 @@ from dgml_core.extraction_xml import (
     has_extraction,
     provenance_issues,
     standalone_extraction_doc,
+    unboxed_value_paths,
     verify_input_citations,
 )
 
@@ -882,6 +883,39 @@ def test_unboxed_partly_printed_value_is_dropped_not_read_as_inferred() -> None:
     }
     assert drop_unboxed_values(values).values == 1
     assert "PeriodStart" not in values
+
+
+def _unboxed_and_unsupported() -> dict[str, Any]:
+    return {
+        "Name": {"text": "Acme", "locations": _BOX},
+        "Total": {"text": "4.00", "locations": _NO_BOX},
+        "Region": {"text": "EMEA", "method": "inferred"},  # names nothing it used
+    }
+
+
+def test_keep_unboxed_writes_a_printed_value_with_no_box_and_lists_it() -> None:
+    """With keep_unboxed, a printed value grounding found no box for stays
+    (written without dg:origin) and is listed; an unsupported value still
+    goes."""
+    values = _unboxed_and_unsupported()
+    assert drop_unboxed_values(values, keep_unboxed=True) == (
+        0,
+        0,
+        ["Region=EMEA (unsupported)"],
+        1,
+    )
+    assert values["Total"] == {"text": "4.00", "locations": _NO_BOX}
+    assert "Region" not in values
+    assert unboxed_value_paths(values) == ["Total=4.00"]
+
+
+def test_without_keep_unboxed_a_printed_value_with_no_box_is_dropped() -> None:
+    values = _unboxed_and_unsupported()
+    result = drop_unboxed_values(values)
+    assert (result.values, result.unsupported) == (1, 1)
+    assert result.paths == ["Total=4.00", "Region=EMEA (unsupported)"]
+    assert set(values) == {"Name"}
+    assert unboxed_value_paths(values) == []
 
 
 def test_unprinted_and_partly_boxed_values_are_kept() -> None:
