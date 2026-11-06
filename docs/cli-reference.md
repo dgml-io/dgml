@@ -1472,7 +1472,8 @@ Two formats are involved:
 The LLM is configurable like every other model-using command — via the
 `grounded` section of the workspace `config.toml` (`schema_model`,
 `values_model`, `values_reasoning_effort`, `locations_reasoning_effort`, API
-keys, `max_tool_iters`), with per-call overrides on the commands below.
+keys, `max_tool_iters`, `call_timeout_seconds`), with per-call overrides on the
+commands below.
 
 ### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M] [--batch]`
 

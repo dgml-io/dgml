@@ -371,6 +371,7 @@ def test_load_config_defaults(workspace: Workspace) -> None:
     # Unset, the values reasoning effort is the module's measured default.
     assert config.values_reasoning_effort == "medium"
     assert config.locations_reasoning_effort == "high"
+    assert config.call_timeout_seconds == 1800
 
 
 def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> None:
@@ -883,6 +884,32 @@ def test_load_config_reads_locations_reasoning_effort(
     assert load_grounded_config(workspace).locations_reasoning_effort == expected
 
 
+def test_load_config_reads_call_timeout_seconds(workspace: Workspace) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "call_timeout_seconds": 600,
+        },
+    )
+    assert load_grounded_config(workspace).call_timeout_seconds == 600.0
+
+
+@pytest.mark.parametrize("raw", [0, -1, 0.0, True, "600"])
+def test_load_config_rejects_a_bad_call_timeout_seconds(workspace: Workspace, raw: Any) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "call_timeout_seconds": raw,
+        },
+    )
+    with pytest.raises(GroundedConfigInvalid, match="call_timeout_seconds"):
+        load_grounded_config(workspace)
+
+
 def test_load_config_rejects_unknown_locations_reasoning_effort(workspace: Workspace) -> None:
     _write_grounded_config(
         workspace,
@@ -924,6 +951,26 @@ def test_locations_effort_default_sends_no_reasoning_effort(workspace: Workspace
     phase1, phase3 = _extract_with_grounding_call(workspace, config)
     assert phase1.kwargs["reasoning_effort"] == "medium"
     assert "reasoning_effort" not in phase3.kwargs
+
+
+def test_call_timeout_defaults_on_both_extraction_calls(workspace: Workspace) -> None:
+    """Unset, ``call_timeout_seconds`` leaves value extraction and location
+    grounding on the module default."""
+    config = GroundedConfig(schema_model=DEFAULT_SCHEMA_MODEL, values_model=DEFAULT_VALUES_MODEL)
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert (phase1.kwargs["timeout"], phase3.kwargs["timeout"]) == (1800, 1800)
+
+
+def test_configured_call_timeout_reaches_both_extraction_calls(workspace: Workspace) -> None:
+    """``call_timeout_seconds`` is the timeout of value extraction (phase 1)
+    and of location grounding (phase 3)."""
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        call_timeout_seconds=600.0,
+    )
+    phase1, phase3 = _extract_with_grounding_call(workspace, config)
+    assert (phase1.kwargs["timeout"], phase3.kwargs["timeout"]) == (600.0, 600.0)
 
 
 @pytest.mark.parametrize("locations_effort", ["low", None])
