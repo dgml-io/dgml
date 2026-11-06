@@ -371,6 +371,7 @@ def test_load_config_defaults(workspace: Workspace) -> None:
     # Unset, the values reasoning effort is the module's measured default.
     assert config.values_reasoning_effort == "medium"
     assert config.locations_reasoning_effort == "high"
+    assert config.keep_unboxed_values is False
 
 
 def test_load_config_override_drops_tier_credentials(workspace: Workspace) -> None:
@@ -881,6 +882,31 @@ def test_load_config_reads_locations_reasoning_effort(
         },
     )
     assert load_grounded_config(workspace).locations_reasoning_effort == expected
+
+
+def test_load_config_reads_keep_unboxed_values(workspace: Workspace) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "keep_unboxed_values": True,
+        },
+    )
+    assert load_grounded_config(workspace).keep_unboxed_values is True
+
+
+def test_load_config_rejects_a_non_bool_keep_unboxed_values(workspace: Workspace) -> None:
+    _write_grounded_config(
+        workspace,
+        {
+            "schema_model": DEFAULT_SCHEMA_MODEL,
+            "values_model": DEFAULT_VALUES_MODEL,
+            "keep_unboxed_values": "yes",
+        },
+    )
+    with pytest.raises(GroundedConfigInvalid, match="keep_unboxed_values"):
+        load_grounded_config(workspace)
 
 
 def test_load_config_rejects_unknown_locations_reasoning_effort(workspace: Workspace) -> None:
@@ -1841,6 +1867,8 @@ def test_extract_values_writes_stats_file(workspace: Workspace) -> None:
         "located_pageless": 0,
         "dropped_unboxed_values": 0,
         "dropped_unboxed": [],
+        "kept_unboxed_values": 0,
+        "kept_unboxed": [],
         "rejected_boxes": 0,
         "snapped_boxes": 0,
         "unnormalized_enum_values": 0,
@@ -2986,6 +3014,8 @@ def test_extract_values_calculated_field_end_to_end(workspace: Workspace) -> Non
         "located_pageless": 0,
         "dropped_unboxed_values": 0,
         "dropped_unboxed": [],
+        "kept_unboxed_values": 0,
+        "kept_unboxed": [],
         "rejected_boxes": 0,
         "snapped_boxes": 0,
         "unnormalized_enum_values": 0,
@@ -4119,6 +4149,38 @@ def test_extract_values_phase3_skips_a_page_the_file_does_not_have(
         "have (it has 1); they stay unmatched",
         f"file {fid}: phase 3 (locations) starting: 1 items on 1 pages",
     ]
+
+
+def test_extract_values_keeps_a_value_with_no_box_when_configured(workspace: Workspace) -> None:
+    """The same unboxable leaf, with ``keep_unboxed_values``: it is written
+    without dg:origin, not dropped, and the stats list it as kept."""
+    fid = "f1aaaaaaaaaa"
+    ds_id, phase1_values = _seed_two_leaves_one_missing_page(workspace, fid, page_count=1)
+    phase3_args = {"locations": [{"id": "a", "bounding_boxes": [[10.0, 20.0, 30.0, 40.0]]}]}
+    config = GroundedConfig(
+        schema_model=DEFAULT_SCHEMA_MODEL,
+        values_model=DEFAULT_VALUES_MODEL,
+        keep_unboxed_values=True,
+    )
+    with patch(
+        "litellm.completion",
+        side_effect=[
+            _tool_call_response("submit_values", {"values": phase1_values}, call_id="p1"),
+            _tool_call_response("submit_locations", phase3_args, call_id="p3"),
+        ],
+    ):
+        result = extract_values(workspace, ds_id, fid, config=config, write_stats=True)
+
+    assert result.values["subtitle"] == {"text": "Farewell", "locations": [{"page_number": 2}]}
+    xml = workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+    assert "<docset:subtitle>Farewell</docset:subtitle>" in xml
+    stats = workspace.docs.get_doc("extraction_stats", f"{ds_id}/{fid}")
+    assert stats is not None and stats["outcome"] == "ok"
+    assert stats["matching"]["unmatched"] == 1
+    assert stats["matching"]["dropped_unboxed_values"] == 0
+    assert stats["matching"]["dropped_unboxed"] == []
+    assert stats["matching"]["kept_unboxed_values"] == 1
+    assert stats["matching"]["kept_unboxed"] == ["subtitle=Farewell"]
 
 
 def test_extract_values_phase3_makes_no_call_when_every_page_is_missing(

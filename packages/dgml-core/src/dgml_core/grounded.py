@@ -99,6 +99,7 @@ from .extraction_xml import (
     embed_extraction_into,
     has_document_tree,
     standalone_extraction_doc,
+    unboxed_value_paths,
     verify_input_citations,
 )
 from .files import FileStore
@@ -340,6 +341,10 @@ class GroundedConfig:
     # Checked by name only: a budget the model refuses fails in phase 3, after
     # the values call has been paid for, on the first page that needs grounding.
     locations_reasoning_effort: str | None = _LOCATIONS_REASONING_EFFORT
+    # Write a printed value grounding found no box for (without dg:origin,
+    # listed in ``matching.kept_unboxed``) instead of dropping it. Off by
+    # default: such a value can't be checked against the page.
+    keep_unboxed_values: bool = False
 
 
 def parse_reasoning_effort(raw: Any, *, source: str) -> str | None:
@@ -431,6 +436,9 @@ def load_grounded_config(
         if "locations_reasoning_effort" in sec
         else _LOCATIONS_REASONING_EFFORT
     )
+    keep_unboxed_values = sec.get("keep_unboxed_values", False)
+    if not isinstance(keep_unboxed_values, bool):
+        raise GroundedConfigInvalid("'grounded.keep_unboxed_values' must be true or false if set")
 
     return GroundedConfig(
         schema_model=schema.model,
@@ -444,6 +452,7 @@ def load_grounded_config(
         max_tool_iters=max_tool_iters_raw,
         values_reasoning_effort=values_reasoning_effort,
         locations_reasoning_effort=locations_reasoning_effort,
+        keep_unboxed_values=keep_unboxed_values,
     )
 
 
@@ -1268,6 +1277,7 @@ class _FileExtraction:
         self.located_pageless = 0
         self.dropped_unboxed_values = 0
         self.dropped_unboxed_paths: list[str] = []
+        self.kept_unboxed_paths: list[str] = []
         self.rejected_boxes = 0
         self.snapped_boxes = 0
         self.unnormalized_enums = 0
@@ -1574,10 +1584,12 @@ class _FileExtraction:
         )
         # A printed value grounding couldn't box can't be tied to the page,
         # and a value with no box, no default and nothing it used can't be
-        # verified: drop them rather than write them with no provenance.
-        unboxed = drop_unboxed_values(final_values)
+        # verified: drop them rather than write them with no provenance. With
+        # keep_unboxed_values the first kind is written, and listed.
+        unboxed = drop_unboxed_values(final_values, keep_unboxed=self.config.keep_unboxed_values)
         self.dropped_unboxed_values = unboxed.values
         self.dropped_unboxed_paths = unboxed.paths
+        self.kept_unboxed_paths = unboxed_value_paths(final_values)
         # After grounding, so evidence that never got a box (and so emits no
         # dg:chunk) counts as dropped too.
         self.dropped_inputs = (
@@ -1687,6 +1699,7 @@ class _FileExtraction:
             located_pageless=self.located_pageless,
             dropped_unboxed_values=self.dropped_unboxed_values,
             dropped_unboxed_paths=self.dropped_unboxed_paths,
+            kept_unboxed_paths=self.kept_unboxed_paths,
             rejected_boxes=self.rejected_boxes,
             snapped_boxes=self.snapped_boxes,
             unnormalized_enums=self.unnormalized_enums,
@@ -2240,6 +2253,7 @@ def _build_extraction_stats(
     located_pageless: int,
     dropped_unboxed_values: int,
     dropped_unboxed_paths: list[str],
+    kept_unboxed_paths: list[str],
     rejected_boxes: int,
     snapped_boxes: int,
     unnormalized_enums: int,
@@ -2330,6 +2344,10 @@ def _build_extraction_stats(
             # Which ones ("path=text"), so a drop is diagnosable without
             # re-running the extraction.
             "dropped_unboxed": dropped_unboxed_paths,
+            # Printed values with no box written anyway, without dg:origin
+            # (grounded.keep_unboxed_values), as "path=text".
+            "kept_unboxed_values": len(kept_unboxed_paths),
+            "kept_unboxed": kept_unboxed_paths,
             # Boxes whose words on the text layer don't read as their value:
             # moved to the one exact match on their line (snapped), or, with
             # no single match there, stripped (rejected).

@@ -452,7 +452,7 @@ def _unverifiable(leaf: dict[str, Any], values: dict[str, Any]) -> str | None:
     return "unsupported"
 
 
-def drop_unboxed_values(values: dict[str, Any]) -> UnboxedResult:
+def drop_unboxed_values(values: dict[str, Any], *, keep_unboxed: bool = False) -> UnboxedResult:
     """Remove every value that can't be verified, in place.
 
     Every value written must be checkable: a printed value (one with
@@ -468,7 +468,11 @@ def drop_unboxed_values(values: dict[str, Any]) -> UnboxedResult:
     shifts the ones after it, so every remaining ``inputs`` path is
     re-indexed; an input naming a removed value is dropped. That can leave
     another value with nothing it used, so this repeats until nothing more is
-    removed."""
+    removed.
+
+    With *keep_unboxed*, a printed value with no box stays and is written
+    without ``dg:origin`` (:func:`unboxed_value_paths` lists them); only
+    unsupported values are removed."""
     unboxed = unsupported = dropped_inputs = 0
     dropped_paths: list[str] = []
     while True:
@@ -476,6 +480,7 @@ def drop_unboxed_values(values: dict[str, Any]) -> UnboxedResult:
             path: reason
             for path, leaf in walk_all_leaves(values)
             if (reason := _unverifiable(leaf, values)) is not None
+            and not (keep_unboxed and reason == "unboxed")
         }
         if not marks:
             break
@@ -489,6 +494,17 @@ def drop_unboxed_values(values: dict[str, Any]) -> UnboxedResult:
                 dropped_paths.append(f"{path_text} (unsupported)")
         dropped_inputs += _remap_inputs(values, pruned.removed, pruned.removed_index)
     return UnboxedResult(unboxed, dropped_inputs, dropped_paths, unsupported)
+
+
+def unboxed_value_paths(values: dict[str, Any]) -> list[str]:
+    """Each printed value in *values* with no box, as ``"path=text"``: what
+    :func:`drop_unboxed_values` kept with ``keep_unboxed`` (none after a drop
+    without it)."""
+    return [
+        f"{path_to_str(path)}={leaf.get('text')}"
+        for path, leaf in walk_all_leaves(values)
+        if "locations" in leaf and _origin_from_locations(leaf["locations"]) is None
+    ]
 
 
 class _Pruned(NamedTuple):
