@@ -18,7 +18,7 @@ built one of two ways:
 - **In code**, by an application that keeps its settings elsewhere —
   :meth:`Configuration.build` takes typed sections and the storage binding, and the
   workspace is opened with ``Workspace.open(configuration=…)``. No ``config.toml``,
-  no user config, no ``DGML_*`` environment variables, nothing written back.
+  no user config, no ``DGML_*`` config overrides, nothing written back.
 - **From TOML**, for a workspace addressed by path or held in the store of workspaces —
   derived by ``Workspace.config`` from the result of the usual merge (user config →
   workspace config → environment).
@@ -132,9 +132,6 @@ class ProviderSpec:
 
     def table(self) -> dict[str, Any]:
         return {"provider": self.provider, **dict(self.options)}
-
-    def _frozen(self) -> tuple[Any, ...]:
-        return (self.provider, tuple(sorted(self.options.items())))
 
 
 @dataclass(frozen=True)
@@ -346,8 +343,8 @@ class Configuration:
     """One workspace's configuration: identity, storage binding, and the merge
     sections every loader reads. See the module docstring for the two ways to get one.
 
-    Equality covers everything; the hash covers identity and storage only (sections
-    hold dicts), which is what a per-tenant cache of ``Workspace`` objects keys on.
+    Equality covers everything. It is not hashable: ``sections`` and provider options
+    are plain dicts a caller can still mutate.
     ``sections`` is the merge as written: ``Models`` provider keys stay in its
     ``[models]`` table, and ``load_merged_config`` writes them onto the models that
     take them each time a loader reads this configuration — so a per-call model
@@ -367,8 +364,9 @@ class Configuration:
             f"sections={sections!r})"
         )
 
-    def __hash__(self) -> int:
-        return hash((self.identity, self.storage.blobs._frozen(), self.storage.docs._frozen()))
+    # Unhashable on purpose (see the docstring); without this, ``frozen=True`` would
+    # generate a ``__hash__`` that fails on the first dict it meets.
+    __hash__ = None  # type: ignore[assignment]
 
     @classmethod
     def build(

@@ -49,6 +49,7 @@ therefore treat ``{}`` and "absent" alike unless they mean to distinguish them
 
 from __future__ import annotations
 
+import copy
 import tomllib
 from typing import TYPE_CHECKING, Any
 
@@ -196,19 +197,6 @@ def _drop_none_values(sections: dict[Any, Any]) -> dict[Any, Any]:
     }
 
 
-def _merge_toml_layers(
-    workspace: Workspace, *, cli_overrides: dict[str, Any] | None = None
-) -> dict[ConfigSection, Any]:
-    """The TOML-path merge: user file → workspace config → env → ``cli_overrides``.
-
-    What ``Workspace.config`` derives a :class:`~dgml_core.configuration.Configuration`
-    from for a workspace addressed by path or id, and what :func:`load_merged_config`
-    starts from for one. Provider keys are not applied here — the loaders' read does
-    that, once, with the overrides in.
-    """
-    return _merge_layers(workspace, cli_overrides)
-
-
 def load_merged_config(
     workspace: Workspace, *, cli_overrides: dict[str, Any] | None = None
 ) -> dict[ConfigSection, Any]:
@@ -244,27 +232,38 @@ def load_merged_config(
                 continue  # undeclared section: dropped, as ``extra="ignore"`` does on TOML
             if not isinstance(value, dict):
                 raise CorruptMetadata(f"malformed config: '{key}' must be a table")
-            sections[section] = _deep_update(sections.get(section, {}), value)
+            sections[section] = _deep_merge(sections.get(section, {}), value)
         merged = _drop_none_values(sections)
     apply_provider_keys(merged)
     return merged
 
 
-def _deep_update(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """pydantic-settings' source combination for one section: an overlay sets the
-    keys it names and inherits the rest, recursively."""
-    merged = dict(base)
-    for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_update(merged[key], value)
+def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``overrides`` into a copy of ``base``: dict-valued keys
+    recurse, everything else replaces. pydantic-settings' source combination for one
+    section, and how ``run_clustering`` overlays a partial ``clustering`` config on its
+    bundled defaults. Returns a fresh dict — neither input is mutated, and nothing in
+    the result is shared with them."""
+    out = copy.deepcopy(base)
+    for key, value in overrides.items():
+        existing = out.get(key)
+        if isinstance(value, dict) and isinstance(existing, dict):
+            out[key] = _deep_merge(existing, value)
         else:
-            merged[key] = value
-    return merged
+            out[key] = copy.deepcopy(value)
+    return out
 
 
-def _merge_layers(
-    workspace: Workspace, cli_overrides: dict[str, Any] | None
+def _merge_toml_layers(
+    workspace: Workspace, *, cli_overrides: dict[str, Any] | None = None
 ) -> dict[ConfigSection, Any]:
+    """The TOML-path merge: user file → workspace config → env → ``cli_overrides``.
+
+    What ``Workspace.config`` derives a :class:`~dgml_core.configuration.Configuration`
+    from for a workspace addressed by path or id, and what :func:`load_merged_config`
+    starts from for one. Provider keys are not applied here — the loaders' read does
+    that, once, with the overrides in.
+    """
     user_path = user_config_path()
     if not user_path.exists() and workspace.has_legacy_json_config():
         raise LegacyConfigPresent(
