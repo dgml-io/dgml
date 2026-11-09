@@ -247,9 +247,9 @@ def load_store_configs(
                     f"only the binding its Configuration carries"
                 )
             return _configured_store_configs(workspace, workspace_id)
-        # The TOML merge directly, not ``load_merged_config``: that reads
-        # ``workspace.config``, whose derivation is what calls here. Storage on the
-        # TOML path is TOML-derived by definition, so nothing is bypassed.
+        # The TOML merge alone, not ``load_merged_config``: that also applies the
+        # ``[models]`` provider keys, which storage never reads. Storage on the TOML
+        # path is TOML-derived by definition, so nothing is bypassed.
         from .config import _merge_toml_layers
 
         merged = _merge_toml_layers(workspace)

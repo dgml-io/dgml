@@ -31,11 +31,16 @@ FileStore(ws).add(path, file_id=document.id)
 
 What this does and does not do:
 
-- **Nothing is read from disk or the environment.** The user-level `~/.config/dgml/config.toml`,
-  `DGML_*` variables and the store of workspaces play no part; `cfg` is the whole
-  configuration. (One exception by design: a model side with *no* key configured still falls
-  back to litellm's own per-provider environment lookup — so a multi-tenant host should keep
-  provider keys out of its process environment and pass them in `cfg`.)
+- **No config layer is read from disk or the environment.** The user-level
+  `~/.config/dgml/config.toml`, `DGML_*` overrides and the store of workspaces play no part;
+  `cfg` is the whole configuration. Credentials left out of `cfg` are another matter: the
+  code that uses them may look them up itself. A model side with *no* key configured falls
+  back to litellm's own per-provider environment lookup, and a storage provider given no
+  credentials falls back to its own chain — the S3 store to boto3's default chain
+  (`AWS_ACCESS_KEY_ID`, `~/.aws/credentials`, an instance role), the Mongo sample to
+  `DGML_MONGO_URI`. A host that must not pick these up keeps them out of its process
+  environment and passes credentials in `cfg`. The AWS Textract OCR provider is the
+  exception: it takes only `region` and `profile`, so it always uses boto3's default chain.
 - **Nothing leaks through a `repr`.** Every `api_key` field — on `Model`, `Models`, and the
   resolved task configs such as `GenerationConfig` — is left out of its repr, and `ProviderSpec`,
   `StorageConfig` and `Configuration` print every option or section value whose name carries a
@@ -70,9 +75,6 @@ What this does and does not do:
 - **`Identity.workspace_id` must be a valid workspace id** (3–40 chars of `[a-z0-9_-]`, starting
   with a letter or digit), the same rule `create_workspace` applies: it becomes a directory
   name, an S3 key prefix and a Mongo collection prefix. Normalize your own ids at the edge.
-- **Tenant = workspace.** Build one `Configuration` per tenant and cache the `Workspace` you
-  open with it (`Configuration` is hashable by identity and storage) — the store clients are
-  built per `Workspace` object.
 
 ## Sections
 
@@ -115,6 +117,7 @@ both. Provider options — including credential ones such as `mongo_uri` or
 ## The CLI path is unchanged
 
 A workspace addressed by path or id still has its `config.toml` (or store row), layered under
-the user config and the environment. Internally it is the same object: `Workspace.config` is
-derived from that merge, so every loader has one read path. That TOML path is the only one
-that writes (identity, storage seal).
+the user config and the environment. `Workspace.config` gives it the same shape as an
+in-memory workspace: a `Configuration` derived from that merge, the `[workspace]` block and
+the bound storage table. The loaders read the merge directly rather than through it. That
+TOML path is the only one that writes (identity, storage seal).

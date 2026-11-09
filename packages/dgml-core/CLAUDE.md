@@ -76,7 +76,7 @@ loader (`load_grounded_config`, `load_ocr_config`, …) reads its sections throu
 - **In memory**, by an application: `Configuration.build(identity=…, storage=…,
   models=Models(…), …)` with typed sections and credentials **by value**, then
   `Workspace.open(configuration=cfg)`. No `config.toml`, no user config, no
-  `DGML_*` environment, no store of workspaces, nothing written back; the first
+  `DGML_*` config overrides, no store of workspaces, nothing written back; the first
   open writes the workspace's meta document to the docstore and later opens check
   it names the same workspace. `root` is optional when every store is remote (an empty temp dir stands in,
   flagged `ws.scratch`, which nothing lasting may be written under); the

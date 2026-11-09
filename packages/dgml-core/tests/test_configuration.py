@@ -327,15 +327,17 @@ def test_from_merged_accepts_string_keys() -> None:
     assert cfg == _build(models=Models(advanced=Model("a/m")))
 
 
-def test_hashable_by_identity_and_storage() -> None:
+def test_unhashable_but_compares_by_value() -> None:
+    """Its dicts can still be mutated, so it compares by value but has no hash."""
     a = _build(models=Models(advanced=Model("a/m")))
-    b = _build(models=Models(advanced=Model("other")))
-    assert hash(a) == hash(b) and a != b
-    assert len({a, b}) == 2
-    other_storage = Configuration.build(
-        identity=_ID, storage=Storage.combined(ProviderSpec("x:Y", {"k": 1}))
+    assert a == _build(models=Models(advanced=Model("a/m")))
+    assert a != _build(models=Models(advanced=Model("other")))
+    other_storage = Storage.combined(ProviderSpec(_LOCAL.provider, {"workspace_path": "/other"}))
+    assert a != Configuration.build(
+        identity=_ID, storage=other_storage, models=Models(advanced=Model("a/m"))
     )
-    assert hash(other_storage) != hash(a)
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(a)
 
 
 def test_is_frozen() -> None:

@@ -53,7 +53,6 @@ actually take effect, and operators can retune them.
 
 from __future__ import annotations
 
-import copy
 import json
 from dataclasses import dataclass, replace
 from importlib import resources
@@ -70,6 +69,7 @@ from clustering.scenarios.s4_zero_shot import S4ZeroShot
 from clustering.scenarios.s5_full_supervised import S5FullSupervised
 
 from .classification import ClassificationConfig
+from .config import _deep_merge
 from .errors import ClusteringConfigInvalid
 
 _CONFIG_RESOURCE = "clustering_config.json"
@@ -390,23 +390,6 @@ def _build_config(
         raise ClusteringConfigInvalid(
             f"clustering config failed validation: {type(exc).__name__}: {exc}"
         ) from exc
-
-
-def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge ``overrides`` into a copy of ``base``.
-
-    Dict-valued keys recurse; everything else replaces. Returns a fresh
-    dict — neither input is mutated. Used to overlay a user's partial
-    ``clustering`` config on top of the bundled defaults.
-    """
-    out = copy.deepcopy(base)
-    for key, value in overrides.items():
-        existing = out.get(key)
-        if isinstance(value, dict) and isinstance(existing, dict):
-            out[key] = _deep_merge(existing, value)
-        else:
-            out[key] = copy.deepcopy(value)
-    return out
 
 
 def _scenario_section(
