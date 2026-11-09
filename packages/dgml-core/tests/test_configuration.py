@@ -44,6 +44,7 @@ from dgml_core.configuration import (
 from dgml_core.conversion import FormatFamily
 from dgml_core.default_config import PROVIDER_MODELS
 from dgml_core.errors import GroundedConfigMissing, InvalidArgument
+from dgml_core.generation.config import ThinkingMode
 from dgml_core.models_config import ConfigSection, Tier, resolve_tiered_model
 from dgml_core.storage import Workspace
 
@@ -98,7 +99,7 @@ def test_every_section_renders_its_loader_keys() -> None:
             {FormatFamily.DOCX: ProviderSpec("mod:Conv", {"binary": "/usr/bin/x"})}
         ),
         generation=Generation(
-            model=Model("g"), label_model=Model("l", api_key="lk"), thinking="disabled"
+            model=Model("g"), label_model=Model("l", api_key="lk"), thinking=ThinkingMode.DISABLED
         ),
         clustering=Clustering({"scenario": {"pooling_pages": 2}}),
     )

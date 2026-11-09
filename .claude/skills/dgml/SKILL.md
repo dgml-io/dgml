@@ -221,7 +221,8 @@ and a per-item `results` array (each entry carries a `status`: `added` /
 `skipped` / `soft_failed` / `hard_failed`). `--on-conflict skip` makes re-runs
 safe (returns the existing record on a hash- or path-collision); `docset
 add-file` is also idempotent. `--recursive` walks subdirectories (default: top
-level only).
+level only). Hidden files and directories (`.…`, e.g. macOS `._` files) and
+Office lock files (`~$…`) are never gathered.
 
 ```bash
 DIR=/path/to/pdfs

@@ -1147,6 +1147,7 @@ Errors (run-level, error envelope + exit 1):
 | `EMPTY_DOCSET` | DocSet exists but has no files assigned. |
 | `GENERATION_CONFIG_MISSING` | A generation model can't be resolved — neither the per-task field (`generation.model` / `generation.label_model`) nor its `[models]` tier (`standard` / `advanced`) is set in the merged config. |
 | `GENERATION_CONFIG_INVALID` | The `generation` section is malformed (bad model string, both `api_key` and `api_key_env` set, etc.). A **pre-flight check** (before any transcription spend) also raises this for a model string with no resolvable provider. |
+| `CONVERSION_CONFIG_INVALID` | The `conversion` section is malformed or has a key that is not a format family (`conversion.doc` instead of `conversion.docx`). A **pre-flight check** (before any transcription spend, and before a `--batch` job is opened) loads the section, so this fails the run even when every file in the DocSet is a PDF. |
 | `AUTH_ERROR` | Pre-flight check: the API key for `model` or `label_model`'s provider is absent (and no `api_key` / `api_key_env` set). Skipped when `generation.api_base` is set, since a custom endpoint may authenticate differently. |
 
 > stdout is a single JSON object. The transcription / labeling / render
@@ -2108,7 +2109,7 @@ Error codes that can come back on `file add`:
 | `TEXT_EXTRACTION_CONFIG_INVALID` | `--text-mode hybrid` but the optional `text_extraction` section in `<workspace>/config.toml` is malformed. No record is created. |
 | `UNSUPPORTED_FILE_TYPE` | Path is not a `.pdf` and is not a convertible source with a converter configured for its format family. |
 | `INVALID_PDF` | File does not start with the `%PDF-` magic. |
-| `CONVERSION_CONFIG_INVALID` | The `conversion` section of `<workspace>/config.toml` is malformed or names an unresolvable/invalid provider. |
+| `CONVERSION_CONFIG_INVALID` | The `conversion` section is malformed, has a key that is not a format family (`conversion.doc` instead of `conversion.docx`), or names an unresolvable/invalid provider. The section is the merge of every config layer, so the offending key may be in the user-level config or a `DGML_CONVERSION__*` environment variable, not only `<workspace>/config.toml`. |
 | `CONFLICT` | Hash- or path-conflict and `--on-conflict error`; or `--id <id>` naming an id another File already holds (`conflict_kind: "id"`, under any policy). (Also `workspace create --id <id>` when the store of workspaces already holds that id.) |
 | `INVALID_ARGUMENT` | `--id` is malformed, was passed with a directory `<path>`, or cannot be honoured because `--on-conflict` would return an existing record with a different id. |
 | `CLASSIFICATION_CONFIG_MISSING` | `--auto-classify` was passed but `<workspace>/config.toml` is missing or has no `classification` section. |
@@ -2142,8 +2143,13 @@ case-insensitive) **whose
 format family has a converter configured** in the workspace `conversion`
 config. Convertible sources with no configured converter are skipped, not
 gathered — so a folder of PDFs with stray Office docs doesn't produce a pile
-of per-file failures. (A malformed `conversion` config aborts the run with
-`CONVERSION_CONFIG_INVALID`.) `--recursive` descends into subdirectories; the
+of per-file failures. Deciding what to gather means loading the `conversion`
+config, so a malformed section or a key that is not a format family aborts
+the run with `CONVERSION_CONFIG_INVALID` **before anything is added — even
+when the folder holds only PDFs**. (A single `dgml file add <file>.pdf` never
+reads that section, so it is unaffected.) Hidden files and directories (names
+starting with `.`, such as macOS `._` files) and Office lock files (`~$…`) are
+never gathered. `--recursive` descends into subdirectories; the
 default scans the top level only (the `find -maxdepth 1` equivalent).
 
 `--on-conflict`, `--text-mode`, and `--auto-classify` apply per file
@@ -3431,11 +3437,12 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `INTERNAL_ERROR` | hard | Unexpected exception; the message is a short, single-line `<ExcType>: <msg>` (capped, whitespace collapsed). Pass `--verbose` (or set `DGML_DEBUG=1`) for the full stderr traceback. |
 | `NOT_FOUND` | hard | Generic not-found (base for the specific codes below). |
 | `DOCSET_NOT_FOUND` | hard | No DocSet with the given id. |
+| `EMPTY_DOCSET` | hard | `docset generate` was pointed at a DocSet that exists but has no files assigned. |
 | `FILE_NOT_FOUND` | hard / soft | A File id, assignment, or source is missing. Soft as a per-item `results` entry in `docset generate`/`ground`. |
 | `UNSUPPORTED_FILE_TYPE` | hard | `file add` path is neither a PDF nor a convertible source. |
 | `INVALID_PDF` | hard | File does not start with the `%PDF-` magic. |
 | `CONFLICT` | hard | Hash- or path-conflict under `--on-conflict error`; `file add --id <id>` naming an id another File already holds; `docset create --id <id>` naming an id a DocSet already holds; or `workspace create --id <id>` naming an id the store of workspaces already holds. |
-| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed, or a family's converter cannot be resolved or does not handle that family's file types (checked before a file is added or gathered, so a misconfigured family is one error, not one per file). |
+| `CONVERSION_CONFIG_INVALID` | hard | The `conversion` config section is malformed or has a key that is not a format family (`conversion.doc` instead of `conversion.docx`), or a family's converter cannot be resolved or does not handle that family's file types (checked before a file is added or gathered, so a misconfigured family is one error, not one per file). |
 | `CONVERSION_FAILED` | hard / soft | A docx/xlsx/pptx→PDF conversion failed (soft as `conversion_error` on a bulk add entry); also raised by `extraction generate-schema` and `extraction extract` for a file that has no PDF because its conversion failed. |
 | `OCR_CONFIG_MISSING` | hard | `--text-mode ocr`/`hybrid` with no `ocr` config section. |
 | `OCR_CONFIG_INVALID` | hard | The `ocr` config section has invalid fields, or names a provider that cannot be resolved. |

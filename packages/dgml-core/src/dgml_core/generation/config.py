@@ -58,7 +58,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from dgml_core.config import config_bool, load_merged_config
 from dgml_core.errors import (
@@ -82,11 +82,40 @@ from dgml_core.storage import Workspace
 #
 # Set ``thinking = "adaptive"`` under ``[generation]`` to restore the model
 # default.
-DEFAULT_THINKING = "disabled"
 
-# Pass A wire formats; see ``GenerationConfig.transcription``.
-TRANSCRIPTION_MODES = ("text", "lines")
-DEFAULT_TRANSCRIPTION = "text"
+
+class ThinkingMode(StrEnum):
+    """Anthropic extended thinking for the generation passes (and any
+    :class:`~dgml_core.llm.LLMConfig`). Ignored for non-Anthropic models."""
+
+    DISABLED = "disabled"
+    ADAPTIVE = "adaptive"
+    BETWEEN_TOOLS = "between_tools"
+
+
+DEFAULT_THINKING = ThinkingMode.DISABLED
+
+
+class TranscriptionMode(StrEnum):
+    """Pass A wire formats; see ``GenerationConfig.transcription``."""
+
+    TEXT = "text"
+    LINES = "lines"
+
+
+DEFAULT_TRANSCRIPTION = TranscriptionMode.TEXT
+
+_Mode = TypeVar("_Mode", bound=StrEnum)
+
+
+def _mode(kind: type[_Mode], value: Any, key: str) -> _Mode:
+    """*value* as a member of *kind*, else GENERATION_CONFIG_INVALID naming the key."""
+    try:
+        return kind(value)
+    except ValueError:
+        raise GenerationConfigInvalid(
+            f"'generation.{key}' must be one of {[m.value for m in kind]} (got {value!r})"
+        ) from None
 
 
 @dataclass(frozen=True)
@@ -121,53 +150,40 @@ class GenerationConfig:
     label_api_key: str | None = field(default=None, repr=False)
     label_api_key_env: str | None = None
     label_api_base: str | None = None
-    # Anthropic extended thinking for BOTH generation passes, one of
-    # :data:`~dgml_core.llm.ANTHROPIC_THINKING_MODES`. Defaults to ``"disabled"``
-    # rather than to "whatever the model does", because the shipped labeling
-    # model is a Claude 5 model and those think adaptively unless told not to —
-    # see the note on :data:`DEFAULT_THINKING`. Ignored for non-Anthropic models.
-    thinking: str = DEFAULT_THINKING
-    # How Pass A is asked for a window: ``"text"`` -- the model copies the
-    # text into typed block lines; ``"lines"`` -- the model assigns structure
+    # Anthropic extended thinking for BOTH generation passes. Defaults to
+    # ``disabled`` rather than to "whatever the model does", because the
+    # shipped labeling model is a Claude 5 model and those think adaptively
+    # unless told not to — see the note on :data:`DEFAULT_THINKING`. Ignored
+    # for non-Anthropic models.
+    thinking: ThinkingMode = DEFAULT_THINKING
+    # How Pass A is asked for a window: ``text`` -- the model copies the
+    # text into typed block lines; ``lines`` -- the model assigns structure
     # to the numbered lines of the text layer and the text is copied from the
     # page (``dgml_core.generation.lines``). ``lines`` needs a text layer and
     # falls back to ``text`` window by window where a page has none.
-    transcription: str = DEFAULT_TRANSCRIPTION
+    transcription: TranscriptionMode = DEFAULT_TRANSCRIPTION
 
 
-def _resolve_transcription(merged: dict[ConfigSection, Any]) -> str:
+def _resolve_transcription(merged: dict[ConfigSection, Any]) -> TranscriptionMode:
     """Read ``[generation] transcription``, defaulting to :data:`DEFAULT_TRANSCRIPTION`."""
     section = merged.get(ConfigSection.GENERATION) or {}
     if not isinstance(section, dict):
         return DEFAULT_TRANSCRIPTION
-    value = section.get("transcription", DEFAULT_TRANSCRIPTION)
-    if value not in TRANSCRIPTION_MODES:
-        raise GenerationConfigInvalid(
-            f"'generation.transcription' must be one of {list(TRANSCRIPTION_MODES)} (got {value!r})"
-        )
-    return str(value)
+    return _mode(
+        TranscriptionMode, section.get("transcription", DEFAULT_TRANSCRIPTION), "transcription"
+    )
 
 
-def _resolve_thinking(merged: dict[ConfigSection, Any]) -> str:
+def _resolve_thinking(merged: dict[ConfigSection, Any]) -> ThinkingMode:
     """Read ``[generation] thinking``, defaulting to :data:`DEFAULT_THINKING`.
 
     Validated here, at the config boundary, so a typo names the file it came
     from instead of surfacing as a provider 400 mid-run.
     """
-    # Imported lazily: `dgml_core.llm` pulls in litellm (~1.4s), which #160
-    # deliberately kept off the eager import path. Config resolution runs once
-    # per command and is already past that point when it needs the modes.
-    from dgml_core.llm import ANTHROPIC_THINKING_MODES
-
     section = merged.get(ConfigSection.GENERATION) or {}
     if not isinstance(section, dict):
         return DEFAULT_THINKING
-    value = section.get("thinking", DEFAULT_THINKING)
-    if value not in ANTHROPIC_THINKING_MODES:
-        raise GenerationConfigInvalid(
-            f"'generation.thinking' must be one of {list(ANTHROPIC_THINKING_MODES)} (got {value!r})"
-        )
-    return str(value)
+    return _mode(ThinkingMode, section.get("thinking", DEFAULT_THINKING), "thinking")
 
 
 def _resolve_from_merged(merged: dict[ConfigSection, Any]) -> GenerationConfig:

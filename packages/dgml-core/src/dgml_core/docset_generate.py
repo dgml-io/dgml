@@ -1,0 +1,1555 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Generating a DocSet: the whole ``docset generate`` orchestration as one call.
+
+:func:`generate_docset` converts every file in a DocSet to DGML XML via the
+typed-block pipeline, grounds each rendered document in place, adds semantic
+links, measures coverage, and refreshes the docset's schema artifacts — the
+layer *above* :func:`~dgml_core.generation.convert_batch` that was previously
+reachable only through the ``dgml`` CLI. Progress is diagnostic and goes to
+this module's logger at INFO (see the Logging section of the package
+CLAUDE.md); every per-file fact an embedding application needs comes back
+structured on the returned :class:`GenerateReport`, never as text to parse.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import tempfile
+from collections import Counter
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from . import layout
+from .concurrency import map_concurrent
+from .conversion import load_conversion_config
+from .docsets import DocSetStore
+from .errors import (
+    BatchJobInvalid,
+    DgmlError,
+    EmptyDocSet,
+    FileNotFound,
+    GenerationFailed,
+    InvalidArgument,
+)
+from .files import FileStore
+from .generation.config import ThinkingMode, TranscriptionMode
+from .models import DocSet
+from .pages import load_pdf_config
+from .storage import Workspace, write_json_atomic
+from .text_extraction import TextMode
+
+if TYPE_CHECKING:
+    from .batch.jobs import JobSession
+    from .generation.config import GenerationConfig
+    from .generation.pipeline import BatchOptions
+    from .generation.schema import Schema
+    from .style_config import StyleConfig
+
+__all__ = [
+    "GenerateFileResult",
+    "GenerateFileStatus",
+    "GenerateReport",
+    "JobRequest",
+    "any_ocr_file",
+    "batch_stage_models",
+    "generate_docset",
+]
+
+_Mode = TypeVar("_Mode", bound=StrEnum)
+
+
+def _mode_arg(kind: type[_Mode], value: Any, name: str) -> _Mode:
+    """*value* as a member of *kind*, else INVALID_ARGUMENT naming the parameter."""
+    try:
+        return kind(value)
+    except ValueError:
+        raise InvalidArgument(
+            f"{name} must be one of {[m.value for m in kind]} (got {value!r})"
+        ) from None
+
+
+logger = logging.getLogger(__name__)
+
+
+#: Distinct rejected concept names reported per file in `unmatched_concepts`.
+#: Enough to recognize the pattern (aliases? new roles? junk?) without turning
+#: a results payload into a log.
+_UNMATCHED_EXAMPLES = 10
+
+
+class GenerateFileStatus(StrEnum):
+    """One file's outcome in a :class:`GenerateReport`: the ``status`` value of
+    its row in the ``results`` array."""
+
+    CONVERTED = "converted"
+    #: Already generated; left as it was.
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class GenerateFileResult:
+    """One file's outcome in a :class:`GenerateReport`.
+
+    Every field other than ``status`` is populated only where it applies —
+    ``output`` on success, ``error`` on failure, and the per-pass fields
+    (``grounded`` and friends, ``links``, ``label_error``, ``link_error``,
+    ``off_schema_concepts``) only on a converted file, mirroring the CLI's
+    conditional JSON keys. ``to_json`` renders exactly the row the CLI emits.
+    """
+
+    status: GenerateFileStatus
+    file_id: str
+    source: str
+    #: Store key of the rendered ``<stem>.dgml.xml`` (converted and skipped files).
+    output: str | None = None
+    #: ``{code, message}`` for a failed file.
+    error: dict[str, str] | None = None
+    #: Semantic links applied to the final XML (converted files).
+    links: int | None = None
+    #: Whether grounding annotated the rendered XML (converted files).
+    grounded: bool | None = None
+    matched_token_pct: float | None = None
+    elements_annotated: int | None = None
+    #: ``{code, message}`` when grounding failed (``grounded`` is False).
+    grounding_error: dict[str, str] | None = None
+    #: ``{code, message}`` when the labeling model was unreachable.
+    label_error: dict[str, str] | None = None
+    #: Short reason when the semantic-link pass could not complete.
+    link_error: str | None = None
+    #: ``{count, distinct, examples}`` for concepts outside an authored
+    #: vocabulary — rejections under a strict schema, additions under
+    #: extend-schema (see :class:`GenerateReport.schema_extended`).
+    off_schema_concepts: dict[str, Any] | None = None
+
+    def to_json(self, *, extend_schema: bool = False) -> dict[str, Any]:
+        """This file's row in the ``results`` array, keys in the CLI's order
+        and present only where the matching pass ran or failed."""
+        row: dict[str, Any] = {
+            "status": str(self.status),
+            "file_id": self.file_id,
+            "source": self.source,
+        }
+        if self.output is not None:
+            row["output"] = self.output
+        if self.error is not None:
+            row["error"] = dict(self.error)
+        if self.links is not None:
+            row["links"] = self.links
+        if self.grounded is not None:
+            row["grounded"] = self.grounded
+            if self.grounded:
+                row["matched_token_pct"] = self.matched_token_pct
+                row["elements_annotated"] = self.elements_annotated
+            else:
+                row["grounding_error"] = dict(self.grounding_error or {})
+        if self.label_error is not None:
+            row["label_error"] = dict(self.label_error)
+        if self.link_error is not None:
+            row["link_error"] = self.link_error
+        if self.off_schema_concepts is not None:
+            key = "added_concepts" if extend_schema else "unmatched_concepts"
+            row[key] = dict(self.off_schema_concepts)
+        return row
+
+
+@dataclass(frozen=True)
+class GenerateReport:
+    """What :func:`generate_docset` did, per file and in aggregate.
+
+    ``skipped`` + ``failed`` + ``converted`` always cover every file assigned
+    to the docset (``total``), so the three lists are the whole story — a
+    partial failure is a ``failed`` entry here, never an exception.
+    ``to_json`` renders the exact envelope ``dgml docset generate`` prints.
+    """
+
+    docset: DocSet
+    total: int
+    skipped: list[GenerateFileResult]
+    failed: list[GenerateFileResult]
+    converted: list[GenerateFileResult]
+    #: Already-generated documents re-rendered (no re-LLM) because the growing
+    #: docset changed their namespacing.
+    rerendered: list[str]
+    #: The docset's store key (``docsets/<id>``) — the prefix the per-file DGML
+    #: lives under. A store-native key, not a local path, so it is meaningful
+    #: on any backend.
+    output_key: str
+    #: Store key of the coverage report, when one was written (coverage on +
+    #: debug), else None.
+    coverage_report_key: str | None
+    #: The effective transcription/labeling models and where they came from
+    #: (workspace config, a profile/file, and/or explicit overrides), so every
+    #: run's model choice is recorded in its output, not just in config.toml.
+    model: str
+    label_model: str
+    model_source: str
+    #: Whether the vocabulary was an authored schema kept open (extend-schema):
+    #: decides if off-schema concepts render as ``added_concepts`` (coined and
+    #: used) or ``unmatched_concepts`` (refused).
+    schema_extended: bool
+    #: Under batch mode, one entry per stage — a batched stage's
+    #: ``WaveStats.to_json()`` or ``{"skipped": "<reason>"}`` for one that ran
+    #: synchronously (see :class:`~dgml_core.generation.BatchOptions.stats`).
+    #: None for a synchronous run.
+    batch_stages: dict[str, dict[str, Any]] | None = None
+
+    @property
+    def results(self) -> list[GenerateFileResult]:
+        """Every file's outcome, in the CLI's order: skipped, failed, converted."""
+        return [*self.skipped, *self.failed, *self.converted]
+
+    def to_json(self) -> dict[str, Any]:
+        """The single ``docset generate`` envelope, built the same way whether
+        or not any file actually needed converting (so the paths can't drift)."""
+        payload: dict[str, Any] = {
+            "docset_id": self.docset.id,
+            "docset_name": self.docset.name,
+            "summary": {
+                "total": self.total,
+                "converted": len(self.converted),
+                "skipped": len(self.skipped),
+                "failed": len(self.failed),
+            },
+            "models": {
+                "model": self.model,
+                "label_model": self.label_model,
+                "source": self.model_source,
+            },
+            "output_key": self.output_key,
+            "coverage_report": self.coverage_report_key,
+            "results": [r.to_json(extend_schema=self.schema_extended) for r in self.results],
+            "rerendered": list(self.rerendered),
+        }
+        if self.batch_stages is not None:
+            # Additive, and present only under batch mode: without it the
+            # payload is exactly what a synchronous run has always emitted.
+            payload["batch"] = {
+                "enabled": True,
+                "stages": {name: dict(stats) for name, stats in self.batch_stages.items()},
+            }
+        return payload
+
+
+@dataclass
+class JobRequest:
+    """A batch job for :func:`generate_docset` to open — once its pre-flights
+    have passed — and close itself, so a run interrupted while it waits on a
+    provider is continued, not paid for twice: pass the same request with
+    ``job_id`` set to the id the first run logged. ``wait=False`` stops the
+    run once a wave is submitted (:class:`~dgml_core.errors.BatchPending`).
+    ``deadline_s`` caps how long the run waits on the provider.
+
+    ``command``, ``argv`` and ``cwd`` are what the ``dgml batch resume``
+    command replays; a library caller leaves them alone. ``log`` receives the
+    session's own lines (default: this module's logger, at INFO).
+
+    ``session`` is an OUTPUT: the session the run opened, closed by the time
+    the call returns or raises, for a caller that reports on it
+    (``manifest.status``, ``deadline_json()``). None when the run never got
+    past its pre-flights — no job exists then.
+    """
+
+    job_id: str | None = None
+    wait: bool = True
+    deadline_s: float | None = None
+    command: str | None = None
+    argv: list[str] = field(default_factory=list)
+    cwd: str | None = None
+    record_usage: bool = True
+    log: Callable[[str], None] | None = None
+    session: JobSession | None = field(default=None, init=False)
+
+
+#: What a job opened for :func:`generate_docset` records as its command.
+_GENERATE_COMMAND = "docset generate"
+
+
+def _open_job(ws: Workspace, request: JobRequest) -> JobSession:
+    """Open *request*'s session as this process's active job, and record it
+    on the request for the caller."""
+    from .batch import start_session
+
+    session = start_session(
+        ws,
+        command=request.command or _GENERATE_COMMAND,
+        argv=list(request.argv),
+        job_id=request.job_id,
+        wait=request.wait,
+        cwd=request.cwd,
+        record_usage=request.record_usage,
+        log=request.log or logger.info,
+        deadline_s=request.deadline_s,
+    )
+    request.session = session
+    if session.resumed:
+        logger.info(f"[batch-job] resuming {session.job_id} (run {session.manifest.runs})")
+    else:
+        # Named up front: if this run is interrupted, this id is what
+        # continues it. A run that finishes deletes its job.
+        logger.info(f"[batch-job] job {session.job_id}: an interrupted run continues from this id")
+    return session
+
+
+def _load_schema_roster(path: Path) -> dict[str, str]:
+    """Load a flat ``{concept: description}`` JSON roster (the shape emitted at
+    ``cache/concept_roster.json``) into a roster seed.
+
+    Used for automatic roster reuse on an incremental generate, so newly-added
+    documents stay tag-consistent with the docset's existing vocabulary. Concept
+    keys are sanitized to PascalCase; descriptions are truncated to the roster
+    hint length. Raises ``InvalidArgument`` on a missing / malformed file or one
+    with no usable concepts.
+    """
+    from .generation.blocks import sanitize_concept
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise InvalidArgument(f"roster file not found: {path}") from exc
+
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidArgument(f"roster is not valid JSON ({path}): {exc}") from exc
+    if not isinstance(raw, dict):
+        raise InvalidArgument(
+            f"roster must be a JSON {{concept: description}} object, got "
+            f"{type(raw).__name__} ({path})"
+        )
+
+    roster: dict[str, str] = {}
+    for name, description in raw.items():
+        concept = sanitize_concept(str(name))
+        if concept:
+            roster[concept] = str(description)[:60]
+    if not roster:
+        raise InvalidArgument(f"roster produced no usable concepts ({path})")
+    return roster
+
+
+def _schema_parent_map(schema: Schema) -> dict[str, str]:
+    """The leaf → container map ``render_dgml`` groups entity containers with.
+
+    Names pass through VERBATIM (only ``sanitize_tag_name`` for XML validity):
+    the map's keys and values must be the same strings the labeling roster and
+    the emitted tags use, and ``sanitize_concept`` — written for model output —
+    would fold names like ``Notes`` to nothing and silently break the pairing.
+    """
+    from .generation.schema import sanitize_tag_name
+
+    parent_map: dict[str, str] = {}
+    for tag in schema.tags.values():
+        if tag.name and tag.parent_role:
+            parent_map[sanitize_tag_name(tag.name)] = sanitize_tag_name(tag.parent_role)
+    return parent_map
+
+
+def _load_schema_seed(
+    path: Path, label: str = "schema"
+) -> tuple[Schema, dict[str, str], list[str]]:
+    """Load a user-supplied tag schema into ``(schema, parent_map, notes)``.
+
+    ``schema_path`` takes any of four forms, detected by CONTENT rather than
+    by file extension so the parameter stays one parameter:
+
+    - a plain newline-delimited tag list (``#`` comments and blanks ignored);
+    - a JSON ``{name: one-line description}`` object — the recommended form;
+    - an exported ``schema.json`` (Schema v1: a ``tags`` map of
+      ``name -> {role, kind, examples, parent_role}``);
+    - its lossless RELAX NG Compact render ``full-schema.rnc`` (``.rnc``
+      suffix; the ``# Field: value`` comment contract carries the same fields).
+
+    The schema seeds the labeling vocabulary with full fidelity — role
+    descriptions, curated examples, kind, hierarchy (via
+    ``ConvertOptions.schema_seed``); each tag's ``parent_role`` also becomes
+    the leaf → container ``parent_map`` that drives entity-container grouping
+    in ``render_dgml``. *notes* are the loader's remarks about anything it had
+    to change, for the progress log.
+
+    Deliberately NOT built on ``_load_schema_roster``: that reader exists for
+    the legacy ``concept_roster.json`` reuse path, truncates descriptions to 60
+    characters, and pushes names through ``sanitize_concept`` — the exact
+    mangling an authored schema must not suffer.
+
+    Raises ``InvalidArgument`` on a missing file, or on anything the loader
+    cannot read unambiguously. A bad schema must fail HERE, at load, and never
+    as a tag that quietly failed to appear hours later. *label* names whatever
+    asked for the file, since the automatic-reuse path reads a stored schema
+    that the user did not name on the command line.
+    """
+    from .generation.schema import parse_authored_schema, schema_from_dict
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise InvalidArgument(f"{label} file not found: {path}") from exc
+    except OSError as exc:
+        raise InvalidArgument(f"{label} could not be read ({path}): {exc}") from exc
+
+    try:
+        if Path(path).suffix.lower() == ".rnc":
+            from .generation.rnc import rnc_to_schema_dict
+
+            schema, notes = schema_from_dict(rnc_to_schema_dict(text))
+        else:
+            schema, notes = parse_authored_schema(text)
+    except InvalidArgument as exc:
+        raise InvalidArgument(f"{label} {path}: {exc}") from exc
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
+        raise InvalidArgument(f"{label} {path} could not be parsed: {exc}") from exc
+
+    return schema, _schema_parent_map(schema), notes
+
+
+def _has_generated_tree(xml_text: str) -> bool:
+    """True when a ``<stem>.dgml.xml`` holds a generated document tree — the
+    generate skip test. An extraction-only file (whose root has just a
+    ``dg:extraction`` child) or an unparseable one returns False so generation
+    proceeds and (re)builds the tree."""
+    from .extraction_xml import has_document_tree
+
+    try:
+        return has_document_tree(xml_text)
+    except Exception:
+        return False
+
+
+def any_ocr_file(file_store: FileStore, file_ids: list[str]) -> bool:
+    """Whether any of *file_ids* is an OCR file, the only kind grounding sends
+    to the image-style model (``text_mode == "ocr"``; an unreadable record
+    counts as not OCR, as it does there). Batch pre-flight uses it to decide
+    whether a run reaches the style model at all."""
+    for fid in file_ids:
+        try:
+            if file_store.get(fid).text_mode == TextMode.OCR.value:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def batch_stage_models(
+    file_store: FileStore,
+    file_ids: list[str],
+    gen_cfg: GenerationConfig,
+    style_config: StyleConfig | None,
+    *,
+    semlinks: bool,
+) -> dict[str, str]:
+    """Stage name → model for every stage a batch run over *file_ids* sends to
+    a batch endpoint — the map :func:`~dgml_core.batch.assert_batchable`
+    pre-flights. Transcription always; the labeling model always too (roster
+    planning and concept descriptions batch under every vocabulary) and again
+    as the link pass unless *semlinks* is off; image style only when a file is
+    OCR, the only kind grounding sends to it."""
+    stages = {"transcribe": gen_cfg.model, "label": gen_cfg.label_model}
+    if style_config is not None and any_ocr_file(file_store, file_ids):
+        stages["style"] = style_config.model
+    if semlinks:
+        stages["links"] = gen_cfg.label_model
+    return stages
+
+
+#: ``batch_stages["style"]`` when the workspace enables image style but no
+#: document of the run had a page to style (none is an OCR file, say).
+_STYLE_NOTHING_TO_STYLE = "no OCR document with a page to style"
+
+
+def _style_staged(
+    staged: dict[str, dict[str, Any]],
+    style_config: StyleConfig | None,
+    batch: BatchOptions,
+) -> None:
+    """Run the image-style passes a batch run deferred while grounding (OCR
+    files under an enabled ``style`` section) as one batch stage, and put each
+    styled document's final grounded XML in its held-back writes. Documents
+    are taken in name order (the staging pool fills *staged* in completion
+    order); the stage's stats land in ``batch.stats["style"]``."""
+    pending = {
+        name: item["pending_style"]
+        for name, item in sorted(staged.items())
+        if item.get("pending_style") is not None
+    }
+    if not pending:
+        if style_config is not None:
+            batch.stats["style"] = {"skipped": _STYLE_NOTHING_TO_STYLE}
+        return
+    from .style_llm import style_batch_executor, style_documents_batch
+
+    assert style_config is not None  # a pending style pass needs the section that configured it
+    executor = style_batch_executor(
+        style_config, poll_interval_s=batch.poll_interval_s, log=logger.info
+    )
+    try:
+        finished = style_documents_batch(pending, executor, log=logger.info)
+    finally:
+        batch.stats["style"] = executor.stats.to_json()
+    for name, data in finished.items():
+        item = staged[name]
+        item["deferred"][item["xml_key"]] = data
+
+
+def _rewind_generate_inputs(
+    job: JobSession,
+    *,
+    cache_dir: Path,
+    seed_files: Mapping[str, Path],
+    doc_names: list[str],
+) -> None:
+    """Put back, on a resumed job run, what generation wrote to its own inputs
+    during earlier runs of the job.
+
+    Two kinds of input feed back into generate's requests: the roster seeds
+    (``schema.json``, ``concept_roster.json`` — labeling rewrites both, and the
+    next run would seed from them) and each document's transcription cache
+    (``<stem>_blocks.json`` — a cached document makes no transcription request,
+    so its responses would never be replayed and never billed). On the job's
+    first run their state is recorded; on every later run it is restored, so
+    the run makes exactly the requests the job started with and replays them.
+    Everything else generate writes is output, written only once the job's
+    last wave has come back."""
+    from .generation.transcribe import blocks_cache_path
+
+    def _reader(path: Path) -> Callable[[], bytes | None]:
+        return lambda: path.read_bytes() if path.exists() else None
+
+    for name, path in seed_files.items():
+        data = job.rewind_input(f"generate/{name}", _reader(path))
+        if job.resumed:
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+    for doc_name in doc_names:
+        blocks = blocks_cache_path(cache_dir, doc_name)
+        cached_at_start = job.rewind_presence(f"generate/blocks/{doc_name}", blocks.exists())
+        if job.resumed and not cached_at_start:
+            blocks.unlink(missing_ok=True)
+    job.persist()  # once for every input recorded above
+
+
+def generate_docset(
+    ws: Workspace,
+    docset_id: str,
+    *,
+    generation_config: str | None = None,
+    model: str | None = None,
+    label_model: str | None = None,
+    window_size: int | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    thinking: ThinkingMode | None = None,
+    transcription: TranscriptionMode | None = None,
+    max_parallel_docs: int | None = None,
+    cache_dir: Path | None = None,
+    schema_path: Path | None = None,
+    extend_schema: bool = False,
+    reuse_roster: bool = True,
+    coverage: bool = True,
+    semlinks: bool = True,
+    semlink_cache: bool = True,
+    semlink_verify: bool = True,
+    debug: bool = False,
+    batch: BatchOptions | None = None,
+    job: JobSession | JobRequest | None = None,
+) -> GenerateReport:
+    """Convert every file in a DocSet to DGML XML via the typed-block pipeline.
+
+    Per window: flat JSON block transcription (``generation.model``); then ONE
+    batch-wide semantic-labeling call across all documents
+    (``generation.label_model``); then deterministic ``dg:chunk`` rendering. Word
+    coverage is measured on the rendered XML unless ``coverage=False``.
+
+    Each rendered ``<stem>.dgml.xml`` is then grounded in place against the
+    file's page OCR — ``dg:origin`` boxes are written onto every element with
+    text content (deterministic, no LLM). A file with no ``page_text/`` is
+    left ungrounded with a warning rather than failing the run. ``debug``
+    additionally writes the per-file ``<stem>.dgml.grounding_stats.json``.
+
+    Per-file problems (a missing source, a duplicate filename, a transcription
+    that produced nothing) are ``failed`` entries on the returned
+    :class:`GenerateReport`, and the run continues — partial success, matching
+    the pipeline's soft-failure design. What raises instead is what makes the
+    whole run meaningless: :class:`~dgml_core.errors.DocSetNotFound`,
+    :class:`~dgml_core.errors.EmptyDocSet`, a malformed style config, an
+    unresolvable model, a missing API key, or — under ``batch`` — a stage
+    whose model has no batch backend
+    (:class:`~dgml_core.errors.BatchUnavailable`): the pre-flight failures,
+    caught in that order and before any transcription spend. A ``schema_path``
+    that is missing or unparseable, ``extend_schema`` with no authored schema
+    to extend, and an unusable remembered roster raise
+    :class:`~dgml_core.errors.InvalidArgument` — today only once a file needs
+    converting, after the skip check has read the store. A ``thinking`` or
+    ``transcription`` outside its enum raises it before anything is read.
+
+    ``model`` / ``label_model`` / ``generation_config`` (a bundled profile name
+    or a config-file path) override the workspace's merged ``generation``
+    config, exactly like the CLI flags of the same names; the effective models
+    and their source come back on the report. ``window_size``,
+    ``temperature``, ``max_tokens`` and ``max_parallel_docs`` default (as
+    None) to :class:`~dgml_core.generation.ConvertOptions`'s own values, so
+    the numbers live there only. Progress lines log at INFO on this module's
+    logger, from the worker threads the stages run on as well as the calling
+    one (``logging`` serializes them) — every fact a caller should branch on
+    is on the report, never only in these strings.
+
+    ``batch`` runs the batchable stages (transcription, labeling, the link
+    pass, OCR files' image-style pass) through the providers' batch endpoints
+    (see :class:`~dgml_core.generation.BatchOptions`). It is read, never
+    written: the run works on a copy whose ``credentials`` default to the
+    resolved models' key references and whose ``stats`` come back as the
+    report's ``batch_stages``, so one may serve several runs. Under batch mode nothing is written
+    until the link pass is past its last wave, so a run interrupted while it
+    waits on a provider leaves every output as it found it.
+
+    ``job`` puts a batch run under a batch job, which records every response
+    so an interrupted run is continued rather than paid for again. A
+    :class:`JobRequest` is the usual form: the run opens the job once its
+    pre-flights have passed (a rejected run leaves no job behind) and closes
+    it however the run ends, so the caller holds no session. A caller that
+    opened a :class:`~dgml_core.batch.JobSession` itself may pass that
+    instead and keeps closing it; the run then uses it as it finds it. Either
+    way a resumed run converts what the job STARTED with and replays the
+    job's stored responses. A job needs ``batch``.
+    """
+    request: JobRequest | None = None
+    session: JobSession | None = None
+    if isinstance(job, JobRequest):
+        request = job
+    else:
+        session = job
+    if job is not None and batch is None:
+        raise BatchJobInvalid("a batch job needs batch mode: pass batch=BatchOptions(...)")
+    if request is not None:
+        # A request reused to continue its job still holds the last run's
+        # session: this run's slot starts empty.
+        request.session = None
+    try:
+        report = _generate_docset(
+            ws,
+            docset_id,
+            generation_config=generation_config,
+            model=model,
+            label_model=label_model,
+            window_size=window_size,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            transcription=transcription,
+            max_parallel_docs=max_parallel_docs,
+            cache_dir=cache_dir,
+            schema_path=schema_path,
+            extend_schema=extend_schema,
+            reuse_roster=reuse_roster,
+            coverage=coverage,
+            semlinks=semlinks,
+            semlink_cache=semlink_cache,
+            semlink_verify=semlink_verify,
+            debug=debug,
+            batch=batch,
+            job=session,
+            request=request,
+        )
+    except BaseException as exc:
+        # One close, with how the run ended: an interrupt keeps the job's
+        # open batches for a resume, a pause (BatchPending) leaves it pending,
+        # anything else settles it (see JobSession.close).
+        if request is not None and request.session is not None:
+            request.session.close(exc)
+        raise
+    if request is not None and request.session is not None:
+        request.session.close(None)
+    return report
+
+
+def _generate_docset(
+    ws: Workspace,
+    docset_id: str,
+    *,
+    generation_config: str | None,
+    model: str | None,
+    label_model: str | None,
+    window_size: int | None,
+    temperature: float | None,
+    max_tokens: int | None,
+    thinking: ThinkingMode | None,
+    transcription: TranscriptionMode | None,
+    max_parallel_docs: int | None,
+    cache_dir: Path | None,
+    schema_path: Path | None,
+    extend_schema: bool,
+    reuse_roster: bool,
+    coverage: bool,
+    semlinks: bool,
+    semlink_cache: bool,
+    semlink_verify: bool,
+    debug: bool,
+    batch: BatchOptions | None,
+    job: JobSession | None,
+    request: JobRequest | None,
+) -> GenerateReport:
+    """:func:`generate_docset` proper. *job* is a session the caller owns;
+    *request* is one this run opens after its pre-flights (the caller closes
+    it — see :func:`generate_docset`)."""
+    from .extraction_xml import carry_extraction_over, has_extraction
+    from .generation import (
+        ConvertOptions,
+        convert_batch,
+        resolve_generation_api_key,
+        resolve_generation_config,
+        resolve_generation_label_api_key,
+        validate_generation_models,
+    )
+    from .generation import coverage as cov_mod
+    from .generation.blocks import Block, block_concept_labels
+    from .generation.link_stage import LinkOutcome, LinkStage, StagedDocument
+    from .generation.pipeline import load_labeled_docs_from_cache
+    from .generation.rnc import write_docset_rnc
+    from .generation.to_semantic import build_header
+    from .generation.vocab import TagVocab
+    from .xml_grounding import ground_dgml_xml
+
+    # Caller-supplied modes are checked before anything is read, as the CLI's
+    # argparse choices check them: a misspelling must not reach the pipeline
+    # (a bad transcription mode would silently run text mode).
+    if thinking is not None:
+        thinking = _mode_arg(ThinkingMode, thinking, "thinking")
+    if transcription is not None:
+        transcription = _mode_arg(TranscriptionMode, transcription, "transcription")
+    # None means the pipeline's own default: ConvertOptions is the one place
+    # these numbers are written down.
+    if window_size is None:
+        window_size = ConvertOptions.window_size
+    if temperature is None:
+        temperature = ConvertOptions.temperature
+    if max_tokens is None:
+        max_tokens = ConvertOptions.max_tokens
+    if max_parallel_docs is None:
+        max_parallel_docs = ConvertOptions.max_parallel_docs
+
+    ds_store = DocSetStore(ws)
+    file_store = FileStore(ws)
+
+    ds = ds_store.get(docset_id)
+    file_ids = ds_store.list_files(docset_id)
+    if not file_ids:
+        raise EmptyDocSet(f"DocSet '{docset_id}' has no files assigned.")
+
+    # Validate the optional `style` config up front — before any LLM
+    # transcription — rather than surfacing per-file during grounding. A
+    # malformed section fails fast with STYLE_CONFIG_INVALID; a referenced-but-
+    # unset `api_key_env` fails fast with AUTH_ERROR (the grounding-time style
+    # pass is best-effort and would otherwise swallow this silently, after the
+    # transcription spend).
+    from .style_config import load_style_config, resolve_api_key
+
+    style_config = load_style_config(ws)
+    if style_config is not None:
+        resolve_api_key(style_config)
+
+    # Resolve the effective LLM models: the merged 'generation' config by default
+    # (per-task field or [models] tier, each model with its own credentials since
+    # the two may name different providers), optionally overlaid by
+    # `generation_config` (a bundled profile or a config file) and/or `model` /
+    # `label_model`. With no overrides this is load_generation_config and still
+    # raises GENERATION_CONFIG_MISSING when nothing resolves a model.
+    # `gen_model_source` records where the models came from and is echoed into
+    # the report so the choice stays visible/recorded.
+    gen_cfg, gen_model_source = resolve_generation_config(
+        ws,
+        config=generation_config,
+        model=model,
+        label_model=label_model,
+    )
+    gen_model = gen_cfg.model
+    resolved_label_model = gen_cfg.label_model
+    gen_api_key = resolve_generation_api_key(gen_cfg)
+    gen_api_base = gen_cfg.api_base
+    label_api_key = resolve_generation_label_api_key(gen_cfg)
+    label_api_base = gen_cfg.label_api_base
+    logger.info(
+        f"[models] transcription={gen_model} labeling={resolved_label_model} "
+        f"(source: {gen_model_source})"
+    )
+
+    # Pre-flight — fail fast BEFORE any transcription spend on the two model
+    # misconfigurations detectable offline: a malformed model string, or a
+    # missing API key for either model's provider. A present-but-wrong key or a
+    # well-formed-but-nonexistent model id can't be caught here; those surface
+    # per file as label_error (see _on_label_error below). Mirrors the style-
+    # config pre-flight above.
+    validate_generation_models(gen_cfg, gen_api_key, label_api_key)
+
+    # The conversion config is loaded here, once, for the same reason: a
+    # malformed section or a key that is not a format family is
+    # CONVERSION_CONFIG_INVALID before any cache or source material is pulled
+    # from the store, and even when no file needs converting — the config is
+    # wrong whether or not this run would have read it.
+    converters = load_conversion_config(ws)
+
+    if batch is not None:
+        # Last of the pre-flights: a stage whose model has no batch backend is
+        # BATCH_UNAVAILABLE here, never a silent full-price fallback mid-run.
+        # Imported lazily so a synchronous run never loads the batch package.
+        from .batch import assert_batchable
+        from .batch.jobs import credential_ref
+
+        stages = batch_stage_models(file_store, file_ids, gen_cfg, style_config, semlinks=semlinks)
+        assert_batchable(stages)
+        logger.info(f"[batch] batch mode on ({', '.join(stages)})")
+        # The run works on a copy: the caller's options are never written to
+        # (one BatchOptions may serve several runs), the non-secret key
+        # references a job records with each provider batch default from the
+        # resolved config unless the caller named its own, and the stats the
+        # pipeline fills start empty and come back on the report.
+        batch = replace(
+            batch,
+            credentials={
+                "transcribe": credential_ref("generation", "transcribe", gen_cfg.api_key_env),
+                "label": credential_ref("generation", "label", gen_cfg.label_api_key_env),
+                **batch.credentials,
+            },
+            stats={},
+        )
+    if request is not None:
+        # Every pre-flight has passed: the job opens now, so a rejected run
+        # never leaves one behind.
+        job = _open_job(ws, request)
+
+    # The semantic-link pass runs on the labeling model (and its credentials):
+    # its sync driver runs per document in the sink below, its batch driver
+    # over every staged document at once.
+    link_stage = LinkStage(
+        workspace=ws,
+        docset_id=docset_id,
+        model=resolved_label_model,
+        api_key=label_api_key,
+        api_base=label_api_base,
+        enabled=semlinks,
+        verify=semlink_verify,
+        use_cache=semlink_cache,
+        record_usage=debug,
+        job=job,
+        log=logger.info,
+    )
+
+    # The docset prefix is always the output base — schema.json,
+    # coverage_report.json, cache/, and semantic/ live under it. Each file's
+    # final .dgml.xml lands at its per-(docset, file) key (see
+    # layout.dgml_xml_key) so placement is deterministic and stable.
+    # The docset's store key (``docsets/<id>``) — the prefix the cache, coverage
+    # report, and per-file DGML live under. Reported to the user and used to
+    # build child keys; no directory is created here (the store owns that).
+    # Slash-stripped because it is echoed as ``output_key`` in the JSON result,
+    # where the trailing-slash form would be a breaking change; nothing
+    # prefix-matches on it.
+    output_key = layout.docset_prefix(docset_id).rstrip("/")
+
+    # Resolve each assigned file into exactly one bucket so the summary counts
+    # always sum to `total`: skipped (already converted), failed (source
+    # missing, or a duplicate filename the pipeline can't disambiguate), or a
+    # to-convert candidate. Partial success — a per-file problem is recorded
+    # and the run continues, matching `dgml cluster`.
+    skipped_results: list[GenerateFileResult] = []
+    failed_results: list[GenerateFileResult] = []
+    # original_filename → list of (file_id, out_xml_key, page_text_prefix).
+    # Grouped by filename to detect collisions: convert_batch keys documents by
+    # filename, so two files sharing a basename can't both convert in one run.
+    candidates: dict[str, list[tuple[str, str, str | None]]] = {}
+    # Already-generated docs, for whole-docset roster reuse + namespacing recompute.
+    prior_stems: dict[str, str] = {}  # cache stem → original_filename
+    prior_out_paths: dict[str, str] = {}  # original_filename → existing .dgml.xml key
+    # original_filename → file id for grounding (resolves the file's page OCR).
+    # Spans candidates *and* re-rendered prior docs; kept separate from
+    # filename_to_fid so the failure-reconciliation loop stays candidate-only.
+    name_to_fid: dict[str, str] = {}
+    for fid in file_ids:
+        record = file_store.get(fid)
+        name = record.original_filename
+        stem = Path(name).stem
+        # Generation slices the persisted <stem>.pdf, or — for a file added before
+        # conversions were persisted — the original source, converted on demand.
+        # Both are store blobs under the file's prefix; materialized to a real
+        # path for transcription just before convert_batch (below).
+        if not (
+            ws.blobs.blob_exists(layout.file_source_key(fid, f"{stem}.pdf"))
+            or ws.blobs.blob_exists(layout.file_source_key(fid, name))
+        ):
+            failed_results.append(
+                GenerateFileResult(
+                    status=GenerateFileStatus.FAILED,
+                    file_id=fid,
+                    source=name,
+                    error={
+                        "code": FileNotFound.code,
+                        "message": f"no source PDF for file '{fid}'",
+                    },
+                )
+            )
+            logger.info(f"Source missing for {name} (file '{fid}') — reported as failed")
+            continue
+        out_xml_key = layout.dgml_xml_key(docset_id, fid, stem)
+        generated = ws.blobs.blob_exists(out_xml_key) and _has_generated_tree(
+            ws.blobs.get_blob(out_xml_key).decode("utf-8")
+        )
+        if job is not None:
+            # A job run decides what to convert from the state the job STARTED
+            # in: a file an earlier run of this job converted is converted
+            # again, replaying the job's stored responses (billed once, when
+            # the job completes), rather than skipped as already done.
+            generated = job.rewind_presence(f"generate/output/{fid}", generated)
+        if generated:
+            # Skip only when a generated document tree is present. An
+            # extraction-only file (`extraction extract` ran before
+            # `generate`) falls through and gets its tree built; _on_output
+            # carries the existing dg:extraction over into the fresh render.
+            skipped_results.append(
+                GenerateFileResult(
+                    status=GenerateFileStatus.SKIPPED, file_id=fid, source=name, output=out_xml_key
+                )
+            )
+            prior_stems[stem] = name
+            prior_out_paths[name] = out_xml_key
+            name_to_fid[name] = fid  # in case it re-renders below and needs re-grounding
+            logger.info(f"Skipping {name} (already converted)")
+            continue
+        pt_prefix = layout.file_text_prefix(fid)
+        candidates.setdefault(name, []).append(
+            (fid, out_xml_key, pt_prefix if ws.blobs.list_blobs(pt_prefix) else None)
+        )
+
+    if job is not None:
+        job.persist()  # the output presences recorded above, once
+
+    # Same-basename collision: the typed-block pipeline keys documents by
+    # filename, so it can't tell two same-named files apart in one batch.
+    # Fail them explicitly instead of silently dropping/misattributing output.
+    convert_names: list[str] = []
+    dgml_xml_keys: dict[str, str] = {}
+    filename_to_fid: dict[str, str] = {}
+    page_text_dirs: dict[str, Path] = {}
+    page_text_prefixes: dict[str, str] = {}
+    for name, group in candidates.items():
+        if len(group) > 1:
+            for fid, _out, _pref in group:
+                failed_results.append(
+                    GenerateFileResult(
+                        status=GenerateFileStatus.FAILED,
+                        file_id=fid,
+                        source=name,
+                        error={
+                            "code": GenerationFailed.code,
+                            "message": (
+                                f"duplicate filename '{name}' within the docset; the "
+                                "generation pipeline keys documents by filename, so give "
+                                "each file a unique name before converting"
+                            ),
+                        },
+                    )
+                )
+            logger.info(
+                f"Duplicate filename '{name}' across {len(group)} files — reported as failed"
+            )
+            continue
+        fid, out_xml_key, pt_pfx = group[0]
+        convert_names.append(name)
+        dgml_xml_keys[name] = out_xml_key
+        filename_to_fid[name] = fid
+        name_to_fid[name] = fid
+        if pt_pfx is not None:
+            page_text_prefixes[name] = pt_pfx
+
+    # Coverage is computed (and its per-file summary logged) whenever the
+    # caller didn't disable it, but the coverage_report.json *file* is an
+    # intermediate artifact persisted only under `debug`.
+    cov_report_key = layout.docset_coverage_report_key(docset_id) if (coverage and debug) else None
+    written: list[GenerateFileResult] = []
+    rerendered: list[str] = []
+    cov_results: list[dict[str, Any]] = []
+    # `_on_output` runs on convert_batch's document pool, so it records its
+    # per-document results here — each document owns one key, so no two threads
+    # write the same entry — and the three lists above are extended in a fixed
+    # order once the batch has drained. Appending straight from the workers
+    # would make the report depend on completion order.
+    converted_by_name: dict[str, GenerateFileResult] = {}
+    cov_by_name: dict[str, dict[str, Any]] = {}
+    rerendered_by_name: dict[str, None] = {}
+    # Already-generated docs reloaded from cache (populated below when there is
+    # new work) so namespacing spans the whole docset and flipped originals
+    # re-render. _on_output reads prior_outputs to route/flag them.
+    prior_docs: dict[str, list[Block]] = {}
+    prior_outputs: dict[str, str] = {}
+
+    # name → short reason for a per-document transcription failure, so the
+    # reconciliation loop below can name the cause in the report instead of
+    # the generic "produced no output" message. The full error still goes to
+    # the log at INFO via convert_batch's progress hook.
+    gen_errors: dict[str, str] = {}
+    # name → {code, message} when a file's labeling couldn't reach the model at
+    # all (bad model id, wrong/absent key, network). Surfaced as label_error on
+    # the converted entry so a misconfigured label_model is visible without
+    # reading the progress log; the document still renders (unlabeled).
+    # Labeling completes before any _on_output fires, so the entry below can
+    # read this.
+    label_errors: dict[str, dict[str, str]] = {}
+    # name -> short reason when the semantic-link pass could not complete. The
+    # document keeps its (unlinked) DGML, so without this a rate limit or a bad
+    # model id looked exactly like "this document has no links".
+    link_errors: dict[str, str] = {}
+    # name -> {count, distinct, examples} for the concepts that fell outside an
+    # AUTHORED vocabulary. Reported as `unmatched_concepts` under a strict
+    # schema (refused, so the list is what the schema is missing) and as
+    # `added_concepts` under extend_schema (coined and used, so the list is
+    # the candidate set for the schema's next revision). Absent from a file's
+    # entry when nothing went outside, like every other conditional field here.
+    off_schema_concepts: dict[str, dict[str, Any]] = {}
+
+    def _on_error(name: str, message: str) -> None:
+        gen_errors[name] = message
+
+    def _on_label_error(name: str, err: dict[str, str]) -> None:
+        label_errors[name] = err
+        logger.info(f"[label] {name}: model unreachable ({err.get('message', '')})")
+
+    def _on_off_schema(name: str, tally: Counter[str]) -> None:
+        # Which names the model reached for outside the supplied schema. The
+        # most actionable output of either mode — under strict these are gaps
+        # to consider adding, under extend they are additions to review.
+        # Reported per file, not just logged, so it is readable without the
+        # progress log.
+        off_schema_concepts[name] = {
+            "count": sum(tally.values()),
+            "distinct": len(tally),
+            "examples": [concept for concept, _n in tally.most_common(_UNMATCHED_EXAMPLES)],
+        }
+
+    def _ground_output(name: str, xml: str) -> dict[str, Any]:
+        """First half of a document's sink: write the render and ground it.
+
+        Returns what the rest of the sink needs. Split from the link pass and
+        the reporting so batch mode can ground every document, run all their
+        link plans as one batch stage, then finish each; the sync sink below
+        runs the three halves back to back.
+        """
+        xml_key = dgml_xml_keys[name]
+        # A blob already at this key may carry extracted values — an
+        # extraction-only file getting its tree now, or a full-extraction
+        # file being re-rendered. Capture its dg:extraction before the fresh
+        # render overwrites it; re-embedded below after grounding + semlinks.
+        prior_with_extraction: str | None = None
+        if ws.blobs.blob_exists(xml_key):
+            try:
+                prior_text = ws.blobs.get_blob(xml_key).decode("utf-8")
+                if has_extraction(prior_text):
+                    prior_with_extraction = prior_text
+            except Exception:
+                prior_with_extraction = None  # unparseable prior — nothing to carry
+        # Under batch mode nothing is written yet: the link pass runs after
+        # every document is grounded, so the grounded tree is held and written
+        # only once that pass is past its last wave (see
+        # LinkStage.link_documents). A run interrupted while it waits on the
+        # provider therefore leaves every output exactly as it found it.
+        deferred: dict[str, bytes] = {}
+        if batch is None:
+            ws.blobs.put_blob(xml_key, xml.encode("utf-8"))
+        # Ground in place: re-parse the just-written tree, align it against the
+        # file's page OCR, and rewrite <stem>.dgml.xml with dg:origin boxes.
+        # Deterministic and free; a file with no page_text is left ungrounded.
+        # Runs for re-rendered prior docs too — their fresh XML would otherwise
+        # lose the boxes a previous run grounded in. Grounding needs a real path
+        # (lxml); materialize the blob to a working copy, ground in place, then
+        # persist the result (and its stats sidecar) back through the store.
+        grounded: bool
+        matched_token_pct: float | None = None
+        elements_annotated: int | None = None
+        grounding_error: dict[str, str] | None = None
+        pending_style: Any = None
+        try:
+            with contextlib.ExitStack() as gstack:
+                if batch is None:
+                    gpath = gstack.enter_context(ws.blobs.materialize(xml_key))
+                else:
+                    gdir = Path(gstack.enter_context(tempfile.TemporaryDirectory()))
+                    gpath = gdir / xml_key.rsplit("/", 1)[-1]
+                    gpath.write_bytes(xml.encode("utf-8"))
+                res = ground_dgml_xml(
+                    ws,
+                    name_to_fid[name],
+                    gpath,
+                    output_path=gpath,
+                    force=True,
+                    write_stats=debug,
+                    record_usage=debug,
+                    # Under batch mode an OCR file's image-style pass joins one
+                    # batch stage with every other document's (see below).
+                    defer_style=batch is not None,
+                )
+                pending_style = res.pending_style
+                writes = {xml_key: gpath.read_bytes()}
+                if res.stats_path is not None and res.stats_path.exists():
+                    if batch is not None:
+                        # gpath is a scratch copy deleted on exit; name the
+                        # blob the tree is written to instead.
+                        stats = json.loads(res.stats_path.read_bytes())
+                        stats["source"] = stats["output"] = xml_key
+                        write_json_atomic(res.stats_path, stats)
+                    writes[
+                        layout.pair_artifact_key(docset_id, name_to_fid[name], res.stats_path.name)
+                    ] = res.stats_path.read_bytes()
+                if batch is None:
+                    for key, data in writes.items():
+                        ws.blobs.put_blob(key, data)
+                else:
+                    deferred.update(writes)
+        except DgmlError as exc:
+            grounded = False
+            grounding_error = {"code": exc.code, "message": str(exc)}
+            logger.info(f"[ground] {name}: not grounded ({exc})")
+        else:
+            grounded = True
+            matched_token_pct = res.stats["matched_token_pct"]
+            elements_annotated = res.stats["elements_annotated"]
+            logger.info(
+                f"[ground] {name}: {res.stats['elements_annotated']} element(s), "
+                f"{res.stats['matched_token_pct']}% tokens matched"
+            )
+        if batch is not None and xml_key not in deferred:
+            # Not grounded: the sync path leaves the plain render in the blob.
+            deferred[xml_key] = xml.encode("utf-8")
+        return {
+            "xml": xml,
+            "xml_key": xml_key,
+            "prior_with_extraction": prior_with_extraction,
+            "grounded": grounded,
+            "matched_token_pct": matched_token_pct,
+            "elements_annotated": elements_annotated,
+            "grounding_error": grounding_error,
+            "deferred": deferred,
+            "pending_style": pending_style,
+        }
+
+    def _finish_output(name: str, staged: dict[str, Any], links_added: int) -> None:
+        """Last half of a document's sink: re-embed extraction, then report."""
+        xml = staged["xml"]
+        xml_key = staged["xml_key"]
+        prior_with_extraction = staged["prior_with_extraction"]
+        # Re-embed the prior dg:extraction last, after grounding + semlinks
+        # have finished rewriting the tree, so the extraction subtree is
+        # spliced in verbatim and never run through those passes.
+        if prior_with_extraction is not None:
+            try:
+                merged = carry_extraction_over(
+                    prior_with_extraction, ws.blobs.get_blob(xml_key).decode("utf-8")
+                )
+                ws.blobs.put_blob(xml_key, merged.encode("utf-8"))
+                logger.info(
+                    f"[extraction] {name}: carried dg:extraction over into the fresh render"
+                )
+            except Exception as exc:  # never lose the fresh DGML over the merge
+                logger.info(f"[extraction] {name}: dg:extraction NOT carried over ({exc})")
+        if name in prior_outputs:
+            # an already-generated doc whose namespacing flipped
+            rerendered_by_name[name] = None
+            return
+        pt_dir = page_text_dirs.get(name)
+        if coverage and pt_dir is not None:
+            result = cov_mod.compute_coverage(xml, name, page_text_dir=pt_dir)
+            logger.info(cov_mod.coverage_summary_line(result))
+            # debug: how many assigned labels reached the DGML (e.g. "180
+            # labels exported over 200 total"). Reloads labeled blocks from
+            # cache; best-effort, recorded under `label_propagation`.
+            if debug:
+                try:
+                    stem = Path(name).stem
+                    labeled = load_labeled_docs_from_cache(cache, [stem]).get(stem)
+                    if labeled is not None:
+                        prop = cov_mod.compute_label_propagation(
+                            block_concept_labels(labeled), xml, source_name=name
+                        )
+                        result["label_propagation"] = {
+                            k: v for k, v in prop.items() if k != "source"
+                        }
+                        logger.info(cov_mod.label_propagation_summary_line(prop))
+                except Exception as exc:  # debug-only diagnostic — never fatal
+                    logger.info(f"[labels] {name}: propagation check skipped ({exc})")
+            cov_by_name[name] = result
+        # Each field set only when that step failed, like grounding_error,
+        # which is present only when grounded is False.
+        converted_by_name[name] = GenerateFileResult(
+            status=GenerateFileStatus.CONVERTED,
+            file_id=filename_to_fid[name],
+            source=name,
+            output=xml_key,
+            links=links_added,
+            grounded=staged["grounded"],
+            matched_token_pct=staged["matched_token_pct"],
+            elements_annotated=staged["elements_annotated"],
+            grounding_error=staged["grounding_error"],
+            label_error=label_errors.get(name),
+            link_error=link_errors.get(name),
+            off_schema_concepts=off_schema_concepts.get(name),
+        )
+
+    def _links_added(name: str, outcome: LinkOutcome) -> int:
+        if outcome.error is not None:
+            link_errors[name] = outcome.error
+        return outcome.links
+
+    def _on_output(name: str, xml: str) -> None:
+        # The synchronous sink: ground, link, finish — one document at a time.
+        staged = _ground_output(name, xml)
+        outcome = link_stage.link_document(name, staged["xml_key"])
+        _finish_output(name, staged, _links_added(name, outcome))
+
+    # Batch mode grounds each document as it is rendered and holds it here;
+    # the link pass then runs over all of them as one batch stage, and each is
+    # finished after (see LinkStage.link_documents). Distinct keys per
+    # document, so the render pool's concurrent writes never collide.
+    staged_outputs: dict[str, dict[str, Any]] = {}
+
+    def _stage_output(name: str, xml: str) -> None:
+        staged_outputs[name] = _ground_output(name, xml)
+
+    if convert_names:
+        # The cache always exists — it holds functional files the next run
+        # reloads (blocks, per-chunk labels, concept_roster.json). `debug` only
+        # controls whether the extra debug-only artifacts are also written
+        # (threaded via ConvertOptions.debug below).
+        # The cache is a store-backed working directory: its blobs are pulled in
+        # before the run and pushed back after (LocalStore works in place, no
+        # copy). A `cache_dir` override stays a plain local directory (explicit
+        # scratch, not store-backed). schema.json — written by labeling next to
+        # the cache — rides along, persisted as the docset's generation-schema
+        # blob (exact bytes, so no reserialization drift).
+        with contextlib.ExitStack() as _cache_stack:
+            if cache_dir is not None:
+                cache = Path(cache_dir)
+            else:
+                cache = _cache_stack.enter_context(
+                    ws.blobs.working_dir(layout.generation_cache_prefix(docset_id))
+                )
+            schema_key = layout.docset_generation_schema_key(docset_id)
+            authored_key = layout.docset_authored_schema_key(docset_id)
+            schema_json_local = cache.parent / "schema.json"
+            authored_local = cache.parent / layout.AUTHORED_SCHEMA_FILE
+            if cache_dir is None:
+                for key, dest in ((schema_key, schema_json_local), (authored_key, authored_local)):
+                    if not dest.exists() and ws.blobs.blob_exists(key):
+                        ws.blobs.download_blob(key, dest)
+            roster_path = Path(cache) / "concept_roster.json"
+            if job is not None:
+                # A resumed job run must read the inputs the job STARTED from:
+                # generation writes its own seeds and transcription caches
+                # mid-run, and reading them back would change its requests.
+                _rewind_generate_inputs(
+                    job,
+                    cache_dir=Path(cache),
+                    seed_files={"schema.json": schema_json_local, "roster": roster_path},
+                    doc_names=convert_names,
+                )
+            schema_seed = None
+            roster_seed: dict[str, str] | None = None
+            parent_map_seed: dict[str, str] = {}
+            # Set on a schema_path run: the authored vocabulary, persisted
+            # below to a slot derive_schema never writes, so the next run seeds
+            # from what the user wrote rather than from this run's own output.
+            authored_seed: Schema | None = None
+            # Whether the seed in hand is one a PERSON wrote (this run's
+            # schema_path, or one a previous run remembered) as opposed to one
+            # the pipeline derived from its own labels. Only the former closes.
+            authored = False
+            if schema_path is not None:
+                schema_seed, parent_map_seed, schema_notes = _load_schema_seed(Path(schema_path))
+                authored_seed = schema_seed
+                authored = True
+                logger.info(
+                    f"Loaded schema: {len(schema_seed.tags)} concept(s), "
+                    f"{len(parent_map_seed)} container link(s) from {schema_path}"
+                )
+                for note in schema_notes:
+                    logger.info(f"[schema] {note}")
+            elif reuse_roster:
+                # Incremental reuse in precedence order: the vocabulary the USER
+                # authored first (never overwritten by derive_schema), then the
+                # derived schema.json — full fidelity (role descriptions,
+                # observed examples, kind, hierarchy) — then the flat
+                # cache/concept_roster.json fallback. Only the authored slot
+                # carries hierarchy through: entity-container grouping stays
+                # something the user opted into, never inferred from a run's
+                # own observations.
+                from .generation.schema import Schema
+
+                if authored_local.exists():
+                    try:
+                        schema_seed, parent_map_seed, _notes = _load_schema_seed(
+                            authored_local, layout.AUTHORED_SCHEMA_FILE
+                        )
+                        authored = True
+                        logger.info(
+                            f"Reusing the docset's authored schema: {len(schema_seed.tags)} tag(s)"
+                        )
+                    except InvalidArgument as exc:
+                        logger.info(f"[schema] authored-schema.json unusable ({exc}); ignoring")
+                        schema_seed, parent_map_seed = None, {}
+                if schema_seed is None and schema_json_local.exists():
+                    try:
+                        schema_seed = Schema.load(schema_json_local)
+                        logger.info(f"Reusing docset schema: {len(schema_seed.tags)} tag(s)")
+                    except (json.JSONDecodeError, TypeError, ValueError, OSError):
+                        schema_seed = None
+                if schema_seed is None and roster_path.exists():
+                    try:
+                        roster_seed = _load_schema_roster(roster_path)
+                        logger.info(f"Reusing docset roster: {len(roster_seed)} concept(s)")
+                    except InvalidArgument:
+                        roster_seed = None
+
+            # Closure keys on AUTHORSHIP, not on the mere presence of a seed.
+            # A vocabulary a PERSON wrote is a specification: supplying one
+            # means the output carries those tag names and no others, with no
+            # flag to half-apply it. A vocabulary the PIPELINE derived from its
+            # own previous output is not a specification — it is a hint for
+            # consistency — so automatic reuse of schema.json /
+            # concept_roster.json seeds exactly as it always has and keeps
+            # coining. That distinction is what lets this feature be all-or-
+            # nothing without changing what an ordinary incremental generate
+            # does.
+            seed_names = (
+                list(schema_seed.tags) if schema_seed is not None else list(roster_seed or {})
+            )
+            # extend_schema keeps an AUTHORED vocabulary open: the user's names
+            # are still authoritative and reused first, but labeling may coin for
+            # a role they did not cover, and every coinage is reported back as a
+            # candidate for the next revision. It is meaningless without an
+            # authored schema, so say so rather than silently doing nothing.
+            if extend_schema and not authored:
+                raise InvalidArgument(
+                    "Extending the schema needs a supplied schema to extend. Supply a "
+                    "schema file, or run on a docset where an earlier run supplied one "
+                    "and left an authored schema. (Without a supplied schema, labeling "
+                    "already coins its own vocabulary.)"
+                )
+            vocab = TagVocab.build(
+                seed_names,
+                closed=authored and bool(seed_names) and not extend_schema,
+                authored=authored,
+            )
+            if vocab.closed:
+                logger.info(
+                    f"Vocabulary CLOSED at {len(vocab.names)} tag(s): the generated DGML uses "
+                    "these tag names and no others. Unmatched content still renders "
+                    "(as dg:chunk, text intact)."
+                )
+            elif vocab.extends:
+                logger.info(
+                    f"Vocabulary EXTENDS {len(vocab.names)} authored tag(s): these are reused "
+                    "wherever one fits; a role they do not cover may be coined, and every "
+                    "coinage is reported under added_concepts."
+                )
+            elif seed_names:
+                logger.info(f"Seeded with {len(seed_names)} derived tag(s); labeling may coin more")
+
+            # Reload already-generated docs from cache so the whole docset stays
+            # consistent as its schema/roster grows; changed originals re-render
+            # (no re-LLM). Replay resolves through the SAME vocabulary a fresh
+            # run uses, or a re-rendered prior would diverge from its neighbours.
+            labeled_priors = load_labeled_docs_from_cache(cache, list(prior_stems), vocab)
+            for stem, blocks in labeled_priors.items():
+                nm = prior_stems[stem]
+                prior_docs[nm] = blocks
+                prior_outputs[nm] = ws.blobs.get_blob(prior_out_paths[nm]).decode("utf-8")
+                dgml_xml_keys[nm] = prior_out_paths[nm]
+
+            # Materialize each file's page_text/ into a local dir the pipeline
+            # (transcribe gate + coverage) reads. LocalStore yields the real dir
+            # zero-copy; a remote store downloads it to a temp dir held open for
+            # the whole batch. Populate the same dict `_on_output` closes over.
+            with contextlib.ExitStack() as pt_stack:
+                for nm, pref in page_text_prefixes.items():
+                    page_text_dirs[nm] = pt_stack.enter_context(ws.blobs.materialize_dir(pref))
+                # Materialize each file's source dir so transcription's path tools
+                # (load_document_as_pdf → ghostscript) get the original + its
+                # persisted sibling <stem>.pdf on disk. LocalStore yields the real
+                # dir (zero-copy); a remote store downloads it for the batch.
+                pdf_paths: list[Path | str] = [
+                    pt_stack.enter_context(
+                        ws.blobs.materialize_dir(layout.file_prefix(filename_to_fid[nm]))
+                    )
+                    / nm
+                    for nm in convert_names
+                ]
+                options = ConvertOptions(
+                    model=gen_model,
+                    label_model=resolved_label_model,
+                    api_key=gen_api_key,
+                    api_base=gen_api_base,
+                    label_api_key=label_api_key,
+                    label_api_base=label_api_base,
+                    window_size=window_size,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking=thinking or gen_cfg.thinking,
+                    transcription=transcription or gen_cfg.transcription,
+                    max_parallel_docs=max_parallel_docs,
+                    cache_dir=cache,
+                    debug=debug,
+                    record_usage=debug,
+                    page_text_dirs=page_text_dirs,
+                    workspace=ws,
+                    dgml_header=build_header(ws.organization, ds.name),
+                    converters=converters,
+                    pdf_config=load_pdf_config(ws),
+                    roster_seed=roster_seed,
+                    schema_seed=schema_seed,
+                    parent_map=parent_map_seed or None,
+                    vocab=vocab,
+                    progress=logger.info,
+                    batch=batch,
+                )
+                convert_batch(
+                    pdf_paths,
+                    options=options,
+                    on_output=_on_output if batch is None else _stage_output,
+                    on_error=_on_error,
+                    on_label_error=_on_label_error,
+                    on_off_schema=_on_off_schema,
+                    prior_docs=prior_docs,
+                    prior_outputs=prior_outputs,
+                )
+                if batch is not None:
+                    # OCR files' image-style passes, deferred by grounding: ONE
+                    # batch stage over every document's pages, before the link
+                    # pass (which reads the styled tree, as in the sync run).
+                    _style_staged(staged_outputs, style_config, batch)
+                    # Still inside the page_text materialization: finishing a
+                    # document computes its coverage against those pages.
+                    link_outcomes = link_stage.link_documents(
+                        {
+                            name: StagedDocument(item["xml_key"], item["deferred"])
+                            for name, item in staged_outputs.items()
+                        },
+                        batch=batch,
+                        max_workers=max_parallel_docs,
+                    )
+                    batch_links = {n: _links_added(n, o) for n, o in link_outcomes.items()}
+                    # On the document pool, like the sync sink; the results are
+                    # folded in queued order below, so the report order holds.
+                    map_concurrent(
+                        lambda item: _finish_output(item[0], item[1], batch_links[item[0]]),
+                        list(staged_outputs.items()),
+                        max_workers=max_parallel_docs,
+                    )
+            # Documents were converted on a pool, so fold the per-document
+            # results back in a fixed order — queued order for converted files,
+            # docset order for re-rendered priors — and the report stays
+            # identical to the serial run it replaced.
+            written.extend(
+                converted_by_name[name] for name in convert_names if name in converted_by_name
+            )
+            cov_results.extend(cov_by_name[name] for name in convert_names if name in cov_by_name)
+            rerendered.extend(name for name in prior_docs if name in rerendered_by_name)
+            # convert_batch silently drops documents whose transcription failed, so
+            # `_on_output` never fires for them. Reconcile: any queued file with no
+            # output is a per-file failure, not a vanished row (keeps counts summing
+            # to `total`).
+            produced = {entry.source for entry in written}
+            for name, fid in filename_to_fid.items():
+                if name not in produced:
+                    message = gen_errors.get(
+                        name, "the generation pipeline produced no output for this file"
+                    )
+                    failed_results.append(
+                        GenerateFileResult(
+                            status=GenerateFileStatus.FAILED,
+                            file_id=fid,
+                            source=name,
+                            error={"code": GenerationFailed.code, "message": message},
+                        )
+                    )
+            if cov_report_key is not None and cov_results:
+                # Merge into any existing report so an incremental run keeps the
+                # already-generated docs' coverage instead of overwriting it.
+                existing_docs: list[dict[str, Any]] = []
+                if ws.blobs.blob_exists(cov_report_key):
+                    try:
+                        existing_docs = json.loads(ws.blobs.get_blob(cov_report_key)).get(
+                            "documents", []
+                        )
+                    except json.JSONDecodeError:
+                        existing_docs = []
+                merged = cov_mod.merge_coverage_documents(existing_docs, cov_results)
+                ws.blobs.put_blob(
+                    cov_report_key, cov_mod.dump_coverage_report(merged).encode("utf-8")
+                )
+            # Persist schema.json (labeling wrote it next to the cache) as the
+            # docset's generation-schema blob — exact bytes, before write_docset_rnc
+            # reads it back — then flush the cache working dir to the store.
+            if cache_dir is None and schema_json_local.exists():
+                ws.blobs.put_blob(schema_key, schema_json_local.read_bytes())
+            # The authored vocabulary lands in a slot derive_schema never
+            # touches. Without this, ground truth goes in and `seed union
+            # everything coined` comes back out, and the NEXT run auto-seeds
+            # from that polluted version — which is precisely why a seeded run
+            # is not reproducible today. Stored in canonical Schema v1 form
+            # whatever form it was authored in (tag list, {name: description},
+            # RNC), so there is one shape to read back.
+            if cache_dir is None and authored_seed is not None:
+                authored_seed.save(authored_local)
+                ws.blobs.put_blob(authored_key, authored_local.read_bytes())
+                logger.info(f"[schema] wrote {layout.AUTHORED_SCHEMA_FILE} (authored vocabulary)")
+    else:
+        logger.info(
+            "Nothing to convert — every file is already converted, missing, or a duplicate name."
+        )
+
+    # Final step, after every file is converted, grounded and semlinked:
+    # refresh the docset's full-schema.rnc (schema.json rendered as RELAX NG
+    # Compact, with data types observed in the final XML). Best-effort — a
+    # schema render failure must not fail the generate.
+    try:
+        rnc_key = write_docset_rnc(ws, docset_id)
+        if rnc_key is not None:
+            logger.info(f"[schema] wrote {rnc_key.rsplit('/', 1)[-1]}")
+    except Exception as exc:
+        logger.info(f"[schema] full-schema.rnc skipped ({exc})")
+
+    batch_stages: dict[str, dict[str, Any]] | None = None
+    if batch is not None:
+        batch_stages = dict(batch.stats)
+        if not semlinks:
+            batch_stages["links"] = {"skipped": "--no-semlinks"}
+
+    return GenerateReport(
+        docset=ds,
+        total=len(file_ids),
+        skipped=skipped_results,
+        failed=failed_results,
+        converted=written,
+        rerendered=rerendered,
+        output_key=output_key,
+        # Report the coverage report key only if a report was actually written.
+        coverage_report_key=cov_report_key if cov_results else None,
+        model=gen_model,
+        label_model=resolved_label_model,
+        model_source=gen_model_source,
+        schema_extended=extend_schema,
+        batch_stages=batch_stages,
+    )

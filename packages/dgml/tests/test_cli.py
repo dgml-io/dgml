@@ -3725,31 +3725,6 @@ def test_docset_generate_duplicate_filename_fails(
     mock_batch.assert_not_called()
 
 
-def test_load_schema_roster_errors(tmp_path: Path) -> None:
-    """_load_schema_roster rejects missing files, non-object/invalid JSON, and
-    rosters that sanitize to no usable concepts — all as InvalidArgument."""
-    from dgml.cli import _load_schema_roster
-    from dgml_core.errors import InvalidArgument
-
-    with pytest.raises(InvalidArgument):
-        _load_schema_roster(tmp_path / "missing.json")
-
-    arr = tmp_path / "arr.json"
-    arr.write_text("[1, 2, 3]", encoding="utf-8")
-    with pytest.raises(InvalidArgument):
-        _load_schema_roster(arr)
-
-    bad = tmp_path / "bad.json"
-    bad.write_text("{not valid json", encoding="utf-8")
-    with pytest.raises(InvalidArgument):
-        _load_schema_roster(bad)
-
-    junk = tmp_path / "junk.json"
-    junk.write_text(json.dumps({"###": "x", "!!!": "y"}), encoding="utf-8")
-    with pytest.raises(InvalidArgument):
-        _load_schema_roster(junk)
-
-
 # ---------------------------------------------------------------------------
 # `dgml file add <directory>` — bulk ingest (Option A)
 # ---------------------------------------------------------------------------
@@ -3857,6 +3832,9 @@ def test_file_add_directory_gathers_configured_pptx(
     (src / "deck.pptx").write_bytes(b"PK\x03\x04 not really a pptx")
     (src / "OLD.PPT").write_bytes(b"\xd0\xcf\x11\xe0 not really a ppt")
     (src / "notes.docx").write_bytes(b"PK\x03\x04 not really a docx")
+    # Office lock file and macOS AppleDouble sidecar: never gathered.
+    (src / "~$deck.pptx").write_bytes(b"\x05user")
+    (src / "._deck.pptx").write_bytes(b"\x00\x05\x16\x07")
 
     rc = main(_ws_args(ws) + ["file", "add", str(src)])
     assert rc == 0
@@ -3872,6 +3850,36 @@ def test_file_add_directory_gathers_configured_pptx(
         assert entry["file"]["page_count"] == 1
         assert entry["file"]["pdf_converter"] == "fixed-pdf"
         assert (ws / layout.file_pdf_key(entry["file"]["id"], name)).is_file()
+
+
+@pytest.mark.parametrize("root_name", ["src", ".inbox"])
+def test_gather_skips_hidden_paths_and_lock_files(tmp_path: Path, root_name: str) -> None:
+    """A directory gather skips hidden files and directories below the root and
+    Office `~$` lock files; a hidden root itself is still gathered from."""
+    from dgml.cli import _gather_pdfs
+
+    root = tmp_path / root_name
+    for rel in (
+        "a.pdf",
+        "~$b.docx",
+        "._a.pdf",
+        ".hidden.pdf",
+        "sub/c.pdf",
+        "sub/~$d.docx",
+        "sub/._c.pdf",
+        "sub/.cache/x.pdf",
+        ".hidden/b.pdf",
+        ".Trashes/c.pdf",
+    ):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(b"x")
+    suffixes = frozenset({".pdf", ".docx"})
+
+    assert _gather_pdfs(root, recursive=False, suffixes=suffixes) == [root / "a.pdf"]
+    assert _gather_pdfs(root, recursive=True, suffixes=suffixes) == [
+        root / "a.pdf",
+        root / "sub" / "c.pdf",
+    ]
 
 
 class _SpreadsheetOnlyConverter(_FixedPdfConverter):
@@ -3909,6 +3917,58 @@ def test_file_add_directory_refuses_a_family_on_the_wrong_converter(
     err = _read_stderr(capsys)["error"]
     assert err["code"] == "CONVERSION_CONFIG_INVALID"
     assert "does not handle '.pptx'" in err["message"]
+    assert not (ws / "files").exists() or not any((ws / "files").iterdir())
+
+
+def _write_extension_keyed_conversion(ws: Path) -> None:
+    """Append the dgml-io/dgml#274 mistake to the workspace config: a converter
+    under ``conversion.doc`` (an extension) rather than ``conversion.docx``."""
+    conversion = {"doc": {"provider": "translators_pdf.libreoffice:LibreOfficeConverter"}}
+    with (ws / "config.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n" + dump_toml({"conversion": conversion}) + "\n")
+
+
+def test_file_add_rejects_extension_as_conversion_family(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `.doc` added under `[conversion.doc]` is a CONVERSION_CONFIG_INVALID that
+    names the right key, not UNSUPPORTED_FILE_TYPE as if nothing were configured
+    (dgml-io/dgml#274). No record is created."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_extension_keyed_conversion(ws)
+    src = tmp_path / "report.doc"
+    src.write_bytes(b"\xd0\xcf\x11\xe0 not really a doc")
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc != 0
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "unknown conversion family 'doc'" in err["message"]
+    assert "'.doc' files are configured under conversion.docx" in err["message"]
+    assert not (ws / "files").exists() or not any((ws / "files").iterdir())
+
+
+def test_file_add_directory_rejects_extension_as_conversion_family(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A folder add under `[conversion.doc]` fails up front rather than silently
+    skipping every `.doc` as an unconfigured type (dgml-io/dgml#274)."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_extension_keyed_conversion(ws)
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "report.doc").write_bytes(b"\xd0\xcf\x11\xe0 not really a doc")
+    _write_text_pdf(src / "a.pdf", ["Page one"])
+
+    rc = main(_ws_args(ws) + ["file", "add", str(src)])
+    assert rc != 0
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "unknown conversion family 'doc'" in err["message"]
     assert not (ws / "files").exists() or not any((ws / "files").iterdir())
 
 
@@ -4570,6 +4630,36 @@ def test_docset_generate_preflight_rejects_missing_api_key(
         rc = main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage"])
     assert rc == 1
     assert _read_stderr(capsys)["error"]["code"] == "AUTH_ERROR"
+    mock_batch.assert_not_called()
+
+
+def test_docset_generate_preflight_rejects_extension_as_conversion_family(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pre-flight: a `[conversion.doc]` table (an extension, not a family) is
+    CONVERSION_CONFIG_INVALID before any transcription, even though every file
+    in the DocSet is a PDF and nothing would have been converted
+    (dgml-io/dgml#274)."""
+    ws_root = tmp_path / "ws"
+    ds_id = _seed_docset_with_one_file(ws_root, capsys)
+    Workspace(root=ws_root).config_path.write_text(
+        dump_toml(
+            {
+                "generation": {
+                    "model": "anthropic/claude-haiku-5-5",
+                    "label_model": "anthropic/claude-sonnet-4-6",
+                },
+                "conversion": {"doc": {"provider": "translators_pdf.libreoffice:LibreOffice"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with patch("dgml_core.generation.convert_batch") as mock_batch:
+        rc = main(_ws_args(ws_root) + ["docset", "generate", ds_id, "--no-coverage"])
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "CONVERSION_CONFIG_INVALID"
+    assert "unknown conversion family 'doc'" in err["message"]
     mock_batch.assert_not_called()
 
 
@@ -5501,143 +5591,6 @@ def test_discover_cases(tmp_path: Path) -> None:
     results = run_cases(cases_path)
     failed = [r for r in results if not r["passed"]]
     assert not failed, "\n".join(f"  FAIL [{r['description']}]: {r['message']}" for r in failed)
-
-
-def test_load_schema_seed_json_builds_roster_and_parent_map(tmp_path: Path) -> None:
-    from dgml.cli import _load_schema_seed
-
-    p = tmp_path / "schema.json"
-    p.write_text(
-        json.dumps(
-            {
-                "tags": {
-                    "PartyInformation": {
-                        "name": "PartyInformation",
-                        "role": "party block",
-                        "kind": "section",
-                    },
-                    "PartyAddress": {
-                        "name": "PartyAddress",
-                        "role": "address",
-                        "parent_role": "PartyInformation",
-                    },
-                    "OrderDate": {"name": "OrderDate", "role": "order date"},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    schema, parent_map, _notes = _load_schema_seed(p)
-    assert {"PartyInformation", "PartyAddress", "OrderDate"} <= set(schema.tags)
-    assert schema.tags["PartyAddress"].role == "address"
-    assert schema.tags["PartyInformation"].kind == "section"  # fidelity kept, not flattened
-    assert parent_map["PartyAddress"] == "PartyInformation"  # via parent_role
-    assert "OrderDate" not in parent_map  # top-level, no container
-
-
-def test_load_schema_seed_accepts_rnc(tmp_path: Path) -> None:
-    """--schema-path also accepts the lossless full-schema.rnc render — the
-    `# Field: value` comment contract reconstructs the same roster/parent_map."""
-    from dgml.cli import _load_schema_seed
-
-    p = tmp_path / "full-schema.rnc"
-    p.write_text(
-        "# " + "-" * 20 + "\n"
-        '# Description: "party block"\n'
-        "# Kind: section\n"
-        "PartyInformation = element PartyInformation {\n  common.atts,\n"
-        "  mixed { any.docset* }\n}\n\n"
-        "# " + "-" * 20 + "\n"
-        '# Description: "address"\n'
-        "# Kind: inline\n"
-        "# Parent: PartyInformation\n"
-        "PartyAddress = element PartyAddress {\n  common.atts,\n  text\n}\n",
-        encoding="utf-8",
-    )
-    schema, parent_map, _notes = _load_schema_seed(p)
-    assert {tag.name: tag.role for tag in schema.tags.values()} == {
-        "PartyInformation": "party block",
-        "PartyAddress": "address",
-    }
-    assert parent_map == {"PartyAddress": "PartyInformation"}
-
-
-def test_load_schema_seed_accepts_a_plain_tag_list(tmp_path: Path) -> None:
-    """Form A — one bare tag name per line, `#` comments and blanks ignored.
-
-    Names are taken VERBATIM: `Notes` and `Details` survive (`sanitize_concept`
-    would fold both to ''), and only XML validity is enforced, which turns
-    `Line Items` into `Line_Items` and says so in the notes."""
-    from dgml.cli import _load_schema_seed
-
-    p = tmp_path / "tags.txt"
-    p.write_text(
-        "# Liquor distribution purchase orders\n\nCustomerName\nNotes\n"
-        "Details\nLine Items\nAgreementSummary\n",
-        encoding="utf-8",
-    )
-    schema, parent_map, notes = _load_schema_seed(p)
-    assert list(schema.tags) == [
-        "CustomerName",
-        "Notes",
-        "Details",
-        "Line_Items",
-        "AgreementSummary",
-    ]
-    assert all(tag.kind == "inline" for tag in schema.tags.values())
-    assert parent_map == {}
-    assert any("Line Items" in note and "Line_Items" in note for note in notes)
-    assert any("kind=inline" in note for note in notes)
-
-
-def test_load_schema_seed_accepts_a_name_to_description_mapping(tmp_path: Path) -> None:
-    """Form B — the recommended shape. Previously rejected outright."""
-    from dgml.cli import _load_schema_seed
-
-    p = tmp_path / "schema.json"
-    p.write_text(
-        json.dumps({"BuyerName": "bill-to org", "OrderDate": "date the order was placed"}),
-        encoding="utf-8",
-    )
-    schema, parent_map, _notes = _load_schema_seed(p)
-    assert {n: t.role for n, t in schema.tags.items()} == {
-        "BuyerName": "bill-to org",
-        "OrderDate": "date the order was placed",
-    }
-    assert parent_map == {}
-
-
-def test_load_schema_seed_rejects_ambiguous_input(tmp_path: Path) -> None:
-    """What cannot be read UNAMBIGUOUSLY fails at load, never as a tag that
-    quietly failed to appear in the output hours later."""
-    from dgml.cli import _load_schema_seed
-    from dgml_core.errors import InvalidArgument
-
-    def _reject(name: str, text: str) -> str:
-        p = tmp_path / name
-        p.write_text(text, encoding="utf-8")
-        with pytest.raises(InvalidArgument) as excinfo:
-            _load_schema_seed(p)
-        return str(excinfo.value)
-
-    # A `key: value` file (YAML, or Form B written as text) would otherwise
-    # load as tags named "concepts_" and "BuyerName__bill-to_org".
-    assert "':'" in _reject("seed.txt", "concepts:\n  BuyerName: bill-to org\n")
-    # Two names that differ only in case/punctuation are one tag, twice.
-    assert "differ only in case" in _reject("dup.txt", "BuyerName\nbuyer_name\n")
-    # A kind outside VALID_KINDS is a typo, not a silent coercion to `inline`.
-    assert "kind" in _reject("k.json", json.dumps({"tags": {"A": {"role": "x", "kind": "field"}}}))
-    # A parent_role naming a tag that does not exist would synthesize a
-    # container outside the vocabulary.
-    assert "parent_role" in _reject(
-        "p.json", json.dumps({"tags": {"A": {"role": "x", "parent_role": "Nope"}}})
-    )
-    # An empty `tags` map, and a JSON array (neither form).
-    assert "no tags" in _reject("e.json", json.dumps({"tags": {}}))
-    assert "array" in _reject("a.json", json.dumps(["A", "B"]))
-
-    with pytest.raises(InvalidArgument):
-        _load_schema_seed(tmp_path / "missing.json")
 
 
 # ---------------------------------------------------------------------------
@@ -7861,16 +7814,19 @@ def test_missing_chain_extra_reports_missing_extra(
     assert err["message"] == "The 'chain' extra is not installed. Run: pip install dgml[chain]"
 
 
-def test_generate_max_tokens_default_matches_the_library() -> None:
-    """The flag default and ConvertOptions.max_tokens are two copies of one
-    number. They have to move together: a CLI run that silently used a lower
-    ceiling than a library run would truncate replies the library completes,
-    and the failure shows up as an under-labeled chunk, not as an error."""
+def test_generate_pipeline_knobs_have_no_cli_default() -> None:
+    """The flags carry no copy of the pipeline's numbers: unset, they reach
+    generate_docset as None and ConvertOptions' own defaults apply (pinned in
+    the library suite). A second copy here would let a CLI run silently use a
+    lower max_tokens ceiling than a library run, and the failure would show
+    up as an under-labeled chunk, not as an error."""
     from dgml.cli import _build_parser
-    from dgml_core.generation.pipeline import ConvertOptions
 
     args = _build_parser().parse_args(["docset", "generate", "somedocset"])
-    assert args.max_tokens == ConvertOptions.max_tokens
+    assert args.window_size is None
+    assert args.temperature is None
+    assert args.max_tokens is None
+    assert args.max_parallel_calls is None
 
 
 def test_generate_max_tokens_default_clears_the_largest_observed_reply() -> None:
