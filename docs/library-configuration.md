@@ -20,7 +20,7 @@ cfg = Configuration.build(
         family="anthropic_google",
         anthropic_api_key=secrets["anthropic"],
         google_api_key=secrets["gemini"],
-        expert=Model("anthropic/claude-opus-5", api_key=secrets["opus"]),  # this tier only
+        expert=Model("anthropic/claude-opus-5-5", api_key=secrets["opus"]),  # this tier only
     ),
     ocr=Ocr(provider="azure", options={"endpoint": tenant.di_endpoint, "api_key": secrets["azure_di"]}),
 )
