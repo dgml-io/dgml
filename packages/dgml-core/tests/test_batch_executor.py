@@ -104,6 +104,51 @@ def test_errored_item_is_resubmitted_once_then_run_synchronously() -> None:
     assert ex.stats.batch_ok == 1 and ex.stats.batches == 2
 
 
+def test_sync_fallback_stops_a_trickling_stream_at_the_requests_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A streamed request the batch could not serve falls back to the default
+    synchronous call (``llm._completion_with_retry``), and its total deadline
+    travels with the request: a stream that keeps trickling a chunk a second,
+    never ending, is stopped at the request's 5 s deadline. Before, only the
+    sync driver set a deadline, so this path was bounded by nothing but the
+    read timeout between chunks."""
+    from dgml_core import llm
+    from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+
+    now = [0.0]
+    chunks_sent = [0]
+
+    def trickle() -> Iterator[Any]:
+        while True:
+            if chunks_sent[0] >= 1000:
+                raise AssertionError("the stream deadline never fired")
+            chunks_sent[0] += 1
+            now[0] += 1.0
+            yield ModelResponseStream(
+                id="trickle",
+                model="gpt-4o",
+                choices=[StreamingChoices(index=0, delta=Delta(content="."))],
+            )
+
+    monkeypatch.setattr("litellm.completion", lambda **_kwargs: trickle())
+    monkeypatch.setattr("time.monotonic", lambda: now[0])
+    backend = FakeBackend(
+        lambda req: BatchItemError(req.custom_id, ItemErrorKind.INVALID, "rejected")
+    )
+    ex = BatchExecutor(backend, sleep=lambda _s: None, min_wave_size=1)  # default sync path
+    step = llm._build_completion_kwargs(
+        llm.LLMConfig(model="gpt-4o", timeout=5, stream=True),
+        messages=[{"role": "user", "content": "extract"}],
+    )
+
+    out = ex.run_wave({"u": step})
+
+    assert isinstance(out["u"], llm.StreamDeadlineExceeded)
+    assert chunks_sent[0] == 5
+    assert ex.stats.sync_fallbacks == 1
+
+
 def test_non_retryable_item_falls_back_immediately() -> None:
     def script(req: BatchRequest) -> Any:
         if req.custom_id == "bad":
