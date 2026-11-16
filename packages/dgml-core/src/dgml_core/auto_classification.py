@@ -291,8 +291,9 @@ def prepare_bulk_classify(
     DocSets that exist now decide whether auto-extraction can run at all.
     Every model that will run is checked for a batch backend up front — the
     classification model always, the values model when a DocSet that files
-    can be assigned to already has an extraction schema — and a model with
-    none is a hard :class:`~dgml_core.errors.BatchUnavailable`.
+    can be assigned to already has an extraction schema and no extractor that
+    may not fall back is configured — and a model with none is a hard
+    :class:`~dgml_core.errors.BatchUnavailable`.
 
     Credentials are resolved here too, by building each executor. A failure
     (an unset ``api_key_env``) is *not* fatal: the synchronous run soft-fails
@@ -310,15 +311,11 @@ def prepare_bulk_classify(
     models: dict[str, StageRequest] = {"classification": config.model}
     doc_store = DocSetStore(ws)
     if any(doc_store.has_schema(ds.id) for ds in docsets):
-        from dgml_core.grounded import load_grounded_config, values_batch_stages
+        from dgml_core.grounded import extraction_batch_stages, load_grounded_config
 
         try:
             state.grounded = load_grounded_config(ws)
-            models.update(
-                values_batch_stages(
-                    state.grounded.values_model, state.grounded.values_reasoning_effort
-                )
-            )
+            models.update(extraction_batch_stages(state.grounded))
         except DgmlError as exc:
             # Soft, exactly like the synchronous auto-extract: every extraction
             # block will carry this error; classification still runs.
@@ -332,7 +329,11 @@ def prepare_bulk_classify(
         raise
     except DgmlError as exc:
         state.classifier_error = exc
-    if state.grounded is not None:
+    from dgml_core.grounded import values_model_runs
+
+    # An extractor that may not fall back never calls the values model, so
+    # the extraction run needs no executor (``extractor`` stays ``None``).
+    if state.grounded is not None and values_model_runs(state.grounded):
         from dgml_core.grounded import values_batch_executor
 
         try:
@@ -584,8 +585,8 @@ def _extract_assigned_batch(
     auto-extract would. Returns the run's stats, or ``None`` when no batch ran
     (the grounded config or its credentials failed; each block says why)."""
     from dgml_core.errors import AuthError
-    from dgml_core.extraction import auto_extract
-    from dgml_core.grounded import extract_values_batch_pairs
+    from dgml_core.extraction import auto_extract, extractor_key, failed_run_model
+    from dgml_core.grounded import extract_values_batch_pairs, no_batch_block, values_model_runs
 
     if batch.grounded is None:
         for block in items.values():
@@ -598,7 +599,7 @@ def _extract_assigned_batch(
             }
         return None
     grounded = batch.grounded
-    if batch.extractor is None:
+    if batch.extractor is None and values_model_runs(grounded):
         for (docset_id, fid), block in items.items():
             if isinstance(batch.extractor_error, AuthError):
                 # Every file fails on this at setup, before any request, so the
@@ -613,6 +614,7 @@ def _extract_assigned_batch(
                     "tool_calls": None,
                     "usage": None,
                     "error": soft_error(batch.extractor_error),
+                    **extractor_key(grounded, None),
                 }
         return None
 
@@ -639,19 +641,28 @@ def _extract_assigned_batch(
             "tool_calls": None,
             "usage": None,
             "error": None,
+            **extractor_key(grounded, None),
         }
         outcome = results[pair]
         if isinstance(outcome, Exception):
             extraction["error"] = soft_error(outcome)
+            extraction["model"] = failed_run_model(grounded, outcome)
             # As auto_extract: a DgmlError carries what the run spent.
             if isinstance(outcome, DgmlError):
                 extraction["usage"] = outcome.usage
         else:
+            extraction["model"] = outcome.model
             extraction["tool_calls"] = outcome.tool_calls
             extraction["usage"] = outcome.usage or None
+            extraction.update(extractor_key(grounded, outcome.extractor))
         block["extraction"] = extraction
+    stats = (
+        no_batch_block()
+        if executor is None
+        else {"provider": executor.backend.provider, **executor.stats.to_json()}
+    )
     return {
-        "provider": executor.backend.provider,
+        "provider": stats.pop("provider"),
         "docset_ids": sorted({docset_id for docset_id, _ in pairs}),
-        **executor.stats.to_json(),
+        **stats,
     }

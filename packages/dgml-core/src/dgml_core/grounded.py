@@ -55,6 +55,7 @@ import copy
 import json
 import logging
 import re
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -72,6 +73,8 @@ from .errors import (
     AuthError,
     ConversionFailed,
     DgmlError,
+    ExtractorFailed,
+    ExtractorOutputInvalid,
     FileNotFound,
     GroundedConfigInvalid,
     GroundedConfigMissing,
@@ -100,6 +103,19 @@ from .extraction_xml import (
     has_document_tree,
     standalone_extraction_doc,
     verify_input_citations,
+)
+from .extractor import (
+    ExtractionRequest,
+    ExtractorConfig,
+    ExtractorOutput,
+    ValueExtractor,
+    clean_stats,
+    clean_usage,
+    load_extractor_config,
+    make_extractor,
+    output_from_json,
+    output_to_json,
+    validate_extractor_output,
 )
 from .files import FileStore
 from .llm import (
@@ -295,6 +311,15 @@ _REQUIRED_TOOL_CHOICE_REJECTED: set[tuple[str, str | None, str | None]] = set()
 #: model (every file of the docset takes it) and logged at INFO per file.
 _WARNED_PERMISSIVE_SCHEMA: set[str] = set()
 
+# ``(provider, error class)`` pairs whose extractor fallback was already
+# announced this process by the single-file driver (``extract_values``, which
+# the CLI's bulk loops call once per file): WARNING the first time, INFO after.
+# The multi-file drivers summarize per run instead (see ``_log_fallbacks``).
+_WARNED_EXTRACTOR_FALLBACK: set[tuple[str, str]] = set()
+
+#: File ids a fallback summary line names before "and N more".
+_FALLBACK_SUMMARY_IDS = 5
+
 
 # ---- Config ---------------------------------------------------------------
 
@@ -340,6 +365,9 @@ class GroundedConfig:
     # Checked by name only: a budget the model refuses fails in phase 3, after
     # the values call has been paid for, on the first page that needs grounding.
     locations_reasoning_effort: str | None = _LOCATIONS_REASONING_EFFORT
+    # The ``[extractor]`` section: a custom extractor that replaces the three
+    # LLM phases of value extraction. ``None`` runs dgml's own pipeline.
+    extractor: ExtractorConfig | None = None
 
 
 def parse_reasoning_effort(raw: Any, *, source: str) -> str | None:
@@ -444,6 +472,7 @@ def load_grounded_config(
         max_tool_iters=max_tool_iters_raw,
         values_reasoning_effort=values_reasoning_effort,
         locations_reasoning_effort=locations_reasoning_effort,
+        extractor=load_extractor_config(workspace),
     )
 
 
@@ -1048,6 +1077,11 @@ class ExtractionResult:
     that field is ``{}``, so read it with ``.get`` rather than indexing. A
     failed run carries the same docs on its error instead (see
     :class:`~dgml_core.errors.DgmlError`), ``None`` there when unbuilt.
+
+    ``extractor`` is the provider path of the custom extractor whose values
+    these are, and ``None`` when dgml's own pipeline produced them, including
+    after a fallback. ``model`` is then the extractor's reported model (or its
+    provider path) rather than the values model.
     """
 
     values: dict[str, Any]
@@ -1057,6 +1091,7 @@ class ExtractionResult:
     model: str
     usage: dict[str, Any] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
+    extractor: str | None = None
 
 
 def extract_values(
@@ -1104,7 +1139,76 @@ def extract_values(
 
     :func:`extract_values_batch` runs the same per-file steps for many files,
     with each LLM phase submitted as one batch wave.
+
+    With ``config.extractor`` set, the configured custom extractor
+    (:mod:`dgml_core.extractor`) replaces the three phases; dgml validates its
+    tree and runs the box verification, the unboxed-value drop and the XML
+    write on it. When it fails and ``fallback`` is on, the three phases run
+    instead and the fallback is logged (WARNING the first time this process
+    sees that provider fail that way, INFO after).
     """
+    result, fallback = _extract_one(
+        workspace,
+        docset_id,
+        file_id,
+        config=config,
+        write_stats=write_stats,
+        record_usage=record_usage,
+    )
+    if fallback is not None:
+        provider, error = fallback
+        key = (provider, type(error).__name__)
+        level = logging.INFO if key in _WARNED_EXTRACTOR_FALLBACK else logging.WARNING
+        _WARNED_EXTRACTOR_FALLBACK.add(key)
+        logger.log(
+            level,
+            "file %s: extractor %s failed (%s: %s); extracted with dgml's own pipeline instead",
+            file_id,
+            provider,
+            type(error).__name__,
+            error,
+        )
+    return result
+
+
+#: What a fallback was: ``(provider, the error the extractor failed with)``.
+_Fallback = tuple[str, Exception]
+
+
+class ExtractorOutcome(StrEnum):
+    """What the custom extractor's step came to (the stats ``extractor``
+    block's ``outcome``): ``OK`` its tree was taken, ``FAILED`` it raised (or
+    could not be constructed), ``INVALID`` its tree failed validation."""
+
+    OK = "ok"
+    FAILED = "failed"
+    INVALID = "invalid"
+
+
+class BoxesVerified(StrEnum):
+    """How :func:`~dgml_core.matching.verify_boxes` treated an extractor's
+    boxes (the stats ``extractor`` block's ``boxes_verified``): ``APPLIED`` it
+    snapped or rejected them as it does phase 3's; ``REPORTED`` the extractor
+    verifies its own boxes, so the counts are a report and the boxes were
+    written as returned."""
+
+    APPLIED = "applied"
+    REPORTED = "reported"
+
+
+def _extract_one(
+    workspace: Workspace,
+    docset_id: str,
+    file_id: str,
+    *,
+    config: GroundedConfig,
+    write_stats: bool,
+    record_usage: bool,
+) -> tuple[ExtractionResult, _Fallback | None]:
+    """One file, synchronously: the body of :func:`extract_values`, which also
+    returns the fallback that happened (if one did) so each driver logs it its
+    own way."""
+    extractor = _construct_extractor(config.extractor)
     run = _FileExtraction(
         workspace,
         docset_id,
@@ -1112,6 +1216,7 @@ def extract_values(
         config=config,
         write_stats=write_stats,
         record_usage=record_usage,
+        extractor=extractor,
     )
     # Logged once the run is set up, so a refused file (no schema, not
     # assigned) never reads as started. A failure is the caller's to report:
@@ -1120,20 +1225,23 @@ def extract_values(
         "file %s: extracting values into docset %s with %s",
         file_id,
         docset_id,
-        config.values_model,
+        config.extractor.provider if config.extractor is not None else config.values_model,
     )
     try:
-        steps = run.phase1_steps()
-        try:
-            llm.drive(steps, run.phase1_config())
-        finally:
-            # Mirror the latches into the stats on every exit, so a failure
-            # midway still reports how far phase 1 got.
-            run.mirror_phase1()
-        pages = run.after_phase1()
         per_page: list[_PageOutcome] = []
-        if pages:
-            per_page = _run_phase3_pages(run, pages)
+        if extractor is not None and run.run_extractor(extractor):
+            pass  # the extractor's tree is in; finish() runs the shared tail
+        else:
+            steps = run.phase1_steps()
+            try:
+                llm.drive(steps, run.phase1_config())
+            finally:
+                # Mirror the latches into the stats on every exit, so a failure
+                # midway still reports how far phase 1 got.
+                run.mirror_phase1()
+            pages = run.after_phase1()
+            if pages:
+                per_page = _run_phase3_pages(run, pages)
         result = run.finish(per_page)
         logger.info(
             "file %s: extracted values into docset %s (%s)",
@@ -1141,12 +1249,46 @@ def extract_values(
             docset_id,
             _describe_run(result.tool_calls, result.usage),
         )
-        return result
+        return result, run.fallback
     except BaseException as exc:
         run.fail(exc)
         raise
     finally:
         run.record()
+
+
+def _construct_extractor(config: ExtractorConfig | None) -> ValueExtractor | Exception | None:
+    """The configured extractor, constructed; ``None`` when none is configured;
+    the exception its constructor raised, which every file of the run then
+    fails with (or falls back from), as a failing ``extract`` would."""
+    if config is None:
+        return None
+    try:
+        return make_extractor(config)
+    except Exception as exc:
+        return exc
+
+
+def _log_fallbacks(fallbacks: dict[str, _Fallback]) -> None:
+    """One WARNING per ``(provider, error class)`` for a multi-file run's
+    fallbacks, naming up to :data:`_FALLBACK_SUMMARY_IDS` file ids and "and N
+    more"; ``--verbose`` (INFO) names every file through the per-file lines."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for file_id, (provider, error) in fallbacks.items():
+        groups.setdefault((provider, type(error).__name__), []).append(file_id)
+    for (provider, error_name), ids in groups.items():
+        shown = ", ".join(ids[:_FALLBACK_SUMMARY_IDS])
+        more = len(ids) - _FALLBACK_SUMMARY_IDS
+        logger.warning(
+            "extractor %s failed with %s for %d file%s (%s%s); extracted with dgml's own "
+            "pipeline instead",
+            provider,
+            error_name,
+            len(ids),
+            "" if len(ids) == 1 else "s",
+            shown,
+            f" and {more} more" if more > 0 else "",
+        )
 
 
 def _describe_run(tool_calls: int, usage: dict[str, Any]) -> str:
@@ -1211,6 +1353,7 @@ class _FileExtraction:
         write_stats: bool,
         record_usage: bool,
         tier: PricingTier = PricingTier.STANDARD,
+        extractor: ValueExtractor | Exception | None = None,
     ) -> None:
         self.workspace = workspace
         self.docset_id = docset_id
@@ -1230,12 +1373,47 @@ class _FileExtraction:
                 f"file '{file_id}' is not assigned to docset '{docset_id}'; assign it first"
             )
         # A stored schema is not re-checked on read; here it is about to be used.
+        self.rnc_schema = rnc_schema
         self.vocab = check_invariant_paths(parse_rnc(rnc_schema))
         self.schema = rnc_to_json_schema(rnc_schema)
         self.guidance = store.get_guidance(docset_id) if store.has_guidance(docset_id) else None
-        self.pdf_bytes = _pdf_bytes(workspace, file_id)
-        self.api_key = _resolve_api_key(config.values_api_key, config.values_api_key_env)
+        # The PDF is checked here, so a missing one raises from the constructor
+        # as before, but read on first use: a custom extractor that succeeds
+        # never needs dgml to hold it (and under --batch every pair's would be
+        # held until its last wave).
+        self.file_record = FileStore(workspace).get(file_id)
+        pdf_key = layout.file_pdf_key(file_id, self.file_record.original_filename)
+        if not workspace.blobs.blob_exists(pdf_key):
+            _pdf_bytes(workspace, file_id)  # raises FileNotFound or ConversionFailed
+        self._pdf_bytes: bytes | None = None
+        # The values model's key is only read by dgml's own phases, which an
+        # extractor that may not fall back never reaches.
+        self.api_key = (
+            _resolve_api_key(config.values_api_key, config.values_api_key_env)
+            if values_model_runs(config)
+            else None
+        )
         self.api_base = config.values_api_base
+
+        # The custom extractor (``config.extractor``): the instance, or the
+        # exception its constructor raised, which this file fails with or
+        # falls back from when it is asked to run. ``extractor_used`` is the
+        # provider whose values finish() writes, None for dgml's own pipeline.
+        self.extractor_config = config.extractor
+        self.extractor = extractor
+        self.extractor_used: str | None = None
+        self.extractor_outcome: ExtractorOutcome | None = None
+        self.extractor_error: str | None = None
+        self.extractor_model: str | None = None
+        self.extractor_duration = 0.0
+        self.extractor_tool_calls = 0
+        self.extractor_usage: dict[str, Any] | None = None
+        self.extractor_details: dict[str, Any] | None = None
+        self.extractor_locations = 0
+        self.boxes_verified: BoxesVerified | None = None
+        #: ``(provider, error)`` when the extractor failed and dgml fell back.
+        self.fallback: _Fallback | None = None
+        self._request: ExtractionRequest | None = None
 
         self.phase1_totals: dict[str, Any] = _empty_totals()
         self.phase3_totals: dict[str, Any] = _empty_totals()
@@ -1293,6 +1471,170 @@ class _FileExtraction:
         self.stats_doc: dict[str, Any] | None = None
         self.usage_doc: dict[str, Any] | None = None
         self.failure: DgmlError | None = None
+
+    @property
+    def pdf_bytes(self) -> bytes:
+        """The stored PDF, read on first use (see ``__init__``)."""
+        if self._pdf_bytes is None:
+            self._pdf_bytes = _pdf_bytes(self.workspace, self.file_id)
+        return self._pdf_bytes
+
+    # ---- custom extractor ---------------------------------------------
+
+    @property
+    def request(self) -> ExtractionRequest:
+        """The :class:`ExtractionRequest` a custom extractor receives for this
+        file, built once."""
+        if self._request is None:
+            page_count = self.file_record.page_count
+            if page_count is None:
+                page_count = pdf_page_count_bytes(self.pdf_bytes)
+            self._request = ExtractionRequest(
+                docset_id=self.docset_id,
+                file_id=self.file_id,
+                page_count=page_count,
+                schema_rnc=self.rnc_schema,
+                schema=self.schema,
+                guidance=self.guidance,
+                original_filename=self.file_record.original_filename,
+                vocab=self.vocab,
+                _ws=self.workspace,
+            )
+        return self._request
+
+    def input_name(self) -> str:
+        """The batch job's input name for this pair's recorded extractor output."""
+        return f"extractor/{self.docset_id}/{self.file_id}.json"
+
+    def run_extractor(self, extractor: ValueExtractor | Exception) -> bool:
+        """The synchronous driver's extractor step: call ``extract`` (or replay
+        the active batch job's record of it), then :meth:`take_output`. True
+        when the extractor's tree is in and the run can go straight to
+        :meth:`finish`; False when dgml's own phases must run (a fallback).
+        *extractor* is the instance, or the exception its constructor raised;
+        a recorded output is replayed either way, since it needs no instance."""
+        outcome: ExtractorOutput | Exception
+        jobs = sys.modules.get("dgml_core.batch.jobs")
+        job = None if jobs is None else jobs.active_session()
+        recorded = None if job is None else job.recorded_input(self.input_name())
+        started = time.monotonic()
+        if recorded is not None:
+            outcome = output_from_json(recorded)
+        elif isinstance(extractor, Exception):
+            outcome = extractor
+        else:
+            try:
+                outcome = extractor.extract(self.request)
+            except Exception as exc:
+                outcome = exc
+        self.extractor_duration = round(time.monotonic() - started, 3)
+        took = self.take_output(outcome)
+        # Recorded only once take_output has accepted the tree, from what it
+        # kept (as _run_extractor_batch does): a rejected output is not
+        # recorded, and bad telemetry was dropped rather than failing the encode.
+        if took and job is not None and recorded is None:
+            assert isinstance(outcome, ExtractorOutput)
+            job.record_input(self.input_name(), output_to_json(self.kept_output(outcome)))
+        return took
+
+    def validate(self, output: Any) -> None:
+        """:func:`validate_extractor_output` for this file."""
+        request = self.request
+        validate_extractor_output(
+            output, vocab=self.vocab, page_count=request.page_count, page_size=request.page_size
+        )
+
+    def take_output(self, outcome: ExtractorOutput | Exception) -> bool:
+        """Take what the extractor produced for this file: validate it, record
+        the stats block, and decide. True when the tree is in; False when the
+        extractor failed and ``fallback`` lets dgml's own phases run. Raises the
+        extractor's error (as a :class:`ValuesExtractionFailed`) when it may
+        not fall back."""
+        config = self.extractor_config
+        assert config is not None
+        provider = config.provider
+        error: Exception | None = None
+        if isinstance(outcome, Exception):
+            error = outcome
+            self.extractor_outcome = ExtractorOutcome.FAILED
+        else:
+            # Telemetry first, so what the extractor spent is accounted even
+            # when its tree is rejected and dgml falls back.
+            self._take_telemetry(outcome)
+            try:
+                self.validate(outcome)
+            except ExtractorOutputInvalid as exc:
+                error = exc
+                self.extractor_outcome = ExtractorOutcome.INVALID
+        if error is None:
+            assert isinstance(outcome, ExtractorOutput)
+            self._take_values(outcome)
+            self.extractor_used = provider
+            self.extractor_outcome = ExtractorOutcome.OK
+            self.phase1_duration = self.extractor_duration
+            logger.info(
+                "file %s: extractor %s returned %d locations in %.1fs",
+                self.file_id,
+                provider,
+                self.extractor_locations,
+                self.extractor_duration,
+            )
+            return True
+        self.extractor_error = f"{type(error).__name__}: {error}"
+        if not config.fallback:
+            # Every message names the extractor. A DGML error the extractor
+            # raised (or the invalid-output error) keeps its class, so its code
+            # stands; anything else becomes an ExtractorFailed, named by type.
+            if isinstance(error, ValuesExtractionFailed):
+                raise type(error)(f"extractor {provider} failed: {error}") from error
+            raise ExtractorFailed(f"extractor {provider} failed: {self.extractor_error}") from error
+        self.fallback = (provider, error)
+        logger.info(
+            "file %s: extractor %s failed (%s); falling back to dgml's own pipeline",
+            self.file_id,
+            provider,
+            self.extractor_error,
+        )
+        return False
+
+    def _take_telemetry(self, output: Any) -> None:
+        """What an output reports about itself, into the totals and the stats
+        block. Tolerant of a malformed output: validation has not run yet."""
+        if not isinstance(output, ExtractorOutput):
+            return
+        self.extractor_model = output.model if isinstance(output.model, str) else None
+        self.extractor_tool_calls = output.tool_calls if isinstance(output.tool_calls, int) else 0
+        self.extractor_usage = clean_usage(output.usage, file_id=self.file_id)
+        self.extractor_details = clean_stats(output.stats, file_id=self.file_id)
+        if self.extractor_usage is not None:
+            add_partial(self.phase1_totals, {**_empty_totals(), **self.extractor_usage})
+
+    def kept_output(self, output: ExtractorOutput) -> ExtractorOutput:
+        """*output* as dgml kept it: its validated tree with the telemetry
+        :meth:`_take_telemetry` cleaned, so the job record always encodes."""
+        return ExtractorOutput(
+            values=output.values,
+            model=self.extractor_model,
+            usage=self.extractor_usage,
+            stats=self.extractor_details,
+            tool_calls=self.extractor_tool_calls,
+        )
+
+    def _take_values(self, output: ExtractorOutput) -> None:
+        """Fold a validated output's tree into the run: a copy (so the
+        extractor keeps its own), through the post-processing the default path
+        runs after phase 1, into the slot :meth:`finish` reads."""
+        self.tool_calls_total += self.extractor_tool_calls
+        values = copy.deepcopy(output.values)
+        self._postprocess_values(values)
+        self.extractor_locations = sum(
+            len(leaf["locations"])
+            for _, leaf in walk_all_leaves(values)
+            if isinstance(leaf.get("locations"), list)
+        )
+        self.total_locations = self.extractor_locations
+        self._phase2_values = values
+        self.phase3_started = time.monotonic()
 
     # ---- phase 1 ------------------------------------------------------
 
@@ -1406,59 +1748,16 @@ class _FileExtraction:
         # usage row and stats sidecar still carry what phase 1 did.
         if self.phase1.refusal is not None:
             raise ValuesExtractionFailed(self.phase1.refusal)
-        # The merged extracted_value leaf shape lets a sloppy model blur the
-        # printed/unprinted boundary; normalize before phases 2/3 (and the
-        # serializer) so their invariants hold regardless.
-        demoted_claims = _normalize_leaf_provenance(phase1_values)
-        # Inputs are positional paths the model counts out in its own output;
-        # each cites the text it read there, so a miscounted index is
-        # re-pointed at the one sibling that matches, or dropped — never left
-        # naming a real but wrong element. Then normalize again: a value that
-        # lost every input can no longer claim to be calculated or inferred.
-        citations = verify_input_citations(phase1_values)
-        self.repaired_inputs = citations.repaired
-        self.citations_dropped = citations.dropped
-        demoted_claims += _normalize_leaf_provenance(phase1_values)
+        self._postprocess_values(phase1_values)
         # A value read off the page but returned without locations would be
         # dropped as unverifiable; place it on the first page that prints its
-        # exact text so phase 2 can ground it.
+        # exact text so phase 2 can ground it. (Not for a custom extractor's
+        # tree: with no phase 2 to box it, a page alone would still be dropped.)
         self.located_pageless = locate_pageless_values(
             self.workspace,
             self.file_id,
             phase1_values,
             FileStore(self.workspace).get(self.file_id).page_count,
-        )
-        # Provisional: if a later phase fails, the stats still show the
-        # claims phase 1 made with nothing behind them. Replaced in finish()
-        # by the count of values dropped as unsupported.
-        self.unsupported_values = demoted_claims
-        # Unprinted leaves (calculated, inferred, defaulted) carry no
-        # locations — phases 2 and 3 never see them; counted here so the
-        # stats file can attest they were deliberate, not dropped. Partly
-        # printed leaves are grounded as usual and also name their inputs.
-        # dropped_inputs is inputs that won't resolve to a dg:inputs target —
-        # incomplete provenance that would otherwise vanish silently at
-        # serialization. Counted for paths now, so a later phase failing
-        # still leaves it in the stats, and again after grounding to add the
-        # evidence that never got a box.
-        self.dropped_inputs = self.citations_dropped + count_dropped_inputs(
-            phase1_values, evidence=False
-        )
-        self.unprinted_fields = sum(1 for _ in walk_unprinted_leaves(phase1_values))
-        self.partly_printed_fields = sum(
-            1 for _, leaf in walk_input_leaves(phase1_values) if "locations" in leaf
-        )
-        # Enum leaves whose normalized value isn't one of the schema's tokens
-        # serialize text-only; count them so misses are visible in stats.
-        self.unnormalized_enums = count_unnormalized_enum_values(phase1_values, self.vocab)
-        # Recompute checkable derivations (report-only): a mismatch means a
-        # calculated leaf's value agrees with neither the sum, the count, nor
-        # any single one of its inputs.
-        self.derivations_checked, self.derivations_mismatched = check_derivations(phase1_values)
-        # Schema-declared `## Invariant:` relations (count/sum across the
-        # submission). Report-only, like the derivation recompute above.
-        self.invariants_checked, self.invariant_violations = check_invariants(
-            phase1_values, self.vocab
         )
 
         # --- Phase 2: code-side OCR matching ------------------------
@@ -1507,6 +1806,53 @@ class _FileExtraction:
         elif not dropped:
             logger.info("file %s: phase 3 (locations) not needed", self.file_id)
         return pages
+
+    def _postprocess_values(self, values: dict[str, Any]) -> None:
+        """Normalize a values tree in place and take its report-only counts:
+        what the default path runs on the phase-1 tree before phase 2, and
+        what a custom extractor's validated tree goes through before
+        :meth:`finish`."""
+        # The merged extracted_value leaf shape lets a sloppy model blur the
+        # printed/unprinted boundary; normalize before phases 2/3 (and the
+        # serializer) so their invariants hold regardless.
+        demoted_claims = _normalize_leaf_provenance(values)
+        # Inputs are positional paths the model counts out in its own output;
+        # each cites the text it read there, so a miscounted index is
+        # re-pointed at the one sibling that matches, or dropped — never left
+        # naming a real but wrong element. Then normalize again: a value that
+        # lost every input can no longer claim to be calculated or inferred.
+        citations = verify_input_citations(values)
+        self.repaired_inputs = citations.repaired
+        self.citations_dropped = citations.dropped
+        demoted_claims += _normalize_leaf_provenance(values)
+        # Provisional: if a later phase fails, the stats still show the
+        # claims phase 1 made with nothing behind them. Replaced in finish()
+        # by the count of values dropped as unsupported.
+        self.unsupported_values = demoted_claims
+        # Unprinted leaves (calculated, inferred, defaulted) carry no
+        # locations — phases 2 and 3 never see them; counted here so the
+        # stats file can attest they were deliberate, not dropped. Partly
+        # printed leaves are grounded as usual and also name their inputs.
+        # dropped_inputs is inputs that won't resolve to a dg:inputs target —
+        # incomplete provenance that would otherwise vanish silently at
+        # serialization. Counted for paths now, so a later phase failing
+        # still leaves it in the stats, and again after grounding to add the
+        # evidence that never got a box.
+        self.dropped_inputs = self.citations_dropped + count_dropped_inputs(values, evidence=False)
+        self.unprinted_fields = sum(1 for _ in walk_unprinted_leaves(values))
+        self.partly_printed_fields = sum(
+            1 for _, leaf in walk_input_leaves(values) if "locations" in leaf
+        )
+        # Enum leaves whose normalized value isn't one of the schema's tokens
+        # serialize text-only; count them so misses are visible in stats.
+        self.unnormalized_enums = count_unnormalized_enum_values(values, self.vocab)
+        # Recompute checkable derivations (report-only): a mismatch means a
+        # calculated leaf's value agrees with neither the sum, the count, nor
+        # any single one of its inputs.
+        self.derivations_checked, self.derivations_mismatched = check_derivations(values)
+        # Schema-declared `## Invariant:` relations (count/sum across the
+        # submission). Report-only, like the derivation recompute above.
+        self.invariants_checked, self.invariant_violations = check_invariants(values, self.vocab)
 
     # ---- phase 3 ------------------------------------------------------
 
@@ -1569,9 +1915,20 @@ class _FileExtraction:
         # Phase 3's boxes are drawn by a model; where the page has a text
         # layer, a box whose words don't read as its value is wrong: it is
         # moved to the nearest exact match, or stripped before the drop below.
-        self.snapped_boxes, self.rejected_boxes = verify_boxes(
-            self.workspace, self.file_id, final_values
-        )
+        # A custom extractor that verifies its own boxes (and may return
+        # normalized text the page does not print) gets the check on a copy:
+        # the counts are kept as a report, the boxes are written as returned.
+        if self.extractor_used is not None and self._extractor_verifies_boxes():
+            self.boxes_verified = BoxesVerified.REPORTED
+            self.snapped_boxes, self.rejected_boxes = verify_boxes(
+                self.workspace, self.file_id, copy.deepcopy(final_values)
+            )
+        else:
+            if self.extractor_used is not None:
+                self.boxes_verified = BoxesVerified.APPLIED
+            self.snapped_boxes, self.rejected_boxes = verify_boxes(
+                self.workspace, self.file_id, final_values
+            )
         # A printed value grounding couldn't box can't be tied to the page,
         # and a value with no box, no default and nothing it used can't be
         # verified: drop them rather than write them with no provenance.
@@ -1617,11 +1974,15 @@ class _FileExtraction:
         if existing is not None and has_document_tree(existing):
             # A generated document tree is present — add extraction alongside it.
             mode = "full-extraction"
-            doc = embed_extraction_into(existing, final_values, vocab=self.vocab)
+            doc = embed_extraction_into(
+                existing, final_values, vocab=self.vocab, extractor=self.extractor_used
+            )
         else:
             # No tree (fresh, or a prior extraction-only file) — (re)write standalone.
             mode = "extraction"
-            doc = standalone_extraction_doc(final_values, vocab=self.vocab)
+            doc = standalone_extraction_doc(
+                final_values, vocab=self.vocab, extractor=self.extractor_used
+            )
         workspace.blobs.put_blob(xml_key, doc.encode("utf-8"))
         self.outcome = UsageOutcome.OK
         # The values are already stored: telemetry failing to build must not
@@ -1633,10 +1994,34 @@ class _FileExtraction:
             tool_calls=self.tool_calls_total,
             xml_key=xml_key,
             mode=mode,
-            model=self.config.values_model,
+            model=self.model_used(),
             usage=self.usage_doc or {},
             stats=self.stats_doc or {},
+            extractor=self.extractor_used,
         )
+
+    def model_used(self) -> str:
+        """What produced the values: the extractor's reported model, else its
+        provider path, when its values were used; otherwise the values model,
+        including after a fallback."""
+        if self.extractor_used is None:
+            return self.config.values_model
+        return self.extractor_model or self.extractor_used
+
+    def model_ran(self) -> str | None:
+        """:meth:`model_used`, or ``None`` when no model ran: a custom extractor
+        is configured, its values were not taken, and no fallback ran. The stats
+        and the usage row report this, so a failed run names only what ran."""
+        if (
+            self.extractor_config is not None
+            and self.extractor_used is None
+            and self.fallback is None
+        ):
+            return None
+        return self.model_used()
+
+    def _extractor_verifies_boxes(self) -> bool:
+        return isinstance(self.extractor, ValueExtractor) and bool(self.extractor.verifies_boxes)
 
     def fail(self, exc: BaseException) -> None:
         """Note why the run failed, for the usage row and the stats, and keep
@@ -1661,9 +2046,31 @@ class _FileExtraction:
             "duration_s": round(time.monotonic() - self.started, 3),
         }
 
+    def _extractor_stats(self) -> dict[str, Any] | None:
+        """The stats file's ``extractor`` block, present only when one is
+        configured; ``None`` otherwise."""
+        config = self.extractor_config
+        if config is None:
+            return None
+        return {
+            "provider": config.provider,
+            "model": self.extractor_model,
+            # None when it never ran (a setup failure).
+            "outcome": None if self.extractor_outcome is None else str(self.extractor_outcome),
+            "error": self.extractor_error,
+            "fell_back": self.fallback is not None,
+            "duration_s": self.extractor_duration,
+            "tool_calls": self.extractor_tool_calls,
+            "locations": self.extractor_locations,
+            "boxes_verified": None if self.boxes_verified is None else str(self.boxes_verified),
+            "usage": self.extractor_usage,
+            "details": self.extractor_details,
+        }
+
     def _stats_summary(self) -> dict[str, Any]:
         return _build_extraction_stats(
-            model=self.config.values_model,
+            model=self.model_ran(),
+            extractor=self._extractor_stats(),
             outcome=self.outcome,
             error_msg=self.error_msg,
             phase1_totals=self.phase1_totals,
@@ -1704,10 +2111,18 @@ class _FileExtraction:
         )
 
     def _append_usage_rows(self, usage_doc: dict[str, Any]) -> None:
+        context: dict[str, Any] = {
+            "file_id": self.file_id,
+            "docset_id": self.docset_id,
+            "tool_calls": self.tool_calls_total,
+        }
+        if self.extractor_config is not None:
+            # The provider whose values were written; None after a fallback.
+            context["extractor"] = self.extractor_used
         event = UsageEvent(
             at=now_iso(),
             operation=UsageOperation.EXTRACT_VALUES,
-            model=self.config.values_model,
+            model=self.model_ran(),
             cost_usd=usage_doc["cost_usd"],
             prompt_tokens=usage_doc["prompt_tokens"],
             completion_tokens=usage_doc["completion_tokens"],
@@ -1716,11 +2131,7 @@ class _FileExtraction:
             cache_creation_tokens=usage_doc["cache_creation_tokens"],
             duration_s=usage_doc["duration_s"],
             outcome=self.outcome,
-            context={
-                "file_id": self.file_id,
-                "docset_id": self.docset_id,
-                "tool_calls": self.tool_calls_total,
-            },
+            context=context,
             error=self.error_msg,
             tier=self.tier,
         )
@@ -1848,7 +2259,7 @@ def extract_values_batch(
     file_ids: list[str],
     *,
     config: GroundedConfig,
-    executor: BatchExecutor,
+    executor: BatchExecutor | None,
     write_stats: bool = False,
     record_usage: bool = False,
 ) -> dict[str, ExtractionResult | Exception]:
@@ -1896,15 +2307,29 @@ def extract_values_many(
     With *batch*, both LLM phases go through the provider's batch API
     (:func:`extract_values_batch`); a values model with no batch backend is
     :class:`~dgml_core.errors.BatchUnavailable`, raised before any request. An
-    unset ``values_api_key_env`` is not fatal there: the synchronous run fails
-    each file on it at setup, before any request, so the files are run
-    synchronously and each reports that error (no LLM call is made, and
-    ``batch`` stays ``None``).
+    unset ``values_api_key_env`` is not fatal there: the files are run
+    synchronously (``batch`` stays ``None``), where each fails on it at setup,
+    before any request.
+
+    An extractor that may not fall back never calls the values model, so with
+    one configured neither check applies: *batch* calls its ``extract_many``
+    with every file, and ``batch`` is a block of zeros with ``provider: None``.
     """
+    if batch and not values_model_runs(config):
+        outcomes = extract_values_batch(
+            workspace,
+            docset_id,
+            file_ids,
+            config=config,
+            executor=None,
+            write_stats=write_stats,
+            record_usage=record_usage,
+        )
+        return ManyExtraction(dict(outcomes), no_batch_block())
     if batch:
         from .batch import assert_batchable
 
-        assert_batchable(values_batch_stages(config.values_model, config.values_reasoning_effort))
+        assert_batchable(extraction_batch_stages(config))
         try:
             executor = values_batch_executor(config, poll_interval_s=poll_interval_s, log=log)
         except AuthError:
@@ -1924,9 +2349,10 @@ def extract_values_many(
                 {"provider": executor.backend.provider, **executor.stats.to_json()},
             )
     sync: dict[str, ExtractionResult | Exception] = {}
+    fallbacks: dict[str, _Fallback] = {}
     for fid in file_ids:
         try:
-            sync[fid] = extract_values(
+            sync[fid], fallback = _extract_one(
                 workspace,
                 docset_id,
                 fid,
@@ -1936,6 +2362,10 @@ def extract_values_many(
             )
         except Exception as exc:
             sync[fid] = exc
+        else:
+            if fallback is not None:
+                fallbacks[fid] = fallback
+    _log_fallbacks(fallbacks)
     return ManyExtraction(sync)
 
 
@@ -1948,7 +2378,7 @@ def extract_values_batch_pairs(
     pairs: list[ExtractionPair],
     *,
     config: GroundedConfig,
-    executor: BatchExecutor,
+    executor: BatchExecutor | None,
     write_stats: bool = False,
     record_usage: bool = False,
 ) -> dict[ExtractionPair, ExtractionResult | Exception]:
@@ -1976,13 +2406,18 @@ def extract_values_batch_pairs(
     that finished keep their results. Only interrupts (non-``Exception``) propagate, after
     every open pair's row and stats are written.
 
-    Duplicate *pairs* raise :class:`ValueError`.
+    *executor* may be ``None`` only when the values model never runs
+    (:func:`values_model_runs`): an extractor that may not fall back leaves
+    no phase to send. Otherwise, and for duplicate *pairs*, raises
+    :class:`ValueError`.
     """
     from .batch import Unit, UnitOutcome, run_stage
 
     if len(set(pairs)) != len(pairs):
         dupes = sorted({p for p in pairs if pairs.count(p) > 1})
         raise ValueError(f"(docset_id, file_id) pairs must be unique; duplicated: {dupes}")
+    if executor is None and values_model_runs(config):
+        raise ValueError("executor is required unless an extractor that may not fall back is set")
 
     results: dict[ExtractionPair, ExtractionResult | Exception] = {}
     runs: dict[ExtractionPair, _FileExtraction] = {}
@@ -2030,10 +2465,22 @@ def extract_values_batch_pairs(
             results[pair] = exc
 
     try:
+        pages_by_pair: dict[ExtractionPair, list[tuple[int, list[UnmatchedItem]]]] = {}
+        # --- Custom extractor: one extract_many call over every pair ----
+        # A pair whose tree is in contributes no phase-1 unit and no phase-3
+        # page; one that fell back goes through the phases below as usual.
+        if config.extractor is not None:
+            done, fallbacks = _run_extractor_batch(config.extractor, runs, pairs, _fail)
+            for pair in done:
+                pages_by_pair[pair] = []
+            _log_fallbacks(fallbacks)
+
         # --- Phase 1: one stage over every pair ------------------------
         units: list[Unit] = []
         unit_pairs: dict[str, ExtractionPair] = {}
         for pair, run in list(runs.items()):
+            if pair in pages_by_pair:
+                continue
             try:
                 units.append(Unit(_name(pair), run.phase1_config(), run.phase1_steps()))
                 unit_pairs[_name(pair)] = pair
@@ -2043,9 +2490,9 @@ def extract_values_batch_pairs(
         # (``stage_error``); units that finished keep their results.
         outcomes: dict[str, UnitOutcome] = {}
         if units:
+            assert executor is not None  # checked on entry: units need the values model
             outcomes = run_stage(units, executor, stage="extraction phase 1")
 
-        pages_by_pair: dict[ExtractionPair, list[tuple[int, list[UnmatchedItem]]]] = {}
         for name, outcome in outcomes.items():
             pair = unit_pairs[name]
             run = runs[pair]
@@ -2083,6 +2530,7 @@ def extract_values_batch_pairs(
             page_units.extend(built)
         page_outcomes: dict[str, UnitOutcome] = {}
         if page_units:
+            assert executor is not None  # as phase 1
             page_outcomes = run_stage(page_units, executor, stage="extraction phase 3")
 
         # --- Finish each surviving pair, in input order ----------------
@@ -2127,6 +2575,111 @@ def extract_values_batch_pairs(
                 run.record()
         raise
     return {pair: results[pair] for pair in pairs}
+
+
+def _run_extractor_batch(
+    config: ExtractorConfig,
+    runs: dict[ExtractionPair, _FileExtraction],
+    order: list[ExtractionPair],
+    fail: Callable[[ExtractionPair, Exception], None],
+) -> tuple[set[ExtractionPair], dict[str, _Fallback]]:
+    """The batch driver's extractor step: one ``extract_many`` call over every
+    pair in *runs* that has no recorded output in the active batch job, then
+    :meth:`_FileExtraction.take_output` per pair in *order*.
+
+    Returns the pairs whose tree is in (nothing left to ask the model for) and
+    the fallbacks, keyed ``docset/file``. A pair that may not fall back is
+    closed through *fail*. Each accepted output is recorded under the job as
+    ``inputs/extractor/<docset>/<file>.json``, so a resumed run replays it and
+    never calls the extractor for that file again, even when the extractor can
+    no longer be constructed. A failed or rejected output is not recorded: the
+    resume calls the extractor for that file again. If it fails again, the
+    fallback's phase 1 is replayed from the response store; if it succeeds, its
+    tree is taken and the fallback's recorded responses go unused."""
+    extractor = _construct_extractor(config)
+    jobs = sys.modules.get("dgml_core.batch.jobs")
+    job = None if jobs is None else jobs.active_session()
+
+    outputs: dict[ExtractionPair, ExtractorOutput | Exception] = {}
+    fresh_pairs: set[ExtractionPair] = set()  # the pairs extract_many returned an output for
+    pending: list[tuple[ExtractionPair, _FileExtraction]] = []
+    for pair in order:
+        run = runs.get(pair)
+        if run is None:
+            continue
+        # A recorded output needs no instance: replayed even when the
+        # constructor failed this time.
+        recorded = None if job is None else job.recorded_input(run.input_name())
+        if recorded is not None:
+            outputs[pair] = output_from_json(recorded)
+        elif isinstance(extractor, Exception):
+            outputs[pair] = extractor
+        else:
+            pending.append((pair, run))
+
+    if pending and isinstance(extractor, ValueExtractor):
+        requests: list[ExtractionRequest] = []
+        asked: list[tuple[ExtractionPair, _FileExtraction]] = []
+        for pair, run in pending:
+            try:
+                requests.append(run.request)
+            except Exception as exc:
+                outputs[pair] = exc
+            else:
+                asked.append((pair, run))
+        logger.info("extractor %s: extracting %d files", config.provider, len(asked))
+        started = time.monotonic()
+        fresh: list[ExtractorOutput | Exception]
+        try:
+            fresh = list(extractor.extract_many(requests, max_concurrency=config.max_concurrency))
+            if len(fresh) != len(requests):
+                raise ExtractorFailed(
+                    f"extract_many returned {len(fresh)} outcomes for {len(requests)} requests"
+                )
+        except Exception as exc:
+            fresh = [exc] * len(requests)
+        duration = round(time.monotonic() - started, 3)
+        failed = 0
+        for (pair, run), outcome in zip(asked, fresh, strict=True):
+            run.extractor_duration = duration
+            outputs[pair] = outcome
+            if isinstance(outcome, Exception):
+                failed += 1
+            else:
+                fresh_pairs.add(pair)
+        logger.info(
+            "extractor %s: %d of %d files returned in %.1fs",
+            config.provider,
+            len(asked) - failed,
+            len(asked),
+            duration,
+        )
+
+    done: set[ExtractionPair] = set()
+    fallbacks: dict[str, _Fallback] = {}
+    for pair in order:
+        if pair not in outputs:
+            continue
+        run = runs[pair]
+        outcome = outputs[pair]
+        try:
+            took = run.take_output(outcome)
+        except Exception as exc:
+            fail(pair, exc)
+            continue
+        if took:
+            done.add(pair)
+            # Recorded only once take_output has accepted the tree, from what
+            # it kept: a rejected output is not recorded, and bad telemetry
+            # was dropped rather than failing the encode.
+            if job is not None and pair in fresh_pairs:
+                assert isinstance(outcome, ExtractorOutput)
+                job.record_input(run.input_name(), output_to_json(run.kept_output(outcome)))
+        elif run.fallback is not None:
+            fallbacks[f"{pair[0]}/{pair[1]}"] = run.fallback
+    if job is not None and fresh_pairs:
+        job.persist()  # once for every output recorded above
+    return done, fallbacks
 
 
 def _as_exception(error: BaseException) -> Exception:
@@ -2216,8 +2769,9 @@ def _write_extraction_stats(
 
 def _build_extraction_stats(
     *,
-    model: str,
+    model: str | None,
     outcome: UsageOutcome,
+    extractor: dict[str, Any] | None = None,
     error_msg: str | None,
     phase1_totals: dict[str, Any],
     phase3_totals: dict[str, Any],
@@ -2263,12 +2817,18 @@ def _build_extraction_stats(
     LLM call. The three match counts together cover every phase-1
     location: ``phase2_matched + phase3_matched + unmatched == total``.
     Computed (reasoned) fields carry no locations, so they sit outside
-    that invariant and are counted separately."""
+    that invariant and are counted separately. When a custom extractor
+    supplied the values (``extractor.outcome == "ok"``) it supplied every
+    box too: ``total_locations`` counts them and the three match counts are
+    zero; ``phase1.duration_s`` is the extractor's time, and its ``usage`` is
+    in the phase-1 totals. The ``extractor`` block is present only when one is
+    configured."""
     return {
         "completed_at": now_iso(),
         "model": model,
         "outcome": str(outcome),
         "error": error_msg,
+        **({"extractor": extractor} if extractor is not None else {}),
         "phases": {
             "phase1": {
                 "duration_s": phase1_duration,
@@ -2524,6 +3084,33 @@ def values_batch_stages(
             "reasoning_effort": grid.reasoning_effort,
         },
     }
+
+
+def values_model_runs(config: GroundedConfig) -> bool:
+    """Whether an extraction with *config* may call the values model: always,
+    unless an extractor is configured that may not fall back (``fallback =
+    false``), since only dgml's own phases call it."""
+    return config.extractor is None or config.extractor.fallback
+
+
+def extraction_batch_stages(
+    config: GroundedConfig, *, stage: str = "extraction"
+) -> dict[str, dict[str, Any]]:
+    """:func:`values_batch_stages` for *config*'s values model, or no stages
+    when that model never runs (:func:`values_model_runs`), so a batch run
+    with such an extractor is not refused over a model it never calls."""
+    if not values_model_runs(config):
+        return {}
+    return values_batch_stages(config.values_model, config.values_reasoning_effort, stage=stage)
+
+
+def no_batch_block() -> dict[str, Any]:
+    """The ``batch`` block of an extraction run that built no executor, since
+    the values model never runs (:func:`values_model_runs`): every counter
+    zero and ``provider: None``."""
+    from .batch.executor import WaveStats
+
+    return {"provider": None, **WaveStats().to_json()}
 
 
 # ---- Phase 3: per-page LLM for unmatched items ----------------------------

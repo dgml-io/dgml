@@ -557,6 +557,32 @@ class ValuesExtractionFailed(DgmlError):
     code = "VALUES_EXTRACTION_FAILED"
 
 
+class ExtractorConfigInvalid(DgmlError):
+    """The ``[extractor]`` config section is malformed, or names a class that
+    cannot be imported, is not a :class:`~dgml_core.extractor.ValueExtractor`, or
+    rejects its options. Raised at config load; never falls back."""
+
+    code = "EXTRACTOR_CONFIG_INVALID"
+
+
+class ExtractorFailed(ValuesExtractionFailed):
+    """A custom extractor raised (or its construction did). A subclass of
+    :class:`ValuesExtractionFailed`, so every caller that handles that class
+    handles this one; with ``[extractor] fallback = true`` dgml's own pipeline
+    runs instead and this is only logged."""
+
+    code = "EXTRACTOR_FAILED"
+
+
+class ExtractorOutputInvalid(ValuesExtractionFailed):
+    """A custom extractor returned a tree that fails
+    :func:`dgml_core.extractor.validate_extractor_output`. The message lists up
+    to ten problems, each with its path. Falls back like
+    :class:`ExtractorFailed`."""
+
+    code = "EXTRACTOR_OUTPUT_INVALID"
+
+
 class GroundingFailed(DgmlError):
     code = "GROUNDING_FAILED"
 

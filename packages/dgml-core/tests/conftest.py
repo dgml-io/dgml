@@ -346,6 +346,7 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     grounded._REQUIRED_TOOL_CHOICE_REJECTED.clear()
     grounded._WARNED_TELEMETRY.clear()
     grounded._WARNED_PERMISSIVE_SCHEMA.clear()
+    grounded._WARNED_EXTRACTOR_FALLBACK.clear()
     monkeypatch.setattr(pipeline, "_WARNED_DEBUG_WITHOUT_USAGE", False)
 
 

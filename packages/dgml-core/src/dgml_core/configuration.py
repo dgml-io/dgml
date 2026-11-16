@@ -63,6 +63,7 @@ __all__ = [
     "Clustering",
     "Configuration",
     "Conversion",
+    "Extractor",
     "Generation",
     "Grounded",
     "Identity",
@@ -254,6 +255,24 @@ class Ocr:
 
 
 @dataclass(frozen=True)
+class Extractor:
+    """``[extractor]``: a custom extractor for ``dgml extraction extract``.
+    ``provider`` is the dotted path of a ``dgml_core.ValueExtractor`` subclass;
+    ``options`` are that class's own fields, validated by its ``parse_config``;
+    ``fallback`` (default true) runs dgml's own pipeline when the extractor
+    fails; ``max_concurrency`` (default 5) bounds the default ``extract_many``
+    under ``--batch``. Reads ``dgml_core.extractor.load_extractor_config``."""
+
+    provider: str
+    fallback: bool | None = None
+    max_concurrency: int | None = None
+    options: Mapping[str, Any] = field(default_factory=dict)
+
+    def table(self) -> dict[str, Any]:
+        return {**_table(self, exclude=frozenset({"options"})), **dict(self.options)}
+
+
+@dataclass(frozen=True)
 class Pdf:
     """``[pdf]``: the page engine, ``ghostscript`` (default) or ``pypdfium2``. Reads
     ``dgml_core.pages.load_pdf_config``."""
@@ -386,6 +405,7 @@ class Configuration:
         conversion: Conversion | None = None,
         generation: Generation | None = None,
         clustering: Clustering | None = None,
+        extractor: Extractor | None = None,
     ) -> Configuration:
         """Build from typed sections. A section left ``None`` is absent — the loaders
         already treat ``{}`` and absent alike. ``models.family`` is expanded into
@@ -405,6 +425,7 @@ class Configuration:
             ConfigSection.CONVERSION: conversion,
             ConfigSection.GENERATION: generation,
             ConfigSection.CLUSTERING: clustering,
+            ConfigSection.EXTRACTOR: extractor,
         }
         layer = {s.value: t.table() for s, t in typed.items() if t is not None}
         # A single layer: normalized for the same provider-key and family rules as a

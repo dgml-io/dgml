@@ -725,6 +725,33 @@ Field rules:
 Every other field is passed to the named provider, which declares the keys it
 accepts and rejects the rest — so a custom provider's options go here too.
 
+### `extractor` (optional)
+
+A custom extractor for `dgml extraction extract` (and the auto-extraction on
+assignment): a class that replaces the three LLM phases. Absent, dgml's own
+pipeline runs. See [custom-extractors.md](custom-extractors.md).
+
+```toml
+[extractor]
+provider = "my_pkg.extractors:InvoiceExtractor"
+fallback = true
+max_concurrency = 5
+model = "my-model"
+```
+
+Field rules:
+
+- `provider` — required. A dotted `"module.path:ClassName"` naming an
+  `ValueExtractor` subclass. Resolved and validated when the config is loaded.
+- `fallback` — optional, default `true`. Whether a file the extractor fails
+  (an exception, or an invalid tree) is extracted by dgml's own pipeline
+  instead. `false` fails the file with the extractor's error.
+- `max_concurrency` — optional positive int, default 5. Files extracted
+  concurrently by the default `extract_many` under `--batch`.
+
+Every other field is passed to the named class, which declares the keys it
+accepts and rejects the rest.
+
 ### `grounded` (optional, required for `dgml docset schema generate` / `dgml file extract`)
 
 The two models default to tiers — `schema_model` ← `expert`, `values_model` ←
@@ -1139,7 +1166,7 @@ One record:
 {
   "at": "2026-05-15T17:42:00Z",
   "operation": "extract_values",     // classify | cluster | schema_generate | extract_values | transcribe | label | links | hybrid_merge | style_annotate | batch_unused | llm_call (no operation named); a library caller's LLMConfig may name its own
-  "model": "gemini/gemini-3-flash-preview",
+  "model": "gemini/gemini-3-flash-preview",  // null only on a failed extract_values row where no model ran (a custom extractor failed with no fallback)
   "cost_usd": 0.0123,                // null when litellm doesn't price the model
   "prompt_tokens": 12345,
   "completion_tokens": 234,
@@ -1268,6 +1295,9 @@ itself, so a workspace whose batch runs all finished has no `batches/`.
   by every resumed run (`docset generate`'s `schema.json` and
   `concept_roster.json`). Inputs recorded only by presence (a document's
   `_blocks.json`) have no file here; their flag is in `job.json` `inputs`.
+  `inputs/extractor/<docset_id>/<file_id>.json` is a custom extractor's
+  validated output for one file of an `extraction extract --batch` job, so a
+  resumed run reads it back instead of calling the extractor again.
 
 ## `docsets/<id>/files/<file_id>/<stem>.dgml.xml` (optional)
 

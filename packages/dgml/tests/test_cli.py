@@ -29,7 +29,7 @@ from unittest.mock import patch
 
 import pytest
 from dgml.cli import main
-from dgml_core import layout
+from dgml_core import ExtractionRequest, ExtractorConfig, ExtractorOutput, ValueExtractor, layout
 from dgml_core.conversion import ConverterConfig, DocConverter
 from dgml_core.docsets import DocSetStore
 from dgml_core.errors import FileNotFound, InvalidArgument
@@ -6166,6 +6166,234 @@ def test_extraction_extract_records_usage_under_debug(
     assert stats is not None and stats["outcome"] == "ok"
 
 
+class CliFakeExtractor(ValueExtractor):
+    """A custom extractor the CLI tests point ``[extractor] provider`` at: boxes
+    ``VendorName`` on the seeded page, or fails the file ids in ``failing``."""
+
+    name: ClassVar[str] = "clifake"
+    config_fields: ClassVar[frozenset[str]] = frozenset()
+    failing: ClassVar[set[str]] = set()
+
+    @classmethod
+    def parse_config(cls, config: ExtractorConfig) -> ExtractorConfig:
+        return config
+
+    def __init__(self, config: ExtractorConfig) -> None:
+        self.config = config
+
+    def extract(self, request: ExtractionRequest) -> ExtractorOutput:
+        if request.file_id in self.failing:
+            raise RuntimeError("fake extractor failed")
+        return ExtractorOutput(
+            values={
+                "VendorName": {
+                    "text": "Acme",
+                    "locations": [{"page_number": 1, "bounding_box": [10, 10, 60, 30]}],
+                }
+            },
+            model="fake-model",
+        )
+
+
+def _seed_page_text_with_words(ws: Path, fid: str) -> None:
+    """A text layer printing "Acme" where the fake extractor boxes it, so the
+    box verification (which reads the page size) keeps the box."""
+    Workspace(root=ws).blobs.put_blob(
+        layout.file_page_text_key(fid, 1),
+        json.dumps(
+            {
+                "file_id": fid,
+                "page": 1,
+                "width": 1000,
+                "height": 1000,
+                "words": [{"t": "Acme", "l": [10, 10, 60, 30]}],
+            }
+        ).encode(),
+    )
+
+
+def _install_cli_extractor(
+    ws: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fallback: bool | None = None,
+    values_model: str = "gemini/gemini-3.1-pro-preview",
+) -> str:
+    """Write a `[grounded]` plus `[extractor]` config naming the fake extractor
+    above (resolved by its dotted path), and return that path."""
+    monkeypatch.setattr(CliFakeExtractor, "failing", set())
+    provider = f"{__name__}:CliFakeExtractor"
+    extractor: dict[str, Any] = {"provider": provider}
+    if fallback is not None:
+        extractor["fallback"] = fallback
+    Workspace(root=ws).config_path.write_text(
+        dump_toml(
+            {
+                "grounded": {
+                    "schema_model": "anthropic/claude-opus-4-7",
+                    "values_model": values_model,
+                },
+                "extractor": extractor,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return provider
+
+
+def test_extraction_extract_reports_the_custom_extractor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `[extractor]` configured, the single-file and per-file payloads gain
+    an `extractor` block naming the provider and whether the file fell back;
+    `model` is what produced the values. No model call is made for a file the
+    extractor handled."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    provider = _install_cli_extractor(ws, monkeypatch)
+    ds_id = _new_docset(ws, capsys)
+    schema_file = tmp_path / "schema.rnc"
+    schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
+    main(_ws_args(ws) + ["extraction", "set-schema", ds_id, "--schema-file", str(schema_file)])
+    capsys.readouterr()
+    wsx = Workspace(root=ws)
+    store = DocSetStore(wsx)
+    for fid in ("fileextr0001", "fileextr0002"):
+        _seed_file_dir(ws, fid, pages=1)
+        _seed_page_text_with_words(ws, fid)
+        store.add_file(ds_id, fid)
+
+    with patch("litellm.completion", side_effect=AssertionError("no model call")):
+        assert main(_ws_args(ws) + ["extraction", "extract", ds_id, "fileextr0001"]) == 0
+    one = _read_stdout(capsys)
+    assert one["extractor"] == provider
+    assert one["model"] == "fake-model" and one["field_count"] == 1
+    xml = Workspace(root=ws).blobs.get_blob(one["xml_key"]).decode("utf-8")
+    assert f'dg:extractor="{provider}"' in xml
+
+    # Several files: the second falls back to dgml's own pipeline.
+    CliFakeExtractor.failing.add("fileextr0002")
+    values = {"VendorName": {"text": "Acme", "locations": []}}
+    with patch(
+        "litellm.completion", return_value=_tool_response("submit_values", {"values": values})
+    ):
+        rc = main(_ws_args(ws) + ["extraction", "extract", ds_id, "fileextr0001", "fileextr0002"])
+    assert rc == 0
+    many = _read_stdout(capsys)
+    assert many["model"] == "gemini/gemini-3.1-pro-preview"  # the run's values model
+    results = {r["file_id"]: r for r in many["results"]}
+    assert results["fileextr0001"]["extractor"] == provider
+    assert results["fileextr0001"]["model"] == "fake-model"
+    assert results["fileextr0002"]["extractor"] is None  # fell back to dgml's own pipeline
+    assert results["fileextr0002"]["model"] == "gemini/gemini-3.1-pro-preview"
+
+    # --no-extractor-fallback: the failing file is reported failed instead,
+    # with no model, since none ran for it.
+    with patch("litellm.completion", side_effect=AssertionError("no model call")):
+        rc = main(
+            _ws_args(ws)
+            + ["extraction", "extract", ds_id, "fileextr0002", "--no-extractor-fallback"]
+        )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "EXTRACTOR_FAILED" and "fake extractor failed" in err["message"]
+    with patch("litellm.completion", side_effect=AssertionError("no model call")):
+        rc = main(
+            _ws_args(ws)
+            + [
+                "extraction",
+                "extract",
+                ds_id,
+                "fileextr0001",
+                "fileextr0002",
+                "--no-extractor-fallback",
+            ]
+        )
+    assert rc == 0
+    results = {r["file_id"]: r for r in _read_stdout(capsys)["results"]}
+    assert results["fileextr0001"]["status"] == "ok"
+    assert results["fileextr0002"]["status"] == "failed"
+    assert results["fileextr0002"]["model"] is None
+    assert results["fileextr0002"]["extractor"] is None
+    assert results["fileextr0002"]["error"]["code"] == "EXTRACTOR_FAILED"
+
+
+def test_extraction_extract_refuses_no_extractor_fallback_without_an_extractor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _write_grounded_config(ws)
+    ds_id = _new_docset(ws, capsys)
+    with patch("litellm.completion") as mock_completion:
+        rc = main(
+            _ws_args(ws) + ["extraction", "extract", ds_id, "somefile", "--no-extractor-fallback"]
+        )
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "INVALID_ARGUMENT"
+    assert "no custom extractor" in err["message"]
+    mock_completion.assert_not_called()
+
+
+def test_extraction_extract_batch_skips_the_values_model_check_when_it_never_runs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extractor that may not fall back never calls the values model, so
+    `--batch` does not refuse a values model with no batch backend: the run
+    reports a `batch` block of zeros with `provider: null`."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    _install_cli_extractor(
+        ws, monkeypatch, values_model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
+    )
+    ds_id = _new_docset(ws, capsys)
+    schema_file = tmp_path / "schema.rnc"
+    schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
+    main(_ws_args(ws) + ["extraction", "set-schema", ds_id, "--schema-file", str(schema_file)])
+    capsys.readouterr()
+    store = DocSetStore(Workspace(root=ws))
+    for fid in ("fileextr0001", "fileextr0002"):
+        _seed_file_dir(ws, fid, pages=1)
+        _seed_page_text_with_words(ws, fid)
+        store.add_file(ds_id, fid)
+    argv = _ws_args(ws) + ["extraction", "extract", ds_id, "--all", "--batch"]
+
+    with patch("litellm.completion", side_effect=AssertionError("no model call")):
+        assert main(argv) == 1  # the values model may run as the fallback
+    assert _read_stderr(capsys)["error"]["code"] == "BATCH_UNAVAILABLE"
+
+    with patch("litellm.completion", side_effect=AssertionError("no model call")):
+        assert main([*argv, "--no-extractor-fallback"]) == 0
+    payload = _read_stdout(capsys)
+    assert payload["summary"] == {"total": 2, "ok": 2, "failed": 0}
+    assert payload["batch"]["provider"] is None and payload["batch"]["requests"] == 0
+
+
+def test_extraction_extract_reports_a_broken_extractor_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    Workspace(root=ws).config_path.write_text(
+        dump_toml(
+            {
+                "grounded": {"schema_model": "a/b", "values_model": "c/d"},
+                "extractor": {"provider": "no.such.module:Nope"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    ds_id = _new_docset(ws, capsys)
+    rc = main(_ws_args(ws) + ["extraction", "extract", ds_id, "somefile"])
+    assert rc == 1
+    assert _read_stderr(capsys)["error"]["code"] == "EXTRACTOR_CONFIG_INVALID"
+
+
 def test_docset_add_file_auto_extracts_when_schema_set(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -6213,6 +6441,64 @@ def test_docset_add_file_auto_extracts_when_schema_set(
     xml = _wsx.blobs.get_blob(layout.dgml_xml_key(ds_id, "fileauto0001", "doc")).decode("utf-8")
     assert "<dg:extraction>" in xml
     assert "Acme" in xml
+
+
+def test_docset_add_file_reports_the_custom_extractor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auto-extract block says what ran: the extractor's model and
+    provider when its values were written; no model and no extractor when
+    the extractor failed with no fallback; the values model (and no
+    extractor) once a fallback ran, whether or not it succeeded."""
+    ws = tmp_path / "ws"
+    _init_ws(ws)
+    capsys.readouterr()
+    provider = _install_cli_extractor(ws, monkeypatch, fallback=False)
+    ds_id = _new_docset(ws, capsys)
+    schema_file = tmp_path / "schema.rnc"
+    schema_file.write_text(_RNC_SCHEMA, encoding="utf-8")
+    main(_ws_args(ws) + ["extraction", "set-schema", ds_id, "--schema-file", str(schema_file)])
+    capsys.readouterr()
+    for fid in ("fileauto0005", "fileauto0006", "fileauto0007", "fileauto0008"):
+        _seed_file_dir(ws, fid, pages=1)
+        _seed_page_text_with_words(ws, fid)
+
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        assert main(_ws_args(ws) + ["docset", "add-file", "fileauto0005", "--docset", ds_id]) == 0
+    extraction = _read_stdout(capsys)["extraction"]
+    assert extraction["error"] is None
+    assert extraction["model"] == "fake-model" and extraction["extractor"] == provider
+
+    # The extractor fails and fallback = false: no model ran at all.
+    failing = {"fileauto0006", "fileauto0007", "fileauto0008"}
+    monkeypatch.setattr(CliFakeExtractor, "failing", failing)
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        assert main(_ws_args(ws) + ["docset", "add-file", "fileauto0006", "--docset", ds_id]) == 0
+    extraction = _read_stdout(capsys)["extraction"]
+    assert extraction["error"].startswith("EXTRACTOR_FAILED")
+    assert extraction["model"] is None and extraction["extractor"] is None
+
+    # The fallback ran and failed after its call: the values model ran.
+    _install_cli_extractor(ws, monkeypatch, fallback=True)
+    monkeypatch.setattr(CliFakeExtractor, "failing", {"fileauto0007", "fileauto0008"})
+    bogus = {"Bogus": {"text": "x", "locations": [{"page_number": 1}]}}
+    response = _tool_response("submit_values", {"values": bogus})
+    with patch("litellm.completion", return_value=response):
+        assert main(_ws_args(ws) + ["docset", "add-file", "fileauto0007", "--docset", ds_id]) == 0
+    extraction = _read_stdout(capsys)["extraction"]
+    assert "VALUES_EXTRACTION_FAILED" in extraction["error"]
+    assert extraction["model"] == "gemini/gemini-3.1-pro-preview"
+    assert extraction["extractor"] is None
+
+    # The fallback ran and succeeded.
+    values = {"VendorName": {"text": "Acme", "method": "defaulted"}}
+    response = _tool_response("submit_values", {"values": values})
+    with patch("litellm.completion", return_value=response):
+        assert main(_ws_args(ws) + ["docset", "add-file", "fileauto0008", "--docset", ds_id]) == 0
+    extraction = _read_stdout(capsys)["extraction"]
+    assert extraction["error"] is None
+    assert extraction["model"] == "gemini/gemini-3.1-pro-preview"
+    assert extraction["extractor"] is None
 
 
 def test_docset_add_file_without_schema_has_no_extraction_block(

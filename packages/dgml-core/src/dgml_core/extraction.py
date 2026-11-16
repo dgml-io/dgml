@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 from .dgml_output import read_dgml
 from .docsets import DocSetStore
-from .errors import DgmlError, ValuesNotFound
+from .errors import DgmlError, InvalidArgument, ValuesNotFound
 from .storage import Workspace
 
 if TYPE_CHECKING:
@@ -67,6 +67,11 @@ def auto_extract(
     reports what it spent before failing (the error's ``usage``); it is
     ``None`` when nothing was spent (a config error) or the totals could not
     be built.
+
+    ``model`` is what produced the values, or what ran before the failure:
+    see :func:`failed_run_model`. With a custom extractor configured the block
+    also carries ``extractor``, as the CLI's extract payload does: the provider
+    whose values were written, ``None`` on a failure or after a fallback.
     """
     from .grounded import extract_values, load_grounded_config
 
@@ -84,6 +89,7 @@ def auto_extract(
         _log_auto_extract_failed(file_id, docset_id, block["error"])
         return block
     block["model"] = config.values_model
+    block.update(extractor_key(config, None))
     # extract_values logs the run's start and finish; only the soft failure,
     # which is this caller's call, is logged here.
     try:
@@ -98,6 +104,7 @@ def auto_extract(
     except DgmlError as exc:
         block["error"] = f"{exc.code}: {exc}"
         block["usage"] = exc.usage
+        block["model"] = failed_run_model(config, exc)
         _log_auto_extract_failed(file_id, docset_id, block["error"])
         return block
     except Exception as exc:
@@ -108,11 +115,44 @@ def auto_extract(
         # the parent command exits 0. The traceback goes to the log, since
         # the block can only carry the message.
         block["error"] = f"{type(exc).__name__}: {exc}"
+        block["model"] = failed_run_model(config, exc)
         _log_auto_extract_failed(file_id, docset_id, block["error"], exc_info=True)
         return block
+    block["model"] = result.model
     block["tool_calls"] = result.tool_calls
     block["usage"] = result.usage or None
+    block.update(extractor_key(config, result.extractor))
     return block
+
+
+def extractor_key(config: GroundedConfig, extractor: str | None) -> dict[str, Any]:
+    """The ``extractor`` key of an auto-extract block: present only when a
+    custom extractor is configured, holding the provider whose values were
+    written (``ExtractionResult.extractor``) or ``None``."""
+    if config.extractor is None:
+        return {}
+    return {"extractor": extractor}
+
+
+def failed_run_model(config: GroundedConfig, exc: BaseException) -> str | None:
+    """What an auto-extract block's ``model`` says of a run that failed with
+    *exc*.
+
+    The values model, which ran or was about to: a run without a custom
+    extractor, and one whose extractor failed and whose fallback then ran,
+    whatever the fallback's outcome. ``None`` when the configured extractor
+    failed and no fallback ran (``fallback = false``), since no model ran at
+    all. The extractor's own model when its values were taken and the run
+    failed after that. This is the ``model`` of the stats the error carries
+    (the run's ``model_ran``); an error raised before the run started (an
+    unassigned file, a missing schema) carries none and is reported against
+    the values model.
+    """
+    stats = getattr(exc, "stats", None)
+    if not stats:
+        return config.values_model
+    model = stats.get("model")
+    return model if isinstance(model, str) else None
 
 
 def _log_auto_extract_failed(
@@ -171,6 +211,7 @@ def extract_file(
     values_model: str | None = None,
     values_effort: str | None = None,
     locations_effort: str | None = None,
+    extractor_fallback: bool | None = None,
     write_stats: bool = False,
     record_usage: bool = False,
 ) -> ExtractionResult:
@@ -193,6 +234,9 @@ def extract_file(
     model's whole credential group, so neither the section's ``values_*`` keys nor
     a tier's carry over to the new model
     (see :func:`~dgml_core.grounded.load_grounded_config`).
+    ``extractor_fallback`` overrides ``extractor.fallback`` for this call (a
+    custom extractor, :mod:`dgml_core.extractor`); it is
+    :class:`~dgml_core.errors.InvalidArgument` when no extractor is configured.
     ``write_stats`` and ``record_usage`` (both off by default) are forwarded
     to :func:`~dgml_core.grounded.extract_values`; the result's ``usage`` and
     ``stats`` carry the same numbers either way.
@@ -204,6 +248,7 @@ def extract_file(
         values_model=values_model,
         values_effort=values_effort,
         locations_effort=locations_effort,
+        extractor_fallback=extractor_fallback,
     )
     try:
         return extract_values(
@@ -234,6 +279,7 @@ def extraction_config(
     values_model: str | None = None,
     values_effort: str | None = None,
     locations_effort: str | None = None,
+    extractor_fallback: bool | None = None,
 ) -> GroundedConfig:
     """The workspace's grounded config with :func:`extract_file`'s per-call
     overrides applied — the config every ``dgml extraction extract`` form
@@ -243,6 +289,13 @@ def extraction_config(
     from .grounded import load_grounded_config, parse_reasoning_effort
 
     config = load_grounded_config(ws, values_model=values_model)
+    if extractor_fallback is not None:
+        if config.extractor is None:
+            raise InvalidArgument(
+                "no custom extractor is configured ([extractor] in config.toml), "
+                "so there is no extractor fallback to set"
+            )
+        config = replace(config, extractor=replace(config.extractor, fallback=extractor_fallback))
     if values_effort is not None:
         config = replace(
             config,

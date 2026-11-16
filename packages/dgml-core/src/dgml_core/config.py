@@ -132,6 +132,7 @@ def _build_settings_class(user_path: Path, ws_config: dict[str, Any] | None) -> 
         grounded: dict[str, Any] = {}
         classification: dict[str, Any] = {}
         ocr: dict[str, Any] = {}
+        extractor: dict[str, Any] = {}
         pdf: dict[str, Any] = {}
         style: dict[str, Any] = {}
         text_extraction: dict[str, Any] = {}
