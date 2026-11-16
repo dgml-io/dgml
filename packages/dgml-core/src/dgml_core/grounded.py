@@ -115,6 +115,7 @@ from .extractor import (
     make_extractor,
     output_from_json,
     output_to_json,
+    resolve_extractor_class,
     validate_extractor_output,
 )
 from .files import FileStore
@@ -2021,7 +2022,10 @@ class _FileExtraction:
         return self.model_used()
 
     def _extractor_verifies_boxes(self) -> bool:
-        return isinstance(self.extractor, ValueExtractor) and bool(self.extractor.verifies_boxes)
+        # Read from the class, not ``self.extractor``: the batch driver keeps
+        # the run's one instance to itself, and a replayed output has none.
+        config = self.extractor_config
+        return config is not None and bool(resolve_extractor_class(config.provider).verifies_boxes)
 
     def fail(self, exc: BaseException) -> None:
         """Note why the run failed, for the usage row and the stats, and keep

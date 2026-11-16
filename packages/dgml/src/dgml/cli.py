@@ -4476,6 +4476,13 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         if extracting
         else None
     )
+    if grounded is not None and args.no_extractor_fallback and grounded.extractor is None:
+        # The extract step refuses this (INVALID_ARGUMENT); refused now, before
+        # the earlier steps pay.
+        raise InvalidArgument(
+            "no custom extractor is configured ([extractor] in config.toml), "
+            "so there is no extractor fallback to set"
+        )
 
     session = None
     if batch:

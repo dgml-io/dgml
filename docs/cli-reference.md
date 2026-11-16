@@ -1426,7 +1426,9 @@ the step and the flag, instead of argparse usage text (exit 2) from the
 generate step after the schema step has already paid. A bad `--values-effort`
 or `--locations-effort` is refused up front too (`GROUNDED_CONFIG_INVALID`), and
 so is a missing `grounded` config when the extract step will run
-(`GROUNDED_CONFIG_MISSING`), with or without `--batch`.
+(`GROUNDED_CONFIG_MISSING`), with or without `--batch`. So is
+`--no-extractor-fallback` when no `[extractor]` is configured and the extract
+step will run (`INVALID_ARGUMENT`).
 
 ```json
 {"error": {"code": "INVALID_ARGUMENT",

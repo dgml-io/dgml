@@ -681,9 +681,12 @@ def test_verify_boxes_and_drop_unboxed_still_run(workspace: Workspace, fake: str
     assert result.stats["matching"]["dropped_unboxed_values"] == 1
 
 
+@pytest.mark.parametrize("batch", [False, True])
 def test_self_verifying_extractor_keeps_its_boxes_and_reports_the_counts(
-    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, batch: bool
 ) -> None:
+    """The same under ``--batch``, where the run's one instance stays in the
+    batch driver and each file's run has none."""
     provider = install(monkeypatch, SelfVerifyingExtractor)
     fid = "f1aaaaaaaaaa"
     ds_id = _seed(workspace, fid)
@@ -691,7 +694,16 @@ def test_self_verifying_extractor_keeps_its_boxes_and_reports_the_counts(
     SelfVerifyingExtractor.outputs[fid] = ExtractorOutput(
         values={"title": {"text": "2024-01-05", "locations": [_loc(box=HELLO_WORLD_BOX)]}}
     )
-    result = extract_values(workspace, ds_id, fid, config=_config(provider))
+    if batch:
+        _backend()
+        many = extract_values_many(
+            workspace, ds_id, [fid], config=_config(provider), batch=True, poll_interval_s=0
+        )
+        outcome = many.outcomes[fid]
+        assert not isinstance(outcome, Exception)
+        result = outcome
+    else:
+        result = extract_values(workspace, ds_id, fid, config=_config(provider))
     assert result.values["title"]["text"] == "2024-01-05"
     assert result.values["title"]["locations"] == [
         {"page_number": 1, "bounding_box": HELLO_WORLD_BOX}

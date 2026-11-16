@@ -424,6 +424,22 @@ def test_existing_schema_is_reused_and_steps_can_be_skipped(
 # ---- failures --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("batch", [[], ["--batch"]])
+def test_no_extractor_fallback_without_an_extractor_is_refused_before_any_step(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], batch: list[str]
+) -> None:
+    """As `extraction extract` refuses it, and before generate pays."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        rc = main(_run_argv(ws, did, "--no-extractor-fallback", *batch))
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "INVALID_ARGUMENT" and "no custom extractor" in err["message"]
+    # The run's own error, not a step's: no step ran (generate would have paid).
+    assert "details" not in err and "step" not in err["message"]
+    assert list_jobs(Workspace(root=ws)) == []
+
+
 def test_batch_unavailable_names_the_offending_step(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
