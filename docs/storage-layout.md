@@ -771,6 +771,10 @@ Field rules:
   checked by name, not against what the model supports: one the provider
   refuses fails in phase 3, after the values call has been paid for, on the
   first page that needs grounding.
+- `call_timeout_seconds` — optional positive number, default `1800`. The
+  timeout of every model call schema generation and extraction make. Set it
+  below your own deadline when the pipeline runs inside a bounded function, so
+  a call doesn't keep running (and billing) after the caller has given up.
 
 ### `generation` (required for `dgml docset generate`)
 

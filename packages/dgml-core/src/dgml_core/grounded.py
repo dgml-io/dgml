@@ -252,7 +252,7 @@ _PHASE3_GRID_REASONING_EFFORT = "medium"
 # extractions on a multi-page document (observed real-world timeouts
 # at ~13min on a 7-page ledger with reasoning=high). 30 min gives
 # the model room to think through a long table without us cutting
-# the connection.
+# the connection. The default of ``grounded.call_timeout_seconds``.
 _DEFAULT_TIMEOUT_SECONDS = 1800
 
 # Default number of files the schema-generation step samples from a
@@ -340,6 +340,10 @@ class GroundedConfig:
     # Checked by name only: a budget the model refuses fails in phase 3, after
     # the values call has been paid for, on the first page that needs grounding.
     locations_reasoning_effort: str | None = _LOCATIONS_REASONING_EFFORT
+    # Timeout of every model call schema generation and extraction make, in
+    # seconds. A caller with its own deadline sets it shorter, so a call isn't
+    # left running (and billing) after the caller has given up on it.
+    call_timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
 
 
 def parse_reasoning_effort(raw: Any, *, source: str) -> str | None:
@@ -431,6 +435,15 @@ def load_grounded_config(
         if "locations_reasoning_effort" in sec
         else _LOCATIONS_REASONING_EFFORT
     )
+    call_timeout_raw = sec.get("call_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
+    if (
+        not isinstance(call_timeout_raw, (int, float))
+        or isinstance(call_timeout_raw, bool)
+        or not call_timeout_raw > 0
+    ):
+        raise GroundedConfigInvalid(
+            "'grounded.call_timeout_seconds' must be a positive number if set"
+        )
 
     return GroundedConfig(
         schema_model=schema.model,
@@ -444,6 +457,7 @@ def load_grounded_config(
         max_tool_iters=max_tool_iters_raw,
         values_reasoning_effort=values_reasoning_effort,
         locations_reasoning_effort=locations_reasoning_effort,
+        call_timeout_seconds=float(call_timeout_raw),
     )
 
 
@@ -663,7 +677,7 @@ def generate_schema_steps(
         api_base=config.schema_api_base,
         max_tokens=None,
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
-        timeout=_DEFAULT_TIMEOUT_SECONDS,
+        timeout=config.call_timeout_seconds,
         reasoning_effort=_DEFAULT_REASONING_EFFORT,
         workspace=workspace,
         record_usage=record_usage,
@@ -1302,6 +1316,7 @@ class _FileExtraction:
             self.api_key,
             self.api_base,
             self.config.values_reasoning_effort,
+            timeout=self.config.call_timeout_seconds,
         )
 
     def phase1_steps(self) -> LLMSteps[Phase1Result]:
@@ -1382,6 +1397,7 @@ class _FileExtraction:
             api_base=self.api_base,
             max_tool_iters=self.config.max_tool_iters,
             reasoning_effort=self.config.values_reasoning_effort,
+            timeout=self.config.call_timeout_seconds,
         )
 
     def mirror_phase1(self) -> None:
@@ -1516,6 +1532,7 @@ class _FileExtraction:
             self.api_key,
             self.api_base,
             reasoning_effort=self.config.locations_reasoning_effort,
+            timeout=self.config.call_timeout_seconds,
         )
 
     def phase3_steps(
@@ -1534,6 +1551,7 @@ class _FileExtraction:
             max_tool_iters=self.config.max_tool_iters,
             totals=totals,
             reasoning_effort=self.config.locations_reasoning_effort,
+            timeout=self.config.call_timeout_seconds,
         )
 
     def fold_failed_phase3(self, page_totals: list[dict[str, Any]]) -> None:
@@ -2411,6 +2429,8 @@ def _phase1_llm_config(
     api_key: str | None,
     api_base: str | None,
     reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> LLMConfig:
     """The request config for every phase-1 turn.
 
@@ -2431,7 +2451,7 @@ def _phase1_llm_config(
         max_tokens=None,
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
-        timeout=_DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
     )
 
@@ -2442,6 +2462,7 @@ def _phase3_llm_config(
     api_base: str | None,
     *,
     reasoning_effort: str | None,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> LLMConfig:
     """The request config for a phase-3 page call.
 
@@ -2459,7 +2480,7 @@ def _phase3_llm_config(
         max_tokens=None,
         max_completion_tokens=_DEFAULT_MAX_COMPLETION_TOKENS,
         temperature=_DEFAULT_VALUES_TEMPERATURE,
-        timeout=_DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
     )
 
@@ -2605,6 +2626,7 @@ def phase3_page_steps(
     max_tool_iters: int,
     totals: dict[str, Any] | None = None,
     reasoning_effort: str | None,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> LLMSteps[_Phase3PageResult]:
     """Phase 3 for ONE page, as an :data:`~dgml_core.llm.LLMSteps` generator.
 
@@ -2691,6 +2713,7 @@ def phase3_page_steps(
         api_key,
         api_base,
         reasoning_effort=_PHASE3_GRID_REASONING_EFFORT if normalized else reasoning_effort,
+        timeout=timeout,
     )
     forced_tool_choice = {
         "type": "function",
@@ -3586,6 +3609,7 @@ def phase1_steps(
     api_base: str | None,
     max_tool_iters: int,
     reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> LLMSteps[Phase1Result]:
     """Phase 1 for ONE file, as an :data:`~dgml_core.llm.LLMSteps` generator.
 
@@ -3657,6 +3681,7 @@ def phase1_steps(
                         vocab=vocab,
                         counters=run.counters,
                         reasoning_effort=reasoning_effort,
+                        timeout=timeout,
                         page_offset=part.first_page - 1 if part is not None else 0,
                     )
                 )
@@ -3923,6 +3948,7 @@ def _phase1_attempt_steps(
     chunked: bool = False,
     permissive: bool = False,
     reasoning_effort: str | None = _VALUES_REASONING_EFFORT,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
     page_offset: int = 0,
 ) -> LLMSteps[tuple[dict[str, Any], int, int]]:
     """One phase-1 attempt: a multi-turn loop until the model finishes submitting.
@@ -4004,7 +4030,7 @@ def _phase1_attempt_steps(
     # they get "required" and can never end a turn without a tool call.
     # ``reasoning_effort`` is that constant unless the workspace set
     # ``grounded.values_reasoning_effort`` (``None`` = send none).
-    llm_config = _phase1_llm_config(model, api_key, api_base, reasoning_effort)
+    llm_config = _phase1_llm_config(model, api_key, api_base, reasoning_effort, timeout=timeout)
 
     tool_calls_run = 0
     chunk_calls = 0
