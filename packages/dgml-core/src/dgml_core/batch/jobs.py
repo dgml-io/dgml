@@ -34,7 +34,8 @@ identical documents, say) each keep their own response.
 **The digest** is the SHA-256 of the litellm completion kwargs serialized as
 canonical JSON (sorted keys, no whitespace), leaving out what is not part of
 the request's meaning: the credential (``api_key``), transport settings
-(``timeout``, ``client``, ``logger_fn``) and any credential-bearing header.
+(``timeout``, ``client``, ``logger_fn``, a streamed request's total deadline
+:data:`dgml_core.llm.STREAM_DEADLINE_KWARG`) and any credential-bearing header.
 The same request therefore digests identically in every process, whatever
 the hash seed, and a changed input (a different page, prompt or model)
 produces a different digest — so a stale stored response is never replayed
@@ -509,7 +510,9 @@ def late_billed_summary(manifest: Manifest) -> dict[str, Any] | None:
 
 
 #: kwargs that are not part of a request's meaning (credentials, transport).
-_NON_SEMANTIC_KWARGS = frozenset({"api_key", "timeout", "client", "logger_fn"})
+_NON_SEMANTIC_KWARGS = frozenset(
+    {"api_key", "timeout", "client", "logger_fn", llm.STREAM_DEADLINE_KWARG}
+)
 #: Header names that carry credentials, dropped from any header mapping.
 _CREDENTIAL_HEADERS = frozenset({"authorization", "x-api-key", "api-key", "x-goog-api-key"})
 #: The only hidden response fields a stored response keeps: the cost the

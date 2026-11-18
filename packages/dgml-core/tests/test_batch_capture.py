@@ -63,6 +63,19 @@ def test_capture_returns_the_body_litellm_would_post_and_sends_nothing() -> None
     assert "test-key" not in str(captured.body)  # the key travels as a header only
 
 
+def test_capture_drops_a_streamed_requests_deadline_from_the_body() -> None:
+    """The total deadline a streamed request carries is not a provider
+    parameter; litellm would copy it into the body a batch sends."""
+    from dgml_core import llm
+
+    kwargs = {**_KWARGS, "stream": True, llm.STREAM_DEADLINE_KWARG: 1800}
+    captured = capture_sync_request(
+        kwargs, seam=HTTPX_HANDLER, reply=_REPLY, api_key="test-key", expect_path="/v1/messages"
+    )
+    assert llm.STREAM_DEADLINE_KWARG not in captured.body
+    assert kwargs[llm.STREAM_DEADLINE_KWARG] == 1800  # the caller's kwargs are untouched
+
+
 def test_capture_leaves_the_callers_kwargs_untouched() -> None:
     before = repr(_KWARGS)
     capture_sync_request(_KWARGS, seam=HTTPX_HANDLER, reply=_REPLY, api_key="k")

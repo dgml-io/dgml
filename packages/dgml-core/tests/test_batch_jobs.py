@@ -128,7 +128,7 @@ def _texts(responses: dict[str, Any]) -> dict[str, str]:
 
 def test_digest_ignores_credentials_and_transport_but_not_content() -> None:
     base = _kwargs("hello")
-    same = {**base, "api_key": SECRET, "timeout": 30.0}
+    same = {**base, "api_key": SECRET, "timeout": 30.0, llm.STREAM_DEADLINE_KWARG: 1800}
     assert request_digest(same) == request_digest(base)
     headers_a = {**base, "extra_headers": {"anthropic-beta": "x", "x-api-key": "k1"}}
     headers_b = {**base, "extra_headers": {"anthropic-beta": "x", "Authorization": "k2"}}
