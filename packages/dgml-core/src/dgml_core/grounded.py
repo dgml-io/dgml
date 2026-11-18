@@ -398,11 +398,17 @@ def load_grounded_config(
     *,
     schema_model: str | None = None,
     values_model: str | None = None,
+    extractor: bool = True,
 ) -> GroundedConfig:
     """Resolve the two grounded models (schema generation → ``expert`` tier,
     value extraction → ``advanced`` tier) and their credentials from the merged
     config's ``[grounded]`` section and ``[models]`` tiers. A model set on the
     section overrides its tier.
+
+    The ``[extractor]`` section is loaded too, which imports the extractor
+    class and runs its ``parse_config``. A caller that never extracts values
+    passes ``extractor=False``: the section is not read, ``extractor`` is
+    ``None``, and a broken ``[extractor]`` table cannot fail it.
 
     ``schema_model`` / ``values_model`` are per-call overrides, applied as the
     merged config's highest layer (``cli_overrides``): an override replaces that
@@ -473,7 +479,7 @@ def load_grounded_config(
         max_tool_iters=max_tool_iters_raw,
         values_reasoning_effort=values_reasoning_effort,
         locations_reasoning_effort=locations_reasoning_effort,
-        extractor=load_extractor_config(workspace),
+        extractor=load_extractor_config(workspace) if extractor else None,
     )
 
 

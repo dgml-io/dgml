@@ -624,7 +624,8 @@ def resolve_credential(workspace: Workspace, ref: Mapping[str, Any] | None) -> s
     if section == "grounded":
         from dgml_core.grounded import load_grounded_config
 
-        grounded = load_grounded_config(workspace)
+        # Only the keys are read, so a broken [extractor] does not block them.
+        grounded = load_grounded_config(workspace, extractor=False)
         return grounded.schema_api_key if field_name == "schema" else grounded.values_api_key
     if section == "classification":
         from dgml_core.classification import load_classification_config

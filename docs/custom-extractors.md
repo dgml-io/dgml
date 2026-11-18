@@ -184,6 +184,7 @@ succeeds or replays the fallback's phase 1 if not.
 - A config error (`EXTRACTOR_CONFIG_INVALID`): a bad dotted path, a class that
   is not a `ValueExtractor` or is abstract, `parse_config` raising or returning
   `None`, an unknown option key. Raised at config load. Never falls back.
+  Schema generation does not read `[extractor]`, so it is not affected.
 - The extractor raising (`EXTRACTOR_FAILED`), from `__init__` or `extract`,
   whatever the exception. Raise `ExtractorFailed` for a failure you detect.
 - Invalid output (`EXTRACTOR_OUTPUT_INVALID`).
@@ -196,6 +197,12 @@ own pipeline instead, logged as a WARNING naming the provider and the files
 `ExtractorFailed` or `ExtractorOutputInvalid` message, or the type and
 message of any other exception; the error carries the run's usage and stats.
 An interrupt never falls back.
+
+With `fallback = true` the values model's key is resolved before the extractor
+runs, so a `values_api_key_env` naming an unset variable fails every file with
+`AUTH_ERROR` before the extractor is called, even the files it would have
+handled: a run whose fallback cannot work never pays for the extractor. With
+`fallback = false` the key is not read.
 
 ### What the result says
 

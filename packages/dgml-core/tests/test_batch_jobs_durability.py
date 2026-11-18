@@ -581,7 +581,7 @@ def test_j8_a_credential_whose_config_no_longer_loads_raises(
 ) -> None:
     import dgml_core.grounded as grounded_mod
 
-    def broken(_ws: Workspace) -> Any:
+    def broken(_ws: Workspace, **_kwargs: Any) -> Any:
         raise ValueError("bad [grounded] section")
 
     monkeypatch.setattr(grounded_mod, "load_grounded_config", broken)

@@ -31,7 +31,12 @@ import pytest
 from dgml_core import layout, llm
 from dgml_core.batch import FakeBackend, active_session, provider_of, register_backend
 from dgml_core.batch import registry as batch_registry
-from dgml_core.batch.jobs import BatchJobStore, start_session
+from dgml_core.batch.jobs import (
+    BatchJobStore,
+    credential_ref,
+    resolve_credential,
+    start_session,
+)
 from dgml_core.configuration import Configuration, Identity, Model, Models, ProviderSpec, Storage
 from dgml_core.configuration import Extractor as ExtractorSection
 from dgml_core.docsets import DocSetStore
@@ -291,6 +296,23 @@ def test_load_config_rejects(
     # A config error reaches every extraction caller through the grounded loader.
     with pytest.raises(ExtractorConfigInvalid):
         load_grounded_config(workspace)
+
+
+def test_callers_that_never_extract_skip_a_broken_section(workspace: Workspace) -> None:
+    """``extractor=False`` (schema generation, a batch job's key lookup) does
+    not read ``[extractor]``, so a broken one cannot fail it."""
+    write_config(
+        workspace,
+        {
+            "grounded": {"values_model": "m", "schema_model": "s", "schema_api_key": "sk-schema"},
+            "extractor": {"provider": "no.such.module:Nope"},
+        },
+    )
+    with pytest.raises(ExtractorConfigInvalid):
+        load_grounded_config(workspace)
+    assert load_grounded_config(workspace, extractor=False).extractor is None
+    ref = credential_ref("grounded", "schema", None)
+    assert resolve_credential(workspace, ref) == "sk-schema"
 
 
 def test_section_must_be_a_table(workspace: Workspace) -> None:

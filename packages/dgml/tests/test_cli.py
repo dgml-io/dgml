@@ -5887,16 +5887,21 @@ def test_extraction_generate_schema_no_files(
     mock_completion.assert_not_called()
 
 
+@pytest.mark.parametrize("broken_extractor", [False, True])
 def test_extraction_generate_schema_happy_path(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], broken_extractor: bool
 ) -> None:
     """generate-schema renders the LLM's typed field tree straight to RNC and
     stores it — datatypes preserved, no JSON Schema hop. The sample PDF is placed
-    directly (no ghostscript needed for schema-gen)."""
+    directly (no ghostscript needed for schema-gen). It never reads
+    `[extractor]`, so a broken one does not fail it."""
     ws = tmp_path / "ws"
     _init_ws(ws)
     capsys.readouterr()
     _write_grounded_config(ws)
+    if broken_extractor:
+        with Workspace(root=ws).config_path.open("a", encoding="utf-8") as fh:
+            fh.write('\n[extractor]\nprovider = "no.such.module:Nope"\n')
     ds_id = _new_docset(ws, capsys)
 
     # Seed a file record and its source PDF where generation expects it

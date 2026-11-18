@@ -136,7 +136,7 @@ def generate_schema(ws: Workspace, docset_id: str, file_ids: list[str]) -> dict[
 
     store = DocSetStore(ws)
     ds = store.get(docset_id)
-    config = load_grounded_config(ws)
+    config = load_grounded_config(ws, extractor=False)
     rnc = _generate(ws, file_ids, config=config, docset_name=ds.name)
     store.set_schema(docset_id, rnc)
     return {"docset_id": docset_id, "schema": rnc, "model": config.schema_model}

@@ -3722,7 +3722,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
     if sub == "generate-schema":
         ds = store.get(args.docset_id)  # raises DocSetNotFound
-        config = load_grounded_config(ws, schema_model=args.schema_model or None)
+        config = load_grounded_config(ws, schema_model=args.schema_model or None, extractor=False)
         if args.batch:
             # Before any PDF is read: an unsupported provider is BATCH_UNAVAILABLE,
             # never a silent full-price call.
