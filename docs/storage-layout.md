@@ -771,6 +771,11 @@ Field rules:
   checked by name, not against what the model supports: one the provider
   refuses fails in phase 3, after the values call has been paid for, on the
   first page that needs grounding.
+- `keep_unboxed_values` — optional bool, default `false`. When `true`, a
+  printed value grounding found no box for is written without `dg:origin`
+  instead of dropped, and listed in `matching.kept_unboxed`. For scanned pages,
+  where a value phase 1 read can fail to get a box; such a value can't be
+  checked against the page.
 
 ### `generation` (required for `dgml docset generate`)
 

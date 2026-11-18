@@ -1472,7 +1472,8 @@ Two formats are involved:
 The LLM is configurable like every other model-using command — via the
 `grounded` section of the workspace `config.toml` (`schema_model`,
 `values_model`, `values_reasoning_effort`, `locations_reasoning_effort`, API
-keys, `max_tool_iters`), with per-call overrides on the commands below.
+keys, `max_tool_iters`, `keep_unboxed_values`), with per-call overrides on the
+commands below.
 
 ### `dgml extraction generate-schema <docset_id> [--from-file ID ...] [--schema-model M] [--batch]`
 
@@ -1780,6 +1781,12 @@ are renumbered; a value left with nothing it used is dropped in turn. Each
 dropped value is listed as `"path=text"` in `matching.dropped_unboxed`
 (unsupported ones marked `(unsupported)`).
 
+With `grounded.keep_unboxed_values = true`, a printed value left with no box is
+written anyway, without `dg:origin`, and listed as `"path=text"` in
+`matching.kept_unboxed` (counted in `matching.kept_unboxed_values`). On a
+scanned page, where grounding can miss most boxes, that keeps the values phase
+1 read; nothing in the XML ties them to the page.
+
 A value printed in part keeps its boxes **and** names its inputs, so one
 element holds the whole fact:
 
@@ -1968,7 +1975,9 @@ values calculated from `evidence` text are not recomputed). It also counts
 written), and
 `repaired_inputs` (inputs re-pointed to where their cited text matched), and
 `dropped_unboxed_values` (printed values no box was found for, which are not
-written; `dropped_unboxed` lists each as `"path=text"`), `snapped_boxes` and `rejected_boxes` (boxes whose words on the text
+written; `dropped_unboxed` lists each as `"path=text"`), `kept_unboxed_values`
+and `kept_unboxed` (the same, written anyway under
+`grounded.keep_unboxed_values`), `snapped_boxes` and `rejected_boxes` (boxes whose words on the text
 layer didn't read as their value: moved to the exact match on their line, or
 stripped). The first four replace 0.7's
 `computed_fields` and `dropped_refs`. The top-level

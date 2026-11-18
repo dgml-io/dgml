@@ -220,6 +220,7 @@ class Grounded:
     max_tool_iters: int | None = None
     values_reasoning_effort: str | None = None
     locations_reasoning_effort: str | None = None
+    keep_unboxed_values: bool | None = None
 
     def table(self) -> dict[str, Any]:
         return _table(self)
