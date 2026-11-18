@@ -19,7 +19,11 @@ jobs:
       - uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
+      # Pinned, not the runner's system python3: that moved to 3.14, which
+      # torch has no wheels for. The test job pins its matrix version the same way.
       - run: uv sync --all-extras --dev --locked
+        env:
+          UV_PYTHON: "3.12"
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       # `.gemini/skills/*` are hand-kept mirrors of the canonical `.claude/skills/*`
@@ -36,6 +40,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev --locked
+        env:
+          UV_PYTHON: "3.12"
       - run: uv run mypy packages samples/dgml-sample-service
 
   test:
@@ -107,6 +113,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev --locked
+        env:
+          UV_PYTHON: "3.12"
       - run: uv run pytest packages/dgml-storage-s3 packages/dgml-storage-mongo -v
         env:
           DGML_TEST_S3_ENDPOINT: http://localhost:9000
@@ -124,6 +132,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev --locked
+        env:
+          UV_PYTHON: "3.12"
       - name: Fail on copyleft dependencies
         # `--partial-match` is required for the deny tokens (GPL, AGPL, …)
         # to match real license strings like "GNU General Public License
