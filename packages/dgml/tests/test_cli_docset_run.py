@@ -49,6 +49,7 @@ from dgml_core.storage import Workspace
 from .conftest import dump_toml
 from .test_cli import (
     _RNC_SCHEMA,
+    CliFakeExtractor,
     _init_ws,
     _read_stderr,
     _read_stdout,
@@ -423,6 +424,22 @@ def test_existing_schema_is_reused_and_steps_can_be_skipped(
 # ---- failures --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("batch", [[], ["--batch"]])
+def test_no_extractor_fallback_without_an_extractor_is_refused_before_any_step(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], batch: list[str]
+) -> None:
+    """As `extraction extract` refuses it, and before generate pays."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    with patch("litellm.completion", side_effect=AssertionError("no model call expected")):
+        rc = main(_run_argv(ws, did, "--no-extractor-fallback", *batch))
+    assert rc == 1
+    err = _read_stderr(capsys)["error"]
+    assert err["code"] == "INVALID_ARGUMENT" and "no custom extractor" in err["message"]
+    # The run's own error, not a step's: no step ran (generate would have paid).
+    assert "details" not in err and "step" not in err["message"]
+    assert list_jobs(Workspace(root=ws)) == []
+
+
 def test_batch_unavailable_names_the_offending_step(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -436,6 +453,31 @@ def test_batch_unavailable_names_the_offending_step(
         assert err["code"] == "BATCH_UNAVAILABLE"
         assert f"stage '{step}'" in err["message"]
     assert list_jobs(Workspace(root=ws)) == []  # rejected before any job existed
+
+
+def test_batch_checks_the_values_model_only_when_it_may_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An extractor that may not fall back (`fallback = false` or
+    `--no-extractor-fallback`) never calls the values model, so it is not a
+    batch stage."""
+    ws, did = _seed(tmp_path, capsys, schema=True)
+    wsx = Workspace(root=ws)
+    with wsx.config_path.open("a", encoding="utf-8") as fh:
+        fh.write(f'\n[extractor]\nprovider = "{CliFakeExtractor.__module__}:CliFakeExtractor"\n')
+    seen: list[set[str]] = []
+
+    def stop(stages: dict[str, Any]) -> None:
+        seen.append(set(stages))
+        raise BatchUnavailable("stop here")
+
+    with patch("dgml.cli._batch_preflight", side_effect=stop):
+        assert main(_run_argv(ws, did, "--batch")) == 1
+        assert main(_run_argv(ws, did, "--batch", "--no-extractor-fallback")) == 1
+    capsys.readouterr()
+    assert {"extract", "extract.locations"} <= seen[0]
+    assert not {"extract", "extract.locations"} & seen[1]
+    assert "generate.transcribe" in seen[1]
 
 
 def test_batch_checks_the_style_model_only_when_a_file_is_ocr(

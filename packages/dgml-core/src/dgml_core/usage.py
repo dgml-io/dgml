@@ -117,12 +117,14 @@ class UsageEvent:
 
     ``cost_usd`` and the token counts can be ``None`` when litellm
     doesn't know the price for the model in use; the UX surfaces those
-    as "unknown" rather than treating them as zero.
+    as "unknown" rather than treating them as zero. ``model`` is ``None``
+    only for a failed row where no model ran (a custom value extractor
+    failed with no fallback).
     """
 
     at: str
     operation: UsageOperation | str
-    model: str
+    model: str | None
     cost_usd: float | None
     prompt_tokens: int | None
     completion_tokens: int | None

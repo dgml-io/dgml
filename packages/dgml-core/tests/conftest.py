@@ -336,9 +336,10 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset the library's ``_WARNED_*`` once-per-process warning dedup (see
     the Logging section of ../CLAUDE.md) so tests stay order-independent —
     any test may trigger these paths, not only the modules that assert on them."""
-    from dgml_core import grounded, models_config, ocr
+    from dgml_core import extractor, grounded, models_config, ocr
     from dgml_core.generation import pipeline
 
+    extractor._WARNED_UNSET_KEY_ENV.clear()
     models_config._WARNED_TIER_FALLBACKS.clear()
     models_config._WARNED_DISABLED.clear()
     models_config._WARNED_PROVIDER_KEY_NOT_APPLIED.clear()
@@ -346,6 +347,7 @@ def _reset_warning_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
     grounded._REQUIRED_TOOL_CHOICE_REJECTED.clear()
     grounded._WARNED_TELEMETRY.clear()
     grounded._WARNED_PERMISSIVE_SCHEMA.clear()
+    grounded._WARNED_EXTRACTOR_FALLBACK.clear()
     monkeypatch.setattr(pipeline, "_WARNED_DEBUG_WITHOUT_USAGE", False)
 
 

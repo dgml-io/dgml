@@ -3526,6 +3526,15 @@ def _add_extraction_subparsers(
             "'default' to send no reasoning effort."
         ),
     )
+    ex_extract.add_argument(
+        "--no-extractor-fallback",
+        action="store_true",
+        help=(
+            "With a custom [extractor] configured: fail a file the extractor fails "
+            "instead of extracting it with dgml's own pipeline (overrides "
+            "extractor.fallback for this call). INVALID_ARGUMENT without an extractor."
+        ),
+    )
     _add_batch_arguments(ex_extract, what="extraction")
 
     ex_get_values = extraction.add_parser(
@@ -3603,7 +3612,8 @@ def _extract_many(
     without parsing the summary. An empty run (``--all`` on an empty DocSet)
     exits ``0``.
     """
-    from dgml_core.grounded import extract_values_many, values_batch_stages
+    from dgml_core.extraction import extractor_key, failed_run_model
+    from dgml_core.grounded import extract_values_many, extraction_batch_stages
 
     store = DocSetStore(ws)
     store.get(args.docset_id)  # raises DocSetNotFound
@@ -3615,7 +3625,7 @@ def _extract_many(
     if args.batch:
         # Checked before any file is read, and before the job opens, so a
         # rejected run leaves no job behind.
-        _batch_preflight(values_batch_stages(config.values_model, config.values_reasoning_effort))
+        _batch_preflight(extraction_batch_stages(config))
         _start_batch_job(args, ws, command="extraction extract")
     many = extract_values_many(
         ws,
@@ -3641,11 +3651,12 @@ def _extract_many(
         one: dict[str, Any] = {
             "docset_id": args.docset_id,
             "file_id": fid,
-            "model": config.values_model,
+            "model": outcome.model,
             "mode": outcome.mode,
             "tool_calls": outcome.tool_calls,
             "field_count": len(outcome.values),
             "xml_key": outcome.xml_key,
+            **extractor_key(config, outcome.extractor),
         }
         if batch_block is not None:
             one["batch"] = batch_block
@@ -3656,16 +3667,26 @@ def _extract_many(
     for fid in file_ids:
         outcome = outcomes[fid]
         if isinstance(outcome, BaseException):
-            results.append({"file_id": fid, "status": "failed", "error": _error_block(outcome)})
+            results.append(
+                {
+                    "file_id": fid,
+                    "status": "failed",
+                    "model": failed_run_model(config, outcome),
+                    "error": _error_block(outcome),
+                    **extractor_key(config, None),
+                }
+            )
         else:
             results.append(
                 {
                     "file_id": fid,
                     "status": "ok",
+                    "model": outcome.model,
                     "mode": outcome.mode,
                     "tool_calls": outcome.tool_calls,
                     "field_count": len(outcome.values),
                     "xml_key": outcome.xml_key,
+                    **extractor_key(config, outcome.extractor),
                 }
             )
     payload: dict[str, Any] = {
@@ -3687,7 +3708,7 @@ def _extract_many(
 
 def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     """Dispatch the `extraction` command group."""
-    from dgml_core.extraction import extract_file, extraction_config
+    from dgml_core.extraction import extract_file, extraction_config, extractor_key
     from dgml_core.extraction_schema import rnc_to_json_schema
     from dgml_core.grounded import (
         generate_schema,
@@ -3701,7 +3722,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
 
     if sub == "generate-schema":
         ds = store.get(args.docset_id)  # raises DocSetNotFound
-        config = load_grounded_config(ws, schema_model=args.schema_model or None)
+        config = load_grounded_config(ws, schema_model=args.schema_model or None, extractor=False)
         if args.batch:
             # Before any PDF is read: an unsupported provider is BATCH_UNAVAILABLE,
             # never a silent full-price call.
@@ -3798,8 +3819,16 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
             parse_reasoning_effort(args.values_effort, source="--values-effort")
         if args.locations_effort is not None:
             parse_reasoning_effort(args.locations_effort, source="--locations-effort")
+        extractor_fallback = False if args.no_extractor_fallback else None
         if len(extract_ids) == 1 and not args.all and not args.batch:
             # The original single-file form: output and errors unchanged.
+            config = extraction_config(
+                ws,
+                values_model=args.values_model,
+                values_effort=args.values_effort,
+                locations_effort=args.locations_effort,
+                extractor_fallback=extractor_fallback,
+            )
             result = extract_file(
                 ws,
                 args.docset_id,
@@ -3807,6 +3836,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 values_model=args.values_model,
                 values_effort=args.values_effort,
                 locations_effort=args.locations_effort,
+                extractor_fallback=extractor_fallback,
                 write_stats=args.debug,
                 record_usage=args.debug,
             )
@@ -3819,6 +3849,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                     "tool_calls": result.tool_calls,
                     "field_count": len(result.values),
                     "xml_key": result.xml_key,
+                    **extractor_key(config, result.extractor),
                 },
                 fmt,
             )
@@ -3832,6 +3863,7 @@ def _extraction_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 values_model=args.values_model,
                 values_effort=args.values_effort,
                 locations_effort=args.locations_effort,
+                extractor_fallback=extractor_fallback,
             ),
             file_ids=extract_ids,
             single=len(extract_ids) == 1 and not args.all,
@@ -4124,6 +4156,7 @@ _RUN_PASSTHROUGH: tuple[tuple[str, str, bool, str], ...] = (
     ("--values-model", "values_model", True, "extract"),
     ("--values-effort", "values_effort", True, "extract"),
     ("--locations-effort", "locations_effort", True, "extract"),
+    ("--no-extractor-fallback", "no_extractor_fallback", False, "extract"),
 )
 _RUN_BOOLEAN_OPTIONAL: frozenset[str] = frozenset({"--batch-label"})
 
@@ -4386,10 +4419,10 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
     turn a resumed run into a different one."""
     from dgml_core.generation import load_generation_batch, resolve_generation_config
     from dgml_core.grounded import (
+        extraction_batch_stages,
         load_grounded_config,
         parse_reasoning_effort,
         schema_batch_request,
-        values_batch_stages,
     )
 
     ds_store = DocSetStore(ws)
@@ -4443,6 +4476,13 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
         if extracting
         else None
     )
+    if grounded is not None and args.no_extractor_fallback and grounded.extractor is None:
+        # The extract step refuses this (INVALID_ARGUMENT); refused now, before
+        # the earlier steps pay.
+        raise InvalidArgument(
+            "no custom extractor is configured ([extractor] in config.toml), "
+            "so there is no extractor fallback to set"
+        )
 
     session = None
     if batch:
@@ -4484,12 +4524,11 @@ def _docset_run_cmd(args: argparse.Namespace, ws: Workspace, fmt: str) -> int:
                 if args.batch_label is not None
                 else load_generation_batch_label(ws)
             )
+        if grounded is not None and args.no_extractor_fallback and grounded.extractor:
+            # As the extract step applies the flag: its values model never runs.
+            grounded = replace(grounded, extractor=replace(grounded.extractor, fallback=False))
         if grounded is not None and (has_schema or args.schema_from):
-            stages.update(
-                values_batch_stages(
-                    grounded.values_model, grounded.values_reasoning_effort, stage="extract"
-                )
-            )
+            stages.update(extraction_batch_stages(grounded, stage="extract"))
         _batch_preflight(stages)
         session = _start_batch_job(args, ws, command="docset run", pinned=pinned)
         schema_needed = bool(session.state.setdefault(_RUN_SCHEMA_NEEDED_STATE, schema_needed))

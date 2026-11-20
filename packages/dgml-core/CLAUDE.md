@@ -131,6 +131,28 @@ To write a new provider: see the "Writing your own provider" section in the
 [src/dgml_core/ocr.py](src/dgml_core/ocr.py) module docstring, and
 [docs/ocr-providers.md](../../docs/ocr-providers.md).
 
+## Custom extractors
+
+`dgml extraction extract` dispatches to an optional `ValueExtractor` ABC defined in
+[src/dgml_core/extractor.py](src/dgml_core/extractor.py), named by the
+`[extractor] provider` dotted path exactly as an OCR provider is (same
+importer, same `parse_config` / `config_fields` contract, no registry). It
+replaces the three LLM phases of `_FileExtraction` in `grounded.py`; dgml
+validates its tree (`validate_extractor_output`) and runs the shared tail
+(`verify_boxes`, `drop_unboxed_values`, the XML write, telemetry) on it. There
+is no bundled extractor: the built-in pipeline is not one, it is what runs
+when none is configured and what a run falls back to (`fallback = true`).
+`load_grounded_config` carries the section as `GroundedConfig.extractor`, so
+every extraction caller gets it, along with the `[models]` key pairs of the
+providers the class lists in `api_key_providers`
+(`GroundedConfig.provider_credentials`; other providers' pairs are not read). `make_extractor` resolves the pairs
+for the providers the class lists in `api_key_providers` into
+`config.api_keys` after `parse_config` and before `__init__`, so
+`parse_config` never sees a key. Under `--batch` the extractor's `extract_many`
+is one call before the first wave, and its validated outputs are recorded
+under the job (`inputs/extractor/…`) for replay. See
+[docs/custom-extractors.md](../../docs/custom-extractors.md).
+
 ## PDF engines
 
 PDF work follows the same shape as OCR. One **engine** supplies both

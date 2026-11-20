@@ -624,7 +624,8 @@ def resolve_credential(workspace: Workspace, ref: Mapping[str, Any] | None) -> s
     if section == "grounded":
         from dgml_core.grounded import load_grounded_config
 
-        grounded = load_grounded_config(workspace)
+        # Only the keys are read, so a broken [extractor] does not block them.
+        grounded = load_grounded_config(workspace, extractor=False)
         return grounded.schema_api_key if field_name == "schema" else grounded.values_api_key
     if section == "classification":
         from dgml_core.classification import load_classification_config
@@ -1374,17 +1375,36 @@ class JobSession:
 
         On the job's first run, *read* gives the current content (``None`` when
         absent) and it is recorded; on every later run the recorded content is
-        returned, so the caller can restore it before reading its inputs."""
+        returned, so the caller can restore it before reading its inputs.
+        :meth:`recorded_input` and :meth:`record_input` are its two halves, for
+        a caller that reads many inputs in one call."""
         with self._lock:
             if name not in self.manifest.inputs:
                 data = read()
-                self.manifest.inputs[name] = data is not None
-                if data is not None:
-                    self.store.put_input(name, data)
+                self._record_input(name, data)
                 return data
             if not self.manifest.inputs[name]:
                 return None
         return self.store.get_input(name)
+
+    def recorded_input(self, name: str) -> bytes | None:
+        """The content recorded for input *name*, or ``None`` when none was
+        recorded (never recorded, or recorded as absent)."""
+        with self._lock:
+            if not self.manifest.inputs.get(name):
+                return None
+        return self.store.get_input(name)
+
+    def record_input(self, name: str, data: bytes | None) -> None:
+        """Record input *name* as *data* (``None``: absent), so every later run
+        reads it back through :meth:`recorded_input`."""
+        with self._lock:
+            self._record_input(name, data)
+
+    def _record_input(self, name: str, data: bytes | None) -> None:
+        self.manifest.inputs[name] = data is not None
+        if data is not None:
+            self.store.put_input(name, data)
 
     def rewind_presence(self, name: str, present_now: bool) -> bool:
         """Whether a file the command can only *add* (never change) existed

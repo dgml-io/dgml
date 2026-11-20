@@ -1143,41 +1143,61 @@ def _serialize(root: etree._Element) -> str:
     return xml.decode("utf-8")  # type: ignore[no-any-return]
 
 
+#: ``dg:extractor``: the custom extractor whose values a ``dg:extraction``
+#: holds. Absent when dgml's own pipeline produced them.
+EXTRACTOR_ATTR = f"{{{DG_NS}}}extractor"
+
+
 def _build_extraction(
-    parent: etree._Element, docset_ns: str, vocab: Vocabulary, values: dict[str, Any]
+    parent: etree._Element,
+    docset_ns: str,
+    vocab: Vocabulary,
+    values: dict[str, Any],
+    *,
+    extractor: str | None = None,
 ) -> etree._Element:
     """Append a ``<dg:extraction>`` element (with the field tree) under *parent*.
 
     Pass 1 (:func:`_collect_ref_ids`) assigns an ``xml:id`` to every path some
     leaf names as an input; pass 2 emits the tree, stamping those ids on the
-    input elements and ``dg:inputs`` on the leaves that use them."""
+    input elements and ``dg:inputs`` on the leaves that use them. *extractor*
+    names the custom extractor that produced the values (``dg:extractor``);
+    ``None`` writes no attribute."""
     ext = etree.SubElement(parent, EXTRACTION_TAG)
+    if extractor is not None:
+        ext.set(EXTRACTOR_ATTR, extractor)
     _add_children(ext, docset_ns, vocab.roots, values, ids=_collect_ref_ids(values))
     return ext
 
 
-def standalone_extraction_doc(values: dict[str, Any], *, vocab: Vocabulary) -> str:
+def standalone_extraction_doc(
+    values: dict[str, Any], *, vocab: Vocabulary, extractor: str | None = None
+) -> str:
     """A minimal core DGML file (spec mode ``extraction``): a root ``dg:chunk``
     holding only the ``dg:extraction`` element. Used when no document tree
-    (``docset generate``) exists yet for the file."""
+    (``docset generate``) exists yet for the file. *extractor* is the custom
+    extractor to name on the element, if one produced the values."""
     docset_ns = vocab.namespace_uri
     nsmap = {**_NSMAP_BASE, "docset": docset_ns}
     root = etree.Element(CHUNK_TAG, nsmap=nsmap)
-    _build_extraction(root, docset_ns, vocab, values)
+    _build_extraction(root, docset_ns, vocab, values, extractor=extractor)
     return _serialize(root)
 
 
-def embed_extraction_into(core_xml: str, values: dict[str, Any], *, vocab: Vocabulary) -> str:
+def embed_extraction_into(
+    core_xml: str, values: dict[str, Any], *, vocab: Vocabulary, extractor: str | None = None
+) -> str:
     """Add (or replace) the ``dg:extraction`` element in an existing core DGML
     file (spec mode ``full-extraction``). The document tree is left untouched;
-    any prior ``dg:extraction`` child of the root is replaced."""
+    any prior ``dg:extraction`` child of the root is replaced. *extractor* as
+    in :func:`standalone_extraction_doc`."""
     root = etree.fromstring(core_xml.encode("utf-8"))
     if root.tag != CHUNK_TAG:
         raise ValueError("core DGML file root is not dg:chunk")
     for child in list(root):
         if child.tag == EXTRACTION_TAG:
             root.remove(child)
-    _build_extraction(root, vocab.namespace_uri, vocab, values)
+    _build_extraction(root, vocab.namespace_uri, vocab, values, extractor=extractor)
     return _serialize(root)
 
 

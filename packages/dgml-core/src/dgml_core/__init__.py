@@ -26,6 +26,7 @@ from .conversion import (
     load_conversion_config,
     make_converter,
 )
+from .default_config import Provider
 from .dgml_output import DgmlDocument, read_dgml
 from .docset_generate import (
     GenerateFileResult,
@@ -65,6 +66,9 @@ from .errors import (
     EmptyDocSet,
     EmptyModelResponse,
     EngineNotAvailable,
+    ExtractorConfigInvalid,
+    ExtractorFailed,
+    ExtractorOutputInvalid,
     FileNotFound,
     GenerationConfigInvalid,
     GenerationConfigMissing,
@@ -118,6 +122,15 @@ from .errors import (
 # scope (all already loaded above) and reaches ``.grounded`` → ``.llm`` and
 # ``.extraction_xml`` inside the functions, so it costs nothing here.
 from .extraction import add_file_and_extract, extract_file, get_extracted_values
+from .extractor import (
+    ExtractionRequest,
+    ExtractorConfig,
+    ExtractorOutput,
+    ValueExtractor,
+    load_extractor_config,
+    make_extractor,
+    validate_extractor_output,
+)
 from .file_attestation import (
     ArtifactKind,
     ArtifactRef,
@@ -351,7 +364,13 @@ __all__ = [
     "EmptyModelResponse",
     "EngineName",
     "EngineNotAvailable",
+    "ExtractionRequest",
     "ExtractionResult",
+    "ExtractorConfig",
+    "ExtractorConfigInvalid",
+    "ExtractorFailed",
+    "ExtractorOutput",
+    "ExtractorOutputInvalid",
     "FileAttestation",
     "FileNotFound",
     "FileRecord",
@@ -403,6 +422,7 @@ __all__ = [
     "PdfConfigInvalid",
     "PdfSliceFailed",
     "PdfSlicer",
+    "Provider",
     "ProviderSpec",
     "RecordNotFound",
     "RegistryNotFound",
@@ -420,6 +440,7 @@ __all__ = [
     "TextExtractionFailed",
     "TextMode",
     "UnsupportedFileType",
+    "ValueExtractor",
     "ValuesExtractionFailed",
     "ValuesNotFound",
     "VerifyResult",
@@ -464,6 +485,7 @@ __all__ = [
     "list_job_summaries",
     "load_classification_config",
     "load_conversion_config",
+    "load_extractor_config",
     "load_ocr_config",
     "load_pdf_config",
     "load_store_configs",
@@ -471,6 +493,7 @@ __all__ = [
     "make_blob_store",
     "make_converter",
     "make_doc_store",
+    "make_extractor",
     "make_ocr_provider",
     "make_workspaces_store",
     "migrate_workspace",
@@ -488,6 +511,7 @@ __all__ = [
     "stamp_schema_version",
     "storage_fingerprint",
     "unlock_job",
+    "validate_extractor_output",
     "verify_attestation_dir",
     "verify_bundle",
     "verify_file_version",

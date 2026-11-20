@@ -169,6 +169,19 @@ file and page in one wave. A file whose phase 1 takes extra turns (the chunked
 protocol, a truncation retry, the permissive-schema fallback) rides extra
 waves. One file id keeps the single-file payload (plus the `batch` block).
 
+With a custom extractor configured ([custom-extractors.md](custom-extractors.md))
+the extractor's work is not sent to the model's batch API: dgml calls its
+`extract_many` once with every file of the run, before the first wave, and
+batches only the phases of the files that fell back to dgml's own pipeline. A
+run the extractor handled entirely submits nothing and reports zero `requests`.
+With `fallback = false` (or `--no-extractor-fallback`) the values model never
+runs, so it is not checked for a batch backend or a key, and the `batch` block
+is all zeros with `"provider": null`. This applies to `extraction extract`,
+`docset run` and the auto-extraction of `file add`. The call blocks (under `--no-wait` the command exits only after it returns),
+and in job mode each validated output is recorded under the job, so a resume
+never calls the extractor for that file again. Memory is lighter than the
+default path: dgml reads a file's PDF only when that file falls back.
+
 ## `dgml extraction generate-schema <docset_id> --batch`
 
 Schema generation is one request per docset (the configured `schema_model`,

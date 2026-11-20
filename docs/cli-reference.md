@@ -731,6 +731,16 @@ lands in `extraction.error`, the assignment stands, exit stays 0). No schema
 `cost_usd` and the token counts are `null` when the provider did not report
 them.
 
+`extraction.model` is what produced the values, or what ran before the
+failure: the values model, or with a [custom extractor](custom-extractors.md)
+configured the extractor's reported model (or its provider path) when its
+values were written. After an extractor failure it is the values model when the
+fallback ran, whether or not that succeeded, and `null` when no fallback ran
+(`extractor.fallback = false`), since no model ran at all. With an extractor
+configured the block also carries `extractor`, as `extraction extract` does:
+the provider whose values were written, `null` on a failure or after a
+fallback.
+
 ```json
 {
   "docset_id": "o8vr8rs488vg",
@@ -1356,7 +1366,7 @@ exactly as its standalone command would:
 | `--no-extract` | Skip steps 1 and 3. |
 | `--generation-config`, `--model`, `--label-model`, `--window-size`, `--temperature`, `--max-tokens`, `--transcription`, `--thinking`, `--no-coverage`, `--cache-dir`, `--max-parallel-calls`, `--schema-path`, `--extend-schema`, `--no-roster`, `--no-semlinks`, `--no-semlink-cache`, `--no-semlink-verify`, `--batch-label` / `--no-batch-label` | Passed to `docset generate` unchanged. |
 | `--schema-model M` | Passed to `extraction generate-schema`. |
-| `--values-model M`, `--values-effort E`, `--locations-effort E` | Passed to `extraction extract`. |
+| `--values-model M`, `--values-effort E`, `--locations-effort E`, `--no-extractor-fallback` | Passed to `extraction extract`. |
 | `--batch` / `--no-batch` | Every step through the provider's batch API, under **one** batch job. Defaults to `[generation] batch`. |
 | `--batch-poll-interval S` | Seconds between batch status polls (default 30). |
 | `--no-wait`, `--job ID` | Batch job mode for the whole run (see [Batch jobs](#batch-jobs---no-wait-and-dgml-batch)). |
@@ -1416,7 +1426,9 @@ the step and the flag, instead of argparse usage text (exit 2) from the
 generate step after the schema step has already paid. A bad `--values-effort`
 or `--locations-effort` is refused up front too (`GROUNDED_CONFIG_INVALID`), and
 so is a missing `grounded` config when the extract step will run
-(`GROUNDED_CONFIG_MISSING`), with or without `--batch`.
+(`GROUNDED_CONFIG_MISSING`), with or without `--batch`. So is
+`--no-extractor-fallback` when no `[extractor]` is configured and the extract
+step will run (`INVALID_ARGUMENT`).
 
 ```json
 {"error": {"code": "INVALID_ARGUMENT",
@@ -1588,7 +1600,7 @@ fields, prompts for where to find one value. Returns
 Return the DocSet's extraction guidance as `{docset_id, guidance}`. Errors
 `GUIDANCE_NOT_FOUND` if none is set.
 
-### `dgml extraction extract <docset_id> <file_id>... [--all] [--values-model M] [--values-effort E] [--locations-effort E] [--batch]`
+### `dgml extraction extract <docset_id> <file_id>... [--all] [--values-model M] [--values-effort E] [--locations-effort E] [--no-extractor-fallback] [--batch]`
 
 Extract values from a file against the DocSet schema and write a `dg:extraction`
 element into the file's core `<stem>.dgml.xml`. Runs a three-phase pipeline
@@ -1604,6 +1616,22 @@ flag. Errors `SCHEMA_NOT_FOUND` if the DocSet has no schema, and
 `FILE_NOT_FOUND` if the file is not assigned to the DocSet — assign it first with
 `docset add-file` (the schema and the assignment can be set in either order; only
 this command needs both in place).
+
+With an `[extractor]` section in the config (a custom extractor, see
+[custom-extractors.md](custom-extractors.md)), that class replaces the three
+phases and the payload gains an `extractor` key: the extractor whose values
+were written, or `null` when the extractor failed and the file was extracted
+by the pipeline above instead (the default, `extractor.fallback = true`), the
+same as the `dg:extractor` attribute on the written element. `model` is
+likewise what produced the values: the extractor's reported model, or the
+values model after a fallback. The same rule gives the `model` of the
+`extraction_stats.json` file and of the `usage.jsonl` row, which a failed run
+also writes: the values model when the fallback ran, whatever its outcome,
+and `null` when the extractor failed and no fallback ran, since no model ran.
+`--no-extractor-fallback` fails such a file instead, with the
+extractor's error (`EXTRACTOR_FAILED` or `EXTRACTOR_OUTPUT_INVALID`); it is
+`INVALID_ARGUMENT` when no extractor is configured. A broken section is
+`EXTRACTOR_CONFIG_INVALID` before any file is read.
 
 `--values-model` overrides `grounded.values_model` for this call. A model's
 credentials move with it, so the override takes none of
@@ -1640,6 +1668,16 @@ needs grounding.
 }
 ```
 
+With a custom extractor configured, the same payload (and each per-file
+entry below) also carries:
+
+```json
+  "extractor": "my_pkg.extractors:InvoiceExtractor"
+```
+
+or `"extractor": null` for a file the extractor failed and dgml's own pipeline
+extracted, and on a failed per-file entry.
+
 > `generate` and `extract` compose in either order: extract-then-generate
 > builds the tree and carries the `dg:extraction` over; generate-then-extract
 > embeds the extraction alongside the existing tree. Both end at
@@ -1647,12 +1685,16 @@ needs grounding.
 
 #### Several files, and `--batch`
 
-`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--batch] [--batch-poll-interval SECONDS] [--no-wait] [--job JOB_ID] [--batch-deadline DURATION]`
+`dgml extraction extract <docset_id> (<file_id>... | --all) [--values-model M] [--values-effort E] [--no-extractor-fallback] [--batch] [--batch-poll-interval SECONDS] [--no-wait] [--job JOB_ID] [--batch-deadline DURATION]`
 
 With more than one file id, or `--all` (every file in the DocSet), the command
 extracts each file independently and returns one entry per file. A file that
 fails is reported in its entry (`status: failed` with an `{code, message}`
-error) and the others still run. The command exits `0` once the run completes
+error) and the others still run. The top-level `model` is the run's values
+model; each entry's `model` is what produced that file's values, or what ran
+before its failure, as the single-file `model` above (so with a custom
+extractor it is the extractor's model, the values model after a fallback, and
+`null` for a file whose extractor failed with no fallback). The command exits `0` once the run completes
 — unless **every** file failed, when it exits `2` with the same payload on
 stdout, so a script can detect a total failure from the exit code alone. A
 partial failure exits `0` (read `.summary.failed`), and so does `--all` on a
@@ -1682,10 +1724,10 @@ block.
   "model": "anthropic/claude-sonnet-4-6",
   "summary": {"total": 2, "ok": 1, "failed": 1},
   "results": [
-    {"file_id": "5kqt9r5fowno", "status": "ok", "mode": "extraction",
-     "tool_calls": 0, "field_count": 7,
+    {"file_id": "5kqt9r5fowno", "status": "ok", "model": "anthropic/claude-sonnet-4-6",
+     "mode": "extraction", "tool_calls": 0, "field_count": 7,
      "xml_key": "docsets/o8vr8rs488vg/files/5kqt9r5fowno/Invoice 2025.dgml.xml"},
-    {"file_id": "9mzn2c4q1abx", "status": "failed",
+    {"file_id": "9mzn2c4q1abx", "status": "failed", "model": "anthropic/claude-sonnet-4-6",
      "error": {"code": "FILE_NOT_FOUND", "message": "..."}}
   ],
   "batch": {"provider": "anthropic", "waves": 2, "batches": 2, "requests": 5,
@@ -1695,7 +1737,13 @@ block.
 }
 ```
 
-`batch` totals cover both phases of the run.
+`batch` totals cover both phases of the run. With a custom extractor
+configured, `--batch` calls its `extract_many` once with every file and
+batches only the phases of the files that fell back, so a run the extractor
+handled entirely reports zero `requests`. With `fallback = false` or
+`--no-extractor-fallback` the values model never runs, so it is not checked
+for a batch backend (no `BATCH_UNAVAILABLE`) or a key, and `batch` is all zeros
+with `"provider": null`.
 
 ### `dgml extraction get-values <docset_id> <file_id> [--as values|xml]`
 
@@ -3470,6 +3518,9 @@ envelope). **Hard** = emitted as the stderr `error` envelope with exit `1`;
 | `GROUNDED_CONFIG_INVALID` | hard | The `grounded` config section has a missing/invalid field. |
 | `SCHEMA_GENERATION_FAILED` | hard | The schema-generation LLM call failed or returned a non-object. |
 | `VALUES_EXTRACTION_FAILED` | hard | The value-extraction pipeline failed. |
+| `EXTRACTOR_CONFIG_INVALID` | hard | The `extractor` config section is malformed, or names a class that cannot be resolved, is not a `ValueExtractor`, or rejects its options. Raised before any file is read; never falls back. |
+| `EXTRACTOR_FAILED` | hard / soft | The custom extractor raised and `extractor.fallback` is off (or `--no-extractor-fallback` was passed); with fallback on, the file is extracted by dgml's own pipeline and the payload's `extractor` is `null`. Soft in `extraction.error` on auto-extraction. |
+| `EXTRACTOR_OUTPUT_INVALID` | hard / soft | The custom extractor returned a tree that fails validation (the message lists the problems with their paths); same fallback rule as `EXTRACTOR_FAILED`. |
 | `CHAIN_CONFIG` | hard | A chain config is missing/invalid, or `dgml chain add/remove` hit a bad/built-in chain. |
 | `CHAIN_RPC` | hard | A JSON-RPC call to the chain failed (network, bad RPC URL, node error). |
 | `CHAIN_TX_REVERTED` | hard | A broadcast `stake`/`registry create` transaction reverted on-chain. |

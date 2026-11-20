@@ -27,6 +27,18 @@ updated without touching the config generator.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
+
+class Provider(StrEnum):
+    """A model provider with a ``[models] <provider>_api_key`` / ``_api_key_env``
+    pair. The value is the key prefix (``anthropic_api_key``)."""
+
+    ANTHROPIC = "anthropic"
+    GOOGLE = "google"
+    OPENAI = "openai"
+
+
 # The four tiers, cheapest → strongest, per provider family. The tier→task
 # mapping and per-task overrides are documented in the CLI reference, not
 # baked into the config file (the mapping may change without a config rewrite).
@@ -91,10 +103,10 @@ PROVIDER_MODELS: dict[str, dict[str, str]] = {
 # is written onto the keyless models whose id carries a prefix listed here (see
 # `apply_provider_keys`). `anthropic_google` is a family that mixes two
 # of these, not a provider, so it has no key of its own.
-PROVIDERS: dict[str, tuple[str, ...]] = {
-    "anthropic": ("anthropic",),
-    "google": ("gemini",),
-    "openai": ("openai",),
+PROVIDERS: dict[Provider, tuple[str, ...]] = {
+    Provider.ANTHROPIC: ("anthropic",),
+    Provider.GOOGLE: ("gemini",),
+    Provider.OPENAI: ("openai",),
 }
 
 # Per family, the API-key env var(s) its tiers need at runtime (the standard
