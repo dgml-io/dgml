@@ -143,8 +143,9 @@ validates its tree (`validate_extractor_output`) and runs the shared tail
 is no bundled extractor: the built-in pipeline is not one, it is what runs
 when none is configured and what a run falls back to (`fallback = true`).
 `load_grounded_config` carries the section as `GroundedConfig.extractor`, so
-every extraction caller gets it, along with the `[models]` provider key pairs
-(`GroundedConfig.provider_credentials`). `make_extractor` resolves the pairs
+every extraction caller gets it, along with the `[models]` key pairs of the
+providers the class lists in `api_key_providers`
+(`GroundedConfig.provider_credentials`; other providers' pairs are not read). `make_extractor` resolves the pairs
 for the providers the class lists in `api_key_providers` into
 `config.api_keys` after `parse_config` and before `__init__`, so
 `parse_config` never sees a key. Under `--batch` the extractor's `extract_many`

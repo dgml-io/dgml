@@ -96,8 +96,12 @@ The keys come from the `[models]` provider keys, `anthropic_api_key`,
 - dgml passes only the providers the class lists. A provider outside
   `anthropic`, `google` and `openai` is refused with
   `EXTRACTOR_CONFIG_INVALID` when the config is loaded.
+- dgml reads only the listed providers' keys. A malformed key of one of them
+  (empty, or both forms set) fails the config load with
+  `MODELS_CONFIG_INVALID`; other providers' keys are not checked here.
 - An `_api_key_env` form is read from the environment when the extractor is
-  built. A variable that is not set passes no key and logs a WARNING.
+  built. A variable that is not set passes no key and logs a WARNING, once
+  per process.
 - A provider with no key configured is left out, and `config.api_key`
   returns `None`. Passing `None` to the provider's SDK makes it read its own
   environment variable. An extractor that cannot run without a key raises
@@ -236,7 +240,8 @@ message of any other exception; the error carries the run's usage and stats.
 An interrupt never falls back.
 
 With `fallback = true` the values model's key is resolved before the extractor
-runs, so a `values_api_key_env` naming an unset variable fails every file with
+runs, so an `_api_key_env` naming an unset variable, whether `values_api_key_env`
+or the `[models]` key of the values model's provider, fails every file with
 `AUTH_ERROR` before the extractor is called, even the files it would have
 handled: a run whose fallback cannot work never pays for the extractor. With
 `fallback = false` the key is not read.

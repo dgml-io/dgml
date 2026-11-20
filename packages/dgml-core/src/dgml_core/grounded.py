@@ -418,7 +418,9 @@ def load_grounded_config(
 
     The ``[extractor]`` section is loaded too, which imports the extractor
     class and runs its ``parse_config``, and with it the ``[models]`` provider
-    pairs (``provider_credentials``) the extractor may be given. A caller that
+    pairs (``provider_credentials``) of the providers the class lists in
+    ``api_key_providers``; a malformed pair of one of those raises
+    ``ModelsConfigInvalid``, and other providers' pairs are not read. A caller that
     never extracts values passes ``extractor=False``: the section is not read,
     ``extractor`` is ``None``, and a broken ``[extractor]`` table cannot fail it.
 
@@ -481,8 +483,15 @@ def load_grounded_config(
 
     extractor_config = load_extractor_config(workspace) if extractor else None
     models = merged.get(ConfigSection.MODELS)
+    # Only the pairs the extractor asks for: a malformed pair of a provider it
+    # never uses is left to the loader that would use it.
     provider_credentials = (
-        provider_keys(models) if extractor_config is not None and isinstance(models, dict) else {}
+        provider_keys(
+            models,
+            providers=resolve_extractor_class(extractor_config.provider).api_key_providers,
+        )
+        if extractor_config is not None and isinstance(models, dict)
+        else {}
     )
 
     return GroundedConfig(

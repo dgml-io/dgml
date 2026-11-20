@@ -94,7 +94,7 @@ Everything goes through public `dgml_core` calls:
 | Upload a file | `FileStore(ws).add(path, text_mode=…)` — soft failures come back on `AddFileResult` |
 | Classify | `classify_file(ws, file_id, config=load_classification_config(ws), mode=ClassifyMode.EXISTING \| EXISTING_OR_NEW)` |
 | Assign (+ auto-extract) | `add_file_and_extract(ws, docset_id, file_id)` |
-| Generate a schema | `grounded.generate_schema(ws, file_ids, config=load_grounded_config(ws), docset_name=…)` |
+| Generate a schema | `grounded.generate_schema(ws, file_ids, config=load_grounded_config(ws, extractor=False), docset_name=…)` |
 | Extract / re-extract | `extract_file(ws, docset_id, file_id)` |
 | A file's docsets | `DocSetStore(ws).docsets_for_file(file_id)` |
 | Read the pair's DGML and values | `read_dgml(ws, docset_id, file_id)` (the full `.dgml.xml`) and `get_extracted_values(ws, docset_id, file_id)` — the same calls `dgml extraction get-values` makes |

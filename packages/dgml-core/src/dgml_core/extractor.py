@@ -67,16 +67,22 @@ from .config import load_merged_config
 from .default_config import Provider
 from .dg_refs import METHODS
 from .errors import DgmlError, ExtractorConfigInvalid, ExtractorOutputInvalid, FileNotFound
-from .extraction_schema import Tag, Vocabulary
-from .matching import LeafPath, path_to_str
 from .models_config import ConfigSection, Credentials
 from .provider import ProviderConfigFields, import_provider_class
 from .usage import _USAGE_FIELDS
 
 if TYPE_CHECKING:
+    # Type-only: ``dgml_core`` imports this module eagerly, and these two pull in
+    # the generation pipeline. ``path_to_str`` is imported where it is called.
+    from .extraction_schema import Tag, Vocabulary
+    from .matching import LeafPath
     from .storage import Workspace
 
 logger = logging.getLogger(__name__)
+
+# (extractor, provider, env var) already warned about as unset: a sync run builds
+# the extractor once per file, so the warning would otherwise repeat per file.
+_WARNED_UNSET_KEY_ENV: set[tuple[str, Provider, str]] = set()
 
 #: Files extracted concurrently by the default :meth:`ValueExtractor.extract_many`
 #: under ``--batch``; ``[extractor] max_concurrency`` overrides it.
@@ -396,13 +402,13 @@ def _resolve_api_keys(
         api_key, api_key_env = credentials.get(provider, (None, None))
         if api_key_env is not None:
             api_key = os.environ.get(api_key_env) or None
-            if api_key is None:
+            warned = (cls._describe(), provider, api_key_env)
+            if api_key is None and warned not in _WARNED_UNSET_KEY_ENV:
+                _WARNED_UNSET_KEY_ENV.add(warned)
                 logger.warning(
                     "extractor %s: 'models.%s_api_key_env' names %s, which is not set; "
                     "the extractor gets no %s key",
-                    cls._describe(),
-                    provider,
-                    api_key_env,
+                    *warned,
                     provider,
                 )
         if api_key:
@@ -477,6 +483,8 @@ def vocabulary_problems(values: dict[str, Any], vocab: Vocabulary) -> list[str]:
     list of entries of the item kind, a choice one of its alternatives, and an
     unknown key is a problem rather than dropped. An empty tree, or roots set
     to ``None``, is a legal "nothing found"."""
+    from .matching import path_to_str
+
     problems: list[str] = []
 
     def check_children(children: list[Tag], value: dict[str, Any], path: LeafPath) -> None:
@@ -534,6 +542,8 @@ def _leaf_problems(
 ) -> list[str]:
     """Leaf-shape and location problems, walking by the vocabulary so a
     ``choice`` leaf is told apart from its group form."""
+    from .matching import path_to_str
+
     problems: list[str] = []
 
     def check_leaf(leaf: dict[str, Any], path: LeafPath) -> None:

@@ -49,6 +49,7 @@ from dgml_core.errors import (
     ExtractorFailed,
     ExtractorOutputInvalid,
     InvalidArgument,
+    ModelsConfigInvalid,
     ValuesExtractionFailed,
 )
 from dgml_core.extraction import auto_extract, extract_file, extraction_config
@@ -1652,6 +1653,51 @@ def test_unset_key_env_passes_no_key_with_a_warning(
     (built,) = KeyedExtractor.configs
     assert built.api_key(Provider.ANTHROPIC) is None
     assert "MY_ANTHROPIC_KEY, which is not set" in caplog.text
+
+
+def test_unset_key_env_warns_once_per_run(
+    workspace: Workspace,
+    keyed: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sync run builds the extractor per file; the warning is not repeated."""
+    monkeypatch.delenv("MY_ANTHROPIC_KEY", raising=False)
+    _write_keyed_config(workspace, keyed, anthropic_api_key_env="MY_ANTHROPIC_KEY")
+    ds_id, fids = _seed_many(workspace, 3)
+    with caplog.at_level(logging.WARNING, logger="dgml_core"):
+        extract_values_many(workspace, ds_id, fids, config=load_grounded_config(workspace))
+    assert len(KeyedExtractor.configs) == 3
+    assert caplog.text.count("MY_ANTHROPIC_KEY, which is not set") == 1
+
+
+def test_malformed_key_of_a_provider_the_extractor_never_uses_is_not_read(
+    workspace: Workspace, keyed: str
+) -> None:
+    """The extractor asks for anthropic only: a malformed openai pair is the
+    values model's loader's to report, not every extraction's."""
+    _write_keyed_config(
+        workspace,
+        keyed,
+        anthropic_api_key=_ANTHROPIC_KEY,
+        openai_api_key="sk-openai",
+        openai_api_key_env="OPENAI_KEY",
+    )
+    config = load_grounded_config(workspace)
+    assert dict(config.provider_credentials) == {Provider.ANTHROPIC: (_ANTHROPIC_KEY, None)}
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed(workspace, fid)
+    assert extract_values(workspace, ds_id, fid, config=config).extractor == keyed
+
+
+def test_malformed_key_of_a_provider_the_extractor_uses_fails_at_load(
+    workspace: Workspace, keyed: str
+) -> None:
+    _write_keyed_config(
+        workspace, keyed, anthropic_api_key=_ANTHROPIC_KEY, anthropic_api_key_env="MY_KEY"
+    )
+    with pytest.raises(ModelsConfigInvalid, match=r"models\.anthropic_api_key"):
+        load_grounded_config(workspace)
 
 
 def test_no_configured_key_is_none_not_an_error(workspace: Workspace, keyed: str) -> None:

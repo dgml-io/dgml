@@ -64,3 +64,18 @@ def test_import_does_not_load_litellm() -> None:
         [sys.executable, "-c", probe], check=True, capture_output=True, text=True
     ).stdout.strip()
     assert out == "", f"`import dgml_core` loaded: {out}"
+
+
+def test_import_does_not_load_the_extraction_schema_or_matching() -> None:
+    # ``dgml_core.extractor`` is imported eagerly and names these only for
+    # types; importing them pulls in the generation pipeline (~100ms).
+    probe = (
+        "import sys, dgml_core\n"
+        "loaded = sorted(m for m in ('dgml_core.extraction_schema', 'dgml_core.matching', "
+        "'dgml_core.generation.semantic_transform') if m in sys.modules)\n"
+        "print(','.join(loaded))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert out == "", f"`import dgml_core` loaded: {out}"

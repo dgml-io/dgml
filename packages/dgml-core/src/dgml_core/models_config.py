@@ -50,7 +50,7 @@ then higher), emitting a warning — so a minimal config that sets only, say,
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -290,13 +290,19 @@ def _unknown_family(family: str) -> ModelsConfigInvalid:
     )
 
 
-def provider_keys(models: Mapping[str, Any], *, strict: bool = True) -> dict[Provider, Credentials]:
-    """A ``[models]`` table's ``<provider>_api_key`` / ``_env`` pairs; a provider with
-    neither is left out. A malformed pair — empty, or both forms set — raises
-    ``ModelsConfigInvalid`` when *strict*, else is left out for the loader that would
-    have used it to report."""
+def provider_keys(
+    models: Mapping[str, Any],
+    *,
+    strict: bool = True,
+    providers: Collection[Provider] = PROVIDERS,
+) -> dict[Provider, Credentials]:
+    """A ``[models]`` table's ``<provider>_api_key`` / ``_env`` pairs for *providers*
+    (all of them by default); a provider with neither is left out. A malformed pair —
+    empty, or both forms set — raises ``ModelsConfigInvalid`` when *strict*, else is
+    left out for the loader that would have used it to report. Other providers' pairs
+    are not read."""
     out: dict[Provider, Credentials] = {}
-    for p in PROVIDERS:
+    for p in sorted(providers):
         try:
             pair = _credentials(models, f"{p}_", "models", ModelsConfigInvalid)
         except ModelsConfigInvalid:
