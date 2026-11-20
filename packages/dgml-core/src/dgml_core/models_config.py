@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .default_config import PROVIDER_MODELS, PROVIDERS
+from .default_config import PROVIDER_MODELS, PROVIDERS, Provider
 from .errors import DgmlError, ModelsConfigInvalid
 
 logger = logging.getLogger(__name__)
@@ -143,7 +143,7 @@ Credentials = tuple[str | None, str | None]
 """An ``(api_key, api_key_env)`` pair; at most one is set."""
 
 
-def provider_of(model: str) -> str | None:
+def provider_of(model: str) -> Provider | None:
     """The :data:`~dgml_core.default_config.PROVIDERS` key serving ``model``'s
     litellm prefix, or ``None`` for an unprefixed or unlisted one."""
     prefix, sep, _ = model.partition("/")
@@ -290,12 +290,12 @@ def _unknown_family(family: str) -> ModelsConfigInvalid:
     )
 
 
-def provider_keys(models: Mapping[str, Any], *, strict: bool = True) -> dict[str, Credentials]:
+def provider_keys(models: Mapping[str, Any], *, strict: bool = True) -> dict[Provider, Credentials]:
     """A ``[models]`` table's ``<provider>_api_key`` / ``_env`` pairs; a provider with
     neither is left out. A malformed pair — empty, or both forms set — raises
     ``ModelsConfigInvalid`` when *strict*, else is left out for the loader that would
     have used it to report."""
-    out: dict[str, Credentials] = {}
+    out: dict[Provider, Credentials] = {}
     for p in PROVIDERS:
         try:
             pair = _credentials(models, f"{p}_", "models", ModelsConfigInvalid)
@@ -337,7 +337,7 @@ def _check_provider_key_for(merged: Mapping[ConfigSection, Any], model: Model, l
 
 
 def _take_provider_key(
-    table: dict[str, Any], model_key: str, prefix: str, providers: Mapping[str, Credentials]
+    table: dict[str, Any], model_key: str, prefix: str, providers: Mapping[Provider, Credentials]
 ) -> None:
     """Write the provider key onto one model group that carries no credentials of its
     own and no ``api_base`` — a model at a custom endpoint is not its provider's service."""
@@ -346,7 +346,10 @@ def _take_provider_key(
         return
     if any(table.get(f"{prefix}{suffix}") is not None for suffix in GROUP_SUFFIXES):
         return
-    api_key, api_key_env = providers.get(provider_of(model) or "", (None, None))
+    provider = provider_of(model)
+    if provider is None:
+        return
+    api_key, api_key_env = providers.get(provider, (None, None))
     if api_key is not None:
         table[f"{prefix}api_key"] = api_key
     if api_key_env is not None:

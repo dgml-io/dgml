@@ -26,6 +26,7 @@ from .conversion import (
     load_conversion_config,
     make_converter,
 )
+from .default_config import Provider
 from .dgml_output import DgmlDocument, read_dgml
 from .docset_generate import (
     GenerateFileResult,
@@ -421,6 +422,7 @@ __all__ = [
     "PdfConfigInvalid",
     "PdfSliceFailed",
     "PdfSlicer",
+    "Provider",
     "ProviderSpec",
     "RecordNotFound",
     "RegistryNotFound",

@@ -57,7 +57,7 @@ import logging
 import re
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import partial
@@ -66,6 +66,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import layout, llm
 from .config import load_merged_config
+from .default_config import Provider
 from .dg_refs import METHODS, ValueMethod
 from .docsets import DocSetStore
 from .errors import (
@@ -146,7 +147,13 @@ from .matching import (
     walk_input_leaves,
     walk_unprinted_leaves,
 )
-from .models_config import ConfigSection, Tier, resolve_tiered_model
+from .models_config import (
+    ConfigSection,
+    Credentials,
+    Tier,
+    provider_keys,
+    resolve_tiered_model,
+)
 from .ocr import _image_dimensions
 from .pages import (
     PdfConfig,
@@ -369,6 +376,10 @@ class GroundedConfig:
     # The ``[extractor]`` section: a custom extractor that replaces the three
     # LLM phases of value extraction. ``None`` runs dgml's own pipeline.
     extractor: ExtractorConfig | None = None
+    # The ``[models]`` provider pairs, read with the extractor (empty without
+    # one): :func:`~dgml_core.extractor.make_extractor` resolves the ones the
+    # extractor's ``api_key_providers`` asks for when it constructs it.
+    provider_credentials: Mapping[Provider, Credentials] = field(default_factory=dict, repr=False)
 
 
 def parse_reasoning_effort(raw: Any, *, source: str) -> str | None:
@@ -406,9 +417,10 @@ def load_grounded_config(
     section overrides its tier.
 
     The ``[extractor]`` section is loaded too, which imports the extractor
-    class and runs its ``parse_config``. A caller that never extracts values
-    passes ``extractor=False``: the section is not read, ``extractor`` is
-    ``None``, and a broken ``[extractor]`` table cannot fail it.
+    class and runs its ``parse_config``, and with it the ``[models]`` provider
+    pairs (``provider_credentials``) the extractor may be given. A caller that
+    never extracts values passes ``extractor=False``: the section is not read,
+    ``extractor`` is ``None``, and a broken ``[extractor]`` table cannot fail it.
 
     ``schema_model`` / ``values_model`` are per-call overrides, applied as the
     merged config's highest layer (``cli_overrides``): an override replaces that
@@ -467,6 +479,12 @@ def load_grounded_config(
         else _LOCATIONS_REASONING_EFFORT
     )
 
+    extractor_config = load_extractor_config(workspace) if extractor else None
+    models = merged.get(ConfigSection.MODELS)
+    provider_credentials = (
+        provider_keys(models) if extractor_config is not None and isinstance(models, dict) else {}
+    )
+
     return GroundedConfig(
         schema_model=schema.model,
         values_model=values.model,
@@ -479,7 +497,8 @@ def load_grounded_config(
         max_tool_iters=max_tool_iters_raw,
         values_reasoning_effort=values_reasoning_effort,
         locations_reasoning_effort=locations_reasoning_effort,
-        extractor=load_extractor_config(workspace) if extractor else None,
+        extractor=extractor_config,
+        provider_credentials=provider_credentials,
     )
 
 
@@ -1215,7 +1234,7 @@ def _extract_one(
     """One file, synchronously: the body of :func:`extract_values`, which also
     returns the fallback that happened (if one did) so each driver logs it its
     own way."""
-    extractor = _construct_extractor(config.extractor)
+    extractor = _construct_extractor(config.extractor, config.provider_credentials)
     run = _FileExtraction(
         workspace,
         docset_id,
@@ -1264,14 +1283,17 @@ def _extract_one(
         run.record()
 
 
-def _construct_extractor(config: ExtractorConfig | None) -> ValueExtractor | Exception | None:
-    """The configured extractor, constructed; ``None`` when none is configured;
-    the exception its constructor raised, which every file of the run then
-    fails with (or falls back from), as a failing ``extract`` would."""
+def _construct_extractor(
+    config: ExtractorConfig | None, credentials: Mapping[Provider, Credentials]
+) -> ValueExtractor | Exception | None:
+    """The configured extractor, constructed with the provider keys it asks for
+    out of *credentials*; ``None`` when none is configured; the exception its
+    constructor raised, which every file of the run then fails with (or falls
+    back from), as a failing ``extract`` would."""
     if config is None:
         return None
     try:
-        return make_extractor(config)
+        return make_extractor(config, credentials=credentials)
     except Exception as exc:
         return exc
 
@@ -2480,7 +2502,9 @@ def extract_values_batch_pairs(
         # A pair whose tree is in contributes no phase-1 unit and no phase-3
         # page; one that fell back goes through the phases below as usual.
         if config.extractor is not None:
-            done, fallbacks = _run_extractor_batch(config.extractor, runs, pairs, _fail)
+            done, fallbacks = _run_extractor_batch(
+                config.extractor, config.provider_credentials, runs, pairs, _fail
+            )
             for pair in done:
                 pages_by_pair[pair] = []
             _log_fallbacks(fallbacks)
@@ -2589,6 +2613,7 @@ def extract_values_batch_pairs(
 
 def _run_extractor_batch(
     config: ExtractorConfig,
+    credentials: Mapping[Provider, Credentials],
     runs: dict[ExtractionPair, _FileExtraction],
     order: list[ExtractionPair],
     fail: Callable[[ExtractionPair, Exception], None],
@@ -2606,7 +2631,7 @@ def _run_extractor_batch(
     resume calls the extractor for that file again. If it fails again, the
     fallback's phase 1 is replayed from the response store; if it succeeds, its
     tree is taken and the fallback's recorded responses go unused."""
-    extractor = _construct_extractor(config)
+    extractor = _construct_extractor(config, credentials)
     jobs = sys.modules.get("dgml_core.batch.jobs")
     job = None if jobs is None else jobs.active_session()
 

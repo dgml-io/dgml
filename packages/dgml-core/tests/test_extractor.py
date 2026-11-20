@@ -28,7 +28,7 @@ from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
-from dgml_core import layout, llm
+from dgml_core import Provider, layout, llm
 from dgml_core.batch import FakeBackend, active_session, provider_of, register_backend
 from dgml_core.batch import registry as batch_registry
 from dgml_core.batch.jobs import (
@@ -189,6 +189,25 @@ class CrashingInit(FakeExtractor):
         raise RuntimeError("no SDK")
 
 
+class KeyedExtractor(FakeExtractor):
+    """Asks for the Anthropic key; records the config each hook saw."""
+
+    name: ClassVar[str] = "keyed"
+    api_key_providers: ClassVar[frozenset[Provider]] = frozenset({Provider.ANTHROPIC})
+
+    parsed: ClassVar[list[ExtractorConfig]] = []
+    configs: ClassVar[list[ExtractorConfig]] = []
+
+    @classmethod
+    def parse_config(cls, config: ExtractorConfig) -> ExtractorConfig:
+        cls.parsed.append(config)
+        return super().parse_config(config)
+
+    def __init__(self, config: ExtractorConfig) -> None:
+        super().__init__(config)
+        type(self).configs.append(config)
+
+
 def install(monkeypatch: pytest.MonkeyPatch, cls: type) -> str:
     """Publish *cls* on this module so the resolver imports it by dotted path."""
     monkeypatch.setattr(sys.modules[__name__], cls.__name__, cls, raising=False)
@@ -197,12 +216,20 @@ def install(monkeypatch: pytest.MonkeyPatch, cls: type) -> str:
 
 @pytest.fixture(autouse=True)
 def _reset_fakes() -> Iterator[None]:
-    for cls in (FakeExtractor, SelfVerifyingExtractor, ForgetfulExtractor, CrashingInit):
+    for cls in (
+        FakeExtractor,
+        SelfVerifyingExtractor,
+        ForgetfulExtractor,
+        CrashingInit,
+        KeyedExtractor,
+    ):
         cls.outputs = {}
         cls.calls = []
         cls.many_calls = []
         cls.constructed = 0
         cls.requests = []
+    KeyedExtractor.parsed = []
+    KeyedExtractor.configs = []
     yield
 
 
@@ -1554,3 +1581,167 @@ def test_recorded_input_and_record_input_compose_rewind(workspace: Workspace) ->
     assert session.rewind_input("a", lambda: b"2") == b"1"
     assert session.rewind_input("b", lambda: b"2") is None
     session.close(None)
+
+
+# ---------------------------------------------------------------------------
+# API keys
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_KEY = "sk-ant-extractor-test-key"
+_GOOGLE_KEY = "gk-google-extractor-test-key"
+
+
+@pytest.fixture
+def keyed(monkeypatch: pytest.MonkeyPatch) -> str:
+    return install(monkeypatch, KeyedExtractor)
+
+
+def _write_keyed_config(workspace: Workspace, provider: str, **models: Any) -> None:
+    write_config(
+        workspace,
+        {
+            "models": models,
+            "grounded": {"values_model": DEFAULT_VALUES_MODEL, "schema_model": "s"},
+            "extractor": {"provider": provider},
+        },
+    )
+
+
+def test_declared_provider_gets_its_models_key(workspace: Workspace, keyed: str) -> None:
+    """The class gets the key of the provider it asks for, not another one, and
+    parse_config never sees a key."""
+    _write_keyed_config(
+        workspace, keyed, anthropic_api_key=_ANTHROPIC_KEY, google_api_key=_GOOGLE_KEY
+    )
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed(workspace, fid)
+    extract_values(workspace, ds_id, fid, config=load_grounded_config(workspace))
+
+    (config,) = KeyedExtractor.configs
+    assert config.api_keys == {Provider.ANTHROPIC: _ANTHROPIC_KEY}
+    assert config.api_key(Provider.ANTHROPIC) == _ANTHROPIC_KEY
+    assert config.api_key(Provider.GOOGLE) is None
+    assert KeyedExtractor.parsed and all(c.api_keys == {} for c in KeyedExtractor.parsed)
+
+
+def test_key_env_is_read_when_the_extractor_is_built(
+    workspace: Workspace, keyed: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_keyed_config(workspace, keyed, anthropic_api_key_env="MY_ANTHROPIC_KEY")
+    config = load_grounded_config(workspace)  # loading reads no env var
+    monkeypatch.setenv("MY_ANTHROPIC_KEY", _ANTHROPIC_KEY)
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed(workspace, fid)
+    extract_values(workspace, ds_id, fid, config=config)
+    (built,) = KeyedExtractor.configs
+    assert built.api_key(Provider.ANTHROPIC) == _ANTHROPIC_KEY
+
+
+def test_unset_key_env_passes_no_key_with_a_warning(
+    workspace: Workspace,
+    keyed: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("MY_ANTHROPIC_KEY", raising=False)
+    _write_keyed_config(workspace, keyed, anthropic_api_key_env="MY_ANTHROPIC_KEY")
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed(workspace, fid)
+    with caplog.at_level(logging.WARNING, logger="dgml_core"):
+        extract_values(workspace, ds_id, fid, config=load_grounded_config(workspace))
+    (built,) = KeyedExtractor.configs
+    assert built.api_key(Provider.ANTHROPIC) is None
+    assert "MY_ANTHROPIC_KEY, which is not set" in caplog.text
+
+
+def test_no_configured_key_is_none_not_an_error(workspace: Workspace, keyed: str) -> None:
+    _write_keyed_config(workspace, keyed)
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed(workspace, fid)
+    result = extract_values(workspace, ds_id, fid, config=load_grounded_config(workspace))
+    assert result.extractor == keyed
+    (built,) = KeyedExtractor.configs
+    assert built.api_keys == {} and built.api_key(Provider.ANTHROPIC) is None
+
+
+def test_keys_stay_out_of_repr_stats_usage_and_xml(workspace: Workspace, keyed: str) -> None:
+    _write_keyed_config(workspace, keyed, anthropic_api_key=_ANTHROPIC_KEY)
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed(workspace, fid)
+    config = load_grounded_config(workspace)
+    assert _ANTHROPIC_KEY not in repr(config)
+    result = extract_values(
+        workspace, ds_id, fid, config=config, record_usage=True, write_stats=True
+    )
+    (built,) = KeyedExtractor.configs
+    assert _ANTHROPIC_KEY not in repr(built) and "anthropic" in repr(built)
+    assert _ANTHROPIC_KEY not in json.dumps(result.stats)
+    assert _ANTHROPIC_KEY not in json.dumps(read_events(workspace))
+    assert _ANTHROPIC_KEY not in workspace.blobs.get_blob(result.xml_key).decode("utf-8")
+
+
+def test_in_memory_configuration_passes_the_key(keyed: str, tmp_path: Path) -> None:
+    cfg = Configuration.build(
+        identity=Identity(workspace_id="tenant-1", name="n", organization="o"),
+        storage=Storage.combined(ProviderSpec("dgml_core.storage_local:LocalStore")),
+        models=Models(
+            advanced=Model(DEFAULT_VALUES_MODEL),
+            expert=Model(DEFAULT_SCHEMA_MODEL),
+            anthropic_api_key=_ANTHROPIC_KEY,
+        ),
+        extractor=ExtractorSection(provider=keyed),
+    )
+    ws = Workspace.open(configuration=cfg, root=tmp_path)
+    fid = "f1aaaaaaaaaa"
+    ds_id = _seed(ws, fid)
+    extract_file(ws, ds_id, fid)
+    (built,) = KeyedExtractor.configs
+    assert built.api_key(Provider.ANTHROPIC) == _ANTHROPIC_KEY
+
+
+def test_batch_passes_the_key(workspace: Workspace, keyed: str) -> None:
+    _write_keyed_config(workspace, keyed, anthropic_api_key=_ANTHROPIC_KEY)
+    ds_id, fids = _seed_many(workspace, 2)
+    _backend()
+    extract_values_many(
+        workspace,
+        ds_id,
+        fids,
+        config=load_grounded_config(workspace),
+        batch=True,
+        poll_interval_s=0,
+    )
+    (built,) = KeyedExtractor.configs
+    assert built.api_key(Provider.ANTHROPIC) == _ANTHROPIC_KEY
+
+
+def test_make_extractor_without_credentials_keeps_the_given_keys(keyed: str) -> None:
+    given = ExtractorConfig(provider=keyed, api_keys={Provider.ANTHROPIC: "sk-given"})
+    ext = make_extractor(given)
+    assert isinstance(ext, KeyedExtractor) and ext.config.api_keys == {
+        Provider.ANTHROPIC: "sk-given"
+    }
+    # With credentials, the resolved keys replace what the config held.
+    ext = make_extractor(given, credentials={Provider.GOOGLE: (_GOOGLE_KEY, None)})
+    assert isinstance(ext, KeyedExtractor) and ext.config.api_keys == {}
+
+
+@pytest.mark.parametrize(
+    ("providers", "match"),
+    [
+        (frozenset({"mistral"}), "unknown providers \\['mistral'\\]"),
+        ("anthropic", "must be a set of providers"),
+        (frozenset({3}), "must be a set of providers"),
+    ],
+)
+def test_bad_api_key_providers_fail_at_config_load(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, providers: Any, match: str
+) -> None:
+    class BadKeys(FakeExtractor):
+        name: ClassVar[str] = "badkeys"
+
+    BadKeys.api_key_providers = providers
+    provider = install(monkeypatch, BadKeys)
+    _write_keyed_config(workspace, provider)
+    with pytest.raises(ExtractorConfigInvalid, match=match):
+        load_extractor_config(workspace)

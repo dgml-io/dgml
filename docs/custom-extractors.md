@@ -72,6 +72,43 @@ fallback alone. An extractor's model is its own option in the table.
 A dotted `provider` path runs code from your config, as you, the same trust
 model as `[ocr]`, `[conversion]` and `[storage]`.
 
+### API keys
+
+An extractor that calls a model provider can use the key already configured
+for dgml's own models instead of taking its own. List the providers in
+`api_key_providers`, and read each key in `__init__` with `config.api_key`:
+
+```python
+from dgml_core import Provider
+
+
+class InvoiceExtractor(ValueExtractor):
+    api_key_providers: ClassVar[frozenset[Provider]] = frozenset({Provider.ANTHROPIC})
+
+    def __init__(self, config: ExtractorConfig) -> None:
+        self.client = anthropic.Anthropic(api_key=config.api_key(Provider.ANTHROPIC))
+```
+
+The keys come from the `[models]` provider keys, `anthropic_api_key`,
+`google_api_key` and `openai_api_key`, or their `_api_key_env` forms
+(`Models(anthropic_api_key=...)` in a `Configuration.build`):
+
+- dgml passes only the providers the class lists. A provider outside
+  `anthropic`, `google` and `openai` is refused with
+  `EXTRACTOR_CONFIG_INVALID` when the config is loaded.
+- An `_api_key_env` form is read from the environment when the extractor is
+  built. A variable that is not set passes no key and logs a WARNING.
+- A provider with no key configured is left out, and `config.api_key`
+  returns `None`. Passing `None` to the provider's SDK makes it read its own
+  environment variable. An extractor that cannot run without a key raises
+  `ExtractorFailed`.
+- `parse_config` never sees a key; `config.api_keys` is empty there.
+- Keys never appear in the config's `repr`, the stats file, the usage rows,
+  the DGML or a batch job's records.
+
+A key goes only to its provider's own API. Send it nowhere else, and take a
+key for any other service as one of the class's own options.
+
 ### The request
 
 An `ExtractionRequest` is one file against one docset:

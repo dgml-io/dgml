@@ -43,6 +43,10 @@ Writing your own extractor
        provider = "your_pkg.mod:YourExtractor"
        your_option = "…"
 
+An extractor that calls a model provider lists it in ``api_key_providers``;
+:func:`make_extractor` hands it that provider's ``[models] <provider>_api_key``
+(or the value of ``<provider>_api_key_env``) as ``config.api_key(provider)``.
+
 See ``docs/custom-extractors.md`` for the values-dict contract and the rules
 :func:`validate_extractor_output` applies.
 """
@@ -52,18 +56,20 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from .concurrency import map_concurrent
 from .config import load_merged_config
+from .default_config import Provider
 from .dg_refs import METHODS
 from .errors import DgmlError, ExtractorConfigInvalid, ExtractorOutputInvalid, FileNotFound
 from .extraction_schema import Tag, Vocabulary
 from .matching import LeafPath, path_to_str
-from .models_config import ConfigSection
+from .models_config import ConfigSection, Credentials
 from .provider import ProviderConfigFields, import_provider_class
 from .usage import _USAGE_FIELDS
 
@@ -95,20 +101,33 @@ class ExtractorConfig:
     is whether dgml's own pipeline runs when the extractor fails or returns an
     invalid tree; ``max_concurrency`` bounds the default
     :meth:`ValueExtractor.extract_many` under ``--batch``.
+
+    ``api_keys`` holds the provider keys :func:`make_extractor` resolved for the
+    providers the class lists in :attr:`ValueExtractor.api_key_providers`. It is
+    empty when the config is loaded and when ``parse_config`` runs; read it in
+    ``__init__`` through :meth:`api_key`.
     """
 
     provider: str
     fallback: bool = True
     max_concurrency: int = DEFAULT_EXTRACTOR_CONCURRENCY
     options: Mapping[str, Any] = field(default_factory=dict)
+    api_keys: Mapping[Provider, str] = field(default_factory=dict)
+
+    def api_key(self, provider: Provider) -> str | None:
+        """*provider*'s key, or ``None`` when none is configured: the provider's
+        SDK then reads its own environment variable."""
+        return self.api_keys.get(provider)
 
     def __repr__(self) -> str:
-        """Credential-named options print as ``***``."""
+        """Credential-named options print as ``***``; of ``api_keys`` only the
+        providers print."""
         from .redaction import redacted
 
         return (
             f"ExtractorConfig(provider={self.provider!r}, fallback={self.fallback!r}, "
-            f"max_concurrency={self.max_concurrency!r}, options={redacted(self.options)!r})"
+            f"max_concurrency={self.max_concurrency!r}, options={redacted(self.options)!r}, "
+            f"api_keys={sorted(str(p) for p in self.api_keys)!r})"
         )
 
 
@@ -194,6 +213,10 @@ class ValueExtractor(ProviderConfigFields, ABC):
     ``verifies_boxes`` says the extractor checked its own boxes against the
     page: dgml then runs :func:`~dgml_core.matching.verify_boxes` on a copy,
     keeps only its counts, and writes the boxes as returned.
+    ``api_key_providers`` lists the providers whose ``[models]`` key the class
+    uses; :func:`make_extractor` resolves those keys into ``config.api_keys``
+    before ``__init__``. It is a request, not a requirement: a provider with no
+    configured key is left out, and ``config.api_key`` returns ``None``.
 
     ``extract`` must be thread-safe: the default :meth:`extract_many` calls it
     from several threads on one instance.
@@ -203,6 +226,7 @@ class ValueExtractor(ProviderConfigFields, ABC):
     config_section: ClassVar[str] = "extractor"
     config_error: ClassVar[type[DgmlError]] = ExtractorConfigInvalid
     verifies_boxes: ClassVar[bool] = False
+    api_key_providers: ClassVar[frozenset[Provider]] = frozenset()
 
     @classmethod
     def log(cls) -> logging.Logger:
@@ -256,11 +280,36 @@ class ValueExtractor(ProviderConfigFields, ABC):
 def resolve_extractor_class(provider: str) -> type[ValueExtractor]:
     """Import the :class:`ValueExtractor` subclass named by the dotted *provider*.
     Raises :class:`ExtractorConfigInvalid` for a malformed path, an import
-    failure, a class that is not an :class:`ValueExtractor`, or an abstract one."""
+    failure, a class that is not an :class:`ValueExtractor`, an abstract one, or
+    an ``api_key_providers`` that is not a collection of known providers."""
     cls: type[ValueExtractor] = import_provider_class(
         provider, ValueExtractor, kind="extractor", error=ExtractorConfigInvalid
     )
+    _check_api_key_providers(cls)
     return cls
+
+
+def _check_api_key_providers(cls: type[ValueExtractor]) -> None:
+    """Refuse an ``api_key_providers`` that is not a collection of
+    :class:`~dgml_core.default_config.Provider` values, so a typo fails at config
+    load rather than quietly passing no key."""
+    wanted: Any = cls.api_key_providers
+    known = sorted(str(p) for p in Provider)
+    if (
+        isinstance(wanted, str)
+        or not isinstance(wanted, Collection)
+        or not all(isinstance(p, str) for p in wanted)
+    ):
+        raise ExtractorConfigInvalid(
+            f"{cls._describe()!r}.api_key_providers must be a set of providers "
+            f"({', '.join(known)}), got {wanted!r}"
+        )
+    unknown = sorted(str(p) for p in wanted if p not in known)
+    if unknown:
+        raise ExtractorConfigInvalid(
+            f"{cls._describe()!r}.api_key_providers names unknown providers {unknown}; "
+            f"known: {', '.join(known)}"
+        )
 
 
 def load_extractor_config(workspace: Workspace) -> ExtractorConfig | None:
@@ -314,12 +363,51 @@ def _run_parse_config(cls: type[ValueExtractor], config: ExtractorConfig) -> Ext
     return parsed
 
 
-def make_extractor(config: ExtractorConfig) -> ValueExtractor:
+def make_extractor(
+    config: ExtractorConfig, *, credentials: Mapping[Provider, Credentials] | None = None
+) -> ValueExtractor:
     """Construct the extractor *config* names: resolve the class, re-run
     ``parse_config``, then ``__init__``. What the constructor raises is the
-    extractor's failure, not a config error."""
+    extractor's failure, not a config error.
+
+    *credentials* are the ``[models]`` provider pairs (``(api_key, api_key_env)``
+    per provider, as :func:`~dgml_core.models_config.provider_keys` reads them).
+    When given, the keys of the providers the class lists in
+    ``api_key_providers`` are resolved (an ``_env`` form read from the
+    environment now) into ``config.api_keys``, replacing what it held; other
+    providers' keys are not passed. Without *credentials*, ``config.api_keys``
+    is passed as given."""
     cls = resolve_extractor_class(config.provider)
-    return cls(_run_parse_config(cls, config))
+    parsed = _run_parse_config(cls, config)
+    if credentials is not None:
+        parsed = replace(parsed, api_keys=_resolve_api_keys(cls, credentials))
+    return cls(parsed)
+
+
+def _resolve_api_keys(
+    cls: type[ValueExtractor], credentials: Mapping[Provider, Credentials]
+) -> dict[Provider, str]:
+    """The keys of the providers *cls* asks for that have one configured. A
+    ``<provider>_api_key_env`` naming an unset variable is left out with a
+    WARNING, since the provider's SDK would otherwise read its own env var,
+    which may hold a different key."""
+    keys: dict[Provider, str] = {}
+    for provider in sorted(Provider(p) for p in cls.api_key_providers):
+        api_key, api_key_env = credentials.get(provider, (None, None))
+        if api_key_env is not None:
+            api_key = os.environ.get(api_key_env) or None
+            if api_key is None:
+                logger.warning(
+                    "extractor %s: 'models.%s_api_key_env' names %s, which is not set; "
+                    "the extractor gets no %s key",
+                    cls._describe(),
+                    provider,
+                    api_key_env,
+                    provider,
+                )
+        if api_key:
+            keys[provider] = api_key
+    return keys
 
 
 # ---------------------------------------------------------------------------
